@@ -8,6 +8,8 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
+using System.Threading;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -31,6 +33,12 @@ namespace TensorSharp.Models
     /// happened to fit the card the default was chosen on. Everything here is a
     /// cap: it can only ever hand back something at or below the caller's own
     /// default, so a card with room keeps today's behaviour exactly.
+    ///
+    /// Memory an owner will allocate later can be claimed ahead of use
+    /// (<see cref="Reserve"/>): the spare readings here, and the shared decoder's
+    /// slot admission and room checks, leave it out, so a cache that grows on
+    /// demand does not take it first. A vision tower whose weights upload with the
+    /// first image claims them, and its largest image's compute, when it loads.
     /// </summary>
     internal static class GpuMemoryBudget
     {
@@ -90,7 +98,7 @@ namespace TensorSharp.Models
         /// query fails — callers then keep their own default untouched.
         /// </summary>
         internal static bool TryGetSpareBytes(BackendType backend, out long spareBytes)
-            => TryGetSpareBytes(AppliesTo(backend), out spareBytes);
+            => TryGetSpareBytes(backend, AppliesTo(backend), out spareBytes);
 
         /// <summary>
         /// Same as <see cref="TryGetSpareBytes(BackendType, out long)"/>, but for a
@@ -98,7 +106,7 @@ namespace TensorSharp.Models
         /// for why Metal is included here and not there.
         /// </summary>
         internal static bool TryGetReservationSpareBytes(BackendType backend, out long spareBytes)
-            => TryGetSpareBytes(AppliesToReservations(backend), out spareBytes);
+            => TryGetSpareBytes(backend, AppliesToReservations(backend), out spareBytes);
 
         /// <summary>
         /// The device's free bytes with no headroom set aside, on the backends <see cref="AppliesToReservations"/> covers: the
@@ -112,19 +120,65 @@ namespace TensorSharp.Models
                 return false;
             if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long totalBytes) || totalBytes <= 0)
                 return false;
-            freeBytes = Math.Max(0, free);
+            // Bytes another owner claimed ahead of use (Reserve) are not this request's to take.
+            freeBytes = Math.Max(0, free - Math.Max(0, ReservedBytes(backend, GgmlDevice)));
             return true;
         }
 
-        private static bool TryGetSpareBytes(bool backendApplies, out long spareBytes)
+        private static bool TryGetSpareBytes(BackendType backend, bool backendApplies, out long spareBytes)
         {
             spareBytes = 0;
             if (!backendApplies)
                 return false;
             if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeBytes, out long totalBytes) || totalBytes <= 0)
                 return false;
-            spareBytes = Math.Max(0, freeBytes - ResolveHeadroomBytes(totalBytes));
+            spareBytes = SpareBytes(freeBytes, totalBytes, ReservedBytes(backend, GgmlDevice));
             return true;
+        }
+
+        /// <summary>The spare of a device reading: its free bytes less the headroom and the bytes reserved on it.</summary>
+        internal static long SpareBytes(long freeBytes, long totalBytes, long reservedBytes)
+            => Math.Max(0, freeBytes - ResolveHeadroomBytes(totalBytes) - Math.Max(0, reservedBytes));
+
+        // ---------------------------------------------------------------- reservations
+
+        /// <summary>The device a GGML backend's readings describe (<see cref="GgmlBasicOps.TryGetDeviceMemoryInfo"/>: the
+        /// primary backend's, rank 0 under tensor parallelism), and so the one its reservations are made on.</summary>
+        internal const int GgmlDevice = 0;
+
+        private static readonly object s_reservationsLock = new();
+        private static readonly List<DeviceReservation> s_reservations = new();
+
+        /// <summary>
+        /// Claim <paramref name="bytes"/> of <paramref name="device"/>'s memory for <paramref name="owner"/> before it allocates
+        /// them: every spare reading of that device leaves them out (<see cref="TryGetSpareBytes"/>, and the shared decoder's
+        /// slot admission and room checks), so caches sized from what is free, a KV cache growing on demand above all, leave
+        /// the owner its room. The owner sets <see cref="DeviceReservation.Bytes"/> to what it still needs as it allocates
+        /// (memory it holds is no longer free, and stays out of the readings by itself) and disposes the reservation when it
+        /// lets the memory go. <paramref name="backend"/> names the device's family: a GGML backend's device is
+        /// <see cref="GgmlDevice"/>, direct CUDA's the allocator's ordinal.
+        /// </summary>
+        internal static DeviceReservation Reserve(BackendType backend, int device, string owner, long bytes)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(owner);
+            var reservation = new DeviceReservation(backend, device, owner, bytes);
+            lock (s_reservationsLock) s_reservations.Add(reservation);
+            return reservation;
+        }
+
+        /// <summary>The bytes reserved on <paramref name="device"/> of <paramref name="backend"/>'s family, by every owner.</summary>
+        internal static long ReservedBytes(BackendType backend, int device)
+        {
+            long sum = 0;
+            lock (s_reservationsLock)
+                foreach (DeviceReservation r in s_reservations)
+                    if (r.Backend == backend && r.Device == device) sum += r.Bytes;
+            return sum;
+        }
+
+        internal static void Release(DeviceReservation reservation)
+        {
+            lock (s_reservationsLock) s_reservations.Remove(reservation);
         }
 
         /// <summary>
@@ -150,5 +204,35 @@ namespace TensorSharp.Models
                 return minTokens;
             return (int)Math.Min(affordable, desiredTokens);
         }
+    }
+
+    /// <summary>A claim on a device's memory (<see cref="GpuMemoryBudget.Reserve"/>): the bytes its owner may still allocate
+    /// there. Disposing it gives the claim up.</summary>
+    internal sealed class DeviceReservation : IDisposable
+    {
+        private long _bytes;
+
+        internal DeviceReservation(BackendType backend, int device, string owner, long bytes)
+        {
+            Backend = backend;
+            Device = device;
+            Owner = owner;
+            _bytes = Math.Max(0, bytes);
+        }
+
+        public BackendType Backend { get; }
+
+        public int Device { get; }
+
+        public string Owner { get; }
+
+        /// <summary>The bytes still claimed: the owner lowers it as it allocates them (never below 0).</summary>
+        public long Bytes
+        {
+            get => Interlocked.Read(ref _bytes);
+            set => Interlocked.Exchange(ref _bytes, Math.Max(0, value));
+        }
+
+        public void Dispose() => GpuMemoryBudget.Release(this);
     }
 }

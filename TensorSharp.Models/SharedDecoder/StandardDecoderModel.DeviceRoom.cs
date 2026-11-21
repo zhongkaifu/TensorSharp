@@ -90,7 +90,11 @@ namespace TensorSharp.Models
         /// </summary>
         private (long Free, long Total) DeviceMemory(bool fresh = false)
         {
-            if (DeviceRoomForTests is { } stand) return stand();
+            if (DeviceRoomForTests is { } stand)
+            {
+                var (standFree, standTotal) = stand();
+                return (Math.Max(0, standFree - CudaReservedBytes), standTotal);
+            }
             long now = Stopwatch.GetTimestamp();
             if (!fresh && _deviceReadAt != 0 && now - _deviceReadAt < DeviceReadTicks) return _deviceReading;
             if (_allocator is not TensorSharp.Cuda.CudaAllocator cuda || !cuda.TryGetDeviceMemory(out long free, out long total))
@@ -100,10 +104,32 @@ namespace TensorSharp.Models
                 _deviceRoomLogged = true;
                 cuda.LogDeviceRoom($"{Config.Architecture} device room");
             }
-            _deviceReading = (free, total);
+            _deviceReading = (Math.Max(0, free - CudaReservedBytes), total);
             _deviceReadAt = now;
             return _deviceReading;
         }
+
+        /// <summary>
+        /// The bytes claimed ahead of use on this model's direct-CUDA device (<see cref="GpuMemoryBudget.Reserve"/>: a loaded
+        /// vision tower's weights before their upload and the compute of the largest image it accepts), which
+        /// <see cref="DeviceMemory"/> leaves out of the free bytes, so slots, their growth and prompt steps leave them free.
+        /// A test standing in for the device (<see cref="DeviceRoomForTests"/>) sees only the reservations on the device it
+        /// names (<see cref="ReservationDeviceForTests"/>), none by default.
+        /// </summary>
+        private long CudaReservedBytes
+        {
+            get
+            {
+                (BackendType Backend, int Device)? device = ReservationDeviceForTests;
+                if (device == null && DeviceRoomForTests == null && _allocator is TensorSharp.Cuda.CudaAllocator cuda)
+                    device = (BackendType.Cuda, cuda.DeviceId);
+                return device is { } d ? GpuMemoryBudget.ReservedBytes(d.Backend, d.Device) : 0;
+            }
+        }
+
+        /// <summary>Tests: the device whose reservations this model's readings leave out while a test stands in for the device
+        /// (<see cref="DeviceRoomForTests"/>, <see cref="DeviceMemoryProbe"/>).</summary>
+        internal (BackendType Backend, int Device)? ReservationDeviceForTests { get; set; }
 
         /// <summary>This model allocated or freed device memory: the next question reads the device anew.</summary>
         private void NoteDeviceMemoryChanged() => _deviceReadAt = 0;

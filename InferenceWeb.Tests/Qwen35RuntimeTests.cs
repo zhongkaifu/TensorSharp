@@ -2728,6 +2728,33 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.Equal(0, unified.EnsureSequenceSlot("second", 64));
     }
 
+    /// <summary>Memory claimed on the GGML device (<see cref="GpuMemoryBudget.Reserve"/>: a loaded vision tower's weights before
+    /// the first image uploads them, and its largest image's compute) counts as taken: a second request's slot that fits the
+    /// free memory beside the headroom only with the claim counted as free waits, and the prefix cache is asked for the
+    /// difference; once the claim is given up the slot is made. The model names a device no real reading uses, so the claim
+    /// reaches no other test.</summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlCuda)]
+    public void NewSlotsLeaveReservedDeviceMemoryOnCuda(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var model = Create(Fixture("dense"), backend: backend);
+        const long gb = 1L << 30;
+        const int device = 1 << 20;
+        model.DeviceMemoryProbe = () => (8 * gb, 64 * gb);   // 2 GB headroom
+        model.ReservationDeviceForTests = (backend, device);
+        var unified = (IUnifiedBatchModel)model;
+        Assert.Equal(0, unified.EnsureSequenceSlot("lone", 64));
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        using (GpuMemoryBudget.Reserve(backend, device, "a vision tower", 7 * gb))
+        {
+            Assert.True(model.DeviceSlotDeficitBytes >= gb, "the claim is what the device lacks of its headroom");
+            Assert.Throws<TensorSharp.Runtime.Scheduling.SequenceSlotUnavailableException>(() => unified.EnsureSequenceSlot("second", 64));
+        }
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        Assert.Equal(0, unified.EnsureSequenceSlot("second", 64));
+    }
+
     /// <summary>A slot whose rows a graph left on the device grows there (new caches zero-filled on the device, the rows
     /// copied device to device) when a request's reservation passes its capacity, and decoding continues exactly as
     /// without the growth. Through the host it downloaded every row and uploaded them again.</summary>

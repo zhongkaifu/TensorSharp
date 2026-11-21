@@ -490,19 +490,39 @@ namespace TensorSharp.Models
         private static long DeviceHeadroom(long totalBytes) => Math.Max(1L << 30, totalBytes / 32);
 
         /// <summary>The device's free and total bytes (the GGML backend's report; tests substitute their own).</summary>
-        internal Func<(long Free, long Total)?> DeviceMemoryProbe { get; set; } = static ()
+        internal Func<(long Free, long Total)?> DeviceMemoryProbe { get; set; } = GgmlDeviceMemory;
+
+        private static readonly Func<(long Free, long Total)?> GgmlDeviceMemory = static ()
             => GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0 ? (free, total) : null;
 
-        /// <summary>What the device lacks for <paramref name="needBytes"/> beside its headroom, after the kept graph arenas
-        /// are released and then the idle slots' device copies dropped (0 when it fits or is not measured).</summary>
+        /// <summary>The bytes claimed ahead of use on the device the GGML backend reports (<see cref="GpuMemoryBudget.Reserve"/>,
+        /// <see cref="GpuMemoryBudget.GgmlDevice"/>: a loaded vision tower's weights before their upload and the compute of the
+        /// largest image it accepts), which a new slot leaves free beside the headroom. A test's probe sees only the
+        /// reservations on the device it names (<see cref="ReservationDeviceForTests"/>), none by default.</summary>
+        private long GgmlReservedBytes
+        {
+            get
+            {
+                (BackendType Backend, int Device)? device = ReservationDeviceForTests;
+                if (device == null && ReferenceEquals(DeviceMemoryProbe, GgmlDeviceMemory))
+                    device = (_backend, GpuMemoryBudget.GgmlDevice);
+                return device is { } d ? GpuMemoryBudget.ReservedBytes(d.Backend, d.Device) : 0;
+            }
+        }
+
+        /// <summary>What the device lacks for <paramref name="needBytes"/> beside its headroom and the bytes reserved on it,
+        /// after the kept graph arenas are released and then the idle slots' device copies dropped (0 when it fits or is not
+        /// measured).</summary>
         private long DeviceDeficit(long needBytes)
         {
             if (needBytes <= 0 || DeviceMemoryProbe() is not { } memory) return 0;
-            long deficit = Math.Max(0, needBytes + DeviceHeadroom(memory.Total) - memory.Free);
+            long reserved = GgmlReservedBytes;
+            long Short((long Free, long Total) m) => Math.Max(0, needBytes + DeviceHeadroom(m.Total) + reserved - m.Free);
+            long deficit = Short(memory);
             if (deficit > 0 && GgmlBasicOps.ReleaseKeptArenas() > 0 && DeviceMemoryProbe() is { } after)
-                deficit = Math.Max(0, needBytes + DeviceHeadroom(after.Total) - after.Free);
+                deficit = Short(after);
             if (deficit > 0 && DropIdleSlotDeviceCopies() > 0 && DeviceMemoryProbe() is { } dropped)
-                deficit = Math.Max(0, needBytes + DeviceHeadroom(dropped.Total) - dropped.Free);
+                deficit = Short(dropped);
             return deficit;
         }
 
