@@ -1147,6 +1147,7 @@ public sealed class MainPage : ContentPage
 
         await RunUiCheckAsync();
         await RunTtftProbeAsync();
+        await RunSpeechProbeAsync();
 
         // Screenshot hook: neither simctl nor devicectl can tap, so the menu -- the one
         // surface all of this app's navigation lives on -- can otherwise never appear in
@@ -1389,6 +1390,172 @@ public sealed class MainPage : ContentPage
         {
             Say("ttft FAIL " + ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Device E2E hook (Debug builds only): a spoken reply's timeline on this phone.
+    ///
+    /// <para>
+    /// Launched with <c>TENSORAGENT_SPEECH_CHECK=1</c> and a model that speaks (LFM3-Omni,
+    /// via <c>TENSORAGENT_USE_MODEL</c>). The question is whether the speech plays WHILE the
+    /// text is written, which only the phone can answer: it switches Speak replies on, sends
+    /// each prompt of <c>TENSORAGENT_SPEECH_PROMPTS</c> ('|'-separated; an English and a
+    /// Chinese one by default) in a new chat, and prints the page's own record of the turn
+    /// (<c>speechTimeline</c>: when the text and every chunk of speech reached the page, when
+    /// the player scheduled each one, and the AudioContext's states) beside the app's audio
+    /// session. One <c>speechcheck</c> line per fact, on stdout and in logs/speech.log. The
+    /// chats it made are deleted afterwards.
+    /// </para>
+    /// </summary>
+    private async Task RunSpeechProbeAsync()
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_CHECK"), "1", StringComparison.Ordinal))
+            return;
+
+        Core.Hosting.AgentAppHost app = _host.App;
+        string speechLog = Path.Combine(app.Paths.LogsDirectory, "speech.log");
+        void Say(string line)
+        {
+            Console.WriteLine("TensorAgent: " + line);
+            try { File.AppendAllText(speechLog, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff} {line}{Environment.NewLine}"); }
+            catch (Exception) { /* diagnostic only */ }
+        }
+        var made = new List<string>();
+        try
+        {
+            for (int i = 0; i < 360 && app.ModelLoad != Core.Hosting.AgentAppHost.ModelLoadState.Loaded; i++)
+                await Task.Delay(500);
+            for (int i = 0; i < 180 && !app.PrefixCacheIsWarm; i++)
+                await Task.Delay(500);
+            bool ready = false;
+            for (int i = 0; i < 60 && !ready; i++)
+            {
+                await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent && window.TensorAgent.refreshModel ? window.TensorAgent.refreshModel() : 0");
+                await Task.Delay(1000);
+                string? answer = await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent && window.TensorAgent.hasModel ? window.TensorAgent.hasModel() : false");
+                ready = answer is not null && answer.Contains("true", StringComparison.OrdinalIgnoreCase);
+            }
+            Say($"speechcheck model={app.ModelLoad} warm={app.PrefixCacheIsWarm} pageHasModel={ready}");
+            Say("speechcheck audio-session " + DescribeAudioSession());
+            string? speaking = await _webView.EvaluateJavaScriptAsync(
+                "window.TensorAgent.setSpeakReplies ? window.TensorAgent.setSpeakReplies(true) : 'nobridge'");
+            Say("speechcheck speak-replies " + speaking);
+            if (speaking is null || !speaking.Contains("true", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            string prompts = Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_PROMPTS") is { Length: > 0 } given
+                ? given
+                : "In three or four sentences, tell me why the sky is blue.|请用三四句话解释为什么天空是蓝色的。";
+            int turn = 0;
+            foreach (string prompt in prompts.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                turn++;
+                await _webView.EvaluateJavaScriptAsync("window.TensorAgent.openConversation(null)");
+                await Task.Delay(2000);
+                await _webView.EvaluateJavaScriptAsync("document.getElementById('text').value = ''; true");
+                await CallBridgeAsync("insertText", new { text = prompt });
+                await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent.send(); if (document.activeElement) document.activeElement.blur(); true");
+                Say($"speechcheck turn {turn} sent: {prompt}");
+                string timeline = "null";
+                bool sessionSaid = false;
+                for (int i = 0; i < 1200; i++)
+                {
+                    await Task.Delay(250);
+                    timeline = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                        "window.TensorAgent.speechTimeline ? window.TensorAgent.speechTimeline() : 'null'"));
+                    if (!sessionSaid && timeline.Contains("\"chunkAt\":[", StringComparison.Ordinal)
+                        && !timeline.Contains("\"chunkAt\":[]", StringComparison.Ordinal))
+                    {
+                        sessionSaid = true;
+                        Say($"speechcheck turn {turn} audio-session while speaking " + DescribeAudioSession());
+                    }
+                    if (!timeline.Contains("\"done\":-1", StringComparison.Ordinal))
+                        break;
+                }
+                string diagnostics = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent && window.TensorAgent.diagnostics ? window.TensorAgent.diagnostics() : 'nopage'"));
+                try
+                {
+                    using JsonDocument d = JsonDocument.Parse(diagnostics);
+                    if (d.RootElement.TryGetProperty("conversation", out JsonElement c) && c.GetString() is { Length: > 0 } id)
+                        made.Add(id);
+                }
+                catch (JsonException) { }
+                Say($"speechcheck turn {turn} summary " + SummarizeSpeechTimeline(timeline));
+                Say($"speechcheck turn {turn} timeline " + timeline);
+                // Let the reply finish playing before the next turn silences it.
+                await Task.Delay(TimeSpan.FromSeconds(20));
+                Say($"speechcheck turn {turn} after playback " + UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent.speechTimeline ? JSON.stringify(JSON.parse(window.TensorAgent.speechTimeline()).states.slice(-2)) : 'null'"))
+                    + " " + DescribeAudioSession());
+            }
+        }
+        catch (Exception ex)
+        {
+            Say("speechcheck FAIL " + ex.Message);
+        }
+        finally
+        {
+            if (made.Count > 0)
+            {
+                try
+                {
+                    using var client = new HttpClient { BaseAddress = new Uri(_host.BaseUrl) };
+                    client.DefaultRequestHeaders.Add("Cookie", $"tensoragent_token={_host.Token}");
+                    foreach (string id in made.Distinct())
+                        Say($"speechcheck deleted {id}: {(int)(await client.DeleteAsync("/api/agent/conversations/" + Uri.EscapeDataString(id))).StatusCode}");
+                    await _webView.EvaluateJavaScriptAsync("window.TensorAgent.openConversation(null)");
+                }
+                catch (Exception ex) { Say("speechcheck cleanup failed " + ex.Message); }
+            }
+            Say("speechcheck end");
+        }
+    }
+
+    /// <summary>The turn's timeline in the numbers that matter: time to the first text, the first speech the page
+    /// had and when it was scheduled to sound, the last text, and how much speech arrived before the text ended.</summary>
+    private static string SummarizeSpeechTimeline(string timeline)
+    {
+        try
+        {
+            using JsonDocument d = JsonDocument.Parse(timeline);
+            JsonElement r = d.RootElement;
+            if (r.ValueKind != JsonValueKind.Object)
+                return "no timeline";
+            int[] chunkAt = r.GetProperty("chunkAt").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            int[] startAt = r.GetProperty("startAt").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            int lastText = r.GetProperty("lastText").GetInt32();
+            int beforeLast = chunkAt.Count(t => t <= lastText);
+            return $"firstText={r.GetProperty("firstText").GetInt32()}ms lastText={lastText}ms texts={r.GetProperty("texts").GetInt32()} "
+                + $"chunks={chunkAt.Length} firstChunk={(chunkAt.Length > 0 ? chunkAt[0] : -1)}ms "
+                + $"firstScheduledStart={(startAt.Length > 0 ? startAt[0] : -1)}ms chunksBeforeLastText={beforeLast} "
+                + $"lastChunk={(chunkAt.Length > 0 ? chunkAt[^1] : -1)}ms done={r.GetProperty("done").GetInt32()}ms "
+                + $"noPlayer={r.GetProperty("noPlayer").GetInt32()} states={r.GetProperty("states").GetRawText()}";
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return "unreadable timeline: " + ex.Message;
+        }
+    }
+
+    /// <summary>The app's audio session and the chat WebView's media settings, for the speech probe.</summary>
+    private string DescribeAudioSession()
+    {
+#if IOS
+        AVFoundation.AVAudioSession session = AVFoundation.AVAudioSession.SharedInstance();
+        string web = _webView.Handler is Microsoft.Maui.Handlers.WebViewHandler handler
+            ? $"requiresUserAction={handler.PlatformView.Configuration.MediaTypesRequiringUserActionForPlayback} "
+              + $"inline={handler.PlatformView.Configuration.AllowsInlineMediaPlayback}"
+            : "no handler";
+        return $"category={session.Category} mode={session.Mode} options={session.CategoryOptions} "
+            + $"otherAudio={session.OtherAudioPlaying} silencedHint={session.SecondaryAudioShouldBeSilencedHint} "
+            + $"volume={session.OutputVolume:F2} route={string.Join(",", session.CurrentRoute.Outputs.Select(o => o.PortType))} {web}";
+#else
+        return "n/a";
+#endif
     }
 
     /// <summary>
