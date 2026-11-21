@@ -39,7 +39,7 @@
 #define TS_FP4_NVFP4_BLOCK 64
 #define TS_FP4_NVFP4_BLOCK_BYTES 36
 
-#define TS_FP4_VERSION 6
+#define TS_FP4_VERSION 7
 
 __device__ __forceinline__ float ts_fp4_warp_sum(float v)
 {
@@ -1147,3 +1147,222 @@ extern "C" __global__ void ts_fp4_get_rows_f32(const uint8_t* __restrict__ plane
         o[c] = (nibble & 8 ? -mag : mag) * 2.0f * ts_fp4_ue4m3(scales[c / 16]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// ts_fp4_gemm_w4a4 for a fused gate|up matrix [2 ff][k] (the ff gate rows first) with the SwiGLU in its epilogue: a CTA's 128
+// weight rows are 64 gate rows and their 64 up rows (rows g0 .. g0 + 63 and ff + g0 ..), so it holds both halves of its
+// outputs and writes y[m][ff] = silu(gate) * up, where the plain product wrote [m][2 ff] for a SwiGLU pass to read back.
+// Every gate and up value is the plain product's for its row (the same tiles of K, the same MMAs, the same split-K partials
+// summed in split order and scaled as it scales them) and silu is ts_fp4_silu, so y is what ts_fp4_quantize_swiglu_nvfp4_f32
+// stages from the plain product's rows bit for bit. The main loop is ts_fp4_gemm_w4a4's (copied), only the weight rows each
+// tile row reads differ. ff % 64 == 0. Grid (ff / 64, activation tiles, splits): the plain product's tile count, so its
+// split-K counters serve.
+// ---------------------------------------------------------------------------
+template <int BN, int WM, int WN, int STAGES, int BK = TS_FP4_BK>
+__device__ __forceinline__ void ts_fp4_gemm_w4a4_swiglu(
+    const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k,
+    const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale,
+    int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters)
+{
+    static_assert(WM * WN == 8, "eight warps");
+    constexpr int WROWS = TS_FP4_BM / WM, WCOLS = BN / WN;
+    constexpr int MT = WROWS / 16, NT = WCOLS / 8, HALF = TS_FP4_BM / 2;
+    extern __shared__ __align__(16) uint8_t smemRaw[];
+    using Smem = TsFp4GemmSmem<BN, WM, WN, STAGES, BK>;
+    constexpr int CROW = Smem::CROW, SROW = Smem::SROW, CHUNKS = BK / 32;
+    auto& sm = *reinterpret_cast<Smem*>(smemRaw);
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp % WM, wn = warp / WM;
+    const int ff = outDim / 2, g0 = blockIdx.x * HALF, col0 = blockIdx.y * BN;
+    const int splits = gridDim.z;
+    const int stagesTotal = k / BK;
+    const int perSplit = (stagesTotal + splits - 1) / splits;
+    const int sBegin = blockIdx.z * perSplit;
+    const int sEnd = min(stagesTotal, sBegin + perSplit);
+    const int nStages = max(0, sEnd - sBegin);
+    const long long wRowBytes = k / 2, wScaleBytes = k / 16;
+    // Tile row r: gate row g0 + r, or up row ff + g0 + r - 64; valid while its gate row is.
+    auto weightRow = [&](int r) { return r < HALF ? g0 + r : ff + g0 + (r - HALF); };
+    auto validRow = [&](int r) { return (r < HALF ? g0 + r : g0 + (r - HALF)) < ff; };
+
+    auto load = [&](int slot, int stage) {
+        const long long kc = (long long)stage * (BK / 2), ks = (long long)stage * SROW;
+        for (int i = tid; i < TS_FP4_BM * CHUNKS; i += 256)
+        {
+            const int r = i / CHUNKS, c = i % CHUNKS;
+            const bool ok = validRow(r);
+            const int gr = weightRow(r);
+            ts_fp4_cp16(sm.ac[slot] + r * CROW + c * 16, wCodes + (ok ? gr : 0) * wRowBytes + kc + c * 16, ok);
+        }
+        for (int r = tid; r < TS_FP4_BM; r += 256)
+        {
+            const bool ok = validRow(r);
+            const int gr = weightRow(r);
+            if (SROW == 16)
+                ts_fp4_cp16(sm.as[slot] + r * SROW, wScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+            else
+                ts_fp4_cp8(sm.as[slot] + r * SROW, wScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+        }
+        for (int i = tid; i < BN * CHUNKS; i += 256)
+        {
+            const int r = i / CHUNKS, c = i % CHUNKS;
+            const int gr = col0 + r;
+            const bool ok = gr < m;
+            ts_fp4_cp16(sm.bc[slot] + r * CROW + c * 16, xCodes + (ok ? gr : 0) * wRowBytes + kc + c * 16, ok);
+        }
+        for (int r = tid; r < BN; r += 256)
+        {
+            const int gr = col0 + r;
+            const bool ok = gr < m;
+            if (SROW == 16)
+                ts_fp4_cp16(sm.bs[slot] + r * SROW, xScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+            else
+                ts_fp4_cp8(sm.bs[slot] + r * SROW, xScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+        }
+    };
+
+    float acc[MT][NT][4];
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s)
+    {
+        if (s < nStages)
+            load(s, sBegin + s);
+        ts_fp4_cp_commit();
+    }
+    const int g = lane >> 2, q = lane & 3;
+    for (int it = 0; it < nStages; ++it)
+    {
+        ts_fp4_cp_wait<STAGES - 2>();
+        __syncthreads();
+        const int next = it + STAGES - 1;
+        if (next < nStages)
+            load(next % STAGES, sBegin + next);
+        ts_fp4_cp_commit();
+        const int slot = it % STAGES;
+        const uint8_t* ac = sm.ac[slot];
+        const uint8_t* as = sm.as[slot];
+        const uint8_t* bc = sm.bc[slot];
+        const uint8_t* bs = sm.bs[slot];
+#pragma unroll
+        for (int kstep = 0; kstep < BK / 64; ++kstep)
+        {
+            uint32_t a[MT][4], sa[MT];
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+            {
+                const int r = wm * WROWS + i * 16;
+                ts_fp4_ldsm_x4(a[i], ac + (r + (lane & 15)) * CROW + kstep * 32 + (lane >> 4) * 16);
+                sa[i] = *(const uint32_t*)(as + (r + g + (lane & 1) * 8) * SROW + kstep * 4);
+            }
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+            {
+                const int c = wn * WCOLS + j * 8 + g;
+                const uint8_t* bp = bc + c * CROW + kstep * 32 + q * 4;
+                const uint32_t b0 = *(const uint32_t*)bp, b1 = *(const uint32_t*)(bp + 16);
+                const uint32_t sb = *(const uint32_t*)(bs + c * SROW + kstep * 4);
+#pragma unroll
+                for (int i = 0; i < MT; ++i)
+                    ts_fp4_mma_fp4(acc[i][j], a[i], b0, b1, sa[i], sb);
+            }
+        }
+    }
+    ts_fp4_cp_wait<0>();
+    __syncthreads();
+
+    // Tile element (i, j, e): tile row lr (weight row weightRow(lr)), tile column lc (activation row col0 + lc).
+    auto element = [&](int i, int j, int e, int& lr, int& lc) {
+        lr = wm * WROWS + i * 16 + g + (e >= 2 ? 8 : 0);
+        lc = wn * WCOLS + j * 8 + q * 2 + (e & 1);
+    };
+    float* ys = reinterpret_cast<float*>(smemRaw);   // [128 tile rows][BN]: the products' values, the pipeline done with
+    if (splits == 1)
+    {
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    int lr, lc;
+                    element(i, j, e, lr, lc);
+                    const int c = col0 + lc;
+                    if (validRow(lr) && c < m)
+                        ys[lr * BN + lc] = acc[i][j][e] * rowScale[c] * alpha;
+                }
+    }
+    else
+    {
+        float* mine = partial + (long long)blockIdx.z * m * outDim;
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    int lr, lc;
+                    element(i, j, e, lr, lc);
+                    const int c = col0 + lc;
+                    if (validRow(lr) && c < m)
+                        mine[(long long)c * outDim + weightRow(lr)] = acc[i][j][e];
+                }
+        __threadfence();
+        __syncthreads();
+        __shared__ int last;
+        const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+        if (tid == 0)
+            last = atomicAdd(counters + tile, 1) == splits - 1;
+        __syncthreads();
+        if (!last)
+            return;
+        __threadfence();
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    int lr, lc;
+                    element(i, j, e, lr, lc);
+                    const int c = col0 + lc;
+                    if (!validRow(lr) || c >= m)
+                        continue;
+                    const int r = weightRow(lr);
+                    float sum = 0.0f;
+                    for (int z = 0; z < splits; ++z)
+                        sum += __ldcg(partial + ((long long)z * m + c) * outDim + r);
+                    ys[lr * BN + lc] = sum * rowScale[c] * alpha;
+                }
+        if (tid == 0)
+            counters[tile] = 0;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < HALF * BN; idx += 256)
+    {
+        const int lc = idx / HALF, lr = idx % HALF, c = col0 + lc;
+        if (g0 + lr < ff && c < m)
+            y[(long long)c * ff + g0 + lr] = ts_fp4_silu(ys[lr * BN + lc]) * ys[(lr + HALF) * BN + lc];
+    }
+}
+
+#define TS_FP4_GEMM_SWIGLU(NAME, BN, WM, WN, STAGES) \
+    extern "C" __global__ __launch_bounds__(256) void NAME( \
+        const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k, \
+        const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale, \
+        int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters) \
+    { ts_fp4_gemm_w4a4_swiglu<BN, WM, WN, STAGES, TS_FP4_BK>(wCodes, wScales, outDim, k, xCodes, xScales, rowScale, m, \
+        alpha, y, partial, counters); }
+
+// grid (ff / 64, activation tiles, splits).
+TS_FP4_GEMM_SWIGLU(ts_fp4_gemm_w4a4_32_swiglu, 32, 8, 1, 3)
+TS_FP4_GEMM_SWIGLU(ts_fp4_gemm_w4a4_64_swiglu, 64, 4, 2, 3)

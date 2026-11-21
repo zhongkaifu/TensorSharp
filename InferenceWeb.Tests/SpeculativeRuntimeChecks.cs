@@ -270,6 +270,100 @@ internal static class SpeculativeRuntimeChecks
     }
 
     /// <summary>
+    /// Several requests speculating through a block drafter at once draft their blocks in one program a step
+    /// (<see cref="IBatchedSpeculativeTarget.TryDraftBatch"/>) and write their commits' catch-ups in one program when the step
+    /// ends: their streams are plain decoding's and those of the same requests drafting one at a time (the program disabled,
+    /// as before it), and each request drafts and keeps the drafts it does drafting alone. With <paramref name="nearTie"/>
+    /// above 0 (a backend whose products round by their row count: a program over three requests' blocks reads every weight
+    /// for 3 x b rows where a lone block reads it for b), a stream may part from plain decoding's only at a near-tie of its
+    /// context's logits (<see cref="AssertEngineSpeculationMatchesPlain"/>'s rule) and the draft counts may differ.
+    /// TODO: once SpeculativeVerifyWindows (feature/muse-glimmer-unified) is on main, prove each parting from the run's own
+    /// verify row as the DFlash lossless gates there do.
+    /// </summary>
+    public static async Task AssertBatchedBlockDraftsDraftAsEachRequest(Func<StandardDecoderModel> create,
+        SpeculationOptions speculation, string label, int maxNew = 20, double nearTie = 0, BatchedRings rings = BatchedRings.Kept)
+    {
+        int[][] plain = await ServeAsync(create, EnginePrompts, null, maxNew, verifySteps: null);
+        int blocks = 0, injects = 0, verified = 0, alone = -1, follows = 0, featureCommits = 0, ringCarries = 0;
+        bool keeps = false;
+        string declined = null;
+        var together = new List<SequenceState>();
+        int[][] batched = await ServeAsync(() =>
+        {
+            StandardDecoderModel model = create();
+            model.VerifyFollowDisabledForTests = rings == BatchedRings.CatchUps;
+            model.VerifyFollowWritesFromFeaturesForTests = rings == BatchedRings.FromFeatures;
+            return model;
+        }, EnginePrompts, speculation, maxNew, steps => verified = steps, together,
+            model => (blocks, injects, declined, follows, featureCommits, ringCarries, keeps) = (model.BatchedBlockDrafts, model.DFlashLaneInjects,
+                model.BatchedBlockDraftDeclineReason, model.VerifyFollows, model.VerifyFeatureCommits, model.RingHeldCarries,
+                model.BatchedSpecVerifyKeepsDrafter));
+        var single = new List<SequenceState>();
+        int[][] perRequest = await ServeAsync(() =>
+        {
+            StandardDecoderModel model = create();
+            model.BatchedBlockDraftDisabledForTests = true;
+            return model;
+        }, EnginePrompts, speculation, maxNew, verifySteps: null, single, model => alone = model.BatchedBlockDrafts + model.DFlashLaneInjects);
+        Assert.Null(declined);
+        Assert.True(verified > 0, $"{label}: no batched verify ran");
+        Assert.True(blocks > 0, $"{label}: no step drafted its requests' blocks together");
+        // Where the batched verify keeps the rings itself, its program (or its commit, from the features it returned to the
+        // model) wrote the kept rows and the drafts took their carries from the rings; else the catch-ups went in together.
+        if (keeps && rings == BatchedRings.Kept)
+            Assert.True(follows > 0 && featureCommits == 0, $"{label}: {follows} verifies wrote the rings, {featureCommits} commits from features");
+        else if (keeps && rings == BatchedRings.FromFeatures)
+            Assert.True(featureCommits > 0 && follows == 0, $"{label}: {featureCommits} commits wrote the rings from features, {follows} verifies");
+        else
+            Assert.True(injects > 0, $"{label}: no step wrote its requests' catch-ups together");
+        if (keeps && rings != BatchedRings.CatchUps)
+            Assert.True(ringCarries > 0, $"{label}: no draft took its carry from its ring");
+        Assert.Equal(0, alone);
+        for (int r = 0; r < EnginePrompts.Length; r++)
+        {
+            AssertPartsOnlyAtANearTie(create, EnginePrompts[r], plain[r], batched[r], nearTie, $"{label}: request {r} drafted together");
+            AssertPartsOnlyAtANearTie(create, EnginePrompts[r], plain[r], perRequest[r], nearTie, $"{label}: request {r} drafted alone");
+            if (nearTie > 0) continue;
+            SpeculationStats a = together[r].SpecStats, b = single[r].SpecStats;
+            Assert.True(a != null && b != null, $"{label}: request {r} did not speculate");
+            Assert.True(a.TokensDrafted == b.TokensDrafted && a.TokensAccepted == b.TokensAccepted,
+                $"{label}: request {r} drafted {a.TokensDrafted} (accepted {a.TokensAccepted}) together, "
+                + $"{b.TokensDrafted} ({b.TokensAccepted}) alone");
+        }
+    }
+
+    /// <summary>How a batched step's commits reach the drafters' rings in <see cref="AssertBatchedBlockDraftsDraftAsEachRequest"/>.</summary>
+    public enum BatchedRings
+    {
+        /// <summary>As the model chooses: the verify writes the windows into the rings where it keeps them.</summary>
+        Kept,
+        /// <summary>The verify returns its features to the model, and the commit writes the kept rows from them.</summary>
+        FromFeatures,
+        /// <summary>The verify returns its features to the caller, whose contexts' catch-ups go in together.</summary>
+        CatchUps,
+    }
+
+    /// <summary><paramref name="actual"/> is <paramref name="plain"/>, or (with <paramref name="nearTie"/> above 0) parts from it
+    /// only where the two tokens' logits are within that share of the largest logit's magnitude, the context's logits from
+    /// one prompt forward over the tokens both agree on.</summary>
+    private static void AssertPartsOnlyAtANearTie(Func<StandardDecoderModel> create, int[] prompt, int[] plain, int[] actual,
+        double nearTie, string label)
+    {
+        if (plain.SequenceEqual(actual)) return;
+        string streams = $"{label} gave [{string.Join(",", actual)}], plain [{string.Join(",", plain)}]";
+        Assert.True(nearTie > 0, streams);
+        int d = 0;
+        while (d < plain.Length && d < actual.Length && plain[d] == actual[d]) d++;
+        Assert.True(d < plain.Length && d < actual.Length, streams);
+        using ModelBase reference = create();
+        float[] logits = reference.ForwardPrompt(prompt.Concat(plain.Take(d)).ToArray());
+        float largest = logits.Max(Math.Abs);
+        float apart = Math.Abs(logits[plain[d]] - logits[actual[d]]);
+        Assert.True(apart <= nearTie * largest,
+            $"{streams}: they part at token {d}, whose logits are {apart:E2} apart ({apart / largest:E2} of the largest)");
+    }
+
+    /// <summary>
     /// The draft chains of several requests in one pass (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>) are
     /// each request's own chain (<see cref="IDraftHead.DraftChain"/> on its bound slot): four requests at different
     /// positions folding 1, 3, 2 and 2 verified rows in front of their anchors, with different caps, the last one's draft

@@ -265,7 +265,8 @@ namespace TensorSharp.Graph
         /// rounded on its own, each tap's two products added, and the taps added in order (tap 0's term, then the result plus
         /// each later tap's: zero on the rows before that tap reaches). Inputs: x [hidden, rows], taps [stride, rows] (the
         /// conv projection of the sublayer's input) and the base kernel [hidden, width, 2]. Ip: width, group, groups, side,
-        /// stride. Result: [hidden, rows].</summary>
+        /// stride, then (optional) a block's rows: the rows are blocks of that many one after another (several requests'
+        /// blocks), each convolved on its own (r counts from its block's first row). Result: [hidden, rows].</summary>
         DFlashConv = 17,
         /// <summary>A diffusion transformer's adaLN modulation of a packed sequence: each row RMS-normed and times the norm
         /// weight, then n + n * scale + shift, where scale and shift are columns of the modulation matrix picked by the row's
@@ -329,6 +330,38 @@ namespace TensorSharp.Graph
         /// serves the F16 form as its fused ones (the products on cuBLAS F16, the SwiGLU and b1 in the down product's input,
         /// the bias and scale in H3_FUSED_SCALED_RESIDUAL).</summary>
         ScaledResidual = 24,
+        /// <summary>Several sequences' verify-window recurrences of one gated delta-net layer (a batched verify: each sequence on
+        /// its own state): the sequences' GatedDeltaNet ops, each the window form (its rows' outputs alone, its scan inputs
+        /// saved, the state read and left). Inputs: per sequence its op's q, k, v, g, beta, state and saved-inputs leaf, in
+        /// sequence order. Ip: the sequences, then each one's saved-input rows. Results: each sequence's op result, in order.
+        /// An executor may run every sequence's scan in one dispatch; each sequence's values are its op's.</summary>
+        DeltaNetScans = 25,
+        /// <summary>Several block drafter lanes' attentions (several requests' blocks drafted in one program, each lane's rows
+        /// over its own KV ring under its own mask): the lanes' FlashAttention ops and the concatenation of their results along
+        /// the rows. Inputs: per lane its op's q, K, V and mask, in lane order. Ip: the lanes. Fp: the scale. Result: the lanes'
+        /// attentions [d, heads, lanes * rows]. An executor may run every lane's in one dispatch; each lane's values are its op's.</summary>
+        RingAttentionLanes = 26,
+        /// <summary>Several sequences' attentions of one layer (a batched verify's windows, each over its own caches): the
+        /// sequences' cache writes and attention ops, which read the region's inputs and each sequence's own caches alone.
+        /// Inputs: the step's q, k and v. Results: each sequence's attention [heads * dv, its rows], in order. An executor may run
+        /// the region's ops at its end and launch the sequences' attention kernels together (each sequence's values its ops');
+        /// any other computes the ops in place.</summary>
+        SequenceAttentions = 27,
+        /// <summary>Several sequences' delta-rule inputs of one gated delta-net layer (a batched verify's windows, each sequence
+        /// with its own conv window and history): each sequence's <see cref="DeltaNetPrep"/> region and the copy of its conv
+        /// input into its conv history. Inputs: per sequence its conv window, qkv, alpha and beta (its prep region's), its conv
+        /// history's view [convRows + rows, channels] and, with ip[5] set, its window's saved scan inputs (the leaf its
+        /// GatedDeltaNet window op saves q | k | v | g | beta into), in sequence order; then the conv kernel, dt and a. Ip: dk,
+        /// k heads, dv, v heads, the sequences, the saved-inputs flag. Fp: eps. Results: per sequence its prep's q, k, v, g and
+        /// beta, in sequence order. An executor may run every sequence's prep in one dispatch, writing each conv input into its
+        /// history (and its results into its saved inputs' planes, read there by the scans); each value is its op's.</summary>
+        DeltaNetPreps = 28,
+        /// <summary>Several sequences' gated norms of one gated delta-net layer (a batched verify's windows) and the concatenation
+        /// of their results along the rows: each sequence's <see cref="GatedRmsNorm"/> region, then the concatenation. Inputs:
+        /// per sequence its norm's y and z, in sequence order; then the norm weight. Ip: the sigmoid flag, the sequences. Fp:
+        /// eps. Result: the concatenation [heads * d, every sequence's rows]. An executor may run every sequence's norm in one
+        /// dispatch into the concatenation; each value is its op's.</summary>
+        GatedRmsNorms = 29,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

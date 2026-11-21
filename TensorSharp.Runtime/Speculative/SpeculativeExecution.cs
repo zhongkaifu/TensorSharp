@@ -801,16 +801,31 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>
         /// Batched step, first half when drafting for several sequences in one pass:
         /// whether this sequence drafts at all this step and, if so, its carried
-        /// feature row and draft cap. The same gates as <see cref="ProposeForBatch"/>.
+        /// feature row and draft cap. The same gates as <see cref="ProposeForBatch"/>, the
+        /// carry the drafter holds taken as it takes it (the first draft after a prompt the
+        /// trunk kept the drafter in step with); the caller binds this sequence's drafter
+        /// state first.
         /// </summary>
         public bool TryPrepareBatchDraft(int position, int kMax, [NotNullWhen(true)] out float[]? carry, out int maxTokens)
         {
             carry = null;
             maxTokens = Math.Min(Math.Min(kMax, MaxDraftTokens), _model.MaxContextLength - position - 2);
-            if (!SupportsBatchDraft || !CarryValid || maxTokens <= 0)
+            if (!SupportsBatchDraft || maxTokens <= 0 || !EnsureCarry(position))
                 return false;
             carry = _pendingH;
             return true;
+        }
+
+        /// <summary>This sequence's share of writing a batched step's catch-ups after the step (a model that writes every
+        /// sequence's at once when the step ends, <see cref="IBatchedSpeculativeTarget.BeginBatchedSpeculation"/>): catch-up
+        /// time of a step that verified drafts, plain time of one that drafted nothing, as <see cref="CommitBatch"/> counts
+        /// its own.</summary>
+        public void AddBatchCatchUp(long ticks, bool drafted)
+        {
+            if (drafted)
+                Stats.CatchUpTicks += ticks;
+            else
+                Stats.PlainTicks += ticks;
         }
 
         /// <summary>Apply the drafter's gate to a block drafted for this sequence by a

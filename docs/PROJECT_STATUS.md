@@ -421,7 +421,7 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     GDN switches, `TS_NEMOTRON_FLASH_DECODE`, `TS_NEMOTRON_LINEAR_RESIDUAL_FUSED`,
     `TS_NEMOTRON_MAMBA2_NATIVE_DECODE` / `_PREFILL`, `TS_NEMOTRON_MOE_PREFILL_BATCHED`,
     `TS_MUSE_GLIMMER_FUSED` / `_FUSED_CPU` / `_TP_FUSED` / `_VENC_FUSED`,
-    `TS_DFLASH_FUSED`, `TS_DSV4_MMA_EXPERTS` / `_STAGED_EXPERTS`,
+    `TS_DFLASH_FUSED`, `TS_DFLASH_BATCHED_INJECT`, `TS_DSV4_MMA_EXPERTS` / `_STAGED_EXPERTS`,
     `TS_DSV4_DSPARK_CAPTURE`, and the hyper-connection overrides `TS_DSV4_HC_NATIVE` /
     `TS_GLM_HC_NATIVE` (the backend probe decides); Muse-Glimmer's
     `TS_MUSE_GLIMMER_INGRAPH_EMBED` / `_VENC_F32` / `_GELU_TANH` overrides; two

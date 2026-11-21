@@ -173,8 +173,11 @@ namespace TensorSharp.Runtime.Speculative
         /// The carry a proposal at <paramref name="position"/> chains from (the trunk's features of the row before it,
         /// <see cref="DraftContext.CarryHidden"/>) when the drafter took it itself as the trunk forwarded that row (a prompt
         /// read on the plain path that the target kept the drafter in step with, <see cref="HandlesOwnPrefill"/>): copied
-        /// into <paramref name="carry"/>, and true. False when it holds none, and then the step that would have drafted
-        /// first captures the carry plainly. Default false.
+        /// into <paramref name="carry"/>, and true. Also true, with <paramref name="carry"/> left as it is, when the drafter's
+        /// state holds the carried row itself (a batched verify that kept it in step,
+        /// <see cref="IBatchedSpeculativeTarget.BatchedSpecVerifyKeepsDrafter"/>): the proposal and the catch-up after it then
+        /// write no row from the carry. False when it holds none, and then the step that would have drafted first captures
+        /// the carry plainly. Default false.
         /// </summary>
         bool TryTakeHeldCarry(int position, float[] carry) => false;
 

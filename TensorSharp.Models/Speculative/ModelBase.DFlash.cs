@@ -589,9 +589,6 @@ namespace TensorSharp.Models
         /// <see cref="Dispose"/>; only the rings are ours.</summary>
         private protected void DisposeDFlash()
         {
-            _dflashDeferInjects = false;
-            _dflashPendingInjects.Clear();
-            _dflashPendingRowCount = 0;
             DisposeDSpine();
             DisposeDFlashRingPool();
             if (_dflashSubHead != IntPtr.Zero)
@@ -677,6 +674,28 @@ namespace TensorSharp.Models
             RecordDSpineDumpRows(hRows, rowOffset, n, startPos);
             if (DFlashDraftingDeclined)
                 return;   // this request's ring is incomplete; it decodes without drafts
+            // The ring holds the carry row the write starts with (a batched verify wrote it: DFlashRing.HeldTo), and the
+            // runtime no longer keeps its features: a draft's carry inject writes nothing, a catch-up from the row after it.
+            if (n > 0 && DFlashRingHoldsCarry(startPos + 1))
+            {
+                rowOffset++;
+                n--;
+                startPos++;
+                if (n == 0)
+                    return;
+            }
+            // A batched step's commit waits on the ring (ModelBase.DFlash.Lanes.cs), and anything else writes after its queue.
+            if (TryDeferDFlashInject(hRows, rowOffset, n, startPos))
+                return;
+            FlushBoundDFlashRows();
+            WriteDFlashRows(hRows, rowOffset, n, startPos);
+        }
+
+        /// <summary><see cref="DFlashEncodeAndInject"/>'s write: the graph program, the fused graph or the per-op pair.</summary>
+        private void WriteDFlashRows(float[] hRows, int rowOffset, int n, int startPos)
+        {
+            if (DFlashDraftingDeclined)
+                return;
             if (TryGraphDFlashInject(hRows, rowOffset, n, startPos))
                 return;
             _dflashFusedInjectFailed = false;
@@ -911,7 +930,7 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe int DFlashDraftBlockCore(int anchorToken, int position, int b, int[] draftOut, float[] confOut)
         {
-            FlushDeferredDFlashInjects();
+            FlushBoundDFlashRows();
             int graph = TryGraphDFlashDraftBlock(anchorToken, position, b, draftOut, confOut);
             if (graph >= 0)
                 return graph;
@@ -1601,11 +1620,16 @@ namespace TensorSharp.Models
             // Unary term: the ordinary DFlash head, kept only at its top-k.
             int[] candIds = new int[gamma * k];
             float[] unary = new float[gamma * k];
+            DFlashSlotTrace[] trace = DFlashTraceForTests ? new DFlashSlotTrace[gamma] : null;
             using (Tensor logits = LinearForward(predRows, DFlashTargetOutputWeightName))
             {
                 float* lp = GetFloatPtr(logits);
                 for (int e = 0; e < gamma; e++)
+                {
                     DFlashTopK(lp + (long)e * vocab, vocab, k, candIds, unary, e * k);
+                    if (trace != null)
+                        trace[e] = new DFlashSlotTrace { Logits = new ReadOnlySpan<float>(lp + (long)e * vocab, vocab).ToArray() };
+                }
             }
             // The target's own logit transform, applied AFTER the top-k because both
             // halves of it are monotonic (so the candidate set is unchanged) and doing
@@ -1659,6 +1683,11 @@ namespace TensorSharp.Models
                 chosen = 0;
                 for (int c = 1; c < k; c++)
                     if (row[c] > row[chosen]) chosen = c;
+                if (trace != null)
+                {
+                    trace[e].Candidates = candIds.AsSpan(e * k, k).ToArray();
+                    trace[e].Scores = (float[])row.Clone();
+                }
 
                 if (DFlashSelectorDebug && _dflashSelectorDebugBlocks < 3)
                 {
@@ -1688,6 +1717,7 @@ namespace TensorSharp.Models
 
             if (DFlashSelectorDebug)
                 _dflashSelectorDebugBlocks++;
+            if (trace != null) LastDFlashTraceForTests = trace;
             return gamma;
         }
 

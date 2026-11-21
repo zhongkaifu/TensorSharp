@@ -718,7 +718,7 @@ namespace TensorSharp.Graph
                     case GraphNodeKind.Fused:
                         _regionInputs.Push(e.Srcs ?? Array.Empty<int>());
                         if (InRegion) _nested++;
-                        else if (_x.Fuses((GraphFusion)e.Node) || _x.RunsConcurrently((GraphFusion)e.Node)) _region = e;
+                        else if (_x.Fuses((GraphFusion)e.Node) || _x.RunsConcurrently((GraphFusion)e.Node) || _x.RunsTogether((GraphFusion)e.Node)) _region = e;
                         break;
                     case GraphNodeKind.FusedEnd:
                         if (InRegion && _nested > 0) _nested--;
@@ -782,6 +782,21 @@ namespace TensorSharp.Graph
             /// wrote).</summary>
             private void RunFused(in GraphNode region, int[] results, GraphNode[] writes)
             {
+                if (_x.RunsTogether((GraphFusion)region.Node))
+                {
+                    // The region's ops, now: their writes, then their results, the executor launching their kernels together.
+                    _x.BeginTogether();
+                    try
+                    {
+                        foreach (GraphNode w in writes) Write(w);
+                        foreach (int r in results) Force(r);
+                    }
+                    finally
+                    {
+                        _x.EndTogether();
+                    }
+                    return;
+                }
                 var inputs = new Tensor[region.Srcs.Length];
                 var weights = new IGraphWeight[region.Srcs.Length];
                 // A region whose kernel finishes writes left for later to its inputs itself takes them unread.
@@ -1406,6 +1421,17 @@ namespace TensorSharp.Graph
 
         /// <summary>A concurrent region's ops are queued; <paramref name="results"/> are what later ops will wait for.</summary>
         protected virtual void EndConcurrent(Tensor[] results) { }
+
+        /// <summary>Whether a region of <paramref name="kind"/> (<see cref="GraphFusion.SequenceAttentions"/>) runs its ops at its
+        /// end between <see cref="BeginTogether"/> and <see cref="EndTogether"/>, where the executor may launch their kernels
+        /// together.</summary>
+        protected virtual bool RunsTogether(GraphFusion kind) => false;
+
+        /// <summary>A together region's ops are about to run: the executor may hold their launches back.</summary>
+        protected virtual void BeginTogether() { }
+
+        /// <summary>A together region's ops ran: the launches held back are made now, before anything reads their results.</summary>
+        protected virtual void EndTogether() { }
 
         protected virtual bool TryAddWeightedNorm(Tensor a, Tensor b, Tensor weight, float eps, out Tensor sum, out Tensor normed)
         {
@@ -2627,7 +2653,10 @@ namespace TensorSharp.Graph
             return x.GetElementsAsFloat((int)x.ElementCount());
         }
 
-        /// <summary>ggml_top_k on the host (executors with a kernel override it; their result need not carry host ints).</summary>
+        /// <summary>ggml_top_k on the host (executors with a kernel override it; their result need not carry host ints): each
+        /// row's k largest values' indices, largest first, a tie to the lower index. A few picks keep a sorted run of k and
+        /// let a value in only past the run's last, which gives a full sort's order: sorting every row of a block drafter's
+        /// logits (a DFlash2 block's 16 candidates of Qwen3.8's 248,320 ids, 7 rows a block) took ~165 ms a block on MLX.</summary>
         protected virtual Value TopK(Tensor x, int k, RunState run)
         {
             long cols = x.Sizes[^1], rows = x.ElementCount() / cols;
@@ -2638,7 +2667,7 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>Picks up to which a row is selected in one pass rather than sorted whole.</summary>
-        internal const int TopKSelectionMax = 32;
+        internal const int TopKSelectionMax = 64;
 
         /// <summary>
         /// Each row's <paramref name="k"/> largest values' columns into <paramref name="picked"/> [rows, k], largest first, a tie to

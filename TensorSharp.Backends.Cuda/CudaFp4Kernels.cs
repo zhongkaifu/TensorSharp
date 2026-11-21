@@ -22,7 +22,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FP4_VERSION in tensorsharp_fp4_kernels.cu: bump both together whenever a kernel is added or
         /// changes its signature.</summary>
-        public const int CurrentVersion = 6;
+        public const int CurrentVersion = 7;
 
         /// <summary>K values one GEMM stage takes: a planar matrix's row width must be a multiple of it.</summary>
         public const int StageK = 256;
@@ -50,6 +50,7 @@ namespace TensorSharp.Cuda
         private const int Block = 256;
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
+        private readonly IntPtr _gemm32SwiGlu, _gemm64SwiGlu;
         private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _quantSwiGlu, _addRmsNorm, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _tma256SwiGlu,
             _tma128SwiGlu, _getRows;
         private readonly IntPtr[] _gemv = new IntPtr[GemvMaxRows + 1];
@@ -78,6 +79,8 @@ namespace TensorSharp.Cuda
             _tma128 = module.GetFunction("ts_fp4_gemm_w4a4_tma128");
             _tma256SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_tma256_swiglu");
             _tma128SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_tma128_swiglu");
+            _gemm32SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_32_swiglu");
+            _gemm64SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_64_swiglu");
             _getRows = module.GetFunction("ts_fp4_get_rows_f32");
             for (int n = 1; n <= GemvMaxRows; n++)
                 _gemv[n] = module.GetFunction($"ts_fp4_gemv_nvfp4_{n}");
@@ -92,7 +95,7 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuFuncSetAttribute(_quantSwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_addRmsNorm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             foreach (var (fn, smem) in new[] { (_gemm32, _smem32), (_gemm64, _smem64), (_gemm128, _smem128), (_tma256, _smemTma256), (_tma128, _smemTma128),
-                         (_tma256SwiGlu, _smemTma256), (_tma128SwiGlu, _smemTma128) })
+                         (_tma256SwiGlu, _smemTma256), (_tma128SwiGlu, _smemTma128), (_gemm32SwiGlu, _smem32), (_gemm64SwiGlu, _smem64) })
                 CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem).ThrowOnError();
         }
 
@@ -258,6 +261,33 @@ namespace TensorSharp.Cuda
                 Launch(fn, (uint)tilesY, (uint)tilesX, 1, 256, smem, stream, args);
             else
                 Launch(fn, (uint)tilesX, (uint)tilesY, (uint)splits, 256, smem, stream, args);
+        }
+
+        /// <summary>Whether <see cref="GemmSwiGlu"/> takes <paramref name="m"/> rows of a fused gate|up matrix of
+        /// <paramref name="outDim"/> rows: the cp.async GEMM's 32- and 64-column tiles (up to 64 rows, below the TMA GEMM) and ff
+        /// a multiple of 64.</summary>
+        public static bool TakesSwiGlu(int m, int outDim) => m >= 1 && m <= 64 && outDim % 128 == 0;
+
+        /// <summary>
+        /// y[m, ff] = silu(gate) * up for a fused gate|up matrix of <paramref name="outDim"/> = 2 ff rows (the gate rows first) on
+        /// the cp.async GEMM (<see cref="TakesSwiGlu"/>), each CTA over 64 gate rows and their 64 up rows: every gate and up value
+        /// is the one <see cref="Gemm"/> stores for its row with the same <paramref name="splits"/> (pass
+        /// <see cref="Splits"/>' choice for the [m, 2 ff] product), so y is what a SwiGLU over that product computes, its bytes
+        /// never written and read again. <paramref name="partial"/> and <paramref name="counters"/> as <see cref="Gemm"/>'s for
+        /// that product.
+        /// </summary>
+        public void GemmSwiGlu(IntPtr planes, int outDim, int k, IntPtr xCodes, IntPtr xScales, IntPtr rowScale, int m, float alpha,
+            IntPtr y, IntPtr partial, IntPtr counters, int splits, IntPtr stream)
+        {
+            if (!TakesSwiGlu(m, outDim))
+                throw new ArgumentOutOfRangeException(nameof(m), $"{m} rows of a {outDim}-row gate|up matrix");
+            int bn = TileColumns(m);
+            int tilesX = outDim / 2 / 64, tilesY = (m + bn - 1) / bn;
+            IntPtr a0 = planes, a1 = ScalePlane(planes, outDim, k), a4 = xCodes, a5 = xScales, a6 = rowScale, a9 = y, a10 = partial, a11 = counters;
+            int a2 = outDim, a3 = k, a7 = m; float a8 = alpha;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
+            var (fn, smem) = bn == 32 ? (_gemm32SwiGlu, _smem32) : (_gemm64SwiGlu, _smem64);
+            Launch(fn, (uint)tilesX, (uint)tilesY, (uint)splits, 256, smem, stream, args);
         }
 
         /// <summary>y[m, outDim] = alpha * rowScale * (x W^T) on the TMA-fed GEMM (<see cref="TakesTma"/>): the products and

@@ -1812,26 +1812,6 @@ namespace TensorSharp.GGML
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 kNormArr, ringKArr, ringVArr, ringDtype, scales);
 
-        /// <summary>DFlash PASS A+B for several rings in one GGML graph (CUDA).</summary>
-        public static bool DFlashInjectBatched(
-            int nLanes, int maxRows, int totalRows,
-            float[] featRows, int featureSize,
-            int[] gather, long[] ringRowsIdx, int[] positions,
-            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
-            float eps, float ropeBase, float ropeFreqScale,
-            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
-            IntPtr encNormData,
-            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype, float[] scales = null)
-            => GgmlNative.DFlashInjectBatched(nLanes, maxRows, totalRows, featRows, featureSize,
-                gather, ringRowsIdx, positions,
-                numLayers, hiddenSize, headDim, numKvHeads, ringRows,
-                eps, ropeBase, ropeFreqScale, fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
-                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
-                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
-                kNormArr, ringKArr, ringVArr, ringDtype, scales);
-
         /// <summary>DFlash PASS C in one GGML graph: the block draft, then either the
         /// borrowed LM head + softmax + on-device top-1 (plain DFlash) or the DFlash2
         /// candidate lattice the caller walks (selRank &gt; 0).</summary>
@@ -1894,46 +1874,6 @@ namespace TensorSharp.GGML
                 selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes,
                 selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes,
                 selScoresOut, selCandOut, scales);
-
-        /// <summary>DFlash PASS C for several sequences in one graph; see
-        /// <see cref="GgmlNative.DFlashDraftBlockBatched"/>.</summary>
-        public static bool DFlashDraftBlockBatched(
-            int nLanes, int[] blockIds, int blockLen, int[] positions,
-            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
-            float eps, float ropeBase, float ropeFreqScale, float kqScale,
-            int[] ringSlotPos, int slidingWindow,
-            IntPtr[] attnNormArr,
-            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
-            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] qNormArr, IntPtr[] kNormArr,
-            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
-            IntPtr[] ffnNormArr,
-            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
-            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
-            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
-            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
-            IntPtr outNormData,
-            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
-            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocabSize, int[] idsOut, float[] confOut,
-            
-            
-            int convTaps, int convGroupSize, int convNumGroups,
-            IntPtr[] attnConvBaseArr,
-            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
-            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
-            IntPtr[] ffnConvBaseArr,
-            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
-            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
-            
-            
-            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
-            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
-            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
-            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
-            float[] selScoresOut, int[] selCandOut, float[] scales)
-            => GgmlNative.DFlashDraftBlockBatched(nLanes, blockIds, blockLen, positions, numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows, eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow, attnNormArr, qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr, kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr, vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr, qNormArr, kNormArr, oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr, ffnNormArr, gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr, upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr, downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr, ringKArr, ringVArr, ringDtype, outNormData, tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocabSize, idsOut, confOut, convTaps, convGroupSize, convNumGroups, attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr, attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr, ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr, ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr, selRank, selTopK, selLogitScale, selLogitSoftcap, selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes, selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes, selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes, selScoresOut, selCandOut, scales);
 
         /// <summary>Drop the persistent DFlash graphs.</summary>
         public static void DFlashResetCaches() => GgmlNative.DFlashResetCaches();

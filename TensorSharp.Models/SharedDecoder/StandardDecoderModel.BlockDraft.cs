@@ -92,7 +92,9 @@ namespace TensorSharp.Models
             // ggml_metal's fused drafter runs DFlash2's head, top-k and selector walk on TensorSharp's own Metal kernels after
             // its graph (tsm::df_tail_run): 12.3 ms a block of Qwen3.8-27B UD-IQ3_XXS's drafter on an M5 Pro against 15.5 ms
             // for these programs, whose selector walk is ~70 dependent kernels. It keeps that path until the walk is a region
-            // the GGML builder serves with those kernels.
+            // the GGML builder serves with those kernels. Several requests' blocks keep it too (StandardDecoderModel.BlockDraftLanes.cs):
+            // the program over four requests' blocks took 48.0 ms a step against 42.6 for four fused drafts, and over two 23.1
+            // against 21.3 (the drafter's products are compute-bound on the M5 Pro past 8 rows, as the trunk's verify is).
             if (_backend == BackendType.GgmlMetal && cfg.HasSelector && !GraphBlockDraftOnMetalForTests) return "ggml_metal's fused selector tail";
             return null;
         }
@@ -128,9 +130,11 @@ namespace TensorSharp.Models
             return step.Op(GraphOp.GetRows, step.TensorWeight(_dflashTokenIds, 1, vocab), indices);
         }
 
-        private Slot DFlashRingSlot()
+        private Slot DFlashRingSlot() => DFlashRingSlotOf(_dflashRingK, _dflashRingV);
+
+        /// <summary>The slot of the ring whose layers are <paramref name="ringK"/> and <paramref name="ringV"/>.</summary>
+        private Slot DFlashRingSlotOf(Tensor[] ringK, Tensor[] ringV)
         {
-            Tensor[] ringK = _dflashRingK, ringV = _dflashRingV;
             _dflashRingSlots ??= new Dictionary<Tensor[], Slot>(ReferenceEqualityComparer.Instance);
             if (_dflashRingSlots.TryGetValue(ringK, out Slot slot)) return slot;
             var k = new Tensor[ringK.Length][];
@@ -234,14 +238,15 @@ namespace TensorSharp.Models
             return new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
         }
 
-        /// <summary>The ring rows of the step's positions, (start + i) % ringRows (I64 [n, 1]), refilled when it advances.</summary>
-        private int DFlashRingRowsInput(GraphStep step, int n)
+        /// <summary>The ring rows of sequence <paramref name="sequence"/>'s positions from its start plus
+        /// <paramref name="offset"/>, (start + offset + i) % ringRows (I64 [n, 1]), refilled when the step advances.</summary>
+        private int DFlashRingRowsInput(GraphStep step, int n, int sequence = 0, int offset = 0)
         {
             int ringRows = DFlashRingRows;
             var rows = new int[n];
             void Fill()
             {
-                for (int i = 0; i < n; i++) rows[i] = (step.Starts[0] + i) % ringRows;
+                for (int i = 0; i < n; i++) rows[i] = (step.Starts[sequence] + offset + i) % ringRows;
             }
             Fill();
             int node = step.InputRows(rows);
@@ -319,13 +324,16 @@ namespace TensorSharp.Models
             /// <summary>Each following sequence's ring's carry: its last row's feature row is written there, so the first
             /// draft after the prompt has its carry without the step returning features (<see cref="TryTakeHeldCarry"/>).</summary>
             public required Tensor[] Carry { get; init; }
+            /// <summary>A batched verify's windows (StandardDecoderModel.VerifyFollow.cs): every row of each following
+            /// sequence's window goes into its ring at its position, the rows' inputs refilled as the step advances.</summary>
+            public bool Windows { get; init; }
 
             /// <summary>What the plan changes in the emitted program.</summary>
             public string Key
             {
                 get
                 {
-                    var key = new System.Text.StringBuilder();
+                    var key = new System.Text.StringBuilder(Windows ? "w" : "");
                     for (int s = 0; s < Keep.Length; s++) key.Append(s > 0 ? "." : "").Append(Keep[s]).Append(ZeroBefore[s] ? "z" : "");
                     return key.ToString();
                 }
@@ -434,6 +442,11 @@ namespace TensorSharp.Models
         /// </summary>
         private void EmitDFlashFollow(GraphStep step, int[] taps, DFlashFollowPlan plan)
         {
+            if (plan.Windows)
+            {
+                EmitDFlashVerifyFollow(step, taps, plan);
+                return;
+            }
             DFlashConfig cfg = DFlashSettings;
             string prefix = DFlashConfig.WeightPrefix;
             int hidden = Config.HiddenSize, hd = cfg.HeadDim, kvHeads = cfg.NumKVHeads, ringRows = DFlashRingRows;
@@ -530,6 +543,7 @@ namespace TensorSharp.Models
                         if (confOut != null && at < confOut.Length) confOut[at] = confValues[i];
                     }
                 }
+                if (outputs.Trace != null) LastDFlashTraceForTests = ReadDFlashTrace(graph, outputs.Trace, gamma);
             }
             catch (Exception e) when (e is NotSupportedException or InvalidOperationException)
             {
@@ -545,6 +559,25 @@ namespace TensorSharp.Models
             _dflashRingHostStale = true;
             GraphBlockDrafts++;
             return gamma;
+        }
+
+        /// <summary>Tests: a lone block's trace outputs (<see cref="StepOutputs.Trace"/>) as each slot's logits, candidates and
+        /// scores.</summary>
+        private DFlashSlotTrace[] ReadDFlashTrace(CachedGraph graph, int[] trace, int gamma)
+        {
+            int vocab = Config.VocabSize;
+            float[] logits = graph.Outputs[trace[0]];
+            var slots = new DFlashSlotTrace[gamma];
+            for (int e = 0; e < gamma; e++)
+            {
+                slots[e] = new DFlashSlotTrace { Logits = logits.AsSpan(e * vocab, vocab).ToArray() };
+                if (trace.Length > 1 + 2 * e + 1)
+                {
+                    slots[e].Candidates = Array.ConvertAll(graph.Outputs[trace[1 + 2 * e]], v => (int)v);
+                    slots[e].Scores = (float[])graph.Outputs[trace[2 + 2 * e]].Clone();
+                }
+            }
+            return slots;
         }
 
         /// <summary>
@@ -602,36 +635,39 @@ namespace TensorSharp.Models
             int cur = step.RmsNorm(x, step.Weight(DFlashConfig.WeightPrefix + "output_norm.weight"), cfg.Eps);
             // Row 0 is the anchor's own prediction, which neither head reads.
             int rows = step.View2(cur, hidden, gamma, hidden * 4L, hidden * 4L);
-            int[] draft = cfg.HasSelector ? EmitDFlashSelector(step, rows, gamma) : EmitDFlashTop1(step, rows, gamma);
-            return new StepOutputs { Logits = -1, Final = -1, Hidden = -1, Draft = draft };
+            var trace = DFlashTraceForTests ? new List<int>() : null;
+            int[] draft = cfg.HasSelector ? EmitDFlashSelector(step, rows, gamma, trace: trace) : EmitDFlashTop1(step, rows, gamma, trace);
+            return new StepOutputs { Logits = -1, Final = -1, Hidden = -1, Draft = draft, Trace = trace?.ToArray() };
         }
 
-        /// <summary>The additive mask [ringRows, b] (F16) of the block's attention over the ring, refilled when the step
+        /// <summary>The additive mask [ringRows, b] (F16) of sequence <paramref name="sequence"/>'s block attending its ring,
+        /// whose slots hold the positions <paramref name="held"/> returns (the bound ring's when null), refilled when the step
         /// advances.</summary>
-        private int DFlashBlockMaskInput(GraphStep step, int b)
+        private int DFlashBlockMaskInput(GraphStep step, int b, int sequence = 0, Func<int[]> held = null)
         {
+            held ??= BuildRingSlotPositions;
             var mask = new ushort[(long)DFlashRingRows * b];
-            FillDFlashBlockMask(mask, step.Starts[0], b);
+            FillDFlashBlockMask(mask, held(), step.Starts[sequence], b);
             int node = step.InputF16(mask, DFlashRingRows, b);
             step.RefillOnAdvance(node, () =>
             {
-                FillDFlashBlockMask(mask, step.Starts[0], b);
+                FillDFlashBlockMask(mask, held(), step.Starts[sequence], b);
                 return true;
             });
             return node;
         }
 
         /// <summary>
-        /// Query p + s sees the ring slot of a position q of the ring's valid run (BuildRingSlotPositions) with q &lt; p and
+        /// Query p + s sees the ring slot of a position q of the ring's valid run (<paramref name="held"/>: BuildRingSlotPositions'
+        /// map) with q &lt; p and
         /// (p + s) - q &lt; sliding_window, as the per-op drafter's window mask does, and every slot of the block itself
         /// (rows (p + i) % ringRows: attention inside the block is non-causal). Built from the ring's bookkeeping alone, so
         /// nothing is read back.
         /// </summary>
-        private void FillDFlashBlockMask(ushort[] mask, int p, int b)
+        private void FillDFlashBlockMask(ushort[] mask, int[] held, int p, int b)
         {
             const ushort open = 0, closed = 0xFC00;   // F16 0 and -inf
             int ringRows = DFlashRingRows, swa = DFlashSettings.SlidingWindow;
-            int[] held = BuildRingSlotPositions();
             for (int s = 0; s < b; s++)
             {
                 Span<ushort> row = mask.AsSpan(s * ringRows, ringRows);
@@ -653,8 +689,11 @@ namespace TensorSharp.Models
         /// per-channel base and with the per-group delta (each broadcast), the shift a concatenation behind zeros. The ops are
         /// a region (<see cref="GraphFusion.DFlashConv"/>): an executor with its kernel computes them in one dispatch, with
         /// their roundings (about ten small kernels a convolution, twenty convolutions a Qwen3.8-27B DFlash2 block).
+        /// <para>With <paramref name="lanes"/> blocks (several requests' blocks, one after another: [hidden, lanes * b]) each is
+        /// convolved on its own, the taps never reaching from one into the next: the same ops over a lane dimension (4-D views,
+        /// so the count of kernels does not grow with the lanes), and the region names the block's rows.</para>
         /// </summary>
-        private int EmitDFlashConv(GraphStep step, int x, int taps, string baseName, int side, int b, int zeros)
+        private int EmitDFlashConv(GraphStep step, int x, int taps, string baseName, int side, int b, int zeros, int lanes = 1)
         {
             DFlashConfig cfg = DFlashSettings;
             int hidden = cfg.HiddenSize, width = cfg.ConvKernelSize, group = cfg.ConvGroupSize, groups = cfg.ConvNumGroups;
@@ -662,31 +701,54 @@ namespace TensorSharp.Models
             const long f = sizeof(float);
             int baseKernel = step.Weight(baseName);   // [hidden, taps, 2]
             bool region = !DFlashConvRegionsDisabledForTests;
-            if (region)
+            if (region && lanes == 1)
                 step.BeginFused(GraphFusion.DFlashConv, stackalloc[] { x, taps, baseKernel }, stackalloc long[] { width, group, groups, side, stride });
+            else if (region)
+                step.BeginFused(GraphFusion.DFlashConv, stackalloc[] { x, taps, baseKernel }, stackalloc long[] { width, group, groups, side, stride, b });
             int result = -1;
             for (int t = 0; t < width && t < b; t++)
             {
                 int n = b - t;
-                int shifted = step.View3(x, group, groups, n, group * f, hidden * f, 0);                                  // x rows 0 .. n
-                int channels = step.View3(baseKernel, group, groups, 1, group * f, hidden * f, ((long)side * width + t) * hidden * f);
-                int delta = step.Cont(step.View3(taps, 1, groups, n, f, stride * f, (t * stride + side * half + (long)t * groups) * f));
-                int term = step.Op(GraphOp.Add, step.Op(GraphOp.Mul, shifted, channels), step.Op(GraphOp.Mul, shifted, delta));
-                term = step.Reshape(term, hidden, n);                                                                   // rows t .. b
-                if (t > 0)
-                    term = step.Op(GraphOp.Concat, stackalloc[] { step.View2(zeros, hidden, t, hidden * f, 0), term }, stackalloc long[] { 1 });
+                long channelsAt = ((long)side * width + t) * hidden * f;
+                int term;
+                if (lanes == 1)
+                {
+                    int shifted = step.View3(x, group, groups, n, group * f, hidden * f, 0);                              // x rows 0 .. n
+                    int channels = step.View3(baseKernel, group, groups, 1, group * f, hidden * f, channelsAt);
+                    int delta = step.Cont(step.View3(taps, 1, groups, n, f, stride * f, (t * stride + side * half + (long)t * groups) * f));
+                    term = step.Op(GraphOp.Add, step.Op(GraphOp.Mul, shifted, channels), step.Op(GraphOp.Mul, shifted, delta));
+                    term = step.Reshape(term, hidden, n);                                                               // rows t .. b
+                    if (t > 0)
+                        term = step.Op(GraphOp.Concat, stackalloc[] { step.View2(zeros, hidden, t, hidden * f, 0), term }, stackalloc long[] { 1 });
+                }
+                else
+                {
+                    // Each lane's rows 0 .. n, and the deltas of its rows t .. b.
+                    int shifted = step.View4(x, group, groups, n, lanes, group * f, hidden * f, b * hidden * f, 0);
+                    int channels = step.View3(baseKernel, group, groups, 1, group * f, hidden * f, channelsAt);
+                    int delta = step.Cont(step.View4(taps, 1, groups, n, lanes, f, stride * f, b * stride * f,
+                        (t * stride + side * half + (long)t * groups) * f));
+                    term = step.Op(GraphOp.Add, step.Op(GraphOp.Mul, shifted, channels), step.Op(GraphOp.Mul, shifted, delta));
+                    term = step.Reshape(term, hidden, n, lanes);                                                        // each lane's rows t .. b
+                    if (t > 0)
+                        term = step.Op(GraphOp.Concat, stackalloc[] { step.View3(zeros, hidden, t, lanes, hidden * f, t * hidden * f, 0), term },
+                            stackalloc long[] { 1 });
+                }
                 result = result < 0 ? term : step.Op(GraphOp.Add, result, term);
             }
+            if (lanes > 1) result = step.Reshape(result, hidden, (long)lanes * b);
             if (region) step.EndFused(stackalloc[] { result });
             return result;
         }
 
         /// <summary>Plain DFlash: each row's top-1 of the target head's softmax and its probability (the head's raw logits:
         /// no logit scale, no softcap). Outputs: the ids as F32 [gamma], the confidences [gamma].</summary>
-        private int[] EmitDFlashTop1(GraphStep step, int rows, int gamma)
+        private int[] EmitDFlashTop1(GraphStep step, int rows, int gamma, List<int> trace = null)
         {
             int vocab = Config.VocabSize;
-            int probs = step.Op(GraphOp.SoftMaxExt, stackalloc[] { step.MatMul(DFlashTargetOutputWeightName, rows) }, default, stackalloc[] { 1f, 0f });
+            int logits = step.MatMul(DFlashTargetOutputWeightName, rows);
+            trace?.Add(step.Output(logits, (long)vocab * gamma));
+            int probs = step.Op(GraphOp.SoftMaxExt, stackalloc[] { logits }, default, stackalloc[] { 1f, 0f });
             int best = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { probs }, stackalloc long[] { 1 }));        // I32 [1, gamma]
             int conf = step.Op(GraphOp.GetRows, step.Reshape(probs, 1, vocab, gamma), best);                                // [1, 1, gamma]
             int ids = EmitDFlashTokenIds(step, step.Reshape(best, gamma));
@@ -700,25 +762,23 @@ namespace TensorSharp.Models
         ///     score[e][c] = unary[e][c] + &lt;A[pred_e] * (P h_e), B[cand[e][c]]&gt;
         /// with pred_0 the anchor and pred_e the candidate position e - 1 chose, picked by its index on the device. Outputs:
         /// each position's id (F32 [1]) in order, then each position's confidence (the softmax of its scores at the choice).
+        /// <para>Several requests' blocks (<paramref name="lanes"/> &gt; 1) walk their lattices together: <paramref name="rows"/>
+        /// are position-major (row e * lanes + j is lane j's position e), so each step's rows of every lane are one block, the
+        /// anchors are <paramref name="anchors"/> (I32 [lanes]), the products and gathers run over the lane dimension, and
+        /// each output holds the lanes' values in order (F32 [lanes]).</para>
         /// </summary>
-        private int[] EmitDFlashSelector(GraphStep step, int rows, int gamma)
+        private int[] EmitDFlashSelector(GraphStep step, int rows, int gamma, int lanes = 1, int anchors = -1, List<int> trace = null)
         {
             DFlashConfig cfg = DFlashSettings;
             int vocab = Config.VocabSize, k = cfg.SelectorTopK, rank = cfg.SelectorRank;
             string prefix = DFlashConfig.WeightPrefix;
             const long f = sizeof(float);
+            if (lanes > 1) return EmitDFlashSelectorLanes(step, rows, gamma, lanes, anchors);
             int logits = step.MatMul(DFlashTargetOutputWeightName, rows);                                                  // [vocab, gamma]
+            trace?.Add(step.Output(logits, (long)vocab * gamma));
             int cand = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { k }));      // I32 [k, gamma]
-            int unary = step.Reshape(step.Op(GraphOp.GetRows, step.Reshape(logits, 1, vocab, gamma), cand), k, gamma);
-            if (cfg.HasUnaryLogitTransform)
-            {
-                unary = step.Op(GraphOp.Scale, stackalloc[] { unary }, default, stackalloc[] { cfg.LogitScale });
-                if (cfg.FinalLogitSoftcap > 0f)
-                {
-                    unary = step.Op(GraphOp.Scale, stackalloc[] { unary }, default, stackalloc[] { 1f / cfg.FinalLogitSoftcap });
-                    unary = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Tanh, unary) }, default, stackalloc[] { cfg.FinalLogitSoftcap });
-                }
-            }
+            int unary = EmitDFlashUnaryTransform(step,
+                step.Reshape(step.Op(GraphOp.GetRows, step.Reshape(logits, 1, vocab, gamma), cand), k, gamma));
             int flat = step.Reshape(cand, (long)k * gamma);
             int candIds = EmitDFlashTokenIds(step, flat);                                                                  // [1, k * gamma]
             int projected = step.MatMul(prefix + "selector_hidden.weight", rows);                                         // [rank, gamma]
@@ -747,6 +807,68 @@ namespace TensorSharp.Models
                 int probs = step.Op(GraphOp.SoftMaxExt, stackalloc[] { score }, default, stackalloc[] { 1f, 0f });
                 outputs[e] = step.Output(step.Op(GraphOp.GetRows, step.View2(candIds, 1, k, f, (long)e * k * f), chosen), 1);
                 outputs[gamma + e] = step.Output(step.Op(GraphOp.GetRows, step.Reshape(probs, 1, k), chosen), 1);
+                if (trace != null)
+                {
+                    trace.Add(step.Output(step.Cont(step.View2(candIds, 1, k, f, (long)e * k * f)), k));
+                    trace.Add(step.Output(score, k));
+                }
+            }
+            return outputs;
+        }
+
+        /// <summary>The selector's unary scores through the target's logit transform (scale, then softcap), where it has one.</summary>
+        private int EmitDFlashUnaryTransform(GraphStep step, int unary)
+        {
+            DFlashConfig cfg = DFlashSettings;
+            if (!cfg.HasUnaryLogitTransform) return unary;
+            unary = step.Op(GraphOp.Scale, stackalloc[] { unary }, default, stackalloc[] { cfg.LogitScale });
+            if (cfg.FinalLogitSoftcap > 0f)
+            {
+                unary = step.Op(GraphOp.Scale, stackalloc[] { unary }, default, stackalloc[] { 1f / cfg.FinalLogitSoftcap });
+                unary = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Tanh, unary) }, default, stackalloc[] { cfg.FinalLogitSoftcap });
+            }
+            return unary;
+        }
+
+        /// <summary>
+        /// <see cref="EmitDFlashSelector"/>'s walk for several requests' blocks at once: the lattice of every lane's position e
+        /// is one contiguous block of the position-major rows, its predecessor rows gathered by each lane's choice at e - 1
+        /// (a gather over the lane dimension), its transitions one product a lane (a batched product), its choice each lane's
+        /// first-max candidate. The same ops a lane as the walk of one block, with the lanes as a dimension.
+        /// </summary>
+        private int[] EmitDFlashSelectorLanes(GraphStep step, int rows, int gamma, int lanes, int anchors)
+        {
+            DFlashConfig cfg = DFlashSettings;
+            int vocab = Config.VocabSize, k = cfg.SelectorTopK, rank = cfg.SelectorRank, n = gamma * lanes;
+            string prefix = DFlashConfig.WeightPrefix;
+            const long f = sizeof(float);
+            int logits = step.MatMul(DFlashTargetOutputWeightName, rows);                                                  // [vocab, n]
+            int cand = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { k }));      // I32 [k, n]
+            int unary = EmitDFlashUnaryTransform(step,
+                step.Reshape(step.Op(GraphOp.GetRows, step.Reshape(logits, 1, vocab, n), cand), k, n));
+            int flat = step.Reshape(cand, (long)k * n);
+            int candIds = EmitDFlashTokenIds(step, flat);                                                                  // [1, k * n]
+            int projected = step.MatMul(prefix + "selector_hidden.weight", rows);                                         // [rank, n]
+            int successors = EmitDFlashCodebookRows(step, prefix + "selector_successor.weight", flat);                     // [rank, k * n]
+            int predecessors = gamma > 1 ? EmitDFlashCodebookRows(step, prefix + "selector_predecessor.weight", flat) : -1;
+            int pred = step.Reshape(EmitDFlashCodebookRows(step, prefix + "selector_predecessor.weight", anchors), rank, 1, lanes);
+
+            long block = (long)lanes * k;   // a position's candidates, every lane's
+            var outputs = new int[2 * gamma];
+            int chosen = -1;
+            for (int e = 0; e < gamma; e++)
+            {
+                if (e > 0)
+                    pred = step.Op(GraphOp.GetRows,
+                        step.View3(predecessors, rank, k, lanes, rank * f, k * rank * f, (e - 1) * block * rank * f), chosen); // [rank, 1, lanes]
+                int m = step.Op(GraphOp.Mul, pred, step.View3(projected, rank, 1, lanes, rank * f, rank * f, (long)e * lanes * rank * f));
+                int transition = step.Op(GraphOp.MulMat,
+                    step.View3(successors, rank, k, lanes, rank * f, k * rank * f, e * block * rank * f), m);              // [k, 1, lanes]
+                int score = step.Reshape(step.Op(GraphOp.Add, step.View3(unary, k, 1, lanes, k * f, k * f, e * block * f), transition), k, lanes);
+                chosen = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { score }, stackalloc long[] { 1 }));          // I32 [1, lanes]
+                int probs = step.Op(GraphOp.SoftMaxExt, stackalloc[] { score }, default, stackalloc[] { 1f, 0f });
+                outputs[e] = step.Output(step.Op(GraphOp.GetRows, step.View3(candIds, 1, k, lanes, f, k * f, e * block * f), chosen), lanes);
+                outputs[gamma + e] = step.Output(step.Op(GraphOp.GetRows, step.Reshape(probs, 1, k, lanes), chosen), lanes);
             }
             return outputs;
         }

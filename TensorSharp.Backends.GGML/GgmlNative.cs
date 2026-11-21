@@ -2419,22 +2419,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_DFlashInjectBatched(
-            int nLanes, int maxRows, int totalRows,
-            float[] featRows, int featureSize,
-            int[] gather, long[] ringRowsIdx, int[] positions,
-            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
-            float eps, float ropeBase, float ropeFreqScale,
-            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
-            IntPtr encNormData,
-            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] kNormArr,
-            IntPtr[] ringKArr, IntPtr[] ringVArr,
-            int ringDtype, float[] scales, int scaleCount);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_DFlashDraftBlock(
             int[] blockIds, int blockLen, int[] positions,
             int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
@@ -2514,97 +2498,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_DFlashDraftBlockBatched(
-            int nLanes, int[] blockIds, int blockLen, int[] positions,
-            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
-            float eps, float ropeBase, float ropeFreqScale, float kqScale,
-            int[] ringSlotPos, int slidingWindow,
-            IntPtr[] attnNormArr,
-            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
-            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] qNormArr, IntPtr[] kNormArr,
-            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
-            IntPtr[] ffnNormArr,
-            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
-            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
-            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
-            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
-            IntPtr outNormData,
-            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
-            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocabSize, int[] idsOut, float[] confOut,
-            // DFlash2 grouped dynamic convolution. convTaps == 0 disables it and
-            // every array below may be null (a first-generation drafter).
-            int convTaps, int convGroupSize, int convNumGroups,
-            IntPtr[] attnConvBaseArr,
-            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
-            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
-            IntPtr[] ffnConvBaseArr,
-            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
-            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
-            // DFlash2 candidate selector. selRank == 0 disables it; when it is on,
-            // idsOut/confOut are left untouched and the lattice comes back instead.
-            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
-            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
-            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
-            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
-            float[] selScoresOut, int[] selCandOut, float[] scales, int scaleCount);
-
-        /// <summary>DFlash PASS C for several sequences in one graph (CUDA). Arrays are
-        /// lane-major: blockIds/positions [nLanes * blockLen], ringSlotPos
-        /// [nLanes * ringRows], ringKArr/ringVArr [nLanes * numLayers]; outputs hold
-        /// each lane's block exactly as <see cref="DFlashDraftBlock"/> returns it, one
-        /// after another. False = declined (or an older native library).</summary>
-        public static bool DFlashDraftBlockBatched(
-            int nLanes, int[] blockIds, int blockLen, int[] positions,
-            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
-            float eps, float ropeBase, float ropeFreqScale, float kqScale,
-            int[] ringSlotPos, int slidingWindow,
-            IntPtr[] attnNormArr,
-            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
-            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] qNormArr, IntPtr[] kNormArr,
-            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
-            IntPtr[] ffnNormArr,
-            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
-            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
-            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
-            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
-            IntPtr outNormData,
-            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
-            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocabSize, int[] idsOut, float[] confOut,
-            
-            
-            int convTaps, int convGroupSize, int convNumGroups,
-            IntPtr[] attnConvBaseArr,
-            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
-            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
-            IntPtr[] ffnConvBaseArr,
-            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
-            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
-            
-            
-            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
-            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
-            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
-            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
-            float[] selScoresOut, int[] selCandOut, float[] scales)
-        {
-            try
-            {
-                return TSGgml_DFlashDraftBlockBatched(nLanes, blockIds, blockLen, positions, numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows, eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow, attnNormArr, qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr, kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr, vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr, qNormArr, kNormArr, oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr, ffnNormArr, gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr, upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr, downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr, ringKArr, ringVArr, ringDtype, outNormData, tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocabSize, idsOut, confOut, convTaps, convGroupSize, convNumGroups, attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr, attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr, ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr, ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr, selRank, selTopK, selLogitScale, selLogitSoftcap, selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes, selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes, selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes, selScoresOut, selCandOut, scales, scales?.Length ?? 0) != 0;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                return false;
-            }
-        }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial void TSGgml_DFlashResetCaches();
 
         /// <summary>DFlash PASS A+B in one graph. False = declined, caller falls back.</summary>
@@ -2638,39 +2531,6 @@ internal enum GgmlIndexReductionOp
                 kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 kNormArr, ringKArr, ringVArr, ringDtype, scales, scales.Length) != 0;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                return false;
-            }
-        }
-
-        /// <summary>DFlash PASS A+B for several rings in one graph (CUDA): lane i's
-        /// <paramref name="maxRows"/> padded rows gather compact feature rows and land in
-        /// rings <paramref name="ringKArr"/>[i * numLayers ..]. False = declined (older
-        /// native library included); the caller injects lane by lane.</summary>
-        public static bool DFlashInjectBatched(
-            int nLanes, int maxRows, int totalRows,
-            float[] featRows, int featureSize,
-            int[] gather, long[] ringRowsIdx, int[] positions,
-            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
-            float eps, float ropeBase, float ropeFreqScale,
-            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
-            IntPtr encNormData,
-            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype, float[] scales = null)
-        {
-            try
-            {
-                return TSGgml_DFlashInjectBatched(nLanes, maxRows, totalRows, featRows, featureSize,
-                    gather, ringRowsIdx, positions,
-                    numLayers, hiddenSize, headDim, numKvHeads, ringRows,
-                    eps, ropeBase, ropeFreqScale,
-                    fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
-                    kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
-                    vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
-                    kNormArr, ringKArr, ringVArr, ringDtype, scales, scales?.Length ?? 0) != 0;
             }
             catch (EntryPointNotFoundException)
             {

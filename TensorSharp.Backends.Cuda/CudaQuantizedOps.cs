@@ -1028,7 +1028,7 @@ namespace TensorSharp.Cuda
         {
             if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
                 || !CudaKernelOps.TryGetContiguousRows(input, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
-                || rows != inputRows || 2L * cols != ne1 || inputCols != ne0 || rows < CudaFp4Kernels.TmaMinRows
+                || rows != inputRows || 2L * cols != ne1 || inputCols != ne0
                 || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows
                 || result.ElementType != DType.Float32 || input.ElementType != DType.Float32)
                 return false;
@@ -1040,7 +1040,10 @@ namespace TensorSharp.Cuda
             if (weight.GgmlType != Nvfp4PlanarType)
                 return false;
             var (codes, scales, rowScale) = Fp4Activations(allocator, rows, k);
-            if (!CudaFp4Kernels.TakesTmaSwiGlu(rows, outDim, k, weight.DevicePtr, codes, scales))
+            // Prompt rows on the TMA GEMM; fewer (a batched verify's) on the cp.async GEMM's paired tiles, with the K splits the
+            // [rows, 2 ff] product takes (RunNvfp4PlanarGemm), so each gate and up value is that product's.
+            bool tma = CudaFp4Kernels.TakesTmaSwiGlu(rows, outDim, k, weight.DevicePtr, codes, scales);
+            if (!tma && (CudaFp4Kernels.TakesTma(rows, outDim, k, weight.DevicePtr, codes, scales) || !CudaFp4Kernels.TakesSwiGlu(rows, outDim)))
                 return false;
             allocator.Context.MakeCurrent();
             IntPtr stream = allocator.Stream.Handle;
@@ -1051,7 +1054,19 @@ namespace TensorSharp.Cuda
                 inputStorage.EnsureDeviceCurrent();
                 fp4.Quantize(inputPtr, codes, scales, rowScale, k, rows, stream);
             }
-            fp4.GemmTmaSwiGlu(weight.DevicePtr, outDim, k, codes, scales, rowScale, rows, 1.0f, resultPtr, stream);
+            if (tma)
+                fp4.GemmTmaSwiGlu(weight.DevicePtr, outDim, k, codes, scales, rowScale, rows, 1.0f, resultPtr, stream);
+            else
+            {
+                int splits = fp4.Splits(outDim, k, rows, rows <= 64 ? 8 : 1);
+                IntPtr partial = IntPtr.Zero, counters = IntPtr.Zero;
+                if (splits > 1)
+                {
+                    partial = EnsureScratch(Fp4PartialScratch, allocator, (long)splits * rows * outDim * sizeof(float));
+                    counters = EnsureZeroedScratch(Fp4CounterScratch, allocator, (long)CudaFp4Kernels.Tiles(outDim, rows) * sizeof(int));
+                }
+                fp4.GemmSwiGlu(weight.DevicePtr, outDim, k, codes, scales, rowScale, rows, 1.0f, resultPtr, partial, counters, splits, stream);
+            }
             resultStorage.MarkDeviceModified();
             return true;
         }

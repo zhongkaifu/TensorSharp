@@ -114,7 +114,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void EnsureDFlashRingHostSynchronized()
         {
-            FlushDeferredDFlashInjects();
+            FlushBoundDFlashRows();
             if (!_dflashRingHostStale || _dflashRingK == null)
                 return;
             for (int l = 0; l < _dflash.NumLayers; l++)
@@ -458,6 +458,7 @@ namespace TensorSharp.Models
             _dflashRingValidFrom = 0;
             _dflashRingHigh = 0;
             _dflashRingCarryEnd = -1;
+            _dflashRingHeldTo = -1;
         }
 
         /// <summary>
@@ -491,6 +492,7 @@ namespace TensorSharp.Models
             _dflashRingFilled = end;
             _dflashRingHigh = Math.Max(_dflashRingHigh, end + DFlashRingLookahead);
             _dflashRingCarryEnd = -1;   // the carry no longer sits at the frontier (a followed step sets it again)
+            _dflashRingHeldTo = -1;     // nor the ring's own carry row (a batched verify's commit sets it again)
         }
 
         /// <summary>Rows a draft writes ahead of the frontier: its block (the ring's slots of positions it does not hold yet).</summary>
@@ -546,9 +548,7 @@ namespace TensorSharp.Models
             int keep = Math.Min(n, _dflashRingRows);
             int skip = n - keep;
 
-            if (_dflashDeferInjects)
-                DeferDFlashInject(hRows, rowOffset + skip, keep, startPos + skip, a);
-            else if (!RunFusedDFlashInject(a, hRows, rowOffset + skip, keep, startPos + skip, a.RingK, a.RingV))
+            if (!RunFusedDFlashInject(a, hRows, rowOffset + skip, keep, startPos + skip, a.RingK, a.RingV))
             {
                 _dflashFusedInjectFailed = true;
                 return false;
@@ -592,132 +592,6 @@ namespace TensorSharp.Models
                 a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
                 a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
                 a.KNorm, ringK, ringV, GgmlTypeF32, a.Scales);
-        }
-
-        // ---- Deferred ring injects (batched speculation) ----
-
-        /// <summary>A ring write waiting for <see cref="FlushDeferredDFlashInjects"/>: rows
-        /// [FirstRow, FirstRow + Count) of the pending feature buffer, at positions from
-        /// StartPos, into the ring whose layer pointers were bound when it was recorded.</summary>
-        private readonly struct PendingDFlashInject
-        {
-            public PendingDFlashInject(int firstRow, int count, int startPos, IntPtr[] ringK, IntPtr[] ringV)
-            {
-                FirstRow = firstRow; Count = count; StartPos = startPos; RingK = ringK; RingV = ringV;
-            }
-            public int FirstRow { get; }
-            public int Count { get; }
-            public int StartPos { get; }
-            public IntPtr[] RingK { get; }
-            public IntPtr[] RingV { get; }
-        }
-
-        private bool _dflashDeferInjects;
-        private readonly List<PendingDFlashInject> _dflashPendingInjects = new();
-        private float[] _dflashPendingRows = Array.Empty<float>();
-        private int _dflashPendingRowCount;
-        private bool _dflashDeferredInjectFailureLogged;
-
-        /// <summary>
-        /// Queue fused ring injects until <see cref="EndDeferredDFlashInjects"/> (or the next
-        /// draft): a batched speculative step injects every lane's accepted rows at commit
-        /// and every lane's carried row before its draft, and one graph for all lanes
-        /// replaces a launch and a stream sync per lane. The ring bookkeeping (frontier,
-        /// valid run) still happens at each call; only the device write waits. CUDA only.
-        /// </summary>
-        private protected void BeginDeferredDFlashInjects()
-        {
-            if (s_dflashBatchedInject && _hasDFlash && _backend == BackendType.GgmlCuda)
-                _dflashDeferInjects = true;
-        }
-
-        // TS_DFLASH_BATCHED_INJECT=0 injects lane by lane, as before.
-        private static readonly bool s_dflashBatchedInject =
-            Environment.GetEnvironmentVariable("TS_DFLASH_BATCHED_INJECT") != "0";
-
-        private protected void EndDeferredDFlashInjects()
-        {
-            _dflashDeferInjects = false;
-            FlushDeferredDFlashInjects();
-        }
-
-        private void DeferDFlashInject(float[] hRows, int rowOffset, int keep, int firstPos, DFlashArrays a)
-        {
-            int feat = _dflash.FeatureSize;
-            long need = (long)(_dflashPendingRowCount + keep) * feat;
-            if (_dflashPendingRows.LongLength < need)
-                Array.Resize(ref _dflashPendingRows, (int)Math.Max(need, 2L * _dflashPendingRows.LongLength));
-            Array.Copy(hRows, (long)rowOffset * feat, _dflashPendingRows, (long)_dflashPendingRowCount * feat, (long)keep * feat);
-            _dflashPendingInjects.Add(new PendingDFlashInject(_dflashPendingRowCount, keep, firstPos,
-                (IntPtr[])a.RingK.Clone(), (IntPtr[])a.RingV.Clone()));
-            _dflashPendingRowCount += keep;
-        }
-
-        /// <summary>Write every queued inject: one graph over all of them on CUDA, else (one
-        /// queued, or the batched graph declined) one inject each. Called before anything
-        /// reads a ring.</summary>
-        private void FlushDeferredDFlashInjects()
-        {
-            int lanes = _dflashPendingInjects.Count;
-            if (lanes == 0)
-                return;
-            try
-            {
-                var a = GetDFlashArrays();
-                var cfg = _dflash;
-                int nl = cfg.NumLayers;
-                if (lanes > 1)
-                {
-                    int maxRows = 0;
-                    foreach (var p in _dflashPendingInjects)
-                        maxRows = Math.Max(maxRows, p.Count);
-                    int padded = lanes * maxRows;
-                    var gather = new int[padded];
-                    var idx = new long[padded];
-                    var pos = new int[padded];
-                    var ringK = new IntPtr[lanes * nl];
-                    var ringV = new IntPtr[lanes * nl];
-                    for (int lane = 0; lane < lanes; lane++)
-                    {
-                        var p = _dflashPendingInjects[lane];
-                        for (int r = 0; r < maxRows; r++)
-                        {
-                            // Padding repeats the lane's last row: same bytes into the same slot.
-                            int i = Math.Min(r, p.Count - 1);
-                            gather[lane * maxRows + r] = p.FirstRow + i;
-                            idx[lane * maxRows + r] = (p.StartPos + i) % _dflashRingRows;
-                            pos[lane * maxRows + r] = p.StartPos + i;
-                        }
-                        Array.Copy(p.RingK, 0, ringK, lane * nl, nl);
-                        Array.Copy(p.RingV, 0, ringV, lane * nl, nl);
-                    }
-                    if (GgmlBasicOps.DFlashInjectBatched(lanes, maxRows, _dflashPendingRowCount,
-                            _dflashPendingRows, cfg.FeatureSize, gather, idx, pos,
-                            nl, cfg.HiddenSize, cfg.HeadDim, cfg.NumKVHeads, _dflashRingRows,
-                            cfg.Eps, cfg.RopeBase, 1f,
-                            a.Fc, a.FcType, a.FcNe0, a.FcNe1, a.FcBytes, a.EncNorm,
-                            a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
-                            a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
-                            a.KNorm, ringK, ringV, GgmlTypeF32, a.Scales))
-                        return;
-                }
-                foreach (var p in _dflashPendingInjects)
-                {
-                    if (RunFusedDFlashInject(a, _dflashPendingRows, p.FirstRow, p.Count, p.StartPos, p.RingK, p.RingV)
-                        || _dflashDeferredInjectFailureLogged)
-                        continue;
-                    // The ring keeps stale rows where these belong: drafts get worse until
-                    // they are overwritten, verification keeps the output exact.
-                    _dflashDeferredInjectFailureLogged = true;
-                    Console.Error.WriteLine("[dflash] deferred ring inject failed; drafting continues on stale rows: "
-                        + GgmlBasicOps.LastNativeError());
-                }
-            }
-            finally
-            {
-                _dflashPendingInjects.Clear();
-                _dflashPendingRowCount = 0;
-            }
         }
 
         /// <summary>
@@ -806,7 +680,9 @@ namespace TensorSharp.Models
             if (cfg.HasSelector)
             {
                 MapDraftVocab(_dflashSelCand, gamma * k);
-                return DFlashWalkLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut, confOut);
+                int walked = DFlashWalkLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut, confOut);
+                if (DFlashTraceForTests) TraceFusedLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut);
+                return walked;
             }
             MapDraftVocab(_dflashDraftIds, b);
 
@@ -824,120 +700,43 @@ namespace TensorSharp.Models
         private float[] _dflashSelScores;
         private int[] _dflashSelCand;
 
-        /// <summary>
-        /// One block draft for each of several requests in a single graph, every
-        /// request on its own ring (see <see cref="TryFusedDFlashDraftBlock"/> for the
-        /// single-request pass this mirrors row for row). <paramref name="hPrev"/>[i]
-        /// is request i's carried feature row and <paramref name="positions"/>[i] its
-        /// anchor position. Fills each lane's full proposal block (b - 1 tokens) and
-        /// returns false, with nothing drafted, when the batched graph is unavailable.
-        /// </summary>
-        private protected bool TryFusedDFlashDraftBatch(IReadOnlyList<string> requestIds, int[] anchors,
-            float[][] hPrev, int[] positions, int[][] draftsOut, float[][] confOut)
+        /// <summary>Tests: what a lone block's head decided at each of its slots (<see cref="DFlashTraceForTests"/>).</summary>
+        internal sealed class DFlashSlotTrace
         {
-            var a = GetDFlashArrays();
-            var cfg = _dflash;
-            // DSpine drafts lane by lane (no batched DSpine graph yet).
-            if (a == null || cfg.MarkovRank > 0 || cfg.HasAttentionSinks || cfg.IsDSpine || _backend != BackendType.GgmlCuda)
-                return false;
-            int lanes = requestIds.Count;
-            int b = Math.Min(cfg.BlockSize, DFlashBatchDraftWidth + 1);
-            int rows = _dflashRingRows;
-            int nl = cfg.NumLayers;
-            var ids = new int[lanes * b];
-            var pos = new int[lanes * b];
-            var slots = new int[lanes * rows];
-            var ringK = new IntPtr[lanes * nl];
-            var ringV = new IntPtr[lanes * nl];
-            for (int lane = 0; lane < lanes; lane++)
-            {
-                if (positions[lane] <= 0)
-                    return false;
-                BindDFlashRing(requestIds[lane]);
-                // The drafter's own key for the last committed position, as in DFlashPropose.
-                DFlashEncodeAndInject(hPrev[lane], 0, 1, positions[lane] - 1);
-                Array.Copy(BuildRingSlotPositions(), 0, slots, (long)lane * rows, rows);
-                for (int i = 0; i < b; i++)
-                {
-                    ids[lane * b + i] = i == 0 ? anchors[lane] : cfg.MaskTokenId;
-                    pos[lane * b + i] = positions[lane] + i;
-                }
-                for (int l = 0; l < nl; l++)
-                {
-                    ringK[lane * nl + l] = TensorComputePrimitives.GetStoragePointer(_dflashRingK[l]);
-                    ringV[lane * nl + l] = TensorComputePrimitives.GetStoragePointer(_dflashRingV[l]);
-                }
-            }
-
-            // The lanes' carried rows were queued above; write them in one graph.
-            FlushDeferredDFlashInjects();
-
-            int gamma = b - 1;
-            int k = cfg.SelectorTopK;
-            long laneScores = cfg.HasSelector ? (long)k + (long)k * k * Math.Max(0, gamma - 1) : 0;
-            float[] scores = cfg.HasSelector ? new float[lanes * laneScores] : null;
-            int[] cand = cfg.HasSelector ? new int[lanes * gamma * k] : null;
-            var idsOut = new int[lanes * b];
-            var conf = new float[lanes * b];
-            bool ok = GgmlBasicOps.DFlashDraftBlockBatched(
-                lanes, ids, b, pos,
-                cfg.NumLayers, cfg.HiddenSize, cfg.HeadDim, cfg.NumHeads, cfg.NumKVHeads, rows,
-                cfg.Eps, cfg.RopeBase, 1f, 1f / MathF.Sqrt(cfg.HeadDim),
-                slots, cfg.SlidingWindow,
-                a.AttnNorm,
-                a.Q, a.QType, a.QNe0, a.QNe1, a.QBytes,
-                a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
-                a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
-                a.QNorm, a.KNorm,
-                a.O, a.OType, a.ONe0, a.ONe1, a.OBytes,
-                a.FfnNorm,
-                a.Gate, a.GateType, a.GateNe0, a.GateNe1, a.GateBytes,
-                a.Up, a.UpType, a.UpNe0, a.UpNe1, a.UpBytes,
-                a.Down, a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
-                ringK, ringV, GgmlTypeF32,
-                a.OutNorm,
-                a.TokEmbd, a.TokEmbdType, a.TokEmbdNe0, a.TokEmbdNe1, a.TokEmbdBytes,
-                a.LmHead, a.LmHeadType, a.LmHeadNe0, a.LmHeadNe1, a.LmHeadBytes,
-                DFlashDraftVocabSize, idsOut, conf,
-                cfg.HasConv ? cfg.ConvKernelSize : 0, cfg.ConvGroupSize, cfg.ConvNumGroups,
-                a.AttnConvBase, a.AttnConvProj, a.AttnConvProjType, a.AttnConvProjNe0, a.AttnConvProjNe1, a.AttnConvProjBytes,
-                a.FfnConvBase, a.FfnConvProj, a.FfnConvProjType, a.FfnConvProjNe0, a.FfnConvProjNe1, a.FfnConvProjBytes,
-                cfg.HasSelector ? cfg.SelectorRank : 0, cfg.HasSelector ? cfg.SelectorTopK : 0,
-                cfg.LogitScale, cfg.FinalLogitSoftcap,
-                a.SelHidden, a.SelHiddenType, a.SelHiddenNe0, a.SelHiddenNe1, a.SelHiddenBytes,
-                a.SelPred, a.SelPredType, a.SelPredNe0, a.SelPredNe1, a.SelPredBytes,
-                a.SelSucc, a.SelSuccType, a.SelSuccNe0, a.SelSuccNe1, a.SelSuccBytes,
-                scores, cand, a.Scales);
-            if (!ok)
-                return false;
-            if (cfg.HasSelector) MapDraftVocab(cand, lanes * gamma * k);
-            else MapDraftVocab(idsOut, lanes * b);
-
-            for (int lane = 0; lane < lanes; lane++)
-            {
-                if (cfg.HasSelector)
-                {
-                    var laneScoreSlice = new float[laneScores];
-                    var laneCand = new int[gamma * k];
-                    Array.Copy(scores, lane * laneScores, laneScoreSlice, 0, laneScores);
-                    Array.Copy(cand, lane * gamma * k, laneCand, 0, gamma * k);
-                    DFlashWalkLattice(gamma, k, laneScoreSlice, laneCand, draftsOut[lane], confOut[lane]);
-                }
-                else
-                {
-                    for (int i = 0; i < gamma; i++)
-                    {
-                        draftsOut[lane][i] = idsOut[lane * b + i + 1];
-                        confOut[lane][i] = conf[lane * b + i + 1];
-                    }
-                }
-            }
-            return true;
+            /// <summary>The head's logits of the slot's row (the graph drafter's; null from the fused drafter, which keeps them
+            /// on the device).</summary>
+            public float[] Logits;
+            /// <summary>The selector's candidates of the slot and their scores, in candidate order (null for plain DFlash).</summary>
+            public int[] Candidates;
+            public float[] Scores;
         }
 
-        /// <summary>Drafts a batched block proposes per lane: the trained block minus
-        /// its anchor row, as the single-request draft always runs.</summary>
-        private protected int DFlashBatchDraftWidth => _dflash.MaxDraftTokens;
+        /// <summary>Tests: a lone block records what its head decided at each slot (<see cref="LastDFlashTraceForTests"/>): the
+        /// graph drafter as extra outputs of its program, the fused drafter from the lattice it returns.</summary>
+        internal bool DFlashTraceForTests { get; set; }
+
+        /// <summary>Tests: the last lone block's slots (<see cref="DFlashTraceForTests"/>), or null.</summary>
+        internal DFlashSlotTrace[] LastDFlashTraceForTests { get; private protected set; }
+
+        /// <summary>The fused selector's lattice as each slot's scored row: slot 0's row against the anchor, slot e's the row
+        /// slot e - 1's choice selects (<see cref="DFlashWalkLattice"/>).</summary>
+        private void TraceFusedLattice(int gamma, int k, float[] scores, int[] cand, int[] draftOut)
+        {
+            var slots = new DFlashSlotTrace[gamma];
+            int chosen = 0;
+            for (int e = 0; e < gamma; e++)
+            {
+                long at = e == 0 ? 0 : (long)k + ((long)(e - 1) * k + chosen) * k;
+                var row = new float[k];
+                Array.Copy(scores, at, row, 0, k);
+                var ids = new int[k];
+                Array.Copy(cand, (long)e * k, ids, 0, k);
+                slots[e] = new DFlashSlotTrace { Candidates = ids, Scores = row };
+                chosen = Array.IndexOf(ids, draftOut[e]);
+                if (chosen < 0) chosen = 0;
+            }
+            LastDFlashTraceForTests = slots;
+        }
 
         /// <summary>
         /// The greedy walk through the transition lattice the kernel produced.

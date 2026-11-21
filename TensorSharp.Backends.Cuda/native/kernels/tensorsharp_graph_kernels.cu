@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 37
+#define TS_GRAPH_KERNELS_VERSION 38
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -3254,7 +3254,7 @@ template <int HD>
 __device__ __forceinline__ void ts_graph_ring_attn(
     const float* __restrict__ q, long long qRow, long long qHead, const float* __restrict__ k, const float* __restrict__ v, int len,
     const void* __restrict__ mask, int maskHalf, long long maskRow, int nq, int heads, int kvHeads, float scale, int chunk, int splits,
-    float* __restrict__ partial)
+    float* __restrict__ partial, const int split, const int kvh, const int tile)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int ROW = HD + 8;          // F16 row stride of the K / V tiles: ldmatrix's eight rows hit distinct banks
@@ -3263,13 +3263,12 @@ __device__ __forceinline__ void ts_graph_ring_attn(
     __shared__ __align__(16) __half ks[TS_RING_KT * ROW];
     __shared__ __align__(16) __half vs[TS_RING_KT * ROW];
     __shared__ float ms[64][TS_RING_KT + 1];   // the mask for the tile's block rows and keys, in log2 units
-    const int split = blockIdx.x, kvh = blockIdx.y;
     const int G = heads / kvHeads, R = nq * G;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
     const int kLo = split * chunk, kHi = min(len, kLo + chunk);
     const float* kh = k + (long long)kvh * len * HD;
     const float* vh = v + (long long)kvh * len * HD;
-    const int tile0 = blockIdx.z * 64, p0 = tile0 / G;
+    const int tile0 = tile * 64, p0 = tile0 / G;
     const int pn = min(R - 1, tile0 + 63) / G - p0 + 1;   // block rows the tile's rows span (at most 64)
 
     const int r0 = tile0 + warp * 16 + g, r1 = r0 + 8;
@@ -3440,7 +3439,7 @@ __device__ __forceinline__ void ts_graph_ring_attn(
         int chunk, int splits, float* __restrict__ partial)                                                                        \
     {                                                                                                                              \
         ts_graph_ring_attn<HD>(q, qRow, qHead, k, v, len, mask, maskHalf, maskRow, nq, heads, kvHeads, scale, chunk, splits,       \
-            partial);                                                                                                              \
+            partial, blockIdx.x, blockIdx.y, blockIdx.z);                                                                          \
     }
 
 TS_GRAPH_RING_ATTN(64)
@@ -3511,3 +3510,860 @@ extern "C" __global__ void ts_graph_q8_0_to_f32(const uint8_t* __restrict__ src,
         o[c] = __half2float(__hmul(__int2half_rn(code), d));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Q6_K x q8_1 on the int8 tensor cores: the direct engines' drafter product for Q6_K weights (ts_q35_gemm_q6k), beside
+// ts_graph_gemm_q4k for a drafter's Q4_K ones. Q6_K superblock (256 values, 210 bytes): ql[128] | qh[64] | scales
+// int8[16] | half d; value 128h + 32m + l (h < 2, m < 4, l < 32) is (ql nibble | 2 qh bits) - 32 with scale index
+// 8h + 2m + l / 16. One mma.m16n8k16.s8 per 16-value sub-block, its exact integer sum scaled by the sub-block's weight
+// scale (d * sc) and the activation's 32-value scale and accumulated in F32. Block: 4 warps x 16 weight rows against
+// NT * 8 activation rows; per superblock the activations and each warp's decoded weight rows (int8, value - 32) are
+// staged in shared memory. Grid (row tiles, K splits): with more than one split every block adds its share atomically
+// (the caller zeroes y first). A row's value never depends on how many rows the call holds, but the splits' additions
+// land in any order: for products whose last bits may vary (a drafter's).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void ts_graph_mma_s8_k16(int (&c)[4], int a0, int a1, int b0)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
+#else
+    __trap();
+#endif
+}
+
+template <int NT>
+__device__ __forceinline__ void ts_graph_gemm_q6k(
+    const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y)
+{
+    constexpr int NA = NT * 8;
+    __shared__ __align__(16) int8_t xs[NA][TS_GRAPH_Q4K_ROW];
+    __shared__ float xds[NA][8];
+    __shared__ __align__(16) int8_t ws[4][16][TS_GRAPH_Q4K_ROW];
+    __shared__ float wsc[4][16][16];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int row0 = blockIdx.x * 64 + warp * 16;
+    const int nsb = k / 256, per = (nsb + gridDim.y - 1) / gridDim.y;
+    const int sb0 = blockIdx.y * per, sb1 = min(nsb, sb0 + per);
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            acc[j][e] = 0.0f;
+    for (int sb = sb0; sb < sb1; ++sb)
+    {
+        __syncthreads();
+        for (int i = tid; i < NA * 16; i += blockDim.x)
+        {
+            const int r = i >> 4, c = (i & 15) * 16;
+            *(int4*)&xs[r][c] = r < n ? *(const int4*)(xq + (long long)r * k + sb * 256 + c) : make_int4(0, 0, 0, 0);
+        }
+        for (int i = tid; i < NA * 8; i += blockDim.x)
+        {
+            const int r = i >> 3;
+            xds[r][i & 7] = r < n ? xd[(long long)r * (k >> 5) + sb * 8 + (i & 7)] : 0.0f;
+        }
+        // This warp's 16 weight rows: lane takes (row, half, 4-value group) items, 16 values each.
+        for (int item = lane; item < 16 * 2 * 8; item += 32)
+        {
+            const int r = item >> 4, h = (item >> 3) & 1, l0 = (item & 7) * 4;
+            const int gr = row0 + r;
+            uint32_t q[4] = { 0, 0, 0, 0 };
+            if (gr < outDim)
+            {
+                const uint8_t* blk = w + (long long)gr * rowBytes + (long long)sb * 210;
+                const uint8_t* ql = blk + 64 * h;
+                const uint8_t* qh = blk + 128 + 32 * h;
+                // Q6_K rows are 210 bytes apart: two-byte loads only.
+                const uint32_t a = *(const uint16_t*)(ql + l0) | ((uint32_t)*(const uint16_t*)(ql + l0 + 2) << 16);
+                const uint32_t b = *(const uint16_t*)(ql + 32 + l0) | ((uint32_t)*(const uint16_t*)(ql + 32 + l0 + 2) << 16);
+                const uint32_t c = *(const uint16_t*)(qh + l0) | ((uint32_t)*(const uint16_t*)(qh + l0 + 2) << 16);
+                q[0] = __vsubss4((a & 0x0F0F0F0Fu) | ((c & 0x03030303u) << 4), 0x20202020);
+                q[1] = __vsubss4((b & 0x0F0F0F0Fu) | (((c >> 2) & 0x03030303u) << 4), 0x20202020);
+                q[2] = __vsubss4(((a >> 4) & 0x0F0F0F0Fu) | (((c >> 4) & 0x03030303u) << 4), 0x20202020);
+                q[3] = __vsubss4(((b >> 4) & 0x0F0F0F0Fu) | (((c >> 6) & 0x03030303u) << 4), 0x20202020);
+                if (l0 == 0)
+                {
+                    const float d = __half2float(*(const half*)(blk + 208));
+                    const int8_t* sc = (const int8_t*)(blk + 192) + 8 * h;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        wsc[warp][r][8 * h + j] = d * (float)sc[j];
+                }
+            }
+            else if (l0 == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    wsc[warp][r][8 * h + j] = 0.0f;
+            }
+#pragma unroll
+            for (int m = 0; m < 4; ++m)
+                *(uint32_t*)&ws[warp][r][128 * h + 32 * m + l0] = q[m];
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int j = 0; j < 16; ++j)   // 16-value sub-blocks
+        {
+            const int a0 = *(const int*)&ws[warp][g][16 * j + 4 * t];
+            const int a1 = *(const int*)&ws[warp][g + 8][16 * j + 4 * t];
+            const float s0 = wsc[warp][g][j], s1 = wsc[warp][g + 8][j];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+            {
+                int c[4];
+                ts_graph_mma_s8_k16(c, a0, a1, *(const int*)&xs[8 * nt + g][16 * j + 4 * t]);
+                const float x0 = xds[8 * nt + 2 * t][j >> 1], x1 = xds[8 * nt + 2 * t + 1][j >> 1];
+                acc[nt][0] += (float)c[0] * s0 * x0;
+                acc[nt][1] += (float)c[1] * s0 * x1;
+                acc[nt][2] += (float)c[2] * s1 * x0;
+                acc[nt][3] += (float)c[3] * s1 * x1;
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const int r = row0 + g + 8 * (e >> 1), col = 8 * nt + 2 * t + (e & 1);
+            if (r < outDim && col < n)
+            {
+                float* dst = y + (long long)col * outDim + r;
+                if (gridDim.y > 1)
+                    atomicAdd(dst, acc[nt][e]);
+                else
+                    *dst = acc[nt][e];
+            }
+        }
+}
+
+// y [n][outDim] = xq [n] W^T for n <= NT * 8 rows of a Q6_K weight (rows rowBytes apart; k a multiple of 256). Launch:
+// grid (ceil(outDim / 64), K splits), block 128; with more than one split y starts zeroed.
+#define TS_GRAPH_GEMM_Q6K(NT) \
+    extern "C" __global__ void __launch_bounds__(128) ts_graph_gemm_q6k_##NT( \
+        const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k, \
+        const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y) \
+    { ts_graph_gemm_q6k<NT>(w, rowBytes, outDim, k, xq, xd, n, y); }
+TS_GRAPH_GEMM_Q6K(1)
+TS_GRAPH_GEMM_Q6K(2)
+TS_GRAPH_GEMM_Q6K(4)
+TS_GRAPH_GEMM_Q6K(8)
+
+// ggml_set_rows by device int32 indices into rows of several heads (a block drafter's KV ring, [heads][dstRows][rowLen]): head
+// h's dst row ids[i] (dstHead elements past head h - 1's; rows dstPitch elements apart) takes contiguous F32 src row i of head h
+// (srcHead floats apart): ts_graph_set_rows_f32's writes, every head's in one launch. Launch: grid (count, heads), block 256.
+extern "C" __global__ void ts_graph_set_rows_heads_f32(const float* __restrict__ src, long long srcHead, const int* __restrict__ ids,
+    void* __restrict__ dst, long long dstHead, int rowLen, long long dstPitch, int dstRows, int half)
+{
+    const size_t i = blockIdx.x, h = blockIdx.y;
+    const int row = ids[i];
+    if (row < 0 || row >= dstRows) return;
+    const size_t to = h * (size_t)dstHead + (size_t)row * (size_t)dstPitch;
+    const float* s = src + h * (size_t)srcHead + i * (size_t)rowLen;
+    for (int c = threadIdx.x; c < rowLen; c += blockDim.x)
+    {
+        const float v = s[c];
+        if (half) ((__half*)dst)[to + c] = __float2half_rn(v);
+        else ((float*)dst)[to + c] = v;
+    }
+}
+
+// Several sequences' verify-window scans in one launch (GraphFusion.DeltaNetScans): sequence z's window is
+// ts_graph_gated_delta_net_scan4_f32 over its own buffers (each one sequence of n_t tokens), the sequences' pointers by
+// value. Every value of a sequence is the one-sequence kernel's: the same body over the same operands. (Eight state rows a
+// warp, reading a token's q and k once for eight rows, took 68.9 us a layer for four Qwen3.8-27B sequences' windows against
+// 51.9 for four on an RTX PRO 4500.) Launch: grid (h, ceil(S / 16), sequences), block 128.
+#define TS_GRAPH_GDN_SEQS 16
+
+struct ts_graph_gdn_seqs
+{
+    const float* q[TS_GRAPH_GDN_SEQS];
+    const float* k[TS_GRAPH_GDN_SEQS];
+    const float* v[TS_GRAPH_GDN_SEQS];
+    const float* g[TS_GRAPH_GDN_SEQS];
+    const float* beta[TS_GRAPH_GDN_SEQS];
+    const float* state[TS_GRAPH_GDN_SEQS];
+    float* out[TS_GRAPH_GDN_SEQS];
+    float* in_save[TS_GRAPH_GDN_SEQS];
+};
+
+template <bool KDA>
+__device__ __forceinline__ void ts_graph_gdn_scan4_seq(const ts_graph_gdn_seqs& a, int S, int h, int hk, int n_t, int save_rows)
+{
+    const int z = blockIdx.z;
+    ts_graph_gdn_rows4_scan<KDA>(a.q[z], a.k[z], a.v[z], a.g[z], a.beta[z], a.state[z], a.out[z], S, h, hk, n_t, 1, a.in_save[z],
+        save_rows, 0, blockIdx.x, (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4, threadIdx.x & 31);
+}
+
+extern "C" __global__ void ts_graph_gated_delta_net_scan4_seqs_f32(const ts_graph_gdn_seqs a, int S, int h, int hk, int n_t, int save_rows)
+{
+    ts_graph_gdn_scan4_seq<false>(a, S, h, hk, n_t, save_rows);
+}
+
+extern "C" __global__ void ts_graph_gated_delta_net_scan4_seqs_kda_f32(const ts_graph_gdn_seqs a, int S, int h, int hk, int n_t, int save_rows)
+{
+    ts_graph_gdn_scan4_seq<true>(a, S, h, hk, n_t, save_rows);
+}
+
+// Several block drafter lanes' ring attentions in one launch (GraphFusion.RingAttentionLanes: several requests' blocks drafted
+// in one program, each lane's rows over its own ring under its own mask): lane z / tiles is ts_graph_ring_attn_f16_d<hd> over
+// its pointers (by value), its partials at partial + lane * nq * heads * splits * (HD + 2), so ts_graph_ring_attn_combine_f32
+// over lanes * nq * heads rows merges every lane's at once. Every lane's values are its own launch's. Launch: grid (splits,
+// kvHeads, lanes * tiles), block 128 (tiles = ceil(nq * heads / kvHeads / 64)).
+#define TS_GRAPH_RING_LANES 16
+
+struct ts_graph_ring_lanes
+{
+    const float* q[TS_GRAPH_RING_LANES];
+    const float* k[TS_GRAPH_RING_LANES];
+    const float* v[TS_GRAPH_RING_LANES];
+    const void* mask[TS_GRAPH_RING_LANES];
+};
+
+#define TS_GRAPH_RING_ATTN_LANES(HD)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(128) ts_graph_ring_attn_lanes_f16_d##HD(                                          \
+        const ts_graph_ring_lanes a, long long qRow, long long qHead, int len, int maskHalf, long long maskRow, int nq, int heads,  \
+        int kvHeads, float scale, int chunk, int splits, int tiles, float* __restrict__ partial)                                   \
+    {                                                                                                                              \
+        const int lane = blockIdx.z / tiles;                                                                                       \
+        ts_graph_ring_attn<HD>(a.q[lane], qRow, qHead, a.k[lane], a.v[lane], len, a.mask[lane], maskHalf, maskRow, nq, heads,      \
+            kvHeads, scale, chunk, splits, partial + (long long)lane * nq * heads * splits * (HD + 2), blockIdx.x, blockIdx.y,      \
+            blockIdx.z % tiles);                                                                                                   \
+    }
+
+TS_GRAPH_RING_ATTN_LANES(64)
+TS_GRAPH_RING_ATTN_LANES(128)
+
+// GraphFusion.DeltaNetPreps: ts_graph_deltanet_prep_f32 over several sequences' verify windows in one launch, each sequence's
+// values that kernel's to the bit (its expressions, copied). Sequence z reads its own conv window, qkv, alpha and beta rows
+// (pointers in the table; qkv rows qkv_pitch floats apart, alpha and beta ab_pitch apart) and writes its conv input
+// [channels, conv_rows + rows] (its conv history) where its table entry says; its q, k, v, g and beta rows go to rows
+// z * rows .. of the shared outputs (the sequences' rows one after another). Launch: grid (2 * k_heads + v_heads, rows,
+// sequences), block d (d % 32 == 0, <= 1024).
+#define TS_GRAPH_PREP_SEQS 16
+struct ts_graph_prep_seqs
+{
+    const float* window[TS_GRAPH_PREP_SEQS];
+    const float* qkv[TS_GRAPH_PREP_SEQS];
+    const float* alpha[TS_GRAPH_PREP_SEQS];
+    const float* beta[TS_GRAPH_PREP_SEQS];
+    float* conv_in[TS_GRAPH_PREP_SEQS];
+};
+
+extern "C" __global__ void ts_graph_deltanet_prep_seqs_f32(const ts_graph_prep_seqs seqs,
+    const float* __restrict__ conv_w, const float* __restrict__ dt, const float* __restrict__ a,
+    float* __restrict__ q_all, float* __restrict__ k_all, float* __restrict__ v_all, float* __restrict__ g_all,
+    float* __restrict__ beta_all, int channels, int conv_rows, int width, int d, int k_heads, int v_heads, int rows, float eps,
+    long long qkv_pitch, long long ab_pitch)
+{
+    __shared__ float partial[32];
+    const int z = blockIdx.z;
+    const float* __restrict__ window = seqs.window[z];
+    const float* __restrict__ qkv = seqs.qkv[z];
+    const float* __restrict__ alpha = seqs.alpha[z];
+    const float* __restrict__ beta = seqs.beta[z];
+    float* __restrict__ conv_in = seqs.conv_in[z];
+    float* __restrict__ q_out = q_all + (size_t)z * rows * k_heads * d;
+    float* __restrict__ k_out = k_all + (size_t)z * rows * k_heads * d;
+    float* __restrict__ v_out = v_all + (size_t)z * rows * v_heads * d;
+    float* __restrict__ g_out = g_all + (size_t)z * rows * v_heads;
+    float* __restrict__ beta_out = beta_all + (size_t)z * rows * v_heads;
+    const int i = threadIdx.x;
+    const int head = blockIdx.x;
+    const int t = blockIdx.y;
+    const int span = conv_rows + rows;
+    const size_t c = (size_t)head * d + i;
+    float x = 0.0f;
+    for (int j = 0; j < width; j++)
+    {
+        const int p = t + j;
+        const float in = p < conv_rows ? window[c * conv_rows + p] : qkv[(size_t)(p - conv_rows) * qkv_pitch + c];
+        x += in * conv_w[c * width + j];
+    }
+    conv_in[c * span + conv_rows + t] = qkv[(size_t)t * qkv_pitch + c];
+    if (t == 0)
+        for (int p = 0; p < conv_rows; p++) conv_in[c * span + p] = window[c * conv_rows + p];
+    const float y = x / (1.0f + expf(-x));
+    if (head < 2 * k_heads)
+    {
+        const float sq = ts_graph_warp_sum(y * y);
+        if ((i & 31) == 0) partial[i >> 5] = sq;
+        __syncthreads();
+        float total = 0.0f;
+        for (int s = 0; s < d / 32; s++) total += partial[s];
+        const float yn = y * rsqrtf(total + eps);
+        if (head < k_heads) q_out[((size_t)t * k_heads + head) * d + i] = yn;
+        else k_out[((size_t)t * k_heads + head - k_heads) * d + i] = yn;
+    }
+    else
+    {
+        const int vh = head - 2 * k_heads;
+        v_out[((size_t)t * v_heads + vh) * d + i] = y;
+        if (i == 0)
+        {
+            const size_t gi = (size_t)t * v_heads + vh, ai = (size_t)t * ab_pitch + vh;
+            const float s = alpha[ai] + dt[vh];
+            g_out[gi] = (s > 20.0f ? s : logf(1.0f + expf(s))) * a[vh];
+            beta_out[gi] = 1.0f / (1.0f + expf(-beta[ai]));
+        }
+    }
+}
+
+// GraphFusion.GatedRmsNorms: ts_graph_gated_rms_norm_f32 over several sequences' rows in one launch, each row that kernel's to
+// the bit (its expressions, copied), without the q8_1 copy. Sequence z's rows_per_seq rows of y and its z (a token's heads * d
+// values z_pitch floats apart) at its table's pointers; its outputs at rows z * rows_per_seq .. of out (the sequences'
+// outputs one after another: their concatenation). Launch: grid (rows_per_seq, sequences), block d (d % 32 == 0, <= 1024).
+struct ts_graph_gated_norm_seqs
+{
+    const float* y[TS_GRAPH_PREP_SEQS];
+    const float* z[TS_GRAPH_PREP_SEQS];
+};
+
+extern "C" __global__ void ts_graph_gated_rms_norm_seqs_f32(const ts_graph_gated_norm_seqs seqs, const float* __restrict__ w,
+    float* __restrict__ out_all, int d, float eps, int heads, long long z_pitch, int sigmoid_gate, int rows_per_seq)
+{
+    __shared__ float partial[32];
+    const float* __restrict__ y = seqs.y[blockIdx.y];
+    const float* __restrict__ z = seqs.z[blockIdx.y];
+    float* __restrict__ out = out_all + (size_t)blockIdx.y * rows_per_seq * d;
+    const int i = threadIdx.x;
+    const size_t r = blockIdx.x;
+    const float v = y[r * d + i];
+    const float sq = ts_graph_warp_sum(v * v);
+    if ((i & 31) == 0) partial[i >> 5] = sq;
+    __syncthreads();
+    float total = 0.0f;
+    for (int s = 0; s < d / 32; s++) total += partial[s];
+    const float zz = z[(r / heads) * z_pitch + (r % heads) * d + i];
+    const float gate = sigmoid_gate ? 1.0f / (1.0f + expf(-zz)) : zz / (1.0f + expf(-zz));
+    const float o = v * rsqrtf(total / d + eps) * w[i] * gate;
+    out[r * d + i] = o;
+}
+
+// Several sequences' verify-window K and V rows into their F16 caches in one launch (GraphFusion.SequenceAttentions' writes):
+// entry z (a sequence's K or V) takes rows [heads, count, d] read where they lie (row t of head h at src + h * head_stride +
+// t * row_stride, values unit-stride: the projection's view, which ts_copy_head_first_to_cache_f16 needed packed first) into
+// cache [heads, cells, d] at row (dyn ? dyn[1] : first) + t, taken modulo cells with circular; each value converted as that
+// kernel converts it (__float2half_rn), so every cache row is its bits. Launch: grid (ceil(heads * count * d / 256),
+// entries), block 256.
+#define TS_GRAPH_CACHE_ROWS_SEQS 32
+struct ts_graph_cache_rows_seqs
+{
+    const float* src[TS_GRAPH_CACHE_ROWS_SEQS];
+    __half* cache[TS_GRAPH_CACHE_ROWS_SEQS];
+    const int* dyn[TS_GRAPH_CACHE_ROWS_SEQS];
+    long long head_stride[TS_GRAPH_CACHE_ROWS_SEQS];
+    long long row_stride[TS_GRAPH_CACHE_ROWS_SEQS];
+    int first[TS_GRAPH_CACHE_ROWS_SEQS];
+    int cells[TS_GRAPH_CACHE_ROWS_SEQS];
+};
+
+extern "C" __global__ void ts_graph_cache_rows_seqs_f16(const ts_graph_cache_rows_seqs seqs, int heads, int count, int head_dim, int circular)
+{
+    const int z = blockIdx.y;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= heads * count * head_dim)
+        return;
+    const int* dyn = seqs.dyn[z];
+    const int start = dyn ? dyn[1] : seqs.first[z];
+    const int d = idx % head_dim;
+    const int tmp = idx / head_dim;
+    const int t = tmp % count;
+    const int head = tmp / count;
+    const int cells = seqs.cells[z];
+    const int pos = circular ? ((start + t) % cells) : (start + t);
+    const float v = seqs.src[z][(size_t)head * seqs.head_stride[z] + (size_t)t * seqs.row_stride[z] + d];
+    seqs.cache[z][((size_t)head * cells + pos) * head_dim + d] = __float2half_rn(v);
+}
+
+// ---------------------------------------------------------------------------
+// The gated delta rule with eight lanes a value row (038fb303's direct engine's layout, ts_q35_gdn_scan): a warp keeps four
+// value rows of a head's state, each row's S keys spread over eight lanes (lane i of a row group keeping keys i, i + 8, ...),
+// so a row's two dot products a token (S^T k and S^T q) are a lane's sum over its S / 8 keys and three butterfly steps among
+// its eight lanes. The 32-lane bodies (ts_graph_gated_delta_net_f32, ts_graph_gdn_rows4, ts_graph_gdn_rows4_scan) summed
+// four keys a lane and five steps a row, for four rows a warp one row after another. The operations on each state element
+// are theirs, in their order (decay, the delta from the decayed state, the update, the output); only the sums' grouping
+// differs. Operands and outputs as ts_graph_gated_delta_net_f32's, for S = 64 or 128 (PER = S / 8 keys a lane, a template
+// argument: the state, keys and queries stay in registers). The body takes the warp's sequence, head and first value row;
+// lane / 8 is the warp's row, lane % 8 the row's lane.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float ts_graph_gdn8_sum(float v)
+{
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    return v;
+}
+
+// The general form (decode rows, a commit's re-step, windows with snapshots or a saved state).
+template <int PER>
+__device__ __forceinline__ void ts_graph_gdn8(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
+    float* __restrict__ in_save, int save_rows, int seq, int head, int r0, int lane)
+{
+    constexpr int S = PER * 8;
+    const int kh = head % hk;
+    if (seq >= n_s || r0 >= S)
+        return;
+    const int row = r0 + (lane >> 3), li = lane & 7;
+    float st[PER];
+    const float* s_in = state + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+        st[j] = s_in[li + 8 * j];
+    if (saved != nullptr)
+    {
+        float* s_sv = saved + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+            s_sv[li + 8 * j] = st[j];
+    }
+
+    const float scale = rsqrtf((float)S);
+    const size_t attn = (size_t)n_s * n_t * h * S;
+    const size_t per_snap = (size_t)n_s * h * S * S;
+    for (int t = 0; t < n_t; t++)
+    {
+        const size_t qk_off = ((size_t)(seq * n_t + t) * hk + kh) * S;
+        const size_t v_off = ((size_t)(seq * n_t + t) * h + head) * S;
+        const size_t gb = (size_t)(seq * n_t + t) * h + head;
+        const float eg = kda ? 0.0f : expf(g[gb]);
+        float kk[PER];
+        float kv = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            const int i = li + 8 * j;
+            kk[j] = k[qk_off + i];
+            st[j] *= kda ? expf(g[gb * S + i]) : eg;
+            kv += st[j] * kk[j];
+        }
+        kv = ts_graph_gdn8_sum(kv);
+        const float delta = (v[v_off + row] - kv) * beta[gb];
+        float y = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            st[j] += kk[j] * delta;
+            y += st[j] * q[qk_off + li + 8 * j];
+        }
+        y = ts_graph_gdn8_sum(y);
+        if (li == 0)
+            out[v_off + row] = y * scale;
+        if (in_save != nullptr)
+            ts_graph_gdn_save_token(in_save, save_rows, q, k, v, g, beta, S, h, hk, kda, t, head, r0, 4, r0 == 0, lane);
+
+        const int slot = n_t - 1 - t;
+        if (slot < slots)
+        {
+            float* s_out = out + attn + slot * per_snap + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+            for (int j = 0; j < PER; j++)
+                s_out[li + 8 * j] = st[j];
+        }
+    }
+}
+
+// The verify window's scan (its rows' outputs alone, its inputs saved, the state read and left), each token's inputs read
+// a token ahead as ts_graph_gdn_rows4_scan reads them; every value is ts_graph_gdn8's.
+template <int PER, bool KDA>
+__device__ __forceinline__ void ts_graph_gdn8_scan(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int h, int hk, int n_t, int n_s, float* __restrict__ in_save, int save_rows, int seq, int head, int r0, int lane)
+{
+    constexpr int S = PER * 8;
+    const int kh = head % hk;
+    if (seq >= n_s || r0 >= S)
+        return;
+    const int row = r0 + (lane >> 3), li = lane & 7;
+    float st[PER];
+    const float* s_in = state + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+        st[j] = s_in[li + 8 * j];
+
+    const float scale = rsqrtf((float)S);
+    float nk[PER], nq[PER], ng[KDA ? PER : 1], nv = 0.0f, nb = 0.0f;
+    auto load = [&](int t) {
+        const size_t qk_off = ((size_t)(seq * n_t + t) * hk + kh) * S;
+        const size_t gb = (size_t)(seq * n_t + t) * h + head;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            const int i = li + 8 * j;
+            nk[j] = k[qk_off + i];
+            nq[j] = q[qk_off + i];
+            if (KDA) ng[KDA ? j : 0] = g[gb * S + i];
+        }
+        if (!KDA) ng[0] = g[gb];
+        nv = v[((size_t)(seq * n_t + t) * h + head) * S + row];
+        nb = beta[gb];
+    };
+    if (n_t > 0)
+        load(0);
+    for (int t = 0; t < n_t; t++)
+    {
+        const size_t v_off = ((size_t)(seq * n_t + t) * h + head) * S;
+        float kk[PER], qq[PER], e[KDA ? PER : 1];
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            kk[j] = nk[j];
+            qq[j] = nq[j];
+            if (KDA) e[KDA ? j : 0] = expf(ng[KDA ? j : 0]);
+        }
+        if (!KDA) e[0] = expf(ng[0]);
+        const float vt = nv, b = nb;
+        if (t + 1 < n_t)
+            load(t + 1);
+        float kv = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            st[j] *= e[KDA ? j : 0];
+            kv += st[j] * kk[j];
+        }
+        kv = ts_graph_gdn8_sum(kv);
+        const float delta = (vt - kv) * b;
+        float y = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            st[j] += kk[j] * delta;
+            y += st[j] * qq[j];
+        }
+        y = ts_graph_gdn8_sum(y);
+        if (li == 0)
+            out[v_off + row] = y * scale;
+        if (in_save != nullptr)
+            ts_graph_gdn_save_token(in_save, save_rows, q, k, v, g, beta, S, h, hk, KDA ? 1 : 0, t, head, r0, 4, r0 == 0, lane);
+    }
+}
+
+#define TS_GRAPH_GDN8_BY_S(S, CALL8, CALL16) \
+    do { if ((S) == 64) { CALL8; } else if ((S) == 128) { CALL16; } } while (0)
+
+// ts_graph_gated_delta_net_f32 / ts_graph_gated_delta_net_rows4_f32 on ts_graph_gdn8 (S 64 or 128). Launch: grid
+// (n_s * h, S / 16), block 128.
+extern "C" __global__ void __launch_bounds__(128) ts_graph_gdn8_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
+    float* __restrict__ in_save, int save_rows)
+{
+    const int seq = blockIdx.x / h, head = blockIdx.x % h, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;
+    TS_GRAPH_GDN8_BY_S(S,
+        (ts_graph_gdn8<8>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, slots, kda, saved, in_save, save_rows, seq, head, r0, lane)),
+        (ts_graph_gdn8<16>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, slots, kda, saved, in_save, save_rows, seq, head, r0, lane)));
+}
+
+// ts_graph_gated_delta_net_scan4{,_kda}_f32 on ts_graph_gdn8_scan. The same operands and launch as ts_graph_gdn8_f32.
+#define TS_GRAPH_GDN8_SCAN(NAME, KDA)                                                                                             \
+    extern "C" __global__ void __launch_bounds__(128) NAME(                                                                        \
+        const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,                                     \
+        const float* __restrict__ g, const float* __restrict__ beta, const float* state,                                           \
+        float* out, int S, int h, int hk, int n_t, int n_s, float* __restrict__ in_save, int save_rows)                           \
+    {                                                                                                                              \
+        const int seq = blockIdx.x / h, head = blockIdx.x % h, lane = threadIdx.x & 31;                                            \
+        const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;                                                  \
+        TS_GRAPH_GDN8_BY_S(S,                                                                                                      \
+            (ts_graph_gdn8_scan<8, KDA>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, in_save, save_rows, seq, head, r0, lane)),   \
+            (ts_graph_gdn8_scan<16, KDA>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, in_save, save_rows, seq, head, r0, lane))); \
+    }
+
+TS_GRAPH_GDN8_SCAN(ts_graph_gdn8_scan_f32, false)
+TS_GRAPH_GDN8_SCAN(ts_graph_gdn8_scan_kda_f32, true)
+
+// ts_graph_gated_delta_net_scan4_seqs{,_kda}_f32 on ts_graph_gdn8_scan. Launch: grid (h, S / 16, sequences), block 128.
+#define TS_GRAPH_GDN8_SCAN_SEQS(NAME, KDA)                                                                                        \
+    extern "C" __global__ void __launch_bounds__(128) NAME(const ts_graph_gdn_seqs a, int S, int h, int hk, int n_t, int save_rows) \
+    {                                                                                                                              \
+        const int z = blockIdx.z, lane = threadIdx.x & 31;                                                                         \
+        const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;                                                  \
+        TS_GRAPH_GDN8_BY_S(S,                                                                                                      \
+            (ts_graph_gdn8_scan<8, KDA>(a.q[z], a.k[z], a.v[z], a.g[z], a.beta[z], a.state[z], a.out[z], h, hk, n_t, 1,             \
+                a.in_save[z], save_rows, 0, blockIdx.x, r0, lane)),                                                                 \
+            (ts_graph_gdn8_scan<16, KDA>(a.q[z], a.k[z], a.v[z], a.g[z], a.beta[z], a.state[z], a.out[z], h, hk, n_t, 1,            \
+                a.in_save[z], save_rows, 0, blockIdx.x, r0, lane)));                                                                \
+    }
+
+TS_GRAPH_GDN8_SCAN_SEQS(ts_graph_gdn8_scan_seqs_f32, false)
+TS_GRAPH_GDN8_SCAN_SEQS(ts_graph_gdn8_scan_seqs_kda_f32, true)
+
+// ts_graph_gdn_commit_f32 on ts_graph_gdn8 (the re-step as the decode rows' kernel steps them; S 64 or 128). The same argument
+// and launch.
+extern "C" __global__ void __launch_bounds__(128) ts_graph_gdn8_commit_f32(const ts_graph_gdn_commit c)
+{
+    const int layer = blockIdx.z;
+    if (layer >= c.layers)
+        return;
+    {
+        const long long n = (long long)c.channels * c.conv_rows;
+        const long long blocks = (long long)gridDim.x * gridDim.y, block = (long long)blockIdx.y * gridDim.x + blockIdx.x;
+        const float* __restrict__ from = c.conv_from[layer];
+        float* __restrict__ to = c.conv_to[layer];
+        for (long long i = block * blockDim.x + threadIdx.x; i < n; i += blocks * blockDim.x)
+        {
+            const long long ch = i / c.conv_rows;
+            to[i] = from[ch * c.conv_pitch + (i - ch * c.conv_rows)];
+        }
+    }
+    const int steps = c.steps[layer], S = c.S, h = c.h, head = blockIdx.x, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;
+    if (steps < 0 || r0 >= S)
+        return;
+    if (steps == 0)
+    {
+        const float* __restrict__ src = c.state[layer] + ((size_t)head * S + r0) * S;
+        float* __restrict__ dst = c.out[layer] + ((size_t)head * S + r0) * S;
+        for (int r = 0; r < 4 && r0 + r < S; r++)
+            for (int i = lane; i < S; i += 32)
+                dst[(size_t)r * S + i] = src[(size_t)r * S + i];
+        return;
+    }
+    const float* in = c.inputs[layer];
+    const size_t qk = (size_t)c.save_rows * c.hk * S, vs = (size_t)c.save_rows * h * S, gs = (size_t)c.save_rows * h;
+    TS_GRAPH_GDN8_BY_S(S,
+        (ts_graph_gdn8<8>(in, in + qk, in + 2 * qk, in + 2 * qk + vs, in + 2 * qk + vs + gs, c.state[layer], c.out[layer],
+            h, c.hk, steps, 1, 1, 0, nullptr, nullptr, 0, 0, head, r0, lane)),
+        (ts_graph_gdn8<16>(in, in + qk, in + 2 * qk, in + 2 * qk + vs, in + 2 * qk + vs + gs, c.state[layer], c.out[layer],
+            h, c.hk, steps, 1, 1, 0, nullptr, nullptr, 0, 0, head, r0, lane)));
+}
+
+// GraphFusion.DeltaNetPreps, one block a (head, sequence) over every row of the sequence's window: ts_graph_deltanet_prep_f32's
+// values to the bit (its expressions, copied: each channel's convolution taps in order, SiLU, the q/k heads' L2 norm as a warp
+// sum a 32 channels then the warps' sums in order, the gates), with the head's conv inputs staged in shared memory and written
+// to its conv history in one coalesced pass (a head's channels are one run of 128 * span floats there), where the per-row
+// kernel wrote a float every span floats. Each sequence's q, k, v, g and beta go where its table says (rows contiguous at the
+// pitch of their [rows][heads][d] or [rows][v_heads] layout: a window's saved-input planes, which the commit's re-step reads).
+// Launch: grid (2 * k_heads + v_heads, sequences), block d (d % 32 == 0, d <= 128), dynamic shared memory
+// d * (conv_rows + rows) floats; rows <= TS_GRAPH_PREP2_ROWS, conv_rows < width <= TS_GRAPH_PREP2_WIDTH.
+#define TS_GRAPH_PREP2_ROWS 16
+#define TS_GRAPH_PREP2_WIDTH 8
+struct ts_graph_prep2_seqs
+{
+    const float* window[TS_GRAPH_PREP_SEQS];
+    const float* qkv[TS_GRAPH_PREP_SEQS];
+    const float* alpha[TS_GRAPH_PREP_SEQS];
+    const float* beta[TS_GRAPH_PREP_SEQS];
+    float* conv_in[TS_GRAPH_PREP_SEQS];
+    float* q[TS_GRAPH_PREP_SEQS];
+    float* k[TS_GRAPH_PREP_SEQS];
+    float* v[TS_GRAPH_PREP_SEQS];
+    float* g[TS_GRAPH_PREP_SEQS];
+    float* beta_out[TS_GRAPH_PREP_SEQS];
+};
+
+extern "C" __global__ void ts_graph_deltanet_prep_seqs2_f32(const ts_graph_prep2_seqs seqs,
+    const float* __restrict__ conv_w, const float* __restrict__ dt, const float* __restrict__ a,
+    int channels, int conv_rows, int width, int d, int k_heads, int v_heads, int rows, float eps,
+    long long qkv_pitch, long long ab_pitch)
+{
+    extern __shared__ float prep2_stage[];   // [d channels][conv_rows + rows]
+    __shared__ float partial[32];
+    const int z = blockIdx.y, head = blockIdx.x, i = threadIdx.x;
+    const float* __restrict__ window = seqs.window[z];
+    const float* __restrict__ qkv = seqs.qkv[z];
+    const int span = conv_rows + rows;
+    const size_t c = (size_t)head * d + i;
+    float wk[TS_GRAPH_PREP2_WIDTH];
+#pragma unroll
+    for (int j = 0; j < TS_GRAPH_PREP2_WIDTH; j++)
+        wk[j] = j < width ? conv_w[c * width + j] : 0.0f;
+    for (int p = 0; p < conv_rows; p++)
+        prep2_stage[i * span + p] = window[c * conv_rows + p];
+    for (int t = 0; t < rows; t++)
+        prep2_stage[i * span + conv_rows + t] = qkv[(size_t)t * qkv_pitch + c];
+    for (int t = 0; t < rows; t++)
+    {
+        float x = 0.0f;
+        for (int j = 0; j < width; j++)
+            x += prep2_stage[i * span + t + j] * wk[j];
+        const float y = x / (1.0f + expf(-x));
+        if (head < 2 * k_heads)
+        {
+            const float sq = ts_graph_warp_sum(y * y);
+            __syncthreads();
+            if ((i & 31) == 0) partial[i >> 5] = sq;
+            __syncthreads();
+            float total = 0.0f;
+            for (int s = 0; s < d / 32; s++) total += partial[s];
+            const float yn = y * rsqrtf(total + eps);
+            if (head < k_heads) seqs.q[z][((size_t)t * k_heads + head) * d + i] = yn;
+            else seqs.k[z][((size_t)t * k_heads + head - k_heads) * d + i] = yn;
+        }
+        else
+        {
+            const int vh = head - 2 * k_heads;
+            seqs.v[z][((size_t)t * v_heads + vh) * d + i] = y;
+        }
+    }
+    if (head >= 2 * k_heads && i < rows)
+    {
+        const int vh = head - 2 * k_heads, t = i;
+        const size_t gi = (size_t)t * v_heads + vh, ai = (size_t)t * ab_pitch + vh;
+        const float s = seqs.alpha[z][ai] + dt[vh];
+        seqs.g[z][gi] = (s > 20.0f ? s : logf(1.0f + expf(s))) * a[vh];
+        seqs.beta_out[z][gi] = 1.0f / (1.0f + expf(-seqs.beta[z][ai]));
+    }
+    // The head's conv inputs [window | rows], one coalesced run of d * span floats of its history.
+    __syncthreads();
+    float* __restrict__ hist = seqs.conv_in[z] + (size_t)head * d * span;
+    for (int e = i; e < d * span; e += blockDim.x)
+        hist[e] = prep2_stage[e];
+}
+
+// GraphFusion.AttentionPrep over several sequences' rows (a batched verify's windows, rowsPerSeq rows each, every sequence with
+// its own caches and KV indices): ts_graph_attn_prep_f32's body (copied), row t of sequence t / rowsPerSeq writing its keys and
+// values into that sequence's caches at its own cells, so every value and cache row is that kernel's (and the ops') to the bit.
+// The queries go out as rows of heads. Launch: as ts_graph_attn_prep_f32 over every sequence's rows.
+#define TS_GRAPH_ATTN_PREP_SEQS 16
+struct ts_graph_attn_prep_seqs
+{
+    void* k_cache[TS_GRAPH_ATTN_PREP_SEQS];
+    void* v_cache[TS_GRAPH_ATTN_PREP_SEQS];
+    const int* cells[TS_GRAPH_ATTN_PREP_SEQS];
+    int cap[TS_GRAPH_ATTN_PREP_SEQS];
+};
+
+extern "C" __global__ void __launch_bounds__(TS_GRAPH_ATTN_PREP_WARPS * 32) ts_graph_attn_prep_seqs_f32(const ts_graph_attn_prep_seqs seqs,
+    int rowsPerSeq, const float* __restrict__ q, long long qRow, long long qHead, const float* __restrict__ k, long long kRow, long long kHead,
+    const float* __restrict__ v, long long vRow, long long vHead, const float* __restrict__ qNorm, const float* __restrict__ kNorm,
+    float* __restrict__ out, long long outRow, long long outHead, int cacheFormat,
+    const int* __restrict__ pos, int rows, int heads, int kvHeads, int d, int dv, float eps,
+    int rope_dim, int mode, int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast,
+    float beta_slow)
+{
+    extern __shared__ float rowbuf[];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int units = heads + 2 * kvHeads;
+    const long long unit = (long long)blockIdx.x * TS_GRAPH_ATTN_PREP_WARPS + warp;
+    // Every exit below is a whole warp's: the kernel has no block-wide barrier.
+    if (unit >= (long long)rows * units)
+        return;
+    const int t = (int)(unit / units), h = (int)(unit % units);
+    // Row t is row t % rowsPerSeq of sequence t / rowsPerSeq: its caches, their cells and its KV index there.
+    const int z = t / rowsPerSeq;
+    void* __restrict__ kCache = seqs.k_cache[z];
+    void* __restrict__ vCache = seqs.v_cache[z];
+    const int cap = seqs.cap[z];
+    const bool isQ = h < heads, isV = h >= heads + kvHeads;
+    const int kvh = isV ? h - heads - kvHeads : h - heads;
+    const int cell = isQ ? 0 : seqs.cells[z][t - z * rowsPerSeq];
+    if (!isQ && (cell < 0 || cell >= cap))
+        return;
+    if (isV)
+    {
+        const float* src = v + t * vRow + (long long)kvh * vHead;
+        const size_t at = ((size_t)kvh * cap + cell) * dv;
+        if (cacheFormat == TS_GRAPH_CACHE_Q8_0)
+        {
+            ts_q8_0_store_row_warp(src, (uint8_t*)vCache + ((size_t)kvh * cap + cell) * (size_t)(dv / 32 * 34), dv);
+            return;
+        }
+        for (int i = lane; i < dv; i += 32)
+        {
+            const float val = src[i];
+            if (cacheFormat == TS_GRAPH_CACHE_F16) ((__half*)vCache)[at + i] = __float2half_rn(val);
+            else ((float*)vCache)[at + i] = val;
+        }
+        return;
+    }
+    const float* x = isQ ? q + t * qRow + (long long)h * qHead : k + t * kRow + (long long)kvh * kHead;
+    const float* w = isQ ? qNorm : kNorm;
+    float* qDst = isQ ? out + t * outRow + (long long)h * outHead : nullptr;
+    const size_t at = isQ ? 0 : ((size_t)kvh * cap + cell) * d;
+    float* buf = rowbuf + (size_t)warp * d;
+
+    // ts_rmsnorm_f32's thread sums (blockDim 256): thread 32m + lane squares columns 32m + lane + 256k, k ascending.
+    float part[8];
+#pragma unroll
+    for (int m = 0; m < 8; ++m)
+        part[m] = 0.0f;
+    for (int base = 0; base < d; base += 256)
+    {
+#pragma unroll
+        for (int m = 0; m < 8; ++m)
+        {
+            const int i = base + 32 * m + lane;
+            if (i < d)
+            {
+                float val = x[i];
+                buf[i] = val;
+                part[m] += val * val;
+            }
+        }
+    }
+    // block_reduce_sum: each warp's shuffle-down tree (its sum on lane 0), then the first warp's over lanes 0..7.
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int m = 0; m < 8; ++m)
+    {
+        float s = part[m];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_down_sync(0xFFFFFFFF, s, offset);
+        s = __shfl_sync(0xFFFFFFFF, s, 0);
+        if (lane == m)
+            sum_sq = s;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    const float inv_rms = rsqrtf(__shfl_sync(0xFFFFFFFF, sum_sq, 0) / (float)d + eps);
+    for (int i = lane; i < d; i += 32)
+    {
+        float val = buf[i] * inv_rms;
+        val *= w[i];
+        buf[i] = val;
+    }
+    __syncwarp();
+
+    const int position = pos[t];
+    const int active_dim = rope_dim < d ? rope_dim : d;
+    const int pair_count = active_dim / 2;
+    const bool neox = (mode & 2) != 0;   // GGML_ROPE_TYPE_NEOX
+    for (int i = lane; i < pair_count; i += 32)
+    {
+        float theta_extrap = (float)position * powf(freq_base, -2.0f * (float)i / (float)active_dim);
+        float c;
+        float s;
+        if (ext_factor != 0.0f)
+        {
+            float corr_low;
+            float corr_high;
+            ts_graph_yarn_corr_dims(active_dim, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr_low, &corr_high);
+            float mscale = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+            ts_graph_yarn_rope(theta_extrap, freq_scale, corr_low, corr_high, i, ext_factor, mscale, &c, &s);
+        }
+        else
+        {
+            float angle = theta_extrap * freq_scale;
+            c = cosf(angle);
+            s = sinf(angle);
+        }
+        const int left_index = neox ? i : i * 2;
+        const int right_index = neox ? i + pair_count : i * 2 + 1;
+        float left = buf[left_index];
+        float right = buf[right_index];
+        float out_left = left * c - right * s;
+        float out_right = right * c + left * s;
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, left_index, out_left, buf);
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, right_index, out_right, buf);
+    }
+    for (int col = pair_count * 2 + lane; col < d; col += 32)
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, col, buf[col], buf);
+    if (!isQ && cacheFormat == TS_GRAPH_CACHE_Q8_0)
+    {
+        // The rotated key, every lane's columns written back to the row: quantized whole.
+        __syncwarp();
+        ts_q8_0_store_row_warp(buf, (uint8_t*)kCache + ((size_t)kvh * cap + cell) * (size_t)(d / 32 * 34), d);
+    }
+}
+

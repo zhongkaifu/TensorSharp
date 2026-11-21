@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 14;
+        public const int CurrentVersion = 15;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
@@ -28,6 +28,7 @@ namespace TensorSharp.Cuda
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
         private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine, _windowCombine, _listedCombine;
         private readonly IntPtr _prompt128, _prompt256;
+        private readonly IntPtr _windowSeqs128, _windowSeqs256, _windowSeqsQ8128, _windowSeqsQ8256, _windowCombineSeqs;
         // The prompt kernels with F32 accumulation (ts_flash_prompt2_*) and their tail combine.
         private readonly IntPtr _prompt2_128, _prompt2_256, _prompt2Q8128, _prompt2Q8256, _prompt2Combine;
         private readonly IntPtr _band256, _attn8_256;
@@ -117,6 +118,16 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuFuncSetAttribute(_prompt2_256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_prompt2Q8128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_prompt2Q8256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8256).ThrowOnError();
+            _windowSeqs128 = module.GetFunction("ts_flash_decode_window_seqs_f16_d128");
+            _windowSeqs256 = module.GetFunction("ts_flash_decode_window_seqs_f16_d256");
+            _windowSeqsQ8128 = module.GetFunction("ts_flash_decode_window_seqs_q8_d128");
+            _windowSeqsQ8256 = module.GetFunction("ts_flash_decode_window_seqs_q8_d256");
+            _windowCombineSeqs = module.GetFunction("ts_flash_window_combine_seqs_f32");
+            CudaDriverApi.cuFuncSetAttribute(_windowSeqs128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_windowSeqs256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_windowSeqsQ8128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8128).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_windowSeqsQ8256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8256).ThrowOnError();
+            TakesWindowSequences = true;
             CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
             CudaDriverApi.cuDeviceGetAttribute(out int sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
             MultiprocessorCount = sms;
@@ -527,6 +538,87 @@ namespace TensorSharp.Cuda
             void** cargs = stackalloc void*[] { &c0, &c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9, &c10, &c11, &c12 };
             CudaDriverApi.cuLaunchKernel(_windowCombine, (uint)(rows * heads), 1, 1, (uint)headDim, 1, 1, 0, stream, (IntPtr)cargs,
                 IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Whether this image runs <see cref="LaunchDecodeWindowSequences"/>.</summary>
+        public bool TakesWindowSequences { get; }
+
+        /// <summary>Sequences <see cref="LaunchDecodeWindowSequences"/> takes in one launch (TS_FP_WINDOW_SEQS).</summary>
+        public const int WindowSequencesMax = 16;
+
+        /// <summary>One sequence's verify window in <see cref="LaunchDecodeWindowSequences"/>: <see cref="LaunchDecodeRows"/>'s
+        /// operands without a selection.</summary>
+        public readonly record struct WindowSequence(IntPtr Q, IntPtr K, IntPtr V, int Cap, int Len, int Floor, int Splits, IntPtr Partial,
+            IntPtr Output, IntPtr Dyn, int WindowKeys);
+
+        /// <summary>The argument of ts_flash_decode_window_seqs_*, byte for byte (struct ts_fp_window_seqs).</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private unsafe struct WindowSeqsArgs
+        {
+            public fixed long Q[WindowSequencesMax];
+            public fixed long K[WindowSequencesMax];
+            public fixed long V[WindowSequencesMax];
+            public fixed long Partial[WindowSequencesMax];
+            public fixed long Out[WindowSequencesMax];
+            public fixed long Dyn[WindowSequencesMax];
+            public fixed int Cap[WindowSequencesMax];
+            public fixed int Len[WindowSequencesMax];
+            public fixed int Floor[WindowSequencesMax];
+            public fixed int Splits[WindowSequencesMax];
+            public fixed int WindowKeys[WindowSequencesMax];
+        }
+
+        /// <summary>The argument of ts_flash_window_combine_seqs_f32, byte for byte (struct ts_fp_window_combine_seqs).</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private unsafe struct WindowCombineSeqsArgs
+        {
+            public fixed long Partial[WindowSequencesMax];
+            public fixed long Out[WindowSequencesMax];
+            public fixed long Dyn[WindowSequencesMax];
+            public fixed int Splits[WindowSequencesMax];
+            public fixed int Len[WindowSequencesMax];
+            public fixed int WindowKeys[WindowSequencesMax];
+        }
+
+        /// <summary>
+        /// Several sequences' verify windows of <paramref name="rows"/> rows each, as <see cref="LaunchDecodeRows"/> runs one without a
+        /// selection (bucket <paramref name="bucket"/>), in one window launch and one combine: each sequence over its own caches,
+        /// length, splits and partials (<paramref name="sequences"/>), every value its own launch's. All of one shape (heads, KV
+        /// heads, head width, cache format, scale).
+        /// </summary>
+        public unsafe void LaunchDecodeWindowSequences(ReadOnlySpan<WindowSequence> sequences, int rows, int heads, int kvHeads, int headDim,
+            float scale, int bucket, bool q8, IntPtr stream)
+        {
+            if (!TakesWindowSequences || sequences.Length < 1 || sequences.Length > WindowSequencesMax)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences.Length} verify windows in one launch");
+            var a = new WindowSeqsArgs();
+            var c = new WindowCombineSeqsArgs();
+            int most = 1;
+            bool combines = false;
+            for (int z = 0; z < sequences.Length; z++)
+            {
+                WindowSequence w = sequences[z];
+                a.Q[z] = (long)w.Q; a.K[z] = (long)w.K; a.V[z] = (long)w.V; a.Partial[z] = (long)w.Partial; a.Out[z] = (long)w.Output;
+                a.Dyn[z] = (long)w.Dyn; a.Cap[z] = w.Cap; a.Len[z] = w.Len; a.Floor[z] = w.Floor; a.Splits[z] = w.Splits; a.WindowKeys[z] = w.WindowKeys;
+                c.Partial[z] = (long)w.Partial; c.Out[z] = (long)w.Output; c.Dyn[z] = (long)w.Dyn; c.Splits[z] = w.Splits; c.Len[z] = w.Len;
+                c.WindowKeys[z] = w.WindowKeys;
+                most = Math.Max(most, w.Splits);
+                combines |= w.Splits > 1;
+            }
+            int tiles = (rows * (heads / kvHeads) + BlockRows - 1) / BlockRows, n = rows, h = heads, kv = kvHeads, b = bucket, sms = MultiprocessorCount;
+            float sc = scale;
+            var (fn, smem) = q8 ? (headDim == 128 ? (_windowSeqsQ8128, _smemQ8128) : (_windowSeqsQ8256, _smemQ8256))
+                : headDim == 128 ? (_windowSeqs128, _smem128) : (_windowSeqs256, _smem256);
+            WindowSeqsArgs* pa = &a;
+            void** args = stackalloc void*[] { pa, &n, &h, &kv, &sc, &tiles, &b, &sms };
+            CudaDriverApi.cuLaunchKernel(fn, (uint)(tiles * most), (uint)kvHeads, (uint)sequences.Length, 256, 1, 1, (uint)smem, stream,
+                (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            if (!combines) return;
+            int hd = headDim, ruleRows = heads / kvHeads;
+            WindowCombineSeqsArgs* pc = &c;
+            void** cargs = stackalloc void*[] { pc, &hd, &n, &h, &b, &ruleRows, &kv, &sms };
+            CudaDriverApi.cuLaunchKernel(_windowCombineSeqs, (uint)(rows * heads), (uint)sequences.Length, 1, (uint)headDim, 1, 1, 0, stream,
+                (IntPtr)cargs, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Tests and A/B: <see cref="LaunchDecodeRows"/> runs a window's rows on the row grid (a row a z-slice) without a
