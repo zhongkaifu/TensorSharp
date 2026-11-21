@@ -49,8 +49,9 @@ public sealed class MuseGlimmerVisionFactAttribute : FactAttribute, ITraitAttrib
 /// As the text parity tests (<see cref="MuseGlimmerParityTests"/>), each lane is held to the argmax agreement with its own ggml
 /// backend's llama.cpp set (<see cref="MuseGlimmerParity.GoldenSet"/>: LlamaCpp/ for Metal, LlamaCpp/cuda/, LlamaCpp/vulkan/),
 /// and its first generated position is checked against llama.cpp only on the float-activation lanes
-/// (<see cref="MuseGlimmerParityTests.FirstPositionRuleOf"/>: ggml_metal, MLX, direct CUDA); elsewhere it is logged, as no
-/// frozen legacy image lane exists to hold it to.
+/// (<see cref="MuseGlimmerParityTests.FirstPositionRuleOf"/>: ggml_metal, MLX, direct CUDA); elsewhere it is logged.
+/// Where a lane's rule is relative to legacy (<see cref="ImageRuleOf"/>, the rows on the quantized-product lanes), it reads
+/// legacy's figures frozen on the lane next to its set (<see cref="MuseGlimmerLegacyVision"/>), so the rule outlives stage S9.
 /// </summary>
 public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
 {
@@ -226,18 +227,62 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         }
     }
 
-    private void CheckAgainstLlamaCpp(ModelBase model)
+    /// <summary>How a lane's image prompts are held (<see cref="ImageRuleOf"/>).</summary>
+    internal enum ImageRule
     {
-        IMuseGlimmerVisionTower tower = TowerOf(model);
-        BackendType backend = MuseGlimmerParity.Backend();
-        File goldens = LaneGoldens;
-        bool holdFirst = MuseGlimmerParityTests.FirstPositionRuleOf(backend) == MuseGlimmerParityTests.FirstPositionRule.AgainstLlamaCpp;
-        output.WriteLine($"backend {backend}; model {model.GetType().Name}; tower {tower.GetType().Name}; llama.cpp {goldens.LlamaCppCommit} " +
-            $"({goldens.Backend} goldens); first position {(holdFirst ? "against llama.cpp" : "logged")}");
+        /// <summary>Argmax agreement with the lane's set of at least <see cref="MinAgreement"/>, every parting a near-tie.</summary>
+        NearTies,
+        /// <summary>Argmax agreement with the lane's set of at least <see cref="MinAgreement"/>, and the distribution of every
+        /// position's <see cref="MuseGlimmerParity.Position.TopDelta"/> no worse than the legacy model's frozen one by more than
+        /// <see cref="DistributionSlack"/> in its mean, p50 and p90; its p99 and max, and the partings, are logged.</summary>
+        Distribution,
+        /// <summary>Argmax agreement with the lane's set no more than <see cref="LegacyAgreementSlack"/> under the legacy model's,
+        /// frozen on the lane; partings are logged.</summary>
+        LegacyRelative,
+    }
+
+    /// <summary>
+    /// The image-prompt rule of a lane:
+    /// <list type="bullet">
+    /// <item>ggml_cuda and ggml_vulkan (<see cref="ImageRule.LegacyRelative"/>): their products quantize the activations, and
+    /// both families part from the backend's own llama.cpp set where an engine's step is not a near-tie. Measured on an RTX PRO
+    /// 4500 Blackwell: on ggml_cuda legacy 207/212 (frozen) and the runtime 208/212, each with two partings past the near-tie
+    /// bound; on ggml_vulkan 210/217 (frozen) and 209/217, under 97%.</item>
+    /// <item>direct CUDA (<see cref="ImageRule.Distribution"/>): one position, wide-describe @32, flips with the rows. The runtime
+    /// family takes llama.cpp's token there with the legacy tower's rows and parts with the graph tower's (relative L2 1.3e-5
+    /// apart), where llama.cpp's own gap is 0.277, past the near-tie bound. Legacy flips another position the same way
+    /// (ocean-describe @20, a near-tie) when given the graph tower's rows. Over the 216 positions the runtime family is nearer
+    /// llama.cpp than legacy at 130 and further at 86: mean 0.116 against 0.125, p50 0.083 against 0.090, p90 0.253 against
+    /// 0.260 (RTX PRO 4500 Blackwell, IQ2_XXS). The tail is not held: it is the third-largest of 216 values at p99, six
+    /// ocean-describe positions (a picture past the position table, where llama.cpp clamps and the reference zero-pads) where
+    /// every family and tower sits at 0.3-0.7, and legacy's own p99 moves from 0.458 to 0.548 given the graph tower's rows.</item>
+    /// <item>ggml_metal, MLX and the CPU lanes (<see cref="ImageRule.NearTies"/>).</item>
+    /// </list>
+    /// </summary>
+    internal static ImageRule ImageRuleOf(BackendType backend) => backend switch
+    {
+        BackendType.GgmlCuda or BackendType.GgmlVulkan => ImageRule.LegacyRelative,
+        BackendType.Cuda => ImageRule.Distribution,
+        _ => ImageRule.NearTies,
+    };
+
+    /// <summary>How far under the legacy model's frozen agreement the runtime family's may sit (one percentage point).</summary>
+    private const double LegacyAgreementSlack = 0.01;
+
+    /// <summary>How much worse than the legacy model's frozen distribution the runtime family's may be, in each statistic held.</summary>
+    private const double DistributionSlack = 0.10;
+
+    /// <summary>One image prompt teacher-forced through a model: its positions, the first position's top-10 distance, whether its
+    /// picture is past the position table, and the greedy continuation.</summary>
+    internal sealed record PromptRun(Record Record, List<MuseGlimmerParity.Position> Positions, double FirstErr, bool PastTheTable,
+        string Text, string Reference, int Width, int Height, int Rows, double EncodeMs);
+
+    /// <summary>Every record of <paramref name="goldens"/> through <paramref name="model"/> with <paramref name="tower"/>'s rows:
+    /// teacher-forced against llama.cpp's continuation, and greedy (logged).</summary>
+    internal static List<PromptRun> RunImagePrompts(ModelBase model, IMuseGlimmerVisionTower tower, File goldens, Action<string> log)
+    {
         int patch = model.Tokenizer.LookupToken("<|patch|>"), start = model.Tokenizer.LookupToken("<|image_start|>"), end = model.Tokenizer.LookupToken("<|image_end|>");
-        int total = 0, agree = 0;
-        double worstFirst = 0;
-        var failures = new List<string>();
+        var runs = new List<PromptRun>();
         foreach (Record r in goldens.Records)
         {
             var (pixels, w, h) = tower.ImageProcessor.ProcessImage(RepoPath(r.Image));
@@ -259,45 +304,85 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
             var positions = MuseGlimmerParity.TeacherForce(model, golden, out double[] first, Queue);
             int[] greedy = MuseGlimmerParity.GreedyContinue(model, expanded.ToArray(), r.Generated.Length, Queue);
             int firstDiff = positions.FindIndex(p => !p.Agrees);
-            total += positions.Count;
-            agree += positions.Count(p => p.Agrees);
             double firstErr = r.Steps[0].Top.Max(t => Math.Abs(first[t.Id] - t.Logprob));
-            worstFirst = Math.Max(worstFirst, firstErr);
             bool pastTheTable = w / tower.ImageProcessor.PatchSize > TableSide || h / tower.ImageProcessor.PatchSize > TableSide;
-            double firstBound = backend == BackendType.Mlx ? FirstPositionLogprobBoundMlx
-                : pastTheTable ? FirstPositionLogprobBoundPastTheTable : FirstPositionLogprobBound;
             string text = model.Tokenizer.Decode(greedy.TakeWhile(t => !model.Tokenizer.IsEos(t)).ToList());
             string reference = model.Tokenizer.Decode(r.Generated.ToList());
-            output.WriteLine($"{r.Name} ({w}x{h}, {count} rows, encode {encodeMs:F0} ms): argmax = llama.cpp at {positions.Count(p => p.Agrees)}/{positions.Count} " +
+            log($"{r.Name} ({w}x{h}, {count} rows, encode {encodeMs:F0} ms): argmax = llama.cpp at {positions.Count(p => p.Agrees)}/{positions.Count} " +
                 $"(greedy prefix {(firstDiff < 0 ? positions.Count : firstDiff)}); first position top-10 |dlogprob| <= {firstErr:F4}");
-            output.WriteLine($"  ours:      {text.Replace("\n", "\\n")}");
-            output.WriteLine($"  llama.cpp: {reference.Replace("\n", "\\n")}");
-            if (pastTheTable)
-                output.WriteLine($"  (a side of more than {TableSide} patches: llama.cpp clamps the position table's edges where the reference zero-pads; bound {firstBound})");
-            if (firstErr > firstBound && holdFirst)
-                failures.Add($"{r.Name}: first-position log-probabilities differ by {firstErr:F4} (bound {firstBound})");
-            else if (firstErr > firstBound)
-                output.WriteLine($"  (logged, not held on {backend}: first-position log-probabilities {firstErr:F4} from llama.cpp's, past {firstBound})");
-            foreach (var p in positions.Where(p => !p.Agrees))
+            log($"  ours:      {text.Replace("\n", "\\n")}");
+            log($"  llama.cpp: {reference.Replace("\n", "\\n")}");
+            runs.Add(new PromptRun(r, positions, firstErr, pastTheTable, text, reference, w, h, count, encodeMs));
+        }
+        return runs;
+    }
+
+    private void CheckAgainstLlamaCpp(ModelBase model)
+    {
+        IMuseGlimmerVisionTower tower = TowerOf(model);
+        BackendType backend = MuseGlimmerParity.Backend();
+        File goldens = LaneGoldens;
+        ImageRule rule = ImageRuleOf(backend);
+        bool holdFirst = MuseGlimmerParityTests.FirstPositionRuleOf(backend) == MuseGlimmerParityTests.FirstPositionRule.AgainstLlamaCpp;
+        string lane = MuseGlimmerGoldens.LaneKey(backend);
+        MuseGlimmerLegacyVision.Lane frozen = rule == ImageRule.NearTies ? null : MuseGlimmerLegacyVision.Find(lane, goldens.Backend);
+        output.WriteLine($"backend {backend}; model {model.GetType().Name}; tower {tower.GetType().Name}; llama.cpp {goldens.LlamaCppCommit} " +
+            $"({goldens.Backend} goldens); rule {rule}; first position {(holdFirst ? "against llama.cpp" : "logged")}");
+        Assert.True(rule == ImageRule.NearTies || frozen != null,
+            $"no legacy image figures frozen for {lane} next to the {goldens.Backend} goldens (MuseGlimmerLegacyVisionWriterTests writes " +
+            $"Fixtures/MuseGlimmer/LlamaCpp/{(goldens.Backend == "metal" ? "" : goldens.Backend + "/")}{MuseGlimmerLegacyVision.FileName(lane)})");
+        var runs = RunImagePrompts(model, tower, goldens, output.WriteLine);
+        var failures = new List<string>();
+        foreach (PromptRun run in runs)
+        {
+            double firstBound = backend == BackendType.Mlx ? FirstPositionLogprobBoundMlx
+                : run.PastTheTable ? FirstPositionLogprobBoundPastTheTable : FirstPositionLogprobBound;
+            if (run.PastTheTable)
+                output.WriteLine($"  ({run.Record.Name}: a side of more than {TableSide} patches; llama.cpp clamps the position table's edges where the reference zero-pads; bound {firstBound})");
+            if (run.FirstErr > firstBound && holdFirst)
+                failures.Add($"{run.Record.Name}: first-position log-probabilities differ by {run.FirstErr:F4} (bound {firstBound})");
+            else if (run.FirstErr > firstBound)
+                output.WriteLine($"  (logged, not held on {backend}: {run.Record.Name}'s first-position log-probabilities {run.FirstErr:F4} from llama.cpp's, past {firstBound})");
+            foreach (var p in run.Positions.Where(p => !p.Agrees))
             {
-                string what = $"{r.Name} @{p.Index}: llama.cpp {p.Reference} '{MuseGlimmerParity.Decode(model, p.Reference)}', ours {p.Ours} " +
+                string what = $"{run.Record.Name} @{p.Index}: llama.cpp {p.Reference} '{MuseGlimmerParity.Decode(model, p.Reference)}', ours {p.Ours} " +
                     $"'{MuseGlimmerParity.Decode(model, p.Ours)}'; our gap {p.OurGap:F4}, llama.cpp's gap " + (p.ReferenceGap is { } g ? g.ToString("F4") : "(not in its top 4)");
-                output.WriteLine("  " + what);
-                if (p.OurGap > NearTieNats || p.ReferenceGap is not { } gap || gap > NearTieNats)
+                bool nearTie = p.OurGap <= NearTieNats && p.ReferenceGap is { } gap && gap <= NearTieNats;
+                output.WriteLine("  parting " + what + (nearTie ? "" : " (not a near-tie)"));
+                if (rule == ImageRule.NearTies && !nearTie)
                     failures.Add(what);
             }
         }
+        int total = runs.Sum(r => r.Positions.Count), agree = runs.Sum(r => r.Positions.Count(p => p.Agrees));
         double agreement = (double)agree / total;
-        output.WriteLine($"overall: {agree}/{total} = {agreement:P2}; worst first-position |dlogprob| {worstFirst:F4}");
-        Assert.True(failures.Count == 0, "positions that are not near-ties:\n" + string.Join("\n", failures));
+        var q = MuseGlimmerLegacyVision.QuantilesOf(runs.SelectMany(r => r.Positions).Select(p => p.TopDelta));
+        output.WriteLine($"overall: {agree}/{total} = {agreement:P2}; worst first-position |dlogprob| {runs.Max(r => r.FirstErr):F4}; " +
+            $"top-k |dlogprob| over every position: mean {q.Mean:F4}, p50 {q.P50:F4}, p90 {q.P90:F4}, p99 {q.P99:F4}, max {q.Max:F4}" +
+            (frozen == null ? "" : $"; legacy frozen on this lane {frozen.Agree}/{frozen.Positions} = {frozen.Agreement:P2}, mean " +
+                $"{frozen.TopDelta.Mean:F4}, p50 {frozen.TopDelta.P50:F4}, p90 {frozen.TopDelta.P90:F4}, p99 {frozen.TopDelta.P99:F4}, max {frozen.TopDelta.Max:F4}"));
+        Assert.True(failures.Count == 0, "positions that fail the lane's rule:\n" + string.Join("\n", failures));
+        if (rule == ImageRule.LegacyRelative)
+        {
+            Assert.Equal(frozen.Positions, total);
+            Assert.True(agreement >= frozen.Agreement - LegacyAgreementSlack,
+                $"argmax agreement with llama.cpp {agreement:P2} is more than {LegacyAgreementSlack:P0} under the legacy model's frozen {frozen.Agreement:P2}");
+            return;
+        }
         Assert.True(agreement >= MinAgreement, $"argmax agreement with llama.cpp {agreement:P2} < {MinAgreement:P0}");
+        if (rule == ImageRule.Distribution)
+        {
+            Assert.Equal(frozen.Positions, total);
+            foreach (var (label, ours, legacy) in new[] { ("mean", q.Mean, frozen.TopDelta.Mean), ("p50", q.P50, frozen.TopDelta.P50), ("p90", q.P90, frozen.TopDelta.P90) })
+                Assert.True(ours <= legacy * (1 + DistributionSlack),
+                    $"top-k |dlogprob| {label} {ours:F4} is more than {DistributionSlack:P0} past the legacy model's frozen {legacy:F4}");
+        }
     }
 
     // ================================================================ the towers' rows
 
     /// <summary>Pictures for the rows comparison: the golden images, and synthetic pixels at the design's sizes (336 x 336:
     /// 144 rows, 1036 x 1036: 1369 rows, a 588 x 868 portrait: 651 rows).</summary>
-    private static IEnumerable<(string Name, float[] Pixels, int Width, int Height)> Pictures(MuseGlimmerImageProcessor processor)
+    internal static IEnumerable<(string Name, float[] Pixels, int Width, int Height)> Pictures(MuseGlimmerImageProcessor processor)
     {
         foreach (string image in Goldens.Records.Select(r => r.Image).Distinct())
         {
@@ -317,6 +402,19 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     [MuseGlimmerVisionFact(TowerOnly = BackendType.Cuda)]
     public void TheGraphTowerGivesTheLegacyTowersRowsOnDirectCuda() => CompareTowers(BackendType.Cuda);
 
+    /// <summary>On the quantized-product lanes (ggml_cuda, ggml_vulkan), each picture's 1 - cosine between the graph tower's rows
+    /// and the F32 tower's (<see cref="MuseGlimmerLegacyVision.F32Tower"/>) may be at most this many times the legacy tower's,
+    /// frozen on the lane. Both towers' products quantize the activations there: measured on an RTX PRO 4500 Blackwell, each sits
+    /// at 1 - cosine 6e-5 to 1.7e-3 from the F32 tower on ggml_vulkan and 8e-4 to 4.7e-3 on ggml_cuda, and from each other at up
+    /// to 3.9e-4 on ggml_vulkan, where legacy's per-op tower and the graph tower round independently. There the graph tower's
+    /// distance is 0.74-1.67x legacy's picture by picture and 1.00x summed over the nine; on ggml_cuda, where the two share
+    /// their rounding, 1.00x on every picture.</summary>
+    private const double F32DistanceRatio = 1.25;
+
+    /// <summary>Direct CUDA's tower multiplies F32 copies of its weights' values: it is held to the managed executor's F32 tower
+    /// (cosine 1.0000000 to the per-op F32 tower measured).</summary>
+    private const double MinCosineF32 = 0.99999;
+
     private void CompareTowers(BackendType backend)
     {
         using var lane = new MuseGlimmerVisionTowerTests.Lane(backend);
@@ -324,75 +422,106 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         using var legacy = new MuseGlimmerVisionEncoder(mmproj, lane.Allocator);
         using var gguf = new GgufFile(mmproj);
         using var tower = new MuseGlimmerVisionTower(gguf, lane.Allocator, backend);
-        output.WriteLine($"{backend}: graph tower on {tower.Graph.Executor.GetType().Name}");
-        double worstCos = 1;
-        foreach (var (name, px, w, h) in Pictures(tower.ImageProcessor))
+        bool quantized = MuseGlimmerLegacyVision.QuantizedProducts(backend);
+        string laneKey = MuseGlimmerGoldens.LaneKey(backend), set = MuseGlimmerParity.GoldenSet(backend);
+        MuseGlimmerLegacyVision.Lane frozen = quantized ? MuseGlimmerLegacyVision.Find(laneKey, set) : null;
+        Assert.True(!quantized || frozen is { RowsOneMinusCos.Count: > 0 },
+            $"no legacy tower figures frozen for {laneKey} (MuseGlimmerLegacyVisionWriterTests writes Fixtures/MuseGlimmer/LlamaCpp/{set}/" +
+            $"{MuseGlimmerLegacyVision.FileName(laneKey)})");
+        // The F32 reference: on the quantized lanes the cheaper F32 tower, on direct CUDA the managed one (another executor's
+        // arithmetic than the tower under test).
+        var (reference, owner, referenceName) = quantized || backend == BackendType.Cuda
+            ? MuseGlimmerLegacyVision.F32Tower(gguf, preferDirectCuda: backend != BackendType.Cuda)
+            : ((MuseGlimmerVisionTower)null, (IDisposable)null, (string)null);
+        using (owner)
+        using (reference)
         {
-            var sw = Stopwatch.StartNew();
-            float[] a = legacy.EncodeToHostArray(px, w, h, out _);
-            double legacyMs = sw.Elapsed.TotalMilliseconds;
-            sw.Restart();
-            float[] b = tower.EncodeToHost(px, w, h, out int tokens);
-            double towerMs = sw.Elapsed.TotalMilliseconds;
-            double dot = 0, na = 0, nb = 0;
-            for (int i = 0; i < a.Length; i++)
+            output.WriteLine($"{backend}: graph tower on {tower.Graph.Executor.GetType().Name}" + (reference == null ? "; held to the legacy tower"
+                : quantized ? $"; held to {F32DistanceRatio}x the legacy tower's frozen distance to {referenceName}" : $"; held to {referenceName}"));
+            var failures = new List<string>();
+            foreach (var (name, px, w, h) in Pictures(tower.ImageProcessor))
             {
-                dot += (double)a[i] * b[i];
-                na += (double)a[i] * a[i];
-                nb += (double)b[i] * b[i];
-            }
-            double cos = dot / Math.Sqrt(na * nb);
-            // The worst row: what one image token's embedding is off by.
-            int width = tower.ProjectionDim;
-            double worstRow = 1;
-            for (int row = 0; row < tokens; row++)
-            {
-                double d = 0, x = 0, y = 0;
-                for (int c = 0; c < width; c++)
+                var sw = Stopwatch.StartNew();
+                float[] a = legacy.EncodeToHostArray(px, w, h, out _);
+                double legacyMs = sw.Elapsed.TotalMilliseconds;
+                sw.Restart();
+                float[] b = tower.EncodeToHost(px, w, h, out int tokens);
+                double towerMs = sw.Elapsed.TotalMilliseconds;
+                var (cos, worstRow) = Cosines(a, b, tower.ProjectionDim);
+                var dist = MuseGlimmerVisionTowerTests.Distance(a, b);
+                output.WriteLine($"  {name} ({w}x{h}, {tokens} rows): vs legacy cosine {cos:F7} (worst row {worstRow:F6}), relL2 {dist.RelL2:E2}, " +
+                    $"max {dist.RelMax:E2}; legacy {legacyMs:F0} ms, graph tower {towerMs:F0} ms (one run each, informational)");
+                if (reference == null)
                 {
-                    double p = a[row * width + c], q = b[row * width + c];
-                    d += p * q;
-                    x += p * p;
-                    y += q * q;
+                    if (cos < MinCosine) failures.Add($"{name}: cosine {cos:F7} to the legacy tower < {MinCosine}");
+                    continue;
                 }
-                worstRow = Math.Min(worstRow, d / Math.Sqrt(x * y));
+                float[] f = reference.EncodeToHost(px, w, h, out _);
+                var (fCos, fWorst) = Cosines(f, b, tower.ProjectionDim);
+                double graph = 1 - fCos, legacyNow = MuseGlimmerLegacyVision.OneMinusCos(f, a);
+                if (!quantized)
+                {
+                    output.WriteLine($"    vs the F32 tower: cosine {fCos:F7} (worst row {fWorst:F6}); legacy {1 - legacyNow:F7}");
+                    if (fCos < MinCosineF32) failures.Add($"{name}: cosine {fCos:F7} to the F32 tower < {MinCosineF32}");
+                    continue;
+                }
+                Assert.True(frozen.RowsOneMinusCos.TryGetValue(name, out double legacyFrozen), $"{name}: no frozen legacy figure");
+                output.WriteLine($"    1 - cosine to the F32 tower: graph {graph:E3} (worst row {fWorst:F6}), legacy {legacyNow:E3} now, {legacyFrozen:E3} frozen " +
+                    $"({graph / legacyFrozen:F2}x, bound {F32DistanceRatio}x)");
+                if (graph > F32DistanceRatio * legacyFrozen)
+                    failures.Add($"{name}: 1 - cosine to the F32 tower {graph:E3} > {F32DistanceRatio} x legacy's {legacyFrozen:E3}");
             }
-            var dist = MuseGlimmerVisionTowerTests.Distance(a, b);
-            output.WriteLine($"  {name} ({w}x{h}, {tokens} rows): cosine {cos:F7} (worst row {worstRow:F6}), relL2 {dist.RelL2:E2}, " +
-                $"max {dist.RelMax:E2}; legacy {legacyMs:F0} ms, graph tower {towerMs:F0} ms (one run each, informational)");
-            worstCos = Math.Min(worstCos, cos);
-        }
 
-        // A large image as one program and as programs over layer ranges (what a caller that yields the GPU lock gets):
-        // alternating, after a warm-up of each (informational).
-        var (_, pxL, wL, hL) = Pictures(tower.ImageProcessor).First(p => p.Width == 1036);
-        int defaultYield = tower.YieldPatches;
-        var whole = new List<double>();
-        var split = new Dictionary<int, List<double>> { [1024] = new(), [2048] = new() };
-        float[] oneProgram = tower.EncodeToHost(pxL, wL, hL, out _);
-        foreach (int y in split.Keys)
-        {
-            tower.YieldPatches = y;
-            var rows = tower.EncodeToHost(pxL, wL, hL, out _, betweenParts: () => { });
-            var d = MuseGlimmerVisionTowerTests.Distance(oneProgram, rows);
-            output.WriteLine($"  1036x1036 in {tower.LastParts} programs ({y} patches each): {Math.Max(d.RelL2, d.RelMax):E2} from one program's rows");
-        }
-        for (int round = 0; round < 2; round++)
-        {
-            var sw = Stopwatch.StartNew();
-            tower.EncodeToHost(pxL, wL, hL, out _);
-            whole.Add(sw.Elapsed.TotalMilliseconds);
+            // A large image as one program and as programs over layer ranges (what a caller that yields the GPU lock gets):
+            // alternating, after a warm-up of each (informational).
+            var (_, pxL, wL, hL) = Pictures(tower.ImageProcessor).First(p => p.Width == 1036);
+            int defaultYield = tower.YieldPatches;
+            var whole = new List<double>();
+            var split = new Dictionary<int, List<double>> { [1024] = new(), [2048] = new() };
+            float[] oneProgram = tower.EncodeToHost(pxL, wL, hL, out _);
             foreach (int y in split.Keys)
             {
                 tower.YieldPatches = y;
-                sw.Restart();
-                tower.EncodeToHost(pxL, wL, hL, out _, betweenParts: () => { });
-                split[y].Add(sw.Elapsed.TotalMilliseconds);
+                var rows = tower.EncodeToHost(pxL, wL, hL, out _, betweenParts: () => { });
+                var d = MuseGlimmerVisionTowerTests.Distance(oneProgram, rows);
+                output.WriteLine($"  1036x1036 in {tower.LastParts} programs ({y} patches each): {Math.Max(d.RelL2, d.RelMax):E2} from one program's rows");
             }
+            for (int round = 0; round < 2; round++)
+            {
+                var sw = Stopwatch.StartNew();
+                tower.EncodeToHost(pxL, wL, hL, out _);
+                whole.Add(sw.Elapsed.TotalMilliseconds);
+                foreach (int y in split.Keys)
+                {
+                    tower.YieldPatches = y;
+                    sw.Restart();
+                    tower.EncodeToHost(pxL, wL, hL, out _, betweenParts: () => { });
+                    split[y].Add(sw.Elapsed.TotalMilliseconds);
+                }
+            }
+            tower.YieldPatches = defaultYield;
+            output.WriteLine($"  1036x1036: one program {string.Join(", ", whole.Select(x => x.ToString("F0")))} ms; " +
+                string.Join("; ", split.Select(kv => $"{kv.Key}-patch parts {string.Join(", ", kv.Value.Select(x => x.ToString("F0")))} ms")));
+            Assert.True(failures.Count == 0, $"{backend}:\n" + string.Join("\n", failures));
         }
-        tower.YieldPatches = defaultYield;
-        output.WriteLine($"  1036x1036: one program {string.Join(", ", whole.Select(x => x.ToString("F0")))} ms; " +
-            string.Join("; ", split.Select(kv => $"{kv.Key}-patch parts {string.Join(", ", kv.Value.Select(x => x.ToString("F0")))} ms")));
-        Assert.True(worstCos >= MinCosine, $"{backend}: cosine {worstCos:F7} < {MinCosine}");
+    }
+
+    /// <summary>The cosine of two row sets, and of their least similar row.</summary>
+    private static (double Cos, double WorstRow) Cosines(float[] a, float[] b, int width)
+    {
+        double worstRow = 1;
+        for (int row = 0; row < a.Length / width; row++)
+        {
+            double d = 0, x = 0, y = 0;
+            for (int c = 0; c < width; c++)
+            {
+                double p = a[row * width + c], q = b[row * width + c];
+                d += p * q;
+                x += p * p;
+                y += q * q;
+            }
+            worstRow = Math.Min(worstRow, d / Math.Sqrt(x * y));
+        }
+        return (1 - MuseGlimmerLegacyVision.OneMinusCos(a, b), worstRow);
     }
 }

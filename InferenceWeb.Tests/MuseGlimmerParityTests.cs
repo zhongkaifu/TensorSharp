@@ -224,10 +224,12 @@ internal static class MuseGlimmerParity
         return lp;
     }
 
-    /// <summary>One teacher-forced position: our argmax, our log-probabilities of it and of the reference's token, and
-    /// (where the reference lists it) the reference's log-probability of our token.</summary>
+    /// <summary>One teacher-forced position: our argmax, our log-probabilities of it and of the reference's token, (where the
+    /// reference lists it) the reference's log-probability of our token, and <see cref="TopDelta"/>: the largest |our
+    /// log-probability - the reference's| over the reference's listed top tokens (ten at the first position, four after it),
+    /// the first-position metric of the parity tests at every position.</summary>
     internal sealed record Position(int Index, int Reference, int Ours, double OursLp, double OursLpOfReference, double? ReferenceLpOfOurs,
-        double ReferenceLp)
+        double ReferenceLp, double TopDelta)
     {
         public bool Agrees => Ours == Reference;
         /// <summary>How much more likely our model finds its own choice than the reference's (0 where they agree).</summary>
@@ -257,7 +259,8 @@ internal static class MuseGlimmerParity
             int ours = ArgMax(logits, n), reference = golden.Generated[i];
             Step step = golden.Steps[i];
             double? refOfOurs = step.Top.Where(t => t.Id == ours).Select(t => (double?)t.Logprob).FirstOrDefault();
-            positions.Add(new Position(i, reference, ours, lp[ours], lp[reference], refOfOurs, step.Logprob));
+            positions.Add(new Position(i, reference, ours, lp[ours], lp[reference], refOfOurs, step.Logprob,
+                step.Top.Max(t => Math.Abs(lp[t.Id] - t.Logprob))));
             if (i + 1 < golden.Generated.Length)
                 logits = model.Forward(new[] { reference });
         }

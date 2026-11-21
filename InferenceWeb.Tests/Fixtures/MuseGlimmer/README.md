@@ -99,6 +99,45 @@ python3 eng/validation/muse-glimmer-llamacpp-vision-goldens.py --llama-cpp ~/lla
     --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/vulkan
 ```
 
+### Legacy's image figures (`legacy_vision.<lane>.json`, next to the lane's set)
+
+Stage S9 deletes the legacy model and its tower. The image gates that hold the runtime family relative to legacy read
+legacy's figures, frozen per lane next to the set that lane uses. `MuseGlimmerLegacyVisionWriterTests` wrote them on
+2026-11-20 on the RTX PRO 4500 Blackwell box (sm_120, driver 595.112.07, CUDA 13.2, ggml d9fe7bff unchanged), with the
+IQ2_XXS model and the Q8_0 mmproj:
+
+| File | Lane | Legacy's argmax agreement | top-k \|dlogprob\| mean / p50 / p90 / p99 / max | Rows: 1 - cosine to the F32 tower |
+|---|---|---|---|---|
+| `legacy_vision.cuda.linux-x64.NVIDIA.RTX.PRO.4500.Blackwell.json` | direct CUDA (Metal set) | 215/216 (99.54%) | 0.125 / 0.090 / 0.260 / 0.458 / 0.673 | (not frozen: the lane multiplies F32) |
+| `cuda/legacy_vision.ggml_cuda.linux-x64.NVIDIA.RTX.PRO.4500.Blackwell.json` | ggml_cuda | 207/212 (97.64%) | 0.320 / 0.273 / 0.575 / 0.956 / 1.066 | 8.3e-4 to 4.7e-3 |
+| `vulkan/legacy_vision.ggml_vulkan.linux-x64.NVIDIA.RTX.PRO.4500.Blackwell.json` | ggml_vulkan | 210/217 (96.77%) | 0.183 / 0.130 / 0.384 / 0.743 / 1.358 | 6.2e-5 to 1.7e-3 |
+
+* A position's top-k |dlogprob| is the largest |our log-probability - llama.cpp's| over llama.cpp's listed top tokens
+  (ten at the first generated position, four after it): the parity tests' first-position metric, at every position.
+* The F32 tower is the graph tower with F32 products (`GraphProgram.FloatProducts`): direct CUDA's where the process can
+  open a CUDA device, else the managed executor's. The two agree to 1 - cosine 1e-9.
+
+How `MuseGlimmerVisionParityTests` uses them:
+* ggml_cuda and ggml_vulkan (their products quantize the activations): the runtime family's argmax agreement with the
+  lane's set is at least legacy's frozen agreement minus one percentage point, and every parting is logged with both
+  engines' margins. Each picture's 1 - cosine between the graph tower's rows and the F32 tower's is at most 1.25x
+  legacy's frozen figure.
+* direct CUDA (float activations; the Metal set): argmax agreement at least 97%, and the top-k |dlogprob| distribution's
+  mean, p50 and p90 no more than 10% past legacy's frozen ones; the p99 and max, and every parting, are logged. One
+  position there (wide-describe @32) flips with 1e-5 changes of the rows, and the tail is a few positions of a picture past
+  the position table, which moves 20% with such changes (`ImageRuleOf`). The graph tower's rows are held to cosine 0.99999
+  against the managed executor's F32 tower.
+* ggml_metal, MLX and the CPU lanes keep the near-tie rule (97%, every parting a near-tie).
+
+A lane with no file fails and names the file to write. To refreeze a lane, give the writer the set's folder (the
+model directory as for the parity tests; the ggml pin and `TS_MUSE_GLIMMER_BACKEND` pick the lane):
+
+```bash
+TS_TEST_MODEL_DIR=<models> TS_TEST_GGML_BACKEND=cuda \
+TS_TEST_FREEZE_MUSE_GLIMMER_REAL=InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/cuda TS_TEST_FREEZE_PROVENANCE="<build, GPU, driver>" \
+    dotnet test InferenceWeb.Tests -c Release --filter "FullyQualifiedName~MuseGlimmerLegacyVisionWriterTests"
+```
+
 ## Frozen legacy outputs
 
 Stage S0 of the unified-runtime migration (`docs/design/muse-glimmer-unified.md`)

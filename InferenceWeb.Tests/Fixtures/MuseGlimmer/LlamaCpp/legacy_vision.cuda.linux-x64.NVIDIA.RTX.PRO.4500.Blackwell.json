@@ -1,0 +1,29 @@
+{
+  "lane": "cuda|linux-x64|NVIDIA RTX PRO 4500 Blackwell",
+  "set": "metal",
+  "about": "The legacy Muse-Glimmer model and vision tower on this lane: its teacher-forced argmax agreement with the lane's llama.cpp image goldens (and the distribution of every position's largest |our log-probability - llama.cpp's| over llama.cpp's listed top tokens), and on the quantized-product lanes each picture's 1 - cosine between the legacy tower's rows and the F32 tower's. InferenceWeb.Tests/MuseGlimmerVisionParityTests.cs holds the runtime family to them.",
+  "producer": "MuseGlimmerModel and MuseGlimmerVisionEncoder (legacy)",
+  "provenance": "TensorSharp s4fix follow-up on fc70b540 (wip/glimmer-s4fix), ggml d9fe7bff, CUDA 13.2 (nvcc 13.2.86), driver 595.112.07, NVIDIA RTX PRO 4500 Blackwell (sm_120), linux-x64",
+  "frozenUtc": "2026-11-20T23:29:09.1866135Z",
+  "model": {
+    "file": "Muse-Glimmer-30B-UD-IQ2_XXS.gguf",
+    "sha256": "3e9bd0e609df9d0121ba18c6556de496e7be880184cf22c5dbafbc0600875ad9"
+  },
+  "mmproj": {
+    "file": "mmproj-Muse-Glimmer-30B-Q8_0.gguf"
+  },
+  "llamaCpp": "d3c3e242c16b8cbf51400fad410cd69b22d64f35",
+  "imagePrompts": {
+    "agree": 215,
+    "positions": 216,
+    "agreement": 0.9953703703703703,
+    "topDelta": {
+      "mean": 0.12454834215411897,
+      "p50": 0.0904389484514132,
+      "p90": 0.260430854387697,
+      "p99": 0.45773823750244347,
+      "max": 0.6727352446147936
+    }
+  },
+  "rowsVsF32": null
+}
