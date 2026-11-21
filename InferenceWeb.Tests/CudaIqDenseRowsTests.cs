@@ -37,6 +37,9 @@ public sealed class CudaIqDenseRowsTests(ITestOutputHelper output)
     [InlineData((int)GgmlTensorType.IQ3_S, 6656, 512)]
     // Few output rows of a long input take the split-K form: still row-invariant.
     [InlineData((int)GgmlTensorType.IQ2_S, 6656, 1024)]
+    // Past the split-K kernel's outputs: the decode-once IQ2 rows against the one-row (multi) kernel, a partial last block too.
+    [InlineData((int)GgmlTensorType.IQ2_XXS, 6656, 4096)]
+    [InlineData((int)GgmlTensorType.IQ2_S, 6656, 4100)]
     public void EveryRowOfACallOfUpTo16Rows_IsTheOneRowCallBitForBit(int ggmlType, int inDim, int outDim)
     {
         long rowBytes = NativeDequant.RowSize(ggmlType, inDim);

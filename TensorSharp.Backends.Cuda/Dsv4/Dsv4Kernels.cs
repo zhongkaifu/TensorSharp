@@ -74,6 +74,9 @@ namespace TensorSharp.Cuda
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
         private readonly IntPtr denseQ81RowsMulti;
+        // IQ2_XXS / IQ2_S q8_1 rows decoding each group once for every row: [format (0 IQ2_XXS, 1 IQ2_S) * 4 + log2 rows - 1]
+        // for calls of up to 2, 4, 8 and 16 rows (optional: a module before them has none).
+        private readonly IntPtr[] denseQ81Iq2Rows = new IntPtr[8];
         // The IQ3 formats' rows over F32 activations, the kernels for calls of up to 1, 2, 4, 8 and 16 rows (optional: a module
         // before them has none).
         private readonly IntPtr[] denseF32Rows = new IntPtr[10];   // [format (0 IQ3_XXS, 1 IQ3_S) * 5 + log2 rows]
@@ -352,6 +355,12 @@ namespace TensorSharp.Cuda
                 denseQ81RowsSplitK = module.GetFunction("ts_dsv4_dense_q81_rows_splitk_f32");
                 try { denseQ81RowsMulti = module.GetFunction("ts_dsv4_dense_q81_rows_multi_f32"); }
                 catch (CudaException ex) when (ex.ErrorCode == 500) { denseQ81RowsMulti = IntPtr.Zero; }
+                try
+                {
+                    for (int i = 0; i < denseQ81Iq2Rows.Length; i++)
+                        denseQ81Iq2Rows[i] = module.GetFunction($"ts_dsv4_dense_q81_rows_r{2 << (i % 4)}_{(i < 4 ? "iq2xxs" : "iq2s")}_f32");
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { Array.Clear(denseQ81Iq2Rows); }
                 try
                 {
                     for (int i = 0; i < denseF32Rows.Length; i++)
@@ -1193,6 +1202,16 @@ namespace TensorSharp.Cuda
             // looping over the rows left the GPU too few blocks, and the shared expert slowed down.) One row takes it too:
             // the one-row kernel's warps walk four output rows each, 80 blocks for 2560 outputs. The shared expert's
             // 640 -> 2560 Q4_0 down projection took 3.44 us at one row there (2.37 at two rows); 2.01 us here (RTX 5090).
+            // Two or more rows of an IQ2_XXS / IQ2_S weight: each group decoded once for every row, each row the multi kernel's
+            // bits (a 9-row n-gram verify of Muse-Glimmer-30B had spent 60 ms of its 100 there, the multi kernel decoding the
+            // grid again for each row).
+            if (rows >= 2 && rows <= DenseMultiMaxRows && _denseMulti && (wtype == 16 || wtype == 22)
+                && denseQ81Iq2Rows[(wtype == 16 ? 0 : 4) + 3] != IntPtr.Zero)
+            {
+                int k = rows <= 2 ? 0 : rows <= 4 ? 1 : rows <= 8 ? 2 : 3;
+                Launch(denseQ81Iq2Rows[(wtype == 16 ? 0 : 4) + k], CeilDiv(outDim, 8), 1, 1, BlockSize, 0, stream, args);
+                return;
+            }
             if (rows <= DenseMultiMaxRows && denseQ81RowsMulti != IntPtr.Zero && _denseMulti)
                 Launch(denseQ81RowsMulti, CeilDiv(outDim, 8), 1, 1, BlockSize, 0, stream, args);
             else

@@ -5098,6 +5098,122 @@ extern "C" __global__ void ts_dsv4_dense_q81_rows_multi_f32(
     }
 }
 
+// Several q8_1 rows of an IQ2_XXS or IQ2_S weight, decoding each 32-value group once for all of them: a warp an output row,
+// eight warps a block, a lane the groups lane, lane + 32, ... in order, as ts_dsv4_dense_q81_rows_multi_f32. Each row's integer
+// dot, its scale arithmetic and its running sum are ts_dsv4_dot_iq2xxs_group's / ts_dsv4_dot_iq2s_group's in the same order,
+// and ts_dsv4_warp_sum ends each, so every row is the multi kernel's bits (the one-row call's). That kernel ran the whole
+// warp dot again for each row, decoding the grid each time: a 9-row n-gram verify on Muse-Glimmer-30B UD-IQ2_XXS spent
+// 60 ms of its 100 ms there against 2.7 ms a row in a decode step (RTX PRO 4500 Blackwell).
+template <int MAXR, int WT>
+__device__ __forceinline__ void ts_dsv4_dense_q81_iq2_rows_body(
+    const uint8_t* __restrict__ w, const ts_dsv4_block_q8_1* __restrict__ act, float* __restrict__ out,
+    const int outDim, const int inDim, const long long rowBytes, const int rows)
+{
+    const int lane = threadIdx.x % 32;
+    const int rr = blockIdx.x * 8 + threadIdx.x / 32;
+    if (rr >= outDim)
+        return;
+    const uint8_t* wRow = w + (size_t)rr * rowBytes;
+    const int nGroups = inDim / 32, actBlocks = inDim / TS_DSV4_QK8_1;
+    const int nRows = min(rows, MAXR);
+    float sum[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; ++r)
+        sum[r] = 0.0f;
+    for (int g = lane; g < nGroups; g += 32)
+    {
+        const int group = g & 7;
+        int w8[8];
+        float dw;
+        int ls0, ls1;
+        if (WT == TS_DSV4_WTYPE_IQ2XXS)
+        {
+            const ts_dsv4_block_iq2_xxs* bq2 = (const ts_dsv4_block_iq2_xxs*)(wRow + (size_t)(g >> 3) * TS_DSV4_IQ2XXS_BLOCK_BYTES);
+            const int q2 = ts_dsv4_get_int_b2(bq2->qs, group * 2);
+            const uint8_t* aux8 = (const uint8_t*)&q2;
+            const uint32_t aux32 = (uint32_t)ts_dsv4_get_int_b2(bq2->qs, group * 2 + 1);
+#pragma unroll
+            for (int k0 = 0; k0 < 8; k0 += 2)
+            {
+                const int* gridPos = (const int*)(iq2xxs_grid + aux8[k0 / 2]);
+                const int signsPacked = ksigns_iq2xs[(aux32 >> (7 * k0 / 2)) & 0x7F];
+                const int signs0 = __vcmpne4(((signsPacked & 0x03) << 7) | ((signsPacked & 0x0C) << 21), 0x00000000);
+                w8[k0] = __vsub4(gridPos[0] ^ signs0, signs0);
+                const int signs1 = __vcmpne4(((signsPacked & 0x30) << 3) | ((signsPacked & 0xC0) << 17), 0x00000000);
+                w8[k0 + 1] = __vsub4(gridPos[1] ^ signs1, signs1);
+            }
+            ls0 = aux32 >> 28;
+            ls1 = 0;
+            dw = __half2float(bq2->d);
+        }
+        else
+        {
+            const ts_dsv4_block_iq2_s* bq2 = (const ts_dsv4_block_iq2_s*)(wRow + (size_t)(g >> 3) * TS_DSV4_IQ2S_BLOCK_BYTES);
+            ts_dsv4_iq2s_group_ints(bq2, group, w8);
+            ls0 = bq2->scales[group] & 0x0F;
+            ls1 = bq2->scales[group] >> 4;
+            dw = __half2float(bq2->d);
+        }
+#pragma unroll
+        for (int r = 0; r < MAXR; ++r)
+        {
+            if (r >= nRows)
+                break;
+            const ts_dsv4_block_q8_1* q8 = act + (size_t)r * actBlocks + (size_t)(g >> 3) * 8;
+            int sumi;
+            if (WT == TS_DSV4_WTYPE_IQ2XXS)
+            {
+                sumi = 0;
+#pragma unroll
+                for (int k0 = 0; k0 < 8; k0 += 2)
+                {
+                    sumi = ts_dsv4_dp4a(w8[k0], ts_dsv4_get_int_b4(q8[group].qs, k0 + 0), sumi);
+                    sumi = ts_dsv4_dp4a(w8[k0 + 1], ts_dsv4_get_int_b4(q8[group].qs, k0 + 1), sumi);
+                }
+                sumi = (ls0 * sumi + sumi / 2) / 4;
+            }
+            else
+            {
+                int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                {
+                    sumi0 = ts_dsv4_dp4a(w8[k], ts_dsv4_get_int_b4(q8[group].qs, k), sumi0);
+                    sumi1 = ts_dsv4_dp4a(w8[k + 4], ts_dsv4_get_int_b4(q8[group].qs, k + 4), sumi1);
+                }
+                sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+            }
+            sum[r] += dw * __half2float(q8[group].d) * (float)sumi;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MAXR; ++r)
+    {
+        if (r >= nRows)
+            break;
+        const float v = ts_dsv4_warp_sum(sum[r]);
+        if (lane == 0)
+            out[(size_t)r * outDim + rr] = v;
+    }
+}
+
+#define TS_DSV4_DENSE_Q81_IQ2_ROWS(R, F, WT)                                                                          \
+    extern "C" __global__ void __launch_bounds__(256) ts_dsv4_dense_q81_rows_r##R##_##F##_f32(                            \
+        const uint8_t* __restrict__ w, const ts_dsv4_block_q8_1* __restrict__ act, float* __restrict__ out,             \
+        const int wtype, const int outDim, const int inDim, const long long rowBytes, const int rows)                   \
+    {                                                                                                                   \
+        TS_PDL_ENTRY();                                                                                                 \
+        ts_dsv4_dense_q81_iq2_rows_body<R, WT>(w, act, out, outDim, inDim, rowBytes, rows);                             \
+    }
+TS_DSV4_DENSE_Q81_IQ2_ROWS(2, iq2xxs, TS_DSV4_WTYPE_IQ2XXS)
+TS_DSV4_DENSE_Q81_IQ2_ROWS(4, iq2xxs, TS_DSV4_WTYPE_IQ2XXS)
+TS_DSV4_DENSE_Q81_IQ2_ROWS(8, iq2xxs, TS_DSV4_WTYPE_IQ2XXS)
+TS_DSV4_DENSE_Q81_IQ2_ROWS(16, iq2xxs, TS_DSV4_WTYPE_IQ2XXS)
+TS_DSV4_DENSE_Q81_IQ2_ROWS(2, iq2s, TS_DSV4_WTYPE_IQ2S)
+TS_DSV4_DENSE_Q81_IQ2_ROWS(4, iq2s, TS_DSV4_WTYPE_IQ2S)
+TS_DSV4_DENSE_Q81_IQ2_ROWS(8, iq2s, TS_DSV4_WTYPE_IQ2S)
+TS_DSV4_DENSE_Q81_IQ2_ROWS(16, iq2s, TS_DSV4_WTYPE_IQ2S)
+
 // A decode-size dense projection over F32 activations, for the IQ3 formats (IQ3_XXS, IQ3_S): up to 16 activation rows in
 // one call, the weights read once a call. The q8_1 kernels above round the activations to 8 bits first. On Muse-Glimmer-30B's
 // UD-IQ2_XXS (FFN down in IQ3_XXS, attention output in IQ3_S) that moved the direct-CUDA image prompts' top-k log-probabilities
