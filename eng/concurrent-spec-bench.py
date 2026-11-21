@@ -16,7 +16,12 @@ num_predict --max-tokens) and appends one JSON line per wave to --out:
 
 Prompts are four short code and prose tasks; request i of wave w uses prompt i % 4 behind
 the line "(wave w request i)", the same in every run, so no request reuses another's
-prompt beyond the chat template and two builds see the same prompts. The server is
+prompt beyond the chat template and two builds see the same prompts. --prompt-set long asks
+for the same four tasks at length (hundreds of lines, thousands of words), so no request ends
+before --max-tokens on any build and every wave generates the same token count: the waves then
+compare speed, not where a build's text happened to end (a server without ignore_eos too).
+Each wave records its requests' start and end offsets and the server log's byte range
+(eng/concurrent-spec-waves.py cuts the log's [batched-spec] steps into waves with it). The server is
 started and stopped by the caller (one process per A/B arm), with the agent loop off:
 TensorSharp.Server.Host ... --no-multi-agent --no-skills.
 
@@ -78,8 +83,21 @@ def model_name(url, timeout):
     return tags["models"][0]["name"]
 
 
-def body(model, wave, i, max_tokens):
-    text = f"(wave {wave} request {i})\n" + PROMPTS[i % len(PROMPTS)]
+LONG_PROMPTS = [
+    "Write a complete, well-commented Python module of at least 400 lines that parses ISO 8601 dates, times, durations "
+    "and intervals without using datetime.fromisoformat, with docstrings for every function and an extensive unittest suite.",
+    "Write a long essay of at least 2,000 words, with headings, about why lighthouses were built where they were, how "
+    "their lights and lenses work, and how they changed the coastal towns around them over three centuries.",
+    "Implement a thread-safe LRU cache library in C# of at least 400 lines with Get, Put, TryRemove, an eviction callback, "
+    "hit and miss statistics and XML documentation comments, then explain its locking strategy in detail.",
+    "Explain at length, in at least 2,000 words with headings and many everyday examples, how a bicycle stays upright when "
+    "moving: steering geometry, trail, gyroscopic effects, the rider's corrections and what changes at low speed.",
+]
+
+
+def body(model, wave, i, max_tokens, prompts=None):
+    prompts = prompts or PROMPTS
+    text = f"(wave {wave} request {i})\n" + prompts[i % len(prompts)]
     return {"model": model, "stream": False, "think": False,
             "messages": [{"role": "user", "content": text}],
             # Plain greedy: no repetition penalty either (a server's default 1.1 makes the rows sampled, which a trunk
@@ -115,7 +133,7 @@ def wave(args, model, w, n):
     barrier = threading.Barrier(n)
 
     def worker(i):
-        b = body(model, w, i, args.max_tokens)
+        b = body(model, w, i, args.max_tokens, LONG_PROMPTS if args.prompt_set == "long" else PROMPTS)
         barrier.wait()
         t0 = time.perf_counter()
         r = post(args.url + "/api/chat/ollama", b, args.timeout)
@@ -135,6 +153,7 @@ def wave(args, model, w, n):
     load1 = os.getloadavg()
     time.sleep(args.log_settle)
     stats = read_stats(args.server_log, log0)
+    log1 = log_size(args.server_log) if args.server_log else 0
     first = min(r["start"] for r in results)
     last = max(r["end"] for r in results)
     rates = [r["eval_count"] / (r["eval_ns"] / 1e9) for r in results if r["eval_count"] and r["eval_ns"]]
@@ -144,6 +163,8 @@ def wave(args, model, w, n):
            "wave_tok_s": tokens / (last - first), "wave_wall_s": last - first, "tokens": tokens,
            "eval_counts": [r["eval_count"] for r in results], "digests": [r["sha"] for r in results],
            "ttft_ms": [r["prompt_ns"] / 1e6 if r["prompt_ns"] else None for r in results],
+           "start_s": [r["start"] - first for r in results], "end_s": [r["end"] - first for r in results],
+           "prompt_set": args.prompt_set, "log_range": [log0, log1],
            "loadavg_before": load0, "loadavg_after": load1, "spec": stats}
     if stats:
         steps = sum(s["verify_steps"] for s in stats)
@@ -168,6 +189,8 @@ def main():
     ap.add_argument("--log-settle", type=float, default=1.0, help="seconds to wait for the stats lines after a wave")
     ap.add_argument("--label", default="")
     ap.add_argument("--timeout", type=float, default=900)
+    ap.add_argument("--prompt-set", choices=("short", "long"), default="short",
+                    help="short: the four tasks as issue #391 asked them; long: the same tasks at length (no request ends early)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     model = model_name(args.url, args.timeout)
@@ -178,6 +201,7 @@ def main():
     with open(args.out, "a") as out:
         out.write(json.dumps({"kind": "run", "label": args.label, "url": args.url, "model": model,
                               "concurrency": levels, "max_tokens": args.max_tokens, "repeats": args.repeats,
+                              "prompt_set": args.prompt_set, "server_log": os.path.abspath(args.server_log) if args.server_log else None,
                               "time": time.time()}) + "\n")
         for r in range(args.repeats):
             for n in levels:
