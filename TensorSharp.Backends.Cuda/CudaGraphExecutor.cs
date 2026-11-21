@@ -3983,6 +3983,35 @@ namespace TensorSharp.Cuda
             return product;
         }
 
+        /// <summary>The dense row kernels over q8_1 rows for a decode-size product of the IQ2 formats: IQ2_XXS and IQ2_XS
+        /// (Dsv4Kernels.DenseQ81RowsSupports), and IQ2_S where the module decodes the low-bit IQ formats. Null otherwise, for
+        /// any format DecodeOnce takes, and in a program whose products keep their activations in F32 (FloatProducts): these
+        /// kernels read q8_1 rows, and such a program keeps the F32 route it had. The IQ3 formats take
+        /// <see cref="DenseF32Rows"/>.</summary>
+        private Dsv4Kernels DenseRows(int type, long inDim, IGraphWeight weight)
+        {
+            if (FloatProducts) return null;
+            if (type is not (16 or 17 or 22) || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0 || inDim > int.MaxValue) return null;
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing((CudaAllocator)Allocator))) return null;
+            Dsv4Kernels dk = MoeKernels;
+            if (dk == null) return null;
+            bool reads = type == 22 ? dk.DecodesLowBitIqExperts && inDim % 256 == 0 : Dsv4Kernels.DenseQ81RowsSupports(type, (int)inDim);
+            return reads ? dk : null;
+        }
+
+        /// <summary>The dense row kernels over F32 activations (Dsv4Kernels.DenseF32Rows) for a decode-size product of the IQ3
+        /// formats, IQ3_XXS and IQ3_S. Null for other formats, where the module has no such kernel, and in a FloatProducts
+        /// program (which keeps the F32 route it had).</summary>
+        private Dsv4Kernels DenseF32Rows(int type, long inDim, IGraphWeight weight)
+        {
+            if (FloatProducts) return null;
+            if (type is not (18 or 21) || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0 || inDim > int.MaxValue
+                || !Dsv4Kernels.DenseF32RowsSupports(type, (int)inDim)) return null;
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing((CudaAllocator)Allocator))) return null;
+            Dsv4Kernels dk = MoeKernels;
+            return dk != null && dk.HasDenseF32Rows ? dk : null;
+        }
+
         private Dsv4Kernels DecodeOnce(int type, long inDim, long rows, IGraphWeight weight)
         {
             if (rows > 8 || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0) return null;
@@ -4135,11 +4164,36 @@ namespace TensorSharp.Cuda
                 ((CudaStorage)product.Storage).MarkDeviceModified();
                 return product;
             }
+            // The IQ3 formats at decode size (decode steps, verify windows, several sequences' steps) over the step's F32 rows,
+            // up to 16 a call on Dsv4Kernels.DenseF32Rows: each row's sum is the one-row call's, bit for bit, and each weight row
+            // is read once a call. These had run one row on an F32 matvec and several on the scalar batched F32 kernel, so a
+            // verify row was not the decode step's and a verify window cost 2.6-7x a decode step. The IQ2 formats go to the q8_1
+            // dense rows below, but these do not: Muse-Glimmer-30B's UD-IQ2_XXS keeps FFN down in IQ3_XXS and attention output
+            // in IQ3_S, and with their one-row products over q8_1 rows the direct-CUDA image prompts' top-k log-probabilities
+            // moved from llama.cpp's by 0.1432 nat on average against 0.1163 over float activations (bound 0.1370), where the
+            // IQ2 formats' q8_1 rows changed no measured figure.
+            if (rows >= 1 && rows <= DenseDecodeRows && x.Storage is CudaStorage fs && x.ElementType == DType.Float32 && x.IsContiguous()
+                && x.ElementCount() == rows * inDim && inDim <= int.MaxValue && outDim <= int.MaxValue && cuda.Kernels != null
+                && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr fPtr, out int fType)
+                && DenseF32Rows(fType, inDim, weight) is { } f32Kernels)
+            {
+                var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+                ((CudaStorage)product.Storage).EnsureDeviceCurrent();
+                fs.EnsureDeviceCurrent();
+                cuda.Context.MakeCurrent();
+                for (long first = 0; first < rows; first += Dsv4Kernels.DenseMultiMaxRows)
+                    f32Kernels.DenseF32Rows(fPtr, Ptr(x) + (nint)(first * inDim * sizeof(float)), Ptr(product) + (nint)(first * outDim * sizeof(float)),
+                        fType, (int)outDim, (int)inDim, weight.Bytes / outDim, (int)Math.Min(Dsv4Kernels.DenseMultiMaxRows, rows - first),
+                        cuda.Stream.Handle);
+                ((CudaStorage)product.Storage).MarkDeviceModified();
+                return product;
+            }
             // A decode-size product over q8_1 activations the step already quantized (or quantizes now, once).
             if (rows >= 1 && rows <= DenseDecodeRows && x.Storage is CudaStorage xs && x.ElementType == DType.Float32 && x.IsContiguous()
                 && x.ElementCount() == rows * inDim && inDim % 32 == 0 && inDim <= int.MaxValue && outDim <= int.MaxValue
                 && cuda.Kernels != null && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type)
                 && (DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not null
+                    || DenseRows(type, inDim, weight) is not null
                     || (rows <= 16 && CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows))))
             {
                 Tensor xq = QuantizedOnce(cuda, x, xs, inDim, rows);
@@ -4159,6 +4213,24 @@ namespace TensorSharp.Cuda
                     for (long first = 0; first < rows; first += DecodeOnceRows)
                         dk.DenseQ81Rows(wPtr, Ptr(xq) + (nint)(first * qRow), Ptr(product) + (nint)(first * outDim * sizeof(float)), type,
                             (int)outDim, (int)inDim, weight.Bytes / outDim, (int)Math.Min(DecodeOnceRows, rows - first), cuda.Stream.Handle);
+                    ((CudaStorage)product.Storage).MarkDeviceModified();
+                    return product;
+                }
+                // A format the decode-once kernels do not read but the direct engines' dense row kernels do (the IQ2 formats of
+                // Unsloth's dynamic quants: Muse-Glimmer-30B's UD-IQ2_XXS keeps attention Q and gate in IQ2_XXS, FFN gate and up in
+                // IQ2_S): every row on Dsv4Kernels.DenseQ81Rows, up to 16 a call. Each row's dot is the one-row kernel's, bit for
+                // bit, and each weight row is read once per call. These had run one row on a q8_1 matvec and several on the scalar
+                // batched F32 kernel or a block per row, so a verify row was not the decode step's. A prompt chunk past 32 rows
+                // keeps the F16 tensor-core GEMM: its rows keep float activations, as the lane's first-position parity with
+                // llama.cpp's Metal set needs (the same kernels over a prompt's q8_1 rows put Muse-Glimmer's first positions
+                // 0.51-2.47 nats from it, against the test's bound of 0.15).
+                if (DenseRows(type, inDim, weight) is { } rowsKernels)
+                {
+                    long qRow = inDim / 32 * CudaKernels.Q81BlockBytes;
+                    for (long first = 0; first < rows; first += Dsv4Kernels.DenseMultiMaxRows)
+                        rowsKernels.DenseQ81Rows(wPtr, Ptr(xq) + (nint)(first * qRow), Ptr(product) + (nint)(first * outDim * sizeof(float)),
+                            type, (int)outDim, (int)inDim, weight.Bytes / outDim, (int)Math.Min(Dsv4Kernels.DenseMultiMaxRows, rows - first),
+                            cuda.Stream.Handle);
                     ((CudaStorage)product.Storage).MarkDeviceModified();
                     return product;
                 }
