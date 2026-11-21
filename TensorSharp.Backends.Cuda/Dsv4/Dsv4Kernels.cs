@@ -76,7 +76,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr denseQ81RowsMulti;
         // The IQ3 formats' rows over F32 activations, the kernels for calls of up to 1, 2, 4, 8 and 16 rows (optional: a module
         // before them has none).
-        private readonly IntPtr[] denseF32Rows = new IntPtr[5];
+        private readonly IntPtr[] denseF32Rows = new IntPtr[10];   // [format (0 IQ3_XXS, 1 IQ3_S) * 5 + log2 rows]
         // Decode once, dot every row (optional): [R (rows a pass, 1..8), W index (1, 2, 4 warps an output)]. A module from
         // before the 3/5/6/7-row instantiations fills those widths with the next power of two's kernel.
         private readonly IntPtr[,] denseFast = new IntPtr[9, 3];
@@ -356,11 +356,12 @@ namespace TensorSharp.Cuda
                 {
                     for (int i = 0; i < denseF32Rows.Length; i++)
                     {
-                        int r = 1 << i;
-                        denseF32Rows[i] = module.GetFunction($"ts_dsv4_dense_f32_rows_r{r}_f32");
+                        int k = i % 5, r = 1 << k;
+                        string format = i < 5 ? "iq3xxs" : "iq3s";
+                        denseF32Rows[i] = module.GetFunction($"ts_dsv4_dense_f32_rows_r{r}_{format}_f32");
                         // The activation tiles are dynamic shared memory: up to 72 KB at 16 rows, past the default 48.
                         CudaDriverApi.cuFuncSetAttribute(denseF32Rows[i], CuFuncAttributeMaxDynamicSharedSizeBytes,
-                            r * DenseF32RowsTileBytes(i)).ThrowOnError();
+                            r * DenseF32RowsTileBytes(k)).ThrowOnError();
                     }
                 }
                 catch (CudaException ex) when (ex.ErrorCode == 500) { Array.Clear(denseF32Rows); }
@@ -1127,7 +1128,7 @@ namespace TensorSharp.Cuda
             // The kernel for the smallest power of two at or above the row count: eight warps a block, two output rows a warp
             // (TS_DSV4_F32_ROWS_OUT), and a tile of every row in shared memory.
             int k = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : rows <= 8 ? 3 : 4;
-            Launch(denseF32Rows[k], CeilDiv(outDim, 16), 1, 1, BlockSize, (uint)(rows * DenseF32RowsTileBytes(k)), stream, args);
+            Launch(denseF32Rows[(wtype == 18 ? 0 : 5) + k], CeilDiv(outDim, 16), 1, 1, BlockSize, (uint)(rows * DenseF32RowsTileBytes(k)), stream, args);
         }
 
         /// <summary>Dense projections up to this many output rows (and inputs at least this long) run split-K.</summary>
