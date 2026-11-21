@@ -304,9 +304,6 @@
     <ReferenceNativeSymbol Include="TSGgml_MoeStageBorrows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MulMatIdF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MultiDeviceInit" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerModelForward" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerReleaseTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkAttentionF16KV2D" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkClearVisionRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkCtxSize" SymbolType="Function" />

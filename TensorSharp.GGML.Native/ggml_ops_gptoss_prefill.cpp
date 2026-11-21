@@ -116,7 +116,7 @@ struct GptOssPrefillTpSlot
     }
 };
 
-// Deliberately leaked, like g_mg_tp in ggml_ops_muse_glimmer.cpp: a static
+// Deliberately leaked (as the legacy Muse-Glimmer graph's g_mg_tp was): a static
 // destructor freeing a parked buffer at process exit aborts on ggml_cuda.
 // gptoss_prefill_tp_reset_all is the release path.
 GptOssPrefillTpSlot* const g_gptoss_prefill_tp = new GptOssPrefillTpSlot[tsg::TSG_MAX_DEVICES];

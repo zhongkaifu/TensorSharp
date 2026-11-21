@@ -20,7 +20,7 @@ using namespace tsg;
 // ============================================================================
 // DFlash drafter, fused.
 //
-// The trunk already runs as one graph (ggml_ops_muse_glimmer.cpp); the drafter
+// The trunk already ran as one graph (the legacy Muse-Glimmer graph); the drafter
 // did not, and that is what kept speculation a net loss. Per speculative step the
 // managed drafter issued ~150 separate GPU dispatches, while its actual work is
 // only ~2.5 GB of weight reads (5 blocks of 467M params plus the borrowed
@@ -148,8 +148,9 @@ namespace
     };
 
     // Persistent graph cache. Both entry points key on
-    // (model instance, ring buffer, row count) - see the pool in
-    // ggml_ops_muse_glimmer.cpp for why n_tokens has to be part of the identity.
+    // (model instance, ring buffer, row count): a graph built for one row count
+    // binds that shape, so n_tokens has to be part of the identity (as the legacy
+    // Muse-Glimmer graph's pool found).
     struct DfCache
     {
         bool valid = false;
