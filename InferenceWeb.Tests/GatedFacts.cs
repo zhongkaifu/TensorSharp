@@ -243,6 +243,17 @@ namespace InferenceWeb.Tests
             _ => BackendType.GgmlCpu,
         };
 
+        /// <summary>The native GGML backend of a model-level GGML <see cref="BackendType"/>; any other backend is an error
+        /// (never a silent ggml-cpu, which a process pinned to another GGML backend cannot initialize).</summary>
+        public static TensorSharp.GGML.GgmlBackendType GgmlBackendTypeOf(BackendType backend) => backend switch
+        {
+            BackendType.GgmlCpu => TensorSharp.GGML.GgmlBackendType.Cpu,
+            BackendType.GgmlMetal => TensorSharp.GGML.GgmlBackendType.Metal,
+            BackendType.GgmlCuda => TensorSharp.GGML.GgmlBackendType.Cuda,
+            BackendType.GgmlVulkan => TensorSharp.GGML.GgmlBackendType.Vulkan,
+            _ => throw new ArgumentOutOfRangeException(nameof(backend), backend, "not a GGML backend"),
+        };
+
         /// <summary>
         /// Skip reason for a test that constructs <paramref name="required"/> in a
         /// process pinned to another GGML backend, or null to run. The native bridge
@@ -265,6 +276,26 @@ namespace InferenceWeb.Tests
                 _ => "cpu",
             };
             return $"Requires TS_TEST_GGML_BACKEND={name}: this test constructs {required}, and this process pins {pinned} (one GGML backend per process).";
+        }
+
+        /// <summary>
+        /// Skip reason for a test that runs <paramref name="architecture"/> on the pinned GGML
+        /// backend (<see cref="PinnedGgmlBackend"/>), or null to run. The architecture's serving
+        /// contract lists the backends it runs on (<c>Serving.Backends</c>) and its model refuses
+        /// the others at load, so in a lane that pins another backend such a test could only see
+        /// that refusal. The gate reads the contract itself: a backend the architecture comes to
+        /// declare is tested in its lane from then on.
+        /// </summary>
+        public static string PinnedGgmlServesSkip(string architecture)
+        {
+            if (!TensorSharp.Models.Architecture.ModelArchitectureRegistry.TryGet(architecture, out var descriptor))
+                throw new ArgumentException($"No architecture '{architecture}' is registered.", nameof(architecture));
+            BackendType pinned = PinnedGgmlBackend;
+            if (descriptor.Serving.Backends.Contains(pinned))
+                return null;
+            return $"{descriptor.DisplayName ?? descriptor.Id} runs on " +
+                $"{TensorSharp.Models.Architecture.BackendNames.Describe(descriptor.Serving.Backends)}; this process pins " +
+                $"{TensorSharp.Models.Architecture.BackendNames.OptionName(pinned)} (TS_TEST_GGML_BACKEND), which its model refuses at load.";
         }
 
         private static readonly Lazy<int> PinnedGgmlDevices = new(() =>
@@ -715,6 +746,18 @@ namespace InferenceWeb.Tests
             set { _devices = value; Skip ??= TestGates.GgmlDevicesSkip(GgmlBackend, value); }
         }
         private int _devices;
+    }
+
+    /// <summary>
+    /// [Fact] that runs an architecture on the pinned GGML backend (<c>TestGates.PinnedGgmlBackend</c>) without
+    /// needing weights: it runs in every lane whose pinned backend the architecture's serving contract lists, and
+    /// skips visibly in the others (<see cref="TestGates.PinnedGgmlServesSkip"/>), where the model refuses to load.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class PinnedGgmlServesFactAttribute : FactAttribute
+    {
+        /// <param name="architecture">The architecture id (<c>ModelArchitectureDescriptor.Id</c>) the test runs.</param>
+        public PinnedGgmlServesFactAttribute(string architecture) => Skip = TestGates.PinnedGgmlServesSkip(architecture);
     }
 
     /// <summary>
