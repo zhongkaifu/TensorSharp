@@ -10,7 +10,7 @@ defaults, G11; [§5.4](#54-s5-speculation-status)) are implemented, and so is st
 and ggml_vulkan, `--layer-split 2`, DFlash declined under `--tp`; [§5.5](#55-s6-multi-gpu-status)), and stage S7's Mac
 part (performance: every Mac backend within the gates against legacy, the measured settings kept but one;
 [§5.6](#56-s7-performance-status)); stage S8's Mac part switched the descriptor to the runtime family
-([§5.7](#57-s8-the-switch-status)). S0's CUDA part is done (its frozen lanes are fixtures); S2's, S3's, S4's, S5's and S7's CUDA parts wait for the GPU VM. Written
+([§5.7](#57-s8-the-switch-status)), and stage S9's Mac part deleted the legacy model ([§5.8](#58-s9-the-deletion-status)). S0's CUDA part is done (its frozen lanes are fixtures); S2's, S3's, S4's, S5's and S7's CUDA parts wait for the GPU VM. Written
 2026-11-20 on `feature/muse-glimmer-unified`, cut from `origin/main` 2d759459. ggml is upstream
 d9fe7bff, unchanged (AGENTS.md), built with `TENSORSHARP_GGML_NO_UPDATE=1`. Every statement about
 TensorSharp comes from the code at 2d759459. The numbers in [§4.1](#41-legacy-baseline-measured)
@@ -594,7 +594,7 @@ Estimates are agent-days, including GPU runs.
 | **S6** Multi-GPU (done, [§5.5](#55-s6-multi-gpu-status)) | `--tp 2` on per-rank graphs (ggml_cuda; Vulkan per D4), G12, `--layer-split 2` and hybrid (new), DFlash under TP per D5 | family folder, `GgmlGraphExecutor.cs` (D4), `StandardDecoderModel.Placement.cs` (G12) | TP greedy vs one GPU (legacy tracked 468/500 characters before a paraphrase); TP decode and prefill vs legacy TP (docs: 63.2 tok/s, pp512 1569 on 2x PRO 4000, IQ2_XXS); grow and snapshot under TP (never run for legacy); layer split == one GPU | 2 GPUs in one box | 4 |
 | **S7** Performance (Mac part done, [§5.6](#56-s7-performance-status)) | G4 (prompt step width, CPU ring policy), G5 (in-graph embedding), concurrency reorder, `PrunesLastLayerRows`, `KeepsGateUpApart` by measurement, G8 only if MLX trails | runtime + family folder | §4.3 on every backend (Mac: ggml_metal, MLX, ggml_cpu; VM: ggml_cuda, ggml_vulkan, direct CUDA) | Mac; 1 GPU | 5 |
 | **S8** Switch (Mac part done, [§5.7](#57-s8-the-switch-status)) | the descriptor builds `MuseGlimmerRuntimeModel` with `ServingContract.SharedRuntime(false)`; usage pages (n-gram, batching, layer split), the docs, `config/muse-glimmer-30b.json` (+ drafter pin), regression pins (IQ2_XXS, drafter), TensorAgent catalog re-measured; legacy only through the oracle seam | `MuseGlimmerArchitecture.cs`, `CliUsage.cs`, `ServerUsage.cs`, docs, configs, `TensorAgent.Core/Catalog` | §4.8 on the Mac (Web UI, OpenAI, CLI, TensorAgent app) and the VM; `ServingContractConformanceTests`; both directions of the usage drift tests | Mac; 1 GPU | 3 |
-| **S9** Deletion | delete §1.3's legacy files, native exports, `GgmlExportedSymbols.targets` entries, the `ggml_ops_core.cpp` hooks, MLX helpers with no other caller, legacy-only tests (their outputs frozen first); retire §1.9's names through the removed-names registry (hard errors naming the replacement); docs, website, search indexes, zh-cn | §1.3, `RemovedCliFlags.cs`, docs | whole suites on both Mac lanes and the CPU lane, the CUDA VM suite; a final real-weights smoke (text, image, DFlash, multi-turn) on Metal and CUDA | Mac; 1 GPU | 2 |
+| **S9** Deletion (Mac part done, [§5.8](#58-s9-the-deletion-status)) | delete §1.3's legacy files, native exports, `GgmlExportedSymbols.targets` entries, the `ggml_ops_core.cpp` hooks, MLX helpers with no other caller, legacy-only tests (their outputs frozen first); retire §1.9's names through the removed-names registry (hard errors naming the replacement); docs, website, search indexes, zh-cn | §1.3, `RemovedCliFlags.cs`, docs | whole suites on both Mac lanes and the CPU lane, the CUDA VM suite; a final real-weights smoke (text, image, DFlash, multi-turn) on Metal and CUDA | Mac; 1 GPU | 2 |
 
 Order: S0 -> S1 -> S2 -> S3, then S4 and S5 (independent), then S6 and S7, then S8 and S9. S7's Metal
 work can start right after S3. The total is about 34 agent-days.
@@ -1035,6 +1035,57 @@ waits for the CUDA box: `glimmer/cuda-vm/s8-cuda.sh` (`build`, `cli B Q`, `serve
 | Parallel chats (c4 against sequential, 4 x 3 turns) | **passed**: 12/12 turns identical to sequential, 27.2 s against 53.8 s |
 | TensorAgent Mac app, `muse-glimmer-30b-q4kxl`, chat-e2e's seven scenarios | **passed** 7/7 with the user's settings (KV q4_0, speculation on) and with the entry's own (KV q8_0, speculation off). Against the legacy model built from c012af49, same session and settings: the story turn 17.0 tok/s (legacy 17.1); a new chat reuses 99.7% (legacy 62.3%, its 4,352-token ring cap), first token 0.83 s (8.20 s); the image turn's first token 6.8 s (35.1 s); app footprint 13.4 GB at its highest (legacy 12.7), system wired 22.5 GB (26.6). The catalog keeps its 32 GB tier: by its rule (weights + footprint + 5 GB) both families now come to 33.6-34.3 GB, a question for the catalog, not a regression of the switch |
 | ggml_cuda and direct CUDA E2E | **not run** (the VM) |
+
+**After S8: the TensorAgent footprint (question a).** Measured again with the same two app builds, `footprint -p` and `vmmap
+-summary` after the load and after chat-e2e's fact, newchat and image turns. The runtime's extra 0.7 GB is ggml-metal buffers
+(vmmap's "shared memory": 9.8 GB virtual, 8.4 GB dirty, 413 regions after the turns against legacy's 8.9 GB, 7.8 GB, 322);
+Malloc Large (about 2.0 GB, dirty plus compressed) and Untagged (2.1-2.2 GB) are equal within 0.1 GB. They are the graph tower's
+programs' compute, kept for replay (0.26-0.38 GB for the 1260 x 840 test image by the tower's own sizing), and the runtime's
+step-graph arenas; not the caches (2 KV heads: 54 MB of rings a slot) or the checkpoint files (on disk). The +0.9 GB the app
+logs right after loading is transient (vmmap 5 s later: 11.3 against 11.4 GiB). Legacy wired 4.9 GB more during its image
+turn than after it (27.0 against 22.1 GB; the runtime 23.7 against 21.4), outside its footprint (peak 12.7 GB): in all the app
+causes less memory on the runtime (+0.7 GB footprint, -3.3 to -4.1 GB wired), so it stays. The catalog's 32 GB tier is
+unchanged; its rule gives 34.3 GB on the runtime and 33.6 on legacy, an excess that predates the switch (for the user).
+
+### 5.8 S9, the deletion: status
+
+**The Mac part is done** (2026-11-20, M5 Pro, ggml d9fe7bff unchanged before and after every build; `wip/glimmer-s9` on
+757e0517, each deletion its own commit). The VM part (the cuda and vulkan pins' suites, a real-weight smoke on ggml_cuda and
+direct CUDA, the S8 sessions) waits for the CUDA box: `glimmer/cuda-vm/s9w/s9-cuda.sh` (`build`, `suite P`, `family P`,
+`real B`, `cli B Q`, `server B Q`), on the S4-fix agent's corrected S8 script.
+
+* **Frozen first (d492bfe9).** The legacy tower's rows on the synthetic mmprojs (six grids, F32 and Q8_0 products, Muse
+  Spark's width) and the legacy model's DFlash drafter features, frozen on the managed backend while legacy existed
+  (`Fixtures/MuseGlimmer/LegacySynthetic/managed.json`), joined the frozen logits (S0), real-weight continuations and
+  perplexity (S0) and image figures (S4).
+* **Tests on frozen figures (24cb451d).** The tower tests against the frozen managed rows, within the parity bound on the
+  managed executor and within legacy's own spread between executors (6e-3) elsewhere (measured: managed 6.1e-7, ggml_cpu
+  1.3e-4, ggml_metal 1.6e-3, MLX 4.2e-3); Muse Spark's tower and the drafter features against the same file. The real
+  mmproj's tower rows against the F32 tower on every lane, as the quantized lanes already were (the legacy tower on the same
+  executor shared its rounding; the F32 tower does not): cosine 0.9995 on ggml_metal and MLX (measured 0.99977-0.99999), 0.99
+  on ggml_cpu (its q8_K activations, as ggml_cuda's q8_1: measured 0.99576-0.99900), 0.99999 on direct CUDA. Deleted: the
+  tests of legacy against itself, the writers, the legacy-only KV, MLX-decode and truncation tests.
+* **Deleted.** `MuseGlimmerModel` and its partials, the oracle seam, the probe's `--family` (refused with a message);
+  `MuseGlimmerVisionEncoder` and the native vision block; `ggml_ops_muse_glimmer.cpp`, its exports and `ggml_ops_core.cpp`'s
+  hooks; the CUDA ring-mask kernel only that graph called (`ggml_ops_mask.cu`; no committed PTX is involved, so nothing is
+  regenerated); the MLX helpers only legacy used. 10,649 lines out, 616 in.
+* **Names retired** (`RemovedCliFlags.cs`, one entry a name): the D8 list, each failing startup with its replacement.
+* **Docs.** The model card, the env-var feature matrix, PROJECT_STATUS, the development guides and the capability reference
+  (EN and zh); the website pages and both search indexes name no legacy code or switch.
+
+| Gate (the Mac) | Result |
+|---|---|
+| Synthetic suite (`Category!=Bench`), cpu and metal pins | **passed**: cpu 13,753 passed, 1,199 skipped, 0 failed (14,952); metal 13,702, 1,255, 0 (14,957). 55 fewer than S8's: the deleted legacy tests |
+| Real weights, ggml_metal (IQ2_XXS) | **passed** 11/11: llama.cpp 640/640 and 128/128 teacher-forced, first position within 0.050; legacy's frozen continuations 6/6 identical; perplexity 4.168974 against legacy's frozen 4.168933 (+0.0010%), top-1 62.96% both; three growth paths 360 steps identical to presized; a checkpoint across the rings' wrap continues as the live cache; DFlash identical to plain on all six prompts, alone and together |
+| Real weights, MLX | **passed** 11/11: 639/640 (one near-tie) and 128/128; 5/6 continuations legacy's, the sixth leaving at a near-tie; perplexity +0.0001% |
+| Image prompts | **passed**: ggml_metal 215/216 (first position within 0.18), MLX 215/216 (0.35) |
+| Tower rows against the F32 tower (real mmproj, nine pictures) | **passed** at the bounds set from this run (c57920ce): ggml_metal 0.99979-0.99999 and MLX 0.99977-0.99999 (bound 0.9995; the 0.9999 set against legacy on the same executor no longer applies), ggml_cpu 0.99576-0.99900 (bound 0.99: q8_K activations) |
+| Checkpoint files and checkpoints (the probe, ggml_metal, the 4.1K prompt teacher-forced by legacy's frozen tokens, 500 steps) | **passed**: a checkpoint file written at 3000 and at 4400 positions (160.8 MB) and restored into a new request's slot, a checkpoint cloned at both, and a decode-time rewind: every step's logits at cosine 1.000000 to the presized run, argmax legacy's token 500/500 |
+| CLI, ggml_metal and MLX | **passed**: TTFT 405 / 372 ms, 21.7 / 21.4 tok/s; images 4/4; multi-turn reuse 86/273 and 270/454; DFlash and n-gram (99%) engaged. `TS_MUSE_GLIMMER_SWA_RING=0` stops the CLI before loading ("... was removed: ... Unset it.", exit 1); the probe refuses `--family` |
+| Server (OpenAI, Web UI, DFlash and n-gram servers, c4) | **passed**, S8's figures: OpenAI 7/9 (the same two pre-existing ones), reuse 4,515 / 4,922 (thinking 4,486 / 4,917), the Web UI loop check, c4 12/12 identical to sequential, 27.2 s against 53.8 s |
+| No legacy symbol | **passed**: the class, export and helper names occur in no code, project, build or script file; only in the frozen fixtures' provenance, the history sections of the model card and this document |
+| ggml_cuda, ggml_vulkan, direct CUDA | **not run** (the VM) |
+
 
 ---
 
