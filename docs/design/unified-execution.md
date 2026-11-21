@@ -986,13 +986,21 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
 * **Several sequences' regions (direct CUDA):** a batched step's per-sequence ops of one layer stay per-sequence ops
   (each sequence on its own state and caches) and form a region the CUDA executor runs in one launch, every
   sequence's values its own launch's: `DeltaNetScans` (a verify window's delta-net scans, the multi-sequence form of
-  the window scan kernel), `DeltaNetPreps` (the sequences' delta-rule preps, each writing its conv input into its conv
-  history, the region's copies) and `GatedRmsNorms` (their gated norms into the rows' concatenation), `SequenceAttentions` (the sequences' cache writes and attention ops, run at the region's end
+  the window scan kernel), `DeltaNetPreps` (the sequences' delta-rule preps, a block a head and sequence over its
+  window's rows: each writes its conv input into its conv history in one coalesced run and, where every window is in
+  place with its saved-input planes (`ip[5]`), its q, k, v and gates straight into those planes, so the scans save
+  nothing) and `GatedRmsNorms` (their gated norms into the rows' concatenation), `AttentionPrep` over every sequence's
+  rows (the family's query/key norms and rotary, and each sequence's cache writes into its own caches at its own rows:
+  three more sources a sequence), `SequenceAttentions` (the sequences' cache writes and attention ops, run at the region's end
   between `BeginTogether` and `EndTogether`: the verify windows' flash launches are held back and made in one
   multi-sequence window launch and one combine) and `RingAttentionLanes` (a batched block draft's lanes' ring
-  attentions). A test pins each against its op-by-op form and each sequence run alone, bit for bit
-  (`BatchedVerifyScanRegionTests`). Four Qwen3.8-27B NVFP4 sequences' 8-row verify windows on an RTX PRO 4500: the
-  scans 2.99 -> 2.49 ms a step, the attentions 1.15 -> 0.37.
+  attentions). A test pins each
+  against its op-by-op form and each sequence run alone, bit for bit (`BatchedVerifyScanRegionTests`). Four
+  Qwen3.8-27B NVFP4 sequences' 8-row verify windows on an RTX PRO 4500: the scans 2.99 -> 2.49 ms a step (1.10 under
+  nsys with the eight-lane rule and the preps writing the planes), the attentions 1.15 -> 0.37. Below the TMA GEMM's 65 rows such a verify's NVFP4 gate|up product runs its SwiGLU in its
+  epilogue (`ts_fp4_gemm_w4a4_{32,64}_swiglu`: each CTA's tile 64 gate rows and their 64 up rows, every value the plain
+  product's), so the down projection quantizes ff floats a row instead of a SwiGLU quantizer reading 2 ff (0.04 ms of the
+  four requests' step).
 * **Weight preload:** `IGraphExecutor.Preload(weights)` makes a component's weights resident before its first
   program binds them. On GGML it is `TSGgml_GraphPreloadWeights`: MiniMax-H3's uploader (`ggml_h3_upload.h`:
   direct reads from a registered file mapping, else prefaulted parallel copies) into the device copies a weight

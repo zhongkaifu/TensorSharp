@@ -1554,8 +1554,9 @@ kept rows from them). Each request's `draft` is then its share, and `catchUp` is
 keeps its fused selector tail request by request, which measured faster there (the drafter's products are
 compute-bound on an M5 Pro past 8 rows), and the requests' catch-ups are written in one program when the
 step ends. On direct CUDA several requests' verify windows also share launches: each layer's delta-rule preps (each
-request's conv history copy with it), delta-net scans, gated norms and attention windows of every request run
-in one kernel launch each, every request's values its own launch's.
+request's conv history and scan inputs written with it), delta-net scans, gated norms, query/key preps (each request's
+cache writes with them) and attention windows of every request run in one kernel launch each, every request's values
+its own launch's.
 The rest of this section describes
 the per-sequence and holder paths of the other families; its Qwen arena and holder notes predate the
 runtime.
