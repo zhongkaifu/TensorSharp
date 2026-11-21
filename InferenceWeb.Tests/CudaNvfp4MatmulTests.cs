@@ -185,6 +185,65 @@ public sealed class CudaNvfp4MatmulTests
     }
 
     /// <summary>
+    /// The activation quantizer of the W4A4 prompt products (ts_fp4_quantize_nvfp4_f32) codes every row as ggml-cuda's
+    /// quantize_mmq_nvfp4 does (<see cref="Nvfp4ActivationQuantizer"/>, written on the host from its source), to the bit:
+    /// row scales, UE4M3 block scales and E2M1 codes. Rows of sines over many magnitudes, a zero row, a row with one
+    /// outlier, values whose blocks need subnormal scales and signed zeros.
+    /// </summary>
+    [CudaTheory(Fp4TensorCores = true)]
+    [InlineData(256, 9)]
+    [InlineData(2048, 33)]
+    [InlineData(7680, 70)]
+    public void ActivationQuantizerCodesRowsAsGgmlCudasQuantizer(int k, int rows)
+    {
+        using var allocator = new CudaAllocator();
+        CudaFp4Kernels fp4 = allocator.Fp4Kernels;
+        Assert.NotNull(fp4);
+        var x = new float[rows * k];
+        for (int t = 0; t < rows; t++)
+            for (int i = 0; i < k; i++)
+            {
+                float magnitude = MathF.Pow(10f, (t % 7) - 3);   // 1e-3 .. 1e3 by row
+                x[t * k + i] = magnitude * (MathF.Sin(0.0173f * (i + 1) * (t + 2)) + 0.3f * MathF.Cos(0.061f * i - 3 * t));
+            }
+        Array.Clear(x, 1 * k, k);                                        // a zero row
+        x[2 * k + 5] = 5e4f;                                             // one outlier: the rest of the row is tiny next to it
+        for (int i = 0; i < 64; i++) x[3 * k + i] = 1e-7f * (i - 32);    // blocks far below the row's largest value
+        x[3 * k + 100] = 300f;
+        x[4 * k + 7] = -0f;
+        var (codeBytes, scaleBytes, _) = CudaFp4Kernels.ActivationBytes(rows, k);
+        var x2 = new float[rows, k];
+        Buffer.BlockCopy(x, 0, x2, 0, x.Length * sizeof(float));
+        using var input = Tensor.FromArray(allocator, x2);
+        input.Storage.EnsureDeviceCurrent();   // FromArray fills the host mirror only; the kernel reads the device copy
+        using var codes = new Tensor(allocator, DType.UInt8, codeBytes);
+        using var scales = new Tensor(allocator, DType.UInt8, scaleBytes);
+        using var rowScale = new Tensor(allocator, DType.Float32, rows);
+        allocator.Context.MakeCurrent();
+        fp4.Quantize(Ptr(input), Ptr(codes), Ptr(scales), Ptr(rowScale), k, rows, allocator.Stream.Handle);
+        allocator.Stream.Synchronize();
+        foreach (Tensor written in new[] { codes, scales, rowScale }) ((CudaStorage)written.Storage).MarkDeviceModified();
+        byte[] gotCodes = Bytes(codes, codeBytes), gotScales = Bytes(scales, scaleBytes);
+        float[] gotRows = rowScale.GetElementsAsFloat(rows);
+
+        var wantCodes = new byte[codeBytes];
+        var wantScales = new byte[scaleBytes];
+        var wantRows = new float[rows];
+        Nvfp4ActivationQuantizer.Quantize(x, rows, k, wantCodes, wantScales, wantRows);
+        for (int t = 0; t < rows; t++)
+            Assert.True(BitConverter.SingleToInt32Bits(gotRows[t]) == BitConverter.SingleToInt32Bits(wantRows[t]),
+                $"row {t}: row scale {gotRows[t]:R} against ggml's {wantRows[t]:R}");
+        int scaleMismatches = 0, codeMismatches = 0, firstScale = -1, firstCode = -1;
+        for (int i = 0; i < gotScales.Length; i++)
+            if (gotScales[i] != wantScales[i]) { scaleMismatches++; if (firstScale < 0) firstScale = i; }
+        for (int i = 0; i < gotCodes.Length; i++)
+            if (gotCodes[i] != wantCodes[i]) { codeMismatches++; if (firstCode < 0) firstCode = i; }
+        _output.WriteLine($"{rows} rows of {k}: {scaleMismatches} of {gotScales.Length} block scales and {codeMismatches} of {gotCodes.Length} code bytes differ from ggml's quantizer");
+        Assert.True(scaleMismatches == 0, $"block scale {firstScale} (row {firstScale / (k / 16)}): {(firstScale >= 0 ? gotScales[firstScale] : 0)} against ggml's {(firstScale >= 0 ? wantScales[firstScale] : 0)}");
+        Assert.True(codeMismatches == 0, $"code byte {firstCode} (row {firstCode / (k / 2)}): {(firstCode >= 0 ? gotCodes[firstCode] : 0):X2} against ggml's {(firstCode >= 0 ? wantCodes[firstCode] : 0):X2}");
+    }
+
+    /// <summary>
     /// A SwiGLU feed-forward's down projection on the FP4 tensor cores with the activation quantized straight from the fused
     /// gate|up rows (silu(gate) * up never stored) equals the activation computed first and multiplied, to the bit.
     /// </summary>

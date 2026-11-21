@@ -807,7 +807,7 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [MlxFact]
     public void Nvfp4FeedForwardsOnMlxMatchTheManagedReference() => AssertNvfp4(BackendType.Mlx);
 
-    private void AssertNvfp4(BackendType backend, double tolerance = 0)
+    private void AssertNvfp4(BackendType backend, double tolerance = 0, Action<ModelBase> configure = null)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture("nvfp4");
@@ -817,10 +817,56 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
             Assert.Equal(40, managed.QuantizedWeightTypeForTests("blk.0.ffn_down.weight"));
             reference = Script(managed);
         }
+        if (tolerance <= 0 && backend == BackendType.GgmlCuda && GgmlCudaRunsW4A4())
+            tolerance = W4A4Tolerance(path, reference);
         using var model = Create(path, backend: backend);
+        configure?.Invoke(model);
         int expectedType = ModelBase.WidensNvfp4ToF16(backend) ? 1 : 40;
         Assert.Equal(expectedType, model.QuantizedWeightTypeForTests("blk.0.ffn_down.weight"));
         AssertRows(Script(model), reference, tolerance > 0 ? tolerance : Tolerance("nvfp4", backend), $"nvfp4 on {backend}");
+    }
+
+    /// <summary>ggml-cuda multiplies NVFP4 weights with NVFP4-quantized activations (W4A4, ggml_prec Q4 for src1: mmq.cu's
+    /// ggml_cuda_mmq_get_prec_src1) on GPUs with Blackwell's FP4 tensor cores (CC 12.x), for the products MMQ takes (prompt
+    /// rows); decode rows stay on q8_1 matvecs. A test cannot switch that (GGML_CUDA_MMQ_PREC is process environment).
+    /// W4A4 prompt rows are the default on purpose, as in llama.cpp: on an RTX PRO 4500 they run prompts 1.5x (LFM3-1.7B)
+    /// to 2.3x (Qwen3.8-27B) faster than ggml-cuda's q8_1 route, at a perplexity cost (wikitext-2, 32 x 1024, every row a
+    /// prompt row): LFM3-1.7B NVFP4 +6.6% (22.06 against 20.70; llama.cpp's own +5.9%), Qwen3.8-27B NVFP4 +1.9% (6.563
+    /// against 6.441). Decode speed is unchanged.</summary>
+    private static bool GgmlCudaRunsW4A4()
+    {
+        try { return TensorSharp.Cuda.CudaDevice.GetDevice(0).ComputeCapabilityMajor == 12; }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>
+    /// The bound for W4A4 prompt rows, derived on the fixture from ggml-cuda's own arithmetic: the managed executor with
+    /// ggml-cuda's NVFP4 activation quantizer applied to the rows of its NVFP4 products of more than 16 rows
+    /// (<see cref="Nvfp4ActivationQuantizer"/> through ManagedQuantizedOps.Nvfp4PromptRowsForTests) is one W4A4 realization
+    /// of the script; its largest row distance from the exact reference is what W4A4 rounding costs here (0.380 on this
+    /// fixture; ggml-cuda's own rows on an RTX PRO 4500 sit 0.214-0.378 from it). Another realization of the same quantizer (ggml-cuda's, whose
+    /// inputs differ in their last bits) is as far: this small network turns the flipped FP4 codes of last-bit differences
+    /// into logit changes as large as the rounding itself (ggml-cuda against the emulation: 0.15-0.30 on the same rows). The
+    /// bound is 1.5 times the emulation's own distance. A dropped weight scale (2.5e-3 here) or a wrong layout lands far
+    /// past it; the q8-activation lanes keep the 8e-2 bound.
+    /// </summary>
+    private double W4A4Tolerance(string path, List<float[]> reference)
+    {
+        List<float[]> emulated;
+        ManagedQuantizedOps.Nvfp4PromptRowsForTests = Nvfp4ActivationQuantizer.RoundRows;
+        try
+        {
+            using var managed = Create(path);
+            emulated = Script(managed);
+        }
+        finally
+        {
+            ManagedQuantizedOps.Nvfp4PromptRowsForTests = null;
+        }
+        double own = emulated.Select((row, i) => RelL2(row, reference[i])).Max();
+        _output.WriteLine($"nvfp4 W4A4 emulation: largest row relL2 {own:E2} from the exact reference; bound {1.5 * own:E2}");
+        Assert.True(own > 1e-2, "the W4A4 emulation must round the prompt products' activations");
+        return 1.5 * own;
     }
 
     /// <summary>The .scale sidecars matter: the same checkpoint with them ignored gives other logits (so the comparison above

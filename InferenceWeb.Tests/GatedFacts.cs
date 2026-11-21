@@ -592,6 +592,14 @@ namespace InferenceWeb.Tests
             set { _promptAttention8 = value; if (value) Skip ??= TestGates.PromptAttention8Skip; }
         }
         private bool _promptAttention8;
+
+        /// <summary>The test launches the FP4 tensor-core products; skips where the loaded image has none (<see cref="TestGates.Fp4TensorCoresSkip"/>).</summary>
+        public bool Fp4TensorCores
+        {
+            get => _fp4TensorCores;
+            set { _fp4TensorCores = value; if (value) Skip ??= TestGates.Fp4TensorCoresSkip; }
+        }
+        private bool _fp4TensorCores;
     }
 
     /// <summary>
