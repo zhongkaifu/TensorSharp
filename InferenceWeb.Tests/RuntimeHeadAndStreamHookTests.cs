@@ -233,10 +233,13 @@ public sealed class RuntimeHeadAndStreamHookTests(ITestOutputHelper output) : ID
         string path = Fixture("dense");
         using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         // SharedRuntimeConformanceTests' bounds (managed rows are computed row by row; device kernels may pick another matmul
-        // for one row than for several), times the transform's largest slope (the scale) for the device executors: the
-        // transform scales a rounding difference by up to the scale and compresses the logits it is relative to (measured on
-        // ggml_metal: 1.21e-3; the untransformed rows are within the conformance tests' 1e-3).
-        double tolerance = backend == BackendType.Cpu ? 1e-6 : (backend == BackendType.Mlx ? 5e-3 : 1e-3) * Scale;
+        // for one row than for several: 5e-3 on MLX, ggml_cuda and ggml_vulkan, 1e-3 elsewhere), times the transform's largest
+        // slope (the scale) for the device executors: the transform scales a rounding difference by up to the scale and
+        // compresses the logits it is relative to. Measured, transformed / untransformed: ggml_metal 1.21e-3; ggml_cuda
+        // 2.72e-3 / 2.15e-3 and ggml_vulkan 9.5e-4 / 8.4e-4 (RTX PRO 4500 Blackwell): ggml_cuda's batched rows are past 1e-3
+        // before the transform, as the conformance tests measured them (1.4e-3 / 2.2e-3).
+        double tolerance = backend == BackendType.Cpu ? 1e-6
+            : (backend is BackendType.Mlx or BackendType.GgmlCuda or BackendType.GgmlVulkan ? 5e-3 : 1e-3) * Scale;
         SlotParity.AssertBatchedSlotsMatchAlone(() => new Hooked(path, backend, new Hooks(Scale, Cap)), tolerance, $"transformed {backend}");
     }
 
