@@ -3488,3 +3488,145 @@ extern "C" __global__ void ts_graph_q8_0_to_f32(const uint8_t* __restrict__ src,
         o[c] = __half2float(__hmul(__int2half_rn(code), d));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Q6_K x q8_1 on the int8 tensor cores: the direct engines' drafter product for Q6_K weights (ts_q35_gemm_q6k), beside
+// ts_graph_gemm_q4k for a drafter's Q4_K ones. Q6_K superblock (256 values, 210 bytes): ql[128] | qh[64] | scales
+// int8[16] | half d; value 128h + 32m + l (h < 2, m < 4, l < 32) is (ql nibble | 2 qh bits) - 32 with scale index
+// 8h + 2m + l / 16. One mma.m16n8k16.s8 per 16-value sub-block, its exact integer sum scaled by the sub-block's weight
+// scale (d * sc) and the activation's 32-value scale and accumulated in F32. Block: 4 warps x 16 weight rows against
+// NT * 8 activation rows; per superblock the activations and each warp's decoded weight rows (int8, value - 32) are
+// staged in shared memory. Grid (row tiles, K splits): with more than one split every block adds its share atomically
+// (the caller zeroes y first). A row's value never depends on how many rows the call holds, but the splits' additions
+// land in any order: for products whose last bits may vary (a drafter's).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void ts_graph_mma_s8_k16(int (&c)[4], int a0, int a1, int b0)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
+#else
+    __trap();
+#endif
+}
+
+template <int NT>
+__device__ __forceinline__ void ts_graph_gemm_q6k(
+    const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y)
+{
+    constexpr int NA = NT * 8;
+    __shared__ __align__(16) int8_t xs[NA][TS_GRAPH_Q4K_ROW];
+    __shared__ float xds[NA][8];
+    __shared__ __align__(16) int8_t ws[4][16][TS_GRAPH_Q4K_ROW];
+    __shared__ float wsc[4][16][16];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int row0 = blockIdx.x * 64 + warp * 16;
+    const int nsb = k / 256, per = (nsb + gridDim.y - 1) / gridDim.y;
+    const int sb0 = blockIdx.y * per, sb1 = min(nsb, sb0 + per);
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            acc[j][e] = 0.0f;
+    for (int sb = sb0; sb < sb1; ++sb)
+    {
+        __syncthreads();
+        for (int i = tid; i < NA * 16; i += blockDim.x)
+        {
+            const int r = i >> 4, c = (i & 15) * 16;
+            *(int4*)&xs[r][c] = r < n ? *(const int4*)(xq + (long long)r * k + sb * 256 + c) : make_int4(0, 0, 0, 0);
+        }
+        for (int i = tid; i < NA * 8; i += blockDim.x)
+        {
+            const int r = i >> 3;
+            xds[r][i & 7] = r < n ? xd[(long long)r * (k >> 5) + sb * 8 + (i & 7)] : 0.0f;
+        }
+        // This warp's 16 weight rows: lane takes (row, half, 4-value group) items, 16 values each.
+        for (int item = lane; item < 16 * 2 * 8; item += 32)
+        {
+            const int r = item >> 4, h = (item >> 3) & 1, l0 = (item & 7) * 4;
+            const int gr = row0 + r;
+            uint32_t q[4] = { 0, 0, 0, 0 };
+            if (gr < outDim)
+            {
+                const uint8_t* blk = w + (long long)gr * rowBytes + (long long)sb * 210;
+                const uint8_t* ql = blk + 64 * h;
+                const uint8_t* qh = blk + 128 + 32 * h;
+                // Q6_K rows are 210 bytes apart: two-byte loads only.
+                const uint32_t a = *(const uint16_t*)(ql + l0) | ((uint32_t)*(const uint16_t*)(ql + l0 + 2) << 16);
+                const uint32_t b = *(const uint16_t*)(ql + 32 + l0) | ((uint32_t)*(const uint16_t*)(ql + 32 + l0 + 2) << 16);
+                const uint32_t c = *(const uint16_t*)(qh + l0) | ((uint32_t)*(const uint16_t*)(qh + l0 + 2) << 16);
+                q[0] = __vsubss4((a & 0x0F0F0F0Fu) | ((c & 0x03030303u) << 4), 0x20202020);
+                q[1] = __vsubss4((b & 0x0F0F0F0Fu) | (((c >> 2) & 0x03030303u) << 4), 0x20202020);
+                q[2] = __vsubss4(((a >> 4) & 0x0F0F0F0Fu) | (((c >> 4) & 0x03030303u) << 4), 0x20202020);
+                q[3] = __vsubss4(((b >> 4) & 0x0F0F0F0Fu) | (((c >> 6) & 0x03030303u) << 4), 0x20202020);
+                if (l0 == 0)
+                {
+                    const float d = __half2float(*(const half*)(blk + 208));
+                    const int8_t* sc = (const int8_t*)(blk + 192) + 8 * h;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        wsc[warp][r][8 * h + j] = d * (float)sc[j];
+                }
+            }
+            else if (l0 == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    wsc[warp][r][8 * h + j] = 0.0f;
+            }
+#pragma unroll
+            for (int m = 0; m < 4; ++m)
+                *(uint32_t*)&ws[warp][r][128 * h + 32 * m + l0] = q[m];
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int j = 0; j < 16; ++j)   // 16-value sub-blocks
+        {
+            const int a0 = *(const int*)&ws[warp][g][16 * j + 4 * t];
+            const int a1 = *(const int*)&ws[warp][g + 8][16 * j + 4 * t];
+            const float s0 = wsc[warp][g][j], s1 = wsc[warp][g + 8][j];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+            {
+                int c[4];
+                ts_graph_mma_s8_k16(c, a0, a1, *(const int*)&xs[8 * nt + g][16 * j + 4 * t]);
+                const float x0 = xds[8 * nt + 2 * t][j >> 1], x1 = xds[8 * nt + 2 * t + 1][j >> 1];
+                acc[nt][0] += (float)c[0] * s0 * x0;
+                acc[nt][1] += (float)c[1] * s0 * x1;
+                acc[nt][2] += (float)c[2] * s1 * x0;
+                acc[nt][3] += (float)c[3] * s1 * x1;
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const int r = row0 + g + 8 * (e >> 1), col = 8 * nt + 2 * t + (e & 1);
+            if (r < outDim && col < n)
+            {
+                float* dst = y + (long long)col * outDim + r;
+                if (gridDim.y > 1)
+                    atomicAdd(dst, acc[nt][e]);
+                else
+                    *dst = acc[nt][e];
+            }
+        }
+}
+
+// y [n][outDim] = xq [n] W^T for n <= NT * 8 rows of a Q6_K weight (rows rowBytes apart; k a multiple of 256). Launch:
+// grid (ceil(outDim / 64), K splits), block 128; with more than one split y starts zeroed.
+#define TS_GRAPH_GEMM_Q6K(NT) \
+    extern "C" __global__ void __launch_bounds__(128) ts_graph_gemm_q6k_##NT( \
+        const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k, \
+        const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y) \
+    { ts_graph_gemm_q6k<NT>(w, rowBytes, outDim, k, xq, xd, n, y); }
+TS_GRAPH_GEMM_Q6K(1)
+TS_GRAPH_GEMM_Q6K(2)
+TS_GRAPH_GEMM_Q6K(4)
+TS_GRAPH_GEMM_Q6K(8)

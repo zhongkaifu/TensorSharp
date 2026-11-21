@@ -26,6 +26,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
+        private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
         private readonly int _multiprocessors;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
@@ -112,6 +113,17 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
                 CudaDriverApi.cuDeviceGetAttribute(out _multiprocessors, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
                 TakesQ4kMma = true;
+                // A drafter's Q6_K products on the int8 tensor cores (an image built before them has no such entries).
+                try
+                {
+                    for (int i = 0; i < 4; i++)
+                        _gemmQ6k[i] = module.GetFunction($"ts_graph_gemm_q6k_{1 << i}");
+                    TakesQ6kMma = true;
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500)
+                {
+                    TakesQ6kMma = false;
+                }
                 // A QSA region's kernels: its prompt attention runs on the tensor cores, and its decode rows on the flash
                 // kernels (sm_80 as well).
                 _qsaScores = module.GetFunction("ts_graph_qsa_scores_f32");
@@ -264,6 +276,9 @@ namespace TensorSharp.Cuda
         /// <summary>Activation rows <see cref="LaunchGemmQ4k"/> takes in one launch.</summary>
         public const int Q4kMmaMaxRows = 64;
 
+        /// <summary>Whether this image runs <see cref="LaunchGemmQ6k"/> (its sm_80 bodies are in it).</summary>
+        public bool TakesQ6kMma { get; }
+
         /// <summary>y [n][outDim] = xq [n] W^T for a Q4_K weight (rows <paramref name="rowBytes"/> apart, k a multiple of 256)
         /// on the int8 tensor cores, the direct engines' drafter product: <paramref name="xq"/> int8 [n][k] and
         /// <paramref name="xd"/> [n][k / 32] (the split q8_1 rows). K splits until the row tiles fill the device twice over (at
@@ -287,6 +302,30 @@ namespace TensorSharp.Cuda
                 a5 = xd + (nint)((long)r0 * (k / 32) * 4);
                 a7 = y + (nint)((long)r0 * outDim * 4);
                 CudaDriverApi.cuLaunchKernel(_gemmQ4k[i], tiles, (uint)splits, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            }
+        }
+
+        /// <summary><see cref="LaunchGemmQ4k"/> for a Q6_K weight (rows <paramref name="rowBytes"/> apart, k a multiple of 256): the
+        /// direct engines' drafter product for its Q6_K matrices, with the same K splits and the same rows a launch.</summary>
+        public void LaunchGemmQ6k(IntPtr w, long rowBytes, int outDim, int k, IntPtr xq, IntPtr xd, int n, IntPtr y, IntPtr stream)
+        {
+            uint tiles = (uint)((outDim + 63) / 64);
+            int superblocks = k / 256, splits = 1;
+            while (tiles * splits < 2 * _multiprocessors && splits * 4 <= superblocks)
+                splits *= 2;
+            if (splits > 1)
+                CudaDriverApi.cuMemsetD32Async(y, 0, new UIntPtr((ulong)n * (ulong)outDim), stream).ThrowOnError();
+            IntPtr a4 = IntPtr.Zero, a5 = IntPtr.Zero, a7 = IntPtr.Zero;
+            int rows = 0;
+            void** args = stackalloc void*[] { &w, &rowBytes, &outDim, &k, &a4, &a5, &rows, &a7 };
+            for (int r0 = 0; r0 < n; r0 += Q4kMmaMaxRows)
+            {
+                rows = Math.Min(Q4kMmaMaxRows, n - r0);
+                int i = rows <= 8 ? 0 : rows <= 16 ? 1 : rows <= 32 ? 2 : 3;
+                a4 = xq + (nint)((long)r0 * k);
+                a5 = xd + (nint)((long)r0 * (k / 32) * 4);
+                a7 = y + (nint)((long)r0 * outDim * 4);
+                CudaDriverApi.cuLaunchKernel(_gemmQ6k[i], tiles, (uint)splits, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
             }
         }
 

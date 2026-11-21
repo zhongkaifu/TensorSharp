@@ -4074,9 +4074,12 @@ namespace TensorSharp.Cuda
                 ((CudaStorage)product.Storage).MarkDeviceModified();
                 return product;
             }
-            // A drafter's Q4_K products (IGraphExecutor.Drafting) on the int8 tensor cores, as the direct engines ran theirs: a
-            // Qwen3.8 27B DFlash2 draft block's 45 Q4_K products took 5.0 ms a step on the row-invariant decode kernels, the
-            // engine's 2.6 (RTX PRO 4000). A drafter's last bits need not match anything: its proposals are verified. A
+            // A drafter's Q4_K and Q6_K products (IGraphExecutor.Drafting) on the int8 tensor cores, as the direct engines ran
+            // theirs: a Qwen3.8 27B DFlash2 draft block's 45 Q4_K products took 5.0 ms a step on the row-invariant decode
+            // kernels, the engine's 2.6 (RTX PRO 4000); its four Q6_K matrices (blk.2 / blk.4 ffn_down and attn_v) took 1.63 ms
+            // of four requests' 8.0 ms lanes block on the decode kernels in 8-row pieces, the engine's Q6_K product 0.62 (RTX
+            // PRO 4500). Only a drafter's weights take them: a target's product stays a decode row's sums, so a verify window
+            // answers as plain decode does. A drafter's last bits need not match anything: its proposals are verified. A
             // drafter's weight takes them in any step (IGraphExecutor.MarkDrafterWeight): the trunk's prompt step that writes a
             // block drafter's ring had dequantized each of its weights to F16 for cuBLAS (Qwen3.8-27B DFlash2, a 62-token prompt
             // on an RTX PRO 6000 slice: 3.7 of the ring's 4.2 ms of device time, 1.6 ms now; the direct engine's ring took 1.2).
@@ -4084,14 +4087,18 @@ namespace TensorSharp.Cuda
                 && outDim <= int.MaxValue && weight.Ne2 <= 1 && weight.Bytes % outDim == 0 && x.Storage is CudaStorage ds
                 && x.ElementType == DType.Float32 && x.IsContiguous() && x.ElementCount() == rows * inDim && cuda.Kernels != null
                 && Kernels is { TakesQ4kMma: true } q4k && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr qPtr,
-                    out int qType) && qType == 12)
+                    out int qType) && (qType == 12 || (qType == 14 && q4k.TakesQ6kMma)))
             {
                 (Tensor xq, Tensor xd) = SplitQuantizedOnce(cuda, x, ds, inDim, rows);
                 var product = new Tensor(Allocator, DType.Float32, rows, outDim);
                 ((CudaStorage)product.Storage).EnsureDeviceCurrent();
                 cuda.Context.MakeCurrent();
-                q4k.LaunchGemmQ4k(qPtr, weight.Bytes / outDim, (int)outDim, (int)inDim, Ptr(xq), Ptr(xd), (int)rows, Ptr(product),
-                    cuda.Stream.Handle);
+                if (qType == 12)
+                    q4k.LaunchGemmQ4k(qPtr, weight.Bytes / outDim, (int)outDim, (int)inDim, Ptr(xq), Ptr(xd), (int)rows, Ptr(product),
+                        cuda.Stream.Handle);
+                else
+                    q4k.LaunchGemmQ6k(qPtr, weight.Bytes / outDim, (int)outDim, (int)inDim, Ptr(xq), Ptr(xd), (int)rows, Ptr(product),
+                        cuda.Stream.Handle);
                 ((CudaStorage)product.Storage).MarkDeviceModified();
                 return product;
             }
