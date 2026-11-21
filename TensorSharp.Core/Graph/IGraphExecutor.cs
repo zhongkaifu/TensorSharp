@@ -134,6 +134,11 @@ namespace TensorSharp.Graph
         void SyncToHost(IntPtr data, long bytes);
 
         /// <summary>The host bytes at <paramref name="data"/> changed (or are being freed): drop device copies.</summary>
+        /// <remarks>An executor that <see cref="GraphCapabilities.BindsHostPointers"/> keys the device copy of a weight or
+        /// state leaf by the address and size of its host bytes alone, and keeps it after the plan is gone. A caller that
+        /// frees, re-pins or rewrites such bytes calls this first. Otherwise the next bytes of the same size at that
+        /// address bind the old copy and compute with the old values, with no error. Those bytes can be an array pinned
+        /// again where the GC reused the address, or a recycled pool block.</remarks>
         void Invalidate(IntPtr data);
 
         /// <summary>A weight the model reads only through its products (an untied LM head, never gathered by rows), by its
