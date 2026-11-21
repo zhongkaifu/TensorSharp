@@ -81,15 +81,19 @@ namespace TensorSharp.Models
         private bool _disposed;
 
         /// <summary>
-        /// The tower's claim on its device (<see cref="GpuMemoryBudget.Reserve"/>) on the discrete GPUs whose caches are sized
-        /// from free memory (ggml_cuda, ggml_vulkan: the device the GGML budget reads; direct CUDA: the allocator's): its
-        /// weights until the first image uploads them, and the compute of the largest image it accepts
+        /// The tower's claim on its device (<see cref="GpuMemoryBudget.Reserve"/>) on the backends whose caches are sized from
+        /// the device's free memory (ggml_cuda, ggml_vulkan and ggml_metal: the device the GGML budget reads; direct CUDA: the
+        /// allocator's): its weights until the first image uploads them, and the compute of the largest image it accepts
         /// (<see cref="ReservedComputeBytes"/>) while it is loaded. A KV cache that grows before any image has come then leaves
-        /// the first image its room, as llama.cpp's mtmd does by allocating both when it loads. Null elsewhere: Metal and MLX
-        /// share host memory and keep their own caps.
+        /// the first image its room, as llama.cpp's mtmd does by allocating both when it loads. On ggml_metal a command buffer
+        /// past the working set fails outright and latches the backend's error, where CUDA returns out of memory. Null
+        /// elsewhere: MLX's caches are not sized from a device reading, and the CPU backends have none.
         /// </summary>
         private readonly DeviceReservation _reservation;
         private bool _weightsUploaded;
+
+        /// <summary>The programs run on ggml_metal (<see cref="ComputeBytes"/>'s factor).</summary>
+        private readonly bool _metal;
 
         /// <summary>Load the vision tower of the mmproj at <paramref name="mmprojPath"/> onto <paramref name="allocator"/> (the
         /// model's; <paramref name="backend"/> is its backend, which decides the weights' formats).</summary>
@@ -133,6 +137,7 @@ namespace TensorSharp.Models
                 Graph = new NetworkGraph(Weights, executor, "muse-glimmer vision tower") { MaxCachedPlans = MaxParts };
                 Graph.FloatProducts = Graph.Executor is not ManagedGraphExecutor;
                 _materializesAttention = Graph.Executor is TensorGraphExecutor && Graph.Executor is not MlxGraphExecutor;
+                _metal = backend == BackendType.GgmlMetal;
                 ReservedComputeBytes = ComputeBytes((long)MaxTokens * MergeSize * MergeSize);
                 _reservation = ReserveDevice(allocator, backend, Weights.QuantizedBytes + Weights.DenseBytes + ReservedComputeBytes);
                 // GGML's rotary kernels read a strided half-head view where it lies; the tensor executors' do not (MLX's
@@ -564,7 +569,7 @@ namespace TensorSharp.Models
         internal long ReservedComputeBytes { get; }
 
         /// <summary>The bytes the tower claims on its device now (0 where it claims none).</summary>
-        internal long ReservedBytes => _reservation?.Bytes ?? 0;
+        internal long ReservedBytes => _disposed ? 0 : _reservation?.Bytes ?? 0;
 
         /// <summary>
         /// The device memory an image of <paramref name="patches"/> patches takes to encode beyond the weights: per patch, a
@@ -573,22 +578,23 @@ namespace TensorSharp.Models
         /// its scores the score budget of one piece. Measured on an RTX PRO 4500 Blackwell with a 1792 x 1792 image (16384
         /// patches) as the first image of a process, beyond the 1951 MiB of weights: ggml_cuda 1496 MiB and ggml_vulkan 1216
         /// MiB (flash attention, one arena; nvidia-smi's peak, or ggml's reading where higher), direct CUDA 3463 MiB
-        /// (materialized scores in 256 MiB pieces, the pool's blocks). These factors give 1640 and 3864 MiB.
+        /// (materialized scores in 256 MiB pieces, the pool's blocks); these factors give 1640 and 3864 MiB. On an M5 Pro
+        /// (48 GB) ggml_metal took 795 MiB by ggml's reading and 1010 MiB by the wired memory's growth past the weights; its
+        /// factor gives 1148 MiB.
         /// </summary>
         internal long ComputeBytes(long patches)
         {
             long perPatch = ((long)FeedForwardLength + EmbeddingLength) * sizeof(float);
-            return _materializesAttention
-                ? patches * perPatch * 11 / 2 + AttentionScoreBudget
-                : patches * perPatch * 5 / 2;
+            if (_materializesAttention) return patches * perPatch * 11 / 2 + AttentionScoreBudget;
+            return _metal ? patches * perPatch * 7 / 4 : patches * perPatch * 5 / 2;
         }
 
         private DeviceReservation ReserveDevice(IAllocator allocator, BackendType backend, long bytes)
         {
             DeviceReservation reservation = backend switch
             {
-                BackendType.GgmlCuda or BackendType.GgmlVulkan => GpuMemoryBudget.Reserve(backend, GpuMemoryBudget.GgmlDevice,
-                    "muse-glimmer vision tower", bytes),
+                BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal
+                    => GpuMemoryBudget.Reserve(backend, GpuMemoryBudget.GgmlDevice, "muse-glimmer vision tower", bytes),
                 BackendType.Cuda when allocator is TensorSharp.Cuda.CudaAllocator cuda => GpuMemoryBudget.Reserve(backend, cuda.DeviceId,
                     "muse-glimmer vision tower", bytes),
                 _ => null,

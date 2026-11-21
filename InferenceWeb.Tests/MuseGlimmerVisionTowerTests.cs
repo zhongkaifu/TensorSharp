@@ -318,6 +318,41 @@ public sealed class MuseGlimmerVisionTowerTests(ITestOutputHelper output) : IDis
             Assert.True(spread <= 3 * ParityBound, $"legacy's executors are {spread:E3} apart, past three times the bound {ParityBound:E1}");
     }
 
+    /// <summary>A tower on a backend whose caches are sized from the device's free memory (ggml_cuda, ggml_vulkan, ggml_metal,
+    /// direct CUDA) claims its weights and the compute of the largest image it accepts on that device when it loads
+    /// (<see cref="GpuMemoryBudget.Reserve"/>), only the compute once an image has uploaded the weights, and nothing once
+    /// disposed; the managed, ggml_cpu and MLX towers claim nothing. Each lane this process can open: the managed backend,
+    /// the pinned GGML backend, MLX and direct CUDA.</summary>
+    [Fact]
+    public void TheTowerClaimsItsDeviceMemoryOnTheBackendsThatSizeCachesFromIt()
+    {
+        var backends = new List<BackendType> { BackendType.Cpu, TestGates.PinnedGgmlBackend };
+        if (TestGates.MlxSkip == null) backends.Add(BackendType.Mlx);
+        if (TestGates.CudaSkip == null) backends.Add(BackendType.Cuda);
+        foreach (BackendType backend in backends)
+        {
+            using var lane = new Lane(backend);
+            MuseGlimmerVisionTower tower = Tower(lane, Mmproj);
+            bool claims = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal or BackendType.Cuda;
+            long weights = tower.Weights.QuantizedBytes + tower.Weights.DenseBytes;
+            long compute = tower.ComputeBytes((long)MuseGlimmerVisionTower.MaxTokens * tower.MergeSize * tower.MergeSize);
+            output.WriteLine($"{backend}: claims {tower.ReservedBytes} bytes at load ({weights} of weights, {compute} of compute)");
+            Assert.Equal(compute, tower.ReservedComputeBytes);
+            Assert.True(compute > 0);
+            Assert.Equal(claims ? weights + compute : 0, tower.ReservedBytes);
+            if (claims)
+            {
+                int device = lane.Allocator is CudaAllocator cuda ? cuda.DeviceId : GpuMemoryBudget.GgmlDevice;
+                Assert.True(GpuMemoryBudget.ReservedBytes(backend, device) >= tower.ReservedBytes, "the claim is on the device's readings");
+            }
+            var (w, h, px) = Image((4, 4), 3);
+            tower.EncodeToHost(px, w, h, out _);
+            Assert.Equal(claims ? compute : 0, tower.ReservedBytes);
+            tower.Dispose();
+            Assert.Equal(0, tower.ReservedBytes);
+        }
+    }
+
     /// <summary>Several images on one tower: each geometry's program is compiled once and replayed, a replay gives the rows a
     /// fresh tower gives, and another geometry in between changes nothing.</summary>
     [Fact]

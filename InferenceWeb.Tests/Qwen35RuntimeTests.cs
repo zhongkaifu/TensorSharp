@@ -2731,11 +2731,17 @@ public sealed class Qwen35RuntimeTests : IDisposable
     /// <summary>Memory claimed on the GGML device (<see cref="GpuMemoryBudget.Reserve"/>: a loaded vision tower's weights before
     /// the first image uploads them, and its largest image's compute) counts as taken: a second request's slot that fits the
     /// free memory beside the headroom only with the claim counted as free waits, and the prefix cache is asked for the
-    /// difference; once the claim is given up the slot is made. The model names a device no real reading uses, so the claim
-    /// reaches no other test.</summary>
+    /// difference; once the claim is given up the slot is made (ggml_cuda, and ggml_metal's working set). The model names a
+    /// device no real reading uses, so the claim reaches no other test.</summary>
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData(BackendType.GgmlCuda)]
-    public void NewSlotsLeaveReservedDeviceMemoryOnCuda(BackendType backend)
+    public void NewSlotsLeaveReservedDeviceMemoryOnCuda(BackendType backend) => AssertSlotsLeaveReservedDeviceMemory(backend);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlMetal)]
+    public void NewSlotsLeaveReservedDeviceMemoryOnMetal(BackendType backend) => AssertSlotsLeaveReservedDeviceMemory(backend);
+
+    private void AssertSlotsLeaveReservedDeviceMemory(BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         using var model = Create(Fixture("dense"), backend: backend);
