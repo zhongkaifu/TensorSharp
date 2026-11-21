@@ -478,7 +478,10 @@ namespace TensorSharp.Models
                 var operands = new (int Qkv, int Z, int Z4, int Beta, int Alpha)[step.Sequences];
                 var windows = new int[step.Sequences];
                 var histories = new int[step.Sequences];
-                var srcs = new List<int>(5 * step.Sequences + 3);
+                var planes = new int[step.Sequences];
+                // Every window in place with its saved-input planes (the commit re-steps the kept rows from them): the preps may
+                // write their q, k, v and gates straight there, and the scans then save nothing (038fb303's verify buffers).
+                bool saved = InPlaceRecurrentState;
                 for (int s = 0; s < step.Sequences; s++)
                 {
                     var state = (DeviceGdnState)step.SequenceState(s, layer);
@@ -486,10 +489,17 @@ namespace TensorSharp.Models
                     windows[s] = step.State(state.Conv, GraphFormat.F32, convRows, channels);
                     if (state.EnsureSpecBuffers(step.Counts[s])) NoteGraphBindingsChanged();
                     histories[s] = HistoryView(state, step.Counts[s]);
+                    saved &= state.WindowInPlace(step.Counts[s]) && state.SavedInputs != null;
+                    if (saved) planes[s] = step.State(state.SavedInputs, GraphFormat.F32, state.SavedInputFloats);
+                }
+                var srcs = new List<int>(6 * step.Sequences + 3);
+                for (int s = 0; s < step.Sequences; s++)
+                {
                     srcs.AddRange(new[] { windows[s], operands[s].Qkv, operands[s].Alpha, operands[s].Beta, histories[s] });
+                    if (saved) srcs.Add(planes[s]);
                 }
                 srcs.AddRange(new[] { convW, dt, a });
-                step.BeginFused(GraphFusion.DeltaNetPreps, srcs.ToArray(), stackalloc long[] { dk, kHeads, dv, vHeads, step.Sequences },
+                step.BeginFused(GraphFusion.DeltaNetPreps, srcs.ToArray(), stackalloc long[] { dk, kHeads, dv, vHeads, step.Sequences, saved ? 1 : 0 },
                     stackalloc[] { eps });
                 var results = new List<int>(5 * step.Sequences);
                 for (int s = 0; s < step.Sequences; s++)

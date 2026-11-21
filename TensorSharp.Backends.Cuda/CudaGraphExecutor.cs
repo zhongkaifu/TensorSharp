@@ -2498,7 +2498,10 @@ namespace TensorSharp.Cuda
         {
             CudaGraphKernels kernels = Kernels;
             int n = ip != null && ip.Length >= 5 ? (int)ip[4] : 0;
-            if (kernels is not { TakesPrepSequences: true } || n < 1 || n > CudaGraphKernels.PrepSequences || inputs.Length != 5 * n + 3
+            // With ip[5] set each sequence's inputs carry its window's saved-input planes too (six a sequence).
+            bool planes = ip != null && ip.Length >= 6 && ip[5] != 0;
+            int per = planes ? 6 : 5;
+            if (kernels is not { TakesPrepSequences: true } || n < 1 || n > CudaGraphKernels.PrepSequences || inputs.Length != per * n + 3
                 || results.Length != 5 * n)
                 return false;
             var cuda = (CudaAllocator)Allocator;
@@ -2506,7 +2509,7 @@ namespace TensorSharp.Cuda
                 return false;
             int dk = (int)ip[0], kHeads = (int)ip[1], dv = (int)ip[2], vHeads = (int)ip[3];
             float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
-            Tensor convW = inputs[5 * n], dtT = inputs[5 * n + 1], aT = inputs[5 * n + 2];
+            Tensor convW = inputs[per * n], dtT = inputs[per * n + 1], aT = inputs[per * n + 2];
             int channels = (int)inputs[0].Sizes[0], convRows = (int)inputs[0].Sizes[^1], width = (int)convW.Sizes[^1];
             int rows = (int)(inputs[1].ElementCount() / Math.Max(1, channels));
             long qkvPitch = 0, abPitch = 0;
@@ -2514,9 +2517,12 @@ namespace TensorSharp.Cuda
                 || CudaGraphKernels.TakesTiledDeltaNetPrep(convRows, width, dk, rows)
                 || convW.ElementCount() != (long)channels * width || !convW.IsContiguous() || !dtT.IsContiguous() || !aT.IsContiguous())
                 return false;
+            // A window's saved-input planes ([save rows] tall: q | k [t][kHeads][dk], v [t][vHeads][dv], g | beta [t][vHeads]).
+            long saveRows = 0;
             for (int j = 0; j < n; j++)
             {
-                Tensor window = inputs[5 * j], qkv = inputs[5 * j + 1], alpha = inputs[5 * j + 2], beta = inputs[5 * j + 3], hist = inputs[5 * j + 4];
+                Tensor window = inputs[per * j], qkv = inputs[per * j + 1], alpha = inputs[per * j + 2], beta = inputs[per * j + 3],
+                    hist = inputs[per * j + 4];
                 if (!window.IsContiguous() || window.ElementCount() != (long)channels * convRows || window.Sizes[^1] != convRows
                     || qkv.ElementCount() != (long)channels * rows || alpha.ElementCount() != (long)rows * vHeads
                     || beta.ElementCount() != (long)rows * vHeads || !hist.IsContiguous() || hist.ElementCount() != (long)channels * (convRows + rows)
@@ -2524,41 +2530,116 @@ namespace TensorSharp.Cuda
                     || ja != jb || (j > 0 && (jq != qkvPitch || ja != abPitch)))
                     return false;
                 (qkvPitch, abPitch) = (jq, ja);
+                if (planes)
+                {
+                    Tensor saved = inputs[per * j + 5];
+                    long rowFloats = (long)channels + 2L * vHeads, js = saved.ElementCount() / rowFloats;
+                    if (!saved.IsContiguous() || saved.ElementCount() % rowFloats != 0 || js < rows || (j > 0 && js != saveRows))
+                        return false;
+                    saveRows = js;
+                }
             }
             IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
             foreach (Tensor t in inputs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
-            long total = (long)n * rows;
-            using var qAll = new Tensor(Allocator, DType.Float32, total, kHeads, dk);
-            using var kAll = new Tensor(Allocator, DType.Float32, total, kHeads, dk);
-            using var vAll = new Tensor(Allocator, DType.Float32, total, vHeads, dv);
-            using var gAll = new Tensor(Allocator, DType.Float32, total, vHeads, 1);
-            using var betaAll = new Tensor(Allocator, DType.Float32, total, vHeads, 1);
-            Tensor[] outs = { qAll, kAll, vAll, gAll, betaAll };
-            foreach (Tensor t in outs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
-            var args = new CudaGraphKernels.PrepSequencesArgs();
-            unsafe
+            bool blockRows = kernels.TakesPrepSequences2 && rows <= CudaGraphKernels.PrepSequences2Rows && convRows == width - 1
+                && width <= CudaGraphKernels.PrepSequences2Width && dk <= 256;
+            if (planes && !blockRows) return false;
+            long qkFloats = (long)rows * kHeads * dk, vFloats = (long)rows * vHeads * dv, gFloats = (long)rows * vHeads;
+            Tensor[] outs = null;
+            if (!planes)
             {
+                long total = (long)n * rows;
+                outs = new[]
+                {
+                    new Tensor(Allocator, DType.Float32, total, kHeads, dk), new Tensor(Allocator, DType.Float32, total, kHeads, dk),
+                    new Tensor(Allocator, DType.Float32, total, vHeads, dv), new Tensor(Allocator, DType.Float32, total, vHeads, 1),
+                    new Tensor(Allocator, DType.Float32, total, vHeads, 1),
+                };
+                foreach (Tensor t in outs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            }
+            // Sequence j's q, k, v, g and beta: its rows of the shared outputs, or the start of each of its saved-input planes.
+            long[] PlaneAt(int j)
+            {
+                if (!planes) return new[] { j * qkFloats, j * qkFloats, j * vFloats, j * gFloats, j * gFloats };
+                long q = saveRows * kHeads * dk, v = saveRows * vHeads * dv, g = saveRows * vHeads;
+                return new[] { 0, q, 2 * q, 2 * q + v, 2 * q + v + g };
+            }
+            Tensor OutOf(int j, int o) => planes ? inputs[per * j + 5] : outs[o];
+            cuda.Context.MakeCurrent();
+            try
+            {
+                if (blockRows)
+                {
+                    var args = new CudaGraphKernels.PrepSequences2Args();
+                    unsafe
+                    {
+                        for (int j = 0; j < n; j++)
+                        {
+                            long[] at = PlaneAt(j);
+                            args.Window[j] = (long)P(inputs[per * j]);
+                            args.Qkv[j] = (long)P(inputs[per * j + 1]);
+                            args.Alpha[j] = (long)P(inputs[per * j + 2]);
+                            args.Beta[j] = (long)P(inputs[per * j + 3]);
+                            args.ConvIn[j] = (long)P(inputs[per * j + 4]);
+                            args.Q[j] = (long)(P(OutOf(j, 0)) + (nint)(at[0] * 4));
+                            args.K[j] = (long)(P(OutOf(j, 1)) + (nint)(at[1] * 4));
+                            args.V[j] = (long)(P(OutOf(j, 2)) + (nint)(at[2] * 4));
+                            args.G[j] = (long)(P(OutOf(j, 3)) + (nint)(at[3] * 4));
+                            args.BetaOut[j] = (long)(P(OutOf(j, 4)) + (nint)(at[4] * 4));
+                        }
+                    }
+                    kernels.LaunchDeltaNetPrepSequences2(args, n, P(convW), P(dtT), P(aT), channels, convRows, width, dk, kHeads, vHeads, rows,
+                        eps, qkvPitch, abPitch, cuda.Stream.Handle);
+                    PrepSequence2Launches++;
+                }
+                else
+                {
+                    var args = new CudaGraphKernels.PrepSequencesArgs();
+                    unsafe
+                    {
+                        for (int j = 0; j < n; j++)
+                        {
+                            args.Window[j] = (long)P(inputs[per * j]);
+                            args.Qkv[j] = (long)P(inputs[per * j + 1]);
+                            args.Alpha[j] = (long)P(inputs[per * j + 2]);
+                            args.Beta[j] = (long)P(inputs[per * j + 3]);
+                            args.ConvIn[j] = (long)P(inputs[per * j + 4]);
+                        }
+                    }
+                    kernels.LaunchDeltaNetPrepSequences(args, n, P(convW), P(dtT), P(aT), P(outs[0]), P(outs[1]), P(outs[2]), P(outs[3]),
+                        P(outs[4]), channels, convRows, width, dk, kHeads, vHeads, rows, eps, qkvPitch, abPitch, cuda.Stream.Handle);
+                }
+                long[][] shapes = { new long[] { rows, kHeads, dk }, new long[] { rows, kHeads, dk }, new long[] { rows, vHeads, dv },
+                    new long[] { rows, vHeads, 1 }, new long[] { rows, vHeads, 1 } };
+                long[] counts = { qkFloats, qkFloats, vFloats, gFloats, gFloats };
                 for (int j = 0; j < n; j++)
                 {
-                    args.Window[j] = (long)P(inputs[5 * j]);
-                    args.Qkv[j] = (long)P(inputs[5 * j + 1]);
-                    args.Alpha[j] = (long)P(inputs[5 * j + 2]);
-                    args.Beta[j] = (long)P(inputs[5 * j + 3]);
-                    args.ConvIn[j] = (long)P(inputs[5 * j + 4]);
+                    ((CudaStorage)inputs[per * j + 4].Storage).MarkDeviceModified();
+                    long[] at = PlaneAt(j);
+                    for (int o = 0; o < 5; o++)
+                    {
+                        Tensor home = OutOf(j, o);
+                        ((CudaStorage)home.Storage).MarkDeviceModified();
+                        using Tensor flat = home.View(home.ElementCount());
+                        using Tensor part = flat.Narrow(0, at[o], counts[o]);
+                        results[5 * j + o] = part.View(shapes[o]);
+                    }
                 }
             }
-            cuda.Context.MakeCurrent();
-            kernels.LaunchDeltaNetPrepSequences(args, n, P(convW), P(dtT), P(aT), P(qAll), P(kAll), P(vAll), P(gAll), P(betaAll), channels,
-                convRows, width, dk, kHeads, vHeads, rows, eps, qkvPitch, abPitch, cuda.Stream.Handle);
-            foreach (Tensor t in outs) ((CudaStorage)t.Storage).MarkDeviceModified();
-            for (int j = 0; j < n; j++)
+            finally
             {
-                ((CudaStorage)inputs[5 * j + 4].Storage).MarkDeviceModified();
-                for (int o = 0; o < 5; o++) results[5 * j + o] = outs[o].Narrow(0, (long)j * rows, rows);
+                if (outs != null) foreach (Tensor t in outs) t.Dispose();
             }
+            if (planes) PrepIntoSavedInputs++;
             PrepSequenceLaunches++;
             return true;
         }
+
+        /// <summary>Several sequences' preps that wrote their q, k, v and gates into their windows' saved-input planes (the scan then
+        /// saves nothing), and those that ran a block a head over every row (tests check them).</summary>
+        internal long PrepIntoSavedInputs { get; private set; }
+
+        internal long PrepSequence2Launches { get; private set; }
 
         /// <summary>
         /// Several sequences' gated norms of one layer and their rows' concatenation (<see cref="GraphFusion.GatedRmsNorms"/>) in
@@ -2656,6 +2737,19 @@ namespace TensorSharp.Cuda
                 if (ip[1 + j] != ip[1]) return false;
             long rowFloats = (long)tokens * heads * s;
             IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
+            // Sequence j's q, k, v, g and beta at the starts of its saved-input planes (scalar gates; planes ip[1 + j] rows tall).
+            bool InSavedPlanes(int j)
+            {
+                if (kda) return false;
+                long rows = ip[1 + j], q = rows * keyHeads * s, v = rows * heads * s, g = rows * heads;
+                Tensor save = inputs[7 * j + 6];
+                if (!ReferenceEquals(save.Storage, inputs[7 * j].Storage)) return false;
+                long[] at = { 0, q, 2 * q, 2 * q + v, 2 * q + v + g };
+                for (int i = 0; i < 5; i++)
+                    if (!ReferenceEquals(inputs[7 * j + i].Storage, save.Storage) || inputs[7 * j + i].StorageOffset != save.StorageOffset + at[i])
+                        return false;
+                return true;
+            }
             foreach (Tensor t in inputs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
             for (int j = 0; j < n; j++)
             {
@@ -2679,7 +2773,8 @@ namespace TensorSharp.Cuda
                         args.Beta[z] = (long)P(inputs[7 * j + 4]);
                         args.State[z] = (long)P(inputs[7 * j + 5]);
                         args.Out[z] = (long)P(results[j]);
-                        args.Save[z] = (long)P(inputs[7 * j + 6]);
+                        // Inputs already in the saved-input planes (the prep region wrote them there): nothing to save.
+                        args.Save[z] = InSavedPlanes(j) ? 0 : (long)P(inputs[7 * j + 6]);
                     }
                 }
                 kernels.LaunchGatedDeltaNetScanSequences(args, count, s, heads, keyHeads, tokens, kda, (int)ip[1], cuda.Stream.Handle);

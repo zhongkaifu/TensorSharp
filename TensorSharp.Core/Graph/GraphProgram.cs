@@ -349,10 +349,12 @@ namespace TensorSharp.Graph
         SequenceAttentions = 27,
         /// <summary>Several sequences' delta-rule inputs of one gated delta-net layer (a batched verify's windows, each sequence
         /// with its own conv window and history): each sequence's <see cref="DeltaNetPrep"/> region and the copy of its conv
-        /// input into its conv history. Inputs: per sequence its conv window, qkv, alpha and beta (its prep region's) and its conv
-        /// history's view [convRows + rows, channels], in sequence order; then the conv kernel, dt and a. Ip: dk, k heads, dv,
-        /// v heads, the sequences. Fp: eps. Results: per sequence its prep's q, k, v, g and beta, in sequence order. An executor
-        /// may run every sequence's prep in one dispatch, writing each conv input into its history; each value is its op's.</summary>
+        /// input into its conv history. Inputs: per sequence its conv window, qkv, alpha and beta (its prep region's), its conv
+        /// history's view [convRows + rows, channels] and, with ip[5] set, its window's saved scan inputs (the leaf its
+        /// GatedDeltaNet window op saves q | k | v | g | beta into), in sequence order; then the conv kernel, dt and a. Ip: dk,
+        /// k heads, dv, v heads, the sequences, the saved-inputs flag. Fp: eps. Results: per sequence its prep's q, k, v, g and
+        /// beta, in sequence order. An executor may run every sequence's prep in one dispatch, writing each conv input into its
+        /// history (and its results into its saved inputs' planes, read there by the scans); each value is its op's.</summary>
         DeltaNetPreps = 28,
         /// <summary>Several sequences' gated norms of one gated delta-net layer (a batched verify's windows) and the concatenation
         /// of their results along the rows: each sequence's <see cref="GatedRmsNorm"/> region, then the concatenation. Inputs:

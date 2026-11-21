@@ -123,13 +123,14 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         string path = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35.gguf"));
         int[] all = Enumerable.Range(0, Prompts.Length).ToArray();
         List<float[]>[] together, apart;
-        long regions, windows, preps, norms, writes;
+        long regions, windows, preps, norms, writes, planes, blockRows;
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
             together = Run(model, all);
             var executor = (CudaGraphExecutor)model.GraphExecutorForTests;
             (regions, windows, preps, norms, writes) = (executor.DeltaNetScanRegions, executor.SequenceWindowLaunches, executor.PrepSequenceLaunches,
                 executor.GatedNormSequenceLaunches, executor.SequenceWriteLaunches);
+            (planes, blockRows) = (executor.PrepIntoSavedInputs, executor.PrepSequence2Launches);
         }
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
@@ -148,6 +149,10 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         Assert.True(windows > 0, "no verify step attended its sequences' windows in one launch");
         Assert.True(preps > 0, "no verify step prepared its sequences' delta-rule inputs in one launch");
         Assert.True(norms > 0, "no verify step normed its sequences' outputs in one launch");
+        // The preps wrote their q, k, v and gates into the windows' saved-input planes (the scans saved nothing), a block a head
+        // over every row.
+        Assert.True(planes > 0, "no verify step's preps wrote the windows' saved inputs");
+        Assert.True(blockRows > 0, "no verify step's preps ran a block a head over its rows");
         // An F16 cache's rows are written for every sequence in one launch; a q8_0 cache's each as before.
         if (kv == KvCacheDtype.F16) Assert.True(writes > 0, "no verify step wrote its sequences' cache rows in one launch");
         var alone = new List<float[]>[Prompts.Length];
@@ -161,6 +166,6 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
             Assert.Equal(0, vsOps);
             Assert.Equal(0, vsAlone);
         }
-        _output.WriteLine($"{regions} scan regions, {preps} prep regions, {norms} norm regions, {writes} write launches, {windows} window regions");
+        _output.WriteLine($"{regions} scan regions, {preps} prep regions ({planes} into the saved inputs), {norms} norm regions, {writes} write launches, {windows} window regions");
     }
 }

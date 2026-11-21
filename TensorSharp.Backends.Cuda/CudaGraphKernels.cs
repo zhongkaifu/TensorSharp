@@ -29,7 +29,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
         private readonly IntPtr _setRowsHeads;
         private readonly IntPtr _gdnScanSeqs, _gdnScanSeqsKda;
-        private readonly IntPtr _deltaNetPrepSeqs, _gatedRmsNormSeqs, _cacheRowsSeqs;
+        private readonly IntPtr _deltaNetPrepSeqs, _gatedRmsNormSeqs, _cacheRowsSeqs, _deltaNetPrepSeqs2;
         private readonly IntPtr _gdn8, _gdn8Scan, _gdn8ScanKda, _gdn8ScanSeqs, _gdn8ScanSeqsKda, _gdn8Commit;
         private readonly IntPtr _ringAttnLanes64, _ringAttnLanes128;
         private readonly int _multiprocessors;
@@ -59,6 +59,14 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500)
             {
                 _deltaNetPrepSeqs = _gatedRmsNormSeqs = _cacheRowsSeqs = IntPtr.Zero;
+            }
+            try
+            {
+                _deltaNetPrepSeqs2 = module.GetFunction("ts_graph_deltanet_prep_seqs2_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _deltaNetPrepSeqs2 = IntPtr.Zero;
             }
             try
             {
@@ -1143,6 +1151,48 @@ namespace TensorSharp.Cuda
             long total = (long)heads * count * headDim;
             CudaDriverApi.cuLaunchKernel(_cacheRowsSeqs, (uint)((total + 255) / 256), (uint)entries, 1, 256, 1, 1, 0, stream, (IntPtr)argv,
                 IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Rows and conv taps <see cref="LaunchDeltaNetPrepSequences2"/> takes (TS_GRAPH_PREP2_ROWS, TS_GRAPH_PREP2_WIDTH).</summary>
+        public const int PrepSequences2Rows = 16, PrepSequences2Width = 8;
+
+        /// <summary>Whether this image runs <see cref="LaunchDeltaNetPrepSequences2"/>.</summary>
+        public bool TakesPrepSequences2 => _deltaNetPrepSeqs2 != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_deltanet_prep_seqs2_f32, byte for byte (struct ts_graph_prep2_seqs): each sequence's
+        /// conv window, qkv, alpha and beta rows, its conv history, and where its q, k, v, g and beta go.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct PrepSequences2Args
+        {
+            public fixed long Window[PrepSequences];
+            public fixed long Qkv[PrepSequences];
+            public fixed long Alpha[PrepSequences];
+            public fixed long Beta[PrepSequences];
+            public fixed long ConvIn[PrepSequences];
+            public fixed long Q[PrepSequences];
+            public fixed long K[PrepSequences];
+            public fixed long V[PrepSequences];
+            public fixed long G[PrepSequences];
+            public fixed long BetaOut[PrepSequences];
+        }
+
+        /// <summary><see cref="LaunchDeltaNetPrepSequences"/>' values (ts_graph_deltanet_prep_f32's), a block a head and sequence
+        /// over all its rows: the conv history written in one coalesced pass, the outputs at each sequence's own pointers.</summary>
+        public void LaunchDeltaNetPrepSequences2(PrepSequences2Args args, int sequences, IntPtr convW, IntPtr dt, IntPtr a,
+            int channels, int convRows, int width, int d, int kHeads, int vHeads, int rows, float eps, long qkvPitch, long alphaBetaPitch,
+            IntPtr stream)
+        {
+            if (sequences < 1 || sequences > PrepSequences || d % 32 != 0 || d > 256 || rows < 1 || rows > PrepSequences2Rows
+                || width > PrepSequences2Width || convRows != width - 1)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of {rows} rows, head width {d}, {width} taps");
+            PrepSequences2Args* p = &args;
+            void** argv = stackalloc void*[]
+            {
+                p, &convW, &dt, &a, &channels, &convRows, &width, &d, &kHeads, &vHeads, &rows, &eps, &qkvPitch, &alphaBetaPitch,
+            };
+            uint smem = (uint)((long)d * (convRows + rows) * sizeof(float));
+            CudaDriverApi.cuLaunchKernel(_deltaNetPrepSeqs2, (uint)(2 * kHeads + vHeads), (uint)sequences, 1, (uint)d, 1, 1, smem,
+                stream, (IntPtr)argv, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>The argument of ts_graph_gated_rms_norm_seqs_f32 (struct ts_graph_gated_norm_seqs): each sequence's y and z.</summary>

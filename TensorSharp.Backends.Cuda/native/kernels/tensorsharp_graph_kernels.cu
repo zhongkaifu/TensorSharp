@@ -4114,3 +4114,86 @@ extern "C" __global__ void __launch_bounds__(128) ts_graph_gdn8_commit_f32(const
         (ts_graph_gdn8<16>(in, in + qk, in + 2 * qk, in + 2 * qk + vs, in + 2 * qk + vs + gs, c.state[layer], c.out[layer],
             h, c.hk, steps, 1, 1, 0, nullptr, nullptr, 0, 0, head, r0, lane)));
 }
+
+// GraphFusion.DeltaNetPreps, one block a (head, sequence) over every row of the sequence's window: ts_graph_deltanet_prep_f32's
+// values to the bit (its expressions, copied: each channel's convolution taps in order, SiLU, the q/k heads' L2 norm as a warp
+// sum a 32 channels then the warps' sums in order, the gates), with the head's conv inputs staged in shared memory and written
+// to its conv history in one coalesced pass (a head's channels are one run of 128 * span floats there), where the per-row
+// kernel wrote a float every span floats. Each sequence's q, k, v, g and beta go where its table says (rows contiguous at the
+// pitch of their [rows][heads][d] or [rows][v_heads] layout: a window's saved-input planes, which the commit's re-step reads).
+// Launch: grid (2 * k_heads + v_heads, sequences), block d (d % 32 == 0, d <= 128), dynamic shared memory
+// d * (conv_rows + rows) floats; rows <= TS_GRAPH_PREP2_ROWS, conv_rows < width <= TS_GRAPH_PREP2_WIDTH.
+#define TS_GRAPH_PREP2_ROWS 16
+#define TS_GRAPH_PREP2_WIDTH 8
+struct ts_graph_prep2_seqs
+{
+    const float* window[TS_GRAPH_PREP_SEQS];
+    const float* qkv[TS_GRAPH_PREP_SEQS];
+    const float* alpha[TS_GRAPH_PREP_SEQS];
+    const float* beta[TS_GRAPH_PREP_SEQS];
+    float* conv_in[TS_GRAPH_PREP_SEQS];
+    float* q[TS_GRAPH_PREP_SEQS];
+    float* k[TS_GRAPH_PREP_SEQS];
+    float* v[TS_GRAPH_PREP_SEQS];
+    float* g[TS_GRAPH_PREP_SEQS];
+    float* beta_out[TS_GRAPH_PREP_SEQS];
+};
+
+extern "C" __global__ void ts_graph_deltanet_prep_seqs2_f32(const ts_graph_prep2_seqs seqs,
+    const float* __restrict__ conv_w, const float* __restrict__ dt, const float* __restrict__ a,
+    int channels, int conv_rows, int width, int d, int k_heads, int v_heads, int rows, float eps,
+    long long qkv_pitch, long long ab_pitch)
+{
+    extern __shared__ float prep2_stage[];   // [d channels][conv_rows + rows]
+    __shared__ float partial[32];
+    const int z = blockIdx.y, head = blockIdx.x, i = threadIdx.x;
+    const float* __restrict__ window = seqs.window[z];
+    const float* __restrict__ qkv = seqs.qkv[z];
+    const int span = conv_rows + rows;
+    const size_t c = (size_t)head * d + i;
+    float wk[TS_GRAPH_PREP2_WIDTH];
+#pragma unroll
+    for (int j = 0; j < TS_GRAPH_PREP2_WIDTH; j++)
+        wk[j] = j < width ? conv_w[c * width + j] : 0.0f;
+    for (int p = 0; p < conv_rows; p++)
+        prep2_stage[i * span + p] = window[c * conv_rows + p];
+    for (int t = 0; t < rows; t++)
+        prep2_stage[i * span + conv_rows + t] = qkv[(size_t)t * qkv_pitch + c];
+    for (int t = 0; t < rows; t++)
+    {
+        float x = 0.0f;
+        for (int j = 0; j < width; j++)
+            x += prep2_stage[i * span + t + j] * wk[j];
+        const float y = x / (1.0f + expf(-x));
+        if (head < 2 * k_heads)
+        {
+            const float sq = ts_graph_warp_sum(y * y);
+            __syncthreads();
+            if ((i & 31) == 0) partial[i >> 5] = sq;
+            __syncthreads();
+            float total = 0.0f;
+            for (int s = 0; s < d / 32; s++) total += partial[s];
+            const float yn = y * rsqrtf(total + eps);
+            if (head < k_heads) seqs.q[z][((size_t)t * k_heads + head) * d + i] = yn;
+            else seqs.k[z][((size_t)t * k_heads + head - k_heads) * d + i] = yn;
+        }
+        else
+        {
+            const int vh = head - 2 * k_heads;
+            seqs.v[z][((size_t)t * v_heads + vh) * d + i] = y;
+        }
+    }
+    if (head >= 2 * k_heads && i < rows)
+    {
+        const int vh = head - 2 * k_heads, t = i;
+        const size_t gi = (size_t)t * v_heads + vh, ai = (size_t)t * ab_pitch + vh;
+        const float s = seqs.alpha[z][ai] + dt[vh];
+        seqs.g[z][gi] = (s > 20.0f ? s : logf(1.0f + expf(s))) * a[vh];
+        seqs.beta_out[z][gi] = 1.0f / (1.0f + expf(-seqs.beta[z][ai]));
+    }
+    // The head's conv inputs [window | rows], one coalesced run of d * span floats of its history.
+    __syncthreads();
+    float* __restrict__ hist = seqs.conv_in[z] + (size_t)head * d * span;
+    for (int e = i; e < d * span; e += blockDim.x)
+        hist[e] = prep2_stage[e];
+}
