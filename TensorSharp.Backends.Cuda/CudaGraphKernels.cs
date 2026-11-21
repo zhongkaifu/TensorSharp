@@ -30,6 +30,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr _setRowsHeads;
         private readonly IntPtr _gdnScanSeqs, _gdnScanSeqsKda;
         private readonly IntPtr _deltaNetPrepSeqs, _gatedRmsNormSeqs, _cacheRowsSeqs;
+        private readonly IntPtr _gdn8, _gdn8Scan, _gdn8ScanKda, _gdn8ScanSeqs, _gdn8ScanSeqsKda, _gdn8Commit;
         private readonly IntPtr _ringAttnLanes64, _ringAttnLanes128;
         private readonly int _multiprocessors;
 
@@ -59,7 +60,19 @@ namespace TensorSharp.Cuda
             {
                 _deltaNetPrepSeqs = _gatedRmsNormSeqs = _cacheRowsSeqs = IntPtr.Zero;
             }
-
+            try
+            {
+                _gdn8 = module.GetFunction("ts_graph_gdn8_f32");
+                _gdn8Scan = module.GetFunction("ts_graph_gdn8_scan_f32");
+                _gdn8ScanKda = module.GetFunction("ts_graph_gdn8_scan_kda_f32");
+                _gdn8ScanSeqs = module.GetFunction("ts_graph_gdn8_scan_seqs_f32");
+                _gdn8ScanSeqsKda = module.GetFunction("ts_graph_gdn8_scan_seqs_kda_f32");
+                _gdn8Commit = module.GetFunction("ts_graph_gdn8_commit_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _gdn8 = _gdn8Scan = _gdn8ScanKda = _gdn8ScanSeqs = _gdn8ScanSeqsKda = _gdn8Commit = IntPtr.Zero;
+            }
             _gdnCommit = module.GetFunction("ts_graph_gdn_commit_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
             _sqrt = module.GetFunction("ts_graph_sqrt_f32");
@@ -449,10 +462,25 @@ namespace TensorSharp.Cuda
             int kda = perKeyDecay ? 1 : 0;
             void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda,
                 &saved, &inputs, &inputRows };
+            if (TakesGdn8For(s))
+            {
+                CudaDriverApi.cuLaunchKernel(_gdn8, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
+                    (IntPtr)args, IntPtr.Zero).ThrowOnError();
+                return;
+            }
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNet, (uint)(sequences * heads), (uint)((s + 3) / 4), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
+        /// <summary>Whether every gated delta rule this image runs (<see cref="LaunchGatedDeltaNet"/>, <see cref="LaunchGatedDeltaNetRows4"/>,
+        /// <see cref="LaunchGatedDeltaNetScanSequences"/>, <see cref="LaunchGdnCommit"/>) takes the eight-lane row sums
+        /// (ts_graph_gdn8_*, the direct engine's layout); otherwise the 32-lane ones. One arithmetic for all of them, so a verify
+        /// window's rows and a commit's re-step are the decode rows' bits.</summary>
+        public bool TakesGdn8 => _gdn8 != IntPtr.Zero;
+
+        /// <summary>Whether a head width of <paramref name="s"/> takes the eight-lane sums (64 or 128: S / 8 keys a lane stay in
+        /// registers); every other width keeps the 32-lane ones, in every kernel alike.</summary>
+        public bool TakesGdn8For(int s) => TakesGdn8 && (s == 64 || s == 128);
 
         /// <summary><see cref="LaunchGatedDeltaNet"/> with four state rows a warp (a prompt chunk reads each token's q and k
         /// once for four rows); the same results. With <paramref name="saved"/> ([heads, s, s], one sequence) the state before
@@ -466,17 +494,19 @@ namespace TensorSharp.Cuda
             IntPtr inputs = default, int inputRows = 0)
         {
             int kda = perKeyDecay ? 1 : 0;
+            bool eight = TakesGdn8For(s);
             if (slots == 0 && saved == IntPtr.Zero)
             {
                 void** sargs = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences,
                     &inputs, &inputRows };
-                CudaDriverApi.cuLaunchKernel(perKeyDecay ? _gatedDeltaNetScan4Kda : _gatedDeltaNetScan4, (uint)(sequences * heads),
+                IntPtr scan = eight ? (perKeyDecay ? _gdn8ScanKda : _gdn8Scan) : perKeyDecay ? _gatedDeltaNetScan4Kda : _gatedDeltaNetScan4;
+                CudaDriverApi.cuLaunchKernel(scan, (uint)(sequences * heads),
                     (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream, (IntPtr)sargs, IntPtr.Zero).ThrowOnError();
                 return;
             }
             void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda,
                 &saved, &inputs, &inputRows };
-            CudaDriverApi.cuLaunchKernel(_gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
+            CudaDriverApi.cuLaunchKernel(eight ? _gdn8 : _gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
@@ -513,8 +543,8 @@ namespace TensorSharp.Cuda
             // The driver copies the argument's bytes when the launch is made (or recorded).
             GdnCommitArgs* p = &args;
             void** a = stackalloc void*[] { p };
-            CudaDriverApi.cuLaunchKernel(_gdnCommit, (uint)args.Heads, (uint)((args.S + 15) / 16), (uint)args.Layers, 128, 1, 1, 0, stream,
-                (IntPtr)a, IntPtr.Zero).ThrowOnError();
+            CudaDriverApi.cuLaunchKernel(TakesGdn8For(args.S) ? _gdn8Commit : _gdnCommit, (uint)args.Heads, (uint)((args.S + 15) / 16), (uint)args.Layers, 128,
+                1, 1, 0, stream, (IntPtr)a, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Sequences <see cref="LaunchGatedDeltaNetScanSequences"/> takes in one launch (TS_GRAPH_GDN_SEQS).</summary>
@@ -548,7 +578,8 @@ namespace TensorSharp.Cuda
                 throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of S {s}");
             GdnScanSequencesArgs* p = &args;
             void** a = stackalloc void*[] { p, &s, &heads, &keyHeads, &tokens, &inputRows };
-            CudaDriverApi.cuLaunchKernel(perKeyDecay ? _gdnScanSeqsKda : _gdnScanSeqs, (uint)heads, (uint)((s + 15) / 16), (uint)sequences, 128, 1, 1, 0,
+            IntPtr scan = TakesGdn8For(s) ? (perKeyDecay ? _gdn8ScanSeqsKda : _gdn8ScanSeqs) : perKeyDecay ? _gdnScanSeqsKda : _gdnScanSeqs;
+            CudaDriverApi.cuLaunchKernel(scan, (uint)heads, (uint)((s + 15) / 16), (uint)sequences, 128, 1, 1, 0,
                 stream, (IntPtr)a, IntPtr.Zero).ThrowOnError();
         }
 

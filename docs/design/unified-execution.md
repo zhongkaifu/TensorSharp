@@ -808,6 +808,11 @@ for quantized blocks, `IGraphExpertWeights` for stacked experts); the ops have g
   the rest is launch overhead), 9B 18.8-20.1 -> 22.6-23.0 (Qwen35Model 22.6-22.7). Greedy text unchanged. A prompt
   chunk's delta rule runs four state rows a warp (`ts_graph_gated_delta_net_rows4_f32`, the same bits): 9B 1.8K
   prefill 576 -> 220 ms of GPU time (the per-op scan: 170 ms), 0.8B prefill 600 -> 436 ms.
+* **Direct CUDA's row sums:** every gated delta rule of a 64- or 128-wide head (decode rows, verify windows and their
+  scans, the batched verify's region, the commit's re-step) sums a value row's keys over eight lanes (`ts_graph_gdn8_*`:
+  16 keys a lane and three butterfly steps a dot product, four rows a warp), the layout of 038fb303's direct engine; the
+  32-lane kernels serve other widths. Each state element keeps the operations and their order; only the sums' grouping
+  changed, in every kernel at once, so verify windows and commits stay the decode rows' bits.
 * **Routed experts on direct CUDA:** `CudaGraphExecutor` serves `GraphFusion.RoutedExperts` (the
   renormalized routing) with the per-op path's kernels: decode and verify rows (up to 32) route and run
   their experts on the device through tables of the members' resident copies

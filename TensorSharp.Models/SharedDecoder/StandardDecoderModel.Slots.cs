@@ -281,6 +281,12 @@ namespace TensorSharp.Models
         internal long CacheZeroFillBytes { get; private set; }
 
         private Dictionary<string, Slot> _slots;            // requests with their own slot
+
+        /// <summary>Probes (eng/GdnDriftProbe): <paramref name="requestId"/>'s recurrent state of <paramref name="layer"/> (rank 0),
+        /// or null (no slot, or not a recurrent layer).</summary>
+        internal RecurrentState RecurrentStateForProbe(string requestId, int layer)
+            => _slots != null && _slots.TryGetValue(requestId, out Slot slot) && slot.Recurrent != null && layer >= 0 && layer < slot.Recurrent.Length
+                ? slot.Recurrent[layer]?[0] : null;
         private Dictionary<string, Slot> _retainedSlots;    // finished requests kept for a continuation
         private List<Slot> _slotPool;
         private string _activeKey;                          // request whose slot is in the active fields

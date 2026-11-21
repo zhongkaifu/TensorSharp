@@ -3856,3 +3856,261 @@ extern "C" __global__ void ts_graph_cache_rows_seqs_f16(const ts_graph_cache_row
     const float v = seqs.src[z][(size_t)head * seqs.head_stride[z] + (size_t)t * seqs.row_stride[z] + d];
     seqs.cache[z][((size_t)head * cells + pos) * head_dim + d] = __float2half_rn(v);
 }
+
+// ---------------------------------------------------------------------------
+// The gated delta rule with eight lanes a value row (038fb303's direct engine's layout, ts_q35_gdn_scan): a warp keeps four
+// value rows of a head's state, each row's S keys spread over eight lanes (lane i of a row group keeping keys i, i + 8, ...),
+// so a row's two dot products a token (S^T k and S^T q) are a lane's sum over its S / 8 keys and three butterfly steps among
+// its eight lanes. The 32-lane bodies (ts_graph_gated_delta_net_f32, ts_graph_gdn_rows4, ts_graph_gdn_rows4_scan) summed
+// four keys a lane and five steps a row, for four rows a warp one row after another. The operations on each state element
+// are theirs, in their order (decay, the delta from the decayed state, the update, the output); only the sums' grouping
+// differs. Operands and outputs as ts_graph_gated_delta_net_f32's, for S = 64 or 128 (PER = S / 8 keys a lane, a template
+// argument: the state, keys and queries stay in registers). The body takes the warp's sequence, head and first value row;
+// lane / 8 is the warp's row, lane % 8 the row's lane.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float ts_graph_gdn8_sum(float v)
+{
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    return v;
+}
+
+// The general form (decode rows, a commit's re-step, windows with snapshots or a saved state).
+template <int PER>
+__device__ __forceinline__ void ts_graph_gdn8(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
+    float* __restrict__ in_save, int save_rows, int seq, int head, int r0, int lane)
+{
+    constexpr int S = PER * 8;
+    const int kh = head % hk;
+    if (seq >= n_s || r0 >= S)
+        return;
+    const int row = r0 + (lane >> 3), li = lane & 7;
+    float st[PER];
+    const float* s_in = state + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+        st[j] = s_in[li + 8 * j];
+    if (saved != nullptr)
+    {
+        float* s_sv = saved + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+            s_sv[li + 8 * j] = st[j];
+    }
+
+    const float scale = rsqrtf((float)S);
+    const size_t attn = (size_t)n_s * n_t * h * S;
+    const size_t per_snap = (size_t)n_s * h * S * S;
+    for (int t = 0; t < n_t; t++)
+    {
+        const size_t qk_off = ((size_t)(seq * n_t + t) * hk + kh) * S;
+        const size_t v_off = ((size_t)(seq * n_t + t) * h + head) * S;
+        const size_t gb = (size_t)(seq * n_t + t) * h + head;
+        const float eg = kda ? 0.0f : expf(g[gb]);
+        float kk[PER];
+        float kv = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            const int i = li + 8 * j;
+            kk[j] = k[qk_off + i];
+            st[j] *= kda ? expf(g[gb * S + i]) : eg;
+            kv += st[j] * kk[j];
+        }
+        kv = ts_graph_gdn8_sum(kv);
+        const float delta = (v[v_off + row] - kv) * beta[gb];
+        float y = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            st[j] += kk[j] * delta;
+            y += st[j] * q[qk_off + li + 8 * j];
+        }
+        y = ts_graph_gdn8_sum(y);
+        if (li == 0)
+            out[v_off + row] = y * scale;
+        if (in_save != nullptr)
+            ts_graph_gdn_save_token(in_save, save_rows, q, k, v, g, beta, S, h, hk, kda, t, head, r0, 4, r0 == 0, lane);
+
+        const int slot = n_t - 1 - t;
+        if (slot < slots)
+        {
+            float* s_out = out + attn + slot * per_snap + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+            for (int j = 0; j < PER; j++)
+                s_out[li + 8 * j] = st[j];
+        }
+    }
+}
+
+// The verify window's scan (its rows' outputs alone, its inputs saved, the state read and left), each token's inputs read
+// a token ahead as ts_graph_gdn_rows4_scan reads them; every value is ts_graph_gdn8's.
+template <int PER, bool KDA>
+__device__ __forceinline__ void ts_graph_gdn8_scan(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int h, int hk, int n_t, int n_s, float* __restrict__ in_save, int save_rows, int seq, int head, int r0, int lane)
+{
+    constexpr int S = PER * 8;
+    const int kh = head % hk;
+    if (seq >= n_s || r0 >= S)
+        return;
+    const int row = r0 + (lane >> 3), li = lane & 7;
+    float st[PER];
+    const float* s_in = state + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+        st[j] = s_in[li + 8 * j];
+
+    const float scale = rsqrtf((float)S);
+    float nk[PER], nq[PER], ng[KDA ? PER : 1], nv = 0.0f, nb = 0.0f;
+    auto load = [&](int t) {
+        const size_t qk_off = ((size_t)(seq * n_t + t) * hk + kh) * S;
+        const size_t gb = (size_t)(seq * n_t + t) * h + head;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            const int i = li + 8 * j;
+            nk[j] = k[qk_off + i];
+            nq[j] = q[qk_off + i];
+            if (KDA) ng[KDA ? j : 0] = g[gb * S + i];
+        }
+        if (!KDA) ng[0] = g[gb];
+        nv = v[((size_t)(seq * n_t + t) * h + head) * S + row];
+        nb = beta[gb];
+    };
+    if (n_t > 0)
+        load(0);
+    for (int t = 0; t < n_t; t++)
+    {
+        const size_t v_off = ((size_t)(seq * n_t + t) * h + head) * S;
+        float kk[PER], qq[PER], e[KDA ? PER : 1];
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            kk[j] = nk[j];
+            qq[j] = nq[j];
+            if (KDA) e[KDA ? j : 0] = expf(ng[KDA ? j : 0]);
+        }
+        if (!KDA) e[0] = expf(ng[0]);
+        const float vt = nv, b = nb;
+        if (t + 1 < n_t)
+            load(t + 1);
+        float kv = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            st[j] *= e[KDA ? j : 0];
+            kv += st[j] * kk[j];
+        }
+        kv = ts_graph_gdn8_sum(kv);
+        const float delta = (vt - kv) * b;
+        float y = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++)
+        {
+            st[j] += kk[j] * delta;
+            y += st[j] * qq[j];
+        }
+        y = ts_graph_gdn8_sum(y);
+        if (li == 0)
+            out[v_off + row] = y * scale;
+        if (in_save != nullptr)
+            ts_graph_gdn_save_token(in_save, save_rows, q, k, v, g, beta, S, h, hk, KDA ? 1 : 0, t, head, r0, 4, r0 == 0, lane);
+    }
+}
+
+#define TS_GRAPH_GDN8_BY_S(S, CALL8, CALL16) \
+    do { if ((S) == 64) { CALL8; } else if ((S) == 128) { CALL16; } } while (0)
+
+// ts_graph_gated_delta_net_f32 / ts_graph_gated_delta_net_rows4_f32 on ts_graph_gdn8 (S 64 or 128). Launch: grid
+// (n_s * h, S / 16), block 128.
+extern "C" __global__ void __launch_bounds__(128) ts_graph_gdn8_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
+    float* __restrict__ in_save, int save_rows)
+{
+    const int seq = blockIdx.x / h, head = blockIdx.x % h, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;
+    TS_GRAPH_GDN8_BY_S(S,
+        (ts_graph_gdn8<8>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, slots, kda, saved, in_save, save_rows, seq, head, r0, lane)),
+        (ts_graph_gdn8<16>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, slots, kda, saved, in_save, save_rows, seq, head, r0, lane)));
+}
+
+// ts_graph_gated_delta_net_scan4{,_kda}_f32 on ts_graph_gdn8_scan. The same operands and launch as ts_graph_gdn8_f32.
+#define TS_GRAPH_GDN8_SCAN(NAME, KDA)                                                                                             \
+    extern "C" __global__ void __launch_bounds__(128) NAME(                                                                        \
+        const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,                                     \
+        const float* __restrict__ g, const float* __restrict__ beta, const float* state,                                           \
+        float* out, int S, int h, int hk, int n_t, int n_s, float* __restrict__ in_save, int save_rows)                           \
+    {                                                                                                                              \
+        const int seq = blockIdx.x / h, head = blockIdx.x % h, lane = threadIdx.x & 31;                                            \
+        const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;                                                  \
+        TS_GRAPH_GDN8_BY_S(S,                                                                                                      \
+            (ts_graph_gdn8_scan<8, KDA>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, in_save, save_rows, seq, head, r0, lane)),   \
+            (ts_graph_gdn8_scan<16, KDA>(q, k, v, g, beta, state, out, h, hk, n_t, n_s, in_save, save_rows, seq, head, r0, lane))); \
+    }
+
+TS_GRAPH_GDN8_SCAN(ts_graph_gdn8_scan_f32, false)
+TS_GRAPH_GDN8_SCAN(ts_graph_gdn8_scan_kda_f32, true)
+
+// ts_graph_gated_delta_net_scan4_seqs{,_kda}_f32 on ts_graph_gdn8_scan. Launch: grid (h, S / 16, sequences), block 128.
+#define TS_GRAPH_GDN8_SCAN_SEQS(NAME, KDA)                                                                                        \
+    extern "C" __global__ void __launch_bounds__(128) NAME(const ts_graph_gdn_seqs a, int S, int h, int hk, int n_t, int save_rows) \
+    {                                                                                                                              \
+        const int z = blockIdx.z, lane = threadIdx.x & 31;                                                                         \
+        const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;                                                  \
+        TS_GRAPH_GDN8_BY_S(S,                                                                                                      \
+            (ts_graph_gdn8_scan<8, KDA>(a.q[z], a.k[z], a.v[z], a.g[z], a.beta[z], a.state[z], a.out[z], h, hk, n_t, 1,             \
+                a.in_save[z], save_rows, 0, blockIdx.x, r0, lane)),                                                                 \
+            (ts_graph_gdn8_scan<16, KDA>(a.q[z], a.k[z], a.v[z], a.g[z], a.beta[z], a.state[z], a.out[z], h, hk, n_t, 1,            \
+                a.in_save[z], save_rows, 0, blockIdx.x, r0, lane)));                                                                \
+    }
+
+TS_GRAPH_GDN8_SCAN_SEQS(ts_graph_gdn8_scan_seqs_f32, false)
+TS_GRAPH_GDN8_SCAN_SEQS(ts_graph_gdn8_scan_seqs_kda_f32, true)
+
+// ts_graph_gdn_commit_f32 on ts_graph_gdn8 (the re-step as the decode rows' kernel steps them; S 64 or 128). The same argument
+// and launch.
+extern "C" __global__ void __launch_bounds__(128) ts_graph_gdn8_commit_f32(const ts_graph_gdn_commit c)
+{
+    const int layer = blockIdx.z;
+    if (layer >= c.layers)
+        return;
+    {
+        const long long n = (long long)c.channels * c.conv_rows;
+        const long long blocks = (long long)gridDim.x * gridDim.y, block = (long long)blockIdx.y * gridDim.x + blockIdx.x;
+        const float* __restrict__ from = c.conv_from[layer];
+        float* __restrict__ to = c.conv_to[layer];
+        for (long long i = block * blockDim.x + threadIdx.x; i < n; i += blocks * blockDim.x)
+        {
+            const long long ch = i / c.conv_rows;
+            to[i] = from[ch * c.conv_pitch + (i - ch * c.conv_rows)];
+        }
+    }
+    const int steps = c.steps[layer], S = c.S, h = c.h, head = blockIdx.x, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;
+    if (steps < 0 || r0 >= S)
+        return;
+    if (steps == 0)
+    {
+        const float* __restrict__ src = c.state[layer] + ((size_t)head * S + r0) * S;
+        float* __restrict__ dst = c.out[layer] + ((size_t)head * S + r0) * S;
+        for (int r = 0; r < 4 && r0 + r < S; r++)
+            for (int i = lane; i < S; i += 32)
+                dst[(size_t)r * S + i] = src[(size_t)r * S + i];
+        return;
+    }
+    const float* in = c.inputs[layer];
+    const size_t qk = (size_t)c.save_rows * c.hk * S, vs = (size_t)c.save_rows * h * S, gs = (size_t)c.save_rows * h;
+    TS_GRAPH_GDN8_BY_S(S,
+        (ts_graph_gdn8<8>(in, in + qk, in + 2 * qk, in + 2 * qk + vs, in + 2 * qk + vs + gs, c.state[layer], c.out[layer],
+            h, c.hk, steps, 1, 1, 0, nullptr, nullptr, 0, 0, head, r0, lane)),
+        (ts_graph_gdn8<16>(in, in + qk, in + 2 * qk, in + 2 * qk + vs, in + 2 * qk + vs + gs, c.state[layer], c.out[layer],
+            h, c.hk, steps, 1, 1, 0, nullptr, nullptr, 0, 0, head, r0, lane)));
+}
