@@ -138,6 +138,21 @@ public sealed class BatchedBlockDraftTests : IDisposable
     [InlineData("qwen4exp", "dflash2", BackendType.Cpu)]
     public Task EngineLanesDraftAsEachRequest(string family, string variant, BackendType backend) => EngineDraftsAsEachRequest(family, variant, backend);
 
+    /// <summary>The engine's step with the rings kept by the verify's commit from the features the verify returned to the
+    /// model (where its program cannot follow), and by the contexts' catch-ups (as before the verify kept them): the same
+    /// streams and drafts.</summary>
+    [Theory]
+    [InlineData("qwen35", "dflash2", BackendType.Cpu, "FromFeatures")]
+    [InlineData("qwen35", "dflash2", BackendType.Cpu, "CatchUps")]
+    public Task EngineLanesDraftAsEachRequestWhicheverWritesTheRings(string family, string variant, BackendType backend, string rings)
+        => EngineDraftsAsEachRequest(family, variant, backend, Enum.Parse<SpeculativeRuntimeChecks.BatchedRings>(rings));
+
+    [CudaTheory]
+    [InlineData("qwen35", "dflash2", BackendType.Cuda, "FromFeatures")]
+    [InlineData("qwen35", "dflash2", BackendType.Cuda, "CatchUps")]
+    public Task EngineLanesDraftAsEachRequestWhicheverWritesTheRingsOnDirectCuda(string family, string variant, BackendType backend, string rings)
+        => EngineDraftsAsEachRequest(family, variant, backend, Enum.Parse<SpeculativeRuntimeChecks.BatchedRings>(rings));
+
     [GgmlTheory(BackendType.GgmlCpu)]
     [InlineData("qwen35", "dflash2", BackendType.GgmlCpu)]
     public Task EngineLanesDraftAsEachRequestOnGgmlCpu(string family, string variant, BackendType backend) => EngineDraftsAsEachRequest(family, variant, backend);
@@ -159,7 +174,8 @@ public sealed class BatchedBlockDraftTests : IDisposable
     [InlineData("qwen35", "dflash2", BackendType.GgmlCuda)]
     public Task EngineLanesDraftAsEachRequestOnGgmlCuda(string family, string variant, BackendType backend) => EngineDraftsAsEachRequest(family, variant, backend);
 
-    private async Task EngineDraftsAsEachRequest(string family, string variant, BackendType backend)
+    private async Task EngineDraftsAsEachRequest(string family, string variant, BackendType backend,
+        SpeculativeRuntimeChecks.BatchedRings rings = SpeculativeRuntimeChecks.BatchedRings.Kept)
     {
         using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         var (target, draft) = Fixtures(variant);
@@ -169,7 +185,7 @@ public sealed class BatchedBlockDraftTests : IDisposable
         // direct CUDA's products round by their row count, where a synthetic checkpoint's near-tied logits pick either token.
         double nearTie = backend is BackendType.Cpu or BackendType.GgmlCpu ? 0 : 1e-2;
         await SpeculativeRuntimeChecks.AssertBatchedBlockDraftsDraftAsEachRequest(() => Create(family, target, draft, backend),
-            options, $"{family} {backend} {variant}", nearTie: nearTie);
+            options, $"{family} {backend} {variant} {rings}", nearTie: nearTie, rings: rings);
     }
 
     // ---------------------------------------------------------------- the checks

@@ -324,13 +324,16 @@ namespace TensorSharp.Models
             /// <summary>Each following sequence's ring's carry: its last row's feature row is written there, so the first
             /// draft after the prompt has its carry without the step returning features (<see cref="TryTakeHeldCarry"/>).</summary>
             public required Tensor[] Carry { get; init; }
+            /// <summary>A batched verify's windows (StandardDecoderModel.VerifyFollow.cs): every row of each following
+            /// sequence's window goes into its ring at its position, the rows' inputs refilled as the step advances.</summary>
+            public bool Windows { get; init; }
 
             /// <summary>What the plan changes in the emitted program.</summary>
             public string Key
             {
                 get
                 {
-                    var key = new System.Text.StringBuilder();
+                    var key = new System.Text.StringBuilder(Windows ? "w" : "");
                     for (int s = 0; s < Keep.Length; s++) key.Append(s > 0 ? "." : "").Append(Keep[s]).Append(ZeroBefore[s] ? "z" : "");
                     return key.ToString();
                 }
@@ -439,6 +442,11 @@ namespace TensorSharp.Models
         /// </summary>
         private void EmitDFlashFollow(GraphStep step, int[] taps, DFlashFollowPlan plan)
         {
+            if (plan.Windows)
+            {
+                EmitDFlashVerifyFollow(step, taps, plan);
+                return;
+            }
             DFlashConfig cfg = DFlashSettings;
             string prefix = DFlashConfig.WeightPrefix;
             int hidden = Config.HiddenSize, hd = cfg.HeadDim, kvHeads = cfg.NumKVHeads, ringRows = DFlashRingRows;

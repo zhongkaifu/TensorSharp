@@ -431,7 +431,9 @@ namespace TensorSharp.Runtime.Speculative
         /// the last row of a prompt read on the plain path) and nothing it holds was written since: copied into
         /// <paramref name="carry"/> (<see cref="ISpeculativeTarget.SpecFeatureSize"/> floats), and true. Over the bound drafter
         /// state (<see cref="IPerRequestDraftState.BindDraftState"/>). The first decode step after such a prompt then drafts
-        /// instead of running plainly to capture its carry, while the prompt's steps stay the plain ones. Default false.
+        /// instead of running plainly to capture its carry, while the prompt's steps stay the plain ones. Also true, with
+        /// <paramref name="carry"/> left as it is, when the drafter's state holds the carried row itself (a batched verify kept
+        /// it in step, <see cref="IBatchedSpeculativeTarget.BatchedSpecVerifyKeepsDrafter"/>). Default false.
         /// </summary>
         bool TryTakeHeldCarry(int position, float[] carry) => false;
 
@@ -642,6 +644,15 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Advance sequence i of the last verify by <c>kept[i]</c> tokens
         /// (1 .. window). Throws when the caches may be partially advanced.</summary>
         void CommitBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int[] kept);
+
+        /// <summary>
+        /// Whether the batched verify keeps every sequence's drafter in step itself: the caller then passes no features to
+        /// <see cref="TryBatchedSpecVerify"/> / <see cref="TryBatchedSpecVerifyLogits(IReadOnlyList{string}, int[], int, int[], float[], ref float[], long, out float[])"/>
+        /// and none to the speculative contexts' commits; <see cref="CommitBatchedSpecVerify"/> writes each sequence's kept
+        /// rows into its drafter, which then holds the next draft's carry (<see cref="ISpeculator.TryTakeHeldCarry"/>
+        /// finds it there). Read once a step, before the verify.
+        /// </summary>
+        bool BatchedSpecVerifyKeepsDrafter => false;
 
         /// <summary>Whether <see cref="TryBatchedSpecVerifyLogits"/> serves the batched verify of
         /// sequences that sample: each row's logits come back, and each sequence draws its rows

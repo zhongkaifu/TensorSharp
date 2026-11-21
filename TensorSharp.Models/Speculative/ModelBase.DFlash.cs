@@ -674,6 +674,16 @@ namespace TensorSharp.Models
             RecordDSpineDumpRows(hRows, rowOffset, n, startPos);
             if (DFlashDraftingDeclined)
                 return;   // this request's ring is incomplete; it decodes without drafts
+            // The ring holds the carry row the write starts with (a batched verify wrote it: DFlashRing.HeldTo), and the
+            // runtime no longer keeps its features: a draft's carry inject writes nothing, a catch-up from the row after it.
+            if (n > 0 && DFlashRingHoldsCarry(startPos + 1))
+            {
+                rowOffset++;
+                n--;
+                startPos++;
+                if (n == 0)
+                    return;
+            }
             // A batched step's commit waits on the ring (ModelBase.DFlash.Lanes.cs), and anything else writes after its queue.
             if (TryDeferDFlashInject(hRows, rowOffset, n, startPos))
                 return;

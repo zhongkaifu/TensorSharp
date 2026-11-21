@@ -30,8 +30,9 @@ namespace TensorSharp.Models
     public abstract partial class ModelBase
     {
         /// <summary>One request's ring in a program over several rings: its tensors per draft layer and, for a block, which
-        /// position each slot holds (the mask's bookkeeping, taken after the request's carried row was noted).</summary>
-        private protected readonly record struct DFlashLaneRing(Tensor[] K, Tensor[] V, int[] SlotPositions);
+        /// position each slot holds (the mask's bookkeeping, taken after the request's carried row was noted), and whether
+        /// the ring holds the carried row already (<see cref="DFlashRing.HeldTo"/>: the block writes none for it).</summary>
+        private protected readonly record struct DFlashLaneRing(Tensor[] K, Tensor[] V, int[] SlotPositions, bool HoldsCarry = false);
 
         /// <summary>One ring's queued rows in an inject over several rings: its tensors, its feature rows
         /// [count, feature size] and the position of the first.</summary>
@@ -100,7 +101,7 @@ namespace TensorSharp.Models
             ring.PendingCount = 0;
             DFlashRing previous = _dflashActiveRing;
             SelectDFlashRing(ring);
-            var kept = (_dflashRingFilled, _dflashRingValidFrom, _dflashRingHigh, _dflashRingCarryEnd);
+            var kept = (_dflashRingFilled, _dflashRingValidFrom, _dflashRingHigh, _dflashRingCarryEnd, _dflashRingHeldTo);
             int depth = _dflashDeferDepth;
             _dflashDeferDepth = 0;
             try
@@ -110,7 +111,7 @@ namespace TensorSharp.Models
             finally
             {
                 _dflashDeferDepth = depth;
-                (_dflashRingFilled, _dflashRingValidFrom, _dflashRingHigh, _dflashRingCarryEnd) = kept;
+                (_dflashRingFilled, _dflashRingValidFrom, _dflashRingHigh, _dflashRingCarryEnd, _dflashRingHeldTo) = kept;
                 _dflashRingHostStale = true;
                 SelectDFlashRing(previous);
             }
@@ -164,8 +165,8 @@ namespace TensorSharp.Models
         /// <summary>
         /// The rings of <paramref name="requestIds"/> for a block drafted for every one of them in one program: each request's
         /// ring (assigned as <see cref="BindDFlashRing"/> assigns it), its queued rows written, its carried row (the features
-        /// of position <paramref name="positions"/>[i] - 1, which the program writes with the block) bookkept as written, and
-        /// which position each of its slots holds then. Null, with no row bookkept, when a request has no ring of its own (two
+        /// of position <paramref name="positions"/>[i] - 1, which the program writes with the block) bookkept as written unless
+        /// the ring holds it already (a batched verify wrote it), and which position each of its slots holds then. Null, with no row bookkept, when a request has no ring of its own (two
         /// share one), drafts no more (a failed inject) or has no position before its anchor. The bound ring stays bound.
         /// </summary>
         private protected DFlashLaneRing[] PrepareDFlashLaneRings(IReadOnlyList<string> requestIds, int[] positions)
@@ -192,11 +193,41 @@ namespace TensorSharp.Models
                 {
                     SelectDFlashRing(rings[j]);
                     FlushBoundDFlashRows();
-                    NoteDFlashRingWrite(positions[j] - 1, 1);
-                    _dflashRingHostStale = true;
-                    lanes[j] = new DFlashLaneRing(_dflashRingK, _dflashRingV, (int[])BuildRingSlotPositions().Clone());
+                    bool held = DFlashRingHoldsCarry(positions[j]);
+                    if (!held)
+                    {
+                        NoteDFlashRingWrite(positions[j] - 1, 1);
+                        _dflashRingHostStale = true;
+                    }
+                    lanes[j] = new DFlashLaneRing(_dflashRingK, _dflashRingV, (int[])BuildRingSlotPositions().Clone(), held);
                 }
                 return lanes;
+            }
+            finally
+            {
+                SelectDFlashRing(previous);
+            }
+        }
+
+        /// <summary>
+        /// <paramref name="requestId"/>'s ring takes <paramref name="n"/> feature rows of <paramref name="rows"/> from row
+        /// <paramref name="rowOffset"/> at <paramref name="startPos"/> (a batched verify's kept rows, from the features it returned
+        /// to the model: StandardDecoderModel.VerifyFollow.cs), queued as a commit's catch-up is, and then holds the next draft's
+        /// carry row (<see cref="DFlashRing.HeldTo"/>). The bound ring stays bound.
+        /// </summary>
+        private protected void WriteKeptRowsFromFeatures(string requestId, float[] rows, long rowOffset, int n, int startPos)
+        {
+            if (!_hasDFlash || _dflashRingK == null || requestId == null || rows == null || n <= 0 || startPos <= 0)
+                return;
+            EnsureDFlashRingObjects();
+            DFlashRing previous = _dflashActiveRing;
+            try
+            {
+                if (!TryBindDFlashRing(requestId, mayTake: true) || DFlashDraftingDeclined)
+                    return;
+                DFlashEncodeAndInject(rows, checked((int)rowOffset), n, startPos);
+                if (!DFlashDraftingDeclined && _dflashRingFilled == startPos + n)
+                    _dflashRingHeldTo = startPos + n;
             }
             finally
             {

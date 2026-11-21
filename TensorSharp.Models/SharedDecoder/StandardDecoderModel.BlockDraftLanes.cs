@@ -84,14 +84,23 @@ namespace TensorSharp.Models
             DFlashConfig cfg = DFlashSettings;
             int gamma = cfg.MaxDraftTokens, b = gamma + 1, feat = cfg.FeatureSize;
             for (int j = 0; j < m; j++)
-            {
-                if (carries[j] == null || carries[j].Length < feat)
-                    throw new ArgumentException($"Lane {j}: the carried row needs {feat} floats.", nameof(carries));
                 if (tokensOut[j].Length < gamma || confOut[j].Length < gamma)
                     throw new ArgumentException($"Lane {j} cannot take a {gamma}-token block.", nameof(tokensOut));
-            }
             DFlashLaneRing[] lanes = PrepareDFlashLaneRings(requestIds, positions);
             if (lanes == null) return false;
+            // The lanes whose rings do not hold their carried row yet (a batched verify writes its kept rows into the rings,
+            // the carried one among them): their carries go in with the block.
+            var carriedLanes = new List<int>(m);
+            var key = new System.Text.StringBuilder();
+            for (int j = 0; j < m; j++)
+            {
+                key.Append(lanes[j].HoldsCarry ? '0' : '1');
+                if (lanes[j].HoldsCarry) continue;
+                if (carries[j] == null || carries[j].Length < feat)
+                    throw new ArgumentException($"Lane {j}: the carried row needs {feat} floats.", nameof(carries));
+                carriedLanes.Add(j);
+            }
+            int mc = carriedLanes.Count;
 
             var slots = new Slot[m];
             var first = new int[m];
@@ -109,12 +118,17 @@ namespace TensorSharp.Models
             }
             // llama.cpp's dflash graph feeds build_inp_embd straight in: no trunk embedding scale (DFlashEmbedding).
             Tensor embedded = DFlashEmbedding(ids);
-            var carried = new Tensor(_allocator, DType.Float32, m, feat);
-            float* rows = GetFloatPtrForOverwrite(carried);
-            for (int j = 0; j < m; j++)
-                fixed (float* src = carries[j])
-                    Buffer.MemoryCopy(src, rows + (long)j * feat, (long)feat * sizeof(float), (long)feat * sizeof(float));
-            InvalidateTensorDeviceCache(carried);
+            Tensor carried = null;
+            if (mc > 0)
+            {
+                carried = new Tensor(_allocator, DType.Float32, mc, feat);
+                float* rows = GetFloatPtrForOverwrite(carried);
+                for (int c = 0; c < mc; c++)
+                    fixed (float* src = carries[carriedLanes[c]])
+                        Buffer.MemoryCopy(src, rows + (long)c * feat, (long)feat * sizeof(float), (long)feat * sizeof(float));
+                InvalidateTensorDeviceCache(carried);
+            }
+            int[] carriedAt = carriedLanes.ToArray();
             _dflashLanes = lanes;
             _dflashLaneAnchors = (int[])anchors.Clone();
             CachedGraph graph = null;
@@ -122,8 +136,8 @@ namespace TensorSharp.Models
             try
             {
                 graph = RunTraced(m * b, slots, first, counts, starts, replayable: b <= SmallChunkRows, snapshots: false, attentionFloor: 0,
-                    step => EmitDFlashBlockLanes(step, embedded, carried), out StepOutputs outputs, out owned,
-                    shape: DFlashLanesShape + m, advanceInputs: new[] { embedded, carried });
+                    step => EmitDFlashBlockLanes(step, embedded, carried, carriedAt), out StepOutputs outputs, out owned,
+                    shape: DFlashLanesShape + m + (mc == m ? "" : ":c" + key), advanceInputs: mc > 0 ? new[] { embedded, carried } : new[] { embedded });
                 if (graph == null) return false;   // a trace the lowering does not express: nothing ran
                 // Each output is a run of every lane's values of one position or more, positions in order (row e * m + j is
                 // lane j's position e): the ids' outputs, then the confidences'.
@@ -154,7 +168,7 @@ namespace TensorSharp.Models
             {
                 if (owned) graph?.Dispose();
                 embedded.Dispose();
-                carried.Dispose();
+                carried?.Dispose();
                 _dflashLanes = null;
             }
             BatchedBlockDrafts++;
@@ -162,12 +176,13 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// The block program over the step's lanes (each a sequence on its own ring): the lanes' carried rows into their rings,
+        /// The block program over the step's lanes (each a sequence on its own ring): the carried rows of the lanes
+        /// <paramref name="carriedLanes"/> into their rings (the other lanes' rings hold theirs: a batched verify wrote them),
         /// then the draft layers over [anchor, MASK x (b-1)] of every lane at its positions p .. p + b - 1 (each lane's K/V rows
         /// into its ring, its queries over its ring under its mask), then the head over each lane's rows 1 .. b - 1 in position
         /// order. Its outputs (<see cref="StepOutputs.Draft"/>) are the drafted ids as F32 values, then their confidences.
         /// </summary>
-        private StepOutputs EmitDFlashBlockLanes(GraphStep step, Tensor embedded, Tensor carried)
+        private StepOutputs EmitDFlashBlockLanes(GraphStep step, Tensor embedded, Tensor carried, int[] carriedLanes)
         {
             DFlashConfig cfg = DFlashSettings;
             string prefix = DFlashConfig.WeightPrefix;
@@ -178,27 +193,36 @@ namespace TensorSharp.Models
             for (int j = 0; j < m; j++)
                 for (int i = 0; i < b; i++) positions[j * b + i] = step.Starts[j] + i;
             step.SetPositions(positions);
-            // Each lane's carried row's position (the one before its anchor) and ring row, its block's ring rows and its mask.
-            var carryPositions = new int[m];
+            // Each carried lane's carried row's position (the one before its anchor) and ring row, each lane's block's ring rows
+            // and its mask.
+            int mc = carriedLanes.Length;
+            var carryOf = new int[m];
+            Array.Fill(carryOf, -1);
+            for (int c = 0; c < mc; c++) carryOf[carriedLanes[c]] = c;
+            var carryPositions = new int[mc];
             void FillCarryPositions()
             {
-                for (int j = 0; j < m; j++) carryPositions[j] = step.Starts[j] - 1;
+                for (int c = 0; c < mc; c++) carryPositions[c] = step.Starts[carriedLanes[c]] - 1;
             }
-            FillCarryPositions();
-            int carryAt = step.InputI32(carryPositions, m);
-            step.RefillOnAdvance(carryAt, () =>
+            int carryAt = -1;
+            if (mc > 0)
             {
                 FillCarryPositions();
-                step.RewriteInput(carryAt, carryPositions);
-                return true;
-            });
+                carryAt = step.InputI32(carryPositions, mc);
+                step.RefillOnAdvance(carryAt, () =>
+                {
+                    FillCarryPositions();
+                    step.RewriteInput(carryAt, carryPositions);
+                    return true;
+                });
+            }
             var carryRows = new int[m];
             var blockRows = new int[m];
             var masks = new int[m];
             for (int j = 0; j < m; j++)
             {
                 int lane = j;
-                carryRows[j] = DFlashRingRowsInput(step, 1, lane, offset: -1);
+                carryRows[j] = carryOf[j] >= 0 ? DFlashRingRowsInput(step, 1, lane, offset: -1) : -1;
                 blockRows[j] = DFlashRingRowsInput(step, b, lane);
                 masks[j] = DFlashBlockMaskInput(step, b, lane, () => _dflashLanes[lane].SlotPositions);
             }
@@ -208,16 +232,16 @@ namespace TensorSharp.Models
             float scale = 1f / MathF.Sqrt(hd);
 
             int x = step.HiddenInput(embedded, hidden, rows);
-            // PASS A on the carried rows: g = rmsnorm(fc · feat, enc.output_norm), one row a lane.
-            int g = step.RmsNorm(step.MatMul(prefix + "fc.weight", step.HiddenInput(carried, cfg.FeatureSize, m)),
+            // PASS A on the carried rows: g = rmsnorm(fc · feat, enc.output_norm), one row a carried lane.
+            int g = mc == 0 ? -1 : step.RmsNorm(step.MatMul(prefix + "fc.weight", step.HiddenInput(carried, cfg.FeatureSize, mc)),
                 step.Weight(prefix + "enc.output_norm.weight"), cfg.Eps);
             int fa = -1;
             for (int il = 0; il < cfg.NumLayers; il++)
             {
                 string[] names = _dflashLayerNames[il];
-                // PASS B on the carried rows: their K (head-normed, rotated at their positions) and V, [head_dim, kv_heads, m].
-                int carryK = EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, m, names[DfAttnKNorm], carryAt);
-                int carryV = step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, m);
+                // PASS B on the carried rows: their K (head-normed, rotated at their positions) and V, [head_dim, kv_heads, mc].
+                int carryK = mc == 0 ? -1 : EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, mc, names[DfAttnKNorm], carryAt);
+                int carryV = mc == 0 ? -1 : step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, mc);
                 int h = step.RmsNorm(x, step.Weight(names[DfAttnNorm]), cfg.Eps);
                 int attnTaps = -1;
                 if (cfg.HasConv)
@@ -233,13 +257,21 @@ namespace TensorSharp.Models
                 {
                     DFlashLaneRing lane = _dflashLanes[j];
                     long kRow = (long)hd * kvHeads * f;
-                    // The lane's carried row, then its block, into its ring (the block's write reads the carried row's, so it
-                    // comes after); its queries over the ring.
-                    EmitDFlashRingWrite(step, il, step.View3(carryK, hd, kvHeads, 1, hd * f, kRow, j * kRow),
-                        step.View3(carryV, hd, kvHeads, 1, hd * f, kRow, j * kRow), 1, carryRows[j], out int ringK, out int ringV,
-                        lane.K[il], lane.V[il]);
-                    EmitDFlashRingRowsAfter(step, ringK, ringV, step.View3(k, hd, kvHeads, b, hd * f, kRow, j * b * kRow),
-                        step.View3(v, hd, kvHeads, b, hd * f, kRow, j * b * kRow), b, blockRows[j], out ringK, out ringV);
+                    // The lane's carried row (unless its ring holds it), then its block, into its ring (the block's write reads
+                    // the carried row's, so it comes after); its queries over the ring.
+                    int laneK = step.View3(k, hd, kvHeads, b, hd * f, kRow, j * b * kRow), laneV = step.View3(v, hd, kvHeads, b, hd * f, kRow, j * b * kRow);
+                    int ringK, ringV, c = carryOf[j];
+                    if (c >= 0)
+                    {
+                        EmitDFlashRingWrite(step, il, step.View3(carryK, hd, kvHeads, 1, hd * f, kRow, c * kRow),
+                            step.View3(carryV, hd, kvHeads, 1, hd * f, kRow, c * kRow), 1, carryRows[j], out ringK, out ringV,
+                            lane.K[il], lane.V[il]);
+                        EmitDFlashRingRowsAfter(step, ringK, ringV, laneK, laneV, b, blockRows[j], out ringK, out ringV);
+                    }
+                    else
+                    {
+                        EmitDFlashRingWrite(step, il, laneK, laneV, b, blockRows[j], out ringK, out ringV, lane.K[il], lane.V[il]);
+                    }
                     long qRow = (long)hd * heads * f;
                     int laneQ = step.View3(q, hd, heads, b, hd * f, qRow, j * b * qRow);
                     int attended = step.FlashAttention(step.Permute(laneQ, 0, 2, 1, 3), ringK, ringV, masks[j], scale);   // [hd, heads, b]

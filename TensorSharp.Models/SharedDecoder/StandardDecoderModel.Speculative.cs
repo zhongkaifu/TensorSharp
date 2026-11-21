@@ -616,6 +616,13 @@ namespace TensorSharp.Models
         public bool TryTakeHeldCarry(int position, float[] carry)
         {
             if (carry == null || position <= 0) return false;
+            // The ring holds the carry row itself (a batched verify wrote its kept rows, StandardDecoderModel.VerifyFollow.cs):
+            // the draft injects none, and the host copy is not read (nothing takes it).
+            if (HasDFlash && DFlashRingHoldsCarry(position))
+            {
+                RingHeldCarries++;
+                return true;
+            }
             Tensor held;
             int width;
             if (HasDFlash)
@@ -640,5 +647,8 @@ namespace TensorSharp.Models
 
         /// <summary>Carries <see cref="TryTakeHeldCarry"/> handed over (tests check the first draft took one).</summary>
         internal int HeldCarriesTaken { get; private set; }
+
+        /// <summary>Drafts whose carry row <see cref="TryTakeHeldCarry"/> found in the ring (a batched verify wrote it).</summary>
+        internal int RingHeldCarries { get; private set; }
     }
 }

@@ -459,6 +459,7 @@ namespace TensorSharp.Models
             _dflashRingValidFrom = 0;
             _dflashRingHigh = 0;
             _dflashRingCarryEnd = -1;
+            _dflashRingHeldTo = -1;
         }
 
         /// <summary>
@@ -492,6 +493,7 @@ namespace TensorSharp.Models
             _dflashRingFilled = end;
             _dflashRingHigh = Math.Max(_dflashRingHigh, end + DFlashRingLookahead);
             _dflashRingCarryEnd = -1;   // the carry no longer sits at the frontier (a followed step sets it again)
+            _dflashRingHeldTo = -1;     // nor the ring's own carry row (a batched verify's commit sets it again)
         }
 
         /// <summary>Rows a draft writes ahead of the frontier: its block (the ring's slots of positions it does not hold yet).</summary>

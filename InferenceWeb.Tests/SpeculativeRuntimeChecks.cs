@@ -281,14 +281,23 @@ internal static class SpeculativeRuntimeChecks
     /// verify row as the DFlash lossless gates there do.
     /// </summary>
     public static async Task AssertBatchedBlockDraftsDraftAsEachRequest(Func<StandardDecoderModel> create,
-        SpeculationOptions speculation, string label, int maxNew = 20, double nearTie = 0)
+        SpeculationOptions speculation, string label, int maxNew = 20, double nearTie = 0, BatchedRings rings = BatchedRings.Kept)
     {
         int[][] plain = await ServeAsync(create, EnginePrompts, null, maxNew, verifySteps: null);
-        int blocks = 0, injects = 0, verified = 0, alone = -1;
+        int blocks = 0, injects = 0, verified = 0, alone = -1, follows = 0, featureCommits = 0, ringCarries = 0;
+        bool keeps = false;
         string declined = null;
         var together = new List<SequenceState>();
-        int[][] batched = await ServeAsync(create, EnginePrompts, speculation, maxNew, steps => verified = steps, together,
-            model => (blocks, injects, declined) = (model.BatchedBlockDrafts, model.DFlashLaneInjects, model.BatchedBlockDraftDeclineReason));
+        int[][] batched = await ServeAsync(() =>
+        {
+            StandardDecoderModel model = create();
+            model.VerifyFollowDisabledForTests = rings == BatchedRings.CatchUps;
+            model.VerifyFollowWritesFromFeaturesForTests = rings == BatchedRings.FromFeatures;
+            return model;
+        }, EnginePrompts, speculation, maxNew, steps => verified = steps, together,
+            model => (blocks, injects, declined, follows, featureCommits, ringCarries, keeps) = (model.BatchedBlockDrafts, model.DFlashLaneInjects,
+                model.BatchedBlockDraftDeclineReason, model.VerifyFollows, model.VerifyFeatureCommits, model.RingHeldCarries,
+                model.BatchedSpecVerifyKeepsDrafter));
         var single = new List<SequenceState>();
         int[][] perRequest = await ServeAsync(() =>
         {
@@ -299,7 +308,16 @@ internal static class SpeculativeRuntimeChecks
         Assert.Null(declined);
         Assert.True(verified > 0, $"{label}: no batched verify ran");
         Assert.True(blocks > 0, $"{label}: no step drafted its requests' blocks together");
-        Assert.True(injects > 0, $"{label}: no step wrote its requests' catch-ups together");
+        // Where the batched verify keeps the rings itself, its program (or its commit, from the features it returned to the
+        // model) wrote the kept rows and the drafts took their carries from the rings; else the catch-ups went in together.
+        if (keeps && rings == BatchedRings.Kept)
+            Assert.True(follows > 0 && featureCommits == 0, $"{label}: {follows} verifies wrote the rings, {featureCommits} commits from features");
+        else if (keeps && rings == BatchedRings.FromFeatures)
+            Assert.True(featureCommits > 0 && follows == 0, $"{label}: {featureCommits} commits wrote the rings from features, {follows} verifies");
+        else
+            Assert.True(injects > 0, $"{label}: no step wrote its requests' catch-ups together");
+        if (keeps && rings != BatchedRings.CatchUps)
+            Assert.True(ringCarries > 0, $"{label}: no draft took its carry from its ring");
         Assert.Equal(0, alone);
         for (int r = 0; r < EnginePrompts.Length; r++)
         {
@@ -312,6 +330,17 @@ internal static class SpeculativeRuntimeChecks
                 $"{label}: request {r} drafted {a.TokensDrafted} (accepted {a.TokensAccepted}) together, "
                 + $"{b.TokensDrafted} ({b.TokensAccepted}) alone");
         }
+    }
+
+    /// <summary>How a batched step's commits reach the drafters' rings in <see cref="AssertBatchedBlockDraftsDraftAsEachRequest"/>.</summary>
+    public enum BatchedRings
+    {
+        /// <summary>As the model chooses: the verify writes the windows into the rings where it keeps them.</summary>
+        Kept,
+        /// <summary>The verify returns its features to the model, and the commit writes the kept rows from them.</summary>
+        FromFeatures,
+        /// <summary>The verify returns its features to the caller, whose contexts' catch-ups go in together.</summary>
+        CatchUps,
     }
 
     /// <summary><paramref name="actual"/> is <paramref name="plain"/>, or (with <paramref name="nearTie"/> above 0) parts from it
