@@ -9,7 +9,8 @@ part (the vision tower as graph programs, shared with Muse Spark, and images on 
 defaults, G11; [§5.4](#54-s5-speculation-status)) are implemented, and so is stage S6 (multi-GPU: `--tp 2` on ggml_cuda
 and ggml_vulkan, `--layer-split 2`, DFlash declined under `--tp`; [§5.5](#55-s6-multi-gpu-status)), and stage S7's Mac
 part (performance: every Mac backend within the gates against legacy, the measured settings kept but one;
-[§5.6](#56-s7-performance-status)). S0's CUDA part is done (its frozen lanes are fixtures); S2's, S3's, S4's, S5's and S7's CUDA parts wait for the GPU VM. Written
+[§5.6](#56-s7-performance-status)); stage S8's Mac part switched the descriptor to the runtime family
+([§5.7](#57-s8-the-switch-status)). S0's CUDA part is done (its frozen lanes are fixtures); S2's, S3's, S4's, S5's and S7's CUDA parts wait for the GPU VM. Written
 2026-11-20 on `feature/muse-glimmer-unified`, cut from `origin/main` 2d759459. ggml is upstream
 d9fe7bff, unchanged (AGENTS.md), built with `TENSORSHARP_GGML_NO_UPDATE=1`. Every statement about
 TensorSharp comes from the code at 2d759459. The numbers in [§4.1](#41-legacy-baseline-measured)
@@ -592,7 +593,7 @@ Estimates are agent-days, including GPU runs.
 | **S5** Speculation (Mac part done, [§5.4](#54-s5-speculation-status)) | DFlash through the shared block drafter (graph programs; fused/per-op below), n-gram, defaults by measurement (`--spec-draft`, gate), G11 | family folder (declarations only), `StandardDecoderModel.BlockDraft.cs` if G11 needs it | §4.4 on ggml_metal and ggml_cuda; MLX lossless | Mac; 1 GPU | 3 |
 | **S6** Multi-GPU (done, [§5.5](#55-s6-multi-gpu-status)) | `--tp 2` on per-rank graphs (ggml_cuda; Vulkan per D4), G12, `--layer-split 2` and hybrid (new), DFlash under TP per D5 | family folder, `GgmlGraphExecutor.cs` (D4), `StandardDecoderModel.Placement.cs` (G12) | TP greedy vs one GPU (legacy tracked 468/500 characters before a paraphrase); TP decode and prefill vs legacy TP (docs: 63.2 tok/s, pp512 1569 on 2x PRO 4000, IQ2_XXS); grow and snapshot under TP (never run for legacy); layer split == one GPU | 2 GPUs in one box | 4 |
 | **S7** Performance (Mac part done, [§5.6](#56-s7-performance-status)) | G4 (prompt step width, CPU ring policy), G5 (in-graph embedding), concurrency reorder, `PrunesLastLayerRows`, `KeepsGateUpApart` by measurement, G8 only if MLX trails | runtime + family folder | §4.3 on every backend (Mac: ggml_metal, MLX, ggml_cpu; VM: ggml_cuda, ggml_vulkan, direct CUDA) | Mac; 1 GPU | 5 |
-| **S8** Switch | the descriptor builds `MuseGlimmerRuntimeModel` with `ServingContract.SharedRuntime(false)`; usage pages (n-gram, batching, layer split), the docs, `config/muse-glimmer-30b.json` (+ drafter pin), regression pins (IQ2_XXS, drafter), TensorAgent catalog re-measured; legacy only through the oracle seam | `MuseGlimmerArchitecture.cs`, `CliUsage.cs`, `ServerUsage.cs`, docs, configs, `TensorAgent.Core/Catalog` | §4.8 on the Mac (Web UI, OpenAI, CLI, TensorAgent app) and the VM; `ServingContractConformanceTests`; both directions of the usage drift tests | Mac; 1 GPU | 3 |
+| **S8** Switch (Mac part done, [§5.7](#57-s8-the-switch-status)) | the descriptor builds `MuseGlimmerRuntimeModel` with `ServingContract.SharedRuntime(false)`; usage pages (n-gram, batching, layer split), the docs, `config/muse-glimmer-30b.json` (+ drafter pin), regression pins (IQ2_XXS, drafter), TensorAgent catalog re-measured; legacy only through the oracle seam | `MuseGlimmerArchitecture.cs`, `CliUsage.cs`, `ServerUsage.cs`, docs, configs, `TensorAgent.Core/Catalog` | §4.8 on the Mac (Web UI, OpenAI, CLI, TensorAgent app) and the VM; `ServingContractConformanceTests`; both directions of the usage drift tests | Mac; 1 GPU | 3 |
 | **S9** Deletion | delete §1.3's legacy files, native exports, `GgmlExportedSymbols.targets` entries, the `ggml_ops_core.cpp` hooks, MLX helpers with no other caller, legacy-only tests (their outputs frozen first); retire §1.9's names through the removed-names registry (hard errors naming the replacement); docs, website, search indexes, zh-cn | §1.3, `RemovedCliFlags.cs`, docs | whole suites on both Mac lanes and the CPU lane, the CUDA VM suite; a final real-weights smoke (text, image, DFlash, multi-turn) on Metal and CUDA | Mac; 1 GPU | 2 |
 
 Order: S0 -> S1 -> S2 -> S3, then S4 and S5 (independent), then S6 and S7, then S8 and S9. S7's Metal
@@ -995,6 +996,45 @@ step stays 512 rows on every Mac backend, and no shared runtime, executor or nat
   no end state for it); follow-up turns do (§5.2). The CPU and MLX benchmarks ran beside another agent's builds and jobs at
   times; `artifacts/glimmer-s7/out/cpuwatch.log` records the other processes' load from 12:10 on, and the noisy rounds were
   repeated.
+
+### 5.7 S8, the switch: status
+
+**The Mac part is done** (2026-11-21, M5 Pro, ggml d9fe7bff unchanged). The VM part (the same E2E on ggml_cuda and direct CUDA)
+waits for the CUDA box: `glimmer/cuda-vm/s8-cuda.sh` (`build`, `cli B Q`, `server B Q`, `tests`).
+
+* **The switch (e6df6ff5, a DEFAULT CHANGE).** The descriptor builds `MuseGlimmerRuntimeModel` with
+  `ServingContract.SharedRuntime(hasRoutedExperts: false)`. The legacy `MuseGlimmerModel` is reachable only through the oracle
+  seam `MuseGlimmerArchitecture.CreateLegacyModel` (the frozen and parity tests, `MuseGlimmerKvGrowTests`,
+  `MuseGlimmerKvSnapshotTests`, the probe's `--family legacy`); no option, switch or environment variable selects it. The
+  serving seam `DescriptorBuildsTheRuntimeFamily` and `eng/validation/MuseGlimmerRuntimeHost` are deleted.
+* **Shared tests.** `ServingContractConformanceTests` takes the family off the bespoke list and its gap rows;
+  `SharedRuntimeConformanceTests.DedicatedSuites` proves its claims through `MuseGlimmerRuntimeConformanceTests` (placements,
+  batched slots, continuous batching, checkpoints, DFlash and n-gram through the engine, graphs against per op, on fixtures
+  whose rings lap); `MuseGlimmerRuntimeTests.TheDescriptorBuildsTheRuntimeFamily` replaces the S2 assertion. The other
+  inventory classes needed no change (they already list the runtime class, or test the legacy class while it exists).
+* **Usage and configuration.** `--spec-type`'s help (CLI and server): n-gram runs on Muse-Glimmer without a drafter.
+  `config/muse-glimmer-30b.json` pins the drafter (`dflash-kquant.gguf`, sha256 `27d9a805...`); the new
+  `config/muse-glimmer-30b-iq2xxs.json` is the Mac's UD-IQ2_XXS preset; `config/regression/source-pins.json` and
+  `catalog.json` carry both (the inventory tests pass, 610 regression tests).
+* **Docs (9387abb9).** The model card (EN, zh) gains the runtime section with S7's table; usage, the batching and
+  speculation pages, the matrices, the supported-models and capability pages and the website (with its search indexes) drop
+  the legacy-only claims (n-gram only with a drafter, page reuse, the per-sequence swap, the `TS_MUSE_GLIMMER_*` switches,
+  which now do nothing and are retired in S9).
+* **The pre-switch baseline** for any later A/B is `~/work/TensorSharp-glimmer-pre2`, detached at c012af49 (the last commit
+  whose descriptor builds legacy); rebuild it before use.
+
+| Gate (§4.8, the Mac) | Result |
+|---|---|
+| Synthetic suite (`Category!=Bench`), cpu and metal pins | **passed**: 15,007 / 15,012 tests, 13,795 / 13,743 passed, one failure each (`EverySharedRuntimeFamilyHasAConformanceFixture`), closed by the dedicated suite; the conformance classes then pass on both pins (78 passed, 5 skipped) |
+| CLI, ggml_metal and MLX (IQ2_XXS) | **passed**: text (TTFT 403 ms, 22.0 tok/s; MLX 373 ms, 21.5); the four image questions 4/4 (7319, Red, OCEAN, 3); `--multi-turn-jsonl` reused 86/273 and 270/454; DFlash and n-gram engaged (n-gram 99% and 61% acceptance on the quote-back prompts) |
+| The documented commands, as written (the card's `dotnet run --project ...` quick start and the website's `dotnet TensorSharp.Cli/bin/...` lines; `ggml_cuda` read as `ggml_metal`) | **passed**: all six ran; the image ones answered 7319 |
+| Server, OpenAI API (image streamed and not, `json_schema` with thinking off and on, `json_object` with thinking on, tools streamed and not) | **passed**. `json_object` with thinking off returns 422 (the reply repeated `"population": 2` until the repetition guard stopped it) on the legacy model too, the same request on the pre-switch build: pre-existing |
+| Server, multi-turn reuse (OpenAI; Web UI with thinking off and on) | **passed**: every follow-up reuses what the previous turn held (4,284 / 4,515 / 4,922 tokens; thinking on 4,486 / 4,917) |
+| Web UI loop check (`webui_chat_e2e.py`, thinking off and on, 1,200 tokens) | **passed** |
+| DFlash and n-gram servers | **passed**: reuse as plain; speculation armed |
+| Parallel chats (c4 against sequential, 4 x 3 turns) | **passed**: 12/12 turns identical to sequential, 27.2 s against 53.8 s |
+| TensorAgent Mac app, `muse-glimmer-30b-q4kxl`, chat-e2e's seven scenarios | **passed** 7/7 with the user's settings (KV q4_0, speculation on) and with the entry's own (KV q8_0, speculation off). Against the legacy model built from c012af49, same session and settings: the story turn 17.0 tok/s (legacy 17.1); a new chat reuses 99.7% (legacy 62.3%, its 4,352-token ring cap), first token 0.83 s (8.20 s); the image turn's first token 6.8 s (35.1 s); app footprint 13.4 GB at its highest (legacy 12.7), system wired 22.5 GB (26.6). The catalog keeps its 32 GB tier: by its rule (weights + footprint + 5 GB) both families now come to 33.6-34.3 GB, a question for the catalog, not a regression of the switch |
+| ggml_cuda and direct CUDA E2E | **not run** (the VM) |
 
 ---
 
