@@ -414,10 +414,12 @@ namespace TensorSharp.Models
         {
             if (DeviceRoomForTests != null && RetainedPayloadBytesForTests == null) return true;
             long bytes = ringBytes;
-            foreach (var (key, slot) in _retainedSlots)
-                if (slot.K != null && !Holds(keep, slot))
-                    bytes += RetainedPayloadBytesForTests?.Invoke(key)
-                        ?? (slot.SharesRows ? RecurrentStateBytes(slot) : SlotStorageBytes(slot));
+            // No conversation retained yet (no prefix cache, or none finished): only the rings.
+            if (_retainedSlots != null)
+                foreach (var (key, slot) in _retainedSlots)
+                    if (slot.K != null && !Holds(keep, slot))
+                        bytes += RetainedPayloadBytesForTests?.Invoke(key)
+                            ?? (slot.SharesRows ? RecurrentStateBytes(slot) : SlotStorageBytes(slot));
             return bytes >= shortBy;
         }
 
