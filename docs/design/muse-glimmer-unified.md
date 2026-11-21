@@ -461,8 +461,80 @@ arm runs.
   `Fixtures/Qwen35Legacy` did).
 * **Real weights, greedy.** 5 prompts x 128 tokens plus the 4.6K long prompt, on ggml_metal and MLX
   (the Mac, IQ2_XXS) and ggml_cuda (VM, UD-Q4_K_XL and IQ2_XXS): token-identical to legacy, or the
-  first divergence is a near-tie (legacy's own top-2 margin below 0.05 nat at that step), and the
-  continuation stays on topic.
+  first divergence is a near-tie, and the continuation stays on topic
+  (`RuntimeGreedyContinuationsAreLegacysOrLeaveThemAtANearTie`). A near-tie is either of:
+  * by legacy's numbers: our token is in legacy's frozen top 4 at that step, less than 0.05 nat below
+    legacy's token;
+  * by the F32 reference's: our token is in the reference's top 10 at that step, and the reference
+    puts legacy's token less than TieBound (0.1490 nat) above ours.
+
+  Legacy's own rounding is not the truth at a close step: direct CUDA's refrigerator continuation
+  leaves legacy's at token 78, where legacy put ' separated' 0.228 nat above '.\n\n', but the F32
+  reference puts it 0.144 above, and llama.cpp 0.146.
+* **The F32 reference** (`Fixtures/MuseGlimmer/LegacyReal/f32_reference.json`, written once by
+  `eng/validation/MuseGlimmerF32Reference`). Each distinct legacy continuation of the lanes is
+  teacher-forced from its prompt under exact arithmetic, and the top 10 log-probabilities of each
+  of its 128 steps are kept:
+  * the managed backend, every block-format product the weight's exactly dequantized values times
+    F32 rows (`StandardDecoderModel.FloatProductsForTests`, an internal seam);
+  * an F32 KV cache, the prompt but its last token, then that token and the continuation as one
+    scored chunk.
+
+  Ten sequences cover the five lanes (the lanes' continuations part at a few steps). Each sequence
+  lists the lanes that hold it, and the fixture records the weights' sha256, the commit and the
+  method. It matches an independent F32 seam to 5e-7 (the fixture's 6-place rounding).
+* **How TieBound was derived.**
+  * The sample is direct CUDA's decode path (the prompt in one forward, then one-row forwards),
+    teacher-forced over all ten sequences: 1,280 steps a run.
+  * Six runs whose accuracy against the reference is the same: c593f324; 81bbd0d2; and on 81bbd0d2,
+    the selection rows on 8 splits, selection 16 with global 8, global 1, and no q8_1 products.
+  * The regime is the steps a parting can come from: the reference's top-2 margin under 1 nat, 227
+    steps a run, with refrigerator @78 left out.
+  * The error is our margin between the reference's top two tokens, less the reference's margin.
+    Pooled (n = 1,362): median 0.032, p90 0.102, p99 0.1490 (0.14896, the nearest rank), max 0.201.
+  * The runs' own p99s (n = 227 each):
+
+    | run | p99 |
+    |---|---|
+    | c593f324 | 0.1445 |
+    | 81bbd0d2 | 0.1775 |
+    | 81bbd0d2, selection rows on 8 splits | 0.1384 |
+    | 81bbd0d2, selection 16, global 8 | 0.1678 |
+    | 81bbd0d2, global 1 | 0.1555 |
+    | 81bbd0d2, no q8_1 products | 0.1396 |
+
+  * TieBound is the pooled p99. The procedure was fixed before the numbers were seen, and the bound
+    is not re-tuned in either direction. Pooling estimates the tail better; it was not used to widen
+    the bound.
+  * How thin it is. The refrigerator parting's reference gap is 0.1440 (0.143972), 0.005 under
+    TieBound. The linear-interpolation p99 is 0.1471. A bootstrap over the regime's steps (each
+    step with its six runs' errors, 2,000 draws) puts the p99 between 0.1409 and 0.1731 (90%), and
+    7.6% of the draws are at or under 0.1440.
+* **Teacher-forced accuracy against the F32 reference**
+  (`RuntimeIsNoFurtherFromTheF32ReferenceThanLegacyTeacherForced`). Over every step of the lane's
+  frozen continuations, teacher-forced, the runtime is not further from the reference than legacy
+  is. Two paired tests on the same steps, each one-sided at 1%; legacy's numbers come from its
+  frozen top 4:
+  * The |dlogprob| of the reference's top-1 token, a non-inferiority test with a margin. d_i is the
+    runtime's less legacy's, at each step where that token is in legacy's top 4. The test fails only
+    if mean(d) - 2.33 SE > δ_lane, where SE = sd(d)/sqrt(n) and δ_lane is 0.10 times legacy's own
+    mean top-1 |dlogprob| against the reference on that lane.
+  * Argmax agreement with the reference. An exact binomial (McNemar) on the discordant steps: those
+    where only legacy takes the reference's top-1, against those where only the runtime does. The
+    test fails if p < 0.01.
+
+  Why the margin is 10%. It is the measured floor of legitimate kernel variation: the six equally
+  accurate settings on the cuda lane spread 0.000593 around legacy's 0.0058 there, about 10% of
+  legacy's error.
+
+  Why there is a margin at all. Without one (δ = 0), a lane whose runtime and legacy agree closely
+  fails any systematic difference, however small. ggml_metal did: mean(d) +3.2e-5 nat, 3% of
+  legacy's own error, was z = 2.40 at SE 1.3e-5.
+
+  A bound of legacy plus the settings' range was dropped before this one: it passes whenever any
+  setting beats legacy, which tests that, not the tree under test.
+
+  The test prints n, mean(d), SE, δ_lane, the lower bound and the discordant counts.
 * **Teacher-forced perplexity** (`MuseGlimmerKvGrowProbe --nll-text`,
   `benchmarks/engine_comparison/assets/prefill_corpus.txt`, about 2.4K tokens, so it crosses
   Metal's 2048-row grow and the runtime's 2560-cell ring wrap). The legacy baseline is 4.1689 on

@@ -2857,6 +2857,15 @@ namespace TensorSharp.Models
         /// <summary>Tests: short chunks attend the bucket window around their length, as before capacity windows.</summary>
         internal bool CapacityWindowsDisabledForTests { get; set; }
 
+        /// <summary>
+        /// Tests and the F32 reference tool (eng/validation/MuseGlimmerF32Reference): the model's step programs keep their
+        /// block-format products' activations in F32 (<see cref="GraphProgram.FloatProducts"/>). On the managed backend each such
+        /// product then multiplies the weight's exactly dequantized values by F32 rows, the arithmetic of a per-op path that
+        /// dequantized its weights at load, instead of the managed kernels' integer dot over quantized activations. Set it before
+        /// the model's first step: a step's program is built with the flag it has then.
+        /// </summary>
+        internal bool FloatProductsForTests { get; set; }
+
         private readonly Dictionary<IAllocator, IGraphExecutor> _graphExecutors = new(ReferenceEqualityComparer.Instance);
 
         /// <summary>The backend's graph executor plugin for the current stage's allocator, or null. An executor that binds
@@ -2912,7 +2921,7 @@ namespace TensorSharp.Models
 
             internal GraphStep(StandardDecoderModel model, int rows, Slot[] slots, int[] first, int[] counts, int[] starts,
                 bool decode, bool snapshots, bool record)
-                : base(record)
+                : base(record, model.FloatProductsForTests)
             {
                 RecurrentSnapshots = snapshots;
                 _m = model;

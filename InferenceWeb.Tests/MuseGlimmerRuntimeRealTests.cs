@@ -39,6 +39,16 @@ internal static class MuseGlimmerLegacyReal
 
     internal sealed record Lane(string Key, string ModelSha256, IReadOnlyList<Continuation> Continuations, Perplexity Nll);
 
+    /// <summary>LegacyReal/f32_reference.json (eng/validation/MuseGlimmerF32Reference): each distinct legacy continuation
+    /// teacher-forced from its prompt under exact arithmetic (the managed backend's exactly dequantized weights times F32
+    /// rows, an F32 KV cache), with the top <see cref="ReferenceTopKept"/> log-probabilities of every step and the lanes
+    /// whose frozen continuation it is.</summary>
+    internal const string ReferenceResource = ResourcePrefix + "f32_reference.json";
+    internal const int ReferenceTopKept = 10;
+
+    internal sealed record ReferenceSequence(string Name, string PromptSha256, string TokensSha256, IReadOnlyList<string> Lanes,
+        (int Id, double Logprob)[][] Top);
+
     internal static string CorpusPath()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
@@ -124,7 +134,7 @@ internal static class MuseGlimmerLegacyReal
     {
         var lanes = new Dictionary<string, Lane>(StringComparer.Ordinal);
         var asm = typeof(MuseGlimmerLegacyReal).Assembly;
-        foreach (string name in asm.GetManifestResourceNames().Where(n => n.StartsWith(ResourcePrefix, StringComparison.Ordinal)))
+        foreach (string name in asm.GetManifestResourceNames().Where(n => n.StartsWith(ResourcePrefix, StringComparison.Ordinal) && n != ReferenceResource))
         {
             using Stream s = asm.GetManifestResourceStream(name)!;
             using JsonDocument doc = JsonDocument.Parse(s);
@@ -146,16 +156,50 @@ internal static class MuseGlimmerLegacyReal
     internal static IReadOnlyCollection<string> Lanes => s_lanes.Value.Keys;
 
     internal static Lane Find(string lane) => s_lanes.Value.GetValueOrDefault(lane);
+
+    private static readonly Lazy<(string ModelSha256, IReadOnlyList<ReferenceSequence> Sequences)> s_reference = new(LoadReference);
+
+    private static (string, IReadOnlyList<ReferenceSequence>) LoadReference()
+    {
+        using Stream s = typeof(MuseGlimmerLegacyReal).Assembly.GetManifestResourceStream(ReferenceResource)
+            ?? throw new FileNotFoundException($"{ReferenceResource} is not embedded");
+        using JsonDocument doc = JsonDocument.Parse(s);
+        JsonElement root = doc.RootElement;
+        var sequences = root.GetProperty("sequences").EnumerateArray().Select(q => new ReferenceSequence(
+            q.GetProperty("name").GetString(), q.GetProperty("promptSha256").GetString(), q.GetProperty("tokensSha256").GetString(),
+            q.GetProperty("lanes").EnumerateArray().Select(l => l.GetString()).ToArray(),
+            q.GetProperty("top").EnumerateArray().Select(p => p.EnumerateArray().Select(t => (t[0].GetInt32(), t[1].GetDouble())).ToArray()).ToArray()))
+            .ToList();
+        return (root.GetProperty("model").GetProperty("sha256").GetString(), sequences);
+    }
+
+    /// <summary>The F32 reference of <paramref name="want"/>, <paramref name="lane"/>'s frozen continuation: the fixture's
+    /// sequence that lists the lane, checked against the continuation's prompt, tokens and weights.</summary>
+    internal static ReferenceSequence Reference(Lane lane, Continuation want)
+    {
+        var (weights, sequences) = s_reference.Value;
+        var reference = sequences.FirstOrDefault(r => r.Name == want.Name && r.Lanes.Contains(lane.Key));
+        Assert.True(reference != null, $"f32_reference.json has no sequence of {want.Name} for {lane.Key}");
+        Assert.Equal(lane.ModelSha256, weights);
+        Assert.Equal(want.PromptSha256, reference.PromptSha256);
+        Assert.Equal(PromptSha(want.Tokens), reference.TokensSha256);
+        Assert.Equal(want.Tokens.Length, reference.Top.Length);
+        return reference;
+    }
 }
 
 /// <summary>
 /// The unified-runtime family (<see cref="MuseGlimmerRuntimeModel"/>, through its test seam) on the real weights against the
 /// legacy outputs frozen on the same lane (<see cref="MuseGlimmerLegacyReal"/>), with docs/design/muse-glimmer-unified.md
-/// section 4.2's gates: each greedy continuation is legacy's token for token, or it first leaves legacy's at a near-tie (the
-/// token it takes is in legacy's top four there, less than <see cref="NearTieNats"/> below legacy's choice); the corpus's
-/// teacher-forced perplexity is legacy's within <see cref="PerplexityBound"/> relative and its top-1 agreement within
-/// <see cref="Top1Bound"/>. A move past <see cref="InvestigateBound"/> is printed for investigation (legacy's own two Mac
-/// backends are 0.006% apart).
+/// section 4.2's gates: each greedy continuation is legacy's token for token, or it first leaves legacy's at a near-tie, by
+/// legacy's numbers (the token it takes is in legacy's top four there, less than <see cref="NearTieNats"/> below legacy's
+/// choice) or by the F32 reference's (the token it takes is in the reference's top ten there, and the reference puts
+/// legacy's token less than <see cref="TieBound"/> above it); teacher-forced over the lane's continuations, the runtime is not
+/// further from the F32 reference than legacy is (paired one-sided tests at 1% on the same steps: the |dlogprob| of the
+/// reference's top-1 token within a margin of <see cref="NonInferiorityShare"/> of legacy's own, and argmax agreement); the
+/// corpus's teacher-forced perplexity is legacy's within <see cref="PerplexityBound"/>
+/// relative and its top-1 agreement within <see cref="Top1Bound"/>. A move past <see cref="InvestigateBound"/> is printed
+/// for investigation (legacy's own two Mac backends are 0.006% apart).
 /// </summary>
 public sealed class MuseGlimmerRuntimeRealTests(ITestOutputHelper output)
 {
@@ -163,6 +207,27 @@ public sealed class MuseGlimmerRuntimeRealTests(ITestOutputHelper output)
     internal const double PerplexityBound = 3e-3;
     internal const double InvestigateBound = 5e-4;
     internal const double Top1Bound = 0.005;
+
+    /// <summary>
+    /// How far the F32 reference may put legacy's token above ours where a continuation leaves legacy's: how far a decode
+    /// step's margin between the reference's top two tokens moves from the reference's margin, at the 99th percentile of the
+    /// steps where that margin is below 1 nat (the steps a parting can come from). Measured on direct CUDA's decode path
+    /// teacher-forced over all ten sequences of f32_reference.json in six runs whose accuracy against the reference is the
+    /// same (c593f324, 81bbd0d2, and four split and product settings on 81bbd0d2): 1,362 steps pooled, the refrigerator
+    /// parting the rule was written for left out; p99 0.14896 (docs/design/muse-glimmer-unified.md section 4.2).
+    /// </summary>
+    internal const double TieBound = 0.1490;
+
+    /// <summary>The teacher-forced accuracy gate's one-sided level: 1%, so a mean difference whose lower bound (less 2.33
+    /// standard errors) is over the margin, or a binomial tail under 0.01, is the runtime being further from the F32
+    /// reference than legacy.</summary>
+    internal const double OneSidedZ99 = 2.33;
+    internal const double OneSidedAlpha = 0.01;
+
+    /// <summary>The non-inferiority margin of the top-1 |dlogprob| test, a share of legacy's own mean top-1 |dlogprob|
+    /// against the reference on the lane: the floor of legitimate kernel variation, as six equally accurate kernel settings
+    /// on direct CUDA spread 0.000593 around legacy's 0.0058 there (docs/design/muse-glimmer-unified.md section 4.2).</summary>
+    internal const double NonInferiorityShare = 0.10;
 
     private static MuseGlimmerLegacyReal.Lane Frozen(BackendType backend)
     {
@@ -201,17 +266,107 @@ public sealed class MuseGlimmerRuntimeRealTests(ITestOutputHelper output)
             double legacyMargin = legacyTop.Length > 1 ? legacyTop[0].Logprob - legacyTop[1].Logprob : double.PositiveInfinity;
             int ours = got.Tokens[first];
             double? legacyGap = legacyTop.Where(t => t.Id == ours).Select(t => (double?)(legacyTop[0].Logprob - t.Logprob)).FirstOrDefault();
+            // The reference was teacher-forced on legacy's continuation, whose prefix up to here is ours: its step is this one.
+            var referenceTop = MuseGlimmerLegacyReal.Reference(frozen, want).Top[first];
+            double? referenceOurs = referenceTop.Where(t => t.Id == ours).Select(t => (double?)t.Logprob).FirstOrDefault();
+            double? referenceLegacy = referenceTop.Where(t => t.Id == want.Tokens[first]).Select(t => (double?)t.Logprob).FirstOrDefault();
+            // Legacy's token outside the reference's top ten is at most the tenth's log-probability: a gap at most that.
+            double? referenceGap = referenceOurs is { } ro ? (referenceLegacy ?? referenceTop[^1].Logprob) - ro : null;
             string text = model.Tokenizer.Decode(got.Tokens.ToList()).Replace('\n', ' ');
             string what = $"{want.Name} @{first}: legacy {want.Tokens[first]} '{MuseGlimmerParity.Decode(model, want.Tokens[first])}', " +
                 $"ours {ours} '{MuseGlimmerParity.Decode(model, ours)}'; legacy's top-2 margin {legacyMargin:F4}, legacy's gap to ours " +
-                (legacyGap is { } g ? g.ToString("F4") : "(not in its top 4)");
+                (legacyGap is { } g ? g.ToString("F4") : "(not in its top 4)") + "; the F32 reference's gap from legacy's token to ours " +
+                (referenceGap is { } rg ? (referenceLegacy == null ? "at most " : "") + rg.ToString("F4") : "(ours not in its top 10)") +
+                $" (TieBound {TieBound:F4})";
             output.WriteLine($"[DIFF  ] {what}\n          ours: {(text.Length > 400 ? text[..400] + "..." : text)}");
-            if (legacyGap is not { } gap || gap >= NearTieNats)
+            bool legacysTie = legacyGap is { } gap && gap < NearTieNats;
+            bool referencesTie = referenceGap is { } refGap && refGap < TieBound;
+            if (!legacysTie && !referencesTie)
                 failures.Add(what);
         }
         output.WriteLine($"{identical}/{prompts.Count} continuations identical to legacy's; worst |dlogprob| of legacy's token over the shared " +
             $"prefixes {worstPrefixDelta:F4}");
         Assert.True(failures.Count == 0, "continuations that leave legacy's at a position that is not a near-tie:\n" + string.Join("\n", failures));
+    }
+
+    /// <summary>
+    /// Teacher-forced over every frozen continuation of the lane (the prompt in one forward, then one-row forwards of
+    /// legacy's tokens), the runtime is not further from the F32 reference than legacy is, by two paired tests on the same
+    /// steps, each one-sided at 1%; legacy's numbers come from its frozen top four (greedy, so its argmax is its own token).
+    /// <list type="bullet">
+    /// <item>The |dlogprob| of the reference's top-1 token: d = the runtime's less legacy's at each step where that token is
+    /// in legacy's top four; fails if mean(d) less <see cref="OneSidedZ99"/> standard errors (sd(d) / sqrt(n)) is over the
+    /// margin, <see cref="NonInferiorityShare"/> of legacy's own mean |dlogprob| over those steps.</item>
+    /// <item>Argmax agreement with the reference: an exact binomial (McNemar) on the steps where exactly one of the two takes
+    /// the reference's top-1; fails if the steps where only legacy does are that many or more with probability under
+    /// <see cref="OneSidedAlpha"/>, a fair coin deciding each.</item>
+    /// </list>
+    /// The tests compare the tree under test with legacy step by step; the margin is legacy's own error on the lane, scaled.
+    /// </summary>
+    [MuseGlimmerModelFact]
+    public void RuntimeIsNoFurtherFromTheF32ReferenceThanLegacyTeacherForced()
+    {
+        BackendType backend = MuseGlimmerParity.Backend();
+        var frozen = Frozen(backend);
+        using ModelBase model = MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend);
+        var prompts = MuseGlimmerLegacyReal.Prompts().ToList();
+        int steps = 0, onlyLegacy = 0, onlyOurs = 0;
+        var d = new List<double>();
+        double legacyError = 0;
+        foreach (var want in frozen.Continuations)
+        {
+            var reference = MuseGlimmerLegacyReal.Reference(frozen, want);
+            var golden = prompts.First(p => p.Name == want.Name);
+            Assert.Equal(want.PromptSha256, MuseGlimmerLegacyReal.PromptSha(golden.PromptTokens));
+            model.ResetKVCache();
+            float[] logits = model.Forward(golden.PromptTokens);
+            for (int i = 0; i < want.Tokens.Length; i++)
+            {
+                int n = Math.Min(model.Config.VocabSize, logits.Length);
+                double[] lp = MuseGlimmerParity.LogSoftmax(logits, n);
+                var (refId, refLp) = reference.Top[i][0];
+                steps++;
+                bool ours = MuseGlimmerParity.ArgMax(logits, n) == refId, legacyAgrees = want.Top[i][0].Id == refId;
+                if (legacyAgrees && !ours) onlyLegacy++;
+                if (ours && !legacyAgrees) onlyOurs++;
+                if (want.Top[i].Any(t => t.Id == refId))
+                {
+                    double legacys = Math.Abs(want.Top[i].First(t => t.Id == refId).Logprob - refLp);
+                    d.Add(Math.Abs(lp[refId] - refLp) - legacys);
+                    legacyError += legacys;
+                }
+                if (i + 1 < want.Tokens.Length)
+                    logits = model.Forward(new[] { want.Tokens[i] });
+            }
+        }
+        double mean = d.Average();
+        double sd = Math.Sqrt(d.Sum(x => (x - mean) * (x - mean)) / (d.Count - 1));
+        double se = sd / Math.Sqrt(d.Count);
+        double margin = NonInferiorityShare * legacyError / d.Count, lower = mean - OneSidedZ99 * se;
+        double tail = BinomialUpperTail(onlyLegacy, onlyLegacy + onlyOurs);
+        output.WriteLine($"{frozen.Key}: {steps} teacher-forced steps against the F32 reference. Top-1 |dlogprob|, ours less legacy's: " +
+            $"n {d.Count}, mean(d) {mean:+0.000000;-0.000000}, sd {sd:F6}, SE {se:F6}, z {(se > 0 ? mean / se : 0):+0.000;-0.000}; " +
+            $"lower bound mean(d) - {OneSidedZ99} SE {lower:+0.000000;-0.000000} against the margin {margin:F6} ({NonInferiorityShare:P0} of " +
+            $"legacy's {legacyError / d.Count:F6}). Argmax: only legacy takes the reference's top-1 at {onlyLegacy}, only ours at " +
+            $"{onlyOurs}, one-sided binomial p {tail:F4} (fails under {OneSidedAlpha})");
+        Assert.True(lower <= margin,
+            $"the runtime's top-1 |dlogprob| against the F32 reference is larger than legacy's by more than the margin: mean(d) {mean:F6} " +
+            $"over {d.Count} steps, SE {se:F6}, lower bound {lower:F6}, margin {margin:F6}");
+        Assert.True(tail >= OneSidedAlpha,
+            $"the runtime's argmax leaves the F32 reference's at more steps than legacy's: only legacy's agrees at {onlyLegacy}, " +
+            $"only ours at {onlyOurs}, p {tail:F4}");
+    }
+
+    /// <summary>P(X >= k) for X binomial over <paramref name="n"/> fair trials (1 when n is 0).</summary>
+    internal static double BinomialUpperTail(int k, int n)
+    {
+        double term = Math.Pow(0.5, n), tail = 0;
+        for (int j = 0; j <= n; j++)
+        {
+            if (j >= k) tail += term;
+            term = term * (n - j) / (j + 1);
+        }
+        return Math.Min(1, tail);
     }
 
     [MuseGlimmerModelFact]
