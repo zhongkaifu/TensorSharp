@@ -1610,11 +1610,16 @@ namespace TensorSharp.Models
             // Unary term: the ordinary DFlash head, kept only at its top-k.
             int[] candIds = new int[gamma * k];
             float[] unary = new float[gamma * k];
+            DFlashSlotTrace[] trace = DFlashTraceForTests ? new DFlashSlotTrace[gamma] : null;
             using (Tensor logits = LinearForward(predRows, DFlashTargetOutputWeightName))
             {
                 float* lp = GetFloatPtr(logits);
                 for (int e = 0; e < gamma; e++)
+                {
                     DFlashTopK(lp + (long)e * vocab, vocab, k, candIds, unary, e * k);
+                    if (trace != null)
+                        trace[e] = new DFlashSlotTrace { Logits = new ReadOnlySpan<float>(lp + (long)e * vocab, vocab).ToArray() };
+                }
             }
             // The target's own logit transform, applied AFTER the top-k because both
             // halves of it are monotonic (so the candidate set is unchanged) and doing
@@ -1668,6 +1673,11 @@ namespace TensorSharp.Models
                 chosen = 0;
                 for (int c = 1; c < k; c++)
                     if (row[c] > row[chosen]) chosen = c;
+                if (trace != null)
+                {
+                    trace[e].Candidates = candIds.AsSpan(e * k, k).ToArray();
+                    trace[e].Scores = (float[])row.Clone();
+                }
 
                 if (DFlashSelectorDebug && _dflashSelectorDebugBlocks < 3)
                 {
@@ -1697,6 +1707,7 @@ namespace TensorSharp.Models
 
             if (DFlashSelectorDebug)
                 _dflashSelectorDebugBlocks++;
+            if (trace != null) LastDFlashTraceForTests = trace;
             return gamma;
         }
 
