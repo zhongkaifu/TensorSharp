@@ -35,7 +35,7 @@ namespace TensorSharp.Cuda
         private static readonly GraphCapabilities s_capabilities = new()
         {
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
-            WindowStateInPlace = true, WindowRegionsReadPackedRows = true, SlotBoundRecordings = true,
+            WindowStateInPlace = true, WindowRegionsReadPackedRows = true, SequencePrepRegions = true, SlotBoundRecordings = true,
             HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true, GreedyIdOutputs = true,
             // A sliding-window layer's decode rows and verify windows list their band's cells on the device
             // (TrySparseDecodeAttention, the window rows' selection): their steps record past the window, where a band

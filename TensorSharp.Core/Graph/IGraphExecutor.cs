@@ -36,6 +36,11 @@ namespace TensorSharp.Graph
         /// them, a packed row apart: the window takes the projection as one product, as decode rows do, instead of a product
         /// per row block.</summary>
         public bool WindowRegionsReadPackedRows { get; init; }
+        /// <summary>Several sequences' query/key prep and cache writes run as one attention prep region
+        /// (GraphFusion.AttentionPrep with each further sequence's caches and write rows) in one kernel; a family emits that
+        /// region only for such an executor, and elsewhere each sequence's rows take the ops a step of several sequences
+        /// always emitted.</summary>
+        public bool SequencePrepRegions { get; init; }
         /// <summary>Its recorded steps bind a slot's buffers: a request that runs in a new slot relocates or records them again
         /// (tens of milliseconds a step shape), so a finished request is retained as a copy and its slot serves the next.</summary>
         public bool SlotBoundRecordings { get; init; }
