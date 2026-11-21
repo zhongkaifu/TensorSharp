@@ -393,8 +393,11 @@ public sealed class Lfm3SpeechOutputTests
         using Lfm3SpeechOutput speech = SyntheticOutput(lane, variant, 17, out float[] feedbackTable);
         Lfm3SpeechConfig c = speech.Config;
         var reference = new HostReference(lane.Weights, c);
-        // CPU block products quantize their activations to 8 bits; GGML metal / MLX products and attention round to F16.
-        double tol = variant == "q8_0" ? 6e-2 : laneKind == Lane.Mlx || HalfOperandLane(laneKind) ? 1.5e-2 : variant == "f16" && laneKind == Lane.GgmlCpu ? 1e-2 : 2e-3;
+        // CPU block products quantize their activations to 8 bits; GGML metal / MLX products and attention round to F16, and
+        // so do direct CUDA's F16-weight products (CudaQuantizedOps.RunF16Gemm narrows the activations to F16 for cuBLAS's F16
+        // GEMM at every row count; the streamed bound below already counts direct CUDA among the F16-operand lanes).
+        bool halfOperands = laneKind == Lane.Mlx || HalfOperandLane(laneKind) || (laneKind == Lane.Cuda && variant == "f16");
+        double tol = variant == "q8_0" ? 6e-2 : halfOperands ? 1.5e-2 : variant == "f16" && laneKind == Lane.GgmlCpu ? 1e-2 : 2e-3;
         var rng = new Random(23);
 
         // ---- depthformer: a frame's three passes (the projection kept between them), codes revealed 4 at a time ----
