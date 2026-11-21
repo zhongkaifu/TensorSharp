@@ -47412,4 +47412,101 @@ $L__BB69_153:
 	ret;
 
 }
+	// .globl	ts_graph_set_rows_heads_f32
+.visible .entry ts_graph_set_rows_heads_f32(
+	.param .u64 ts_graph_set_rows_heads_f32_param_0,
+	.param .u64 ts_graph_set_rows_heads_f32_param_1,
+	.param .u64 ts_graph_set_rows_heads_f32_param_2,
+	.param .u64 ts_graph_set_rows_heads_f32_param_3,
+	.param .u64 ts_graph_set_rows_heads_f32_param_4,
+	.param .u32 ts_graph_set_rows_heads_f32_param_5,
+	.param .u64 ts_graph_set_rows_heads_f32_param_6,
+	.param .u32 ts_graph_set_rows_heads_f32_param_7,
+	.param .u32 ts_graph_set_rows_heads_f32_param_8
+)
+{
+	.reg .pred 	%p<8>;
+	.reg .b16 	%rs<2>;
+	.reg .f32 	%f<3>;
+	.reg .b32 	%r<15>;
+	.reg .b64 	%rd<36>;
+
+
+	ld.param.u64 	%rd9, [ts_graph_set_rows_heads_f32_param_0];
+	ld.param.u64 	%rd6, [ts_graph_set_rows_heads_f32_param_1];
+	ld.param.u64 	%rd10, [ts_graph_set_rows_heads_f32_param_2];
+	ld.param.u64 	%rd11, [ts_graph_set_rows_heads_f32_param_3];
+	ld.param.u64 	%rd7, [ts_graph_set_rows_heads_f32_param_4];
+	ld.param.u32 	%r8, [ts_graph_set_rows_heads_f32_param_5];
+	ld.param.u64 	%rd8, [ts_graph_set_rows_heads_f32_param_6];
+	ld.param.u32 	%r10, [ts_graph_set_rows_heads_f32_param_7];
+	ld.param.u32 	%r9, [ts_graph_set_rows_heads_f32_param_8];
+	cvta.to.global.u64 	%rd1, %rd11;
+	cvta.to.global.u64 	%rd2, %rd9;
+	mov.u32 	%r11, %ctaid.x;
+	cvt.u64.u32 	%rd3, %r11;
+	cvta.to.global.u64 	%rd12, %rd10;
+	mul.wide.u32 	%rd13, %r11, 4;
+	add.s64 	%rd14, %rd12, %rd13;
+	ld.global.nc.u32 	%r1, [%rd14];
+	setp.lt.s32 	%p1, %r1, 0;
+	setp.ge.s32 	%p2, %r1, %r10;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB70_5;
+
+	mov.u32 	%r12, %ctaid.y;
+	cvt.u64.u32 	%rd15, %r12;
+	mul.lo.s64 	%rd16, %rd15, %rd7;
+	cvt.s64.s32 	%rd17, %r1;
+	mul.lo.s64 	%rd18, %rd17, %rd8;
+	add.s64 	%rd4, %rd18, %rd16;
+	cvt.s64.s32 	%rd19, %r8;
+	mul.lo.s64 	%rd20, %rd19, %rd3;
+	mul.lo.s64 	%rd21, %rd15, %rd6;
+	add.s64 	%rd5, %rd20, %rd21;
+	mov.u32 	%r13, %tid.x;
+	setp.ge.s32 	%p4, %r13, %r8;
+	@%p4 bra 	$L__BB70_5;
+
+	setp.eq.s32 	%p5, %r9, 0;
+	mov.u32 	%r3, %ntid.x;
+	@%p5 bra 	$L__BB70_4;
+
+$L__BB70_3:
+	cvt.s64.s32 	%rd22, %r13;
+	add.s64 	%rd23, %rd5, %rd22;
+	shl.b64 	%rd24, %rd23, 2;
+	add.s64 	%rd25, %rd2, %rd24;
+	ld.global.nc.f32 	%f1, [%rd25];
+	// begin inline asm
+	{  cvt.rn.f16.f32 %rs1, %f1;}
+
+	// end inline asm
+	add.s64 	%rd26, %rd4, %rd22;
+	shl.b64 	%rd27, %rd26, 1;
+	add.s64 	%rd28, %rd1, %rd27;
+	st.global.u16 	[%rd28], %rs1;
+	add.s32 	%r13, %r13, %r3;
+	setp.lt.s32 	%p6, %r13, %r8;
+	@%p6 bra 	$L__BB70_3;
+	bra.uni 	$L__BB70_5;
+
+$L__BB70_4:
+	cvt.s64.s32 	%rd29, %r13;
+	add.s64 	%rd30, %rd5, %rd29;
+	shl.b64 	%rd31, %rd30, 2;
+	add.s64 	%rd32, %rd2, %rd31;
+	ld.global.nc.f32 	%f2, [%rd32];
+	add.s64 	%rd33, %rd4, %rd29;
+	shl.b64 	%rd34, %rd33, 2;
+	add.s64 	%rd35, %rd1, %rd34;
+	st.global.f32 	[%rd35], %f2;
+	add.s32 	%r13, %r13, %r3;
+	setp.lt.s32 	%p7, %r13, %r8;
+	@%p7 bra 	$L__BB70_4;
+
+$L__BB70_5:
+	ret;
+
+}
 

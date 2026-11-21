@@ -3630,3 +3630,22 @@ TS_GRAPH_GEMM_Q6K(1)
 TS_GRAPH_GEMM_Q6K(2)
 TS_GRAPH_GEMM_Q6K(4)
 TS_GRAPH_GEMM_Q6K(8)
+
+// ggml_set_rows by device int32 indices into rows of several heads (a block drafter's KV ring, [heads][dstRows][rowLen]): head
+// h's dst row ids[i] (dstHead elements past head h - 1's; rows dstPitch elements apart) takes contiguous F32 src row i of head h
+// (srcHead floats apart): ts_graph_set_rows_f32's writes, every head's in one launch. Launch: grid (count, heads), block 256.
+extern "C" __global__ void ts_graph_set_rows_heads_f32(const float* __restrict__ src, long long srcHead, const int* __restrict__ ids,
+    void* __restrict__ dst, long long dstHead, int rowLen, long long dstPitch, int dstRows, int half)
+{
+    const size_t i = blockIdx.x, h = blockIdx.y;
+    const int row = ids[i];
+    if (row < 0 || row >= dstRows) return;
+    const size_t to = h * (size_t)dstHead + (size_t)row * (size_t)dstPitch;
+    const float* s = src + h * (size_t)srcHead + i * (size_t)rowLen;
+    for (int c = threadIdx.x; c < rowLen; c += blockDim.x)
+    {
+        const float v = s[c];
+        if (half) ((__half*)dst)[to + c] = __float2half_rn(v);
+        else ((float*)dst)[to + c] = v;
+    }
+}

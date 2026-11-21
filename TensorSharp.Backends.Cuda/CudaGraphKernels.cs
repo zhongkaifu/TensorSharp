@@ -27,6 +27,7 @@ namespace TensorSharp.Cuda
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
         private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
+        private readonly IntPtr _setRowsHeads;
         private readonly int _multiprocessors;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
@@ -48,6 +49,8 @@ namespace TensorSharp.Cuda
             _getRows = module.GetFunction("ts_graph_get_rows_f32");
             _getRowsF16 = module.GetFunction("ts_graph_get_rows_f16");
             _setRows = module.GetFunction("ts_graph_set_rows_f32");
+            try { _setRowsHeads = module.GetFunction("ts_graph_set_rows_heads_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { _setRowsHeads = IntPtr.Zero; }
             _lightningIndexer = module.GetFunction("ts_graph_lightning_indexer_f32");
             _topkMask = module.GetFunction("ts_graph_topk_mask_f32");
             _maskCells = module.GetFunction("ts_graph_mask_cells");
@@ -558,6 +561,19 @@ namespace TensorSharp.Cuda
             int h = half ? 1 : 0;
             void** args = stackalloc void*[] { &src, &ids, &dst, &rowLen, &dstPitch, &dstRows, &h };
             CudaDriverApi.cuLaunchKernel(_setRows, (uint)count, 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Whether this image runs <see cref="LaunchSetRowsHeads"/>.</summary>
+        public bool TakesSetRowsHeads => _setRowsHeads != IntPtr.Zero;
+
+        /// <summary><see cref="LaunchSetRows"/> into each of <paramref name="heads"/> heads' blocks (<paramref name="dstHead"/> elements
+        /// apart; src heads <paramref name="srcHead"/> floats apart) in one launch: the same rows into each head's block.</summary>
+        public void LaunchSetRowsHeads(IntPtr src, long srcHead, IntPtr ids, IntPtr dst, long dstHead, int heads, int count, int rowLen,
+            long dstPitch, int dstRows, bool half, IntPtr stream)
+        {
+            int h = half ? 1 : 0;
+            void** args = stackalloc void*[] { &src, &srcHead, &ids, &dst, &dstHead, &rowLen, &dstPitch, &dstRows, &h };
+            CudaDriverApi.cuLaunchKernel(_setRowsHeads, (uint)count, (uint)heads, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Most q floats (heads * d) a row of <see cref="LaunchLightningIndexer"/> holds; d &lt;= 256.</summary>

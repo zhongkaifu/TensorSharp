@@ -854,9 +854,14 @@ namespace TensorSharp.Cuda
             int elementBytes = half ? 2 : 4;
             Launch(new[] { src, ids }, dst, (k, stream) =>
             {
-                for (long h = 0; h < heads; h++)
-                    k.LaunchSetRows(Ptr(src) + (nint)(h * srcHead * sizeof(float)), Ptr(ids), Ptr(dst) + (nint)(h * dstHead * elementBytes), count,
-                        (int)ns[0], pitch, (int)nd[1], half, stream);
+                // Every head's rows in one launch (a block drafter's ring writes had taken a launch a KV head: 640 of a
+                // Qwen3.8-27B DFlash2 lanes block's 1,022 kernels for four requests, RTX PRO 4500).
+                if (heads > 1 && k.TakesSetRowsHeads && heads <= 65535)
+                    k.LaunchSetRowsHeads(Ptr(src), srcHead, Ptr(ids), Ptr(dst), dstHead, (int)heads, count, (int)ns[0], pitch, (int)nd[1], half, stream);
+                else
+                    for (long h = 0; h < heads; h++)
+                        k.LaunchSetRows(Ptr(src) + (nint)(h * srcHead * sizeof(float)), Ptr(ids), Ptr(dst) + (nint)(h * dstHead * elementBytes), count,
+                            (int)ns[0], pitch, (int)nd[1], half, stream);
             });
             return true;
         }
