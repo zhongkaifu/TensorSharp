@@ -124,7 +124,11 @@ public sealed class GgmlCudaTeardownTests : IDisposable
         });
         try
         {
-            // Whatever an earlier test left resident must not count as this release.
+            // The same shape once on this thread first, as the paged test does: the attention's first run in a process
+            // grows what the backend keeps for good (its pool, the device code of the kernels it loads), so in a process
+            // of its own the worker's first run would count that too (RTX PRO 4500: 400 MiB held, 296 released, the
+            // session's alone). The unload frees this thread's session; whatever an earlier test left resident goes with it.
+            float[] reference = Attend(allocator, heads, kvHeads, headDim, rows);
             GgmlBasicOps.ClearHostBufferCache();
             long idle = FreeMiB();
 
@@ -143,6 +147,7 @@ public sealed class GgmlCudaTeardownTests : IDisposable
             released = ReleasedMiBByUnload();
             Assert.True(released >= held * 3 / 4,
                 $"a model unload released {released} of {held} MiB: it left the session of a thread that has exited");
+            Assert.Equal(reference, first);
             Assert.Equal(first, second);
         }
         finally
