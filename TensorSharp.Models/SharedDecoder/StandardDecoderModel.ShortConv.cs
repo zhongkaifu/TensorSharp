@@ -462,7 +462,7 @@ namespace TensorSharp.Models
             {
                 var states = new List<ShortConvState>();
                 for (int layer = 0; layer < Config.NumLayers; layer++)
-                    if (_recurrentLayer[layer] && OwnsLayer(layer) && _mesh.StageOf(layer) == stage
+                    if (LayerHasState(layer) && OwnsLayer(layer) && _mesh.StageOf(layer) == stage
                         && ActiveRecurrentState(layer, rank) is ShortConvState { ConvHistory: not null } state && rows <= state.SnapshotCapacity)
                         states.Add(state);
                 if (states.Count == 0) continue;

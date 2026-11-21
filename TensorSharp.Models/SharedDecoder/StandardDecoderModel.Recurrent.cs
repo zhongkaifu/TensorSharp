@@ -123,6 +123,9 @@ namespace TensorSharp.Models
         }
 
         private bool[] _recurrentLayer;
+        /// <summary>Layers that keep a <see cref="RecurrentState"/> per sequence: the recurrent layers, and attention layers
+        /// whose blocks carry state beside their KV cache (<see cref="AttentionLayerHasState"/>).</summary>
+        private bool[] _layerState;
         private bool _anyRecurrent;
         private RecurrentState[][] _recurrentPrimary;   // [layer][rank]
 
@@ -139,6 +142,16 @@ namespace TensorSharp.Models
 
         /// <summary>True for a layer whose token mixer is a recurrent block. Default: none.</summary>
         protected virtual bool IsRecurrentLayer(int layer) => false;
+
+        /// <summary>True for an attention layer that also keeps a per-sequence <see cref="RecurrentState"/>
+        /// (<see cref="CreateRecurrentState"/>), read and advanced by the family's own graph ops: Inkling 2's short convolutions
+        /// over its K, V and block outputs. The stack then counts as recurrent (its prefix rewinds only to its length or zero,
+        /// checkpoints carry the states). Default: none.</summary>
+        protected virtual bool AttentionLayerHasState(int layer) => false;
+
+        /// <summary>Whether <paramref name="layer"/> keeps a per-sequence state (a recurrent layer, or an attention layer with
+        /// <see cref="AttentionLayerHasState"/>).</summary>
+        protected bool LayerHasState(int layer) => _layerState != null && layer < _layerState.Length && _layerState[layer];
 
         /// <summary>A fresh (reset) state for <paramref name="layer"/> on <paramref name="scope"/>'s rank.</summary>
         protected virtual RecurrentState CreateRecurrentState(RankScope scope, int layer)
@@ -170,10 +183,12 @@ namespace TensorSharp.Models
         private void DetectRecurrentLayers()
         {
             _recurrentLayer = new bool[TotalLayers];   // draft layers are attention layers
+            _layerState = new bool[TotalLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 _recurrentLayer[l] = IsRecurrentLayer(l);
-                _anyRecurrent |= _recurrentLayer[l];
+                _layerState[l] = _recurrentLayer[l] || AttentionLayerHasState(l);
+                _anyRecurrent |= _layerState[l];
             }
         }
 
@@ -194,7 +209,7 @@ namespace TensorSharp.Models
         /// that keeps none here.</summary>
         private void NewRecurrentLayer(RecurrentState[][] states, int l)
         {
-            if (!_recurrentLayer[l] || !OwnsLayer(l)) return;
+            if (!_layerState[l] || !OwnsLayer(l)) return;
             int stage = _mesh.StageOf(l);
             states[l] = new RecurrentState[_mesh.TensorParallel];
             for (int r = 0; r < _mesh.TensorParallel; r++)

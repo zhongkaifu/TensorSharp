@@ -53,7 +53,13 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["qwen35"] = typeof(Qwen35RuntimeTests),
         // LFM3's short-conv layers rewind only to their length or to zero, as Qwen 3.5's recurrent layers do.
         ["lfm3"] = typeof(Lfm3RuntimeTests),
+        // Inkling 2 keeps short-conv state on every layer; it declares its placements and expert offload as gaps.
+        ["inkling2"] = typeof(Inkling2RuntimeTests),
     };
+
+    /// <summary>Shared-runtime families that run whole-forward graphs only (StandardDecoderModel.RequiresGraphs): their
+    /// dedicated suite has no per-op path to compare the graphs with. A family leaves the list when it gains one.</summary>
+    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2" };
 
     /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)
     /// does not declare.</summary>

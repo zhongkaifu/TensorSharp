@@ -380,6 +380,30 @@ namespace TensorSharp.Runtime
                 },
             });
 
+            // ---- Inkling 2 ---------------------------------------------------
+            // Every turn is a run of <|message_ROLE|>[name]<|content_KIND|>body<|end_message|>
+            // messages; the model opens its own reply (no generation prompt) and may reason
+            // in a content_thinking message at any effort level, so its replies always need
+            // the parser. Its template re-renders a past turn's reasoning, which is what the
+            // live cache holds from generation.
+            Register(new ChatProtocol
+            {
+                Id = "inkling2",
+                Architectures = new[] { "inkling2", "inkling2_loop" },
+                Render = r => ChatTemplate.RenderInkling2(r.Messages, r.Tools, r.ReasoningEffort),
+                PreferOwnRenderer = _ => true,
+                RendersReasoningEffort = true,
+                RendersAssistantReasoning = true,
+                CreateOutputParser = () => new Inkling2OutputParser(),
+                OutputParserAlwaysRequired = true,
+                ThinkingBudgetUsesOutputParser = true,
+                ThinkingBudgetTransitionText = ChatTemplate.Inkling2EndMessage + ChatTemplate.Inkling2MessageModel + ChatTemplate.Inkling2ContentText,
+                ThinkingBudgetToolTransitionText = ChatTemplate.Inkling2EndMessage + ChatTemplate.Inkling2MessageModel,
+                // The answer is a content_text message, with or without reasoning before it.
+                GrammarActivationTrigger = ChatTemplate.Inkling2ContentText,
+                ThinkingGrammarActivationTrigger = ChatTemplate.Inkling2ContentText,
+            });
+
             // ---- Others -----------------------------------------------------
             Register(new ChatProtocol
             {

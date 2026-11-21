@@ -165,7 +165,8 @@ namespace TensorSharp.Runtime
                 // numeric prompt diverged from llama.cpp.
                 // MiniMax-M2/M3 ("minimax-m2", LLAMA_VOCAB_PRE_TYPE_MINIMAX_M2) share the arm:
                 // their tokenizer.json Split regex is this exact string.
-                "gpt-4o" or "llama4" or "kanana2" or "talkie" or "minimax-m2" =>
+                // Inkling 2 ("inkling2") is GPT-4o's too, without a BOS token (llama-vocab.cpp).
+                "gpt-4o" or "llama4" or "kanana2" or "talkie" or "minimax-m2" or "inkling2" =>
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
                     @"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",

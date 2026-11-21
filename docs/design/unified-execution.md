@@ -405,7 +405,10 @@ MechanismSupport.Gap("whole-layer placement is not implemented for the native ex
 
 `Implementation = SharedRuntime` derives every mechanism from the runtime (all backends that
 can provide the devices) and a family may not override that downwards: a shared-runtime family
-that cannot support something is a runtime bug, not a family exception.
+that cannot support something is a runtime bug, not a family exception. The one exception is a
+mechanism a family does not run yet at all (Inkling 2's placements and expert offload, whose loop,
+depth-mixed stream and own expert path have no split): it declares it `MechanismSupport.None` on
+every backend, with the refusal as its reason, and the gap ratchet below lists each such gap.
 
 The loader reads only this contract: `ResolveTensorParallelSupport` and the hosts' refusals are
 driven by it, so a declared gap is also the operator-facing refusal message.
@@ -440,7 +443,10 @@ driven by it, so a declared gap is also the operator-facing refusal message.
    every placement (asserting the paged batched forward ran). `SharedRuntimeMoeConformanceTests`
    does the same for routed experts with and without host offload, through a test-only family
    that writes nothing but its rotary step. Single-device parity on the real backends
-   (`ggml_cpu`, `ggml_metal`, MLX) is checked against the managed reference.
+   (`ggml_cpu`, `ggml_metal`, MLX) is checked against the managed reference. A family the script
+   cannot drive has a dedicated suite (`SharedRuntimeConformanceTests.DedicatedSuites`) that declares
+   one test per mechanism it claims: none for a mechanism it declares as a gap everywhere, and no
+   per-op comparison for a graph-only family (`GraphOnlyFamilies`).
 
 ---
 

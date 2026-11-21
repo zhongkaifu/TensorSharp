@@ -64,7 +64,7 @@ namespace TensorSharp.Models
             _moeLayer = new bool[TotalLayers];
             for (int l = 0; l < TotalLayers; l++)
             {
-                _moeLayer[l] = OwnsLayer(l) && HasWeight($"blk.{l}.ffn_gate_inp.weight");
+                _moeLayer[l] = OwnsLayer(l) && HasWeight(LayerName(l, "ffn_gate_inp.weight"));
                 _anyMoe |= _moeLayer[l];
             }
             if (!_anyMoe) return;
