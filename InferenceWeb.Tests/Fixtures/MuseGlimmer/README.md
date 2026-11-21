@@ -132,14 +132,8 @@ How `MuseGlimmerVisionParityTests` uses them:
   the managed executor's F32 tower.
 * ggml_metal, MLX and the CPU lanes keep the near-tie rule (97%, every parting a near-tie).
 
-A lane with no file fails and names the file to write. To refreeze a lane, give the writer the set's folder (the
-model directory as for the parity tests; the ggml pin and `TS_MUSE_GLIMMER_BACKEND` pick the lane):
-
-```bash
-TS_TEST_MODEL_DIR=<models> TS_TEST_GGML_BACKEND=cuda \
-TS_TEST_FREEZE_MUSE_GLIMMER_REAL=InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/cuda TS_TEST_FREEZE_PROVENANCE="<build, GPU, driver>" \
-    dotnet test InferenceWeb.Tests -c Release --filter "FullyQualifiedName~MuseGlimmerLegacyVisionWriterTests"
-```
+A lane with no file fails and names the file it needs. The writer (`MuseGlimmerLegacyVisionWriterTests`) went with the
+legacy code in stage S9, so the frozen files cannot be regenerated; they are the record.
 
 ## Frozen legacy outputs
 
@@ -147,12 +141,12 @@ Stage S0 of the unified-runtime migration (`docs/design/muse-glimmer-unified.md`
 froze the legacy model's (`MuseGlimmerModel`) outputs before any stage changed shared
 code, so the runtime family can be held to them after the legacy code is deleted.
 
-* `LegacyGoldens/<lane>.json` (`MuseGlimmerGoldens.cs`, `MuseGlimmerFrozenLegacyTests`):
+* `LegacyGoldens/<lane>.json` (`MuseGlimmerGoldens.cs`, `MuseGlimmerFrozenGoldensTests`):
   the logits of every forward of seven scripted cases (a long prefill, prompt steps,
   the ring wrapping, the full layers' cache growing, a rewind; an untied and a tied
   head) on two synthetic fixtures, per lane (cpu, ggml_cpu, ggml_metal, mlx on the M5 Pro; cpu,
   ggml_cpu, ggml_cuda, ggml_vulkan and direct cuda on an RTX PRO 4500 Blackwell box, linux-x64).
-* `LegacyReal/<lane>.json` (`MuseGlimmerLegacyRealTests.cs`): on the real IQ2_XXS weights
+* `LegacyReal/<lane>.json` (`MuseGlimmerRuntimeRealTests.cs`): on the real IQ2_XXS weights
   (ggml_metal and mlx on the M5 Pro; ggml_cuda, ggml_vulkan and direct cuda on the RTX PRO 4500
   Blackwell box), the greedy continuations of the goldens' prompts with
   each position's top four log-probabilities, and the teacher-forced perplexity of
@@ -164,5 +158,5 @@ code, so the runtime family can be held to them after the legacy code is deleted
   (`MuseGlimmerVisionTowerTests`, `MuseSparkVisionTowerTests`), and the legacy model's DFlash drafter features over the
   speculation tests' prompt (`MuseGlimmerRuntimeSpeculationTests`), each with the SHA-256 of the fixture it ran on.
 
-The writers are Bench tests that run only when `TS_TEST_FREEZE_MUSE_GLIMMER_GOLDENS` or
-`TS_TEST_FREEZE_MUSE_GLIMMER_REAL` names the directory to write into.
+The writers were Bench tests (`TS_TEST_FREEZE_MUSE_GLIMMER_GOLDENS`, `TS_TEST_FREEZE_MUSE_GLIMMER_REAL`,
+`TS_TEST_FREEZE_MUSE_GLIMMER_SYNTHETIC`); they went with the legacy code in stage S9, so these files are the record.

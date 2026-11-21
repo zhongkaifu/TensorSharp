@@ -28,8 +28,8 @@ namespace InferenceWeb.Tests;
 /// SHA-256, its largest magnitude and its L2 norm. The fixtures are regenerated from their options at test time and held
 /// to the SHA-256 the outputs were frozen from.
 ///
-/// The legacy model is held to its own frozen bytes on the lane that froze them (<see cref="MuseGlimmerFrozenLegacyTests"/>)
-/// until stage S9 deletes it; the runtime family (stage S2 on) is held to them within a bound measured between the lanes.
+/// The runtime family (stage S2 on) is held to them within a bound measured between the lanes
+/// (<see cref="MuseGlimmerFrozenGoldensTests"/> checks the files); the legacy model that froze them went in stage S9.
 /// </summary>
 internal static class MuseGlimmerGoldens
 {
@@ -397,13 +397,4 @@ internal static class MuseGlimmerGoldens
             ? $"{caseName}: {got.Count} outputs byte for byte the ones frozen on this lane"
             : $"{caseName}: {got.Count} outputs within {bound:E1} of the ones frozen on {frozen.Lane} (worst relL2 {worstL2:E3}, largest difference {worstMax:E3})";
     }
-
-    // ---------------------------------------------------------------- writing (the freeze)
-
-    internal static JsonObject CaseJson(string fixtureSha256, IEnumerable<float[]> outputs) => new()
-    {
-        ["fixtureSha256"] = fixtureSha256,
-        ["kvDtype"] = CaseKvDtype.ToString(),
-        ["outputs"] = new JsonArray(outputs.Select(o => (JsonNode)Frozen.Of(o).ToJson()).ToArray()),
-    };
 }

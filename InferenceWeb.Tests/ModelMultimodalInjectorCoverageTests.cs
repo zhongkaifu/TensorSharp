@@ -21,8 +21,8 @@ namespace InferenceWeb.Tests;
 /// grows by N image rows, but which is never handed the embeddings - so those rows keep
 /// the embedding of the filler token and the model answers as if it never saw the
 /// image. That is exactly what happened to Muse-Glimmer: <c>LoadProjectors</c> and its
-/// prompt expansion were both wired up, but neither queue stage had a
-/// <c>MuseGlimmerModel</c> case. Asked "这是什么图片" about a banner, the model replied
+/// prompt expansion were both wired up, but neither queue stage had a case for the
+/// (since removed) legacy Muse-Glimmer model. Asked "这是什么图片" about a banner, the model replied
 /// that it had been given "a huge block of characters, all 'o' repeated".
 ///
 /// The injector used to route every stage through its own <c>switch (_model)</c> over
@@ -123,11 +123,6 @@ public class ModelMultimodalInjectorCoverageTests
     [Fact]
     public void MuseGlimmer_DeclaresTheWholeVisionContract()
     {
-        Assert.True(typeof(IVisionCapableModel).IsAssignableFrom(typeof(MuseGlimmerModel)),
-            "MuseGlimmerModel does not declare IVisionCapableModel, so its images are silently dropped.");
-        Assert.True(PromptExpander.IsAssignableFrom(typeof(MuseGlimmerModel)),
-            "MuseGlimmerModel does not declare its prompt expansion, so its image tokens never expand.");
-        // The unified-runtime family (stage S4 of docs/design/muse-glimmer-unified.md) carries the same contract.
         Assert.True(typeof(IVisionCapableModel).IsAssignableFrom(typeof(MuseGlimmerRuntimeModel)),
             "MuseGlimmerRuntimeModel does not declare IVisionCapableModel, so its images are silently dropped.");
         Assert.True(PromptExpander.IsAssignableFrom(typeof(MuseGlimmerRuntimeModel)),

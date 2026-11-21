@@ -24,7 +24,7 @@ namespace InferenceWeb.Tests;
 ///
 /// The bound (<see cref="ParityBound"/>) is the legacy model's own spread between its lanes on the same fixtures: the fused
 /// graphs (ggml_cpu, ggml_metal, ggml_cuda, ggml_vulkan) against the per-op paths (managed, MLX, direct CUDA), measured at the
-/// freezes (<see cref="MuseGlimmerFrozenLegacyTests.TheFrozenLanesAgreeWithinTheBound"/>: 1.37e-3 over the Mac's four lanes,
+/// freezes (<see cref="MuseGlimmerFrozenGoldensTests.TheFrozenLanesAgreeWithinTheBound"/>: 1.37e-3 over the Mac's four lanes,
 /// 3.29e-3 with the RTX PRO 4500 box's, direct CUDA against ggml_vulkan). Bit for bit is not expected: the
 /// runtime attends rings of the window plus 512 rows in prompt steps of at most 512 rows, where legacy reads 2048-row chunks
 /// over a 2304-row ring (ggml_metal) or uniform caches, and pads decode windows differently, so the attention's reductions run
@@ -85,7 +85,7 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
         MuseGlimmerGoldens.Case frozen = MuseGlimmerGoldens.Find(caseName, lane);
         bool sameLane = frozen != null && frozen.Lane == lane;
         output.WriteLine($"[{path}] " + MuseGlimmerGoldens.Check(frozen, caseName, sha, outputs, bytes: false,
-            sameLane ? ParityBound : MuseGlimmerFrozenLegacyTests.CrossLaneBound));
+            sameLane ? ParityBound : MuseGlimmerFrozenGoldensTests.CrossLaneBound));
         // For the record: the distance from every lane legacy was frozen on (the worst output's relL2 and largest difference).
         foreach (string other in MuseGlimmerGoldens.Lanes.OrderBy(l => l, StringComparer.Ordinal))
         {
@@ -323,7 +323,7 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
         Assert.Contains("2 KV heads", e.Message, StringComparison.Ordinal);
     }
 
-    /// <summary>Since the switch (stage S8) the descriptor builds the runtime family; the legacy model is the oracle seam's only.</summary>
+    /// <summary>The descriptor builds the shared-runtime family (the switch, stage S8; the legacy model went in S9).</summary>
     [Fact]
     public void TheDescriptorBuildsTheRuntimeFamily()
     {
@@ -332,8 +332,6 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
         using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
         using (ModelBase created = ModelBase.Create(path, BackendType.Cpu))
             Assert.IsType<MuseGlimmerRuntimeModel>(created);
-        using (ModelBase oracle = MuseGlimmerArchitecture.CreateLegacyModel(path, BackendType.Cpu))
-            Assert.IsType<MuseGlimmerModel>(oracle);
         Assert.Equal(TensorSharp.Models.Architecture.ServingImplementation.SharedRuntime, MuseGlimmerArchitecture.Descriptor.Serving.Implementation);
     }
 }

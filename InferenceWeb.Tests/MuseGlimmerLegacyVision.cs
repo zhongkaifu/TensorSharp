@@ -23,15 +23,15 @@ namespace InferenceWeb.Tests;
 
 /// <summary>
 /// The legacy Muse-Glimmer model and vision tower on the real weights, frozen per lane next to the lane's llama.cpp image
-/// goldens (Fixtures/MuseGlimmer/LlamaCpp/[set/]legacy_vision.&lt;lane&gt;.json), so the image gates that are relative to legacy
-/// outlive stage S9, which deletes it:
+/// goldens (Fixtures/MuseGlimmer/LlamaCpp/[set/]legacy_vision.&lt;lane&gt;.json) before stage S9 deleted them, for the image
+/// gates that are relative to legacy:
 /// <list type="bullet">
 /// <item>its teacher-forced argmax agreement with the lane's set (<see cref="MuseGlimmerParity.GoldenSet"/>), and the
 /// distribution of every position's <see cref="MuseGlimmerParity.Position.TopDelta"/> (mean, p50, p90, p99, max);</item>
 /// <item>on the lanes whose products quantize the activations (ggml_cuda, ggml_vulkan), each picture's 1 - cosine between the
 /// legacy tower's rows and the F32 tower's (<see cref="F32Tower"/>).</item>
 /// </list>
-/// <see cref="MuseGlimmerLegacyVisionWriterTests"/> writes them.
+/// They were written on 2026-11-20 by a writer test that went with the legacy code (Fixtures/MuseGlimmer/README.md).
 /// </summary>
 internal static class MuseGlimmerLegacyVision
 {
@@ -108,85 +108,5 @@ internal static class MuseGlimmerLegacyVision
             nb += (double)b[i] * b[i];
         }
         return 1 - dot / Math.Sqrt(na * nb);
-    }
-}
-
-/// <summary>Writes <see cref="MuseGlimmerLegacyVision"/>'s file for the lane the parity tests run on, into the directory
-/// TS_TEST_FREEZE_MUSE_GLIMMER_REAL names (the lane's set folder under Fixtures/MuseGlimmer/LlamaCpp). Needs the weights and
-/// the mmproj (TS_TEST_MODEL_DIR).</summary>
-[Trait("Category", "Bench")]
-public sealed class MuseGlimmerLegacyVisionWriterTests(ITestOutputHelper output)
-{
-    private const string OutEnv = "TS_TEST_FREEZE_MUSE_GLIMMER_REAL";
-
-    [FreezeFact(OutEnv)]
-    public void FreezeTheLegacyVisionFigures()
-    {
-        string skip = MuseGlimmerVisionParityTests.Skip(needsModel: true, BackendType.GgmlCpu);
-        Assert.True(skip == null, skip);
-        BackendType backend = MuseGlimmerParity.Backend();
-        string lane = MuseGlimmerGoldens.LaneKey(backend), set = MuseGlimmerParity.GoldenSet(backend);
-        var goldens = MuseGlimmerVisionParityTests.GoldensOf(set);
-        string mmproj = MuseGlimmerVisionParityTests.FindMmproj(), modelPath = MuseGlimmerParity.FindModel();
-        string modelSha = File.Exists(modelPath + ".done") ? File.ReadAllText(modelPath + ".done").Split(' ')[0] : MuseGlimmerGoldens.FileSha(modelPath);
-
-        List<MuseGlimmerVisionParityTests.PromptRun> runs;
-        using (var model = new MuseGlimmerModel(modelPath, backend))
-        {
-            ((IVisionCapableModel)model).LoadVisionEncoder(mmproj);
-            runs = MuseGlimmerVisionParityTests.RunImagePrompts(model, model.VisionEncoder, goldens, output.WriteLine);
-        }
-        int agree = runs.Sum(r => r.Positions.Count(p => p.Agrees)), total = runs.Sum(r => r.Positions.Count);
-        var q = MuseGlimmerLegacyVision.QuantilesOf(runs.SelectMany(r => r.Positions).Select(p => p.TopDelta));
-        output.WriteLine($"legacy on {lane}: {agree}/{total} against the {set} set; top-k |dlogprob| mean {q.Mean:F4} p50 {q.P50:F4} " +
-            $"p90 {q.P90:F4} p99 {q.P99:F4} max {q.Max:F4}");
-
-        JsonNode rows = null;
-        if (MuseGlimmerLegacyVision.QuantizedProducts(backend))
-        {
-            using var laneAllocator = new MuseGlimmerVisionTowerTests.Lane(backend);
-            using var legacy = new MuseGlimmerVisionEncoder(mmproj, laneAllocator.Allocator);
-            using var gguf = new GgufFile(mmproj);
-            var (reference, owner, name) = MuseGlimmerLegacyVision.F32Tower(gguf);
-            using (owner)
-            using (reference)
-            {
-                var images = new JsonArray();
-                foreach (var (image, px, w, h) in MuseGlimmerVisionParityTests.Pictures(legacy.ImageProcessor))
-                {
-                    double d = MuseGlimmerLegacyVision.OneMinusCos(reference.EncodeToHost(px, w, h, out _), legacy.EncodeToHostArray(px, w, h, out _));
-                    output.WriteLine($"  {image}: legacy 1 - cosine to the F32 tower {d:E3}");
-                    images.Add(new JsonObject { ["name"] = image, ["width"] = w, ["height"] = h, ["oneMinusCos"] = d });
-                }
-                rows = new JsonObject { ["reference"] = name, ["images"] = images };
-            }
-        }
-
-        var file = new JsonObject
-        {
-            ["lane"] = lane,
-            ["set"] = set,
-            ["about"] = "The legacy Muse-Glimmer model and vision tower on this lane: its teacher-forced argmax agreement with the " +
-                "lane's llama.cpp image goldens (and the distribution of every position's largest |our log-probability - llama.cpp's| " +
-                "over llama.cpp's listed top tokens), and on the quantized-product lanes each picture's 1 - cosine between the legacy " +
-                "tower's rows and the F32 tower's. InferenceWeb.Tests/MuseGlimmerVisionParityTests.cs holds the runtime family to them.",
-            ["producer"] = "MuseGlimmerModel and MuseGlimmerVisionEncoder (legacy)",
-            ["provenance"] = Environment.GetEnvironmentVariable("TS_TEST_FREEZE_PROVENANCE") ?? "",
-            ["frozenUtc"] = DateTime.UtcNow.ToString("O"),
-            ["model"] = new JsonObject { ["file"] = Path.GetFileName(modelPath), ["sha256"] = modelSha },
-            ["mmproj"] = new JsonObject { ["file"] = Path.GetFileName(mmproj) },
-            ["llamaCpp"] = goldens.LlamaCppCommit,
-            ["imagePrompts"] = new JsonObject
-            {
-                ["agree"] = agree,
-                ["positions"] = total,
-                ["agreement"] = (double)agree / total,
-                ["topDelta"] = new JsonObject { ["mean"] = q.Mean, ["p50"] = q.P50, ["p90"] = q.P90, ["p99"] = q.P99, ["max"] = q.Max },
-            },
-            ["rowsVsF32"] = rows,
-        };
-        string path = Path.Combine(Environment.GetEnvironmentVariable(OutEnv), MuseGlimmerLegacyVision.FileName(lane));
-        File.WriteAllText(path, file.ToJsonString(new JsonSerializerOptions { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }) + "\n");
-        output.WriteLine($"wrote {path}");
     }
 }

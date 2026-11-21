@@ -512,7 +512,7 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
     /// The full layers' cache grows mid-sequence (the primary starting at 256 cells: 256 -> 512 inside a prefill that keeps 200
     /// rows, 512 -> 1024 on a decode step, then to 4096 in a prefill that also laps the window's ring, 768 cells at the default
     /// geometry), then decodes on the wrapped rings: every forward gives exactly the logits of a cache that never grew, as the
-    /// legacy probe's grow fix demanded (MuseGlimmerKvGrowTests). The same plan through a request's slot (the unified step),
+    /// legacy probe's grow fix demanded (the legacy MuseGlimmerKvGrowTests, removed with it in S9). The same plan through a request's slot (the unified step),
     /// the slot reserved for 1 token and grown by the steps, gives a presized slot's logits. On an executor whose recorded steps
     /// bind their slots (the CUDA executor) a unified model's primary starts at a fresh slot's size whatever is asked
     /// (<c>PrimaryCacheAllocationLength</c>: 1024 cells there), so no primary holds the whole plan from the start: there the

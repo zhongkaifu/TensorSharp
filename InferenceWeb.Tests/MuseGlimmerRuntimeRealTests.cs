@@ -25,7 +25,7 @@ namespace InferenceWeb.Tests;
 /// tokens each) with the top four log-probabilities of every position, and the teacher-forced perplexity of
 /// benchmarks/engine_comparison/assets/prefill_corpus.txt the way eng/validation/MuseGlimmerKvGrowProbe's --nll-text scores
 /// it (a 64-token prefix in one forward, then one-row forwards). The runtime family is held to these (token-identical or a
-/// near-tie; perplexity within 0.3%); until stage S9 the legacy model is held to them on the lane that froze them.
+/// near-tie; perplexity within 0.3%). The writer went with the legacy model in stage S9.
 /// </summary>
 internal static class MuseGlimmerLegacyReal
 {
@@ -146,64 +146,6 @@ internal static class MuseGlimmerLegacyReal
     internal static IReadOnlyCollection<string> Lanes => s_lanes.Value.Keys;
 
     internal static Lane Find(string lane) => s_lanes.Value.GetValueOrDefault(lane);
-
-    internal static JsonObject ContinuationJson(Continuation c) => new()
-    {
-        ["name"] = c.Name,
-        ["promptSha256"] = c.PromptSha256,
-        ["tokens"] = new JsonArray(c.Tokens.Select(t => (JsonNode)t).ToArray()),
-        ["top"] = new JsonArray(c.Top.Select(p => (JsonNode)new JsonArray(p.Select(t => (JsonNode)new JsonArray(t.Id, Math.Round(t.Logprob, 6))).ToArray())).ToArray()),
-    };
-}
-
-public sealed class MuseGlimmerLegacyRealTests(ITestOutputHelper output)
-{
-    /// <summary>The legacy model on the lane that froze its real-weight continuations reproduces them token for token, each
-    /// position's top log-probabilities within 1e-3 (the same build's arithmetic; a change there moved the oracle).</summary>
-    [MuseGlimmerModelFact]
-    public void LegacyReproducesItsFrozenContinuations()
-    {
-        BackendType backend = MuseGlimmerParity.Backend();
-        string lane = MuseGlimmerGoldens.LaneKey(backend);
-        var frozen = MuseGlimmerLegacyReal.Find(lane);
-        Assert.True(frozen != null, $"no real-weight legacy outputs frozen on {lane} (lanes: {string.Join("; ", MuseGlimmerLegacyReal.Lanes)})");
-        using var model = new MuseGlimmerModel(MuseGlimmerParity.FindModel(), backend);
-        var prompts = MuseGlimmerLegacyReal.Prompts().ToList();
-        Assert.Equal(prompts.Count, frozen.Continuations.Count);
-        double worst = 0;
-        for (int r = 0; r < prompts.Count; r++)
-        {
-            var want = frozen.Continuations[r];
-            Assert.Equal(want.PromptSha256, MuseGlimmerLegacyReal.PromptSha(prompts[r].PromptTokens));
-            var got = MuseGlimmerLegacyReal.Continue(model, prompts[r]);
-            Assert.Equal(want.Tokens, got.Tokens);
-            for (int i = 0; i < want.Top.Length; i++)
-                for (int k = 0; k < want.Top[i].Length; k++)
-                {
-                    Assert.Equal(want.Top[i][k].Id, got.Top[i][k].Id);
-                    worst = Math.Max(worst, Math.Abs(want.Top[i][k].Logprob - got.Top[i][k].Logprob));
-                }
-            output.WriteLine($"{want.Name}: {want.Tokens.Length} tokens as frozen");
-        }
-        output.WriteLine($"worst top-{MuseGlimmerLegacyReal.TopKept} |dlogprob| {worst:E2}");
-        Assert.True(worst <= 1e-3, $"the legacy log-probabilities moved by {worst:E2} since the freeze");
-    }
-
-    /// <summary>The legacy model's teacher-forced perplexity of the corpus is the frozen one (within 1e-4 relative) on the lane
-    /// that froze it.</summary>
-    [MuseGlimmerModelFact]
-    public void LegacyReproducesItsFrozenPerplexity()
-    {
-        BackendType backend = MuseGlimmerParity.Backend();
-        var frozen = MuseGlimmerLegacyReal.Find(MuseGlimmerGoldens.LaneKey(backend));
-        Assert.True(frozen != null, $"no real-weight legacy outputs frozen on {MuseGlimmerGoldens.LaneKey(backend)}");
-        using var model = new MuseGlimmerModel(MuseGlimmerParity.FindModel(), backend);
-        var got = MuseGlimmerLegacyReal.ScoreCorpus(model);
-        output.WriteLine($"perplexity {got.Value:F5} (frozen {frozen.Nll.Value:F5}), top-1 {got.Top1Agreement:P2} over {got.Scored} tokens");
-        Assert.Equal(frozen.Nll.TextSha256, got.TextSha256);
-        Assert.Equal(frozen.Nll.Scored, got.Scored);
-        Assert.True(Math.Abs(got.Value / frozen.Nll.Value - 1) <= 1e-4, $"perplexity {got.Value:F5} vs frozen {frozen.Nll.Value:F5}");
-    }
 }
 
 /// <summary>
@@ -287,59 +229,5 @@ public sealed class MuseGlimmerRuntimeRealTests(ITestOutputHelper output)
         Assert.Equal(frozen.Nll.Scored, got.Scored);
         Assert.True(Math.Abs(rel) <= PerplexityBound, $"perplexity {got.Value:F5} vs legacy {frozen.Nll.Value:F5} ({rel:P3})");
         Assert.True(Math.Abs(top1) <= Top1Bound, $"top-1 agreement {got.Top1Agreement:P2} vs legacy {frozen.Nll.Top1Agreement:P2}");
-    }
-}
-
-/// <summary>Writes Fixtures/MuseGlimmer/LegacyReal/&lt;lane&gt;.json (<see cref="MuseGlimmerLegacyReal"/>) on the backend the parity
-/// tests run on, into the directory TS_TEST_FREEZE_MUSE_GLIMMER_REAL names. Needs the weights (TS_TEST_MODEL_DIR).</summary>
-[Trait("Category", "Bench")]
-public sealed class MuseGlimmerLegacyRealWriterTests(ITestOutputHelper output)
-{
-    private const string OutEnv = "TS_TEST_FREEZE_MUSE_GLIMMER_REAL";
-
-    [FreezeFact(OutEnv)]
-    public void FreezeTheLegacyRealWeightOutputs()
-    {
-        Assert.True(MuseGlimmerParity.Skip(needsDraft: false) == null, MuseGlimmerParity.Skip(needsDraft: false));
-        BackendType backend = MuseGlimmerParity.Backend();
-        string lane = MuseGlimmerGoldens.LaneKey(backend), modelPath = MuseGlimmerParity.FindModel();
-        string modelSha = File.Exists(modelPath + ".done") ? File.ReadAllText(modelPath + ".done").Split(' ')[0] : MuseGlimmerGoldens.FileSha(modelPath);
-        using var model = new MuseGlimmerModel(modelPath, backend);
-        var continuations = new JsonArray();
-        foreach (var golden in MuseGlimmerLegacyReal.Prompts())
-        {
-            var c = MuseGlimmerLegacyReal.Continue(model, golden);
-            int prefix = Enumerable.Range(0, c.Tokens.Length).FirstOrDefault(i => c.Tokens[i] != golden.Generated[i], c.Tokens.Length);
-            output.WriteLine($"{golden.Name}: {c.Tokens.Length} tokens, llama.cpp's for the first {prefix}");
-            continuations.Add(MuseGlimmerLegacyReal.ContinuationJson(c));
-        }
-        var nll = MuseGlimmerLegacyReal.ScoreCorpus(model);
-        output.WriteLine($"perplexity {nll.Value:F5} (mean NLL {nll.MeanNll:F5}), top-1 {nll.Top1Agreement:P2} over {nll.Scored} tokens");
-        var file = new JsonObject
-        {
-            ["lane"] = lane,
-            ["about"] = "The legacy Muse-Glimmer model's greedy continuations of the llama.cpp goldens' prompts and its teacher-forced " +
-                "perplexity of prefill_corpus.txt on the real weights, frozen on this lane in stage S0 of the unified-runtime migration " +
-                "(InferenceWeb.Tests/MuseGlimmerLegacyRealTests.cs reads them).",
-            ["producer"] = "MuseGlimmerModel (legacy)",
-            ["provenance"] = Environment.GetEnvironmentVariable("TS_TEST_FREEZE_PROVENANCE") ?? "",
-            ["frozenUtc"] = DateTime.UtcNow.ToString("O"),
-            ["model"] = new JsonObject { ["file"] = Path.GetFileName(modelPath), ["sha256"] = modelSha },
-            ["kvCacheDtype"] = model.KvCacheDtype.ToString(),
-            ["continuations"] = continuations,
-            ["perplexity"] = new JsonObject
-            {
-                ["text"] = "benchmarks/engine_comparison/assets/prefill_corpus.txt",
-                ["textSha256"] = nll.TextSha256,
-                ["prefix"] = nll.Prefix,
-                ["scored"] = nll.Scored,
-                ["meanNll"] = nll.MeanNll,
-                ["perplexity"] = nll.Value,
-                ["top1Agreement"] = nll.Top1Agreement,
-            },
-        };
-        string path = Path.Combine(Environment.GetEnvironmentVariable(OutEnv), MuseGlimmerGoldens.FileName(lane));
-        File.WriteAllText(path, file.ToJsonString(new JsonSerializerOptions { WriteIndented = false }) + "\n");
-        output.WriteLine($"wrote {path}");
     }
 }

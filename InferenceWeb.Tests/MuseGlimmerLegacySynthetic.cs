@@ -29,7 +29,8 @@ namespace InferenceWeb.Tests;
 /// <item>the legacy model's DFlash drafter features (the residual entering each target layer) over the speculation tests'
 /// prompt (<see cref="MuseGlimmerRuntimeSpeculationTests.LongPrompt"/>), F32 keys and values.</item>
 /// </list>
-/// The managed backend multiplies F32 values, so these are the reference the other executors were held to.
+/// The managed backend multiplies F32 values, so these are the reference the other executors were held to. The writer
+/// (MuseGlimmerLegacySyntheticWriterTests, d492bfe9) went with the legacy code.
 /// </summary>
 internal static class MuseGlimmerLegacySynthetic
 {
@@ -84,91 +85,5 @@ internal static class MuseGlimmerLegacySynthetic
         Assert.Equal(Frozen.FixtureSha256[fixture], MuseGlimmerGoldens.FileSha(mmprojPath));
         Assert.True(Frozen.Towers.TryGetValue(TowerKey(fixture, w, h, seed), out float[] rows), $"no frozen legacy rows for {TowerKey(fixture, w, h, seed)}");
         return rows;
-    }
-}
-
-/// <summary>
-/// Writes <see cref="MuseGlimmerLegacySynthetic"/>'s file from the legacy code on the managed backend, into the directory
-/// TS_TEST_FREEZE_MUSE_GLIMMER_SYNTHETIC names (Fixtures/MuseGlimmer/LegacySynthetic); TS_TEST_FREEZE_PROVENANCE, when set,
-/// is recorded as the build. Each output is computed twice and must repeat bit for bit. Goes with the legacy code in S9.
-/// </summary>
-[Trait("Category", "Bench")]
-public sealed class MuseGlimmerLegacySyntheticWriterTests(ITestOutputHelper output)
-{
-    private const string OutEnv = "TS_TEST_FREEZE_MUSE_GLIMMER_SYNTHETIC";
-
-    [FreezeFact(OutEnv)]
-    public void FreezeTheLegacyTowerRowsAndDrafterFeatures()
-    {
-        string outDir = Environment.GetEnvironmentVariable(OutEnv);
-        string scratch = Path.Combine(Path.GetTempPath(), "ts-mg-freeze-synth-" + Guid.NewGuid().ToString("N"));
-        try
-        {
-            var cpu = new CpuAllocator(BlasEnum.DotNet);
-            var fixtures = new JsonObject();
-            var towers = new JsonObject();
-            foreach (var f in MuseGlimmerLegacySynthetic.TowerFixtures)
-            {
-                string mmproj = MuseGlimmerLegacySynthetic.WriteTowerFixture(f.Name, scratch);
-                fixtures[f.Name] = MuseGlimmerGoldens.FileSha(mmproj);
-                foreach (var (w, h, seed) in MuseGlimmerLegacySynthetic.ImagesOf(f.Name))
-                {
-                    int width = w * MuseGlimmerVisionSynthetic.Patch, height = h * MuseGlimmerVisionSynthetic.Patch;
-                    float[] px = MuseGlimmerVisionSynthetic.Pixels(width, height, seed);
-                    float[] Rows()
-                    {
-                        using var encoder = new MuseGlimmerVisionEncoder(mmproj, cpu);
-                        return encoder.EncodeToHostArray(px, width, height, out _);
-                    }
-                    float[] rows = Rows(), again = Rows();
-                    Assert.Equal(MuseGlimmerGoldens.Sha(rows), MuseGlimmerGoldens.Sha(again));
-                    string key = MuseGlimmerLegacySynthetic.TowerKey(f.Name, w, h, seed);
-                    towers[key] = MuseGlimmerGoldens.Frozen.Of(rows).ToJson();
-                    output.WriteLine($"{key}: {rows.Length} values, repeatable");
-                }
-            }
-
-            var (target, draft) = MuseGlimmerRuntimeSpeculationTests.WriteFiles(Path.Combine(scratch, "spec"));
-            float[] Features()
-            {
-                using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
-                using ModelBase model = new MuseGlimmerModel(target, BackendType.Cpu, 1, null, draft);
-                var spec = (ISpeculativeModel)model;
-                int[] prompt = MuseGlimmerRuntimeSpeculationTests.LongPrompt;
-                var rows = new float[prompt.Length * spec.SpecFeatureSize];
-                spec.SpecForward(prompt, rows, new float[model.Config.VocabSize], allLogitsRows: false);
-                return rows;
-            }
-            float[] features = Features(), repeat = Features();
-            Assert.Equal(MuseGlimmerGoldens.Sha(features), MuseGlimmerGoldens.Sha(repeat));
-            output.WriteLine($"drafter features: {features.Length} values, repeatable");
-
-            var file = new JsonObject
-            {
-                ["lane"] = MuseGlimmerGoldens.LaneKey(BackendType.Cpu),
-                ["about"] = "The legacy Muse-Glimmer per-op vision tower's rows and the legacy model's DFlash drafter features on the synthetic " +
-                    "fixtures, frozen on the managed backend before stage S9 deleted the legacy code (InferenceWeb.Tests/MuseGlimmerLegacySynthetic.cs reads them).",
-                ["producer"] = "MuseGlimmerVisionEncoder and MuseGlimmerModel (legacy)",
-                ["provenance"] = Environment.GetEnvironmentVariable("TS_TEST_FREEZE_PROVENANCE") ?? "",
-                ["frozenUtc"] = DateTime.UtcNow.ToString("O"),
-                ["towerFixtures"] = fixtures,
-                ["towers"] = towers,
-                ["drafter"] = new JsonObject
-                {
-                    ["targetSha256"] = MuseGlimmerGoldens.FileSha(target),
-                    ["draftSha256"] = MuseGlimmerGoldens.FileSha(draft),
-                    ["kvDtype"] = KvCacheDtype.F32.ToString(),
-                    ["features"] = MuseGlimmerGoldens.Frozen.Of(features).ToJson(),
-                },
-            };
-            Directory.CreateDirectory(outDir);
-            string path = Path.Combine(outDir, "managed.json");
-            File.WriteAllText(path, file.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
-            output.WriteLine($"wrote {path}");
-        }
-        finally
-        {
-            try { Directory.Delete(scratch, recursive: true); } catch (IOException) { }
-        }
     }
 }

@@ -44,14 +44,15 @@ public sealed class MuseGlimmerVisionFactAttribute : FactAttribute, ITraitAttrib
 /// <summary>
 /// Muse-Glimmer's image prompts against llama.cpp (Fixtures/MuseGlimmer/LlamaCpp/ref_vision.json, llama.cpp d3c3e242c: its
 /// greedy continuations of nine image prompts with every token's top log-probabilities, made by
-/// eng/validation/muse-glimmer-llamacpp-vision-goldens.py), teacher-forced through the legacy model with its tower and the
-/// unified-runtime family with the graph tower; and the graph tower's rows against the legacy tower's on the real mmproj.
+/// eng/validation/muse-glimmer-llamacpp-vision-goldens.py), teacher-forced through the shared-runtime family with the graph
+/// tower; and the graph tower's rows against the F32 tower's on the real mmproj (the legacy model and its per-op tower, the
+/// references until stage S9 deleted them, are held to through their frozen figures).
 /// As the text parity tests (<see cref="MuseGlimmerParityTests"/>), each lane is held to the argmax agreement with its own ggml
 /// backend's llama.cpp set (<see cref="MuseGlimmerParity.GoldenSet"/>: LlamaCpp/ for Metal, LlamaCpp/cuda/, LlamaCpp/vulkan/),
 /// and its first generated position is checked against llama.cpp only on the float-activation lanes
 /// (<see cref="MuseGlimmerParityTests.FirstPositionRuleOf"/>: ggml_metal, MLX, direct CUDA); elsewhere it is logged.
 /// Where a lane's rule is relative to legacy (<see cref="ImageRuleOf"/>, the rows on the quantized-product lanes), it reads
-/// legacy's figures frozen on the lane next to its set (<see cref="MuseGlimmerLegacyVision"/>), so the rule outlives stage S9.
+/// legacy's figures frozen on the lane next to its set (<see cref="MuseGlimmerLegacyVision"/>).
 /// </summary>
 public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
 {
@@ -82,7 +83,10 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     /// </summary>
     private const double FirstPositionLogprobBoundPastTheTable = 0.25;
 
-    /// <summary>The graph tower's rows against the legacy tower's on the same executor (design §4.5).</summary>
+    /// <summary>The graph tower's rows against the F32 tower's (<see cref="MuseGlimmerLegacyVision.F32Tower"/>) on the lanes
+    /// whose products keep the activations in floating point or quantize them per block on the CPU (ggml_metal, MLX,
+    /// ggml_cpu). The design's bound (§4.5) was set against the legacy tower on the same executor; since stage S9 deleted that
+    /// tower the F32 tower is the reference (the S9 figures: docs/design/muse-glimmer-unified.md §5.8).</summary>
     private const double MinCosine = 0.9999;
 
     internal sealed record Record(string Name, string Prompt, string Image, int PromptN, int[] Generated, MuseGlimmerParity.Step[] Steps);
@@ -167,34 +171,19 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         return Path.Combine(here.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
     }
 
-    private static ModelBase Load(bool runtime)
+    private static ModelBase Load()
     {
-        BackendType backend = MuseGlimmerParity.Backend();
-        ModelBase model = runtime
-            ? MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend)
-            : MuseGlimmerArchitecture.CreateLegacyModel(MuseGlimmerParity.FindModel(), backend);
+        ModelBase model = MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), MuseGlimmerParity.Backend());
         ((IVisionCapableModel)model).LoadVisionEncoder(FindMmproj());
         return model;
     }
 
-    private static IMuseGlimmerVisionTower TowerOf(ModelBase model) => model switch
-    {
-        MuseGlimmerModel legacy => legacy.VisionEncoder,
-        MuseGlimmerRuntimeModel runtime => runtime.VisionTower,
-        _ => throw new ArgumentException(model.GetType().Name),
-    };
-
-    [MuseGlimmerVisionFact]
-    public void LegacyImagePromptsMatchLlamaCpp()
-    {
-        using ModelBase model = Load(runtime: false);
-        CheckAgainstLlamaCpp(model);
-    }
+    private static IMuseGlimmerVisionTower TowerOf(ModelBase model) => ((MuseGlimmerRuntimeModel)model).VisionTower;
 
     [MuseGlimmerVisionFact]
     public void RuntimeImagePromptsMatchLlamaCpp()
     {
-        using ModelBase model = Load(runtime: true);
+        using ModelBase model = Load();
         CheckAgainstLlamaCpp(model);
     }
 
@@ -394,13 +383,17 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     }
 
     [MuseGlimmerVisionFact(TowerOnly = BackendType.GgmlCpu)]
-    public void TheGraphTowerGivesTheLegacyTowersRowsOnThePinnedGgmlBackend() => CompareTowers(TestGates.PinnedGgmlBackend);
+    public void TheGraphTowerGivesTheF32TowersRowsOnThePinnedGgmlBackend() => CompareTowers(TestGates.PinnedGgmlBackend);
 
     [MuseGlimmerVisionFact(TowerOnly = BackendType.Mlx)]
-    public void TheGraphTowerGivesTheLegacyTowersRowsOnMlx() => CompareTowers(BackendType.Mlx);
+    public void TheGraphTowerGivesTheF32TowersRowsOnMlx() => CompareTowers(BackendType.Mlx);
 
     [MuseGlimmerVisionFact(TowerOnly = BackendType.Cuda)]
-    public void TheGraphTowerGivesTheLegacyTowersRowsOnDirectCuda() => CompareTowers(BackendType.Cuda);
+    public void TheGraphTowerGivesTheF32TowersRowsOnDirectCuda() => CompareTowers(BackendType.Cuda);
+
+    /// <summary>The F32 tower's rows of each picture, kept for the process: the managed F32 tower takes 8-95 s an image, and the
+    /// lanes of one run share it.</summary>
+    private static readonly Dictionary<string, float[]> s_f32Rows = new(StringComparer.Ordinal);
 
     /// <summary>On the quantized-product lanes (ggml_cuda, ggml_vulkan), the graph tower's 1 - cosine to the F32 tower's rows
     /// (<see cref="MuseGlimmerLegacyVision.F32Tower"/>), summed over the pictures, may be at most this many times the legacy
@@ -413,14 +406,13 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     private const double F32DistanceRatio = 1.25;
 
     /// <summary>Direct CUDA's tower multiplies F32 copies of its weights' values: it is held to the managed executor's F32 tower
-    /// (cosine 1.0000000 to the per-op F32 tower measured).</summary>
+    /// (cosine 1.0000000 to the legacy per-op F32 tower, measured before stage S9).</summary>
     private const double MinCosineF32 = 0.99999;
 
     private void CompareTowers(BackendType backend)
     {
         using var lane = new MuseGlimmerVisionTowerTests.Lane(backend);
         string mmproj = FindMmproj();
-        using var legacy = new MuseGlimmerVisionEncoder(mmproj, lane.Allocator);
         using var gguf = new GgufFile(mmproj);
         using var tower = new MuseGlimmerVisionTower(gguf, lane.Allocator, backend);
         bool quantized = MuseGlimmerLegacyVision.QuantizedProducts(backend);
@@ -429,48 +421,40 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         Assert.True(!quantized || frozen is { RowsOneMinusCos.Count: > 0 },
             $"no legacy tower figures frozen for {laneKey} (MuseGlimmerLegacyVisionWriterTests writes Fixtures/MuseGlimmer/LlamaCpp/{set}/" +
             $"{MuseGlimmerLegacyVision.FileName(laneKey)})");
-        // The F32 reference: on the quantized lanes the cheaper F32 tower, on direct CUDA the managed one (another executor's
-        // arithmetic than the tower under test).
-        var (reference, owner, referenceName) = quantized || backend == BackendType.Cuda
-            ? MuseGlimmerLegacyVision.F32Tower(gguf, preferDirectCuda: backend != BackendType.Cuda)
-            : ((MuseGlimmerVisionTower)null, (IDisposable)null, (string)null);
+        // The F32 reference: the cheaper F32 tower (direct CUDA's where the process can open it), on direct CUDA the managed
+        // one (another executor's arithmetic than the tower under test).
+        var (reference, owner, referenceName) = MuseGlimmerLegacyVision.F32Tower(gguf, preferDirectCuda: backend != BackendType.Cuda);
+        double minCosine = backend == BackendType.Cuda ? MinCosineF32 : MinCosine;
         using (owner)
         using (reference)
         {
-            output.WriteLine($"{backend}: graph tower on {tower.Graph.Executor.GetType().Name}" + (reference == null ? "; held to the legacy tower"
-                : quantized ? $"; held to {F32DistanceRatio}x the legacy tower's frozen distance to {referenceName}, summed over the pictures" : $"; held to {referenceName}"));
+            output.WriteLine($"{backend}: graph tower on {tower.Graph.Executor.GetType().Name}" + (quantized
+                ? $"; held to {F32DistanceRatio}x the legacy tower's frozen distance to {referenceName}, summed over the pictures"
+                : $"; held to {referenceName} at cosine {minCosine}"));
             var failures = new List<string>();
             double graphSum = 0, legacySum = 0;
             int summed = 0;
             foreach (var (name, px, w, h) in Pictures(tower.ImageProcessor))
             {
                 var sw = Stopwatch.StartNew();
-                float[] a = legacy.EncodeToHostArray(px, w, h, out _);
-                double legacyMs = sw.Elapsed.TotalMilliseconds;
-                sw.Restart();
                 float[] b = tower.EncodeToHost(px, w, h, out int tokens);
                 double towerMs = sw.Elapsed.TotalMilliseconds;
-                var (cos, worstRow) = Cosines(a, b, tower.ProjectionDim);
-                var dist = MuseGlimmerVisionTowerTests.Distance(a, b);
-                output.WriteLine($"  {name} ({w}x{h}, {tokens} rows): vs legacy cosine {cos:F7} (worst row {worstRow:F6}), relL2 {dist.RelL2:E2}, " +
-                    $"max {dist.RelMax:E2}; legacy {legacyMs:F0} ms, graph tower {towerMs:F0} ms (one run each, informational)");
-                if (reference == null)
-                {
-                    if (cos < MinCosine) failures.Add($"{name}: cosine {cos:F7} to the legacy tower < {MinCosine}");
-                    continue;
-                }
-                float[] f = reference.EncodeToHost(px, w, h, out _);
+                float[] f;
+                lock (s_f32Rows)
+                    if (!s_f32Rows.TryGetValue(referenceName + "|" + name, out f))
+                        s_f32Rows[referenceName + "|" + name] = f = reference.EncodeToHost(px, w, h, out _);
                 var (fCos, fWorst) = Cosines(f, b, tower.ProjectionDim);
-                double graph = 1 - fCos, legacyNow = MuseGlimmerLegacyVision.OneMinusCos(f, a);
+                var dist = MuseGlimmerVisionTowerTests.Distance(f, b);
+                double graph = 1 - fCos;
+                output.WriteLine($"  {name} ({w}x{h}, {tokens} rows): vs the F32 tower cosine {fCos:F7} (worst row {fWorst:F6}), relL2 " +
+                    $"{dist.RelL2:E2}, max {dist.RelMax:E2}; graph tower {towerMs:F0} ms (one run, informational)");
                 if (!quantized)
                 {
-                    output.WriteLine($"    vs the F32 tower: cosine {fCos:F7} (worst row {fWorst:F6}); legacy {1 - legacyNow:F7}");
-                    if (fCos < MinCosineF32) failures.Add($"{name}: cosine {fCos:F7} to the F32 tower < {MinCosineF32}");
+                    if (fCos < minCosine) failures.Add($"{name}: cosine {fCos:F7} to the F32 tower < {minCosine}");
                     continue;
                 }
                 Assert.True(frozen.RowsOneMinusCos.TryGetValue(name, out double legacyFrozen), $"{name}: no frozen legacy figure");
-                output.WriteLine($"    1 - cosine to the F32 tower: graph {graph:E3} (worst row {fWorst:F6}), legacy {legacyNow:E3} now, {legacyFrozen:E3} frozen " +
-                    $"({graph / legacyFrozen:F2}x, logged)");
+                output.WriteLine($"    1 - cosine to the F32 tower: graph {graph:E3}, legacy {legacyFrozen:E3} frozen ({graph / legacyFrozen:F2}x, logged)");
                 graphSum += graph;
                 legacySum += legacyFrozen;
                 summed++;

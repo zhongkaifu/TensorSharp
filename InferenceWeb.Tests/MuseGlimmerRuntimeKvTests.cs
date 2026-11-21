@@ -5,7 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// The legacy model's real-weight KV tests (MuseGlimmerKvSnapshotTests: decode across a cache grow, a restored prefix below and
+// The legacy model's real-weight KV tests (MuseGlimmerKvSnapshotTests, removed with it in S9: decode across a cache grow, a restored prefix below and
 // past the ring) re-pointed at the unified-runtime family (stage S3 of docs/design/muse-glimmer-unified.md). The runtime keeps
 // no position-addressed block snapshots where layers ring; a prefix is restored from a checkpoint (a deep copy of a request's
 // caches, the rings whole), a clone of it, or a checkpoint file. Sizes come from the model's seams

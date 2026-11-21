@@ -331,7 +331,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         _ => FirstPositionRule.LoggedOnly,
     };
 
-    // Measured on the legacy model (MuseGlimmerModel, ggml_metal, M5 Pro, 2026-11-20, TensorSharp db59fbfc + these tests,
+    // Measured on the legacy model (ggml_metal, M5 Pro, 2026-11-20, TensorSharp db59fbfc + these tests,
     // ggml d9fe7bff) against the goldens (llama.cpp d3c3e242c, Metal): argmax = llama.cpp's token at 640/640 short and
     // 128/128 long teacher-forced positions (every greedy continuation identical for all 128 tokens), the first position's
     // top-10 log-probabilities within 0.0496 nats (0.0125-0.0496 per prompt); on MLX the same agreement, within 0.0560
@@ -362,14 +362,10 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     /// <summary>The golden set this lane is held to (<see cref="MuseGlimmerParity.GoldenSet"/>).</summary>
     private static string LaneSet => MuseGlimmerParity.GoldenSet(MuseGlimmerParity.Backend());
 
-    /// <summary>The model the descriptor builds (the legacy one until stage S8), or with <paramref name="runtime"/> the
-    /// unified-runtime family through its test seam.</summary>
-    private static ModelBase Load(string draft = null, bool runtime = false)
+    /// <summary>The shared-runtime family the descriptor builds, through its seam.</summary>
+    private static ModelBase Load()
     {
-        BackendType backend = MuseGlimmerParity.Backend();
-        var model = runtime
-            ? MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft)
-            : MuseGlimmerArchitecture.CreateLegacyModel(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft);
+        var model = MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), MuseGlimmerParity.Backend());
         Assert.Equal("muse-glimmer", model.Config.Architecture);
         return model;
     }
@@ -462,36 +458,18 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     /// token at <see cref="MinAgreement"/> of the positions, every other position is a near-tie, and the first position's
     /// top-ten log-probabilities are llama.cpp's within <see cref="FirstPositionLogprobBound"/>.</summary>
     [MuseGlimmerModelFact]
-    public void TeacherForcedContinuationsMatchLlamaCpp()
-    {
-        using var model = Load();
-        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text.json", LaneSet));
-    }
-
-    /// <summary>The same over the 4,664-token prompt: the sliding window (2048), the full layers' cache growth and legacy's
-    /// ring wrap (4352 rows) are all crossed before the first generated token.</summary>
-    [MuseGlimmerModelFact]
-    public void LongContextMatchesLlamaCpp()
-    {
-        using var model = Load();
-        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json", LaneSet));
-    }
-
-    /// <summary><see cref="TeacherForcedContinuationsMatchLlamaCpp"/> on the unified-runtime family (stage S2 of
-    /// docs/design/muse-glimmer-unified.md), held to the same gates.</summary>
-    [MuseGlimmerModelFact]
     public void RuntimeTeacherForcedContinuationsMatchLlamaCpp()
     {
-        using var model = Load(runtime: true);
+        using var model = Load();
         CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text.json", LaneSet));
     }
 
-    /// <summary><see cref="LongContextMatchesLlamaCpp"/> on the unified-runtime family: the 4,664-token prompt wraps its
-    /// 2,560-cell rings in 512-row steps before the first generated token.</summary>
+    /// <summary>The same over the 4,664-token prompt: the sliding window (2048) and the full layers' cache growth are crossed,
+    /// and the 2,560-cell rings wrap in 512-row steps, before the first generated token.</summary>
     [MuseGlimmerModelFact]
     public void RuntimeLongContextMatchesLlamaCpp()
     {
-        using var model = Load(runtime: true);
+        using var model = Load();
         CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json", LaneSet));
     }
 
@@ -506,7 +484,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         {
             frozen = MuseGlimmerLegacyReal.Find(MuseGlimmerGoldens.LaneKey(backend));
             Assert.True(frozen != null, $"no real-weight legacy outputs frozen on {MuseGlimmerGoldens.LaneKey(backend)}: this lane's " +
-                $"first position is held to them (freeze them with MuseGlimmerLegacyRealWriterTests; lanes: {string.Join("; ", MuseGlimmerLegacyReal.Lanes)})");
+                $"first position is held to them (lanes frozen before stage S9: {string.Join("; ", MuseGlimmerLegacyReal.Lanes)})");
         }
         int total = 0, agree = 0;
         double worstOurGap = 0, worstReferenceGap = 0, worstFirst = 0, worstFirstVsLegacy = 0;
@@ -557,117 +535,6 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
             output.WriteLine($"logged only on this lane ({rule}):\n  " + string.Join("\n  ", logged));
         Assert.True(failures.Count == 0, "positions that are not near-ties, or first positions past the bound:\n" + string.Join("\n", failures));
         Assert.True(agreement >= MinAgreement, $"argmax agreement with llama.cpp {agreement:P2} < {MinAgreement:P0}");
-    }
-
-    /// <summary>
-    /// DFlash is lossless speculative decoding: every drafted token is verified by the target, so its greedy output is the
-    /// plain greedy output, except where the verify forward's rounding (several rows at once) flips a near-tie the one-row
-    /// decode resolved the other way. So the DFlash output must equal plain greedy's, or leave it only where plain greedy's
-    /// top-2 margin is below <see cref="DFlashNearTieNats"/>; past each such position both are resumed from plain greedy's
-    /// prefix (teacher-forced: plain's token is fed), and must agree again, to the end of the continuation. A resumed run
-    /// prefills that prefix in one forward, which rounds its rows differently from the one-row decode that produced them, so
-    /// the plain reference past a divergence is plain greedy resumed from the same prefix the same way (the drafted model's
-    /// own plain forwards), not the first run's tail. Every divergence is printed with its margin. (llama.cpp's own DFlash:
-    /// <see cref="GoldensAreWellFormed"/>.)
-    /// <para>A divergence over the line still passes when DFlash's token is the argmax of the verify row that drew it in this
-    /// run (<see cref="VerifyWindowLog"/>): the greedy-lossless property itself, no token emitted that the target's verify
-    /// products did not choose. That is where the backend's verify rows round apart from its one-row decode (ggml_cuda's do).
-    /// A lane whose verify rows are its one-row decode's bits never reaches that branch.</para>
-    /// <para>A corrupt verify forward would pass that check, so the stream is also held to plain one-row decode. Over every
-    /// prompt, with both resumed from plain's prefix past each divergence, DFlash must take plain greedy's token at
-    /// <see cref="VerifyWindowLog.MinAgreement"/> of the positions or more. Each divergence is one position where it does
-    /// not.</para>
-    /// </summary>
-    [MuseGlimmerModelFact(NeedsDraft = true)]
-    public void DFlashDraftingIsLossless()
-    {
-        var records = MuseGlimmerParity.Load("ref_text.json").Records;
-        var plain = new List<MuseGlimmerLegacyReal.Continuation>();
-        using (var model = Load())
-            foreach (var golden in records)
-                plain.Add(MuseGlimmerLegacyReal.Continue(model, golden));
-
-        using var drafted = Load(MuseGlimmerParity.FindDraft());
-        var spec = drafted as ISpeculativeModel;
-        Assert.NotNull(spec);
-        Assert.True(spec.HasDraftHead, "the DFlash drafter did not arm (HasDraftHead is false)");
-        var decoder = new SpeculativeDecoder(spec, spec.DraftBlockSize);
-        var windows = new VerifyWindowLog(decoder, drafted.Config.VocabSize);
-        // GenerateGreedy starts the statistics over on every call: sum them per call.
-        long totalDrafted = 0, accepted = 0, verifies = 0, plains = 0;
-        int identical = 0, divergences = 0, proven = 0, positions = 0;
-        double worstMargin = 0;
-        var failures = new List<string>();
-        for (int r = 0; r < records.Count; r++)
-        {
-            var golden = records[r];
-            int[] want = (int[])plain[r].Tokens.Clone();
-            var tops = ((int Id, double Logprob)[][])plain[r].Top.Clone();
-            int n = want.Length, start = 0;
-            positions += n;
-            var notes = new List<string>();
-            while (start < n)
-            {
-                int[] prompt = golden.PromptTokens.Concat(want.Take(start)).ToArray();
-                if (start > 0)
-                {
-                    // The plain reference from here: greedy resumed from the same prefix, prefilled the same way.
-                    var resumed = MuseGlimmerLegacyReal.Continue(drafted, golden with { PromptTokens = prompt, Generated = new int[n - start] });
-                    resumed.Tokens.CopyTo(want, start);
-                    resumed.Top.CopyTo(tops, start);
-                }
-                windows.Clear();
-                int[] got = decoder.GenerateGreedy(prompt, n - start).Take(n - start).ToArray();
-                totalDrafted += decoder.TokensDrafted; accepted += decoder.TokensAccepted;
-                verifies += decoder.VerifySteps; plains += decoder.PlainSteps;
-                int j = Enumerable.Range(0, n - start).FirstOrDefault(i => i >= got.Length || got[i] != want[start + i], -1);
-                if (j < 0) break;
-                int k = start + j;
-                var top = tops[k];
-                double margin = top[0].Logprob - top[1].Logprob;
-                int theirs = j < got.Length ? got[j] : -1;
-                int rank = Array.FindIndex(top, t => t.Id == theirs);
-                string where = rank >= 0 ? $" (plain's #{rank + 1}, {top[0].Logprob - top[rank].Logprob:F4} nat below its #1)" : " (not in plain's top 4)";
-                string what = $"{golden.Name} @{k}{(start > 0 ? " (resumed at " + start + ")" : "")}: plain {want[k]} '{MuseGlimmerParity.Decode(drafted, want[k])}', dflash {theirs} " +
-                    $"'{(theirs >= 0 ? MuseGlimmerParity.Decode(drafted, theirs) : "(none)")}'{where}; plain's top-2 margin {margin:F4} nat";
-                divergences++;
-                worstMargin = Math.Max(worstMargin, margin);
-                if (margin >= DFlashNearTieNats)
-                {
-                    // Over the line: DFlash's token must be the argmax of the verify row that drew it in this run.
-                    VerifyWindowLog.Row? row = theirs >= 0 ? windows.Drawing(prompt.Length + j) : null;
-                    if (row is { } drew)
-                    {
-                        what += "; " + VerifyWindowLog.Describe(drew, theirs, want[k]);
-                        if (drew.Top[0].Id == theirs) proven++;
-                        else failures.Add(what);
-                    }
-                    else
-                        failures.Add(what + " (no verify row drew it)");
-                }
-                notes.Add(what);
-                start = k + 1;
-            }
-            if (notes.Count == 0)
-            {
-                identical++;
-                output.WriteLine($"[MATCH ] {golden.Name}: {n} tokens, the plain greedy ones");
-            }
-            else
-                output.WriteLine($"[NEAR  ] {golden.Name}: {notes.Count} divergence(s), each resumed from plain's prefix:\n          " +
-                    string.Join("\n          ", notes));
-        }
-        output.WriteLine($"{identical}/{records.Count} identical to plain greedy; {divergences} divergence(s), the widest at a plain top-2 " +
-            $"margin of {worstMargin:F4} nat (bound {DFlashNearTieNats}); DFlash acceptance {(totalDrafted > 0 ? (double)accepted / totalDrafted : 0):P1} " +
-            $"({accepted}/{totalDrafted} drafted tokens over {verifies} verify steps, {plains} plain steps)");
-        double agreement = 1.0 - (double)divergences / positions;
-        output.WriteLine($"teacher-forced agreement with plain one-row decode: {positions - divergences}/{positions} = {agreement:P2} " +
-            $"(bound {VerifyWindowLog.MinAgreement:P0}); {proven} divergence(s) over the near-tie line proven by the verify row that drew them");
-        Assert.True(failures.Count == 0, "DFlash left plain greedy where plain's choice was not a near-tie, and not at its verify row's argmax:\n" +
-            string.Join("\n", failures));
-        Assert.True(agreement >= VerifyWindowLog.MinAgreement,
-            $"DFlash agrees with plain one-row decode at {agreement:P2} of the positions, under {VerifyWindowLog.MinAgreement:P0}");
-        Assert.True(totalDrafted > 0, "DFlash never drafted a token: the drafter is not running.");
     }
 
     /// <summary>
@@ -722,7 +589,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
 /// <summary>
 /// Which llama.cpp golden set a lane's arithmetic is closest to: on the backend the parity tests run on, the first generated
 /// position's top-10 log-probabilities of every golden prompt against every set (<see cref="MuseGlimmerParity.GoldenSets"/>),
-/// for the legacy model and the runtime family. On direct CUDA, assigned by this measurement, the assigned set
+/// for the shared-runtime family (the legacy model measured the same before stage S9 deleted it). On direct CUDA, assigned by this measurement, the assigned set
 /// (<see cref="MuseGlimmerParity.GoldenSet"/>) must be the closest one (the mean over the prompts of the per-prompt worst
 /// difference). ggml_metal, MLX, ggml_cuda and ggml_vulkan are held to their own backend's set by definition, and the
 /// managed backend and ggml_cpu are far from every set (GoldenSet's notes), so for them the numbers are only printed.
@@ -731,22 +598,15 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
 public sealed class MuseGlimmerGoldenSetAffinityTests(ITestOutputHelper output)
 {
     [MuseGlimmerModelFact]
-    public void LegacyShortPromptsAreClosestToTheirLanesSet() => Measure(runtime: false, "ref_text.json");
+    public void RuntimeShortPromptsAreClosestToTheirLanesSet() => Measure("ref_text.json");
 
     [MuseGlimmerModelFact]
-    public void LegacyLongPromptIsClosestToItsLanesSet() => Measure(runtime: false, "ref_text_long.json");
+    public void RuntimeLongPromptIsClosestToItsLanesSet() => Measure("ref_text_long.json");
 
-    [MuseGlimmerModelFact]
-    public void RuntimeShortPromptsAreClosestToTheirLanesSet() => Measure(runtime: true, "ref_text.json");
-
-    [MuseGlimmerModelFact]
-    public void RuntimeLongPromptIsClosestToItsLanesSet() => Measure(runtime: true, "ref_text_long.json");
-
-    private void Measure(bool runtime, string name)
+    private void Measure(string name)
     {
         BackendType backend = MuseGlimmerParity.Backend();
-        string path = MuseGlimmerParity.FindModel();
-        using ModelBase model = runtime ? MuseGlimmerArchitecture.CreateRuntimeModel(path, backend) : MuseGlimmerArchitecture.CreateLegacyModel(path, backend);
+        using ModelBase model = MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend);
         var sets = MuseGlimmerParity.GoldenSets.ToDictionary(s => s, s => MuseGlimmerParity.Load(name, s));
         var sums = MuseGlimmerParity.GoldenSets.ToDictionary(s => s, _ => 0.0);
         var records = sets["metal"].Records;
@@ -768,7 +628,7 @@ public sealed class MuseGlimmerGoldenSetAffinityTests(ITestOutputHelper output)
         }
         var means = sums.ToDictionary(kv => kv.Key, kv => kv.Value / records.Count);
         string closest = means.OrderBy(kv => kv.Value).First().Key, assigned = MuseGlimmerParity.GoldenSet(backend);
-        output.WriteLine($"{backend} {(runtime ? "runtime" : "legacy")}: mean " + string.Join(", ", means.Select(kv => $"{kv.Key} {kv.Value:F4}")) +
+        output.WriteLine($"{backend}: mean " + string.Join(", ", means.Select(kv => $"{kv.Key} {kv.Value:F4}")) +
             $"; closest {closest}, assigned {assigned}");
         if (backend is BackendType.Cuda)
             Assert.Equal(closest, assigned);

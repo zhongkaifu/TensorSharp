@@ -11,7 +11,7 @@
 // that layer on the goldens' untied fixture (8 blocks: 6 sliding-window, 2 full NoPE; a real logit scale and a head that
 // reaches the softcap) with a window of 8 keys, and a synthetic DFlash drafter (blocks of 4, a window of 16, so its 32-row
 // ring wraps): speculation emits plain greedy decoding's stream on every executor, alone and for several requests at once
-// (continuous batching, which legacy lacks), across a whole-layer split, and the drafter is declined under --tp (D5).
+// (continuous batching, which legacy lacked), across a whole-layer split, and the drafter is declined under --tp (D5).
 using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime.Speculative;
@@ -37,7 +37,7 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
     /// 5 and 7, so features of a sliding-window layer, a full NoPE layer's neighbour and the last layer's input).</summary>
     private (string Target, string Draft) Files() => WriteFiles(_dir);
 
-    /// <summary><see cref="Files"/> into <paramref name="dir"/> (the frozen legacy figures' writer uses the same fixtures).</summary>
+    /// <summary><see cref="Files"/> into <paramref name="dir"/> (the frozen legacy features came from the same fixtures).</summary>
     internal static (string Target, string Draft) WriteFiles(string dir)
     {
         Directory.CreateDirectory(dir);
@@ -265,23 +265,24 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
     }
 
     /// <summary>The runtime's drafter features (the residual entering each target layer) are legacy's, to the families'
-    /// parity bound: the prompt's every row, on the managed CPU.</summary>
+    /// parity bound: the prompt's every row, on the managed CPU, against legacy's features frozen there before stage S9
+    /// deleted it (<see cref="MuseGlimmerLegacySynthetic"/>).</summary>
     [Fact]
     public void TheDrafterFeaturesAreLegacys()
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         var (target, draft) = Files();
-        float[] Features(ModelBase model)
+        var frozen = MuseGlimmerLegacySynthetic.Frozen;
+        Assert.Equal(frozen.TargetSha256, MuseGlimmerGoldens.FileSha(target));
+        Assert.Equal(frozen.DraftSha256, MuseGlimmerGoldens.FileSha(draft));
+        float[] runtime;
+        using (ModelBase model = Create(target, BackendType.Cpu, draft))
         {
             var spec = (ISpeculativeModel)model;
-            var rows = new float[LongPrompt.Length * spec.SpecFeatureSize];
-            spec.SpecForward(LongPrompt, rows, new float[model.Config.VocabSize], allLogitsRows: false);
-            return rows;
+            runtime = new float[LongPrompt.Length * spec.SpecFeatureSize];
+            spec.SpecForward(LongPrompt, runtime, new float[model.Config.VocabSize], allLogitsRows: false);
         }
-        float[] runtime, legacy;
-        using (ModelBase model = Create(target, BackendType.Cpu, draft)) runtime = Features(model);
-        using (ModelBase model = new MuseGlimmerModel(target, BackendType.Cpu, 1, null, draft)) legacy = Features(model);
-        var (relL2, relMax) = MuseGlimmerGoldens.Distance(legacy, runtime);
+        var (relL2, relMax) = MuseGlimmerGoldens.Distance(frozen.DrafterFeatures, runtime);
         output.WriteLine($"features of {LongPrompt.Length} rows: relL2 {relL2:E2}, largest difference {relMax:E2} of the largest");
         Assert.True(relL2 <= MuseGlimmerRuntimeTests.ParityBound && relMax <= MuseGlimmerRuntimeTests.ParityBound, $"relL2 {relL2:E2}, max {relMax:E2}");
     }

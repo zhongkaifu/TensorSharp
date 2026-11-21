@@ -20,7 +20,7 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// Muse Spark on the shared vision tower (stage S4 of docs/design/muse-glimmer-unified.md): its mmproj (projector type
 /// muse-glimmer at Spark's width) loads as <see cref="MuseGlimmerVisionTower"/>, the graph program Muse-Glimmer runs, whose
-/// rows are a standalone tower's and the legacy per-op tower's within the towers' parity bound, and they enter Spark's
+/// rows are a standalone tower's, and the legacy per-op tower's (frozen) within the towers' parity bound, and they enter Spark's
 /// prompt as its own vision rows do (normalized with the text, <see cref="MuseSparkModelTests"/>).
 /// </summary>
 [Collection("Muse Spark model")]
@@ -57,11 +57,10 @@ public sealed class MuseSparkVisionTowerTests(ITestOutputHelper output) : IDispo
         using (var gguf = new GgufFile(mmproj))
         using (var standalone = new MuseGlimmerVisionTower(gguf, cpu, BackendType.Cpu))
             Assert.Equal(standalone.EncodeToHost(px, w, h, out _), rows);
-        float[] legacy;
-        using (var encoder = new MuseGlimmerVisionEncoder(mmproj, cpu))
-            legacy = encoder.EncodeToHostArray(px, w, h, out _);
+        // The legacy per-op tower's rows at Spark's width, frozen on the managed backend before stage S9 deleted it.
+        float[] legacy = MuseGlimmerLegacySynthetic.TowerRows("spark-f32", mmproj, 6, 10, 5);
         var d = MuseGlimmerVisionTowerTests.Distance(legacy, rows);
-        output.WriteLine($"Spark's tower vs the legacy tower: relL2 {d.RelL2:E2}, max {d.RelMax:E2}");
+        output.WriteLine($"Spark's tower vs the legacy tower's frozen rows: relL2 {d.RelL2:E2}, max {d.RelMax:E2}");
         Assert.True(Math.Max(d.RelL2, d.RelMax) <= MuseGlimmerVisionTowerTests.ParityBound);
 
         // The rows replace their placeholders (positions 1 .. 15) as Spark's reference decoder takes replacements.
