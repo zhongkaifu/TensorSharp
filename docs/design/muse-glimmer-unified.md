@@ -999,7 +999,7 @@ step stays 512 rows on every Mac backend, and no shared runtime, executor or nat
 
 ### 5.7 S8, the switch: status
 
-**The Mac part is done** (2026-11-21, M5 Pro, ggml d9fe7bff unchanged). The VM part (the same E2E on ggml_cuda and direct CUDA)
+**The Mac part is done** (2026-11-20, M5 Pro, ggml d9fe7bff unchanged). The VM part (the same E2E on ggml_cuda and direct CUDA)
 waits for the CUDA box: `glimmer/cuda-vm/s8-cuda.sh` (`build`, `cli B Q`, `server B Q`, `tests`).
 
 * **The switch (e6df6ff5, a DEFAULT CHANGE).** The descriptor builds `MuseGlimmerRuntimeModel` with

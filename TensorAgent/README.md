@@ -1410,7 +1410,7 @@ the same pins):
 | prompt reuse, follow-up / new chat | 99.7% / 99.6% | 99.8% / 66% |
 | app footprint at its highest, beside the weights | 8.8 GB beside 17.6 GB | 10.9 GB beside 15.9 GB |
 
-On 2026-11-21 Muse-Glimmer moved to the shared decoder runtime (`MuseGlimmerRuntimeModel`). The same entry and files, the
+On 2026-11-20 Muse-Glimmer moved to the shared decoder runtime (`MuseGlimmerRuntimeModel`). The same entry and files, the
 entry's own settings (KV q8_0, speculation off), `chat-e2e.py`'s seven scenarios in the Mac app, the runtime against the
 legacy model built from the commit before the switch, in one session:
 
