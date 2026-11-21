@@ -35,14 +35,17 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
 
     /// <summary>The goldens' untied fixture with a window of <see cref="Window"/> keys, and the DFlash drafter (target layers 2,
     /// 5 and 7, so features of a sliding-window layer, a full NoPE layer's neighbour and the last layer's input).</summary>
-    private (string Target, string Draft) Files()
+    private (string Target, string Draft) Files() => WriteFiles(_dir);
+
+    /// <summary><see cref="Files"/> into <paramref name="dir"/> (the frozen legacy figures' writer uses the same fixtures).</summary>
+    internal static (string Target, string Draft) WriteFiles(string dir)
     {
-        Directory.CreateDirectory(_dir);
+        Directory.CreateDirectory(dir);
         string target = new MuseGlimmerSyntheticModelBuilder
         {
             BlockCount = 8, SlidingWindow = Window, LogitScale = 0.19612f, Softcap = 20f, HeadScale = 3f, BlockOutputScale = 0.004f,
-        }.Write(Path.Combine(_dir, "muse-glimmer.gguf"));
-        string draft = Qwen4ExpSyntheticModelBuilder.WriteDFlash(Path.Combine(_dir, "dflash.gguf"), blockSize: 4,
+        }.Write(Path.Combine(dir, "muse-glimmer.gguf"));
+        string draft = Qwen4ExpSyntheticModelBuilder.WriteDFlash(Path.Combine(dir, "dflash.gguf"), blockSize: 4,
             hidden: MuseGlimmerSyntheticModelBuilder.Hidden, slidingWindow: 16);
         return (target, draft);
     }
@@ -82,7 +85,7 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
     private static double EngineNearTie(BackendType backend)
         => backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.Mlx ? 5e-3 : 0;
 
-    private static readonly int[] LongPrompt = Enumerable.Range(0, 40).Select(i => 40 + (i * 7) % 23).ToArray();
+    internal static readonly int[] LongPrompt = Enumerable.Range(0, 40).Select(i => 40 + (i * 7) % 23).ToArray();
 
     // ---------------------------------------------------------------- DFlash: the block drafter
 

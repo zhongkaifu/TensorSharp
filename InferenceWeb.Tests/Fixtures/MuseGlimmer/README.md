@@ -158,5 +158,11 @@ code, so the runtime family can be held to them after the legacy code is deleted
   each position's top four log-probabilities, and the teacher-forced perplexity of
   `benchmarks/engine_comparison/assets/prefill_corpus.txt`.
 
+* `LegacySynthetic/managed.json` (`MuseGlimmerLegacySynthetic.cs`): on the managed backend, frozen on 2026-11-20 (M5 Pro,
+  757e0517, ggml d9fe7bff) just before stage S9 deleted the legacy code: the legacy per-op vision tower's rows for the
+  tower tests' six grids over the F32-product and the Q8_0-product synthetic mmprojs and for Muse Spark's width
+  (`MuseGlimmerVisionTowerTests`, `MuseSparkVisionTowerTests`), and the legacy model's DFlash drafter features over the
+  speculation tests' prompt (`MuseGlimmerRuntimeSpeculationTests`), each with the SHA-256 of the fixture it ran on.
+
 The writers are Bench tests that run only when `TS_TEST_FREEZE_MUSE_GLIMMER_GOLDENS` or
 `TS_TEST_FREEZE_MUSE_GLIMMER_REAL` names the directory to write into.
