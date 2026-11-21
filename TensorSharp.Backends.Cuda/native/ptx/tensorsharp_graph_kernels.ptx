@@ -50399,4 +50399,54 @@ $L__BB72_212:
 	ret;
 
 }
+	// .globl	ts_graph_ring_attn_lanes_f16_d64
+.visible .entry ts_graph_ring_attn_lanes_f16_d64(
+	.param .align 8 .b8 ts_graph_ring_attn_lanes_f16_d64_param_0[512],
+	.param .u64 ts_graph_ring_attn_lanes_f16_d64_param_1,
+	.param .u64 ts_graph_ring_attn_lanes_f16_d64_param_2,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_3,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_4,
+	.param .u64 ts_graph_ring_attn_lanes_f16_d64_param_5,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_6,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_7,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_8,
+	.param .f32 ts_graph_ring_attn_lanes_f16_d64_param_9,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_10,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_11,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d64_param_12,
+	.param .u64 ts_graph_ring_attn_lanes_f16_d64_param_13
+)
+.maxntid 128, 1, 1
+{
+
+
+
+	ret;
+
+}
+	// .globl	ts_graph_ring_attn_lanes_f16_d128
+.visible .entry ts_graph_ring_attn_lanes_f16_d128(
+	.param .align 8 .b8 ts_graph_ring_attn_lanes_f16_d128_param_0[512],
+	.param .u64 ts_graph_ring_attn_lanes_f16_d128_param_1,
+	.param .u64 ts_graph_ring_attn_lanes_f16_d128_param_2,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_3,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_4,
+	.param .u64 ts_graph_ring_attn_lanes_f16_d128_param_5,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_6,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_7,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_8,
+	.param .f32 ts_graph_ring_attn_lanes_f16_d128_param_9,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_10,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_11,
+	.param .u32 ts_graph_ring_attn_lanes_f16_d128_param_12,
+	.param .u64 ts_graph_ring_attn_lanes_f16_d128_param_13
+)
+.maxntid 128, 1, 1
+{
+
+
+
+	ret;
+
+}
 

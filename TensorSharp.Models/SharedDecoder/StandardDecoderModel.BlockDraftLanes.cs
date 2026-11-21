@@ -252,7 +252,7 @@ namespace TensorSharp.Models
                 int q = EmitDFlashHeads(step, names[DfAttnQ], h, heads, rows, names[DfAttnQNorm]);
                 int k = EmitDFlashHeads(step, names[DfAttnK], h, kvHeads, rows, names[DfAttnKNorm]);
                 int v = step.Reshape(step.MatMul(names[DfAttnV], h), hd, kvHeads, rows);
-                fa = -1;
+                var laneRings = new int[2 * m];
                 for (int j = 0; j < m; j++)
                 {
                     DFlashLaneRing lane = _dflashLanes[j];
@@ -272,11 +272,29 @@ namespace TensorSharp.Models
                     {
                         EmitDFlashRingWrite(step, il, laneK, laneV, b, blockRows[j], out ringK, out ringV, lane.K[il], lane.V[il]);
                     }
-                    long qRow = (long)hd * heads * f;
-                    int laneQ = step.View3(q, hd, heads, b, hd * f, qRow, j * b * qRow);
-                    int attended = step.FlashAttention(step.Permute(laneQ, 0, 2, 1, 3), ringK, ringV, masks[j], scale);   // [hd, heads, b]
+                    laneRings[2 * j] = ringK;
+                    laneRings[2 * j + 1] = ringV;
+                }
+                // Each lane's queries over its ring, the lanes' attentions one region an executor may run in one launch
+                // (GraphFusion.RingAttentionLanes); the rings' writes come before it.
+                long qRow = (long)hd * heads * f;
+                var attendSrcs = new int[4 * m];
+                for (int j = 0; j < m; j++)
+                {
+                    attendSrcs[4 * j] = step.Permute(step.View3(q, hd, heads, b, hd * f, qRow, j * b * qRow), 0, 2, 1, 3);
+                    attendSrcs[4 * j + 1] = laneRings[2 * j];
+                    attendSrcs[4 * j + 2] = laneRings[2 * j + 1];
+                    attendSrcs[4 * j + 3] = masks[j];
+                }
+                bool attendRegion = m > 1;
+                if (attendRegion) step.BeginFused(GraphFusion.RingAttentionLanes, attendSrcs, stackalloc long[] { m }, stackalloc[] { scale });
+                fa = -1;
+                for (int j = 0; j < m; j++)
+                {
+                    int attended = step.FlashAttention(attendSrcs[4 * j], attendSrcs[4 * j + 1], attendSrcs[4 * j + 2], attendSrcs[4 * j + 3], scale);   // [hd, heads, b]
                     fa = fa < 0 ? attended : step.Op(GraphOp.Concat, stackalloc[] { fa, attended }, stackalloc long[] { 2 });
                 }
+                if (attendRegion) step.EndFused(stackalloc[] { fa });
                 int attn = step.MatMul(names[DfAttnOutput], step.Reshape(fa, (long)heads * hd, rows));
                 if (cfg.HasConv) attn = EmitDFlashConv(step, attn, attnTaps, names[DfAttnConvBase], side: 1, b, zeros, m);
                 x = step.Op(GraphOp.Add, attn, x);

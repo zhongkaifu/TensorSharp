@@ -567,6 +567,95 @@ namespace TensorSharp.Cuda
         /// <summary>Draft steps' ring attentions run as <see cref="TryRingAttention"/> (tests check it engaged).</summary>
         internal long RingAttentions { get; private set; }
 
+        /// <summary>
+        /// Several lanes' ring attentions (<see cref="GraphFusion.RingAttentionLanes"/>: several requests' blocks drafted in one
+        /// program) in one launch and one combine: each lane as <see cref="TryRingAttention"/> runs it alone, its pointers by
+        /// value, so each lane's values are its own launch's. A launch a lane had left most of the device idle: 72 blocks over a
+        /// lane's 2,080-row ring, 34 us each, 20 of a four-request Qwen3.8-27B DFlash2 block's launches (RTX PRO 4500), where the
+        /// direct engine's attention took every lane in one. False (the ops run) unless every lane takes the ring kernel with the
+        /// same shape.
+        /// </summary>
+        private bool TryRingAttentionLanes(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            int lanes = ip != null && ip.Length > 0 ? (int)ip[0] : 0;
+            if (RingAttentionDisabledForTests || Kernels is not { TakesRingAttentionLanes: true } || lanes < 1
+                || inputs.Length != 4 * lanes || results.Length != 1 || fp == null || fp.Length < 1)
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            float scale = fp[0];
+            int heads = 0, nq = 0, d = 0, kvHeads = 0, len = 0;
+            long qRow = 0, qHead = 0, maskRow = 0;
+            bool half = false;
+            // The operands as the attention op takes them: q, K and V [heads, rows, d] and the mask [rows, keys] (their leading
+            // ones dropped).
+            var views = new List<Tensor>();
+            Tensor Drop(Tensor t, int rank)
+            {
+                while (t != null && t.DimensionCount > rank && t.Sizes[0] == 1)
+                {
+                    t = t.Select(0, 0);
+                    views.Add(t);
+                }
+                return t;
+            }
+            var operands = new Tensor[4 * lanes];
+            try
+            {
+                for (int j = 0; j < lanes; j++)
+                {
+                    Tensor q = operands[4 * j] = Drop(inputs[4 * j], 3), k = operands[4 * j + 1] = Drop(inputs[4 * j + 1], 3);
+                    Tensor v = operands[4 * j + 2] = Drop(inputs[4 * j + 2], 3), mask = operands[4 * j + 3] = Drop(inputs[4 * j + 3], 2);
+                    if (mask == null || q == null || k == null || v == null || q.DimensionCount != 3 || k.DimensionCount != 3 || v.DimensionCount != 3
+                        || !AllF32OnDevice(q, k, v) || mask.Storage is not CudaStorage || mask.ElementType is not (DType.Float32 or DType.Float16))
+                        return false;
+                    int jh = (int)q.Sizes[0], jn = (int)q.Sizes[1], jd = (int)q.Sizes[2], jkv = (int)k.Sizes[0], jl = (int)k.Sizes[1];
+                    if (j == 0) (heads, nq, d, kvHeads, len, qRow, qHead, maskRow, half) = (jh, jn, jd, jkv, jl, q.Strides[1], q.Strides[0], mask.Strides[0], mask.ElementType == DType.Float16);
+                    if (jh != heads || jn != nq || jd != d || jkv != kvHeads || jl != len || q.Strides[1] != qRow || q.Strides[0] != qHead
+                        || mask.Strides[0] != maskRow || (mask.ElementType == DType.Float16) != half
+                        || !CudaGraphKernels.RingAttentionTakes(d) || kvHeads < 1 || heads % kvHeads != 0 || len < 1 || k.Sizes[2] != d
+                        || v.Sizes[0] != kvHeads || v.Sizes[1] != len || v.Sizes[2] != d || !k.IsContiguous() || !v.IsContiguous() || q.Strides[2] != 1
+                        || mask.DimensionCount != 2 || mask.Sizes[0] != nq || mask.Sizes[1] != len || mask.Strides[1] != 1
+                        || Array.Exists(new[] { q, k, v, mask }, t => ((CudaStorage)t.Storage).DeviceId != cuda.DeviceId)
+                        || ((long)Ptr(k) & 15) != 0 || ((long)Ptr(v) & 15) != 0)
+                        return false;
+                }
+                var result = new Tensor(Allocator, DType.Float32, (long)lanes * nq, heads, d);
+                using var partial = new Tensor(Allocator, DType.Float32, lanes * CudaGraphKernels.RingAttentionPartialFloats(nq, heads, len, d));
+                Launch(inputs, new[] { result, partial }, (kn, stream) =>
+                {
+                    long laneFloats = CudaGraphKernels.RingAttentionPartialFloats(nq, heads, len, d);
+                    for (int first = 0; first < lanes; first += CudaGraphKernels.RingAttentionLanesMax)
+                    {
+                        int count = Math.Min(CudaGraphKernels.RingAttentionLanesMax, lanes - first);
+                        var args = new CudaGraphKernels.RingAttentionLanesArgs();
+                        unsafe
+                        {
+                            for (int z = 0; z < count; z++)
+                            {
+                                args.Q[z] = (long)Ptr(operands[4 * (first + z)]);
+                                args.K[z] = (long)Ptr(operands[4 * (first + z) + 1]);
+                                args.V[z] = (long)Ptr(operands[4 * (first + z) + 2]);
+                                args.Mask[z] = (long)Ptr(operands[4 * (first + z) + 3]);
+                            }
+                        }
+                        kn.LaunchRingAttentionLanes(args, count, qRow, qHead, len, half, maskRow, nq, heads, kvHeads, d, scale,
+                            Ptr(partial) + (nint)((long)first * laneFloats * sizeof(float)), Ptr(result) + (nint)((long)first * nq * heads * d * sizeof(float)), stream);
+                    }
+                });
+                RingAttentions += lanes;
+                RingAttentionLaneRegions++;
+                results[0] = result;
+                return true;
+            }
+            finally
+            {
+                foreach (Tensor view in views) view.Dispose();
+            }
+        }
+
+        /// <summary>Lanes regions whose ring attentions ran in one launch (<see cref="TryRingAttentionLanes"/>).</summary>
+        internal long RingAttentionLaneRegions { get; private set; }
+
         /// <summary>Tests: draft steps' ring attentions take the grouped F32 products (<see cref="TryExplicitRowsOverTensors"/>).</summary>
         internal bool RingAttentionDisabledForTests { get; set; }
 
@@ -1692,6 +1781,7 @@ namespace TensorSharp.Cuda
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
             GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep or GraphFusion.DFlashConv => Kernels != null,
             GraphFusion.DeltaNetScans => Kernels is { TakesGdnScanSequences: true },
+            GraphFusion.RingAttentionLanes => Kernels is { TakesRingAttentionLanes: true } && !RingAttentionDisabledForTests,
             _ => false,
         };
 
@@ -1712,6 +1802,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.AttentionPrep) return TryAttentionPrep(inputs, ip, fp, results);
             if (kind == GraphFusion.DFlashConv) return TryDFlashConv(inputs, ip, results);
             if (kind == GraphFusion.DeltaNetScans) return TryDeltaNetScans(inputs, ip, results);
+            if (kind == GraphFusion.RingAttentionLanes) return TryRingAttentionLanes(inputs, ip, fp, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -1995,7 +2086,8 @@ namespace TensorSharp.Cuda
         /// the attention's gate and prep read the query projection's heads (<see cref="TryHeadRows"/>); the others take contiguous
         /// inputs.</summary>
         protected override bool RegionReadsStridedInputs(GraphFusion kind)
-            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate or GraphFusion.AttentionPrep;
+            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate or GraphFusion.AttentionPrep
+                or GraphFusion.RingAttentionLanes;
 
         /// <summary>
         /// DFlash2's grouped dynamic convolution (<see cref="GraphFusion.DFlashConv"/>) in one launch (ts_graph_dflash_conv_f32)

@@ -29,6 +29,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
         private readonly IntPtr _setRowsHeads;
         private readonly IntPtr _gdnScanSeqs, _gdnScanSeqsKda;
+        private readonly IntPtr _ringAttnLanes64, _ringAttnLanes128;
         private readonly int _multiprocessors;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
@@ -148,6 +149,15 @@ namespace TensorSharp.Cuda
                 _ringAttn128 = module.GetFunction("ts_graph_ring_attn_f16_d128");
                 _ringAttnCombine = module.GetFunction("ts_graph_ring_attn_combine_f32");
                 TakesRingAttention = true;
+                try
+                {
+                    _ringAttnLanes64 = module.GetFunction("ts_graph_ring_attn_lanes_f16_d64");
+                    _ringAttnLanes128 = module.GetFunction("ts_graph_ring_attn_lanes_f16_d128");
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500)
+                {
+                    _ringAttnLanes64 = _ringAttnLanes128 = IntPtr.Zero;
+                }
             }
         }
 
@@ -275,6 +285,43 @@ namespace TensorSharp.Cuda
                 stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
             void** combine = stackalloc void*[] { &partial, &splits, &d, &output };
             CudaDriverApi.cuLaunchKernel(_ringAttnCombine, (uint)(rows * heads), 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)combine, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Lanes <see cref="LaunchRingAttentionLanes"/> takes in one launch (TS_GRAPH_RING_LANES).</summary>
+        public const int RingAttentionLanesMax = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchRingAttentionLanes"/>.</summary>
+        public bool TakesRingAttentionLanes => _ringAttnLanes128 != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_ring_attn_lanes_f16_d*, byte for byte (struct ts_graph_ring_lanes): each lane's queries,
+        /// ring K and V, and mask.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct RingAttentionLanesArgs
+        {
+            public fixed long Q[RingAttentionLanesMax];
+            public fixed long K[RingAttentionLanesMax];
+            public fixed long V[RingAttentionLanesMax];
+            public fixed long Mask[RingAttentionLanesMax];
+        }
+
+        /// <summary><see cref="LaunchRingAttention"/> for <paramref name="lanes"/> lanes of the same shape in one launch (and one
+        /// combine): lane j's queries, ring and mask in <paramref name="args"/>, its partials and rows after lane j - 1's in
+        /// <paramref name="partial"/> (<see cref="RingAttentionPartialFloats"/> floats a lane) and <paramref name="output"/>
+        /// ([lanes * rows][heads][d]). Each lane's values are its own launch's.</summary>
+        public void LaunchRingAttentionLanes(RingAttentionLanesArgs args, int lanes, long qRow, long qHead, int keys, bool maskHalf, long maskRow,
+            int rows, int heads, int kvHeads, int d, float scale, IntPtr partial, IntPtr output, IntPtr stream)
+        {
+            if (!TakesRingAttentionLanes || !RingAttentionTakes(d) || lanes < 1 || lanes > RingAttentionLanesMax || kvHeads < 1
+                || heads % kvHeads != 0 || rows < 1 || keys < 1)
+                throw new ArgumentOutOfRangeException(nameof(lanes), $"{lanes} lanes' ring attention over {keys} keys of {rows} rows, {heads} / {kvHeads} heads of {d}");
+            int chunk = RingAttentionChunk, splits = (keys + chunk - 1) / chunk, half = maskHalf ? 1 : 0;
+            int tiles = (rows * (heads / kvHeads) + 63) / 64;
+            RingAttentionLanesArgs* p = &args;
+            void** a = stackalloc void*[] { p, &qRow, &qHead, &keys, &half, &maskRow, &rows, &heads, &kvHeads, &scale, &chunk, &splits, &tiles, &partial };
+            CudaDriverApi.cuLaunchKernel(d == 64 ? _ringAttnLanes64 : _ringAttnLanes128, (uint)splits, (uint)kvHeads, (uint)(lanes * tiles), 128, 1, 1, 0,
+                stream, (IntPtr)a, IntPtr.Zero).ThrowOnError();
+            void** combine = stackalloc void*[] { &partial, &splits, &d, &output };
+            CudaDriverApi.cuLaunchKernel(_ringAttnCombine, (uint)(lanes * rows * heads), 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)combine, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Weight rows of a tile of the tiled Q6_K head layout, and rows of activations one product takes at most.</summary>

@@ -249,6 +249,9 @@ public sealed class BatchedBlockDraftTests : IDisposable
         // Where the executor replays its plans, the lanes' kept steps advance (their rings' rows, masks and anchors refilled).
         if (together.GraphExecutorForTests.Capabilities.Replays)
             Assert.True(together.DraftAdvances > 0, $"{label}: no lanes step advanced");
+        // Direct CUDA attends every lane's ring in one launch.
+        if (together.GraphExecutorForTests is TensorSharp.Cuda.CudaGraphExecutor cuda)
+            Assert.True(cuda.RingAttentionLaneRegions > 0, $"{label}: no lanes block attended its rings in one launch");
     }
 
     /// <summary>

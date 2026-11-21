@@ -3231,7 +3231,7 @@ template <int HD>
 __device__ __forceinline__ void ts_graph_ring_attn(
     const float* __restrict__ q, long long qRow, long long qHead, const float* __restrict__ k, const float* __restrict__ v, int len,
     const void* __restrict__ mask, int maskHalf, long long maskRow, int nq, int heads, int kvHeads, float scale, int chunk, int splits,
-    float* __restrict__ partial)
+    float* __restrict__ partial, const int split, const int kvh, const int tile)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int ROW = HD + 8;          // F16 row stride of the K / V tiles: ldmatrix's eight rows hit distinct banks
@@ -3240,13 +3240,12 @@ __device__ __forceinline__ void ts_graph_ring_attn(
     __shared__ __align__(16) __half ks[TS_RING_KT * ROW];
     __shared__ __align__(16) __half vs[TS_RING_KT * ROW];
     __shared__ float ms[64][TS_RING_KT + 1];   // the mask for the tile's block rows and keys, in log2 units
-    const int split = blockIdx.x, kvh = blockIdx.y;
     const int G = heads / kvHeads, R = nq * G;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
     const int kLo = split * chunk, kHi = min(len, kLo + chunk);
     const float* kh = k + (long long)kvh * len * HD;
     const float* vh = v + (long long)kvh * len * HD;
-    const int tile0 = blockIdx.z * 64, p0 = tile0 / G;
+    const int tile0 = tile * 64, p0 = tile0 / G;
     const int pn = min(R - 1, tile0 + 63) / G - p0 + 1;   // block rows the tile's rows span (at most 64)
 
     const int r0 = tile0 + warp * 16 + g, r1 = r0 + 8;
@@ -3417,7 +3416,7 @@ __device__ __forceinline__ void ts_graph_ring_attn(
         int chunk, int splits, float* __restrict__ partial)                                                                        \
     {                                                                                                                              \
         ts_graph_ring_attn<HD>(q, qRow, qHead, k, v, len, mask, maskHalf, maskRow, nq, heads, kvHeads, scale, chunk, splits,       \
-            partial);                                                                                                              \
+            partial, blockIdx.x, blockIdx.y, blockIdx.z);                                                                          \
     }
 
 TS_GRAPH_RING_ATTN(64)
@@ -3686,3 +3685,32 @@ extern "C" __global__ void ts_graph_gated_delta_net_scan4_seqs_kda_f32(const ts_
 {
     ts_graph_gdn_scan4_seq<true>(a, S, h, hk, n_t, save_rows);
 }
+
+// Several block drafter lanes' ring attentions in one launch (GraphFusion.RingAttentionLanes: several requests' blocks drafted
+// in one program, each lane's rows over its own ring under its own mask): lane z / tiles is ts_graph_ring_attn_f16_d<hd> over
+// its pointers (by value), its partials at partial + lane * nq * heads * splits * (HD + 2), so ts_graph_ring_attn_combine_f32
+// over lanes * nq * heads rows merges every lane's at once. Every lane's values are its own launch's. Launch: grid (splits,
+// kvHeads, lanes * tiles), block 128 (tiles = ceil(nq * heads / kvHeads / 64)).
+#define TS_GRAPH_RING_LANES 16
+
+struct ts_graph_ring_lanes
+{
+    const float* q[TS_GRAPH_RING_LANES];
+    const float* k[TS_GRAPH_RING_LANES];
+    const float* v[TS_GRAPH_RING_LANES];
+    const void* mask[TS_GRAPH_RING_LANES];
+};
+
+#define TS_GRAPH_RING_ATTN_LANES(HD)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(128) ts_graph_ring_attn_lanes_f16_d##HD(                                          \
+        const ts_graph_ring_lanes a, long long qRow, long long qHead, int len, int maskHalf, long long maskRow, int nq, int heads,  \
+        int kvHeads, float scale, int chunk, int splits, int tiles, float* __restrict__ partial)                                   \
+    {                                                                                                                              \
+        const int lane = blockIdx.z / tiles;                                                                                       \
+        ts_graph_ring_attn<HD>(a.q[lane], qRow, qHead, a.k[lane], a.v[lane], len, a.mask[lane], maskHalf, maskRow, nq, heads,      \
+            kvHeads, scale, chunk, splits, partial + (long long)lane * nq * heads * splits * (HD + 2), blockIdx.x, blockIdx.y,      \
+            blockIdx.z % tiles);                                                                                                   \
+    }
+
+TS_GRAPH_RING_ATTN_LANES(64)
+TS_GRAPH_RING_ATTN_LANES(128)

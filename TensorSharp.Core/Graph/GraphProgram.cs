@@ -336,6 +336,11 @@ namespace TensorSharp.Graph
         /// sequence order. Ip: the sequences, then each one's saved-input rows. Results: each sequence's op result, in order.
         /// An executor may run every sequence's scan in one dispatch; each sequence's values are its op's.</summary>
         DeltaNetScans = 25,
+        /// <summary>Several block drafter lanes' attentions (several requests' blocks drafted in one program, each lane's rows
+        /// over its own KV ring under its own mask): the lanes' FlashAttention ops and the concatenation of their results along
+        /// the rows. Inputs: per lane its op's q, K, V and mask, in lane order. Ip: the lanes. Fp: the scale. Result: the lanes'
+        /// attentions [d, heads, lanes * rows]. An executor may run every lane's in one dispatch; each lane's values are its op's.</summary>
+        RingAttentionLanes = 26,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
