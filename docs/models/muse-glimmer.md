@@ -87,7 +87,9 @@ evidence are in [docs/design/muse-glimmer-unified.md](../design/muse-glimmer-uni
   confidence gate on ggml_metal, the drafter's whole block on MLX), and n-gram without any drafter.
 * **Memory:** the 39 sliding-window layers keep rings of 2560 cells (window 2048 plus a 512-row prompt step), where legacy
   kept 4352 rows; prompt steps carry at most 512 rows a sequence. On MLX the steps carry 1024 rows over 3072-cell rings:
-  prefill 5.0-5.4% faster at 4K-16K, decode unchanged, peak wired still under legacy's.
+  prefill 5.0-5.4% faster at 4K-16K, decode unchanged, peak wired still under legacy's. So do they on direct CUDA (one
+  GPU): prefill 1.25x at 4K and 1.22x at 16K (UD-IQ2_XXS; 1.26x / 1.23x on UD-Q4_K_XL), decode unchanged, every scenario's
+  peak VRAM within legacy's +5% (a server holding a 4K prompt the closest, +2.9-4.7%).
 
 Measured on an M5 Pro (48 GB), UD-IQ2_XXS unless noted, the runtime against the legacy model in one binary (ABBA):
 
@@ -798,7 +800,7 @@ instead (the probe `eng/validation/MuseGlimmerKvGrowProbe` and `TS_GGML_NODE_PRO
 
 | Variable | Effect |
 |---|---|
-| `TS_PREFILL_CHUNK` | Prompt chunk size for `ForwardRefill` (default 2048); a chunk still runs in prompt steps of at most 512 rows a sequence on the sliding-window rings (1024 on MLX) |
+| `TS_PREFILL_CHUNK` | Prompt chunk size for `ForwardRefill` (default 2048); a chunk still runs in prompt steps of at most 512 rows a sequence on the sliding-window rings (1024 on MLX and direct CUDA) |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` | MLX layer-boundary `async_eval` cadence (the runtime's default) |
 | `TS_DFLASH_*` | the shared DFlash drafter's knobs (see [speculative decoding](../speculative_decoding.md)) |
 | `TS_KV_FATTN_COPY` | `0` = never materialize a padded KV window (reproduces the ggml-cuda flash-attention **vec** fault); `force` = always materialize it |

@@ -1115,6 +1115,47 @@ legacy's continuations 5/6 (the sixth a near-tie, as before), perplexity +0.0001
 near-tie (together), a checkpoint past the 3,072-cell rings' lap continuing exactly (the test's prefix moved from 3,000 to
 3,500 positions to pass either ring), and the synthetic family classes on the metal pin (440 passed). ggml_metal keeps 512.
 
+**Direct CUDA prompt step width, after S9 (a DEFAULT CHANGE): 1024 rows.** The same rule, with memory held per scenario: no
+scenario's peak above legacy's +5% (S7's bound), the server included. RTX PRO 4500 Blackwell (32 GB, driver 595.112.07,
+CUDA 13.2); the probe's bench ABBA in one binary on 81bbd0d2 (512 rows as A, the width as B; 2048 also on c593f324's
+content), each arm its own process under the box's GPU lock with the page cache evicted, the arm's own process's peak VRAM;
+the CLI (one request a process) and the server (serve-speed's short x 512 and 4K x 256, cold and warm; GPU-wide peak under
+the lock) at each width's default; legacy's from its own arms on c012af49:
+
+| | 512 rows | 1024 rows | 2048 rows | legacy |
+|---|---|---|---|---|
+| prefill 4K / 16K, UD-IQ2_XXS (B / A) | 1.0 | **1.249 / 1.219** | 1.392 / 1.320 | |
+| prefill 4K / 16K, UD-Q4_K_XL | 1.0 | **1.258 / 1.225** | 1.398 / 1.318 | |
+| decode 4K / 16K (IQ2_XXS; Q4_K_XL) | 1.0 | 1.001 / 0.995; 1.003 / 1.004 | 0.999 / 0.999; 0.994 / 1.008 | |
+| probe peak MiB 4K / 16K, IQ2_XXS | 12,006 / 12,474 | 12,502 / 12,970 | 12,854 / 13,322 | 14,794 / 20,554 |
+| probe peak MiB 4K / 16K, Q4_K_XL | 17,658 / 18,126 | 18,152 / 18,620 | 18,506 / 18,974 | 20,434 / 28,434 |
+| CLI 93-token prompt, IQ2_XXS; Q4_K_XL | 11,814; 17,466 | 11,814; 17,466 | 11,814; 17,466 | 11,386; 17,026 |
+| CLI 4,142-token prompt | 12,772; 18,426 | 13,278; 18,914 | 13,634; 18,702-19,290 | 14,990; 20,630 |
+| CLI 4K time to first token, ms | 4,062, 4,120; 3,994, 4,043 | 3,383; 3,446 | 3,072, 3,072; 3,146, 3,150 | 52,560; 54,166 |
+| server peak, IQ2_XXS; Q4_K_XL | 15,362-15,372; 20,938-21,042 | **15,816; 21,520** | 16,232; 21,926 | 15,106-15,369; 20,746 |
+| server 4K time to first token, ms | 3,884-4,033; 3,834-3,966 | 3,193-3,367; 3,143-3,382 | 2,921-3,051; 2,889-3,026 | 48,172-51,389; 51,743-58,620 |
+
+2048 rows' server peak is 5.6-7.5% over legacy's. TS_CUDA_LOG_VRAM=1 accounts for the 870 MiB it adds over 512 rows at the
+same point:
+* The pool's cached large blocks grow by 795 MiB, to 1,566. These are the prompt step's activations, kept for the next
+  step: the fused gate/up product (312 MiB, against 78), a 256 MiB attention buffer, the GLU output (156, against 39),
+  five hidden-size tensors (52 each, against 13) and five query-size tensors (32 each, against 8).
+* Every kept conversation past 2,560 positions holds a ring 1,536 cells longer: 59 MiB more, 351-409 MiB over this run's
+  six or seven.
+No one buffer comes near the 0.4 GB that would bring 2048 within +5%. Splitting the FFN's rows would change the cuBLAS GEMMs'
+shapes, and so their bits. 1024 rows meet the bound everywhere: the server is the closest, at +2.9-4.7% (IQ2_XXS) and
++3.7% (Q4_K_XL). They are taken: `MuseGlimmerRuntimeModel.CudaRingStepRows`, one device only; placements over several
+devices keep the shared rule. The gates at 1024 rows on 81bbd0d2 (with the faster F32 rows): llama.cpp 636/640 and 128/128
+(first position 0.0805 / 0.0809), images 212/216 (mean 0.1178, p50 0.0879, p90 0.2404 against 0.1370 / 0.0995 / 0.2865),
+perplexity -0.0171%, DFlash lossless 3/3, the growth paths and a checkpoint past the 3,072-cell rings' lap exact, and the
+synthetic family classes on the cuda pin (215 passed, 20 not run: other pins, two GPUs). The CLI's and the server's 1024- and
+512-row arms ran on c593f324's content and the 2048-row server on 81bbd0d2: 1bbce008 changes no prompt step. Legacy's
+greedy continuations give 4/6 on 81bbd0d2 at any width, refrigerator leaving at a 0.228-nat margin; the tie rule is being
+re-based on an F32 reference, so that test is left out here.
+
+ggml_vulkan keeps 512. 2048 rows prefilled 1.067-1.085x there (three rounds), but moved the 4,664-token prompt's first
+position 0.2211 nat from legacy's frozen one, past MuseGlimmerParityTests' 0.15 (0.1350 at 512 rows).
+
 
 ---
 

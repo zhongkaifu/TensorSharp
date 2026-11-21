@@ -98,8 +98,8 @@ public sealed class MuseGlimmerRuntimeKvTests(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// A checkpoint taken past the rings' first lap (3,500 positions; the rings are 2,560 cells, 3,072 on MLX, whose prompt steps
-    /// carry 1,024 rows), cloned into a new request's slot, and written to
+    /// A checkpoint taken past the rings' first lap (3,500 positions; the rings are 2,560 cells, 3,072 on MLX and direct CUDA,
+    /// whose prompt steps carry 1,024 rows), cloned into a new request's slot, and written to
     /// a checkpoint file another model instance reads back and clones: both continue as the live cache does, logit for logit,
     /// for 8 tokens. The legacy test restored 256-token blocks, below the ring and past it.
     /// </summary>

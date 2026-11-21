@@ -164,7 +164,26 @@ namespace TensorSharp.Models
         /// </summary>
         internal const int MlxRingStepRows = 1024;
 
-        protected override int RingStepRowsForPlacement => _backend == BackendType.Mlx ? MlxRingStepRows : base.RingStepRowsForPlacement;
+        /// <summary>
+        /// The rows a prompt step writes into a sliding-window ring on direct CUDA, one device: 1024 (3072-cell rings). The
+        /// executor's prompt-size products of the 30B's IQ2, IQ3 and Q4_K weights dequantize each weight to F16 once a call for
+        /// a cuBLAS GEMM, a cost a step pays whatever its rows, so a prompt in 1024-row steps pays it half as often. Measured on
+        /// an RTX PRO 4500 Blackwell (32 GB), against 512 rows (docs/design/muse-glimmer-unified.md §5.8): the probe's prefill
+        /// 1.25x at 4K and 1.22x at 16K (UD-IQ2_XXS; 1.26x / 1.23x on UD-Q4_K_XL), decode 0.995-1.004x; time to first token at
+        /// 4K 0.82-0.86x in the CLI and the server. Every scenario's peak VRAM within legacy's +5% (S7's bound): the server holding
+        /// a 4K prompt 15,816 MiB against legacy's 15,106-15,369 and 21,520 against 20,746, the CLI and the probe under
+        /// legacy's. 2048 rows prefilled 1.39x / 1.32x but its server peaked 5.6-7.5% over legacy's: the step's activations
+        /// (about 0.8 GB more, held in the pool's cache after the step) and 59 MiB more ring a kept 4K conversation. Placements
+        /// over several devices keep the shared rule (two GPUs were not measured); ggml_cuda and ggml_vulkan keep 512.
+        /// </summary>
+        internal const int CudaRingStepRows = 1024;
+
+        protected override int RingStepRowsForPlacement => _backend switch
+        {
+            BackendType.Mlx => MlxRingStepRows,
+            BackendType.Cuda when Mesh.Stages == 1 && Mesh.TensorParallel == 1 => CudaRingStepRows,
+            _ => base.RingStepRowsForPlacement,
+        };
 
         /// <summary>
         /// The default draft window, by the trunk's verify economics. Measured on an M5 Pro (UD-IQ2_XXS, the 1.63 GB dflash-kquant

@@ -67,7 +67,9 @@ Muse-Glimmer 运行在[共享解码运行时](../design/unified-execution.md)上
   不设置置信门限，MLX 上起草整个块），以及无需草稿模型的 n-gram。
 * **内存：** 39 个滑动窗口层保留 2560 个单元的环（窗口 2048 加一个 512 行的提示步），旧实现为 4352 行；
   每个序列的提示步最多 512 行。MLX 上提示步为 1024 行、环为 3072 个单元：4K-16K 的 prefill 快 5.0-5.4%，解码不变，
-  峰值 wired 内存仍低于旧实现。
+  峰值 wired 内存仍低于旧实现。直接 CUDA（单 GPU）上同样如此：4K / 16K 的 prefill 为原来的 1.25 / 1.22 倍
+  （UD-IQ2_XXS；UD-Q4_K_XL 为 1.26 / 1.23 倍），解码不变，各场景的峰值显存不超过旧实现的 +5%
+  （最接近的是处理 4K 提示的服务器，+2.9-4.7%）。
 
 在 M5 Pro（48 GB）上的测量（除注明外为 UD-IQ2_XXS，运行时与旧模型在同一个二进制中 ABBA 对比；括号内为旧模型）：
 
@@ -652,7 +654,7 @@ DFlash 投机解码只走单卡路径：`--tp N` > 1 下配置的草稿模型会
 
 | 变量 | 作用 |
 |---|---|
-| `TS_PREFILL_CHUNK` | `ForwardRefill` 的提示分块大小（默认 2048）；滑动窗口环上的一个分块仍按每序列最多 512 行的提示步运行（MLX 上为 1024 行） |
+| `TS_PREFILL_CHUNK` | `ForwardRefill` 的提示分块大小（默认 2048）；滑动窗口环上的一个分块仍按每序列最多 512 行的提示步运行（MLX 与直接 CUDA 上为 1024 行） |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` | MLX 层边界 `async_eval` 的间隔（运行时默认值） |
 | `TS_DFLASH_*` | 共享 DFlash 草稿器的参数（见[投机解码](../speculative_decoding.md)） |
 | `TS_KV_FATTN_COPY` | `0` = 从不物化填充后的 KV 窗口（会复现 ggml-cuda flash-attention **vec** 故障）；`force` = 总是物化 |
