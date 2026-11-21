@@ -402,13 +402,14 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     [MuseGlimmerVisionFact(TowerOnly = BackendType.Cuda)]
     public void TheGraphTowerGivesTheLegacyTowersRowsOnDirectCuda() => CompareTowers(BackendType.Cuda);
 
-    /// <summary>On the quantized-product lanes (ggml_cuda, ggml_vulkan), each picture's 1 - cosine between the graph tower's rows
-    /// and the F32 tower's (<see cref="MuseGlimmerLegacyVision.F32Tower"/>) may be at most this many times the legacy tower's,
-    /// frozen on the lane. Both towers' products quantize the activations there: measured on an RTX PRO 4500 Blackwell, each sits
-    /// at 1 - cosine 6e-5 to 1.7e-3 from the F32 tower on ggml_vulkan and 8e-4 to 4.7e-3 on ggml_cuda, and from each other at up
-    /// to 3.9e-4 on ggml_vulkan, where legacy's per-op tower and the graph tower round independently. There the graph tower's
-    /// distance is 0.74-1.67x legacy's picture by picture and 1.00x summed over the nine; on ggml_cuda, where the two share
-    /// their rounding, 1.00x on every picture.</summary>
+    /// <summary>On the quantized-product lanes (ggml_cuda, ggml_vulkan), the graph tower's 1 - cosine to the F32 tower's rows
+    /// (<see cref="MuseGlimmerLegacyVision.F32Tower"/>), summed over the pictures, may be at most this many times the legacy
+    /// tower's sum, frozen on the lane; each picture's ratio is logged. Both towers' products quantize the activations there:
+    /// measured on an RTX PRO 4500 Blackwell, each sits at 1 - cosine 6e-5 to 1.7e-3 from the F32 tower on ggml_vulkan and 8e-4
+    /// to 4.7e-3 on ggml_cuda, and from each other at up to 3.9e-4 on ggml_vulkan, where legacy's per-op tower and the graph
+    /// tower round independently. There the graph tower's distance is 0.74-1.67x legacy's picture by picture (the ratio of two
+    /// independent roundings at 1e-4) and 1.00x summed over the nine; on ggml_cuda, where the two share their rounding, 1.00x on
+    /// every picture. The sum is the same rule on both lanes.</summary>
     private const double F32DistanceRatio = 1.25;
 
     /// <summary>Direct CUDA's tower multiplies F32 copies of its weights' values: it is held to the managed executor's F32 tower
@@ -437,8 +438,10 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         using (reference)
         {
             output.WriteLine($"{backend}: graph tower on {tower.Graph.Executor.GetType().Name}" + (reference == null ? "; held to the legacy tower"
-                : quantized ? $"; held to {F32DistanceRatio}x the legacy tower's frozen distance to {referenceName}" : $"; held to {referenceName}"));
+                : quantized ? $"; held to {F32DistanceRatio}x the legacy tower's frozen distance to {referenceName}, summed over the pictures" : $"; held to {referenceName}"));
             var failures = new List<string>();
+            double graphSum = 0, legacySum = 0;
+            int summed = 0;
             foreach (var (name, px, w, h) in Pictures(tower.ImageProcessor))
             {
                 var sw = Stopwatch.StartNew();
@@ -467,9 +470,18 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
                 }
                 Assert.True(frozen.RowsOneMinusCos.TryGetValue(name, out double legacyFrozen), $"{name}: no frozen legacy figure");
                 output.WriteLine($"    1 - cosine to the F32 tower: graph {graph:E3} (worst row {fWorst:F6}), legacy {legacyNow:E3} now, {legacyFrozen:E3} frozen " +
-                    $"({graph / legacyFrozen:F2}x, bound {F32DistanceRatio}x)");
-                if (graph > F32DistanceRatio * legacyFrozen)
-                    failures.Add($"{name}: 1 - cosine to the F32 tower {graph:E3} > {F32DistanceRatio} x legacy's {legacyFrozen:E3}");
+                    $"({graph / legacyFrozen:F2}x, logged)");
+                graphSum += graph;
+                legacySum += legacyFrozen;
+                summed++;
+            }
+            if (quantized)
+            {
+                Assert.Equal(frozen.RowsOneMinusCos.Count, summed);
+                output.WriteLine($"  summed over the {summed} pictures: graph {graphSum:E3}, legacy frozen {legacySum:E3} " +
+                    $"({graphSum / legacySum:F2}x, bound {F32DistanceRatio}x)");
+                if (graphSum > F32DistanceRatio * legacySum)
+                    failures.Add($"1 - cosine to the F32 tower summed over the pictures {graphSum:E3} > {F32DistanceRatio} x legacy's {legacySum:E3}");
             }
 
             // A large image as one program and as programs over layer ranges (what a caller that yields the GPU lock gets):

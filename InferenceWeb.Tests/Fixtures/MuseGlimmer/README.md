@@ -120,13 +120,16 @@ IQ2_XXS model and the Q8_0 mmproj:
 How `MuseGlimmerVisionParityTests` uses them:
 * ggml_cuda and ggml_vulkan (their products quantize the activations): the runtime family's argmax agreement with the
   lane's set is at least legacy's frozen agreement minus one percentage point, and every parting is logged with both
-  engines' margins. Each picture's 1 - cosine between the graph tower's rows and the F32 tower's is at most 1.25x
-  legacy's frozen figure.
+  engines' margins. The graph tower's 1 - cosine to the F32 tower's rows, summed over the nine pictures, is at most 1.25x
+  legacy's frozen sum; each picture's ratio is logged. Per picture the ratio is that of two independent roundings at
+  1e-4 on ggml_vulkan (0.74-1.67x measured, 1.00x summed), so it is not held.
 * direct CUDA (float activations; the Metal set): argmax agreement at least 97%, and the top-k |dlogprob| distribution's
-  mean, p50 and p90 no more than 10% past legacy's frozen ones; the p99 and max, and every parting, are logged. One
-  position there (wide-describe @32) flips with 1e-5 changes of the rows, and the tail is a few positions of a picture past
-  the position table, which moves 20% with such changes (`ImageRuleOf`). The graph tower's rows are held to cosine 0.99999
-  against the managed executor's F32 tower.
+  mean, p50 and p90 no more than 10% past legacy's frozen ones; the p99 and max, and every parting, are logged. The tail is
+  not held because it is noise at this size: over 216 positions p99 is the third-largest value, the largest values are the
+  same few positions of the picture past the position table for every family and tower, and legacy's own p99 moves 20%
+  (0.458 to 0.548) when it is given the graph tower's rows, 1.3e-5 from its own. One position (wide-describe @32) flips
+  with such changes too (`ImageRuleOf`). The graph tower's rows are held, picture by picture, to cosine 0.99999 against
+  the managed executor's F32 tower.
 * ggml_metal, MLX and the CPU lanes keep the near-tie rule (97%, every parting a near-tie).
 
 A lane with no file fails and names the file to write. To refreeze a lane, give the writer the set's folder (the
