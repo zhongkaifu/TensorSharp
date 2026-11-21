@@ -1410,6 +1410,22 @@ the same pins):
 | prompt reuse, follow-up / new chat | 99.7% / 99.6% | 99.8% / 66% |
 | app footprint at its highest, beside the weights | 8.8 GB beside 17.6 GB | 10.9 GB beside 15.9 GB |
 
+On 2026-11-21 Muse-Glimmer moved to the shared decoder runtime (`MuseGlimmerRuntimeModel`). The same entry and files, the
+entry's own settings (KV q8_0, speculation off), `chat-e2e.py`'s seven scenarios in the Mac app, the runtime against the
+legacy model built from the commit before the switch, in one session:
+
+| Muse-Glimmer 30B (UD-Q4_K_XL) | runtime | legacy |
+| --- | --- | --- |
+| `chat-e2e.py` | 7 of 7 | 7 of 7 |
+| decode in the app (the 449-token story) | 17.0 tok/s | 17.1 tok/s |
+| new chat: prompt reuse, time to the first token | 99.7%, 0.83 s | 62.3% (the legacy ring's 4,352-token cap), 8.20 s |
+| image turn: time to the first token | 6.8 s | 35.1 s |
+| app footprint after loading / at its highest, beside the weights | 12.2 / 13.4 GB | 11.5 / 12.7 GB |
+| system wired at its highest (memguard) | 22.5 GB | 26.6 GB |
+
+With speculation on (the drafter loaded) the runtime's tool turns decoded at 34-40 tok/s and the story at 15.6 tok/s (the
+cost governor parks the drafter on prose).
+
 On 2026-11-05 the Qwen3.8 27B entry moved to the files of
 [`qwen3.8-27b-metal-dflash2.json`](../config/qwen3.8-27b-metal-dflash2.json): UD-IQ3_XXS
 (10.9 GB), the BF16 projector and the DFlash2 Q4_K_M drafter. The app runs that drafter with
