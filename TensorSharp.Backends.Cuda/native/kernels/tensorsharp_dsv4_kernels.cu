@@ -5098,6 +5098,162 @@ extern "C" __global__ void ts_dsv4_dense_q81_rows_multi_f32(
     }
 }
 
+// A decode-size dense projection over F32 activations, for the IQ3 formats (IQ3_XXS, IQ3_S): up to 16 activation rows in
+// one call, the weights read once a call. The q8_1 kernels above round the activations to 8 bits first. On Muse-Glimmer-30B's
+// UD-IQ2_XXS (FFN down in IQ3_XXS, attention output in IQ3_S) that moved the direct-CUDA image prompts' top-k log-probabilities
+// from llama.cpp's by 23% (mean 0.1163 -> 0.1432 nat), past the gate's bound, where the IQ2 formats' q8_1 rows changed
+// nothing measured.
+//
+// Each warp computes TS_DSV4_F32_ROWS_OUT consecutive output rows, eight warps a block. A lane owns the row's 32-value units
+// lane, lane + 32, ... in that order and decodes each once for each of its output rows (ts_dsv4_decode_sub_grouped: int8
+// grid values and the two 16-value halves' scales, as ggml's dequantize_row_iq3_xxs / _iq3_s), then dots each half against
+// every activation row: a sum of the 16 products in order, times the half's scale, added to that row's running sum;
+// ts_dsv4_warp_sum ends it. No step depends on how many rows the call holds, so the one-row call and every row of a longer
+// call give the same bits (a verify window's rows are the decode step's). The block stages each 1024-value tile of every
+// activation row in shared memory once for its 16 output rows: read from L1 and L2 by each warp, the activations had cost
+// 85 us a row of a 19968 -> 6656 projection against 53 us for the q8_1 kernel's whole one-row call (RTX PRO 4500 Blackwell).
+#define TS_DSV4_F32_ROWS_MAX 16
+#define TS_DSV4_F32_ROWS_OUT 2
+// A tile of 32 units (1024 values) of every activation row, staged in shared memory: a unit's 32 floats at a stride of 36,
+// so the 8 lanes of each quarter-warp phase of a 16-byte shared load read 32 distinct banks.
+#define TS_DSV4_F32_ROWS_TILE_UNITS 32
+#define TS_DSV4_F32_ROWS_UNIT_STRIDE 36
+#define TS_DSV4_F32_ROWS_TILE_FLOATS (TS_DSV4_F32_ROWS_TILE_UNITS * TS_DSV4_F32_ROWS_UNIT_STRIDE)
+
+// The body for calls of up to MAXR rows; one kernel per MAXR (1, 2, 4, 8, 16) keeps a short call's accumulators, and so its
+// registers, small. A row's arithmetic is the same in every instantiation (the same decode, the same FMA chain in the same
+// order), so a row's bits do not depend on which kernel ran it either.
+template <int MAXR>
+__device__ __forceinline__ void ts_dsv4_dense_f32_rows_body(
+    const uint8_t* __restrict__ w,      // [outDim, inDim] rows of rowBytes
+    const float* __restrict__ x,        // [rows, inDim] F32, 16-byte aligned rows
+    float* __restrict__ out,            // [rows, outDim]
+    const int wtype,
+    const int outDim,
+    const int inDim,
+    const long long rowBytes,
+    const int rows)
+{
+    // A tile of TILE units of every row: 128 at one row, 64 at two, 32 past that (18 KB a block up to 4 rows), so a short
+    // call takes few tiles (the tile loop's loads and barriers are what a one-row call waits on).
+    constexpr int TILE = MAXR == 1 ? 128 : MAXR == 2 ? 64 : TS_DSV4_F32_ROWS_TILE_UNITS;
+    constexpr int TILE_FLOATS = TILE * TS_DSV4_F32_ROWS_UNIT_STRIDE;
+    extern __shared__ float xs[];       // [rows][TILE_FLOATS]
+    const int lane = threadIdx.x & 31;
+    const int o0 = (blockIdx.x * 8 + (threadIdx.x >> 5)) * TS_DSV4_F32_ROWS_OUT;
+    // Every thread stays for the tile loads and barriers; a warp past the last output row only loads.
+    const int nOut = o0 < outDim ? min(TS_DSV4_F32_ROWS_OUT, outDim - o0) : 0;
+    const int nRows = min(rows, MAXR);
+    float acc[TS_DSV4_F32_ROWS_OUT][MAXR];
+#pragma unroll
+    for (int o = 0; o < TS_DSV4_F32_ROWS_OUT; ++o)
+#pragma unroll
+        for (int r = 0; r < MAXR; ++r)
+            acc[o][r] = 0.0f;
+
+    const int nUnits = inDim / 32;
+    for (int t0 = 0; t0 < nUnits; t0 += TILE)
+    {
+        const int tileUnits = min(TILE, nUnits - t0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nRows * tileUnits * 8; i += blockDim.x)
+        {
+            const int r = i / (tileUnits * 8), rem = i - r * tileUnits * 8, uu = rem >> 3, q = rem & 7;
+            *(float4*)(xs + r * TILE_FLOATS + uu * TS_DSV4_F32_ROWS_UNIT_STRIDE + 4 * q)
+                = *(const float4*)(x + (size_t)r * inDim + (size_t)(t0 + uu) * 32 + 4 * q);
+        }
+        __syncthreads();
+        if (nOut == 0)
+            continue;
+        // The lane's units of the tile in order: over the tiles, units lane, lane + 32, ... of the row.
+        for (int uu = lane; uu < tileUnits; uu += 32)
+        {
+        const int u = t0 + uu;
+        int w8[TS_DSV4_F32_ROWS_OUT][8];
+        float sc[TS_DSV4_F32_ROWS_OUT][2];
+#pragma unroll
+        for (int o = 0; o < TS_DSV4_F32_ROWS_OUT; ++o)
+        {
+            float mnLo, mnHi;
+            if (o < nOut)
+                ts_dsv4_decode_sub_grouped(w + (size_t)(o0 + o) * rowBytes, wtype, u, w8[o], &sc[o][0], &sc[o][1], &mnLo, &mnHi);
+            else
+            {
+#pragma unroll
+                for (int k = 0; k < 8; ++k)
+                    w8[o][k] = 0;
+                sc[o][0] = sc[o][1] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            float wf[TS_DSV4_F32_ROWS_OUT][16];
+#pragma unroll
+            for (int o = 0; o < TS_DSV4_F32_ROWS_OUT; ++o)
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                {
+                    // The four signed bytes as floats, exactly: each byte biased to unsigned (xor 0x80) and set under the
+                    // exponent of 2^23, the bias taken off in one subtraction. The integer-to-float conversions this
+                    // replaces run at a quarter of the rate or less.
+                    const unsigned v = (unsigned)w8[o][4 * h + k] ^ 0x80808080u;
+                    wf[o][4 * k + 0] = __uint_as_float(__byte_perm(v, 0x4B000000u, 0x7650)) - 8388736.0f;
+                    wf[o][4 * k + 1] = __uint_as_float(__byte_perm(v, 0x4B000000u, 0x7651)) - 8388736.0f;
+                    wf[o][4 * k + 2] = __uint_as_float(__byte_perm(v, 0x4B000000u, 0x7652)) - 8388736.0f;
+                    wf[o][4 * k + 3] = __uint_as_float(__byte_perm(v, 0x4B000000u, 0x7653)) - 8388736.0f;
+                }
+#pragma unroll
+            for (int r = 0; r < MAXR; ++r)
+            {
+                if (r >= nRows)
+                    break;
+                const float4* xr = (const float4*)(xs + r * TILE_FLOATS + uu * TS_DSV4_F32_ROWS_UNIT_STRIDE + 16 * h);
+                const float4 a0 = xr[0], a1 = xr[1], a2 = xr[2], a3 = xr[3];
+                const float xv[16] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w,
+                                       a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w };
+#pragma unroll
+                for (int o = 0; o < TS_DSV4_F32_ROWS_OUT; ++o)
+                {
+                    float p = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < 16; ++k)
+                        p = fmaf(wf[o][k], xv[k], p);
+                    acc[o][r] = fmaf(sc[o][h], p, acc[o][r]);
+                }
+            }
+        }
+        }
+    }
+    if (nOut == 0)
+        return;
+#pragma unroll
+    for (int o = 0; o < TS_DSV4_F32_ROWS_OUT; ++o)
+#pragma unroll
+        for (int r = 0; r < MAXR; ++r)
+        {
+            if (r >= nRows)
+                break;
+            const float v = ts_dsv4_warp_sum(acc[o][r]);
+            if (lane == 0 && o < nOut)
+                out[(size_t)r * outDim + o0 + o] = v;
+        }
+}
+
+#define TS_DSV4_DENSE_F32_ROWS(R)                                                                                     \
+    extern "C" __global__ void __launch_bounds__(256) ts_dsv4_dense_f32_rows_r##R##_f32(                                  \
+        const uint8_t* __restrict__ w, const float* __restrict__ x, float* __restrict__ out, const int wtype,             \
+        const int outDim, const int inDim, const long long rowBytes, const int rows)                                    \
+    {                                                                                                                   \
+        TS_PDL_ENTRY();                                                                                                 \
+        ts_dsv4_dense_f32_rows_body<R>(w, x, out, wtype, outDim, inDim, rowBytes, rows);                                \
+    }
+TS_DSV4_DENSE_F32_ROWS(1)
+TS_DSV4_DENSE_F32_ROWS(2)
+TS_DSV4_DENSE_F32_ROWS(4)
+TS_DSV4_DENSE_F32_ROWS(8)
+TS_DSV4_DENSE_F32_ROWS(16)
+
 extern "C" __global__ void ts_dsv4_dense_q81_rows_f32(
     const uint8_t* __restrict__ w,               // [outDim, inDim] rows of rowBytes
     const ts_dsv4_block_q8_1* __restrict__ act,  // [rows, inDim / 32]
