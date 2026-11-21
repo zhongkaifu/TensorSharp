@@ -711,7 +711,7 @@ Muse-Glimmer that runs the fused kernel and the ring on any GPU lane),
   default chunk, which covers the engine's 16-token live-cache rewind. A deeper one is refused
   — `CanTruncateKVCache`/`TryTruncateKVCache` say no and the turn re-prefills,
   `TruncateKVCache` throws. An unwrapped ring, a uniform cache and a drop to 0
-  rewind to any depth, as before (`KvBlockTransferRingTests`).
+  rewind to any depth, as before (tests removed with the legacy model in S9).
 * **Prefix reuse across requests** goes through the Radix prefix cache (the
   default mode) as a page family: cached KV blocks plus the resident primary
   cache (`MuseGlimmerModel.PrefixCache.cs`). A rewind of the resident cache is

@@ -579,7 +579,7 @@ DFlash prefill 塌了 4.4 倍；这个提示停在文档中间，因此续写比
   2303 个 token，覆盖引擎 16 token 的 live-cache 回退。更深的回退会被拒绝——
   `CanTruncateKVCache`/`TryTruncateKVCache` 返回否，本轮改为重新 prefill，
   `TruncateKVCache` 抛异常。尚未回卷的环、统一尺寸的缓存以及回退到 0 仍可回退到任意深度
-  （`KvBlockTransferRingTests`）。
+  （相关测试已随旧模型在 S9 中删除）。
 * **跨请求的前缀复用**以分页家族的方式走 Radix 前缀缓存（默认模式）：缓存的 KV 块加上
   常驻的主缓存（`MuseGlimmerModel.PrefixCache.cs`）。常驻缓存的回退最多 16 个 token，
   并且还必须在上一条所说的环余量之内；带图像的提示不会复用其第一张图像起点之后的任何内容。
