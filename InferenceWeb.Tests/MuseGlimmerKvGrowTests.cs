@@ -124,7 +124,7 @@ public sealed class MuseGlimmerKvGrowTests : IDisposable
     {
         using var env = new EnvScope();
         env.Set("TS_KV_INITIAL_TOKENS", "1024");
-        using var model = ModelBase.Create(_path, TestGates.PinnedGgmlBackend);
+        using var model = MuseGlimmerArchitecture.CreateLegacyModel(_path, TestGates.PinnedGgmlBackend);
 
         int[] tokens = Tokens(2 * BlockSize + 1);
         int prefixLen = 2 * BlockSize;
@@ -161,7 +161,7 @@ public sealed class MuseGlimmerKvGrowTests : IDisposable
     {
         using var env = new EnvScope();
         env.Set("TS_KV_INITIAL_TOKENS", "512");
-        using var model = ModelBase.Create(_path, TestGates.PinnedGgmlBackend);
+        using var model = MuseGlimmerArchitecture.CreateLegacyModel(_path, TestGates.PinnedGgmlBackend);
 
         int[] tokens = Tokens(300);
 
@@ -188,7 +188,7 @@ public sealed class MuseGlimmerKvGrowTests : IDisposable
     {
         using var env = new EnvScope();
         env.Set("TS_KV_INITIAL_TOKENS", initialTokens);
-        using var model = ModelBase.Create(_path, TestGates.PinnedGgmlBackend);
+        using var model = MuseGlimmerArchitecture.CreateLegacyModel(_path, TestGates.PinnedGgmlBackend);
         model.ResetKVCache();
         var outputs = new List<float[]>(plan.Count);
         foreach (int[] chunk in plan)

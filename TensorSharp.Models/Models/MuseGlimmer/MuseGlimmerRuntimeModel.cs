@@ -30,8 +30,9 @@ namespace TensorSharp.Models
     /// <item>a dense SwiGLU feed-forward; the head (<c>output</c>, or <c>token_embd</c> tied) scaled by <c>logit_scale</c>, then a
     /// tanh softcap at <c>final_logit_softcapping</c> (<see cref="LogitScale"/>, <see cref="FinalLogitSoftcap"/>).</item>
     /// </list>
-    /// Until the switch (docs/design/muse-glimmer-unified.md stage S8) the descriptor builds the legacy model: this family is
-    /// reached through <see cref="MuseGlimmerArchitecture.CreateRuntimeModel"/> (tests, the probe, benchmarks) only.
+    /// The descriptor builds it (<see cref="MuseGlimmerArchitecture.Descriptor"/>, since stage S8 of docs/design/muse-glimmer-unified.md);
+    /// the legacy <see cref="MuseGlimmerModel"/> stays reachable through the oracle seam
+    /// <see cref="MuseGlimmerArchitecture.CreateLegacyModel"/> until stage S9 deletes it.
     /// </summary>
     internal sealed partial class MuseGlimmerRuntimeModel : StandardDecoderModel
     {

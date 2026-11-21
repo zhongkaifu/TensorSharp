@@ -649,14 +649,15 @@
         "image"
       ],
       "layout": "dense",
-      "notes": "ATEM tool protocol; DFlash needs separate matching drafter.",
+      "notes": "ATEM tool protocol; on the shared decoder runtime: DFlash with its matching drafter, n-gram without one.",
       "source_evidence": [
         "TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerArchitecture.cs",
         "docs/models/muse-glimmer.md"
       ],
       "configuration_status": "configured",
       "presets": [
-        "muse-glimmer-30b"
+        "muse-glimmer-30b",
+        "muse-glimmer-30b-iq2xxs"
       ]
     },
     {
@@ -3038,11 +3039,66 @@
       "status": "configured",
       "file_sizes": {
         "Muse-Glimmer-30B-UD-Q4_K_XL.gguf": 15878222368,
-        "mmproj-Muse-Glimmer-30B-Q8_0.gguf": 2051685088
+        "mmproj-Muse-Glimmer-30B-Q8_0.gguf": 2051685088,
+        "dflash-kquant.gguf": 1631205312
       },
       "notes": [
-        "Pinned model file identities verified from publisher metadata only; actual inference remains untested.",
-        "Matching DFlash exists separately; n-gram and learned draft coverage must stay distinct."
+        "Pinned model file identities verified from publisher metadata; the runtime family was validated on ggml_cuda, ggml_vulkan and direct CUDA with these files in the unified-runtime migration (docs/design/muse-glimmer-unified.md).",
+        "The pinned DFlash drafter engages by itself; n-gram (--spec --spec-type ngram) needs no drafter and must stay a distinct scenario."
+      ]
+    },
+    {
+      "id": "muse-glimmer-30b-iq2xxs",
+      "config": "config/muse-glimmer-30b-iq2xxs.json",
+      "kind": "text",
+      "family": "muse-glimmer",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "client_http_live",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/muse-glimmer-30b-iq2xxs.json",
+        "config/regression/source-pins.json",
+        "TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerArchitecture.cs",
+        "docs/models/muse-glimmer.md"
+      ],
+      "layout": "dense",
+      "status": "configured",
+      "file_sizes": {
+        "Muse-Glimmer-30B-UD-IQ2_XXS.gguf": 10746373152,
+        "mmproj-Muse-Glimmer-30B-Q8_0.gguf": 2051685088,
+        "dflash-kquant.gguf": 1631205312
+      },
+      "notes": [
+        "UD-IQ2_XXS: the quant validated on a 48 GB Mac (ggml_metal, MLX, ggml_cpu) and the cross-device anchor on CUDA in the unified-runtime migration (docs/design/muse-glimmer-unified.md).",
+        "The pinned DFlash drafter engages by itself; n-gram (--spec --spec-type ngram) needs no drafter and must stay a distinct scenario."
       ]
     },
     {

@@ -369,7 +369,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         BackendType backend = MuseGlimmerParity.Backend();
         var model = runtime
             ? MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft)
-            : ModelBase.Create(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft);
+            : MuseGlimmerArchitecture.CreateLegacyModel(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft);
         Assert.Equal("muse-glimmer", model.Config.Architecture);
         return model;
     }
@@ -746,7 +746,7 @@ public sealed class MuseGlimmerGoldenSetAffinityTests(ITestOutputHelper output)
     {
         BackendType backend = MuseGlimmerParity.Backend();
         string path = MuseGlimmerParity.FindModel();
-        using ModelBase model = runtime ? MuseGlimmerArchitecture.CreateRuntimeModel(path, backend) : ModelBase.Create(path, backend);
+        using ModelBase model = runtime ? MuseGlimmerArchitecture.CreateRuntimeModel(path, backend) : MuseGlimmerArchitecture.CreateLegacyModel(path, backend);
         var sets = MuseGlimmerParity.GoldenSets.ToDictionary(s => s, s => MuseGlimmerParity.Load(name, s));
         var sums = MuseGlimmerParity.GoldenSets.ToDictionary(s => s, _ => 0.0);
         var records = sets["metal"].Records;

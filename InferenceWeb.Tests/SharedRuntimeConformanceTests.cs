@@ -53,6 +53,8 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["qwen35"] = typeof(Qwen35RuntimeTests),
         // LFM3's short-conv layers rewind only to their length or to zero, as Qwen 3.5's recurrent layers do.
         ["lfm3"] = typeof(Lfm3RuntimeTests),
+        // Muse-Glimmer's sliding-window rings bound its rewinds (RingsKeepTruncation); its suites lap the rings on purpose.
+        ["muse-glimmer"] = typeof(MuseGlimmerRuntimeConformanceTests),
     };
 
     /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)

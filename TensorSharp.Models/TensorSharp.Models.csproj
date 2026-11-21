@@ -33,7 +33,6 @@
     <InternalsVisibleTo Include="Lfm3Probe" />
     <InternalsVisibleTo Include="LongContextQualityProbe" />
     <InternalsVisibleTo Include="MuseGlimmerKvGrowProbe" />
-    <InternalsVisibleTo Include="MuseGlimmerRuntimeHost" />
     <InternalsVisibleTo Include="MiniMaxH3ImageAB" />
   </ItemGroup>
   <ItemGroup>

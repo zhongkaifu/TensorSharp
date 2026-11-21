@@ -47,8 +47,9 @@ int topK = int.Parse(Option("--topk", "8"));
 int tp = int.Parse(Option("--tp", "1"));
 // --layer-split N: whole layers over N GPUs (the runtime family; legacy refuses it, as its serving contract says).
 int layerSplit = int.Parse(Option("--layer-split", "1"));
-// --family: "legacy" builds what the descriptor builds (MuseGlimmerModel until the switch, docs/design/muse-glimmer-unified.md
-// stage S8); "runtime" builds the unified-runtime family through its test seam (MuseGlimmerArchitecture.CreateRuntimeModel).
+// --family: "legacy" builds the legacy MuseGlimmerModel through its oracle seam (MuseGlimmerArchitecture.CreateLegacyModel,
+// until stage S9 of docs/design/muse-glimmer-unified.md deletes it); "runtime" builds the unified-runtime family, which the
+// descriptor builds since stage S8.
 string family = Option("--family", "legacy");
 // --scenario bench: the CLI's --benchmark (greedy, end to end) on either family in this binary: a prompt of
 // --bench-prefill tokens cycling 17 ids, then --bench-decode greedy one-row forwards, --bench-runs times.
@@ -77,6 +78,8 @@ if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
     throw new ArgumentException($"Unknown backend '{backendName}'.");
 
+if (family == "legacy" && layerSplit > 1)
+    throw new ArgumentException("--layer-split runs on the runtime family: legacy has no whole-layer placement.");
 if (family != "runtime" && (ringStepRows != null || gateUp != null || noPrune))
     throw new ArgumentException("--ring-step-rows, --gate-up and --no-prune set the runtime family's choices: pass --family runtime.");
 if (ringStepRows != null)
@@ -95,7 +98,7 @@ var load = Stopwatch.StartNew();
 // process exit if any buffer is still registered, as the server's ProcessExit hook knows.
 var model = family switch
 {
-    "legacy" => ModelBase.Create(modelPath, backend, tpDegree: tp, layerSplitDegree: layerSplit),
+    "legacy" => MuseGlimmerArchitecture.CreateLegacyModel(modelPath, backend, tpDegree: tp),
     "runtime" => MuseGlimmerArchitecture.CreateRuntimeModel(modelPath, backend, tpDegree: tp, layerSplitDegree: layerSplit),
     _ => throw new ArgumentException($"--family {family}: use legacy or runtime."),
 };

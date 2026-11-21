@@ -323,16 +323,17 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
         Assert.Contains("2 KV heads", e.Message, StringComparison.Ordinal);
     }
 
-    /// <summary>Until the switch (stage S8) the descriptor still builds the legacy model: the runtime family is the test seam's.</summary>
+    /// <summary>Since the switch (stage S8) the descriptor builds the runtime family; the legacy model is the oracle seam's only.</summary>
     [Fact]
-    public void TheDescriptorStillBuildsTheLegacyModel()
+    public void TheDescriptorBuildsTheRuntimeFamily()
     {
         Directory.CreateDirectory(_dir);
         string path = MuseGlimmerGoldens.WriteFixture("untied", _dir);
         using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
         using (ModelBase created = ModelBase.Create(path, BackendType.Cpu))
-            Assert.IsType<MuseGlimmerModel>(created);
-        using (ModelBase seam = MuseGlimmerArchitecture.CreateRuntimeModel(path, BackendType.Cpu))
-            Assert.IsType<MuseGlimmerRuntimeModel>(seam);
+            Assert.IsType<MuseGlimmerRuntimeModel>(created);
+        using (ModelBase oracle = MuseGlimmerArchitecture.CreateLegacyModel(path, BackendType.Cpu))
+            Assert.IsType<MuseGlimmerModel>(oracle);
+        Assert.Equal(TensorSharp.Models.Architecture.ServingImplementation.SharedRuntime, MuseGlimmerArchitecture.Descriptor.Serving.Implementation);
     }
 }

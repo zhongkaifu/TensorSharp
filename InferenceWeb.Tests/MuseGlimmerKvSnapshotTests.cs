@@ -83,7 +83,7 @@ public class MuseGlimmerKvSnapshotTests
 
         using var env = new EnvScope();
         env.Set("MAX_CONTEXT", "8192");
-        using var model = ModelBase.Create(modelPath, ResolveBackend());
+        using var model = MuseGlimmerArchitecture.CreateLegacyModel(modelPath, ResolveBackend());
 
         int cap = model.MaxReusablePrefixTokens;
         _output.WriteLine($"MaxReusablePrefixTokens = {cap}");
@@ -156,7 +156,7 @@ public class MuseGlimmerKvSnapshotTests
 
         using var env = new EnvScope();
         env.Set("MAX_CONTEXT", "8192");
-        using var model = ModelBase.Create(modelPath, ResolveBackend());
+        using var model = MuseGlimmerArchitecture.CreateLegacyModel(modelPath, ResolveBackend());
 
         // Stay inside the pooled cap: that is exactly the range the executor is
         // allowed to restore, and inside it no ring layer has wrapped.
@@ -229,7 +229,7 @@ public class MuseGlimmerKvSnapshotTests
 
         using var env = new EnvScope();
         env.Set("TS_KV_INITIAL_TOKENS", "2048");
-        using var model = ModelBase.Create(modelPath, ResolveBackend());
+        using var model = MuseGlimmerArchitecture.CreateLegacyModel(modelPath, ResolveBackend());
 
         const int prefixLen = 6 * BlockSize;
         int[] tokens = BuildPrompt(model, prefixLen + 1);
@@ -278,7 +278,7 @@ public class MuseGlimmerKvSnapshotTests
         {
             using var env = new EnvScope();
             env.Set("TS_KV_INITIAL_TOKENS", initialTokens);
-            using var model = ModelBase.Create(modelPath, ResolveBackend());
+            using var model = MuseGlimmerArchitecture.CreateLegacyModel(modelPath, ResolveBackend());
             prompt ??= BuildPrompt(model, promptLen);
             model.ResetKVCache();
             var digests = new List<(string, int)>(steps);

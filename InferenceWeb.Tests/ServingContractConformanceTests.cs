@@ -27,7 +27,7 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly HashSet<string> LegacyBespokeFamilies = new(StringComparer.Ordinal)
     {
-        "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-glimmer", "muse-spark",
+        "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
         "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
@@ -120,20 +120,6 @@ public sealed class ServingContractConformanceTests
         "minimax-h3-image: LayerSplit@ggml_cuda",
         "minimax-h3-image: TensorParallel@ggml_cuda",
         "minimax-m3: HybridParallel@ggml_cuda",
-        "muse-glimmer: ContinuousBatching@cpu",
-        "muse-glimmer: ContinuousBatching@cuda",
-        "muse-glimmer: ContinuousBatching@ggml_cpu",
-        "muse-glimmer: ContinuousBatching@ggml_cuda",
-        "muse-glimmer: ContinuousBatching@ggml_metal",
-        "muse-glimmer: ContinuousBatching@ggml_vulkan",
-        "muse-glimmer: ContinuousBatching@mlx",
-        "muse-glimmer: HybridParallel@cuda",
-        "muse-glimmer: HybridParallel@ggml_cuda",
-        "muse-glimmer: HybridParallel@ggml_vulkan",
-        "muse-glimmer: LayerSplit@cuda",
-        "muse-glimmer: LayerSplit@ggml_cuda",
-        "muse-glimmer: LayerSplit@ggml_vulkan",
-        "muse-glimmer: TensorParallel@cuda",
         "muse-spark: HybridParallel@ggml_cuda",
         "muse-spark: HybridParallel@ggml_vulkan",
         "muse-spark: TensorParallel+batching@ggml_vulkan",

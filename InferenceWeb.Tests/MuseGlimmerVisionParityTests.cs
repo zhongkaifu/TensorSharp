@@ -172,7 +172,7 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         BackendType backend = MuseGlimmerParity.Backend();
         ModelBase model = runtime
             ? MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend)
-            : ModelBase.Create(MuseGlimmerParity.FindModel(), backend);
+            : MuseGlimmerArchitecture.CreateLegacyModel(MuseGlimmerParity.FindModel(), backend);
         ((IVisionCapableModel)model).LoadVisionEncoder(FindMmproj());
         return model;
     }
