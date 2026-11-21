@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using TensorSharp.GGML;
 
 using TensorSharp.Graph;
@@ -329,6 +330,10 @@ namespace TensorSharp.Models
             ? TensorComputePrimitives.GetStoragePointer(t)
             : GraphIdentity.Of(t.Storage, t.StorageOffset);
 
+        /// <summary>Tests: a batched verify's sequences' scans run each in place, not as one region
+        /// (<see cref="GraphFusion.DeltaNetScans"/>).</summary>
+        internal bool DeltaNetScanRegionsDisabledForTests { get; set; }
+
         protected override int EmitRecurrentMixer(GraphStep step, int layer, int normed)
         {
             const long f = sizeof(float);
@@ -374,7 +379,12 @@ namespace TensorSharp.Models
             int ssmNorm = step.TensorWeight(step.Replicated(_deviceSsmNorm[layer]));
             long nb1 = packed * f;
 
-            int output = -1;
+            // Several sequences' verify windows (a batched verify): each sequence's scan waits until every sequence's inputs are
+            // made, and the scans form one region (GraphFusion.DeltaNetScans) an executor may run in one dispatch, each
+            // sequence's values its op's.
+            bool scans = step.Sequences > 1 && step.RecurrentSnapshots && !DeltaNetScanRegionsDisabledForTests;
+            var parts = new int[step.Sequences];
+            var waiting = new List<(int Sequence, int[] Srcs, long Rows, Func<int, int> Then)>();
             for (int s = 0; s < step.Sequences; s++)
             {
                 int count = step.Counts[s];
@@ -480,50 +490,82 @@ namespace TensorSharp.Models
                     cap = state.SnapshotCapacity;
                     if (!inPlaceWindow) verify = step.State(state.Verify, GraphFormat.F32, cap * (state.RowFloats + stateFloats));
                 }
-                int gdn = inPlaceWindow
+                if (scans && inPlaceWindow)
+                {
+                    int saved = step.State(state.SavedInputs, GraphFormat.F32, state.SavedInputFloats);
+                    waiting.Add((s, new[] { q4, k4, v4, g, beta, s4, saved }, state.BackingRows, Rest));
+                    continue;
+                }
+                parts[s] = Rest(inPlaceWindow
                     ? step.Op(GraphOp.GatedDeltaNet,
                         stackalloc[] { q4, k4, v4, g, beta, s4, step.State(state.SavedInputs, GraphFormat.F32, state.SavedInputFloats) },
                         stackalloc long[] { 0, state.BackingRows, 1 })
-                    : step.Op(GraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 }, stackalloc long[] { keep ? count : 1 });
-                int scores = step.View2(gdn, v, count, v * f, 0);
-                if (keep)
-                {
-                    if (!inPlaceWindow)
-                    {
-                        long total = v * count + stateFloats * count;
-                        int fallback = step.Op(GraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
-                        step.Alias(gdn, verify, 0, fallback);
-                    }
-                    // At the window's own pitch, one contiguous copy whatever its rows (at the capacity's pitch a window
-                    // narrower than it wrote [channels] rows of a few floats each: 27 us a layer for 2- and 3-row windows
-                    // of Qwen3.8 Flash Next, 1 ms a window).
-                    int hist = step.State(state.ConvHistory, GraphFormat.F32, convRows + cap, channels);
-                    long histPitch = convRows + count;
-                    step.Effect(step.Op(GraphOp.Cpy, convIn,
-                        step.View2(hist, convRows + count, channels, histPitch * f, 0)));
-                }
-                else
-                {
-                    int newState = step.Op(GraphOp.View, stackalloc[] { gdn },
-                        stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
-                    int copy = step.Op(GraphOp.Cpy, newState, s4);
-                    if (viaBacking && count == 1)
-                        // [outputs | state] of one row ends the backing: the recurrence updates the
-                        // state in place, as Qwen35Model's fused decode does on Metal.
-                        step.Alias(gdn, backing, (state.BackingRows - 1) * state.RowFloats * f, copy);
-                    else
-                        step.Effect(copy);
-                }
+                    : step.Op(GraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 }, stackalloc long[] { keep ? count : 1 }));
 
-                int y = step.Reshape(step.Cont(scores), dv, vHeads, count), zh = z4 >= 0 ? z4 : step.Reshape(z, dv, vHeads, count);
-                bool sigmoid = MixerSigmoidGate;
-                step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, stackalloc long[] { sigmoid ? 1 : 0 }, stackalloc[] { eps });
-                int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(sigmoid ? GraphOp.Sigmoid : GraphOp.Silu, zh));
-                step.EndFused(stackalloc[] { gated });
-                if (mixer) step.EndFused(stackalloc[] { gated });
-                int part = step.Reshape(gated, v, count);
-                output = output < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
+                // The sequence's recurrence's result on: its window's history, its gated output.
+                int Rest(int gdn)
+                {
+                    int scores = step.View2(gdn, v, count, v * f, 0);
+                    if (keep)
+                    {
+                        if (!inPlaceWindow)
+                        {
+                            long total = v * count + stateFloats * count;
+                            int fallback = step.Op(GraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
+                            step.Alias(gdn, verify, 0, fallback);
+                        }
+                        // At the window's own pitch, one contiguous copy whatever its rows (at the capacity's pitch a window
+                        // narrower than it wrote [channels] rows of a few floats each: 27 us a layer for 2- and 3-row windows
+                        // of Qwen3.8 Flash Next, 1 ms a window).
+                        int hist = step.State(state.ConvHistory, GraphFormat.F32, convRows + cap, channels);
+                        long histPitch = convRows + count;
+                        step.Effect(step.Op(GraphOp.Cpy, convIn,
+                            step.View2(hist, convRows + count, channels, histPitch * f, 0)));
+                    }
+                    else
+                    {
+                        int newState = step.Op(GraphOp.View, stackalloc[] { gdn },
+                            stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
+                        int copy = step.Op(GraphOp.Cpy, newState, s4);
+                        if (viaBacking && count == 1)
+                            // [outputs | state] of one row ends the backing: the recurrence updates the
+                            // state in place, as Qwen35Model's fused decode does on Metal.
+                            step.Alias(gdn, backing, (state.BackingRows - 1) * state.RowFloats * f, copy);
+                        else
+                            step.Effect(copy);
+                    }
+
+                    int y = step.Reshape(step.Cont(scores), dv, vHeads, count), zh = z4 >= 0 ? z4 : step.Reshape(z, dv, vHeads, count);
+                    bool sigmoid = MixerSigmoidGate;
+                    step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, stackalloc long[] { sigmoid ? 1 : 0 }, stackalloc[] { eps });
+                    int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(sigmoid ? GraphOp.Sigmoid : GraphOp.Silu, zh));
+                    step.EndFused(stackalloc[] { gated });
+                    if (mixer) step.EndFused(stackalloc[] { gated });
+                    return step.Reshape(gated, v, count);
+                }
             }
+            if (waiting.Count > 0)
+            {
+                var srcs = new List<int>(7 * waiting.Count);
+                var ip = new long[1 + waiting.Count];
+                ip[0] = waiting.Count;
+                for (int w = 0; w < waiting.Count; w++)
+                {
+                    srcs.AddRange(waiting[w].Srcs);
+                    ip[1 + w] = waiting[w].Rows;
+                }
+                bool region = waiting.Count > 1;
+                if (region) step.BeginFused(GraphFusion.DeltaNetScans, srcs.ToArray(), ip);
+                var scanned = new int[waiting.Count];
+                for (int w = 0; w < waiting.Count; w++)
+                    scanned[w] = step.Op(GraphOp.GatedDeltaNet, waiting[w].Srcs, stackalloc long[] { 0, waiting[w].Rows, 1 });
+                if (region) step.EndFused(scanned);
+                for (int w = 0; w < waiting.Count; w++)
+                    parts[waiting[w].Sequence] = waiting[w].Then(scanned[w]);
+            }
+            int output = -1;
+            foreach (int part in parts)
+                output = output < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
             return step.MatMul(LayerName(layer, "ssm_out.weight"), output);
         }
     }

@@ -330,6 +330,12 @@ namespace TensorSharp.Graph
         /// serves the F16 form as its fused ones (the products on cuBLAS F16, the SwiGLU and b1 in the down product's input,
         /// the bias and scale in H3_FUSED_SCALED_RESIDUAL).</summary>
         ScaledResidual = 24,
+        /// <summary>Several sequences' verify-window recurrences of one gated delta-net layer (a batched verify: each sequence on
+        /// its own state): the sequences' GatedDeltaNet ops, each the window form (its rows' outputs alone, its scan inputs
+        /// saved, the state read and left). Inputs: per sequence its op's q, k, v, g, beta, state and saved-inputs leaf, in
+        /// sequence order. Ip: the sequences, then each one's saved-input rows. Results: each sequence's op result, in order.
+        /// An executor may run every sequence's scan in one dispatch; each sequence's values are its op's.</summary>
+        DeltaNetScans = 25,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

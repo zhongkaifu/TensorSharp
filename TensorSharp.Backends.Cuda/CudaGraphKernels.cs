@@ -28,6 +28,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
         private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
         private readonly IntPtr _setRowsHeads;
+        private readonly IntPtr _gdnScanSeqs, _gdnScanSeqsKda;
         private readonly int _multiprocessors;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
@@ -37,6 +38,15 @@ namespace TensorSharp.Cuda
             _gatedDeltaNetRows4 = module.GetFunction("ts_graph_gated_delta_net_rows4_f32");
             _gatedDeltaNetScan4 = module.GetFunction("ts_graph_gated_delta_net_scan4_f32");
             _gatedDeltaNetScan4Kda = module.GetFunction("ts_graph_gated_delta_net_scan4_kda_f32");
+            try
+            {
+                _gdnScanSeqs = module.GetFunction("ts_graph_gated_delta_net_scan4_seqs_f32");
+                _gdnScanSeqsKda = module.GetFunction("ts_graph_gated_delta_net_scan4_seqs_kda_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _gdnScanSeqs = _gdnScanSeqsKda = IntPtr.Zero;
+            }
             _gdnCommit = module.GetFunction("ts_graph_gdn_commit_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
             _sqrt = module.GetFunction("ts_graph_sqrt_f32");
@@ -439,6 +449,41 @@ namespace TensorSharp.Cuda
             void** a = stackalloc void*[] { p };
             CudaDriverApi.cuLaunchKernel(_gdnCommit, (uint)args.Heads, (uint)((args.S + 15) / 16), (uint)args.Layers, 128, 1, 1, 0, stream,
                 (IntPtr)a, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Sequences <see cref="LaunchGatedDeltaNetScanSequences"/> takes in one launch (TS_GRAPH_GDN_SEQS).</summary>
+        public const int GdnScanSequences = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchGatedDeltaNetScanSequences"/>.</summary>
+        public bool TakesGdnScanSequences => _gdnScanSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_gated_delta_net_scan4_seqs_f32, byte for byte (struct ts_graph_gdn_seqs): each
+        /// sequence's q, k, v, gates, betas, state, output and saved inputs.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct GdnScanSequencesArgs
+        {
+            public fixed long Q[GdnScanSequences];
+            public fixed long K[GdnScanSequences];
+            public fixed long V[GdnScanSequences];
+            public fixed long G[GdnScanSequences];
+            public fixed long Beta[GdnScanSequences];
+            public fixed long State[GdnScanSequences];
+            public fixed long Out[GdnScanSequences];
+            public fixed long Save[GdnScanSequences];
+        }
+
+        /// <summary><see cref="LaunchGatedDeltaNetRows4"/>'s verify-window scan (no slot, no saved state, the rows' inputs saved)
+        /// of <paramref name="sequences"/> sequences in one launch, each over its own buffers of <paramref name="tokens"/>
+        /// tokens (its pointers in <paramref name="args"/>): each sequence's values are its own launch's.</summary>
+        public void LaunchGatedDeltaNetScanSequences(GdnScanSequencesArgs args, int sequences, int s, int heads, int keyHeads, int tokens,
+            bool perKeyDecay, int inputRows, IntPtr stream)
+        {
+            if (sequences < 1 || sequences > GdnScanSequences || s % 32 != 0 || s > 256)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of S {s}");
+            GdnScanSequencesArgs* p = &args;
+            void** a = stackalloc void*[] { p, &s, &heads, &keyHeads, &tokens, &inputRows };
+            CudaDriverApi.cuLaunchKernel(perKeyDecay ? _gdnScanSeqsKda : _gdnScanSeqs, (uint)heads, (uint)((s + 15) / 16), (uint)sequences, 128, 1, 1, 0,
+                stream, (IntPtr)a, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Floats of a recurrence's saved inputs for <paramref name="rows"/> tokens: q and k [rows, keyHeads, s], v

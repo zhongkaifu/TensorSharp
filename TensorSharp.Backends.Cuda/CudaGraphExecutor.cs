@@ -1691,6 +1691,7 @@ namespace TensorSharp.Cuda
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
             GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep or GraphFusion.DFlashConv => Kernels != null,
+            GraphFusion.DeltaNetScans => Kernels is { TakesGdnScanSequences: true },
             _ => false,
         };
 
@@ -1710,6 +1711,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.DeltaNetCommit) return TryDeltaNetCommit(inputs, ip, results);
             if (kind == GraphFusion.AttentionPrep) return TryAttentionPrep(inputs, ip, fp, results);
             if (kind == GraphFusion.DFlashConv) return TryDFlashConv(inputs, ip, results);
+            if (kind == GraphFusion.DeltaNetScans) return TryDeltaNetScans(inputs, ip, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -2173,6 +2175,87 @@ namespace TensorSharp.Cuda
             int inputRows)
             => DeviceGatedDeltaNet(q, k, v, g, beta, state, 0, true, inputs, inputRows)
                ?? base.GatedDeltaNetWindow(q, k, v, g, beta, state, inputs, inputRows);
+
+        /// <summary>
+        /// Several sequences' verify-window scans of one layer (<see cref="GraphFusion.DeltaNetScans"/>) in one launch: each
+        /// sequence's window as <see cref="GatedDeltaNetWindow"/> runs it alone (its rows' outputs on the scan kernel, its inputs
+        /// saved, its state read and left), the sequences' buffers by value, so every value is its own launch's. Four
+        /// Qwen3.8-27B sequences' 8-row windows had taken a launch each: 192 of a verify step's kernels, 3.0 of its 28 ms on an
+        /// RTX PRO 4500, where the direct engine's one scan over the sequences took 1.6. False (the ops run) unless every
+        /// sequence is one window of the same shape the window form takes.
+        /// </summary>
+        private bool TryDeltaNetScans(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            int n = ip != null && ip.Length > 0 ? (int)ip[0] : 0;
+            CudaGraphKernels kernels = Kernels;
+            if (kernels is not { TakesGdnScanSequences: true } || n < 1 || inputs.Length != 7 * n || results.Length != n || ip.Length < 1 + n)
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            int s = 0, heads = 0, keyHeads = 0, tokens = 0;
+            bool kda = false;
+            for (int j = 0; j < n; j++)
+            {
+                Tensor q = inputs[7 * j], v = inputs[7 * j + 2], g = inputs[7 * j + 3], save = inputs[7 * j + 6];
+                long[] nq = Ne(q), nv = Ne(v), ng = Ne(g);
+                int js = (int)nv[0], jh = (int)nv[1], jt = (int)nv[2], jk = (int)nq[1], inputRows = (int)ip[1 + j];
+                bool jkda = ng[0] == js && js > 1;
+                if (j == 0) (s, heads, tokens, keyHeads, kda) = (js, jh, jt, jk, jkda);
+                if (js != s || jh != heads || jt != tokens || jk != keyHeads || jkda != kda || nv[3] != 1 || s % 32 != 0 || s > 256
+                    || nq[0] != s || keyHeads < 1 || heads % keyHeads != 0 || tokens < 2 || tokens > inputRows)
+                    return false;
+                for (int i = 0; i < 7; i++)
+                {
+                    Tensor t = inputs[7 * j + i];
+                    if (t?.Storage is not CudaStorage st || st.DeviceId != cuda.DeviceId || !t.IsContiguous() || t.ElementType != DType.Float32)
+                        return false;
+                }
+                if (save.ElementCount() < CudaGraphKernels.GatedDeltaNetInputFloats(inputRows, s, heads, keyHeads, kda))
+                    return false;
+            }
+            // Every sequence's saved inputs hold the same rows (the kernel's planar regions are that many tokens long).
+            for (int j = 1; j < n; j++)
+                if (ip[1 + j] != ip[1]) return false;
+            long rowFloats = (long)tokens * heads * s;
+            IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
+            foreach (Tensor t in inputs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            for (int j = 0; j < n; j++)
+            {
+                results[j] = new Tensor(Allocator, DType.Float32, rowFloats);
+                ((CudaStorage)results[j].Storage).EnsureDeviceCurrent();
+            }
+            cuda.Context.MakeCurrent();
+            for (int first = 0; first < n; first += CudaGraphKernels.GdnScanSequences)
+            {
+                int count = Math.Min(CudaGraphKernels.GdnScanSequences, n - first);
+                var args = new CudaGraphKernels.GdnScanSequencesArgs();
+                unsafe
+                {
+                    for (int z = 0; z < count; z++)
+                    {
+                        int j = first + z;
+                        args.Q[z] = (long)P(inputs[7 * j]);
+                        args.K[z] = (long)P(inputs[7 * j + 1]);
+                        args.V[z] = (long)P(inputs[7 * j + 2]);
+                        args.G[z] = (long)P(inputs[7 * j + 3]);
+                        args.Beta[z] = (long)P(inputs[7 * j + 4]);
+                        args.State[z] = (long)P(inputs[7 * j + 5]);
+                        args.Out[z] = (long)P(results[j]);
+                        args.Save[z] = (long)P(inputs[7 * j + 6]);
+                    }
+                }
+                kernels.LaunchGatedDeltaNetScanSequences(args, count, s, heads, keyHeads, tokens, kda, (int)ip[1], cuda.Stream.Handle);
+            }
+            for (int j = 0; j < n; j++)
+            {
+                ((CudaStorage)results[j].Storage).MarkDeviceModified();
+                ((CudaStorage)inputs[7 * j + 6].Storage).MarkDeviceModified();
+            }
+            DeltaNetScanRegions++;
+            return true;
+        }
+
+        /// <summary>Regions of several sequences' scans run in one launch (<see cref="TryDeltaNetScans"/>; tests check it ran).</summary>
+        internal long DeltaNetScanRegions { get; private set; }
 
         /// <param name="snapshots">0: the rows' outputs alone (a verify window saving its inputs), no state written.</param>
         private Tensor DeviceGatedDeltaNet(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots, bool rowKernels,

@@ -3649,3 +3649,40 @@ extern "C" __global__ void ts_graph_set_rows_heads_f32(const float* __restrict__
         else ((float*)dst)[to + c] = v;
     }
 }
+
+// Several sequences' verify-window scans in one launch (GraphFusion.DeltaNetScans): sequence z's window is
+// ts_graph_gated_delta_net_scan4_f32 over its own buffers (each one sequence of n_t tokens), the sequences' pointers by
+// value. Every value of a sequence is the one-sequence kernel's: the same body over the same operands. (Eight state rows a
+// warp, reading a token's q and k once for eight rows, took 68.9 us a layer for four Qwen3.8-27B sequences' windows against
+// 51.9 for four on an RTX PRO 4500.) Launch: grid (h, ceil(S / 16), sequences), block 128.
+#define TS_GRAPH_GDN_SEQS 16
+
+struct ts_graph_gdn_seqs
+{
+    const float* q[TS_GRAPH_GDN_SEQS];
+    const float* k[TS_GRAPH_GDN_SEQS];
+    const float* v[TS_GRAPH_GDN_SEQS];
+    const float* g[TS_GRAPH_GDN_SEQS];
+    const float* beta[TS_GRAPH_GDN_SEQS];
+    const float* state[TS_GRAPH_GDN_SEQS];
+    float* out[TS_GRAPH_GDN_SEQS];
+    float* in_save[TS_GRAPH_GDN_SEQS];
+};
+
+template <bool KDA>
+__device__ __forceinline__ void ts_graph_gdn_scan4_seq(const ts_graph_gdn_seqs& a, int S, int h, int hk, int n_t, int save_rows)
+{
+    const int z = blockIdx.z;
+    ts_graph_gdn_rows4_scan<KDA>(a.q[z], a.k[z], a.v[z], a.g[z], a.beta[z], a.state[z], a.out[z], S, h, hk, n_t, 1, a.in_save[z],
+        save_rows, 0, blockIdx.x, (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4, threadIdx.x & 31);
+}
+
+extern "C" __global__ void ts_graph_gated_delta_net_scan4_seqs_f32(const ts_graph_gdn_seqs a, int S, int h, int hk, int n_t, int save_rows)
+{
+    ts_graph_gdn_scan4_seq<false>(a, S, h, hk, n_t, save_rows);
+}
+
+extern "C" __global__ void ts_graph_gated_delta_net_scan4_seqs_kda_f32(const ts_graph_gdn_seqs a, int S, int h, int hk, int n_t, int save_rows)
+{
+    ts_graph_gdn_scan4_seq<true>(a, S, h, hk, n_t, save_rows);
+}
