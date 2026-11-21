@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\..\eng\validation\CudaMoeFusionBench.cs" Link="MoeFusionBench.cs" />
+    <Compile Include="..\..\eng\validation\CudaDenseRowsBench.cs" Link="DenseRowsBench.cs" />
     <ProjectReference Include="..\..\TensorSharp.Core\TensorSharp.Core.csproj" />
     <ProjectReference Include="..\..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
   </ItemGroup>
