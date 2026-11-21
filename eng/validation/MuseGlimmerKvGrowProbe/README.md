@@ -72,7 +72,7 @@ $P --model $M --backend ggml_metal --nll-text benchmarks/engine_comparison/asset
 ```
 
 The probe builds the family through `MuseGlimmerArchitecture.CreateRuntimeModel`. `--family`, which
-chose between it and the legacy model until stage S9, is refused. `--scenario bench` times the CLI's
+chose between it and the legacy model until stage S9, is refused (exit 2, one line on stderr). `--scenario bench` times the CLI's
 `--benchmark` procedure (greedy, end to end): a prompt of `--bench-prefill` tokens (default 512) cycling 17 ids in one
 `Forward`, then `--bench-decode` (128) greedy one-row forwards, `--bench-runs` (2) times;
 the report has every run's prefill and decode rates and the best of each.

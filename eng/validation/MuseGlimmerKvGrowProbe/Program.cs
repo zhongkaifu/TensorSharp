@@ -48,9 +48,13 @@ int tp = int.Parse(Option("--tp", "1"));
 // --layer-split N: whole layers over N GPUs.
 int layerSplit = int.Parse(Option("--layer-split", "1"));
 // The probe builds the shared-runtime family, which the descriptor builds since stage S8 of docs/design/muse-glimmer-unified.md.
-// --family chose between it and the legacy model until stage S9 deleted the legacy model, and is refused since.
+// --family chose between it and the legacy model until stage S9 deleted the legacy model, and is refused since: exit 2 and
+// one stderr line, as the CLI's and the server's load refusals.
 if (args.Contains("--family"))
-    throw new ArgumentException("--family was removed with the legacy Muse-Glimmer model (stage S9): the probe builds the shared-runtime family; drop --family.");
+{
+    Console.Error.WriteLine("--family was removed with the legacy Muse-Glimmer model (stage S9): the probe builds the shared-runtime family; drop --family.");
+    Environment.Exit(2);
+}
 const string family = "runtime";
 // --scenario bench: the CLI's --benchmark (greedy, end to end) in this binary: a prompt of
 // --bench-prefill tokens cycling 17 ids, then --bench-decode greedy one-row forwards, --bench-runs times.
