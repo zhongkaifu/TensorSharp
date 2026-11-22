@@ -23,7 +23,7 @@ struct TensorView2DDesc {
 int TSGgml_IsBackendAvailable(int);
 const char* TSGgml_GetLastError();
 int TSGgml_AddmmQuantF32(TensorView2DDesc, TensorView2DDesc, void*, int,
-    std::int64_t, std::int64_t, std::int64_t);
+    std::int64_t, std::int64_t, std::int64_t, int);
 void TSGgml_MatmulTestAbortAfterWeightBind(int);
 int TSGgml_MatmulTestAbortedPendingDeviceCopy();
 int TSGgml_HasResidentDeviceCopy(void*, std::int64_t);
@@ -121,7 +121,7 @@ void check_case(bool cuda, bool quantized, bool opaque, int rows) {
     }
     auto run = [&]() {
         return TSGgml_AddmmQuantF32(view(output, rows), view(input, rows),
-            key, weight.type, width, width, byte_count);
+            key, weight.type, width, width, byte_count, 0);
     };
     require(run() == 1, "Initial AddmmQuant control failed");
     check_scalar(weight, input, output, rows);

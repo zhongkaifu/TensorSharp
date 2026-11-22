@@ -375,7 +375,8 @@ namespace {
         const TensorView2DDesc& result_desc,
         const TensorView2DDesc& m1_desc,
         const QuantizedWeightDesc& m2_quant,
-        bool spark_float32 = false)
+        bool spark_float32 = false,
+        bool q8_nvfp4_activations = false)
     {
         if (!ensure_backend())
         {
@@ -589,6 +590,14 @@ namespace {
         if (mm_tensor == nullptr)
         {
             set_last_error("Failed to create ggml matmul node for addmm_quant.");
+            return 0;
+        }
+        // 8-bit activations for an NVFP4 product (the model's --nvfp4-prompt-activations q8), as the graph builder asks for
+        // its programs' (GraphProgram.Q8Nvfp4Activations).
+        if (q8_nvfp4_activations && qtype == GGML_TYPE_NVFP4 && mm_tensor->op == GGML_OP_MUL_MAT
+            && !ggml_prec_set_src(mm_tensor, GGML_PREC_Q8, 1))
+        {
+            set_last_error("addmm_quant: the NVFP4 product refused the q8 activation precision.");
             return 0;
         }
 
@@ -1521,7 +1530,8 @@ TSG_EXPORT int TSGgml_AddmmQuantF32(
     int m2_ggml_type,
     std::int64_t m2_ne0,
     std::int64_t m2_ne1,
-    std::int64_t m2_raw_bytes)
+    std::int64_t m2_raw_bytes,
+    int q8_nvfp4_activations)
 {
     try
     {
@@ -1531,7 +1541,7 @@ TSG_EXPORT int TSGgml_AddmmQuantF32(
         m2_quant.ne0 = m2_ne0;
         m2_quant.ne1 = m2_ne1;
         m2_quant.raw_bytes = m2_raw_bytes;
-        return addmm_quant_f32_impl(result, m1, m2_quant);
+        return addmm_quant_f32_impl(result, m1, m2_quant, false, q8_nvfp4_activations != 0);
     }
     catch (const std::exception& ex)
     {

@@ -1443,7 +1443,8 @@ internal enum GgmlIndexReductionOp
             int m2GgmlType,
             long m2Ne0,
             long m2Ne1,
-            long m2RawBytes);
+            long m2RawBytes,
+            int q8Nvfp4Activations);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -4133,9 +4134,10 @@ internal enum GgmlIndexReductionOp
             GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight)
             => CheckResult(TSGgml_MuseSparkProjectionFloat32(result, input, weight), "muse_spark_projection_float32");
 
-        public static void AddmmQuant(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
+        public static void AddmmQuant(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes,
+            bool q8Nvfp4Activations = false)
         {
-            CheckResult(TSGgml_AddmmQuantF32(result, m1, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "addmm_quant");
+            CheckResult(TSGgml_AddmmQuantF32(result, m1, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes, q8Nvfp4Activations ? 1 : 0), "addmm_quant");
         }
 
         public static void FusedRmsNormMatMulQuant(

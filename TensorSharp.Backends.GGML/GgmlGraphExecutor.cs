@@ -126,6 +126,7 @@ namespace TensorSharp.GGML
             try
             {
                 if (program.WideTokenProducts) g.MarkWideTokenProducts();
+                if (program.Q8Nvfp4Activations) g.MarkQ8Nvfp4Activations();
                 foreach (GraphNode n in program.Entries)
                 {
                     switch (n.Kind)
