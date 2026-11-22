@@ -110,8 +110,9 @@ body { display: flex; flex-direction: column; }
   padding: 12px 12px 4px;
   display: flex; flex-direction: column; gap: 10px;
   overscroll-behavior: contain;
-  /* What the user is reading stays put while the answer below it grows. */
-  overflow-anchor: auto;
+  /* Only the user and the page scroll the chat: no anchoring adjustments of the browser's own
+     (on iOS a chat held above an answer drifted back down while it streamed). */
+  overflow-anchor: none;
 }
 
 .turn { display: flex; flex-direction: column; max-width: 100%; }

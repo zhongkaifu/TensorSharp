@@ -233,8 +233,8 @@ button.primary:hover { background: var(--accent-hover); }
   display: flex;
   flex-direction: column;
   gap: 16px;
-  /* What the reader is looking at stays put while the answer below it grows. */
-  overflow-anchor: auto;
+  /* Only the reader and the page scroll the chat: no anchoring adjustments of the browser's own. */
+  overflow-anchor: none;
 }
 
 /* Back to the newest line, while the reader is above it during an answer. */
@@ -1488,8 +1488,8 @@ function paintJumpToLatest() {
 function updateAutoScrollState() {
   if (chatContainer.scrollTop === chatScrolledTo) return; // this page's own, or the content growing under it
   chatScrolledTo = -1;
-  // The reader's own scroll (or its momentum), or the bottom reached any way at all.
-  if (chatTouching || Date.now() - chatInputAt < 1500 || isChatNearBottom()) shouldAutoScroll = isChatNearBottom();
+  // The reader's own scroll (or its momentum): nothing else turns following back on.
+  if (chatTouching || Date.now() - chatInputAt < 1500) shouldAutoScroll = isChatNearBottom();
   paintJumpToLatest();
 }
 

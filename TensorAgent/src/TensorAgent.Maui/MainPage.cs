@@ -1452,10 +1452,27 @@ public sealed class MainPage : ContentPage
             foreach (string prompt in prompts.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
                 turn++;
-                await _webView.EvaluateJavaScriptAsync("window.TensorAgent.openConversation(null)");
-                await Task.Delay(2000);
+                // A prompt that starts with '>' is sent in the same chat, after scrolling it up as a finger would: the
+                // reply to a message the user sends must be followed whatever they were reading.
+                bool sameChat = prompt.StartsWith('>');
+                string message = sameChat ? prompt[1..].Trim() : prompt;
+                if (sameChat)
+                {
+                    await _webView.EvaluateJavaScriptAsync(
+                        "(function(){var c=document.getElementById('chat');c.dispatchEvent(new Event('touchstart'));"
+                        + "c.dispatchEvent(new Event('touchmove'));c.scrollTop=Math.max(0,c.scrollTop-200);"
+                        + "c.dispatchEvent(new Event('scroll'));c.dispatchEvent(new Event('touchend'));return c.scrollTop;})()");
+                    await Task.Delay(600);
+                    Say($"speechcheck turn {turn} scrolled up before sending: chat scroll,height,client="
+                        + UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                }
+                else
+                {
+                    await _webView.EvaluateJavaScriptAsync("window.TensorAgent.openConversation(null)");
+                    await Task.Delay(2000);
+                }
                 await _webView.EvaluateJavaScriptAsync("document.getElementById('text').value = ''; true");
-                await CallBridgeAsync("insertText", new { text = prompt });
+                await CallBridgeAsync("insertText", new { text = message });
                 await _webView.EvaluateJavaScriptAsync(
                     "window.TensorAgent.send(); if (document.activeElement) document.activeElement.blur(); true");
                 Say($"speechcheck turn {turn} sent: {prompt}");
@@ -1544,9 +1561,11 @@ public sealed class MainPage : ContentPage
                 Say($"speechcheck turn {turn} summary " + SummarizeSpeechTimeline(timeline));
                 Say($"speechcheck turn {turn} timeline " + timeline);
                 // Let the reply finish playing (the page gives the audio back once it has drained) before the next turn
-                // silences it, and say what the session is then.
+                // silences it, and say what the session is then - unless the run is about something else
+                // (TENSORAGENT_SPEECH_NO_DRAIN=1: the scroll checks).
                 string states = "null";
-                for (int i = 0; i < 240; i++)
+                bool waitForDrain = Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_NO_DRAIN") != "1";
+                for (int i = 0; i < (waitForDrain ? 240 : 0); i++)
                 {
                     await Task.Delay(500);
                     states = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(

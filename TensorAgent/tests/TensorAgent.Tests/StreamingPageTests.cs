@@ -186,4 +186,36 @@ public sealed partial class WebUiPageTests
         Assert.Equal(At("back")[1], At("back")[0]);
         Assert.Equal(At("end")[1], At("end")[0]);
     }
+
+    /// <summary>Whoever sends a message wants to see its reply: after the user scrolled up (and did not come back), the
+    /// next send follows the new reply down again; so does opening another chat.</summary>
+    [WebJavaScriptFact]
+    public void SendingAfterScrollingUpFollowsTheNewReply()
+    {
+        string frames = string.Join(",\n", Enumerable.Range(0, 30).Select(i => "{ token: 'word" + i + " ' }"));
+        JsonElement result = Run("R['/api/chat'] = { __sse: [" + frames + ", { done: true, sessionId: 's1', tokenCount: 30 }], __delay: 2 };", """
+            var chat = __page.byId['chat'];
+            chat.clientHeight = 500; chat.scrollHeight = 2000; chat.scrollTop = 1500;
+            __page.onHtml = function (element, v) { if (/word/.test(v)) chat.scrollHeight += 20; };
+            function sample() { return [chat.scrollTop, chat.scrollHeight]; }
+            var out = {};
+            return settle(20).then(function () {
+              // Scrolled up, and left there.
+              chat.dispatch('touchstart', {}); chat.dispatch('touchmove', {});
+              chat.scrollTop = 300; chat.dispatch('scroll', {}); chat.dispatch('touchend', {});
+              out.away = sample();
+              __page.byId['text'].value = 'Write.';
+              __page.byId['send'].dispatch('click');
+              return wait(150);
+            }).then(function () { out.sent = sample(); return settle(200);
+            }).then(function () { out.end = sample(); return out; });
+            """);
+
+        Assert.False(result.TryGetProperty("error", out JsonElement failure), failure.ToString());
+        int[] At(string name) => result.GetProperty(name).EnumerateArray().Select(v => v.GetInt32()).ToArray();
+        Assert.Equal(300, At("away")[0]);
+        Assert.True(At("sent")[1] > At("away")[1], "the reply did not stream");
+        Assert.Equal(At("sent")[1], At("sent")[0]);
+        Assert.Equal(At("end")[1], At("end")[0]);
+    }
 }

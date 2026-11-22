@@ -213,11 +213,13 @@
     userInput();
   });
   chat.addEventListener('scroll', function () {
+    speechLogScroll('scroll');
     if (chat.scrollTop === scrolledTo) return; // this page's own, or the content growing under it
     scrolledTo = -1;
     // A finger on the glass, or the glide after it, or a wheel or key a moment ago.
+    // Nothing else turns following back on: iOS moves a scroll view by itself now and then
+    // (measured on the phone: a chat held 80 px up drifted back down and started following).
     if (touching || Date.now() - lastInputAt < 1500) userScrolled();
-    else if (atBottom(24) && !stickBottom) userScrolled();
   });
 
   // The way back to the newest line, while the user is reading above it.
@@ -738,9 +740,15 @@
     speechLog = {
       t0: Date.now(), firstText: -1, lastText: -1, texts: 0, done: -1,
       chunkAt: [], startAt: [], leadAt: [], gaps: [], noPlayer: 0, states: [],
-      paints: 0, paintMs: 0, paintMaxMs: 0,
+      paints: 0, paintMs: 0, paintMaxMs: 0, scrolls: [],
     };
     speechLogState('send');
+  }
+  /** Every scroll event of a spoken turn, [ms, why, scrollTop, scrollHeight, clientHeight, following] (the last 300). */
+  function speechLogScroll(why) {
+    if (!speechLog) return;
+    speechLog.scrolls.push([speechLogAt(), why, Math.round(chat.scrollTop), chat.scrollHeight, chat.clientHeight, stickBottom ? 1 : 0]);
+    if (speechLog.scrolls.length > 300) speechLog.scrolls.shift();
   }
   function speechLogPaint(ms) {
     if (!speechLog || speechLog.done >= 0) return;
@@ -1440,6 +1448,9 @@
    */
   function openConversation(conversationId, options) {
     conversationOpening = true;
+    // Another chat, or a new one, starts at its newest line and follows it.
+    stickBottom = true;
+    paintJump();
     detach();
     state.interrupted = false;
     // A durable shared draft follows the composer between chats (its text already
@@ -1825,6 +1836,9 @@
     // Inside the tap: the only moment a WebView lets a spoken reply start playing.
     primeSpeech(true);
     if (speaksReplies()) speechLogStart();
+    // Whoever sends wants to see the reply: follow the newest line again.
+    stickBottom = true;
+    paintJump();
     if (pendingUploadCount) {
       notice(t('page.send.waitForUploads'));
       return;
