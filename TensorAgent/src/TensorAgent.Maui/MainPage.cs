@@ -1482,11 +1482,13 @@ public sealed class MainPage : ContentPage
                     int[] chat = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
                     if (done < 0 && chat.Length == 3)
                     {
-                        if (scrollCheck && held < 0 && texts >= 40 && chat[1] > chat[2] + 500)
+                        // As soon as there is something to scroll up through (a tall window, as on a Mac, takes longer).
+                        if (scrollCheck && held < 0 && texts >= 40 && chat[1] - chat[2] > 160)
                         {
                             await _webView.EvaluateJavaScriptAsync(
                                 "(function(){var c=document.getElementById('chat');c.dispatchEvent(new Event('touchstart'));"
-                                + "c.dispatchEvent(new Event('touchmove'));c.scrollTop=Math.max(0,c.scrollTop-300);"
+                                + "c.dispatchEvent(new Event('touchmove'));"
+                                + "c.scrollTop=Math.max(0,c.scrollTop-Math.min(300,c.scrollHeight-c.clientHeight-80));"
                                 + "c.dispatchEvent(new Event('scroll'));c.dispatchEvent(new Event('touchend'));return c.scrollTop;})()");
                             await Task.Delay(300);
                             held = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)))[0];
