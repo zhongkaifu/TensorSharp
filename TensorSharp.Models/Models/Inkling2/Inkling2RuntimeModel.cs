@@ -60,6 +60,9 @@ namespace TensorSharp.Models
 
         /// <summary>Padded relative-bias tables [extent + 1, rel] (the last row zero) per stored layer, on the model's device.</summary>
         private Tensor[] _relTables;
+        // The full layers' log-scaled positions by position [1, positions]: tau(p) = 1 + alpha log(max(1, (p + 1) / floor)),
+        // read by the step's positions so a decode step advances without a trace.
+        private Tensor _tauTable;
 
         public Inkling2RuntimeModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             int layerSplitDegree = 1, string draftModelPath = null)
@@ -157,7 +160,11 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The padded bias tables, while every host copy of the loaded weights still exists.</summary>
-        protected override void PrepareLoadedWeights() => BuildRelativeTables();
+        protected override void PrepareLoadedWeights()
+        {
+            BuildRelativeTables();
+            BuildTauTable();
+        }
 
         private static string LayerBits(bool[] flags) => new(flags.Select(f => f ? '1' : '0').ToArray());
 
@@ -278,6 +285,17 @@ namespace TensorSharp.Models
             }
         }
 
+        private void BuildTauTable()
+        {
+            int n = Config.DeclaredContextLength > 0 ? Config.DeclaredContextLength : 1 << 20;
+            var tau = new float[n];
+            for (int p = 0; p < n; p++) tau[p] = 1f + _logScaleAlpha * MathF.Log(MathF.Max(1f, (p + 1f) / _logScaleFloor));
+            var t = new Tensor(Mesh.Allocator(0, 0), DType.Float32, n, 1);
+            t.SetElementsAsFloat(tau);
+            HostWritten(t);
+            _tauTable = t;
+        }
+
         /// <summary>The bias table's distance bound of a run: the window on a sliding layer, relative_extent on a full one.</summary>
         private int ExtentOf(int layer) => (int)(_relTables[PhysicalLayer(layer)].Sizes[0] - 1);
 
@@ -286,6 +304,8 @@ namespace TensorSharp.Models
             if (_relTables != null)
                 foreach (Tensor t in _relTables) t?.Dispose();
             _relTables = null;
+            _tauTable?.Dispose();
+            _tauTable = null;
             base.Dispose();
         }
     }

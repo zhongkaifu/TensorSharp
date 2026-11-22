@@ -34,6 +34,11 @@
 #include "ggml_h3_upload.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#if defined(TSG_GGML_USE_CUDA)
+#include "ggml_ops_dsv4_fused.h"
+#include "tsg_inkling_fused.h"
+#endif
+#include <deque>
 
 #include <algorithm>
 #include <atomic>
@@ -113,7 +118,7 @@ namespace
         OP_MEAN = 47,
         OP_ADD_ID = 48,         // srcs: a, b, ids
         OP_ARGMAX = 49,
-        OP_KV_WINDOW = 50,      // srcs: cache; ip: head_dim, cache_size, kv_heads, start, length, kv_type, query_rows, gqa_ratio
+        OP_KV_WINDOW = 50,      // srcs: cache; ip: head_dim, cache_size, kv_heads, start, length, kv_type, query_rows, gqa_ratio (-1: not read by flash attention)
                                 // (a [head_dim, length, kv_heads] window, copied where a backend's attention needs it)
         OP_SWIGLU = 51,         // silu(first half) * second half, along ne0
         OP_GEGLU = 52,
@@ -323,6 +328,20 @@ namespace
         // Lowered on every backend (try_lower_dit_attention): MiniMax-H3's own attention nodes (h3_attend), in place of the
         // region's ops; inside a served TableRopeQkNorm it is part of that region.
         FUSED_DIT_ATTENTION = 22,     // GraphFusion.DitAttention
+        // Inkling 2's attention, served on ggml_cuda inside the graph (try_serve_inkling): a GGML_OP_CUSTOM node the
+        // TensorSharp fused-op backend launches on the ggml-cuda stream (tsg_inkling_fused.h). Its region's ops are a
+        // placeholder (the family emits it only where GraphCapabilities.RelativeBiasAttention says it is served), so a
+        // region it cannot serve fails the build.
+        FUSED_INKLING_ATTENTION = 30, // GraphFusion.InklingAttention
+        // Inkling 2's small stages, served the same way where the kernels take the region's operands (try_serve_inkling_stage);
+        // a region they do not take runs its ops.
+        FUSED_INKLING_CLIP = 31,      // GraphFusion.InklingClip
+        FUSED_INKLING_CONV = 32,      // GraphFusion.InklingConv
+        FUSED_INKLING_MIX = 33,       // GraphFusion.InklingMix
+        FUSED_INKLING_CONTROL = 34,   // GraphFusion.InklingControl
+        FUSED_INKLING_ROUTE = 35,     // GraphFusion.InklingRoute
+        FUSED_INKLING_SITU = 36,      // GraphFusion.InklingSitu
+        FUSED_INKLING_EXPERT_SUM = 37,// GraphFusion.InklingExpertSum
         SELECTED_ATTENTION = 100,     // a prompt chunk's flash attention under a selection's mask (no region: the op)
     };
 
@@ -482,6 +501,13 @@ namespace
         // requests GGML_PREC_Q8 for src1 of every MUL_MAT and MUL_MAT_ID on an NVFP4 matrix. Set before the first node.
         bool q8_nvfp4_activations = false;
         int dit_regions = 0;                                     // regions served as DiT offload nodes
+#if defined(TSG_GGML_USE_CUDA)
+        // Inkling 2's fused nodes (try_serve_inkling) and their descriptors (the nodes' userdata, so their addresses must
+        // not move): a graph holding any runs on the TensorSharp fused-op backend that wraps ggml-cuda.
+        std::deque<tsg_dsv4_fused_desc> inkling_descs;
+        int inkling_nodes = 0;
+        void* inkling_capture = nullptr;   // the whole run as one CUDA graph (tsg_inkling_compute)
+#endif
         // A modulation or gated residual of this graph ran its ops because its segment table is not one the fused kernels
         // take (more than tsg_h3_fused_max_segments(), or not on the host): MiniMax-H3's native DiT then builds the whole
         // block unfused, its BF16 SwiGLU-in-GEMM included, so a BF16 SwigluFfn is not served either.
@@ -502,6 +528,13 @@ namespace
 
         ~TsgGraph()
         {
+#if defined(TSG_GGML_USE_CUDA)
+            if (inkling_capture != nullptr)
+            {
+                host_read_barrier();
+                tsg_inkling_capture_free(inkling_capture);
+            }
+#endif
             if (galloc != nullptr)
             {
                 host_read_barrier();
@@ -1326,6 +1359,236 @@ namespace
     // builds), made from the region's inputs now, in the graph allocator's memory; its ops are numbered and not built, and
     // TSGgml_GraphRun runs the graph through tsg::dit_offload_compute. False (the ops are built) where the operands, the
     // device or a switch (TS_H3_FUSED, TS_H3_CUDNN_ATTENTION, TS_H3_CUBLAS_MATMUL) say otherwise.
+#if defined(TSG_GGML_USE_CUDA)
+    // The fused-op backend wrapping this process's ggml-cuda backend (made once a backend), or null where it cannot be made.
+    ggml_backend_t inkling_backend()
+    {
+        static ggml_backend_t wrapper = nullptr, wrapped = nullptr;
+        if (wrapped != g_backend)
+        {
+            wrapper = g_backend != nullptr ? tsg_dsv4_fused_backend_try_init(g_backend) : nullptr;
+            wrapped = g_backend;
+        }
+        return wrapper;
+    }
+
+    // Which Inkling kinds are served (TS_INKLING_FUSED: unset or "1" all of them, "0" none, else a list of clip, conv, mix,
+    // control, route, situ and sum): a switch for measuring and bisecting the fused kernels against the region's ops.
+    unsigned inkling_fused_mask()
+    {
+        static const unsigned mask = []() -> unsigned
+        {
+            const char* e = std::getenv("TS_INKLING_FUSED");
+            if (e == nullptr || *e == 0 || std::strcmp(e, "1") == 0 || std::strcmp(e, "all") == 0) return 0xFFu;
+            if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return 0u;
+            static const char* names[] = { "clip", "conv", "mix", "control", "route", "situ", "sum" };
+            const std::string list(e);
+            unsigned m = 0;
+            for (int i = 0; i < 7; i++)
+                if (list.find(names[i]) != std::string::npos) m |= 1u << i;
+            return m;
+        }();
+        return mask;
+    }
+
+    bool f32_contiguous(const ggml_tensor* t) { return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); }
+
+    ggml_tensor* inkling_node(TsgGraph* g, int kind, ggml_type type, std::int64_t ne0, std::int64_t ne1, std::int64_t ne2, std::int64_t ne3,
+                              std::initializer_list<ggml_tensor*> args, int i0 = 0, int i1 = 0, int i2 = 0, int i3 = 0, float f0 = 0.0f,
+                              float f1 = 0.0f)
+    {
+        g->inkling_descs.emplace_back();
+        tsg_dsv4_fused_desc& d = g->inkling_descs.back();
+        d.kind = kind;
+        d.i0 = i0; d.i1 = i1; d.i2 = i2; d.i3 = i3;
+        d.f0 = f0; d.f1 = f1;
+        d.cuda_compute = tsg_inkling_cuda_compute;
+        ggml_tensor* a[GGML_MAX_SRC];
+        int n = 0;
+        for (ggml_tensor* t : args)
+            if (t != nullptr) a[n++] = t;   // optional operands come last
+        ggml_tensor* out = ggml_custom_4d(g->ctx, type, ne0, ne1, ne2, ne3, a, n, tsg_dsv4_fused_cpu, 1, &d);
+        g->inkling_nodes++;
+        return out;
+    }
+
+    // Inkling 2's regions (GraphFusion.Inkling*, but attention) as fused nodes on ggml_cuda; false runs the region's ops (another
+    // backend, a shape the kernels do not take, or a kind TS_INKLING_FUSED leaves out).
+    bool try_serve_inkling_stage(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp,
+                           std::vector<ggml_tensor*>& results)
+    {
+        if (kind < FUSED_INKLING_CLIP || kind > FUSED_INKLING_EXPERT_SUM) return false;
+        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) return false;
+        if ((inkling_fused_mask() & (1u << (kind - FUSED_INKLING_CLIP))) == 0) return false;
+        if (inkling_backend() == nullptr) return false;
+        std::vector<ggml_tensor*> in(static_cast<std::size_t>(ns));
+        for (int i = 0; i < ns; i++)
+        {
+            in[static_cast<std::size_t>(i)] = node_at(g, s[i]);
+            if (in[static_cast<std::size_t>(i)] == nullptr) return false;
+        }
+        switch (kind)
+        {
+        case FUSED_INKLING_CLIP:
+        {
+            if (ns < 1 || nip < 1 || nfp < 1) return false;
+            ggml_tensor* x = in[0];
+            ggml_tensor* w = ip[0] != 0 ? (ns > 1 ? in[1] : nullptr) : nullptr;
+            if (!f32_contiguous(x) || x->ne[3] != 1 || x->ne[0] > 4096) return false;
+            if (ip[0] != 0 && (w == nullptr || !f32_contiguous(w) || w->ne[0] != x->ne[0] || ggml_nelements(w) != x->ne[0] * x->ne[1]))
+                return false;
+            results = { inkling_node(g, TSG_INKLING_CLIP, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], 1, { x, w }, 0, 0, 0, 0, fp[0]) };
+            return true;
+        }
+        case FUSED_INKLING_CONV:
+        {
+            if (ns < 3 || nip < 1 || nfp < 1) return false;
+            ggml_tensor *x = in[0], *win = in[1], *kern = in[2];
+            ggml_tensor* dyn = ip[0] > 0 ? (ns > 3 ? in[3] : nullptr) : nullptr;
+            const std::int64_t channels = x->ne[0], count = x->ne[1], taps = kern->ne[0];
+            if (!f32_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 || !f32_contiguous(kern) || kern->ne[1] != channels || taps < 2 || taps > 8)
+                return false;
+            if (win->type != GGML_TYPE_F32 || !ggml_is_contiguous(win) || win->ne[0] != taps - 1 || win->ne[1] != channels) return false;
+            if (ip[0] > 0 && (dyn == nullptr || !f32_contiguous(dyn) || dyn->ne[0] != taps * ip[0] || dyn->ne[1] != count || channels % ip[0] != 0))
+                return false;
+            results = { inkling_node(g, TSG_INKLING_CONV, GGML_TYPE_F32, channels, count, 1, 1, { x, win, kern, dyn },
+                                     static_cast<int>(ip[0]), 0, 0, 0, fp[0]) };
+            return true;
+        }
+        case FUSED_INKLING_MIX:
+        {
+            if (ns != 2 || nfp < 2) return false;
+            ggml_tensor *st = in[0], *q = in[1];
+            if (st->type != GGML_TYPE_F32 || st->nb[0] != sizeof(float) || st->ne[3] != 1 || st->ne[1] < 1 || st->ne[1] > 8) return false;
+            if (!f32_contiguous(q) || q->ne[0] != st->ne[0]) return false;
+            const std::int64_t queries = ggml_nelements(q) / q->ne[0];
+            if (queries < 1 || queries > 4 || st->ne[1] * queries > 32) return false;
+            // The partial sums (rows x 256-wide chunks x (n + n queries) floats, tsg_cuda_inkling_fused.cu) live past the result.
+            const std::int64_t h = st->ne[0], rows = st->ne[2], chunks = (h + 255) / 256;
+            const std::int64_t partial = rows * chunks * (st->ne[1] + st->ne[1] * queries);
+            const std::int64_t extra = (partial + h * queries - 1) / (h * queries);
+            ggml_tensor* node = inkling_node(g, TSG_INKLING_MIX, GGML_TYPE_F32, h, queries, rows + extra, 1, { st, q }, 0, 0, 0, 0, fp[0], fp[1]);
+            results = { ggml_view_3d(g->ctx, node, h, queries, rows, node->nb[1], node->nb[2], 0) };
+            return true;
+        }
+        case FUSED_INKLING_CONTROL:
+        {
+            if (ns != 5 || nfp < 1) return false;
+            ggml_tensor *x = in[0], *m = in[1], *down = in[2], *gain = in[3], *forget = in[4];
+            for (ggml_tensor* t : { x, m, down, gain, forget })
+                if (!f32_contiguous(t)) return false;
+            const std::int64_t h = x->ne[0], rows = x->ne[1], rank = down->ne[1];
+            if (x->ne[2] != 1 || m->ne[0] != h || m->ne[1] != rows || down->ne[0] != 2 * h || gain->ne[0] != rank || gain->ne[1] != h
+                || forget->ne[0] != rank || forget->ne[1] != h)
+                return false;
+            // The controller's rank values a row (g) live past the result, in the node's own tail.
+            const std::int64_t extra = (rank * rows + h - 1) / h;
+            ggml_tensor* node = inkling_node(g, TSG_INKLING_CONTROL, GGML_TYPE_F32, h, rows + extra, 1, 1, { x, m, down, gain, forget },
+                                             0, 0, 0, 0, fp[0]);
+            results = { ggml_view_2d(g->ctx, node, h, rows, node->nb[1], 0) };
+            return true;
+        }
+        case FUSED_INKLING_ROUTE:
+        {
+            if (ns != 2 || nip < 1 || nfp < 1) return false;
+            ggml_tensor *logits = in[0], *bias = in[1];
+            const std::int64_t experts = logits->ne[0], rows = logits->ne[1], top = ip[0];
+            if (!f32_contiguous(logits) || logits->ne[2] != 1 || experts > 1024 || !f32_contiguous(bias) || ggml_nelements(bias) != experts
+                || top < 1 || top > 32 || top > experts)
+                return false;
+            ggml_tensor* ids = inkling_node(g, TSG_INKLING_ROUTE_IDS, GGML_TYPE_I32, top, rows, 1, 1, { logits, bias }, static_cast<int>(top));
+            ggml_tensor* weights = inkling_node(g, TSG_INKLING_ROUTE_WEIGHTS, GGML_TYPE_F32, 1, top, rows, 1, { logits, ids },
+                                                static_cast<int>(top), 0, 0, 0, fp[0]);
+            results = { ids, weights };
+            return true;
+        }
+        case FUSED_INKLING_SITU:
+        {
+            if (ns != 1 || nfp < 2) return false;
+            ggml_tensor* gu = in[0];
+            if (!f32_contiguous(gu) || gu->ne[0] % 2 != 0) return false;
+            results = { inkling_node(g, TSG_INKLING_SITU, GGML_TYPE_F32, gu->ne[0] / 2, gu->ne[1], gu->ne[2], gu->ne[3], { gu }, 0, 0, 0, 0,
+                                     fp[0], fp[1]) };
+            return true;
+        }
+        case FUSED_INKLING_EXPERT_SUM:
+        {
+            if (ns != 2) return false;
+            ggml_tensor *down = in[0], *weights = in[1];
+            if (!f32_contiguous(down) || down->ne[3] != 1 || !f32_contiguous(weights) || weights->ne[0] != 1 || weights->ne[1] != down->ne[1]
+                || weights->ne[2] != down->ne[2])
+                return false;
+            results = { inkling_node(g, TSG_INKLING_EXPERT_SUM, GGML_TYPE_F32, down->ne[0], down->ne[2], 1, 1, { down, weights }) };
+            return true;
+        }
+        default:
+            return false;
+        }
+    }
+
+    // Inkling 2's attention region (GraphFusion.InklingAttention) as one fused node on ggml_cuda (tsg_inkling_fused.h);
+    // false where it cannot be served (the caller then fails the build: the region's ops are a placeholder).
+    bool try_serve_inkling(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp,
+                           std::vector<ggml_tensor*>& results, std::string& why)
+    {
+        if (kind != FUSED_INKLING_ATTENTION) return false;
+        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) { why = "not a single-device ggml_cuda graph"; return false; }
+        if (inkling_backend() == nullptr) { why = "no fused-op backend"; return false; }
+        if (ns != 5 || nip < 6 || nfp < 1)
+        {
+            why = "inputs q, k, v, T, positions; ip ring, extent, band, first key, floor, row offset; fp scale";
+            return false;
+        }
+        ggml_tensor* in[5];
+        for (int i = 0; i < 5; i++)
+            if ((in[i] = node_at(g, s[i])) == nullptr) { why = "a missing input"; return false; }
+        ggml_tensor *q = in[0], *k = in[1], *v = in[2], *table = in[3], *pos = in[4];
+        const std::int64_t d = q->ne[0], count = q->ne[1], heads = q->ne[2], keys = k->ne[1], kvh = k->ne[2], dv = v->ne[0];
+        if (q->type != GGML_TYPE_F32 || q->nb[0] != sizeof(float) || q->ne[3] != 1) { why = "q is not F32 rows"; return false; }
+        if ((k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32) || v->type != k->type || k->nb[0] != ggml_type_size(k->type)
+            || v->nb[0] != ggml_type_size(v->type) || k->ne[3] != 1 || v->ne[3] != 1)
+        {
+            why = "K/V are not F16 or F32 rows";
+            return false;
+        }
+        if (k->ne[0] != d || v->ne[1] != keys || v->ne[2] != kvh
+            || !tsg_inkling_attention_supported((int)d, (int)dv, (int)heads, (int)kvh))
+        {
+            why = "a shape the kernels do not take";
+            return false;
+        }
+        if (table->type != GGML_TYPE_F32 || !ggml_is_contiguous(table) || table->ne[0] != ip[1] + 1 || table->ne[1] != heads
+            || table->ne[2] != count)
+        {
+            why = "the bias table is not contiguous F32 [extent + 1, heads, rows]";
+            return false;
+        }
+        if (pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) || ip[5] < 0 || ip[5] + count > ggml_nelements(pos))
+        {
+            why = "the positions do not cover the rows";
+            return false;
+        }
+        for (int i = 0; i < 6; i++)
+            if (ip[i] < 0 || ip[i] > INT32_MAX) { why = "an ip out of range"; return false; }
+        if (ip[1] < 1) { why = "no extent"; return false; }
+        g->inkling_descs.emplace_back();
+        tsg_dsv4_fused_desc& desc = g->inkling_descs.back();
+        desc.kind = TSG_INKLING_ATTENTION;
+        desc.i0 = (int32_t)ip[0]; desc.i1 = (int32_t)ip[1]; desc.i2 = (int32_t)ip[2]; desc.i3 = (int32_t)ip[3];
+        desc.i4 = (int32_t)ip[4]; desc.i5 = (int32_t)ip[5];
+        desc.f0 = fp[0];
+        desc.cuda_compute = tsg_inkling_cuda_compute;
+        // The split kernel's partials live past the result, in the node's own tail.
+        const std::int64_t workspace = tsg_inkling_attention_workspace_floats(count, heads, kvh, keys, dv);
+        const std::int64_t extra = (workspace + dv * heads - 1) / (dv * heads);
+        ggml_tensor* args[5] = { q, k, v, table, pos };
+        ggml_tensor* node = ggml_custom_4d(g->ctx, GGML_TYPE_F32, dv, heads, count + extra, 1, args, 5, tsg_dsv4_fused_cpu, 1, &desc);
+        g->inkling_nodes++;
+        results = { extra > 0 ? ggml_view_3d(g->ctx, node, dv, heads, count, node->nb[1], node->nb[2], 0) : node };
+        return true;
+    }
+#endif
+
     bool try_serve_in_graph(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp,
                             std::vector<ggml_tensor*>& results)
     {
@@ -2760,6 +3023,28 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before)
                 g_backend_compute_failed.store(true, std::memory_order_release);
         }
+#if defined(TSG_GGML_USE_CUDA)
+        else if (g->inkling_nodes > 0)
+        {
+            // Inkling 2's fused nodes: the fused-op backend runs the graph's ordinary nodes on ggml-cuda as graph views and
+            // launches the fused ones between them, all on one stream.
+            const std::uint64_t errors_before = g_ggml_error_count.load(std::memory_order_acquire);
+            // A replayable graph (a decode step) as one CUDA graph (TS_INKLING_CAPTURE=0 runs it as it is): the fused nodes split
+            // it into many ggml-cuda runs, which the host takes longer to submit than the device to run.
+            static const bool capture = []() { const char* e = std::getenv("TS_INKLING_CAPTURE"); return e == nullptr || std::strcmp(e, "0") != 0; }();
+            if (graph_node_profile_enabled())
+                status = graph_compute_profiled(inkling_backend(), g->graph, g->replayable ? "graph builder decode" : "graph builder prefill");
+            else if (capture && g->replayable)
+            {
+                if (g->inkling_capture == nullptr) g->inkling_capture = tsg_inkling_capture_new();
+                status = tsg_inkling_compute(g->inkling_capture, inkling_backend(), graph_backend(g), g->graph, 2);
+            }
+            else
+                status = ggml_backend_graph_compute_async(inkling_backend(), g->graph);
+            if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before)
+                g_backend_compute_failed.store(true, std::memory_order_release);
+        }
+#endif
         else if (graph_node_profile_enabled())
         {
             status = graph_compute_profiled(graph_backend(g), g->graph, g->replayable ? "graph builder decode" : "graph builder prefill");
@@ -2913,6 +3198,22 @@ TSG_EXPORT int TSGgml_GraphFusedBegin(void* handle, int kind, const int* srcs, i
         }
 #if defined(TSG_GGML_USE_CUDA)
         std::vector<ggml_tensor*> in_graph;
+        std::string inkling_why;
+        if (try_serve_inkling(g, kind, srcs, nsrc, ip, nip, fp, nfp, in_graph, inkling_why)
+            || try_serve_inkling_stage(g, kind, srcs, nsrc, ip, nip, fp, nfp, in_graph))
+        {
+            DeviceRegion r;
+            r.kind = kind;
+            r.in_graph = true;
+            r.results = std::move(in_graph);
+            g->regions.push_back(std::move(r));
+            g->open_regions.push_back(static_cast<int>(g->regions.size()) - 1);
+            g->serving = g->open_regions.back();
+            return 1;
+        }
+        if (kind == FUSED_INKLING_ATTENTION)
+            throw std::runtime_error("graph builder: an Inkling attention region could not be served (" + inkling_why
+                                     + "); its ops are a placeholder");
         if (try_serve_in_graph(g, kind, srcs, nsrc, ip, nip, fp, nfp, in_graph))
         {
             DeviceRegion r;

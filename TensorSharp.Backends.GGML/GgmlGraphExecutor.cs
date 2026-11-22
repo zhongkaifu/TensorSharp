@@ -83,6 +83,8 @@ namespace TensorSharp.GGML
                 GreedyIdOutputs = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
                 // Suppressed tokens (a reply-token policy) as a mask the greedy head adds (GreedyHead).
                 GreedyIdSuppression = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
+                // Inkling 2's attention as one TensorSharp kernel (tsg_cuda_inkling_fused.cu).
+                RelativeBiasAttention = backend == GgmlBackendType.Cuda,
             };
         }
 

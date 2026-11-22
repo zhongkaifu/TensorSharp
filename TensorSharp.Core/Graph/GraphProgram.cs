@@ -362,6 +362,43 @@ namespace TensorSharp.Graph
         /// eps. Result: the concatenation [heads * d, every sequence's rows]. An executor may run every sequence's norm in one
         /// dispatch into the concatenation; each value is its op's.</summary>
         GatedRmsNorms = 29,
+        /// <summary>Inkling 2's attention over one sequence's keys (Inkling2RuntimeModel): the keys a row sees found from the
+        /// positions, each score's relative bias gathered from the row's table. Inputs: q [d, rows, heads], K [d, keys, kv]
+        /// and V [dv, keys, kv] (F16 or F32), T [extent + 1, heads, rows] (B r - t by distance, the last entry - t) and the
+        /// step's positions (I32). Ip: the ring's cells (0: a linear window), the extent, the band (0: none), the first
+        /// key's position (a linear window), the attention floor, the rows' first index in the positions. Fp: the scale.
+        /// Result: [dv, heads, rows]. The region's ops are a placeholder: a family emits it only for an executor that serves
+        /// it (<see cref="GraphCapabilities.RelativeBiasAttention"/>), and one that cannot fails the build.</summary>
+        InklingAttention = 30,
+        /// <summary>Inkling 2's L2 clip: each [d] vector of x [d, heads, rows] (contiguous), after the optional per-channel
+        /// scale w [d, heads] (Ip[0] = 1), times min(1, threshold / (||v|| + 1e-6)). Inputs: x[, w]. Ip: has the scale. Fp:
+        /// threshold. Result: [d, heads, rows].</summary>
+        InklingClip = 31,
+        /// <summary>Inkling 2's causal short convolution of one sequence's rows with its residual: out = scale (x + conv), conv
+        /// the static taps over [window | x] (ggml_ssm_conv's order: tap i of output t reads input t + i, the last tap the row
+        /// itself) plus, with dynamic taps, each head's x[t - L] times the row's lag-L tap; the window then holds the last
+        /// taps - 1 inputs. Inputs: x [channels, rows] (contiguous), the window [taps - 1, channels] (a view of the state leaf,
+        /// written in place), the kernel [taps, channels][, the dynamic taps [taps * heads, rows]]. Ip: heads (0: none). Fp:
+        /// scale. Result: [channels, rows].</summary>
+        InklingConv = 32,
+        /// <summary>Inkling 2's attention over depth: the states [hidden, n, rows] (a strided view of the stream) RMS-normed
+        /// with no weight, scored against each query (the weight [hidden, queries]), softmax over the n states of the scores
+        /// times Fp[1], and the normed states' mix [hidden, queries, rows]. Fp: eps, scale.</summary>
+        InklingMix = 33,
+        /// <summary>Inkling 2's loop controller: x - tanh(forget g) x + tanh(gain g) m, g = down [rms(x); rms(m)] (no norm
+        /// weight). Inputs: x and m [hidden, rows] (contiguous), down [2 hidden, rank], gain and forget [rank, hidden] (F32).
+        /// Fp: eps. Result: [hidden, rows].</summary>
+        InklingControl = 34,
+        /// <summary>Inkling 2's router: probs = sigmoid(logits [E, rows]), the top K of probs + bias (a tie to the lower
+        /// expert) and their unbiased probs normalized (sum + 1e-20) and times Fp[0]. Inputs: logits, bias [E]. Ip: K. Results:
+        /// the ids [K, rows] (I32) and the weights [1, K, rows].</summary>
+        InklingRoute = 35,
+        /// <summary>Inkling 2's SITU over a fused gate|up product [2 ff, K, rows] (gate the first ff rows):
+        /// beta tanh(g / beta) sigmoid(g) * lb tanh(u / lb). Fp: beta, lb. Result: [ff, K, rows].</summary>
+        InklingSitu = 36,
+        /// <summary>Inkling 2's routed experts' weighted sum: sum_k down[:, k] * weights[k] for each row, the products rounded
+        /// and added in expert order. Inputs: down [hidden, K, rows] (contiguous), weights [1, K, rows]. Result: [hidden, rows].</summary>
+        InklingExpertSum = 37,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
