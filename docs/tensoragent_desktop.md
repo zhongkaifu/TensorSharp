@@ -152,6 +152,11 @@ the conversation, partial answer and your guidance. **Stop** remains available
 to interrupt without adding a message. Rapid guidance messages wait for the
 previous generation and tool cleanup before the next response starts.
 
+While an answer streams, the chat follows it only while you are at the bottom. Scroll
+up to read an earlier part and it stays there; choose the **↓** button above the
+composer, or scroll back to the bottom, to follow the answer again. With a model that
+speaks (LFM3-Omni), **Speak replies** plays the reply while it is written.
+
 Interrupted model downloads retain partial files. Return to **Models** and choose
 **Resume** or **Retry**. The app verifies downloaded model files before use; you
 do not need to download GGUFs manually for the built-in catalog.

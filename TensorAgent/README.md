@@ -244,6 +244,14 @@ plus prompt/KV reuse when reported and a stopped/truncated marker when applicabl
 Those statistics are saved with the conversation and return when it is reopened;
 image/video turns do not show the placeholder zero-token counters.
 
+While an answer streams, the chat follows it only while you are at the bottom. Scroll up
+(a drag, a wheel, a key) and it stays where you put it for the rest of the answer, with
+a **↓** button above the composer to jump back to the newest line; coming back to the
+bottom by hand follows again too. The answer paints at most once per display frame, and
+only the paragraph still being written is redrawn, so a long reply costs no more to
+show at its end than at its start (a spoken reply's audio is queued as it arrives, before
+any of that). The bundled Web UI follows the reader the same way.
+
 **Spoken replies.** With a model that speaks loaded (LFM3-Omni and its projector, which carries
 the speech decoder), the composer shows a **Speak replies** switch and, when the model has more
 than one, a voice picker. A reply sent with it on is spoken while it is written: the page plays the
