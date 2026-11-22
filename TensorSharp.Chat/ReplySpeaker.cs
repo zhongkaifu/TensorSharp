@@ -33,7 +33,7 @@ namespace TensorSharp.Server
     {
         private readonly Func<string, int, CancellationToken, IAsyncEnumerable<ChatStreamUpdate>> _speak;
         private readonly SpeechTextSegmenter _segmenter;
-        private readonly Channel<string> _pieces = Channel.CreateUnbounded<string>(
+        private readonly Channel<(string Text, double QueuedMs)> _pieces = Channel.CreateUnbounded<(string, double)>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
         private readonly Channel<ChatStreamUpdate> _audio = Channel.CreateUnbounded<ChatStreamUpdate>(
             new UnboundedChannelOptions { SingleReader = false, SingleWriter = true });
@@ -80,6 +80,21 @@ namespace TensorSharp.Server
         /// <summary>Every spoken piece's frames, in order.</summary>
         public List<int[]> Frames { get; } = new();
 
+        /// <summary>When each piece was cut from the text, given to the engine, first heard from and finished, in
+        /// milliseconds from this speaker's start, and how much speech it made: what tells a reply whose speech fell
+        /// behind its playback (a piece that started late, or ran slower than realtime) from one that did not.</summary>
+        public IReadOnlyList<PieceTiming> Timings { get { lock (_timings) return _timings.ToArray(); } }
+
+        private readonly List<PieceTiming> _timings = new();
+
+        /// <summary>One spoken piece's timeline (<see cref="Timings"/>); -1 where it did not get that far.</summary>
+        public readonly record struct PieceTiming(int Index, int Chars, double QueuedMs, double StartMs, double FirstAudioMs,
+            double EndMs, double AudioSeconds)
+        {
+            public override string ToString() => FormattableString.Invariant(
+                $"#{Index} {Chars}ch queued={QueuedMs:F0} start={StartMs:F0} first={FirstAudioMs:F0} end={EndMs:F0} audio={AudioSeconds:F2}s");
+        }
+
         /// <summary>Visible answer text, as it streams.</summary>
         public void Say(string text)
         {
@@ -87,7 +102,7 @@ namespace TensorSharp.Server
             lock (_gate)
             {
                 if (_closed) return;
-                foreach (string piece in _segmenter.Append(text)) _pieces.Writer.TryWrite(piece);
+                foreach (string piece in _segmenter.Append(text)) _pieces.Writer.TryWrite((piece, _clock.Elapsed.TotalMilliseconds));
             }
         }
 
@@ -107,7 +122,7 @@ namespace TensorSharp.Server
             lock (_gate)
             {
                 if (_closed) return;
-                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite(piece);
+                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite((piece, _clock.Elapsed.TotalMilliseconds));
             }
         }
 
@@ -118,7 +133,7 @@ namespace TensorSharp.Server
             {
                 if (_closed) return;
                 _closed = true;
-                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite(piece);
+                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite((piece, _clock.Elapsed.TotalMilliseconds));
                 _pieces.Writer.TryComplete();
             }
         }
@@ -150,8 +165,10 @@ namespace TensorSharp.Server
             {
                 CancellationToken token = _cancel.Token;
                 int index = 0;
-                await foreach (string piece in _pieces.Reader.ReadAllAsync(token).ConfigureAwait(false))
+                await foreach ((string piece, double queuedMs) in _pieces.Reader.ReadAllAsync(token).ConfigureAwait(false))
                 {
+                    double startMs = _clock.Elapsed.TotalMilliseconds, firstMs = -1;
+                    long samplesBefore = Samples;
                     await foreach (ChatStreamUpdate update in _speak(piece, index, token).WithCancellation(token).ConfigureAwait(false))
                     {
                         if (update.Done)
@@ -161,11 +178,15 @@ namespace TensorSharp.Server
                             continue;
                         }
                         if (update.Audio is not { Length: > 0 } samples) continue;
-                        if (FirstAudioMs < 0) FirstAudioMs = _clock.Elapsed.TotalMilliseconds;
+                        if (firstMs < 0) firstMs = _clock.Elapsed.TotalMilliseconds;
+                        if (FirstAudioMs < 0) FirstAudioMs = firstMs;
                         Samples += samples.Length;
                         if (update.AudioSampleRate > 0) SampleRate = update.AudioSampleRate;
                         _audio.Writer.TryWrite(update);
                     }
+                    lock (_timings)
+                        _timings.Add(new PieceTiming(index, piece.Length, queuedMs, startMs, firstMs, _clock.Elapsed.TotalMilliseconds,
+                            (Samples - samplesBefore) / (double)Math.Max(1, SampleRate)));
                     lock (_spoken) _spoken.Add(piece);
                     Pieces = ++index;
                 }

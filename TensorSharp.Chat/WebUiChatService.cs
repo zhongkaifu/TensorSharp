@@ -3855,6 +3855,10 @@ namespace TensorSharp.Chat
                     spokenAudio.Seconds ?? 0, spoken.Speaker.FirstAudioMs, sw.Elapsed.TotalMilliseconds, reportedInvocations,
                     visibleAnswer.Length, turnPromptTokens, turnKvReusedTokens, turnFinishReason ?? "(none)",
                     LogContent.Of(string.Join(" | ", spoken.Speaker.Spoken)));
+                // When each piece was cut, started, first heard and done (ms from the speech's start): a reply whose speech
+                // fell behind its playback shows here as a piece that started late or ran slower than its audio.
+                webUiLogger.LogInformation(LogEventIds.ChatCompleted, "/api/chat spoken turn pieces: session={SessionId} {Pieces}",
+                    chatSession.Id, string.Join("; ", spoken.Speaker.Timings));
             }
             foreach (object frame in finalFrames)
                 yield return frame;
