@@ -332,7 +332,8 @@ namespace TensorSharp.Server.Skills
                     calls, plan.ClientTools,
                     out List<ToolCall> skillCalls,
                     out List<ToolCall> clientCalls,
-                    out List<ToolCall> unknownCalls);
+                    out List<ToolCall> unknownCalls,
+                    plan.ToolContext);
                 bool originalAccessAllowedThisRound = CanAccessOriginal();
 
                 if (skillCalls.Count == 0 && unknownCalls.Count == 0)
@@ -877,7 +878,8 @@ namespace TensorSharp.Server.Skills
                 calls, plan.ClientTools,
                 out List<ToolCall> skillCalls,
                 out List<ToolCall> clientCalls,
-                out List<ToolCall> unknownCalls);
+                out List<ToolCall> unknownCalls,
+                plan.ToolContext);
 
             // Completion guards are attached only when the request has no client tools.
             // Still close any unexpected progress line rather than leaking a call this
@@ -1722,7 +1724,10 @@ namespace TensorSharp.Server.Skills
             // from their first result whatever it was.
             // An install of the same package returns the same thing the second time ("Already
             // installed" with the whole SKILL.md again — fourteen times in one observed turn).
+            // A provided tool (web_search) given the same input in one turn fetches the same pages.
+            bool provided = plan.ToolContext?.IsProvidedTool(call.Name) == true;
             bool sameResult = call.Name is SkillMarketplaceTools.SearchToolName or SkillMarketplaceTools.InstallToolName
+                || provided
                 || string.Equals(SkillToolNames.CanonicalName(call.Name), SkillToolNames.Shell, StringComparison.Ordinal);
             if (sameResult && call.Name == SkillMarketplaceTools.InstallToolName
                 && plan.ToolContext?.Marketplace?.InstallLimitReached == true)
@@ -1735,7 +1740,7 @@ namespace TensorSharp.Server.Skills
                     : ShellCommand.ReadCommand(call.Arguments != null && call.Arguments.TryGetValue("command", out object raw) ? raw : null)?.Trim();
                 if (string.IsNullOrEmpty(body))
                     return null;
-                if (call.Name is SkillMarketplaceTools.SearchToolName or SkillMarketplaceTools.InstallToolName)
+                if (call.Name is SkillMarketplaceTools.SearchToolName or SkillMarketplaceTools.InstallToolName || provided)
                     return SameResultRepeatPrefix + call.Name + "\n" + body;
                 return plan.ToolContext?.Workspace is { } shellWorkspace
                     ? SameResultRepeatPrefix + SkillToolNames.Shell + "\n" + body + "\n" + WorkspaceFingerprint(shellWorkspace)

@@ -133,7 +133,26 @@ skill provides `WebSearch` and `WebFetch` — with that skill's exact call. A hu
 skill that ships no scripts holds no data, so its result — when it is installed, read,
 or inspected without being installed — says where current figures come from in this
 conversation (that web-search call) or that they cannot be checked, instead of leaving
-the model to state prices from memory. Wherever the host shows such a declared call (that
+the model to state prices from memory.
+
+**Provided tools are real tools.** When `skills_run` is enabled and a reachable skill that
+can run on this host declares `provides-tools` and a `provides-call` the host reads exactly
+(`skills_run(skill="…", path="…", args=[…, "<placeholder>", …])`, optionally followed by
+`, then read <file>`), each provided tool is declared to the model as a tool of its own
+with one string parameter: `WebSearch` becomes `web_search(query)`, `WebFetch` becomes
+`web_fetch(url)`, and any other name becomes its snake-case name with an `input`
+parameter. Its description is the providing skill's own description line. A call runs the
+declared call through `skills_run` (the same sandbox and Run code switch) with the
+parameter in the placeholder's place, and returns the script's output followed by the
+file the declared call says to read (up to 24 KB; the rest is a `read_file` away). With
+the bundled research skill, `web_search` and `web_fetch` run `research.py`, and the
+result carries `notes.md`. A name another tool already has is not taken, and an
+identical call in the same turn is answered from its first result. This is the default
+since a 2B model fetched current data in 6 of 6 traced turns with `web_search`, against
+4 of 6 when it had to fill `skills_run(skill, path, args=[…])` itself, and 0 of 6 before
+these changes. Plain questions and skill tasks did not call it.
+
+Wherever the host shows such a declared call (that
 note, a search with no hub hit, the installed-skills lines, the tool mapping, a script read),
 its placeholder arguments (`"<question>"`) are filled with the user's latest message,
 whitespace collapsed and at most 300 characters, so the call can be copied as it is. A

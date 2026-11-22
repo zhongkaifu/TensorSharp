@@ -120,12 +120,17 @@ namespace TensorSharp.AgentHost.Skills
         /// answered.
         /// </para>
         /// </param>
+        /// <param name="context">
+        /// The request's tool context, whose provided tools (<see cref="SkillToolContext.OfferProvidedTools"/>)
+        /// are this host's to answer too; null when there is none.
+        /// </param>
         public static void Partition(
             IEnumerable<ToolCall?>? calls,
             IReadOnlyCollection<ToolFunction>? clientTools,
             out List<ToolCall> builtIn,
             out List<ToolCall> client,
-            out List<ToolCall> unknown)
+            out List<ToolCall> unknown,
+            SkillToolContext? context = null)
         {
             builtIn = new List<ToolCall>();
             client = new List<ToolCall>();
@@ -157,7 +162,7 @@ namespace TensorSharp.AgentHost.Skills
                 // it here would be running something else entirely.
                 if (theirs != null && call.Name != null && theirs.Contains(call.Name))
                     client.Add(call);
-                else if (IsBuiltInTool(call.Name))
+                else if (IsBuiltInTool(call.Name) || context?.IsProvidedTool(call.Name) == true)
                     builtIn.Add(call);
                 else if (theirs == null)
                     client.Add(call);
@@ -650,6 +655,9 @@ namespace TensorSharp.AgentHost.Skills
                     // code tool is one edit, in the place that already holds the names.
                     _ when SkillToolNames.IsCodeTool(call.Name) =>
                         ExecuteCode(call, context, onToolOutput),
+
+                    _ when context.ProvidedToolNamed(call.Name) is { } provided =>
+                        provided.Execute(call, context, onToolOutput),
 
                     _ => SkillToolResult.Failure($"'{call.Name}' is not a tool this host answers."),
                 };
@@ -1409,6 +1417,25 @@ namespace TensorSharp.AgentHost.Skills
         /// to guess intent; null when the host's loop does not set it.
         /// </summary>
         public string? UserRequest { get; set; }
+
+        private IReadOnlyList<ProvidedTool> _provided = Array.Empty<ProvidedTool>();
+
+        /// <summary>
+        /// Declare the tools the reachable skills provide (<see cref="ProvidedTool"/>) for this
+        /// request, under names none of <paramref name="takenNames"/> has; empty when skill
+        /// scripts cannot run here or no reachable skill that runs here declares one.
+        /// </summary>
+        public IReadOnlyList<ToolFunction> OfferProvidedTools(IEnumerable<string?> takenNames)
+        {
+            _provided = ProvidedTool.For(this, takenNames.Where(n => !string.IsNullOrEmpty(n)).Select(n => n!));
+            return _provided.Select(tool => tool.Declare()).ToArray();
+        }
+
+        /// <summary>Whether <paramref name="name"/> is one of this request's provided tools.</summary>
+        public bool IsProvidedTool(string? name) => ProvidedToolNamed(name) != null;
+
+        internal ProvidedTool? ProvidedToolNamed(string? name) =>
+            name == null ? null : _provided.FirstOrDefault(tool => string.Equals(tool.Name, name, StringComparison.Ordinal));
 
         /// <summary>The latest user message with text in <paramref name="messages"/>, or null.</summary>
         public static string? LatestUserText(IEnumerable<ChatMessage>? messages) =>
