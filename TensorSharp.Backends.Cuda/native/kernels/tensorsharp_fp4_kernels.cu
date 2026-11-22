@@ -23,6 +23,9 @@
 //   * ts_fp4_gemm_w4a4_tma<bm>: prompt rows, TMA-fed and warp-specialized (the same products in the same order);
 //     ts_fp4_gemm_w4a4_tma<bm>_swiglu a fused gate|up projection's rows with silu(gate) * up in the epilogue.
 //   * ts_fp4_get_rows_f32: rows of a planar matrix as F32 (an NVFP4 table's lookup).
+//   * ts_fp4_quantize_q81_f16 + ts_fp4_gemm_w4a8_tma: rows of q8_1 activations on the F16 tensor cores, TMA-fed, for a
+//     model that keeps 8-bit activations on its prompt rows (--nvfp4-prompt-activations q8): the matvec's products at
+//     any number of rows; ts_fp4_gemm_w4a8 the same products on the int8 tensor cores where TMA cannot take the matrix.
 //
 // The kernels came from the removed direct-CUDA Qwen3.5 engine (bit-identical arithmetic). The tensor-core bodies exist
 // only in an sm_120a / sm_121a image (CommittedBaseline false: no compute_75 baseline); ts_fp4_mma_caps reports whether
@@ -39,7 +42,7 @@
 #define TS_FP4_NVFP4_BLOCK 64
 #define TS_FP4_NVFP4_BLOCK_BYTES 36
 
-#define TS_FP4_VERSION 7
+#define TS_FP4_VERSION 9
 
 __device__ __forceinline__ float ts_fp4_warp_sum(float v)
 {
@@ -118,6 +121,27 @@ extern "C" __global__ void ts_fp4_quantize_q81_f32(
     const float d = amax / 127.0f;
     const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
     xq[row * k + b * 32 + lane] = (int8_t)q;
+    if (lane == 0)
+        xd[row * blocks + b] = d;
+}
+
+// The same quantization with the integers stored as F16 (exact), for the W4A8 GEMM on the F16 tensor cores
+// (ts_fp4_gemm_w4a8_tma). xh: [rows, k] F16, xd: [rows, k / 32] F32.
+extern "C" __global__ void ts_fp4_quantize_q81_f16(
+    const float* __restrict__ x, __half* __restrict__ xh, float* __restrict__ xd, int k, int rows)
+{
+    const int blocks = k >> 5;
+    const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= (long long)blocks * rows)
+        return;
+    const long long row = warp / blocks;
+    const int b = (int)(warp % blocks);
+    const float v = x[row * k + b * 32 + lane];
+    const float amax = ts_fp4_warp_max(fabsf(v));
+    const float d = amax / 127.0f;
+    const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
+    xh[row * k + b * 32 + lane] = __int2half_rn(q);
     if (lane == 0)
         xd[row * blocks + b] = d;
 }
@@ -1366,3 +1390,395 @@ __device__ __forceinline__ void ts_fp4_gemm_w4a4_swiglu(
 // grid (ff / 64, activation tiles, splits).
 TS_FP4_GEMM_SWIGLU(ts_fp4_gemm_w4a4_32_swiglu, 32, 8, 1, 3)
 TS_FP4_GEMM_SWIGLU(ts_fp4_gemm_w4a4_64_swiglu, 64, 4, 2, 3)
+
+// ---------------------------------------------------------------------------
+// W4A8: prompt rows of q8_1 activations (ts_fp4_quantize_q81_f32: int8 [rows][k], one F32 scale per 32 values) times a
+// planar NVFP4 matrix on the int8 tensor cores, for a model that keeps 8-bit activations on its prompt rows
+// (--nvfp4-prompt-activations q8). The quantities are the q8 matvec's: E2M1 codes as int8 at twice their value
+// (ts_fp4_e2m1x8), each 16-value block's int32 sum (one mma.m16n8k16, a block's K) scaled by its halved UE4M3 weight scale
+// and its 32-value activation scale into F32. Only the order of the F32 sums differs from the matvec's.
+// CTA: 64 activation rows x 64 weight rows, 4 warps of 32 x 32, K in steps of 64 (four weight blocks, two activation
+// blocks); a register-staged double buffer keeps the next step's loads in flight over the current step's products.
+// k a multiple of 64 (CudaFp4Kernels.TakesWidth); rows and outDim any.
+// ---------------------------------------------------------------------------
+#define TS_W4A8_BM 64
+#define TS_W4A8_BN 64
+#define TS_W4A8_BK 64
+// Shared rows padded by 16 bytes: the eight rows of a fragment load then fall in distinct banks.
+#define TS_W4A8_LD (TS_W4A8_BK + 16)
+
+__device__ __forceinline__ void ts_w4a8_mma(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0)
+{
+    d[0] = d[1] = d[2] = d[3] = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a0), "r"(a1), "r"(b0));
+#else
+    (void) a0; (void) a1; (void) b0;
+    __trap();
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(128) ts_fp4_gemm_w4a8(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, int outDim, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xd, int rows, float alpha, float* __restrict__ y)
+{
+    __shared__ __align__(16) int8_t As[2][TS_W4A8_BM][TS_W4A8_LD];
+    __shared__ __align__(16) int8_t Bs[2][TS_W4A8_BN][TS_W4A8_LD];
+    __shared__ float Asc[2][TS_W4A8_BM][2];   // activation scales: two 32-value blocks a step
+    __shared__ float Bsc[2][TS_W4A8_BN][4];   // halved UE4M3 weight scales: four 16-value blocks a step
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, tg = lane & 3;
+    const int wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
+    const long long row0 = (long long)blockIdx.y * TS_W4A8_BM, col0 = (long long)blockIdx.x * TS_W4A8_BN;
+    const int steps = k / TS_W4A8_BK;
+    const int scalesPerRow = k >> 5;
+
+    // Each thread stages: two 16-byte runs of activations (row tid / 2, bytes (tid & 1) * 32 ..), one 16-byte run of
+    // codes (weight row tid / 2, the step's 32 code bytes' half tid & 1), one activation scale and one weight-scale word.
+    const int ar = tid >> 1, ah = tid & 1;
+    const bool aIn = row0 + ar < rows, bIn = col0 + ar < outDim;
+    const int8_t* aSrc = xq + (aIn ? (row0 + ar) : 0) * (long long)k + ah * 32;
+    const uint8_t* bSrc = codes + (bIn ? (col0 + ar) : 0) * (long long)(k / 2) + ah * 16;
+    const uint8_t* sSrc = scales + (bIn ? (col0 + ar) : 0) * (long long)(k / 16);
+    const float* dSrc = xd + (aIn ? (row0 + ar) : 0) * (long long)scalesPerRow + ah;
+
+    int4 ra0, ra1, rb;
+    float rd;
+    uint32_t rs;
+    auto fetch = [&](int s)
+    {
+        if (aIn)
+        {
+            const int4* p = (const int4*)(aSrc + (long long)s * TS_W4A8_BK);
+            ra0 = p[0]; ra1 = p[1];
+            rd = dSrc[s * 2];
+        }
+        else
+        {
+            ra0 = ra1 = make_int4(0, 0, 0, 0);
+            rd = 0.0f;
+        }
+        if (bIn)
+        {
+            rb = *(const int4*)(bSrc + (long long)s * (TS_W4A8_BK / 2));
+            rs = *(const uint32_t*)(sSrc + (long long)s * 4);
+        }
+        else
+        {
+            rb = make_int4(0, 0, 0, 0);
+            rs = 0;
+        }
+    };
+    auto stage = [&](int buf)
+    {
+        *(int4*)&As[buf][ar][ah * 32] = ra0;
+        *(int4*)&As[buf][ar][ah * 32 + 16] = ra1;
+        Asc[buf][ar][ah] = rd;
+        // 32 codes: two 16-value blocks of this half of the step, each to int8 in value order. Within a block byte j
+        // holds value j (low nibble) and value j + 8 (high): ts_fp4_e2m1x8 of bytes 0-3 gives values 0-3 | 8-11, of
+        // bytes 4-7 values 4-7 | 12-15.
+        const uint32_t w[4] = { (uint32_t)rb.x, (uint32_t)rb.y, (uint32_t)rb.z, (uint32_t)rb.w };
+#pragma unroll
+        for (int blk = 0; blk < 2; ++blk)
+        {
+            const int2 v0 = ts_fp4_e2m1x8((int)w[2 * blk]), v1 = ts_fp4_e2m1x8((int)w[2 * blk + 1]);
+            *(int4*)&Bs[buf][ar][(ah * 2 + blk) * 16] = make_int4(v0.x, v1.x, v0.y, v1.y);
+        }
+        if (ah == 0)
+        {
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+                Bsc[buf][ar][q] = ts_fp4_ue4m3(rs >> (8 * q));
+        }
+    };
+
+    float acc[2][4][4];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                acc[mi][ni][e] = 0.0f;
+
+    if (steps > 0)
+    {
+        fetch(0);
+        stage(0);
+    }
+    __syncthreads();
+    for (int s = 0; s < steps; ++s)
+    {
+        const int buf = s & 1;
+        if (s + 1 < steps)
+            fetch(s + 1);
+#pragma unroll
+        for (int kb = 0; kb < 4; ++kb)
+        {
+            const int kk = kb * 16;
+            uint32_t a[2][2], b[4];
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                a[mi][0] = *(const uint32_t*)&As[buf][wm + mi * 16 + g][kk + tg * 4];
+                a[mi][1] = *(const uint32_t*)&As[buf][wm + mi * 16 + g + 8][kk + tg * 4];
+            }
+#pragma unroll
+            for (int ni = 0; ni < 4; ++ni)
+                b[ni] = *(const uint32_t*)&Bs[buf][wn + ni * 8 + g][kk + tg * 4];
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                const float d0 = Asc[buf][wm + mi * 16 + g][kb >> 1], d1 = Asc[buf][wm + mi * 16 + g + 8][kb >> 1];
+#pragma unroll
+                for (int ni = 0; ni < 4; ++ni)
+                {
+                    int c[4];
+                    ts_w4a8_mma(c, a[mi][0], a[mi][1], b[ni]);
+                    const float w0 = Bsc[buf][wn + ni * 8 + tg * 2][kb], w1 = Bsc[buf][wn + ni * 8 + tg * 2 + 1][kb];
+                    acc[mi][ni][0] += (float)c[0] * (w0 * d0);
+                    acc[mi][ni][1] += (float)c[1] * (w1 * d0);
+                    acc[mi][ni][2] += (float)c[2] * (w0 * d1);
+                    acc[mi][ni][3] += (float)c[3] * (w1 * d1);
+                }
+            }
+        }
+        if (s + 1 < steps)
+            stage(buf ^ 1);
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const long long r = row0 + wm + mi * 16 + g + (e >> 1) * 8;
+                const long long c = col0 + wn + ni * 8 + tg * 2 + (e & 1);
+                if (r < rows && c < outDim)
+                    y[r * outDim + c] = alpha * acc[mi][ni][e];
+            }
+}
+
+
+// ---------------------------------------------------------------------------
+// W4A8 on the F16 tensor cores, TMA-fed and warp-specialized like ts_fp4_gemm_w4a4_tma (sm_120a). The q8_1 activations
+// arrive as F16 integers (ts_fp4_quantize_q81_f16) with their F32 scales; each weight becomes q * UE4M3 in F16, exact
+// (at most 6 significant bits, within F16's range), so one m16n8k16 per 16-value block gives the block's scaled sum
+// s * sum(a q) exactly in F32, the two blocks of a 32-value activation scale accumulate in the MMA, and one FFMA applies
+// that scale: the q8 matvec's quantities, with only the order of the F32 sums its own.
+//   * A producer warpgroup (one thread issues) copies per 128-value K tile: the activations in two 64-value boxes of
+//     BM x 128 bytes (128-byte swizzle), their scales (16 bytes a row), the weight codes (128 x 64 bytes, 64-byte
+//     swizzle) and, on even tiles, the weight scales (16 bytes a row: two tiles).
+//   * Eight consumer warps (2 over tokens x 4 over weight rows, 64 x 32 each) build each B fragment pair from one 16-bit
+//     read of two code bytes (values 2tg, 2tg+1 and 2tg+8, 2tg+9) and the block's scale.
+// grid (128-token tiles, 128-row weight tiles), block 128 producers + 256 consumers; k % 256 == 0, outDim even.
+// ---------------------------------------------------------------------------
+template <int STAGES>
+struct TsW4A8Smem
+{
+    alignas(1024) uint8_t xh[STAGES][2][128 * 128];
+    alignas(1024) uint8_t wc[STAGES][128 * 64];
+    alignas(128) uint8_t xs[STAGES][128 * 16];
+    alignas(128) uint8_t ws[2][128 * 16];
+    alignas(8) unsigned long long full[STAGES];
+    alignas(8) unsigned long long empty[STAGES];
+};
+
+#if defined(TS_FP4_MMA)
+__device__ __forceinline__ void ts_w4a8_mma_f16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t ts_w4a8_hmul2(uint32_t a, uint32_t s)
+{
+    __half2 h = __hmul2(*reinterpret_cast<__half2*>(&a), *reinterpret_cast<__half2*>(&s));
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+// Two equal UE4M3 bytes (NaN codes already zero) -> F16x2.
+__device__ __forceinline__ uint32_t ts_w4a8_scale2(uint32_t two)
+{
+    uint32_t r;
+    asm("{ .reg .b16 t; cvt.u16.u32 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }\n" : "=r"(r) : "r"(two));
+    return r;
+}
+
+// B fragment pair of a 16-value block from its code bytes 2tg, 2tg+1 (x: values 2tg, 2tg+8, 2tg+1, 2tg+9 as nibbles):
+// b0 = (2tg, 2tg+1), b1 = (2tg+8, 2tg+9), each q * scale in F16 (the E2M1 table as F16 high bytes, low bytes zero).
+__device__ __forceinline__ void ts_w4a8_bfrag(uint32_t x, uint32_t sc2, uint32_t& b0, uint32_t& b1)
+{
+    const uint32_t t0 = 0x3E3C3800u, t1 = 0x46444240u, t2 = 0xBEBCB880u, t3 = 0xC6C4C2C0u;
+    const uint32_t mag = __byte_perm(t0, t1, x), neg = __byte_perm(t2, t3, x);
+    const uint32_t r = __byte_perm(mag, neg, 0x3210u | ((x & 0x8888u) >> 1));
+    b0 = ts_w4a8_hmul2(__byte_perm(r, 0u, 0x2404), sc2);
+    b1 = ts_w4a8_hmul2(__byte_perm(r, 0u, 0x3414), sc2);
+}
+
+// 128-byte TMA swizzle: address bits [4:6] ^= bits [7:9] (CUTLASS Swizzle<3,4,3>).
+__device__ __forceinline__ uint32_t ts_fp4_sw128(uint32_t addr) { return addr ^ (((addr >> 7) & 7u) << 4); }
+#endif
+
+template <int STAGES>
+__device__ __forceinline__ void ts_fp4_gemm_w4a8_tma_body(const TsFp4TmaMaps& maps, int outDim, int k, int m, float alpha,
+    float* __restrict__ y)
+{
+    static_assert(STAGES == 2 || STAGES == 3, "the two weight-scale slots are rewritten at tile 2p + 4, after tile 2p + 1 is consumed");
+#if defined(TS_FP4_MMA)
+    extern __shared__ __align__(1024) uint8_t w4a8Smem[];
+    auto& sm = *reinterpret_cast<TsW4A8Smem<STAGES>*>(w4a8Smem);
+    const int token0 = blockIdx.x * 128, row0 = blockIdx.y * 128, kTiles = k / 128;
+    if (threadIdx.x == 0)
+    {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+        {
+            ts_fp4_mbar_init(&sm.full[s], 1);
+            ts_fp4_mbar_init(&sm.empty[s], 8);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 128)
+    {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
+        if (threadIdx.x == 0)
+        {
+            constexpr uint32_t TILE = 2 * 128 * 128 + 128 * 16 + 128 * 64, WS = 128 * 16;
+#pragma unroll 1
+            for (int kt = 0; kt < kTiles; ++kt)
+            {
+                const int s = kt % STAGES;
+                ts_fp4_mbar_wait(&sm.empty[s], 1u ^ ((kt / STAGES) & 1u));
+                const bool scales = (kt & 1) == 0;
+                ts_fp4_mbar_expect(&sm.full[s], scales ? TILE + WS : TILE);
+                ts_fp4_tma_2d(sm.xh[s][0], &maps.xCodes, kt * 256, token0, &sm.full[s]);
+                ts_fp4_tma_2d(sm.xh[s][1], &maps.xCodes, kt * 256 + 128, token0, &sm.full[s]);
+                ts_fp4_tma_2d(sm.xs[s], &maps.xScales, kt * 16, token0, &sm.full[s]);
+                ts_fp4_tma_2d(sm.wc[s], &maps.wCodes, kt * 64, row0, &sm.full[s]);
+                if (scales)
+                    ts_fp4_tma_2d(sm.ws[(kt >> 1) & 1], &maps.wScales, (kt >> 1) * 16, row0, &sm.full[s]);
+            }
+        }
+        return;
+    }
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
+
+    const int ct = threadIdx.x - 128, lane = ct & 31, warp = ct >> 5;
+    const int g = lane >> 2, tg = lane & 3;
+    const int wm = (warp >> 2) * 64, wn = (warp & 3) * 32;
+    constexpr int MI = 4, NI = 4;
+    float acc[MI][NI][4];
+#pragma unroll
+    for (int i = 0; i < MI; ++i)
+#pragma unroll
+        for (int j = 0; j < NI; ++j)
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+    // ldmatrix x4 of a 16 x 16 F16 tile: rows 0-15 at the block's first 8 values, then its last 8.
+    const int aRow = lane & 15, aChunk = lane >> 4;
+
+#pragma unroll 1
+    for (int kt = 0; kt < kTiles; ++kt)
+    {
+        const int s = kt % STAGES;
+        ts_fp4_mbar_wait(&sm.full[s], (kt / STAGES) & 1u);
+        const uint32_t wc = ts_fp4_smem_u32(sm.wc[s]);
+        const float* xs = (const float*)sm.xs[s];
+        const uint8_t* ws = sm.ws[(kt >> 1) & 1] + (kt & 1) * 8;
+#pragma unroll 1
+        for (int q = 0; q < 2; ++q)   // the tile's two 64-value halves (one activation box each)
+        {
+            const uint32_t xh = ts_fp4_smem_u32(sm.xh[s][q]);
+            uint32_t sc[NI][4];
+#pragma unroll
+            for (int ni = 0; ni < NI; ++ni)
+            {
+                // The half's four block scales of this thread's weight row; NaN codes (0x7F, 0xFF) read as zero.
+                uint32_t w = *(const uint32_t*)(ws + (wn + ni * 8 + g) * 16 + q * 4) & 0x7F7F7F7Fu;
+                w &= ~__vcmpeq4(w, 0x7F7F7F7Fu);
+#pragma unroll
+                for (int kb = 0; kb < 4; ++kb)
+                    sc[ni][kb] = ts_w4a8_scale2(__byte_perm(w, 0u, 0x4400 | (kb * 0x11)));
+            }
+#pragma unroll
+            for (int pp = 0; pp < 2; ++pp)   // the half's two activation blocks
+            {
+                const int p = q * 2 + pp;
+                uint32_t b[NI][2][2];
+#pragma unroll
+                for (int ni = 0; ni < NI; ++ni)
+#pragma unroll
+                    for (int kk = 0; kk < 2; ++kk)
+                    {
+                        uint32_t x;
+                        asm volatile("ld.shared.u16 %0, [%1];"
+                            : "=r"(x) : "r"(ts_fp4_sw64(wc + (wn + ni * 8 + g) * 64 + (2 * p + kk) * 8 + tg * 2)));
+                        ts_w4a8_bfrag(x, sc[ni][2 * pp + kk], b[ni][kk][0], b[ni][kk][1]);
+                    }
+#pragma unroll
+                for (int mi = 0; mi < MI; ++mi)
+                {
+                    uint32_t a0[4], a1[4];
+                    ts_fp4_ldsm_x4a(a0, ts_fp4_sw128(xh + (wm + mi * 16 + aRow) * 128 + (pp * 4 + aChunk) * 16));
+                    ts_fp4_ldsm_x4a(a1, ts_fp4_sw128(xh + (wm + mi * 16 + aRow) * 128 + (pp * 4 + 2 + aChunk) * 16));
+                    const float d0 = xs[(wm + mi * 16 + g) * 4 + p], d1 = xs[(wm + mi * 16 + g + 8) * 4 + p];
+#pragma unroll
+                    for (int ni = 0; ni < NI; ++ni)
+                    {
+                        float t[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                        ts_w4a8_mma_f16(t, a0, b[ni][0][0], b[ni][0][1]);
+                        ts_w4a8_mma_f16(t, a1, b[ni][1][0], b[ni][1][1]);
+                        acc[mi][ni][0] = fmaf(t[0], d0, acc[mi][ni][0]);
+                        acc[mi][ni][1] = fmaf(t[1], d0, acc[mi][ni][1]);
+                        acc[mi][ni][2] = fmaf(t[2], d1, acc[mi][ni][2]);
+                        acc[mi][ni][3] = fmaf(t[3], d1, acc[mi][ni][3]);
+                    }
+                }
+            }
+        }
+        __syncwarp();
+        if (lane == 0)
+            ts_fp4_mbar_arrive(&sm.empty[s]);
+    }
+    // D rows are tokens (g, g + 8), columns weight rows (2tg, 2tg + 1).
+#pragma unroll
+    for (int mi = 0; mi < MI; ++mi)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const int c = token0 + wm + mi * 16 + g + h * 8;
+            if (c >= m)
+                continue;
+#pragma unroll
+            for (int ni = 0; ni < NI; ++ni)
+            {
+                const int r = row0 + wn + ni * 8 + tg * 2;
+                if (r >= outDim)
+                    continue;
+                *(float2*)(y + (long long)c * outDim + r) = make_float2(alpha * acc[mi][ni][h * 2], alpha * acc[mi][ni][h * 2 + 1]);
+            }
+        }
+#else
+    __trap();
+#endif
+}
+
+extern "C" __global__ __launch_bounds__(384, 1) void ts_fp4_gemm_w4a8_tma(const __grid_constant__ TsFp4TmaMaps maps, int outDim,
+    int k, int m, float alpha, float* __restrict__ y)
+{
+    ts_fp4_gemm_w4a8_tma_body<2>(maps, outDim, k, m, alpha, y);
+}
+
+/// Dynamic shared memory of ts_fp4_gemm_w4a8_tma. One thread.
+extern "C" __global__ void ts_fp4_gemm_w4a8_tma_smem_bytes(int* out)
+{
+    out[0] = (int)sizeof(TsW4A8Smem<2>);
+}

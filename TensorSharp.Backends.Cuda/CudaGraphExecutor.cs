@@ -2225,7 +2225,7 @@ namespace TensorSharp.Cuda
             int rows = checked((int)(a.ElementCount() / cols));
             Tensor total = new Tensor(Allocator, DType.Float32, a.Sizes), norm = new Tensor(Allocator, DType.Float32, a.Sizes);
             var cuda = (CudaAllocator)Allocator;
-            if (rows > cuda.Nvfp4MatvecRows && CudaFp4Kernels.TakesWidth(cols) && _branchQuantized == null && cuda.Fp4Kernels != null
+            if (cuda.Nvfp4ActivationRows(rows) && CudaFp4Kernels.TakesWidth(cols) && _branchQuantized == null && cuda.Fp4Kernels != null
                 && Array.TrueForAll(inputs, t => ((CudaStorage)t.Storage).DeviceId == cuda.DeviceId))
             {
                 DropUnreadNorms();
@@ -3016,7 +3016,7 @@ namespace TensorSharp.Cuda
             // writes and its SwiGLU reads back (and x's planes straight from the add and norm that make x, where they were
             // deferred). Four Qwen3.8-27B requests' 32-row verify: 64 SwiGLU passes over 2 ff, 0.59 ms of the step, where
             // 038fb303's engine quantized the down projection's input from its gate|up GEMM's SwiGLU epilogue.
-            if (rows > cuda.Nvfp4MatvecRows && cuda.Fp4Kernels != null)
+            if (cuda.Nvfp4ActivationRows(rows) && cuda.Fp4Kernels != null)
             {
                 Tensor swiglu = DeferredNormProduct(gateUp, x2, swiGluFfn: true);
                 if (swiglu == null)
