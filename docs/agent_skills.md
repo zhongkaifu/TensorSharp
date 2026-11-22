@@ -81,7 +81,7 @@ host's sandbox and under its Run code switch (`--skills-allow-exec` on the serve
 
 | Tool | Behavior |
 | --- | --- |
-| `skills_search(query, owner?)` | Searches skills.sh. Each hit carries its `package`, install count, `status` (`installed` or `not installed`) and the exact next call: `install` = `skills_install(package="owner/repo@name")`, or `use` = `skills_read(skill="…")` for a package already installed here. The result says the hits are not installed skills. Successful searches are cached for five minutes with a bounded entry count. |
+| `skills_search(query, owner?)` | First lists up to three skills already installed here that share a meaningful word with the query (its name or description; function words, words under three characters and generic words such as "skill", "agent", "user" and "tools" do not count), skills that can run on this host first and a name match before a description match, each with its exact call: the call it declares (`provides-call`, such as the bundled `research` skill's) or `skills_read(skill="…")`. Then it searches skills.sh. Each hit carries its `package`, install count, `status` (`installed` or `not installed`) and the exact next call: `install` = `skills_install(package="owner/repo@name")`, or `use` = `skills_read(skill="…")` for a package already installed here. The result says the hits are not installed skills. A search with no hub hit names the host's web search call when a skill provides one, and says to search with words for the task rather than its subject. Successful searches are cached for five minutes with a bounded entry count. |
 | `skills_inspect(package)` | Optional. Downloads the package at an immutable commit and returns its instructions, compatibility, license and file list, with the install call to use next. The entire response fits the request's read budget. No repository code is executed. |
 | `skills_install(package, revision?)` | Installs the package into the host's writable skill library and returns, in one result, the provenance line `Installed owner/repo@name from https://github.com/owner/repo/tree/<commit>/<path> @ <commit>`, whether it can run on this host, the skill's instructions (marked as third-party content) and the next call. |
 
@@ -95,7 +95,8 @@ round is needed; an optional `revision` must match. It never overwrites a skill:
   is rewritten, and the original name is recorded;
 - a stale hub entry (GitHub answers 404), a rate limit, or a package this host
   refuses ends with `Next: skills_install(package="…")` naming the next result of
-  this request's search, so the model can follow it without reasoning one out;
+  this request's search, so the model can follow it without reasoning one out.
+  When nothing is left, the result names the host's web search call, if any;
 - a failure of the repository itself — not on GitHub, its archive over the size or
   entry limits, or not the pinned commit — is remembered for the rest of the turn by
   `owner/repo`. Its other search results are skipped as the next result, the result

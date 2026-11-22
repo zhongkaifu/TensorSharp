@@ -369,6 +369,88 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.Equal(archives + 1, _hub.Requests.Count(uri => uri.Host == "codeload.github.com"));
     }
 
+    [Fact]
+    public void WhenNoHubResultIsLeftTheResultNamesTheHostsWebSearch()
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"gone","source":"vanished/repo","installs":50}]""";
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock quote")), context).Ok);
+        SkillToolResult stale = SkillTools.Execute(Call("skills_install", ("package", "vanished/repo@gone")), context);
+        Assert.False(stale.Ok);
+        Assert.Contains("No other search result is left; search again with words for the task, or continue without a hub "
+            + "skill. Web search here: " + ResearchCall + ".", stale.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ASearchListsTheInstalledSkillsThatFitBeforeTheHubsAndANameMatchOutranksAGenericWord()
+    {
+        BundleResearch();
+        // Shares only "analysis" with the query, in its description.
+        Bundle("chart-maker", "Draw a chart for any analysis.");
+        Bundle("unit-converter", "Convert units of measure.");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+
+        SkillToolResult search = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research analysis skill")), context);
+        Assert.True(search.Ok, search.Content);
+        string[] lines = search.Content.Split('\n');
+        Assert.Equal("Installed here, no install needed; use one if it fits the task:", lines[0]);
+        Assert.StartsWith("- research: Use for web searches and current information lookups. Use: " + ResearchCall, lines[1], StringComparison.Ordinal);
+        Assert.StartsWith("- chart-maker: Draw a chart for any analysis. Use: skills_read(skill=\"chart-maker\")", lines[2], StringComparison.Ordinal);
+        Assert.DoesNotContain("unit-converter", search.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("- find-skills", search.Content, StringComparison.Ordinal);   // the search itself
+        Assert.Contains("1. " + Package + " (17 installs)", search.Content, StringComparison.Ordinal);
+        Assert.True(search.Content.IndexOf("- research:", StringComparison.Ordinal)
+            < search.Content.IndexOf("1. " + Package, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ASearchListsAtMostThreeInstalledSkillsAndIgnoresWordsThatSayNothing()
+    {
+        foreach (string name in new[] { "stock-a", "stock-b", "stock-c", "stock-d" })
+            Bundle(name, "Stock tool " + name + ".");
+        Bundle("helper", "An agent skill for the user, with tools.");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+
+        SkillToolResult search = SkillTools.Execute(Call("skills_search", ("query", "stocks")), context);
+        Assert.Equal(3, search.Content.Split('\n').Count(line => line.StartsWith("- stock-", StringComparison.Ordinal)));
+
+        SkillToolResult generic = SkillTools.Execute(Call("skills_search", ("query", "an agent skill for the user with tools")), context);
+        Assert.DoesNotContain("Installed here", generic.Content, StringComparison.Ordinal);
+
+        Assert.Equal(new[] { "nvidia", "research", "searches", "searche", "search" }.ToHashSet(),
+            SkillMarketplaceTools.MeaningfulWords("Nvidia: an agent's research skills & searches, to do"));
+    }
+
+    [Fact]
+    public void AZeroHitSearchNamesTheHostsWebSearchAndToSearchForTheTask()
+    {
+        BundleResearch();
+        _hub.Hits = "[]";
+        SkillRegistry registry = Registry();
+
+        // No installed skill shares a word with the query: the host's web search is named.
+        SkillToolResult none = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock")), RunnableContext(registry));
+        Assert.True(none.Ok, none.Content);
+        Assert.Equal("No hub skill matched. Web search here: " + ResearchCall + ".\n"
+            + "The hub matches what a skill does: search with words for the task, not its subject, or continue without a hub skill.",
+            none.Content);
+
+        // The research skill itself matches: it is listed once, with its call, and not named twice.
+        SkillToolResult listed = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research")), RunnableContext(registry));
+        Assert.StartsWith("Installed here, no install needed; use one if it fits the task:\n- research: ", listed.Content, StringComparison.Ordinal);
+        Assert.Equal(1, CountOf(listed.Content, ResearchCall));
+        Assert.Contains("No hub skill matched.\nThe hub matches what a skill does", listed.Content, StringComparison.Ordinal);
+
+        // Without skill scripts there is no call to name.
+        var noScripts = new SkillToolContext(registry.Skills) { Marketplace = new SkillMarketplaceSession(_marketplace, registry) };
+        SkillToolResult plain = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock")), noScripts);
+        Assert.DoesNotContain("Web search here", plain.Content, StringComparison.Ordinal);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;

@@ -282,6 +282,24 @@ public sealed class FindSkillsHostTests : IDisposable
             research.Manifest.Metadata["provides-call"], StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void ASearchWithTheSubjectStillLeadsToTheBundledResearchSkillOnTheInProcessHost()
+    {
+        // The phone's traced turns opened with skills_search("Nvidia stock research"): the hub had
+        // nothing for the subject, and the bundled research skill - the device's data path - was
+        // never used. The search now answers with it first, as its exact call.
+        AgentAppHost host = Start();
+        SkillRequestPlan plan = Plan(host);
+        Assert.True(host.Skills.TryGet("research", out Skill research));
+        SkillToolResult search = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research")), plan.ToolContext);
+        Assert.True(search.Ok, search.Content);
+        string[] lines = search.Content.Split('\n');
+        Assert.Equal("Installed here, no install needed; use one if it fits the task:", lines[0]);
+        Assert.StartsWith("- research: ", lines[1], StringComparison.Ordinal);
+        Assert.EndsWith(" Use: " + research.Manifest.Metadata["provides-call"].Trim(), lines[1], StringComparison.Ordinal);
+        Assert.DoesNotContain("- find-skills", search.Content, StringComparison.Ordinal);
+    }
+
     public void Dispose()
     {
         _host?.Dispose();
