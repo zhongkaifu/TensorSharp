@@ -165,8 +165,11 @@ namespace TensorSharp.Cli
                     "where a package comes from (--index-url, " +
                     "-i, --find-links, --registry, a URL requirement) is refused by name, and so is an " +
                     "installer the host cannot perform (gem, cargo); -r requirements.txt is read and each " +
-                    "line validated. Only prebuilt wheels are installed and install scripts never run " +
-                    "(pip --only-binary=:all:, npm --ignore-scripts). Also what lets a skill script's missing " +
+                    "line validated. npm install scripts never run (--ignore-scripts). pip installs prebuilt wheels; " +
+                    "only on macOS, where the install's sandbox confines writes and holds the network to the " +
+                    "package index, does it also build a pure-Python package that publishes no wheel " +
+                    "(--prefer-binary, every compiler variable pointed at `false`); elsewhere --only-binary=:all:. " +
+                    "Also what lets a skill script's missing " +
                     "dependency be installed automatically instead of just failing. Requires --code-exec. " +
                     "Default: off (TS_CODE_EXEC_ALLOW_INSTALL env var overrides).",
                     "--code-exec --code-exec-allow-install"),

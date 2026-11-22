@@ -654,10 +654,12 @@ namespace TensorSharp.Server.Host.Hosting
                     "granted for an install can no longer be shared with whatever else was on the line. An " +
                     "option that would change where a package comes from (--index-url, -i, --find-links, " +
                     "--registry, a URL requirement) is refused by name; an installer the host cannot perform " +
-                    "(gem, cargo) is refused too; -r requirements.txt is read and each line validated. Only " +
-                    "prebuilt wheels are installed and install scripts never run (pip --only-binary=:all:, " +
-                    "npm --ignore-scripts), so a package shipping source only fails to install rather than " +
-                    "executing its setup.py as this account. Also what lets a skill script's missing " +
+                    "(gem, cargo) is refused too; -r requirements.txt is read and each line validated. npm " +
+                    "install scripts never run (--ignore-scripts). pip installs prebuilt wheels; only on macOS, " +
+                    "where the install's sandbox confines writes and holds the network to the package index, " +
+                    "does it also build a pure-Python package that publishes no wheel (--prefer-binary, with " +
+                    "every compiler variable pointed at `false`). Elsewhere a package shipping source only fails " +
+                    "to install rather than executing its setup.py (--only-binary=:all:). Also what lets a skill script's missing " +
                     "dependency be installed automatically instead of failing. Requires --code-exec. " +
                     "Default: off (TS_CODE_EXEC_ALLOW_INSTALL env var overrides).",
                     "--code-exec --code-exec-allow-install"),

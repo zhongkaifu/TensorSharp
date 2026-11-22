@@ -697,14 +697,21 @@ namespace TensorSharp.AgentHost.CodeExec
         /// blocking on a prompt, which would otherwise consume the whole install timeout.
         /// </para>
         /// </summary>
+        /// <param name="allowSourceBuilds">
+        /// Let pip build a package that publishes no wheel from its source distribution,
+        /// preferring a wheel whenever one exists. Only for a launch whose sandbox confines
+        /// writes and pins the network to the package index (see
+        /// <see cref="PackageInstaller"/>): a source build runs the package's own setup
+        /// code. False keeps the default of prebuilt wheels only.
+        /// </param>
         public static CodeInstallPlan PythonInstall(
             string interpreter, string envDirectory, IReadOnlyList<string> packages,
-            string? indexUrl = null)
+            string? indexUrl = null, bool allowSourceBuilds = false)
         {
             var args = new List<string>
             {
                 "-m", "pip", "install",
-                "--only-binary=:all:",
+                allowSourceBuilds ? "--prefer-binary" : "--only-binary=:all:",
                 "--no-input",
                 "--disable-pip-version-check",
                 "--no-warn-script-location",
