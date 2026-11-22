@@ -536,8 +536,54 @@ namespace TensorSharp.AgentHost.Skills
         {
             if (skill.Manifest.Metadata.TryGetValue("provides-call", out string? declared)
                 && declared.Contains("path=\"" + path + "\"", StringComparison.Ordinal))
-                return declared.Trim();
+                return FillCall(declared.Trim(), context);
             return RunToolName + "(skill=\"" + skill.Id + "\", path=\"" + path + "\", args=[\"<arguments>\"])";
+        }
+
+        /// <summary>The most characters of the user's request a filled call carries.</summary>
+        internal const int MaxFilledRequestChars = 300;
+
+        /// <summary>A placeholder argument of a declared call, such as <c>"&lt;question&gt;"</c>, quotes included.</summary>
+        private static readonly System.Text.RegularExpressions.Regex CallPlaceholder = new(
+            "\"<[A-Za-z][A-Za-z0-9 _-]{0,40}>\"", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        /// <summary>
+        /// A skill's declared call (<c>provides-call</c>) with its placeholder arguments filled
+        /// with the user's latest message, so the call can be copied as it is. A small model
+        /// copied <c>args=["&lt;question&gt;", ...]</c> verbatim, and the research script
+        /// searched the web for the word "question". Unchanged when the turn's request is
+        /// unknown.
+        /// </summary>
+        internal static string FillCall(string declared, SkillToolContext context)
+        {
+            if (RequestText(context.UserRequest) is not { } request)
+                return declared;
+            string json = JsonSerializer.Serialize(request, ReadableArguments);
+            return CallPlaceholder.Replace(declared, _ => json);
+        }
+
+        /// <summary>The placeholder arguments of a declared call, without their quotes.</summary>
+        internal static IReadOnlyList<string> PlaceholdersOf(string declared) =>
+            CallPlaceholder.Matches(declared).Select(match => match.Value.Trim('"')).Distinct(StringComparer.Ordinal).ToArray();
+
+        /// <summary>
+        /// The user's request as one argument: whitespace collapsed, at most
+        /// <see cref="MaxFilledRequestChars"/> characters (cut at a word, never inside a
+        /// surrogate pair), or null when there is none.
+        /// </summary>
+        internal static string? RequestText(string? request)
+        {
+            if (string.IsNullOrWhiteSpace(request))
+                return null;
+            string text = string.Join(" ", request.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+            if (text.Length > MaxFilledRequestChars)
+            {
+                int end = text.LastIndexOf(' ', MaxFilledRequestChars);
+                if (end <= 0)
+                    end = char.IsHighSurrogate(text[MaxFilledRequestChars - 1]) ? MaxFilledRequestChars - 1 : MaxFilledRequestChars;
+                text = text.Substring(0, end);
+            }
+            return text.Trim();
         }
 
         /// <summary>Arguments as a model types them: no \u0022 for a quote, no \uXXXX for a non-ASCII letter.</summary>
@@ -842,7 +888,7 @@ namespace TensorSharp.AgentHost.Skills
                     // or a compiled package would be advice the model cannot follow.
                     host ??= SkillHostProfile.From(context);
                     if (SkillCompatibility.Assess(provider, host).CanRun)
-                        return providedCall.Trim();
+                        return FillCall(providedCall.Trim(), context);
                 }
             }
             return null;
@@ -959,6 +1005,17 @@ namespace TensorSharp.AgentHost.Skills
                 return SkillToolResult.Failure($"'{skill.Id}' ships no scripts, so there is nothing to run: its SKILL.md is "
                     + "instructions to carry out with this conversation's other tools."
                     + (CurrentFactsNote(skill, context) is { } facts ? " " + facts : string.Empty));
+            }
+            // A placeholder of the skill's declared call passed as it is ("<question>"): the
+            // script would work on that word. Nothing runs; the answer is the call filled in.
+            if (skill.Manifest.Metadata.TryGetValue("provides-call", out string? declaredCall)
+                && PlaceholdersOf(declaredCall) is { Count: > 0 } placeholders
+                && args.FirstOrDefault(argument => placeholders.Contains(argument.Trim(), StringComparer.Ordinal)) is { } left)
+            {
+                return SkillToolResult.Failure($"'args' still holds the placeholder {left.Trim()} from the call, so nothing was run. "
+                    + (RequestText(context.UserRequest) != null
+                        ? "Run it with the request itself: " + FillCall(declaredCall.Trim(), context) + "."
+                        : "Put the request itself in its place."));
             }
             args = SplitJoinedOptions(args, out IReadOnlyList<string> joined);
             SkillToolResult ran = context.ScriptRunner.Run(skill, path, args, onOutput, ReadPackagesArgument(call));

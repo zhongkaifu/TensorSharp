@@ -133,7 +133,12 @@ skill provides `WebSearch` and `WebFetch` — with that skill's exact call. A hu
 skill that ships no scripts holds no data, so its result — when it is installed, read,
 or inspected without being installed — says where current figures come from in this
 conversation (that web-search call) or that they cannot be checked, instead of leaving
-the model to state prices from memory.
+the model to state prices from memory. Wherever the host shows such a declared call (that
+note, a search with no hub hit, the installed-skills lines, the tool mapping, a script read),
+its placeholder arguments (`"<question>"`) are filled with the user's latest message,
+whitespace collapsed and at most 300 characters, so the call can be copied as it is. A
+`skills_run` that still passes a placeholder, as it was given, is not run: the answer is the
+filled call.
 
 **Provenance and visibility.** Each hub install is recorded in
 `.hub-sources.json` in the install directory (package, GitHub URL, commit,

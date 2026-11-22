@@ -451,7 +451,7 @@ public static class SkillMarketplaceTools
     {
         if (runs && context.ScriptRunner != null
             && skill.Manifest.Metadata.TryGetValue("provides-call", out string? declared) && declared.Trim().Length > 0)
-            return declared.Trim();
+            return SkillTools.FillCall(declared.Trim(), context);
         return SkillTools.ReadToolName + "(skill=\"" + skill.Id + "\")";
     }
 

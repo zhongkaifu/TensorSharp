@@ -165,7 +165,8 @@ public sealed class SkillHubInstallTests : IDisposable
 
         SkillToolResult answer = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), context);
         Assert.False(answer.Ok);
-        Assert.Contains("this host already has a skill called 'research' that runs here. Use it: " + ResearchCall + ".",
+        Assert.Contains("this host already has a skill called 'research' that runs here. Use it: skills_run(skill=\"research\", "
+            + "path=\"scripts/research.py\", args=[\"Please do research on Nvidia and tell me if I should buy its stock now.\"]).",
             answer.Content, StringComparison.Ordinal);
         Assert.Contains("The hub skill acme/tools@research is a different one; to install it anyway, the user can ask for "
             + "acme/tools@research by name.", answer.Content, StringComparison.Ordinal);
@@ -201,7 +202,8 @@ public sealed class SkillHubInstallTests : IDisposable
         later.UserRequest = "Research Nvidia's stock.";
         SkillToolResult again = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), later);
         Assert.False(again.Ok);
-        Assert.Contains("Use it: " + ResearchCall, again.Content, StringComparison.Ordinal);
+        Assert.Contains("Use it: skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"Research Nvidia's stock.\"])",
+            again.Content, StringComparison.Ordinal);
         Assert.Contains("is a different one, installed here as 'acme-research'", again.Content, StringComparison.Ordinal);
     }
 
@@ -674,6 +676,55 @@ public sealed class SkillHubInstallTests : IDisposable
         var noScripts = new SkillToolContext(registry.Skills);
         Assert.StartsWith("Skill: research\n", SkillTools.Execute(
             Call("skills_read", ("skill", "research"), ("path", "scripts/research.py")), noScripts).Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheProvidedCallIsShownFilledWithTheUsersRequest()
+    {
+        BundleResearch();
+        _hub.Hits = "[]";
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        context.UserRequest = "Please do research on Nvidia\n and tell me if I should buy its stock now.";
+        string filled = "skills_run(skill=\"research\", path=\"scripts/research.py\", "
+            + "args=[\"Please do research on Nvidia and tell me if I should buy its stock now.\"])";
+
+        // The zero-hit note, the installed block and a script read all carry the call as it can be copied.
+        Assert.Contains("Web search here: " + filled + ".",
+            SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock")), context).Content, StringComparison.Ordinal);
+        Assert.Contains("- research: Use for web searches and current information lookups. Use: " + filled,
+            SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research")), context).Content, StringComparison.Ordinal);
+        Assert.Contains("run it with " + filled + ". Its source follows.",
+            SkillTools.Execute(Call("skills_read", ("skill", "research"), ("path", "scripts/research.py")), context).Content, StringComparison.Ordinal);
+
+        // A long request is one argument of at most 300 characters, cut at a word.
+        string longRequest = string.Join(" ", Enumerable.Repeat("word", 200));
+        string text = SkillTools.RequestText(longRequest)!;
+        Assert.True(text.Length <= SkillTools.MaxFilledRequestChars, text.Length.ToString());
+        Assert.EndsWith("word", text, StringComparison.Ordinal);
+        Assert.Null(SkillTools.RequestText("  \n "));
+        Assert.Equal(new[] { "<question>" }, SkillTools.PlaceholdersOf(ResearchCall));
+    }
+
+    [Fact]
+    public void APlaceholderPassedAsItIsIsNotRunAndTheFilledCallIsTheAnswer()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var runner = new RecordingScriptRunner();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = runner, UserRequest = "Research heat pumps in cold climates." };
+        SkillToolResult left = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", new[] { "<question>", "--out", "notes.md" })), context);
+        Assert.False(left.Ok);
+        Assert.Empty(runner.Runs);
+        Assert.Contains("'args' still holds the placeholder <question> from the call, so nothing was run. Run it with the request "
+            + "itself: skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"Research heat pumps in cold climates.\"]).",
+            left.Content, StringComparison.Ordinal);
+
+        var unknown = new SkillToolContext(registry.Skills) { ScriptRunner = runner };
+        Assert.Contains("Put the request itself in its place.", SkillTools.Execute(Call("skills_run", ("skill", "research"),
+            ("path", "scripts/research.py"), ("args", new[] { "<question>" })), unknown).Content, StringComparison.Ordinal);
+        Assert.Empty(runner.Runs);
     }
 
     private static int CountOf(string text, string part)
