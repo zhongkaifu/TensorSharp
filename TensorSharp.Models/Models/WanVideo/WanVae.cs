@@ -27,7 +27,7 @@ using TensorSharp.GGML;
 
 namespace TensorSharp.Models.WanVideo
 {
-    internal sealed class WanVae : WanVaeBase
+    internal sealed class WanVae : WanVaeBase, IGgmlHostMemoryOwner
     {
         private readonly List<IntPtr> _allocs = new();
         private readonly WanVaeDecodeArgsTemplate _t;
@@ -255,6 +255,9 @@ namespace TensorSharp.Models.WanVideo
                     throw new InvalidOperationException("Wan VAE encode failed (see native error above).");
             }
         }
+
+        /// <summary>The weight copies this decoder allocated.</summary>
+        void IGgmlHostMemoryOwner.CollectHostMemory(List<(IntPtr Base, long Length)> ranges, List<IntPtr> keys) => keys.AddRange(_allocs);
 
         public override void Dispose()
         {

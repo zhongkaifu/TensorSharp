@@ -609,7 +609,7 @@ namespace TensorSharp.Models.MiniMaxH3
             // The decoders' reuse gallocr and attention/projection scratch are of no use
             // to the next request, which starts with the largest upload of all.
             if (_model.Backend == BackendType.GgmlCuda)
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                _model.RunWhileOtherGgmlModelsAreIdle(GgmlBasicOps.ReleaseReuseComputeBuffers);
 
             total.Stop();
             Report(p, "done", steps, steps, total);
@@ -1470,7 +1470,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 releasing?.Invoke("metal");
                 if (Environment.GetEnvironmentVariable("TS_H3_KEEP_RESIDENT") != "1")
                     _dit?.ReleaseDeviceResidency();
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                _model.RunWhileOtherGgmlModelsAreIdle(GgmlBasicOps.ReleaseReuseComputeBuffers);
                 return;
             }
             if (_dit == null || _model.Backend != BackendType.GgmlCuda)
@@ -1482,7 +1482,7 @@ namespace TensorSharp.Models.MiniMaxH3
             // is the RAM the encoder's mapped file needs: a second clip's text
             // conditioning took 50 s against 28 s for the first. The next denoise
             // re-creates both on demand.
-            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            _model.RunWhileOtherGgmlModelsAreIdle(GgmlBasicOps.ReleaseReuseComputeBuffers);
             if (!GpuMemoryBudget.TryGetSpareBytes(_model.Backend, out long spare))
                 return;   // no reading of the device: leave today's behaviour alone
             long need = _model.VideoVaeResidentBytesEstimate();
@@ -1530,7 +1530,7 @@ namespace TensorSharp.Models.MiniMaxH3
             if (_model.Backend != BackendType.GgmlCuda || (_vae == null && _audioVae == null))
                 return;
             // A request that failed part-way never reached its own release of these.
-            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            _model.RunWhileOtherGgmlModelsAreIdle(GgmlBasicOps.ReleaseReuseComputeBuffers);
             // No reading of the device leaves today's behaviour alone.
             bool known = GpuMemoryBudget.TryGetSpareBytes(_model.Backend, out long spare);
             long need = _model.TextEncoderResidentBytesEstimate();

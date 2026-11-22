@@ -32,7 +32,7 @@ using TensorSharp.GGML;
 
 namespace TensorSharp.Models.QwenImage
 {
-    internal sealed class QwenImageVaeGraph : IDisposable
+    internal sealed class QwenImageVaeGraph : IDisposable, IGgmlHostMemoryOwner
     {
         private const int KConv = 0, KNorm = 1, KSilu = 2, KUp = 3, KSave = 4, KAdd = 5, KAttn = 6,
             KAverageDown21 = 7, KDuplicateUp21 = 8;
@@ -232,6 +232,10 @@ namespace TensorSharp.Models.QwenImage
             _decodeOps = ops.ToArray();
             _weights = weights.ToArray();
         }
+
+        /// <summary>The weight copies this graph allocated (their device copies are keyed by them).</summary>
+        void IGgmlHostMemoryOwner.CollectHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges,
+            System.Collections.Generic.List<IntPtr> keys) => keys.AddRange(_allocs);
 
         public void Dispose()
         {

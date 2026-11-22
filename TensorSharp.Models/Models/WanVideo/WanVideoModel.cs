@@ -53,6 +53,11 @@ namespace TensorSharp.Models.WanVideo
         private GgufFile _gguf2;
 
         internal GgufFile DitGguf => _gguf;
+
+        /// <summary>The second expert's GGUF mapping (the A14B low- or high-noise transformer's).</summary>
+        protected override void AddOwnedHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges,
+            System.Collections.Generic.List<IntPtr> keys)
+            => GgmlOwnerRelease.AddMappings(ranges, _gguf2);
         internal string VaePath => _vaePath;
         internal string TePath => _tePath;
         internal BackendType Backend => _backend;

@@ -1327,12 +1327,21 @@ namespace TensorSharp.Models
             }
             _compressedMatrices.Clear();
             _conformerBlocks.Clear();
-            _onesForNorm?.Dispose();
+            // Every tensor this encoder made (the SSCP projection's contiguous copy above all, which the native SSCP binds
+            // as a weight) may have a GGML device copy keyed by its host bytes: drop it before the pool can hand the block
+            // out again.
+            void Release(Tensor t)
+            {
+                if (t == null) return;
+                if (_allocator is GgmlAllocator) GgmlBasicOps.InvalidateTensorHostBuffer(t);
+                t.Dispose();
+            }
+            Release(_onesForNorm);
             foreach (var w in _transposedWeights.Values)
-                w.Dispose();
+                Release(w);
             _transposedWeights.Clear();
             _positionEmbeddingCache.Clear();
-            foreach (var position in _devicePositionEmbeddingCache.Values) position.Dispose();
+            foreach (var position in _devicePositionEmbeddingCache.Values) Release(position);
             _devicePositionEmbeddingCache.Clear();
             foreach (var w in _weights.Values)
             {

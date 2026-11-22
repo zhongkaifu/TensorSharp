@@ -760,6 +760,27 @@ namespace tsg
             if (ids[i] >= 0 && ids[i] < num_experts) ++counts[ids[i]];
     }
 
+    void moe_hot_tier_drop_ranges(const HostRanges& ranges)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_tier_mutex);
+            for (auto it = g_tiers.begin(); it != g_tiers.end();)
+            {
+                auto& tier = **it;
+                if (ranges.contains(tier.source[0]) || ranges.contains(tier.source[1]) || ranges.contains(tier.source[2]))
+                {
+                    g_tier_bytes -= ggml_backend_buffer_get_size(tier.buffer);
+                    free_tier(tier);
+                    it = g_tiers.erase(it);
+                }
+                else ++it;
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_count_mutex);
+        for (auto it = g_counts.begin(); it != g_counts.end();)
+            it = ranges.contains(it->first) ? g_counts.erase(it) : std::next(it);
+    }
+
     void moe_hot_tier_on_drop(const void* ptr)
     {
         if (ptr == nullptr) return;

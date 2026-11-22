@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 
 namespace TensorSharp.GGML
@@ -37,6 +38,10 @@ namespace TensorSharp.GGML
         /// the point.
         /// </summary>
         public long ReleasePooledMemory() => MemoryPool.Trim();
+
+        /// <summary>The host memory this context's pool holds (handed out or kept for reuse), as (base, length) ranges: what a
+        /// model releasing its device copies covers (<see cref="GgmlBasicOps.ReleaseHostRanges"/>).</summary>
+        public IReadOnlyList<(IntPtr Base, long Length)> PoolRanges() => MemoryPool.BlockRanges();
 
         /// <summary>
         /// The model that owns this context has been disposed: release the pooled host

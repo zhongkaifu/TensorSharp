@@ -147,8 +147,7 @@ public sealed class EmbeddingGemma2MultimodalEncoder : IEmbeddingModel
             TextModel?.Dispose();
             if (_context != null)
             {
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                GgmlBasicOps.ClearHostBufferCache();
+                ReleaseDeviceMemory();
                 _context.ReleasePoolForDisposal();
             }
             throw;
@@ -364,6 +363,25 @@ public sealed class EmbeddingGemma2MultimodalEncoder : IEmbeddingModel
             throw new ArgumentOutOfRangeException(name, "Vision token budget must be 70, 140, 280, 560, or 1120.");
     }
 
+    /// <summary>This encoder's GGUF device memory (its context's pool: the vision and audio encoders' tensors; they invalidate
+    /// their own weights): per owner while a model of the process is live, which keeps its own; the whole-process wipe and
+    /// the shared scratch only when none is.</summary>
+    private void ReleaseDeviceMemory()
+    {
+        if (ModelBase.LiveGgmlModels > 0)
+        {
+            // While no live model runs a step: the shared graph caches go too.
+            ModelBase.RunWhileGgmlModelsAreIdle(null, () =>
+            {
+                GgmlBasicOps.ReleaseHostRanges(_context.PoolRanges(), Array.Empty<IntPtr>());
+                GgmlBasicOps.ResetSharedGraphCaches();
+            });
+            return;
+        }
+        GgmlBasicOps.ReleaseReuseComputeBuffers();
+        GgmlBasicOps.ClearHostBufferCache();
+    }
+
     public void Dispose()
     {
         _gate.Wait();
@@ -376,8 +394,7 @@ public sealed class EmbeddingGemma2MultimodalEncoder : IEmbeddingModel
             TextModel.Dispose();
             if (_context != null)
             {
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                GgmlBasicOps.ClearHostBufferCache();
+                ReleaseDeviceMemory();
                 _context.ReleasePoolForDisposal();
             }
         }

@@ -3642,6 +3642,16 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_ResetSharedGraphCaches();
+
+        public static void ResetSharedGraphCaches() => TSGgml_ResetSharedGraphCaches();
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_ReleaseHostRanges(IntPtr* bases, ulong* lengths, int nranges, IntPtr* keys, int nkeys);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_SyncHostBuffer(IntPtr ptr, long byteCount);
 
         [LibraryImport(DllName)]
@@ -5598,6 +5608,27 @@ internal enum GgmlIndexReductionOp
             {
                 TSGgml_InvalidateHostBuffer(ptr);
             }
+        }
+
+        public static unsafe int ReleaseHostRanges(IReadOnlyList<(IntPtr Base, long Length)> ranges, IReadOnlyList<IntPtr> keys)
+        {
+            var bases = new IntPtr[ranges.Count];
+            var lengths = new ulong[ranges.Count];
+            for (int i = 0; i < ranges.Count; i++)
+            {
+                bases[i] = ranges[i].Base;
+                lengths[i] = ranges[i].Length > 0 ? (ulong)ranges[i].Length : 0;
+            }
+            var keyArray = new IntPtr[keys.Count];
+            for (int i = 0; i < keys.Count; i++) keyArray[i] = keys[i];
+            int dropped;
+            fixed (IntPtr* b = bases)
+            fixed (ulong* l = lengths)
+            fixed (IntPtr* k = keyArray)
+                dropped = TSGgml_ReleaseHostRanges(b, l, bases.Length, k, keyArray.Length);
+            if (dropped < 0)
+                throw new InvalidOperationException("ggml host-range release failed: " + GetLastErrorMessage("release host ranges"));
+            return dropped;
         }
 
         /// <summary>Diagnostic: total bytes of device-local COPY buffers resident in the GGML

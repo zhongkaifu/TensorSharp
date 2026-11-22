@@ -618,6 +618,13 @@ namespace TensorSharp.Models.QwenImage
         }
 
         /// <summary>Release the transformer so the next request rebuilds it (a LoRA change).</summary>
+        /// <summary>The stages loaded now (the transformer, the decoder), whose device memory a stage release drops.</summary>
+        internal void AddLoadedStages(List<IGgmlHostMemoryOwner> owners)
+        {
+            if (_dit != null) owners.Add(_dit);
+            if (_vae != null) owners.Add(_vae);
+        }
+
         internal void ResetTransformer()
         {
             _dit?.Dispose();

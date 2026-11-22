@@ -983,6 +983,19 @@ int forward_with_prefix_cache(const TSGQi21Desc& d) {
 }
 
 namespace tsg {
+void qwen_image21_invalidate_ranges(const HostRanges& ranges) {
+    std::lock_guard<std::recursive_mutex> lock(graph_mutex);
+    auto owned = [&](const TSGQi21Weight& w) { return ranges.contains(w.data); };
+    for (auto& device : graph_cache) for (auto& entry : device)
+        if (entry && std::any_of(entry->weight_key.begin(), entry->weight_key.end(), owned)) entry.reset();
+    for (auto it = prefix_caches.begin(); it != prefix_caches.end();) {
+        if (std::any_of((*it)->weight_key.begin(), (*it)->weight_key.end(), owned)) {
+            drop_graphs_of_cache((*it)->id);
+            it = prefix_caches.erase(it);
+        } else ++it;
+    }
+}
+
 void qwen_image21_invalidate_weight(const void* data) {
     std::lock_guard<std::recursive_mutex> lock(graph_mutex);
     for (auto& device : graph_cache) for (auto& entry : device) {

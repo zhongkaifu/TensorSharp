@@ -512,6 +512,14 @@ internal sealed partial class QwenImage21DiT : ModelBase
 
     // The group belongs to the QwenImageModel that created this transformer.
     protected override bool OwnsTensorParallelGroup => false;
+
+    /// <summary>The weights this transformer made itself (gains, split halves, rank shards) and the LoRA factors it binds,
+    /// whose device copies go with its own (the set outlives it only until the model disposes it).</summary>
+    protected override void AddOwnedHostMemory(List<(IntPtr Base, long Length)> ranges, List<IntPtr> keys)
+    {
+        keys.AddRange(_owned);
+        _lora?.CollectHostMemory(ranges);
+    }
     protected override float[] ForwardCore(int[] tokens) => throw new NotSupportedException("Use Predict for image inference.");
     protected override void ResetKVCacheCore() { }
     public override void Dispose()

@@ -50,6 +50,9 @@ namespace tsg
     /// Drops every cached copy (graphs still holding one keep it until they are freed).
     void cpu_repack_clear();
 
+    /// Drops the cached copies of host bytes inside [begin, end) spans (sorted, merged: an owner releasing its memory).
+    void cpu_repack_forget_ranges(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& spans);
+
     /// w · x for a weight ggml-cpu has no fast kernel for on this CPU, as TensorSharp's product (a GGML_OP_CUSTOM node
     /// over the graph's thread pool, ggml_ops_cpu_products.cpp), or null to keep ggml's MUL_MAT. ARM64: BF16 weights
     /// (ggml-cpu's BF16 dot is scalar there) at any width, through Accelerate's sgemm at prompt width on Apple, over F32

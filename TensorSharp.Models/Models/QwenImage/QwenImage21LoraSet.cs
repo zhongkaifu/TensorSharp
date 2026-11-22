@@ -802,6 +802,10 @@ internal sealed class QwenImage21LoraSet : IDisposable
         foreach (var adapter in _adapters) ((QwenImage21Adapter*)adapter)->OutputHead = OutputHeads[step];
     }
 
+    /// <summary>The factors' memory (every allocation of the set: factors, per-rank copies, gains, heads), as ranges: the
+    /// transformer that binds them releases it with its own (QwenImage21DiT.AddOwnedHostMemory).</summary>
+    internal void CollectHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges) => _buffers.AddRanges(ranges);
+
     public void Dispose()
     {
         _buffers.Dispose();

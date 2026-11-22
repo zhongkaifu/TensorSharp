@@ -161,6 +161,20 @@ namespace TensorSharp.GGML
                 };
         }
 
+        /// <summary>The host memory this pool holds: every block it handed out and has not been given back, and every freed
+        /// block it keeps for reuse. A GGML device copy of any of it is keyed inside these ranges.</summary>
+        internal List<(IntPtr Base, long Length)> BlockRanges()
+        {
+            lock (_lock)
+            {
+                var ranges = new List<(IntPtr, long)>(_outstanding.Count + _available.Count + _budgeted.Count);
+                foreach (PoolBlock b in _outstanding.Values) ranges.Add((b.Ptr, (long)b.Size));
+                foreach (PoolBlock b in _available) ranges.Add((b.Ptr, (long)b.Size));
+                foreach (PoolBlock b in _budgeted) ranges.Add((b.Ptr, (long)b.Size));
+                return ranges;
+            }
+        }
+
         public IntPtr Allocate(long byteLength) => AllocateReportingZero(byteLength, out _);
 
         /// <param name="zeroed">True when the block is a fresh anonymous mapping, which the OS

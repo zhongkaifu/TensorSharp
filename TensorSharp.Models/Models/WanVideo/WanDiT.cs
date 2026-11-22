@@ -21,7 +21,7 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.WanVideo
 {
-    internal sealed class WanDiT : IWanDit
+    internal sealed class WanDiT : IWanDit, IGgmlHostMemoryOwner
     {
         public const int FreqDim = 256;
         public const int TextDim = 4096;
@@ -303,6 +303,9 @@ namespace TensorSharp.Models.WanVideo
                 return result;
             }
         }
+
+        /// <summary>The F32 copies this transformer made (the GGUF mapping is the model's).</summary>
+        void IGgmlHostMemoryOwner.CollectHostMemory(List<(IntPtr Base, long Length)> ranges, List<IntPtr> keys) => keys.AddRange(_f32Owned);
 
         public void Dispose()
         {
