@@ -444,6 +444,18 @@ namespace TensorSharp.Chat
                 ["allowed_tools"] = skill.Manifest.AllowedTools,
                 ["bytes"] = skill.TotalBytes,
                 ["origin"] = skill.Origin == SkillOrigin.Installed ? "installed" : "discovered",
+                // Where a skill installed from the skill hub came from, so a user always
+                // sees that it is third-party and exactly which commit of whose repository.
+                ["source"] = skill.Source is { } hub
+                    ? new
+                    {
+                        package = hub.Package,
+                        url = hub.Url,
+                        revision = hub.Revision,
+                        installed = hub.InstalledUtc,
+                        renamed_from = hub.RenamedFrom,
+                    }
+                    : null,
                 ["warnings"] = skill.Manifest.Warnings,
                 ["modified"] = skill.ModifiedUtc,
                 ["files"] = skill.BundledFiles.Select(f => new

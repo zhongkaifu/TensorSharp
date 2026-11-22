@@ -2413,6 +2413,17 @@ function buildSkillRow(sk, idx, selected) {
   meta.textContent = metaParts.join(' · ');
   body.appendChild(meta);
 
+  // A skill installed from the skill hub says whose repository, at which commit.
+  const source = sk && sk.source && typeof sk.source.package === 'string' ? sk.source : null;
+  if (source) {
+    const from = document.createElement('div');
+    from.className = 'skill-meta';
+    from.textContent = 'From the skill hub: ' + source.package + ' @ ' + String(source.revision || '').slice(0, 12)
+      + (source.renamed_from ? ' · renamed from ' + source.renamed_from : '');
+    if (typeof source.url === 'string' && source.url.startsWith('https://github.com/')) from.title = source.url;
+    body.appendChild(from);
+  }
+
   const warnings = (sk && Array.isArray(sk.warnings)) ? sk.warnings : [];
   warnings.forEach(w => {
     const warn = document.createElement('div');
@@ -2588,7 +2599,7 @@ function activityLabel(tool, phase) {
     case 'skills_run':  return writing ? 'Preparing skill run…' : 'Running skill…';
     case 'skills_search': return writing ? 'Preparing skill search…' : 'Searching community skills…';
     case 'skills_inspect': return writing ? 'Preparing skill inspection…' : 'Inspecting skill requirements…';
-    case 'skills_install': return writing ? 'Preparing skill installation…' : 'Installing inspected skill…';
+    case 'skills_install': return writing ? 'Preparing skill installation…' : 'Installing skill…';
     case 'wait_agent':  return writing ? 'Preparing to wait for sub-agents…' : 'Waiting for sub-agents…';
     default: {
       const name = tool ? String(tool).replace(/_/g, ' ') : 'operation';
@@ -3882,6 +3893,8 @@ async function requestAssistantResponse() {
           if (data.skill_step) {
             if (data.skill_step === 'skills_install' && data.ok === true) {
               loadSkillsRoster();
+              // Every install is shown in the turn: which package, from where, at which commit.
+              if (typeof data.detail === 'string' && data.detail) appendTurnNotice(assistDiv, 'Installed ' + data.detail);
             }
             // Completion metadata is intentionally not rendered as a history.
             // Keep only user-facing output files; call execution is logged

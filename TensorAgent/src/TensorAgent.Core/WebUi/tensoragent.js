@@ -973,6 +973,9 @@
     skills_list: ['page.tool.skillsList.writing', 'page.tool.skillsList.running'],
     skills_read: ['page.tool.skillsRead.writing', 'page.tool.skillsRead.running'],
     skills_run: ['page.tool.skillsRun.writing', 'page.tool.skillsRun.running'],
+    skills_search: ['page.tool.skillsSearch.writing', 'page.tool.skillsSearch.running'],
+    skills_inspect: ['page.tool.skillsInspect.writing', 'page.tool.skillsInspect.running'],
+    skills_install: ['page.tool.skillsInstall.writing', 'page.tool.skillsInstall.running'],
     spawn_agent: ['page.tool.spawnAgent.writing', 'page.tool.spawnAgent.running'],
     wait_agent: ['page.tool.waitAgent.writing', 'page.tool.waitAgent.running'],
     send_input: ['page.tool.sendInput.writing', 'page.tool.sendInput.running'],
@@ -1104,6 +1107,11 @@
       var text = labelFor(tool, 'running')
         + (what ? ' · ' + shorten(what, 70) : '')
         + (secs ? ' · ' + t('page.trace.seconds', { seconds: secs }) : '');
+      // An install is never shortened: which package, from where, at which commit is
+      // the whole point of showing it (the host's provenance line is the detail).
+      if (tool === 'skills_install' && step.ok !== false && step.detail) {
+        text = t('page.trace.installed', { what: step.detail });
+      }
 
       stepLine(view, step.ok === false ? 'fail' : 'done', text);
       (step.files || []).forEach(function (file) { fileLine(view, file); });
@@ -5283,6 +5291,7 @@
       info.addEventListener('click', function () { openSkill(s); });
       meta.appendChild(info);
       meta.appendChild(el('div', 'ds', s.description || ''));
+      if (s.source && s.source.package) meta.appendChild(el('div', 'ds', skillSourceLine(s.source)));
       row.appendChild(meta);
       var actions = el('div', 'skill-actions');
       var choice = el('label', 'switch skill-choice');
@@ -5338,6 +5347,13 @@
       });
   }
 
+  // Where a skill installed from the skill hub came from, in one line.
+  function skillSourceLine(source) {
+    var revision = String(source.revision || '');
+    return t('page.skill.fromHub', { package: String(source.package), revision: revision.slice(0, 12) })
+      + (source.renamed_from ? ' · ' + t('page.skill.renamedFrom', { name: String(source.renamed_from) }) : '');
+  }
+
   // One skill, in full: the name, everything the description says, whether it is
   // on for this chat, and the way to remove it.
   function openSkill(s) {
@@ -5355,6 +5371,18 @@
         : s.origin === 'discovered' ? t('page.skill.origin.discovered') : String(s.origin));
     }
     if (bits.length) body.appendChild(el('div', 'meta', bits.join(' · ')));
+    if (s.source && s.source.package) {
+      var from = el('div', 'meta', skillSourceLine(s.source));
+      body.appendChild(from);
+      if (s.source.url && /^https:\/\/github\.com\//.test(String(s.source.url))) {
+        var link = document.createElement('a');
+        link.href = String(s.source.url);
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = String(s.source.url);
+        body.appendChild(el('div', 'meta')).appendChild(link);
+      }
+    }
     body.appendChild(document.createTextNode(s.description || t('page.skill.noDescription')));
 
     var on = $('skill-on');

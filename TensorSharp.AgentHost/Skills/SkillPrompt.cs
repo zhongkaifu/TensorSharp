@@ -284,7 +284,17 @@ namespace TensorSharp.AgentHost.Skills
                     // is worse than a long block — it is a silent no-op on something the
                     // user asked for by name.
                     deferred.Add(skill);
-                    spent += SkillTextBudget.ApproximateTokens(skill.Description) + 32;
+                    spent += SkillTextBudget.ApproximateTokens(DescriptionFor(skill, options.MaxCatalogDescriptionChars)) + 32;
+                    continue;
+                }
+
+                // A skill installed from the hub is third-party content, and its body
+                // reaches the model only as a tool result (skills_read), never as part of
+                // the system prompt.
+                if (skill.Source != null)
+                {
+                    deferred.Add(skill);
+                    spent += 48;
                     continue;
                 }
 
@@ -548,7 +558,7 @@ namespace TensorSharp.AgentHost.Skills
                     // distinction would teach the model nothing it can use.
                     sb.Append('\n');
                     sb.Append("- ").Append(skill.Id).Append(": ")
-                      .Append(Trim(skill.Description, options.MaxCatalogDescriptionChars)).Append('\n');
+                      .Append(DescriptionFor(skill, options.MaxCatalogDescriptionChars)).Append('\n');
                     sb.Append("  Instructions: about ")
                       .Append(skill.Manifest.ApproximateBodyTokens.ToString(CultureInfo.InvariantCulture))
                       .Append(" tokens, NOT loaded. If you decide to use this skill, read them first with ")
@@ -566,7 +576,7 @@ namespace TensorSharp.AgentHost.Skills
                 foreach (Skill skill in catalog)
                 {
                     sb.Append("- ").Append(skill.Id).Append(": ")
-                      .Append(Trim(skill.Description, describeChars)).Append('\n');
+                      .Append(DescriptionFor(skill, describeChars)).Append('\n');
                 }
                 if (omitted > 0)
                 {
@@ -661,7 +671,18 @@ namespace TensorSharp.AgentHost.Skills
         /// shorter cap shortened the line without buying any room.
         /// </summary>
         private static int CatalogEntryTokens(Skill skill, int describeChars) =>
-            SkillTextBudget.ApproximateTokens(Trim(skill.Description, describeChars)) + 16;
+            SkillTextBudget.ApproximateTokens(DescriptionFor(skill, describeChars)) + 16;
+
+        /// <summary>
+        /// The catalog text for a skill. A hub skill's own description is third-party
+        /// text, so the system prompt names where it came from instead; its description and
+        /// instructions are one tool call away (skills_list, skills_read), as tool output.
+        /// </summary>
+        internal static string DescriptionFor(Skill skill, int maxChars) =>
+            skill.Source is { } source
+                ? Trim("third-party skill installed from the skill hub (" + source.Package
+                    + "); skills_list shows its description and skills_read its instructions.", Math.Max(maxChars, 160))
+                : Trim(skill.Description, maxChars);
 
         /// <summary>
         /// The longest description length at which EVERY catalog entry fits the budget,

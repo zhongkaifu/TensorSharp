@@ -19,7 +19,15 @@ public sealed record SkillSearchResult(string Name, string Source, string Packag
 /// <summary>An inspected skill at an immutable Git commit. Instructions remain untrusted source content.</summary>
 public sealed record SkillPackageInspection(
     string Package, string Source, string Revision, SkillManifest Manifest,
-    IReadOnlyList<string> Files, long TotalBytes);
+    IReadOnlyList<string> Files, long TotalBytes)
+{
+    /// <summary>The skill's directory inside the repository at <see cref="Revision"/>; empty at the root.</summary>
+    public string Directory { get; init; } = string.Empty;
+
+    /// <summary>The skill's files on GitHub, at the inspected commit.</summary>
+    public string BrowseUrl => "https://github.com/" + Source + "/tree/" + Revision
+        + (Directory.Length == 0 ? string.Empty : "/" + Directory);
+}
 
 /// <summary>Registration and provenance of one newly installed skill.</summary>
 public sealed record SkillMarketplaceInstall(Skill Skill, string Package, string Source, string Revision);
@@ -99,6 +107,9 @@ public sealed class SkillMarketplace : IDisposable
         if (query.Length < 2 || query.Length > 256 || query.Any(char.IsControl))
             throw new SkillInstallException("A search query must contain 2–256 characters without control characters.");
         owner = string.IsNullOrWhiteSpace(owner) ? null : owner.Trim().ToLowerInvariant();
+        // "owner/repository" (or a package) names its owner first: filter by that.
+        if (owner != null && owner.IndexOfAny(new[] { '/', '@' }) > 0)
+            owner = owner.Split('/', '@')[0];
         if (owner != null && !OwnerPattern.IsMatch(owner))
             throw new SkillInstallException("The owner filter must be a GitHub owner name.");
         var uri = new Uri("https://skills.sh/api/search?q=" + Uri.EscapeDataString(query) + "&limit=20"
@@ -157,9 +168,22 @@ public sealed class SkillMarketplace : IDisposable
             if (_packages.TryGetValue(id.Package, out PackageCache? cached) && IsFresh(cached.Created))
                 return cached.Inspection;
         }
-        byte[] commit = await DownloadAsync(CommitUri(id), _options.MaxJsonBytes, cancellationToken).ConfigureAwait(false);
-        using JsonDocument json = ParseJson(commit, "GitHub commit");
-        string? revision = StringProperty(json.RootElement, "sha");
+        // Asked for the commit id alone (application/vnd.github.sha): the full commit JSON
+        // carries the commit's whole file list and diff, which for a large commit in a skills
+        // monorepo exceeded the JSON limit and made the package uninstallable.
+        byte[] commit = await DownloadAsync(CommitUri(id), _options.MaxJsonBytes, cancellationToken,
+            accept: "application/vnd.github.sha").ConfigureAwait(false);
+        string? revision;
+        string text = Encoding.UTF8.GetString(commit).Trim();
+        if (text.StartsWith('{'))
+        {
+            using JsonDocument json = ParseJson(commit, "GitHub commit");
+            revision = StringProperty(json.RootElement, "sha");
+        }
+        else
+        {
+            revision = text;
+        }
         if (revision == null || !RevisionPattern.IsMatch(revision))
             throw new SkillInstallException("GitHub did not return an immutable 40-character commit revision.");
         PackageCache prepared = await FetchPackageAsync(id, revision.ToLowerInvariant(), cancellationToken).ConfigureAwait(false);
@@ -177,8 +201,26 @@ public sealed class SkillMarketplace : IDisposable
     }
 
     /// <summary>Install exactly the inspected revision; never overwrite an existing skill.</summary>
+    public Task<SkillMarketplaceInstall> InstallAsync(
+        SkillPackageInspection inspection, SkillRegistry registry, CancellationToken cancellationToken = default) =>
+        InstallAsync(inspection, registry, installAs: null, beforeInstall: null, cancellationToken);
+
+    /// <summary>
+    /// Install exactly the inspected revision, never overwriting an existing skill, and
+    /// record where it came from (<see cref="SkillSource"/>).
+    /// </summary>
+    /// <param name="installAs">
+    /// Install under this name instead of the upstream one — the only edit ever made to a
+    /// downloaded file is that SKILL.md's <c>name</c> line, recorded as
+    /// <see cref="SkillSource.RenamedFrom"/>. Null keeps the upstream name.
+    /// </param>
+    /// <param name="beforeInstall">
+    /// Called with the extracted skill directory and its manifest before anything is
+    /// registered; a non-null answer refuses the install with that message.
+    /// </param>
     public async Task<SkillMarketplaceInstall> InstallAsync(
-        SkillPackageInspection inspection, SkillRegistry registry, CancellationToken cancellationToken = default)
+        SkillPackageInspection inspection, SkillRegistry registry, string? installAs,
+        Func<string, SkillManifest, string?>? beforeInstall, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(inspection);
@@ -190,8 +232,11 @@ public sealed class SkillMarketplace : IDisposable
             || !string.Equals(id.Source, inspection.Source, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(id.Name, inspection.Manifest.Name, StringComparison.Ordinal))
             throw new SkillInstallException("The inspected package or revision is inconsistent.");
-        if (registry.TryGet(id.Name, out _))
-            throw new SkillInstallException($"Skill '{id.Name}' already exists; marketplace installation never overwrites it.");
+        string name = string.IsNullOrWhiteSpace(installAs) ? id.Name : installAs.Trim();
+        if (!SkillPattern.IsMatch(name) || name.Length > SkillManifest.MaxNameLength)
+            throw new SkillInstallException($"'{name}' is not a usable skill name.");
+        if (registry.TryGet(name, out _))
+            throw new SkillInstallException($"Skill '{name}' already exists; marketplace installation never overwrites it.");
         Authorize(ArchiveUri(id, inspection.Revision!));
         PackageCache? prepared;
         lock (_gate)
@@ -210,7 +255,13 @@ public sealed class SkillMarketplace : IDisposable
             if (!SkillPathGuard.TryResolve(temporary, prepared.SkillDirectory, out string? skillRoot, out string? error))
                 throw new SkillInstallException(error ?? "The selected skill directory is unsafe.");
             cancellationToken.ThrowIfCancellationRequested();
-            Skill installed = registry.InstallFromDirectory(skillRoot!, overwrite: false);
+            if (!string.Equals(name, id.Name, StringComparison.Ordinal))
+                RenameManifest(Path.Combine(skillRoot!, SkillManifestParser.SkillFileName), name);
+            if (beforeInstall?.Invoke(skillRoot!, prepared.Inspection.Manifest) is { } refusal)
+                throw new SkillInstallException(refusal);
+            var source = new SkillSource(id.Package, prepared.Inspection.BrowseUrl, prepared.Inspection.Revision,
+                DateTimeOffset.UtcNow, string.Equals(name, id.Name, StringComparison.Ordinal) ? null : id.Name);
+            Skill installed = registry.InstallFromDirectory(skillRoot!, overwrite: false, source);
             return new SkillMarketplaceInstall(installed, id.Package, id.Source, prepared.Inspection.Revision);
         }
         finally
@@ -226,6 +277,12 @@ public sealed class SkillMarketplace : IDisposable
         {
             using var memory = new MemoryStream(archive, writable: false);
             using var zip = new ZipArchive(memory, ZipArchiveMode.Read);
+            // GitHub writes the archived commit's id as the ZIP comment. Requiring it to be
+            // the commit asked for binds these bytes to the pinned revision: a cache or
+            // proxy answering with another snapshot of the repository is refused.
+            if (!string.Equals(zip.Comment?.Trim(), revision, StringComparison.OrdinalIgnoreCase))
+                throw new SkillInstallException(
+                    $"The archive GitHub returned is not commit {revision} (it is labelled '{Clip(zip.Comment, 64)}'); nothing was installed.");
             ValidateEntries(zip);
             var matches = new List<(string Directory, SkillManifest Manifest)>();
             foreach (ZipArchiveEntry entry in zip.Entries)
@@ -296,7 +353,13 @@ public sealed class SkillMarketplace : IDisposable
             if (skillArchive.Length > _options.MaxArchiveBytes)
                 throw new SkillInstallException("The selected skill exceeds the archive byte limit.");
             return new PackageCache(DateTimeOffset.UtcNow, skillArchive.ToArray(), string.Empty,
-                new SkillPackageInspection(id.Package, id.Source, revision, selected.Manifest, paths, total));
+                new SkillPackageInspection(id.Package, id.Source, revision, selected.Manifest, paths, total)
+                {
+                    // The archive's first segment is GitHub's "<repo>-<commit>" folder.
+                    Directory = selected.Directory.Contains('/')
+                        ? selected.Directory.Substring(selected.Directory.IndexOf('/') + 1)
+                        : string.Empty,
+                });
         }
         catch (InvalidDataException ex)
         {
@@ -345,21 +408,24 @@ public sealed class SkillMarketplace : IDisposable
         return path.Contains('/') && zip.GetEntry(SkillManifestParser.SkillFileName) != null;
     }
 
-    private async Task<byte[]> DownloadAsync(Uri uri, int limit, CancellationToken cancellationToken)
+    private async Task<byte[]> DownloadAsync(Uri uri, int limit, CancellationToken cancellationToken, string? accept = null)
     {
         Authorize(uri);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_options.RequestTimeout);
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         request.Headers.UserAgent.ParseAdd("TensorSharp-Skills/1.0");
-        request.Headers.Accept.ParseAdd(uri.Host == "codeload.github.com" ? "application/zip" : "application/json");
+        request.Headers.Accept.ParseAdd(accept ?? (uri.Host == "codeload.github.com" ? "application/zip" : "application/json"));
         try
         {
             using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             if (response.RequestMessage?.RequestUri is { } final && final != uri)
                 throw new SkillInstallException("Marketplace redirects are not supported; use a transport with redirects disabled.");
             if (!response.IsSuccessStatusCode)
-                throw new SkillInstallException($"{uri.Host} returned HTTP {(int)response.StatusCode} ({response.ReasonPhrase}).");
+                throw new SkillInstallException($"{uri.Host} returned HTTP {(int)response.StatusCode} ({response.ReasonPhrase}).")
+                {
+                    HttpStatus = (int)response.StatusCode,
+                };
             if (response.Content.Headers.ContentLength is long length && length > limit)
                 throw new SkillInstallException($"{uri.Host} returned more than the {limit}-byte download limit.");
             await using Stream body = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
@@ -396,6 +462,40 @@ public sealed class SkillMarketplace : IDisposable
             throw new SkillInstallException("Marketplace requests are restricted to skills.sh and public GitHub HTTPS endpoints.");
         if (_options.IsRequestAllowed != null && !_options.IsRequestAllowed(uri))
             throw new SkillInstallException($"The host network policy does not allow {uri.Host}.");
+    }
+
+    private static string Clip(string? value, int max) =>
+        string.IsNullOrEmpty(value) ? string.Empty : value.Length <= max ? value : value.Substring(0, max);
+
+    /// <summary>
+    /// Give a downloaded SKILL.md another name: its frontmatter's <c>name</c> line, and
+    /// nothing else, is rewritten.
+    /// </summary>
+    internal static void RenameManifest(string manifestPath, string name)
+    {
+        string text = File.ReadAllText(manifestPath);
+        string newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        string[] lines = text.Split('\n');
+        if (lines.Length < 2 || lines[0].TrimEnd('\r').Trim() != "---")
+            throw new SkillInstallException("The skill's SKILL.md has no frontmatter to rename.");
+        for (int i = 1; i < lines.Length; i++)
+        {
+            string line = lines[i].TrimEnd('\r');
+            if (line.Trim() == "---")
+            {
+                var list = lines.ToList();
+                list.Insert(i, "name: " + name + (newline == "\r\n" ? "\r" : string.Empty));
+                File.WriteAllText(manifestPath, string.Join('\n', list));
+                return;
+            }
+            if (Regex.IsMatch(line, "^name\\s*:"))
+            {
+                lines[i] = "name: " + name + (lines[i].EndsWith('\r') ? "\r" : string.Empty);
+                File.WriteAllText(manifestPath, string.Join('\n', lines));
+                return;
+            }
+        }
+        throw new SkillInstallException("The skill's SKILL.md frontmatter is not closed.");
     }
 
     private static JsonDocument ParseJson(byte[] payload, string source)

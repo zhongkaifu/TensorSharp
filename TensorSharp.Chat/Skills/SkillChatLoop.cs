@@ -547,7 +547,10 @@ namespace TensorSharp.Server.Skills
             var finalThinking = new StringBuilder();
             var finalHeldAnswer = guardCompletion ? new List<ChatStreamUpdate>() : null;
             ChatStreamUpdate finalTerminal = default;
-            var finalTools = plan.ToolContext.Knowledge == null || guardCompletion
+            // A model that was told twice that a call returns nothing new, and made it again, is
+            // stuck: its last round answers in text, with only the caller's own tools declared,
+            // instead of reaching for the same call a fourth time.
+            var finalTools = (plan.ToolContext.Knowledge == null || guardCompletion) && !plan.StuckRepeating
                 ? plan.Tools : plan.ClientTools?.ToList() ?? new List<ToolFunction>();
 
             using var finalRoundScope = TelemetryContextScope.Round(roundsRun + 1);
@@ -1076,13 +1079,29 @@ namespace TensorSharp.Server.Skills
                 }
                 SkillToolResult result = await execution.ConfigureAwait(false);
                 if (repeatKey != null && !plan.TurnCalls.ContainsKey(repeatKey)
-                    && (repeatKey.StartsWith(FailedCallRepeatPrefix, StringComparison.Ordinal) ? !result.Ok : result.Ok))
+                    && (repeatKey.StartsWith(SameResultRepeatPrefix, StringComparison.Ordinal)
+                        || (repeatKey.StartsWith(FailedCallRepeatPrefix, StringComparison.Ordinal) ? !result.Ok : result.Ok)))
                 {
                     plan.TurnCalls[repeatKey] = new RepeatedToolCall
                     {
                         Tool = call.Name, SkillId = result.SkillId, Path = result.ResourcePath,
                         Error = result.Ok ? null : result.Content,
+                        AnyResult = repeatKey.StartsWith(SameResultRepeatPrefix, StringComparison.Ordinal),
                     };
+                }
+                // An install result carries the installed skill's SKILL.md, so reading that file
+                // next returns nothing new: it is answered like a repeated read.
+                if (result.Ok && call.Name == SkillMarketplaceTools.InstallToolName && result.SkillId is { } installedId
+                    && SkillTools.RepeatableReadKey(new ToolCall
+                    {
+                        Name = SkillTools.ReadToolName,
+                        Arguments = new Dictionary<string, object> { ["skill"] = installedId },
+                    }, plan.ToolContext) is { } installedRead)
+                {
+                    plan.TurnCalls.TryAdd(ReadRepeatPrefix + installedRead, new RepeatedToolCall
+                    {
+                        Tool = SkillTools.ReadToolName, SkillId = installedId, Path = "SKILL.md",
+                    });
                 }
 
                 // A run shorter than one heartbeat never hit the loop above; its output
@@ -1679,6 +1698,7 @@ namespace TensorSharp.Server.Skills
         private const string ReadRepeatPrefix = "read\n";
         private const string ListRepeatPrefix = "list\n";
         private const string FailedCallRepeatPrefix = "call\n";
+        private const string SameResultRepeatPrefix = "same\n";
 
         /// <summary>
         /// The key of a call whose repeat in the same turn cannot return anything new, or null: a skill file read
@@ -1694,13 +1714,76 @@ namespace TensorSharp.Server.Skills
                 return ReadRepeatPrefix + read;
             if (call != null && call.Name == SkillTools.ListToolName && plan.ToolContext != null)
                 return ListRepeatPrefix + string.Join("\n", plan.ToolContext.Reachable.Select(skill => skill.Id));
-            if (call == null || !MultiAgentTools.IsTool(call.Name) || call.Name == MultiAgentTools.Wait)
+            if (call == null)
+                return null;
+            // The same search within a turn returns the same hits (they are cached), and the same
+            // shell command over an unchanged workspace is a loop, not a step: both are answered
+            // from their first result whatever it was.
+            // An install of the same package returns the same thing the second time ("Already
+            // installed" with the whole SKILL.md again — fourteen times in one observed turn).
+            bool sameResult = call.Name is SkillMarketplaceTools.SearchToolName or SkillMarketplaceTools.InstallToolName
+                || string.Equals(SkillToolNames.CanonicalName(call.Name), SkillToolNames.Shell, StringComparison.Ordinal);
+            if (sameResult && call.Name == SkillMarketplaceTools.InstallToolName
+                && plan.ToolContext?.Marketplace?.InstallLimitReached == true)
+                return FailedCallRepeatPrefix + call.Name + "\n(install limit reached)";
+            if (sameResult)
+            {
+                string body = call.Name != SkillToolNames.Shell && SkillToolNames.CanonicalName(call.Name) != SkillToolNames.Shell
+                    ? JsonSerializer.Serialize(new SortedDictionary<string, object>(
+                        call.Arguments ?? new Dictionary<string, object>(), StringComparer.Ordinal))
+                    : ShellCommand.ReadCommand(call.Arguments != null && call.Arguments.TryGetValue("command", out object raw) ? raw : null)?.Trim();
+                if (string.IsNullOrEmpty(body))
+                    return null;
+                if (call.Name is SkillMarketplaceTools.SearchToolName or SkillMarketplaceTools.InstallToolName)
+                    return SameResultRepeatPrefix + call.Name + "\n" + body;
+                return plan.ToolContext?.Workspace is { } shellWorkspace
+                    ? SameResultRepeatPrefix + SkillToolNames.Shell + "\n" + body + "\n" + WorkspaceFingerprint(shellWorkspace)
+                    : null;
+            }
+            // (Past the per-turn install limit every install is refused the same way, whichever
+            // package it names — a small model tried eight different ones in a row — so that key
+            // ignores the package; see above.)
+            // A hub lookup that failed (a stale entry, a refused install) fails the same way again.
+            bool hub = SkillMarketplaceTools.IsTool(call.Name) && call.Name != SkillMarketplaceTools.SearchToolName;
+            // A skill script or a file read that failed fails the same way again while the
+            // workspace it reads is unchanged — which is why the workspace's state is part of
+            // the key: once anything in it changes, the same call is a new call.
+            bool workspaceBound = call.Name == SkillTools.RunToolName
+                || string.Equals(SkillToolNames.CanonicalName(call.Name), SkillToolNames.ReadFile, StringComparison.Ordinal);
+            if (!hub && !workspaceBound && (!MultiAgentTools.IsTool(call.Name) || call.Name == MultiAgentTools.Wait))
                 return null;
             var sorted = new SortedDictionary<string, object>(StringComparer.Ordinal);
             if (call.Arguments != null)
                 foreach (KeyValuePair<string, object> argument in call.Arguments)
                     sorted[argument.Key] = argument.Value;
-            return FailedCallRepeatPrefix + call.Name + "\n" + JsonSerializer.Serialize(sorted);
+            string key = FailedCallRepeatPrefix + call.Name + "\n" + JsonSerializer.Serialize(sorted);
+            if (workspaceBound)
+            {
+                if (plan.ToolContext?.Workspace is not { } workspace)
+                    return null;
+                key += "\n" + WorkspaceFingerprint(workspace);
+            }
+            return key;
+        }
+
+        /// <summary>The names, sizes and write times of a workspace's files, as one string.</summary>
+        private static string WorkspaceFingerprint(SessionWorkspace workspace)
+        {
+            try
+            {
+                var builder = new System.Text.StringBuilder();
+                foreach (var entry in workspace.SnapshotWorkFiles().OrderBy(e => e.Key, StringComparer.Ordinal))
+                {
+                    builder.Append(entry.Key).Append('\t').Append(entry.Value.Length.ToString(CultureInfo.InvariantCulture))
+                        .Append('\t').Append(entry.Value.WriteTime.Ticks.ToString(CultureInfo.InvariantCulture)).Append('\n');
+                }
+                return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                    System.Text.Encoding.UTF8.GetBytes(builder.ToString())));
+            }
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
+            {
+                return Guid.NewGuid().ToString("N");   // unknown state: never a repeat
+            }
         }
 
         /// <summary>
@@ -1709,6 +1792,13 @@ namespace TensorSharp.Server.Skills
         /// </summary>
         internal static SkillToolResult RepeatedCallResult(RepeatedToolCall earlier)
         {
+            if (earlier.AnyResult)
+            {
+                return new SkillToolResult(false,
+                    $"Error: this exact {earlier.Tool} call already ran earlier in this turn and nothing it depends on has "
+                    + "changed, so it was not run again: its result is in the conversation above. Use that result, make a "
+                    + "different call, or answer the user now.", null, null);
+            }
             if (earlier.Error == null && earlier.Tool == SkillTools.ListToolName)
             {
                 return new SkillToolResult(true,

@@ -340,6 +340,13 @@ namespace TensorSharp.AgentHost.CodeExec
         }
 
         /// <inheritdoc/>
+        public string? ExplainUnavailablePackage(string language, string package)
+        {
+            CodeLanguage parsed = CodeExecOptions.ParseLanguage(language);
+            return parsed == CodeLanguage.Unknown ? null : _runner.Installer.ExplainUnavailable(parsed, package);
+        }
+
+        /// <inheritdoc/>
         public string? InstallPackages(
             string language, IReadOnlyList<string> packages,
             SessionWorkspace workspace, Action<string>? onOutput = null)

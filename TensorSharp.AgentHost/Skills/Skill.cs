@@ -67,6 +67,27 @@ namespace TensorSharp.AgentHost.Skills
     public readonly record struct SkillFile(string Path, long Bytes, SkillFileKind Kind, bool IsText);
 
     /// <summary>
+    /// Where a skill installed from the public skill hub came from: the exact package, the
+    /// immutable Git commit it was installed at, and when. Recorded by the registry at
+    /// install time and shown wherever the skill is listed, so a user can always see that a
+    /// skill is third-party and which revision of whose repository it is.
+    /// </summary>
+    /// <param name="Package">The hub selector, <c>owner/repository@skill-name</c>.</param>
+    /// <param name="Url">The skill's directory on GitHub at <paramref name="Revision"/>.</param>
+    /// <param name="Revision">The 40-character commit the files were taken from.</param>
+    /// <param name="InstalledUtc">When this host installed it.</param>
+    /// <param name="RenamedFrom">
+    /// The upstream name when it was installed under another one because a different skill
+    /// here already has that name; null when the names agree.
+    /// </param>
+    public sealed record SkillSource(
+        string Package, string Url, string Revision, DateTimeOffset InstalledUtc, string? RenamedFrom = null)
+    {
+        /// <summary>One line for a person: "owner/repo@name from https://github.com/... @ 1a2b3c4".</summary>
+        public string Describe() => Package + " from " + Url + " @ " + Revision;
+    }
+
+    /// <summary>
     /// One skill loaded from disk: its parsed <c>SKILL.md</c>, the directory that
     /// holds it, and an index of the files it ships.
     ///
@@ -124,6 +145,14 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>Total bytes on disk.</summary>
         public long TotalBytes { get; }
+
+        /// <summary>
+        /// Provenance of a skill installed from the skill hub; null for every other skill
+        /// (bundled, operator-provided, or uploaded by the user). A hub skill's files are
+        /// third-party content: they reach the model only as tool output, never as part of
+        /// the system prompt (<see cref="SkillPrompt"/>).
+        /// </summary>
+        public SkillSource? Source { get; internal set; }
 
         /// <summary>The newest write time in the skill directory, used for cache invalidation and listings.</summary>
         public DateTime ModifiedUtc { get; }

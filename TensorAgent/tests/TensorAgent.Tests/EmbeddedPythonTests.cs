@@ -15,6 +15,7 @@ using System.Text;
 using System.Text.Json;
 using TensorAgent.Core.Python;
 using TensorAgent.Core.Sandbox;
+using TensorSharp.AgentHost.CodeExec;
 
 namespace TensorAgent.Tests;
 
@@ -1007,6 +1008,39 @@ public sealed class EmbeddedPythonTests : IDisposable
         Assert.NotNull(wheel);
         Assert.Equal("rich-13.9.4-py3-none-any.whl", wheel.FileName);
         Assert.Equal("bbb", wheel.Sha256);
+    }
+
+    [Fact]
+    public void APackageThatShipsOnlyCompiledCodeIsReportedBeforeAnythingIsInstalled()
+    {
+        // What a hub skill's compatibility check asks before it is installed on the device:
+        // the same index entry and the same selection an install makes, nothing downloaded.
+        var handler = new RecordingHttpHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            "/pypi/pandas/json" => TextResponse(HttpStatusCode.OK, IndexJson(
+                IndexFile("pandas-2.3.0.tar.gz", "sdist", "aaa"),
+                IndexFile("pandas-2.3.0-cp313-cp313-macosx_11_0_arm64.whl", "bdist_wheel", "bbb"))),
+            "/pypi/yfinance/json" => TextResponse(HttpStatusCode.OK, IndexJson(
+                IndexFile("yfinance-1.8.0-py3-none-any.whl", "bdist_wheel", "ccc"))),
+            _ => TextResponse(HttpStatusCode.NotFound, "{}"),
+        });
+        using var client = new HttpClient(handler);
+        ExecutionPolicy policy = Policy(network: true) with { NetworkHosts = ["pypi.org", "files.pythonhosted.org"] };
+        var installer = new InstallHookPackageInstaller(new WheelInstaller(policy, client),
+            new CodeExecOptions { Enabled = true, AllowInstall = true, AllowNetwork = true }, () => policy.NetworkHosts,
+            () => [new BundledDistribution("numpy", "numpy", "2.5.2", Compiled: true)]);
+
+        string? pandas = installer.ExplainUnavailable(CodeLanguage.Python, "pandas");
+        Assert.NotNull(pandas);
+        Assert.StartsWith("pandas: ", pandas, StringComparison.Ordinal);
+        Assert.Contains("compiled code", pandas, StringComparison.Ordinal);
+        Assert.Null(installer.ExplainUnavailable(CodeLanguage.Python, "yfinance"));
+        // Built into the app: usable, and no lookup.
+        Assert.Null(installer.ExplainUnavailable(CodeLanguage.Python, "numpy"));
+        // Unknown is not "no": a lookup that fails refuses nothing.
+        Assert.Null(installer.ExplainUnavailable(CodeLanguage.Python, "does-not-exist"));
+        Assert.DoesNotContain(handler.Requests, r => r.AbsolutePath.Contains("numpy", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Requests, r => r.Host == WheelInstaller.PayloadHost);
     }
 
     [Fact]

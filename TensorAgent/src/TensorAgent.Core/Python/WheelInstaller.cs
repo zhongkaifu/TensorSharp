@@ -172,6 +172,38 @@ public sealed class WheelInstaller : IInstallHook
         }
     }
 
+    /// <summary>
+    /// Why <paramref name="name"/> can never be installed on this device -- every
+    /// published file is compiled or a source build, or targets another Python -- from the
+    /// same index entry and the same selection an install makes, without downloading
+    /// anything else. Null when a compatible pure-Python wheel exists, and when the answer
+    /// is unknown (the network is off, the index did not answer): only a definite "no" is
+    /// a reason, because a skill must not be refused for a lookup that merely failed.
+    /// </summary>
+    public async Task<string?> ExplainUnavailableAsync(string name, CancellationToken cancellationToken)
+    {
+        if (!CanInstall || !TrySplit(name, out string package, out string? version, out _))
+            return null;
+        string url = version is null
+            ? $"{IndexRoot}/{Uri.EscapeDataString(package)}/json"
+            : $"{IndexRoot}/{Uri.EscapeDataString(package)}/{Uri.EscapeDataString(version)}/json";
+        try
+        {
+            using HttpResponseMessage response = await GetAllowedAsync(new Uri(url), Policy, cancellationToken)
+                .ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return null;
+            string json = await ReadTextBoundedAsync(
+                response.Content, MaxIndexBytes, "package metadata", cancellationToken).ConfigureAwait(false);
+            return TrySelectWheel(json, _runtimeRelease, _runtimeVersion, out _, out string? why) ? null : why;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidOperationException
+            or TaskCanceledException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
     /// <inheritdoc />
     public async Task<ExecutionResult> InstallAsync(InstallRequest request, CancellationToken cancellationToken)
     {

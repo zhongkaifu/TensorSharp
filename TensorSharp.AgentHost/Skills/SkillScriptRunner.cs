@@ -267,6 +267,44 @@ namespace TensorSharp.AgentHost.Skills
                 }
             }
 
+            // PEP 723 inline script metadata: the dependency block a script written for
+            // `uv run` carries. The host installs those dependencies itself, through the same
+            // confined installer as everything else (the installer's session ledger makes a
+            // repeat run cost nothing), so such a script runs here unchanged.
+            if (installLanguage == "python")
+            {
+                IReadOnlyList<string> declared = InlineScriptMetadata.Dependencies(ReadScriptHead(scriptPath!));
+                if (declared.Count > 0 && CanAutoInstall("python"))
+                {
+                    string? error = _options.PackageInstaller!.InstallPackages(
+                        "python", declared, _options.Workspace!, onOutput);
+                    if (error == null)
+                    {
+                        setupNotes.Add($"Set up dependencies (inline script metadata): {string.Join(", ", declared)}");
+                    }
+                    else if (!_backend.UsesHostProcesses)
+                    {
+                        // In-process, a package that cannot be installed now never can be: it
+                        // is compiled code, or a build, that this runtime cannot load. Running
+                        // the script anyway would only end in the same ImportError.
+                        return SkillToolResult.Failure(
+                            $"Cannot run {skill.Id}/{normalized} on {InProcessHostName}: it needs "
+                            + $"{string.Join(", ", declared)}, and {error.TrimEnd('.')}. Use a different skill "
+                            + "or the tools this host offers instead.");
+                    }
+                    else
+                    {
+                        setupNotes.Add($"Could not install the dependencies its inline script metadata declares "
+                            + $"({string.Join(", ", declared)}): {error}");
+                    }
+                }
+                else if (declared.Count > 0)
+                {
+                    setupNotes.Add($"This script declares dependencies ({string.Join(", ", declared)}) in inline script "
+                        + "metadata, and this host does not install packages for skill scripts.");
+                }
+            }
+
             try
             {
                 return RunWithAutoInstall(
@@ -277,6 +315,25 @@ namespace TensorSharp.AgentHost.Skills
             {
                 if (perCallScratch && _options.DeleteScratchDirectory)
                     TryDeleteDirectory(workDirectory);
+            }
+        }
+
+        /// <summary>How a result names an in-process host (TensorAgent on iOS).</summary>
+        private static string InProcessHostName => HostOS.IsAppleMobile ? "iOS" : "this in-process host";
+
+        /// <summary>The first 64 KiB of a script: where inline metadata lives, bounded.</summary>
+        private static string? ReadScriptHead(string path)
+        {
+            try
+            {
+                using var reader = new StreamReader(path);
+                char[] buffer = new char[64 * 1024];
+                int read = reader.ReadBlock(buffer, 0, buffer.Length);
+                return new string(buffer, 0, read);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return null;
             }
         }
 

@@ -182,6 +182,106 @@ public sealed class FindSkillsHostTests : IDisposable
         Assert.False(File.Exists(Path.Combine(plan.ToolContext.Workspace!.WorkDirectory, "product.txt")));
     }
 
+    [Fact]
+    public async Task UnselectedDiscoveryInstallsAFoundSkillAndRunsItInTheSameTurn()
+    {
+        // The user names no skill and never asks for an installation: an ordinary task.
+        AgentAppHost host = Start();
+        SkillRequestPlan plan = Plan(host);
+        Assert.Contains(plan.Tools, tool => tool.Name == "skills_install");
+        var results = new List<string>();
+        ToolCall[] workflow =
+        [
+            Call("skills_search", ("query", "arithmetic report")),
+            // A small model reads a hit as if it were installed; the answer names the install call.
+            Call("skills_read", ("skill", "portable-report"), ("path", "SKILL.md")),
+            Call("skills_install", ("package", Package)),
+            Call("skills_run", ("skill", "portable-report"), ("path", "scripts/report.sh"), ("args", "6 7")),
+        ];
+        int round = 0;
+        SkillLoopResult result = await SkillAgentLoop.RunAsync(
+            [new ChatMessage { Role = "user", Content = "Multiply 6 by 7 and save a report of it." }],
+            plan.Tools, plan.ToolContext,
+            (messages, _, _) =>
+            {
+                if (messages.LastOrDefault() is { Role: "tool" } toolResult)
+                    results.Add(toolResult.Content);
+                return Task.FromResult(round < workflow.Length
+                    ? new SkillTurnOutput(new ParsedOutput { ToolCalls = [workflow[round++]] })
+                    : new SkillTurnOutput(new ParsedOutput { Content = "Saved the report: 6 x 7 = 42." }));
+            }, plan.LoopOptions);
+
+        Assert.False(result.HitRoundLimit);
+        Assert.Contains("skills_install(package=\"" + Package + "\")", results[0], StringComparison.Ordinal);
+        Assert.StartsWith("Error: 'portable-report' is a skills_search result, not an installed skill. Install it first with skills_install(package=\""
+            + Package + "\")", results[1], StringComparison.Ordinal);
+        Assert.StartsWith("Installed " + Package + " from https://github.com/fixture/workflows/tree/" + Revision
+            + "/skills/portable-report @ " + Revision, results[2], StringComparison.Ordinal);
+        Assert.Contains("Run skills_run with skill portable-report", results[2], StringComparison.Ordinal);
+        Assert.Contains("answer=42", results[3], StringComparison.Ordinal);
+        Assert.True(host.Skills.TryGet("portable-report", out Skill installed));
+        Assert.Equal(Revision, installed.Source?.Revision);
+        // Inspection happened inside the install: one search, one commit lookup, one archive.
+        Assert.Equal(3, _transport.Requests.Count);
+    }
+
+    [Fact]
+    public void TheInProcessHostRefusesASkillThatNeedsAProgramAndNamesTheNextResult()
+    {
+        AgentAppHost host = Start();
+        SkillRequestPlan plan = Plan(host);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "cut a video")), plan.ToolContext).Ok);
+        SkillToolResult refused = SkillTools.Execute(Call("skills_install", ("package", "fixture/workflows@video-cutter")), plan.ToolContext);
+        Assert.False(refused.Ok);
+        Assert.Contains("Not installed: fixture/workflows@video-cutter Cannot run on ", refused.Content, StringComparison.Ordinal);
+        Assert.Contains("It needs the `ffmpeg` program, and ", refused.Content, StringComparison.Ordinal);
+        Assert.Contains("cannot launch programs", refused.Content, StringComparison.Ordinal);
+        Assert.Contains("Next result, if it fits the task: skills_install(package=\"" + Package + "\"); otherwise", refused.Content, StringComparison.Ordinal);
+        Assert.False(host.Skills.TryGet("video-cutter", out _));
+        Assert.False(Directory.Exists(Path.Combine(host.Paths.InstalledSkillsDirectory, "video-cutter")));
+    }
+
+    [Fact]
+    public void TheBundledResearchSkillIsTheDevicesDataPathAndRunsInProcess()
+    {
+        // On iOS the research skill is where current figures come from, so it has to be runnable
+        // in the in-process runtime: its scripts import only the standard library and each other.
+        AgentAppHost host = Start();
+        SkillRequestPlan plan = Plan(host);
+        SkillHostProfile device = SkillHostProfile.From(plan.ToolContext);
+        Assert.False(device.CanLaunchPrograms);
+        Assert.True(host.Skills.TryGet("research", out Skill research));
+        SkillCompatibilityReport report = SkillCompatibility.Assess(research, device);
+        Assert.True(report.CanRun, string.Join(" ", report.Blockers));
+        Assert.Empty(report.Packages);
+
+        string scripts = Path.Combine(research.RootDirectory, "scripts");
+        var local = Directory.GetFiles(scripts, "*.py").Select(Path.GetFileNameWithoutExtension).ToHashSet(StringComparer.Ordinal);
+        string[] standardLibrary =
+        [
+            "__future__", "argparse", "collections", "concurrent", "csv", "dataclasses", "datetime", "email", "gzip", "hashlib",
+            "html", "http", "io", "itertools", "json", "math", "os", "pathlib", "re", "socket", "ssl", "string", "sys",
+            "textwrap", "time", "typing", "unicodedata", "urllib", "zlib",
+        ];
+        foreach (string file in Directory.GetFiles(scripts, "*.py"))
+        {
+            foreach (string line in File.ReadLines(file))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(line, @"^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*))");
+                if (!match.Success)
+                    continue;
+                string module = (match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value).Split('.')[0];
+                Assert.True(local.Contains(module) || standardLibrary.Contains(module),
+                    $"{Path.GetFileName(file)} imports '{module}', which the iOS in-process runtime may not have.");
+            }
+        }
+
+        // What it declares it stands in for, and the exact call the host hands out for it.
+        Assert.Equal("WebSearch, WebFetch", research.Manifest.Metadata["provides-tools"]);
+        Assert.StartsWith("skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"<question>\"",
+            research.Manifest.Metadata["provides-call"], StringComparison.Ordinal);
+    }
+
     public void Dispose()
     {
         _host?.Dispose();
@@ -202,7 +302,7 @@ public sealed class FindSkillsHostTests : IDisposable
             Requests.Add(uri);
             HttpContent body = uri.Host switch
             {
-                "skills.sh" => new StringContent("""{"skills":[{"name":"portable-report","source":"fixture/workflows","installs":17}]}""", Encoding.UTF8, "application/json"),
+                "skills.sh" => new StringContent("""{"skills":[{"name":"video-cutter","source":"fixture/workflows","installs":40},{"name":"portable-report","source":"fixture/workflows","installs":17}]}""", Encoding.UTF8, "application/json"),
                 "api.github.com" when uri.AbsolutePath == "/repos/fixture/workflows/commits/HEAD" => new StringContent("{\"sha\":\"" + Revision + "\"}", Encoding.UTF8, "application/json"),
                 "codeload.github.com" when uri.AbsolutePath == "/fixture/workflows/zip/" + Revision => new ByteArrayContent(Archive()),
                 _ => throw new InvalidOperationException("Unexpected marketplace request: " + uri),
@@ -215,6 +315,7 @@ public sealed class FindSkillsHostTests : IDisposable
             using var output = new MemoryStream();
             using (var zip = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true))
             {
+                zip.Comment = Revision;   // GitHub labels an archive with its commit
                 void Add(string name, string text)
                 {
                     using var writer = new StreamWriter(zip.CreateEntry("workflows-" + Revision + "/skills/portable-report/" + name).Open(), new UTF8Encoding(false));
@@ -230,6 +331,20 @@ public sealed class FindSkillsHostTests : IDisposable
                     """);
                 Add("scripts/report.sh", "printf 'answer=%s\\n' \"$(( $1 * $2 ))\" > product.txt\ncat product.txt\n");
                 Add("references/contract.txt", "The report contains the product of both supplied integers.\n");
+                void AddVideo(string name, string text)
+                {
+                    using var writer = new StreamWriter(zip.CreateEntry("workflows-" + Revision + "/skills/video-cutter/" + name).Open(), new UTF8Encoding(false));
+                    writer.Write(text);
+                }
+                AddVideo("SKILL.md", """
+                    ---
+                    name: video-cutter
+                    description: Cut a clip out of a video file with ffmpeg.
+                    metadata: {"clawdbot":{"requires":{"bins":["ffmpeg"]}}}
+                    ---
+                    Run scripts/cut.sh with the input file and the two timestamps.
+                    """);
+                AddVideo("scripts/cut.sh", "ffmpeg -i \"$1\" -ss \"$2\" -to \"$3\" -c copy clip.mp4\n");
             }
             return output.ToArray();
         }

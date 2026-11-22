@@ -439,6 +439,34 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>Answer a code-execution call, or say why this host will not.</summary>
         private static SkillToolResult ExecuteCode(ToolCall call, SkillToolContext context, Action<string>? onOutput)
         {
+            // A skill's own `uv run {baseDir}/scripts/x.py` line, typed into the shell: run it
+            // as the skill script it is (SkillCommandTranslation says why the shell cannot).
+            if (context.ScriptRunner != null
+                && string.Equals(SkillToolNames.CanonicalName(call.Name), SkillToolNames.Shell, StringComparison.Ordinal)
+                && call.Arguments != null
+                && call.Arguments.TryGetValue("command", out object? rawCommand)
+                && SkillCommandTranslation.TryTranslate(
+                    CodeExec.ShellCommand.ReadCommand(rawCommand), context, out var translated))
+            {
+                var run = new ToolCall
+                {
+                    Name = RunToolName,
+                    Arguments = new Dictionary<string, object>
+                    {
+                        ["skill"] = translated.Skill.Id,
+                        ["path"] = translated.Path,
+                        ["args"] = translated.Arguments.ToArray(),
+                    },
+                };
+                if (translated.Packages.Count > 0)
+                    run.Arguments["packages"] = string.Join(",", translated.Packages);
+                SkillToolResult ran = ExecuteRun(run, context, onOutput);
+                string how = "Ran this as " + RunToolName + "(skill=\"" + translated.Skill.Id + "\", path=\""
+                    + translated.Path + "\"): this host runs a skill's scripts itself, with the dependencies the "
+                    + "script declares installed first.\n\n";
+                return ran with { Content = (ran.Ok ? how : "Error: " + how) + StripErrorPrefix(ran.Content) };
+            }
+
             if (context.CodeRunner is not { } runner)
             {
                 return SkillToolResult.Failure(
@@ -633,6 +661,9 @@ namespace TensorSharp.AgentHost.Skills
                 AppendBundledFileIndex(sb, skill);
                 if (context.ScriptRunner != null)
                     AppendHostExecutionGuidance(sb, skill);
+                AppendForeignToolGuidance(sb, skill, context);
+                if (CurrentFactsNote(skill, context) is { } facts)
+                    sb.Append("\n\n[TensorSharp host note; not part of SKILL.md]\n").Append(facts).Append('\n');
             }
 
             return SkillToolResult.Success(sb.ToString(), skill.Id, content.Path);
@@ -672,6 +703,108 @@ namespace TensorSharp.AgentHost.Skills
         }
 
         /// <summary>
+        /// A skill written for another agent names that agent's tools — <c>allowed-tools:
+        /// WebSearch, WebFetch, Read, Bash</c> — which do not exist here. Say which of this
+        /// host's tools does each job, as a call, so the model does not wait for a tool it was
+        /// never given (a hub research skill asking for WebSearch is where a small model
+        /// stalled). Only tools this conversation actually has are named.
+        /// </summary>
+        private static void AppendForeignToolGuidance(StringBuilder sb, Skill skill, SkillToolContext context)
+        {
+            IReadOnlyList<string> named = skill.Manifest.AllowedTools;
+            if (named.Count == 0)
+                return;
+            bool code = context.CodeRunner?.CanRun == true;
+            string? ProvidedBy(string tool) => ProvidedCall(tool, context);
+            var lines = new List<string>();
+            var unavailable = new List<string>();
+            // The specification separates allowed-tools with spaces; authors also use commas.
+            foreach (string tool in named.Take(32)
+                .SelectMany(raw => raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .Select(raw => raw.Split('(')[0].Trim())
+                .Where(raw => raw.Length > 0))
+            {
+                string? equivalent = tool switch
+                {
+                    "Bash" or "Shell" or "Glob" or "Grep" or "LS" when code => SkillToolNames.Shell,
+                    "Read" when code => SkillToolNames.ReadFile,
+                    "Write" when code => SkillToolNames.WriteFile,
+                    "Edit" or "MultiEdit" when code => SkillToolNames.EditFile,
+                    _ when tool.StartsWith("mcp__", StringComparison.Ordinal)
+                        && tool.Contains("web", StringComparison.OrdinalIgnoreCase) => ProvidedBy("WebFetch"),
+                    _ => ProvidedBy(tool),
+                };
+                if (IsHostToolName(tool))
+                    continue;
+                if (equivalent != null)
+                    lines.Add(tool + " -> " + equivalent);
+                else
+                    unavailable.Add(tool);
+            }
+            if (lines.Count == 0 && unavailable.Count == 0)
+                return;
+            sb.Append("\n\n[TensorSharp host tools; not part of SKILL.md]\n")
+              .Append("This skill names tools of another agent. Do each of those steps with this host's tool instead:\n");
+            foreach (string line in lines.Distinct())
+                sb.Append("  ").Append(line).Append('\n');
+            if (unavailable.Count > 0)
+                sb.Append("  Not available here: ").Append(string.Join(", ", unavailable.Distinct()))
+                  .Append(". Do those steps yourself, or skip them, and carry on.\n");
+        }
+
+        /// <summary>
+        /// The call that stands in for another agent's tool here, or null. A reachable skill
+        /// declares it: metadata <c>provides-tools</c> names the tools, <c>provides-call</c> the
+        /// exact call (the bundled research skill provides WebSearch and WebFetch). Needs skill
+        /// scripts to be runnable, since the call is a skills_run.
+        /// </summary>
+        internal static string? ProvidedCall(string tool, SkillToolContext context)
+        {
+            if (context.ScriptRunner == null)
+                return null;
+            SkillHostProfile? host = null;
+            foreach (Skill provider in context.Reachable)
+            {
+                if (provider.Manifest.Metadata.TryGetValue("provides-tools", out string? tools)
+                    && provider.Manifest.Metadata.TryGetValue("provides-call", out string? providedCall)
+                    && tools.Split(',').Any(t => string.Equals(t.Trim(), tool, StringComparison.Ordinal)))
+                {
+                    // Only a provider that can run here: on iOS a call that needs a program
+                    // or a compiled package would be advice the model cannot follow.
+                    host ??= SkillHostProfile.From(context);
+                    if (SkillCompatibility.Assess(provider, host).CanRun)
+                        return providedCall.Trim();
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// For a hub skill that ships no scripts: it is instructions, and instructions hold no
+        /// current figures. Says where current ones come from in this conversation — the host's
+        /// web search call — or that none can be checked here. A confident answer built on
+        /// invented prices is the failure this exists for (an instructions-only stock skill
+        /// was followed with figures the model made up while the web search was available).
+        /// </summary>
+        internal static string? CurrentFactsNote(Skill skill, SkillToolContext context)
+        {
+            if (skill.Source == null || skill.Files.Any(f => f.Kind == SkillFileKind.Script))
+                return null;
+            string? search = ProvidedCall("WebSearch", context);
+            return search != null
+                ? "This skill ships no scripts and no data source, so it holds no current figures (prices, rates, "
+                  + "news, dates). If the request needs any, get them with " + search + " and cite the sources that "
+                  + "returns; do not state such figures from memory."
+                : "This skill ships no scripts and no data source, and this conversation has no web search tool, so "
+                  + "current figures (prices, rates, news, dates) cannot be checked here: if the request needs any, say "
+                  + "so instead of stating them.";
+        }
+
+        private static bool IsHostToolName(string tool) =>
+            IsBuiltInTool(tool) || string.Equals(SkillToolNames.CanonicalName(tool), tool, StringComparison.Ordinal)
+                && SkillToolNames.IsCodeTool(tool);
+
+        /// <summary>
         /// The skill's bundled files, appended to a <c>SKILL.md</c> read so the model
         /// knows what it may open without guessing a path. Paths and sizes only — the
         /// contents are the next tier and are fetched on demand.
@@ -698,6 +831,9 @@ namespace TensorSharp.AgentHost.Skills
                   .Append(" more.\n");
             }
         }
+
+        private static string StripErrorPrefix(string? content) =>
+            content != null && content.StartsWith("Error: ", StringComparison.Ordinal) ? content.Substring(7) : content ?? string.Empty;
 
         /// <summary>Most bundled files named in one activation. A long tail helps nobody.</summary>
         private const int MaxIndexedFiles = 40;
@@ -731,6 +867,17 @@ namespace TensorSharp.AgentHost.Skills
                 return SkillToolResult.Failure(resolveError!);
 
             path = StripSkillPrefix(path!, skill!.Id);
+            // A skill with nothing to run: say what it is and what to do instead, rather than
+            // "'.md' files cannot be run" (a small model ran SKILL.md itself, twice).
+            // Only for a hub skill or a Markdown path: a host's own test or fake runner may
+            // run a skill whose script is not on disk.
+            if (!skill.Files.Any(f => f.Kind == SkillFileKind.Script)
+                && (skill.Source != null || path!.EndsWith(".md", StringComparison.OrdinalIgnoreCase)))
+            {
+                return SkillToolResult.Failure($"'{skill.Id}' ships no scripts, so there is nothing to run: its SKILL.md is "
+                    + "instructions to carry out with this conversation's other tools."
+                    + (CurrentFactsNote(skill, context) is { } facts ? " " + facts : string.Empty));
+            }
             return context.ScriptRunner.Run(skill, path, args, onOutput, ReadPackagesArgument(call));
         }
 
@@ -815,9 +962,28 @@ namespace TensorSharp.AgentHost.Skills
         /// a skill may legitimately ship a dotfile.
         /// </para>
         /// </summary>
+        /// <summary>
+        /// Placeholders other agents' skills write for "this skill's directory" in a script
+        /// path ("uv run {baseDir}/scripts/x.py"). A path inside a skill is already relative
+        /// to it here, so the placeholder is dropped.
+        /// </summary>
+        private static readonly string[] SkillDirectoryPlaceholders =
+        {
+            "{baseDir}/", "{basedir}/", "{skillDir}/", "${CLAUDE_SKILL_DIR}/", "$CLAUDE_SKILL_DIR/",
+            "${SKILL_DIR}/", "$SKILL_DIR/", "${SKILL_ROOT}/", "$SKILL_ROOT/", "{SKILL_DIR}/",
+        };
+
         private static string StripSkillPrefix(string path, string skillId)
         {
             string normalized = path.Replace('\\', '/').Trim();
+            foreach (string placeholder in SkillDirectoryPlaceholders)
+            {
+                if (normalized.StartsWith(placeholder, StringComparison.Ordinal))
+                {
+                    normalized = normalized.Substring(placeholder.Length);
+                    break;
+                }
+            }
             while (normalized.StartsWith("./", StringComparison.Ordinal))
                 normalized = normalized.Substring(2);
 
@@ -1076,9 +1242,28 @@ namespace TensorSharp.AgentHost.Skills
                     error = null;
                     return true;
                 }
+                // A hub package this request installed, named by its selector rather than
+                // by the id it was installed as.
+                if (Marketplace?.TryInstalledAs(key, out string installedId) == true
+                    && _byId.TryGetValue(installedId, out skill))
+                {
+                    error = null;
+                    return true;
+                }
             }
 
             skill = null;
+            // A skills_search result is not an installed skill. Say how to install it — the
+            // generic "no such skill" answer here is what left a model that had found the
+            // right skill with no way to use it.
+            if (Marketplace?.FindHit(key) is { } hit)
+            {
+                error = Marketplace.CanInstall
+                    ? $"'{key}' is a skills_search result, not an installed skill. Install it first with "
+                      + SkillMarketplaceTools.InstallCall(hit.Package) + "; that returns its instructions."
+                    : $"'{key}' is a skills_search result, and this host's skill library is read-only, so it cannot be installed here.";
+                return false;
+            }
             error = Reachable.Count == 0
                 ? $"No skill called '{key}' is available; this conversation has no skills."
                 : $"No skill called '{key}' is available. Available skills: "

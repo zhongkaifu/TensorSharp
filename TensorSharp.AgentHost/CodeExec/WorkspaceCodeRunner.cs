@@ -54,6 +54,8 @@ internal sealed class WorkspaceCodeRunner : ICodeRunner
 
     public bool CanInstallPackages => Allows(SkillToolNames.Shell) && _parent.CanInstallPackages;
     public bool CanInstallPackagesFor(string language) => CanInstallPackages && _parent.CanInstallPackagesFor(language);
+    public string? ExplainUnavailablePackage(string language, string package) =>
+        _parent.ExplainUnavailablePackage(language, package);
     public string? InstallPackages(string language, IReadOnlyList<string> packages,
         SessionWorkspace workspace, Action<string>? onOutput = null) =>
         ReferenceEquals(workspace, _workspace) && CanInstallPackages

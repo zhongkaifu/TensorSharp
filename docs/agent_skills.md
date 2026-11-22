@@ -67,41 +67,119 @@ The bundled `find-skills` workflow adapts
 to TensorSharp and TensorAgent. It uses shared .NET tools, so discovery and
 installation do not require `npx`, Node, Git or a child process on mobile.
 
-Enable Network in TensorAgent, or `--skills-allow-network` on the server, and ask
-for a skill or select `find-skills`. The tools are available only when that skill
-is reachable in the request; an explicit empty skill selection disables them.
+Enable Network in TensorAgent, or `--skills-allow-network` on the server. The
+tools are then offered whenever `find-skills` is reachable in the request, which it
+is by default (discovery advertises every installed skill); an explicit empty skill
+selection, or a selection without `find-skills`, disables them.
+
+**Default: a found skill is installed and used in the same turn.** The user does
+not have to ask for the installation separately — "research X and tell me…" is
+enough when the model finds a hub skill for it. The skill network switch is the off
+switch; there is no other option. Installing writes files only: nothing in a skill
+runs at install time, and its scripts run only through `skills_run`, inside the
+host's sandbox and under its Run code switch (`--skills-allow-exec` on the server).
 
 | Tool | Behavior |
 | --- | --- |
-| `skills_search(query, owner?)` | Searches skills.sh and returns package identifiers, sources, links and install counts. Successful searches are cached for five minutes with a bounded entry count. |
-| `skills_inspect(package)` | Downloads a public GitHub repository at an immutable commit and returns the selected skill's instructions, compatibility, license and file list. The entire response fits the request's read budget, with explicit truncation markers. No repository code is executed. |
-| `skills_install(package, revision?)` | Installs the exact package inspected in the same request into the host's writable skill registry. An optional revision must match the inspection. Existing skills are never overwritten. |
+| `skills_search(query, owner?)` | Searches skills.sh. Each hit carries its `package`, install count, `status` (`installed` or `not installed`) and the exact next call: `install` = `skills_install(package="owner/repo@name")`, or `use` = `skills_read(skill="…")` for a package already installed here. The result says the hits are not installed skills. Successful searches are cached for five minutes with a bounded entry count. |
+| `skills_inspect(package)` | Optional. Downloads the package at an immutable commit and returns its instructions, compatibility, license and file list, with the install call to use next. The entire response fits the request's read budget. No repository code is executed. |
+| `skills_install(package, revision?)` | Installs the package into the host's writable skill library and returns, in one result, the provenance line `Installed owner/repo@name from https://github.com/owner/repo/tree/<commit>/<path> @ <commit>`, whether it can run on this host, the skill's instructions (marked as third-party content) and the next call. |
 
-Packages use `owner/repository@manifest-name`, for example
-`vercel-labs/agent-skills@vercel-react-best-practices`. Selection follows the
-manifest name even when the source folder has a different name. The complete
-skill subtree is copied unchanged, including scripts, references and assets.
-Only the installing request gains immediate access through `skills_read` and
-`skills_run`; unrelated active requests retain their original scope. Subsequent
-requests see the installed skill through normal registry discovery.
+`skills_install` inspects the commit it installs itself, so no separate inspect
+round is needed; an optional `revision` must match. It never overwrites a skill:
+
+- a package installed before (by an earlier conversation, under any name) is reused
+  and reported `Already installed`, with no download;
+- a name already taken by a different skill installs the package as
+  `<owner>-<name>`. Only the frontmatter `name` line of the downloaded `SKILL.md`
+  is rewritten, and the original name is recorded;
+- a stale hub entry (GitHub answers 404), a rate limit, or a package this host
+  refuses ends with `Next: skills_install(package="…")` naming the next result of
+  this request's search, so the model can follow it without reasoning one out.
+
+`skills_read`/`skills_run` on a search hit that is not installed answer with that
+hit's exact install call. After installation the package selector also resolves to
+the installed skill, whatever name it was installed under; `owner/name` means that
+publisher's hit, and `owner/repo` in the search's `owner` filter filters by the owner.
+One turn installs at most two new skills (`SkillMarketplaceSession.MaxInstallsPerRequest`);
+a further install is answered with the two it has, to use. The commit is looked up as
+the bare id (`application/vnd.github.sha`), so a monorepo whose last commit is huge
+still installs.
+
+A hub skill written for another agent names that agent's tools. Reading its
+`SKILL.md` (or installing it) appends the host's equivalent for each: `Bash` →
+`shell`, `Read`/`Write`/`Edit` → the file tools, and a tool a reachable skill declares
+it provides — metadata `provides-tools` and `provides-call`; the bundled `research`
+skill provides `WebSearch` and `WebFetch` — with that skill's exact call. A hub
+skill that ships no scripts holds no data, so its result says where current figures
+come from in this conversation (that web-search call) or that they cannot be checked,
+instead of leaving the model to state prices from memory.
+
+**Provenance and visibility.** Each hub install is recorded in
+`.hub-sources.json` in the install directory (package, GitHub URL, commit,
+time, original name). `GET /api/skills` returns it as `source`, the Skills pages of
+TensorAgent and the server Web UI show it, and the turn that installed a skill shows
+`Installed <package> from <url> @ <commit>`.
+
+**Third-party content stays tool output.** A hub skill's description and
+instructions never enter the system prompt: the skills catalog lists such a skill by
+name and source only, its body is never inlined (even when selected), and
+`skills_list`/`skills_read` deliver its text as tool results. Nothing in a skill can
+widen the sandbox, the egress rules or the Run code switch.
+
+**Source validation.** The package must be a public GitHub `owner/repo@name`;
+`HEAD` is resolved to a 40-character commit and only that commit's archive is
+fetched. GitHub labels an archive with its commit id (the ZIP comment), and an
+archive labelled with any other commit is refused. skills.sh publishes no checksums
+or signatures, so the commit id is the integrity anchor. The transport bounds
+download/extraction sizes and rejects redirects, unsafe paths, links, special files
+and ambiguous manifests, and it retains at most two selected skill archives.
+
+**Does it run here?** At install the host reads what the skill needs — programs
+named under `metadata.*.requires.bins`, its script languages, and the Python
+packages its scripts declare (PEP 723 inline script metadata and
+`requirements.txt`) — and checks them against what the host can do:
+
+| Host | What a hub skill gets |
+| --- | --- |
+| TensorAgent on macOS/Windows, TensorSharp.Server | Real processes in the OS sandbox. A missing program is reported as a note (the user can install it). A script's PEP 723 dependencies are installed by the host's package installer before `skills_run` runs it. |
+| TensorAgent on iOS | Python, JavaScript and shell scripts run in-process; no other program can be launched, and only pure-Python wheels or packages built into the app can be imported. A skill that needs a program or a compiled package is **not installed**, with `Cannot run on iOS: …` naming the program or package and the next result to try. A skill installed earlier by other means gets the same verdict from `skills_run`. |
+
+A script written for `uv run` runs unchanged: `skills_run` installs its inline
+dependencies, and a shell command that is exactly the skill's own line —
+`uv run [--with pkg] {baseDir}/scripts/x.py ARGS`, or `python3 $SKILL_DIR/…` —
+is run as `skills_run` of that script, because a shell here has neither the
+placeholder's directory nor a network socket. `{baseDir}`-style placeholders in a
+`skills_run` path are dropped.
+
+**Source distributions.** On macOS, where the install sandbox confines writes and
+pins the network to the package index (the egress proxy), pip prefers wheels and
+builds a package that has none from its source distribution, with every compiler
+and linker variable (`CC`, `CXX`, `LDSHARED`, `CARGO`, …) pointed at `false`: a
+pure-Python source package builds, one that needs compiled code fails. On Linux
+(bubblewrap cannot hold the network to the index), Windows and unconfined hosts,
+installs stay prebuilt wheels only. TensorAgent on iOS installs pure-Python wheels
+only.
+
+**Loops end with an answer.** Within one turn, a repeated call that cannot return
+anything new is answered from its first result instead of being run again: an
+identical `skills_search`; an identical `shell` command, or a `skills_run` or
+`read_file` that failed, while the workspace is unchanged; a `skills_inspect` that
+failed; a repeated `skills_install` of the same package; and every install past the
+per-turn limit. The install result counts as a read of the
+installed `SKILL.md`. A model that repeats such a call after being told so gets a
+final round with only the caller's own tools declared, so it answers in text.
 
 Installation needs a writable `SkillRegistryOptions.InstallDirectory`. The
 server and TensorAgent configure this; the CLI's default registry remains
 read-only and offers search/inspection. Local `SkillsChatClient` delivery can
-opt in with `AllowSkillNetwork = true` and a writable registry. Network access
-alone does not enable script or code execution. Those use their existing host
-permissions and sandbox. A narrowed TensorAgent domain allow-list must allow
-`skills.sh` for search and `api.github.com` plus `codeload.github.com` for packages.
-
-The transport accepts public GitHub packages, bounds download/extraction sizes,
-rejects redirects, unsafe paths, links and ambiguous manifests, and retains at
-most two selected skill archives. Repositories exceeding those limits,
-private repositories, non-GitHub packages and unsupported runtime dependencies
-are reported as errors, not successful installations. Install counts do not
-prove quality. Inspect requirements, install only within the user's request,
-read the full installed instructions, perform the task, and validate its actual
-output. External CLI, browser, credential and device requirements can still make
-a discovered workflow unavailable on a particular host.
+opt in with `AllowSkillNetwork = true` and a writable registry. A narrowed
+TensorAgent domain allow-list must allow `skills.sh` for search and
+`api.github.com` plus `codeload.github.com` for packages. Install counts do not
+prove quality, and installing a skill is not proof that the task works: the model
+still has to perform the task and validate its output. External CLI, browser,
+credential and device requirements can still make a discovered workflow
+unavailable on a particular host.
 
 Reusable live checks are in `eng/validation/FindSkillsProbe`; generated results
 belong in ignored `artifacts/find-skills/`. The probe distinguishes transport,
@@ -851,8 +929,9 @@ immutable, read-only per-session snapshot. The original host path and any adjace
 text or private material are never exposed to generated code.
 `--code-exec-allow-install` makes the host READ a `pip install` instead of
 running it — the tool and the package names, nothing else — validate the names,
-and run the installer itself with an argument vector it built: wheels only, no
-install scripts, and, where the sandbox can pin a single loopback port
+and run the installer itself with an argument vector it built: prebuilt wheels
+(plus pure-Python source builds with compilers disabled where the sandbox holds the
+network to the index, i.e. macOS), no npm install scripts, and, where the sandbox can pin a single loopback port
 (Seatbelt), egress through the proxy to the hosts in
 `--code-exec-install-domains` and nowhere else. The install command is then
 substituted out of the model's line with `true`, so `pip install x && python y.py`

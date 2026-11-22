@@ -52,6 +52,15 @@ namespace TensorSharp.AgentHost.CodeExec
         bool IsProvided(CodeLanguage language, string package) => false;
 
         /// <summary>
+        /// Why <paramref name="package"/> can never be installed on this host — for
+        /// example a package that ships compiled code on a host that loads only the
+        /// extensions built into the app — or null when it can be, or when that is only
+        /// known by trying. Lets a skill's needs be checked before it is installed or run.
+        /// The default (a pip host, which builds or downloads anything) knows of nothing.
+        /// </summary>
+        string? ExplainUnavailable(CodeLanguage language, string package) => null;
+
+        /// <summary>
         /// Install <paramref name="packages"/> into <paramref name="workspace"/>'s
         /// environment.
         /// </summary>
@@ -203,21 +212,32 @@ namespace TensorSharp.AgentHost.CodeExec
         {
             string envDirectory = workspace.EnvDirectory;
             CodeInstallPlan plan;
+            using EgressProxy? proxy = ProxyOrNull();
+            // Only with the proxy actually up: it is what holds a build to the index.
+            bool sourceBuilds = language == CodeLanguage.Python && AllowsSourceBuilds && proxy != null;
             if (language == CodeLanguage.Python)
             {
                 // A venv is not created: `pip install --target` populates a plain directory
                 // that PYTHONPATH then points at, which needs no interpreter copy, no
                 // activation, and no writable environment at run time.
                 plan = CodeEnvironment.PythonInstall(
-                    interpreter, envDirectory, packages, _options.InstallIndex);
+                    interpreter, envDirectory, packages, _options.InstallIndex, sourceBuilds);
             }
             else if (!CodeEnvironment.TryNpmInstall(interpreter, envDirectory, packages, out plan, out string? npmError))
             {
                 return npmError;
             }
 
-            using EgressProxy? proxy = ProxyOrNull();
             var environment = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (sourceBuilds)
+            {
+                // A source build may run the package's setup code, confined like the skill
+                // that asked for it; what it may not do is compile. Every compiler and
+                // linker a Python build backend looks up is pointed at `false`, so a pure
+                // Python source package builds and one with an extension fails at once.
+                foreach (string tool in new[] { "CC", "CXX", "CPP", "LDSHARED", "LDCXXSHARED", "AR", "CARGO", "RUSTC", "FC", "F77", "F90" })
+                    environment[tool] = "false";
+            }
             if (proxy != null)
             {
                 string url = $"http://127.0.0.1:{proxy.Port.ToString(CultureInfo.InvariantCulture)}";
@@ -307,9 +327,14 @@ namespace TensorSharp.AgentHost.CodeExec
             }
             else if (language == CodeLanguage.Python && denied.Count == 0 && result.Error == null)
             {
-                sb.Append("Only prebuilt wheels are installed here (never source packages, which would run ")
-                  .Append("their own build scripts), so a package with no wheel for this platform cannot be ")
-                  .Append("used. Try a different package, or do without it.\n");
+                sb.Append(sourceBuilds
+                    ? "Prebuilt wheels are preferred here, and a package without one is built from source only when "
+                      + "it is pure Python: compilers are disabled for installs, so a package that needs compiled code "
+                      + "and has no wheel for this platform cannot be used. Try a different package, or do without it.\n"
+                    : "Only prebuilt wheels are installed here (never source packages, which would run their own "
+                      + "build scripts: this host's sandbox cannot hold an install to the package index alone), so a "
+                      + "package with no wheel for this platform cannot be used. Try a different package, or do "
+                      + "without it.\n");
             }
             if (result.Stderr.Length > 0)
                 sb.Append("\nInstaller output:\n").Append(Tail(result.Stderr, 1500));
@@ -353,6 +378,19 @@ namespace TensorSharp.AgentHost.CodeExec
         /// </para>
         /// </summary>
         internal bool ProxyIsEnforced => _backend.Sandbox is { Name: "sandbox-exec" };
+
+        /// <summary>
+        /// Whether a pure-Python source distribution may be built during an install. A
+        /// build runs the package's setup code, so it is allowed only where the install's
+        /// sandbox confines writes AND holds the network to the package index (the egress
+        /// proxy pinned by Seatbelt). Elsewhere — bubblewrap, which can only take the
+        /// network away entirely or not at all; a Windows job object; an unconfined host —
+        /// installs stay prebuilt wheels only.
+        /// </summary>
+        internal bool AllowsSourceBuilds =>
+            ProxyIsEnforced
+            && _options.EffectiveInstallDomains.Count > 0
+            && _backend.Sandbox is { Capabilities.ConfinesWrites: true };
 
         /// <summary>
         /// Reject a package name that is not one.

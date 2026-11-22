@@ -3441,7 +3441,15 @@ namespace TensorSharp.AgentHost.CodeExec
 
             if (CodeDiagnostics.MissingCommand(diagnosis) is { } absent)
             {
-                if (CodeDiagnostics.IsPackageManager(absent))
+                if (Skills.SkillTools.IsBuiltInTool(absent))
+                {
+                    // A model that read "call skills_run(...)" typed it into the shell. The name
+                    // is one of this conversation's TOOLS, which no program on any PATH is.
+                    sb.Append("\n'").Append(absent).Append("' is a tool of this conversation, not a program: ")
+                      .Append("call the ").Append(absent).Append(" tool itself, with its arguments, instead of ")
+                      .Append("typing it into the shell.\n");
+                }
+                else if (CodeDiagnostics.IsPackageManager(absent))
                 {
                     // Not "this host has no installer" — it has one, spelled differently.
                     // A model told to run `pip install` on a machine whose only Python is
