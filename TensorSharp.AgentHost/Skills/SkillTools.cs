@@ -690,6 +690,17 @@ namespace TensorSharp.AgentHost.Skills
                 return SkillToolResult.Failure($"Cannot read '{path}' from skill '{skill.Id}': {error}");
 
             var sb = new StringBuilder();
+            // A skill's script read in place of running it: a small model asked for the
+            // provided call's path with skills_read, got 12 KB of source, and typed the script
+            // into the shell. Say first, before the source, how it runs.
+            if (content.OffsetBytes == 0 && context.ScriptRunner != null
+                && Skill.ClassifyFile(content.Path) == SkillFileKind.Script
+                && SkillCompatibility.Assess(skill, SkillHostProfile.From(context)).CanRun)
+            {
+                sb.Append("[TensorSharp host] ").Append(content.Path).Append(" is the '").Append(skill.Id)
+                  .Append("' skill's script, to run, not instructions to read: run it with ")
+                  .Append(RunCallFor(skill, content.Path, context)).Append(". Its source follows.\n\n");
+            }
             sb.Append("Skill: ").Append(skill.Id).Append('\n');
             sb.Append("File: ").Append(content.Path).Append('\n');
             if (content.Truncated || content.OffsetBytes > 0)

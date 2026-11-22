@@ -650,6 +650,32 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.DoesNotContain("[TensorSharp host]", SkillTools.Execute(Call("shell", ("command", "python3 x.py")), other).Content, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void ReadingASkillsScriptSaysFirstHowItRuns()
+    {
+        BundleResearch();
+        Bundle("helper", "Helps.");
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", "helper", "scripts"));
+        File.WriteAllText(Path.Combine(_root, "bundled", "helper", "scripts", "tool.py"), "print(1)\n");
+        SkillRegistry registry = Registry();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = new RecordingScriptRunner() };
+
+        SkillToolResult script = SkillTools.Execute(Call("skills_read", ("skill", "research"), ("path", "scripts/research.py")), context);
+        Assert.True(script.Ok, script.Content);
+        Assert.StartsWith("[TensorSharp host] scripts/research.py is the 'research' skill's script, to run, not instructions to "
+            + "read: run it with " + ResearchCall + ". Its source follows.\n\nSkill: research\n", script.Content, StringComparison.Ordinal);
+        // Without a declared call that names the script, the plain call with its arguments to fill in.
+        SkillToolResult tool = SkillTools.Execute(Call("skills_read", ("skill", "helper"), ("path", "scripts/tool.py")), context);
+        Assert.StartsWith("[TensorSharp host] scripts/tool.py is the 'helper' skill's script, to run, not instructions to read: "
+            + "run it with skills_run(skill=\"helper\", path=\"scripts/tool.py\", args=[\"<arguments>\"]).", tool.Content, StringComparison.Ordinal);
+
+        // Instructions, and a host that cannot run scripts, get the file as it is.
+        Assert.StartsWith("Skill: research\n", SkillTools.Execute(Call("skills_read", ("skill", "research")), context).Content, StringComparison.Ordinal);
+        var noScripts = new SkillToolContext(registry.Skills);
+        Assert.StartsWith("Skill: research\n", SkillTools.Execute(
+            Call("skills_read", ("skill", "research"), ("path", "scripts/research.py")), noScripts).Content, StringComparison.Ordinal);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;

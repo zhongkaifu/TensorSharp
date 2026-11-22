@@ -468,7 +468,11 @@ gets a short block appended. It is labelled
 ready-made `skills_run` argument example for the skill's first bundled script. The
 block exists because portable skills often show another agent's install path
 (`$CODEX_HOME/skills/...`), and a shell cannot find the bundle there. `skills_run`
-resolves the registered skill directory itself.
+resolves the registered skill directory itself. A read of one of a skill's scripts (with
+`skills_run` enabled and the skill able to run here) starts with one line, before the
+source, naming the `skills_run` call that runs it: a small model asked for a provided
+call's script path with `skills_read`, received 12 KB of source, and typed the script into
+the shell.
 
 `skills_run` takes `args` as an array (or a JSON array in a string, or shell-style
 words). An element that is an option and its value written together, such as
