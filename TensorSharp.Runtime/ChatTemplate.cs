@@ -994,6 +994,11 @@ namespace TensorSharp.Runtime
                                 result = enableThinking
                                     ? EnsureQwen35ThinkOpen(result)
                                     : EnsureQwen35ThinkClosed(result);
+                            // Raon's template ends "<think>\n" / "<think></think>\n\n"; restore what TrimEnd took.
+                            if (architecture == "raon1nano" && addGenerationPrompt
+                                && protocol?.AssistantGenerationSuffix?.Invoke(enableThinking) is { Length: > 0 } raonSuffix
+                                && result.EndsWith(raonSuffix.TrimEnd(), StringComparison.Ordinal))
+                                result += raonSuffix.Substring(raonSuffix.TrimEnd().Length);
                             // Some routed templates ignore enable_thinking and leave
                             // the recipient open, allowing a supposedly final answer to
                             // start another long self/reasoning message. Complete the

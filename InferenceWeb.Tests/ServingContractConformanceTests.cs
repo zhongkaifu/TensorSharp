@@ -153,6 +153,13 @@ public sealed class ServingContractConformanceTests
         "qwen_image: HybridParallel@ggml_vulkan",
         "qwen_image: LayerSplit@ggml_cuda",
         "qwen_image: LayerSplit@ggml_vulkan",
+        // Raon-1 nano runs on one device: its hyper-connection streams, per-layer embeddings and RDA state have no placement yet.
+        "raon1nano: HybridParallel@ggml_cuda",
+        "raon1nano: HybridParallel@ggml_vulkan",
+        "raon1nano: LayerSplit@ggml_cuda",
+        "raon1nano: LayerSplit@ggml_vulkan",
+        "raon1nano: TensorParallel@ggml_cuda",
+        "raon1nano: TensorParallel@ggml_vulkan",
         "wan: HybridParallel@ggml_cuda",
         "wan: HybridParallel@ggml_vulkan",
         "wan: LayerSplit@ggml_cuda",
