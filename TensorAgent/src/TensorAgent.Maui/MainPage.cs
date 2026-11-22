@@ -1464,7 +1464,13 @@ public sealed class MainPage : ContentPage
                 // would, mid-stream, and watch whether the chat holds there for the rest of the stream; the other turns
                 // check that the chat follows the newest line all the way down.
                 bool scrollCheck = turn == 1 && Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_SCROLL_CHECK") != "0";
-                int held = -1, maxDrift = 0, scrolledAt = -1, followMisses = 0, followPolls = 0;
+                // A window much bigger than a phone's (the Mac app's) may never have to scroll for a 400-word answer: the
+                // check can give the chat a phone's size instead (TENSORAGENT_SPEECH_CHAT_HEIGHT px tall, 390 px wide).
+                if (int.TryParse(Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_CHAT_HEIGHT"), out int chatHeight) && chatHeight > 0)
+                    await _webView.EvaluateJavaScriptAsync(
+                        "(function(){var c=document.getElementById('chat');c.style.flex='0 0 auto';"
+                        + $"c.style.height='{chatHeight}px';c.style.width='390px';c.style.alignSelf='center';return true;}})()");
+                int held = -1, maxDrift = 0, scrolledAt = -1, followMisses = 0, followPolls = 0, scrollable = 0, viewport = 0;
                 for (int i = 0; i < 2400; i++)
                 {
                     await Task.Delay(250);
@@ -1479,9 +1485,13 @@ public sealed class MainPage : ContentPage
                         sessionSaid = true;
                         Say($"speechcheck turn {turn} audio-session while speaking " + DescribeAudioSession());
                     }
-                    int[] chat = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                    string scrollRaw = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript));
+                    int[] chat = ChatScroll(scrollRaw);
+                    if (i == 8) Say($"speechcheck turn {turn} chat scroll,height,client={scrollRaw}");
                     if (done < 0 && chat.Length == 3)
                     {
+                        scrollable = Math.Max(scrollable, chat[1] - chat[2]);
+                        viewport = chat[2];
                         // As soon as there is something to scroll up through (a tall window, as on a Mac, takes longer).
                         if (scrollCheck && held < 0 && texts >= 40 && chat[1] - chat[2] > 160)
                         {
@@ -1517,7 +1527,7 @@ public sealed class MainPage : ContentPage
                     await Task.Delay(600);
                     int[] after = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
                     Say($"speechcheck turn {turn} scroll held={(held >= 0 ? "yes" : "never scrolled")} scrolledAtText={scrolledAt} "
-                        + $"heldTop={held} maxDriftPx={maxDrift} jumpShown={jumpShown} "
+                        + $"heldTop={held} maxDriftPx={maxDrift} jumpShown={jumpShown} viewportPx={viewport} scrollablePx={scrollable} "
                         + $"afterJumpFromBottomPx={(after.Length == 3 ? after[1] - after[0] - after[2] : -1)}");
                 }
                 else
