@@ -54,54 +54,6 @@ extern "C" bool tsg_cuda_sync_stream0(void)
 }
 
 // ---------------------------------------------------------------------------
-// Ring-cache mask, for Muse-Glimmer's sliding-window layers.
-//
-// Their KV cache is a ring of ringRows slots where slot (p % ringRows) holds
-// position p, so columns are NOT in position order and the causal kernel above
-// does not apply. Mirrors fill_mg_ring_mask in ggml_ops_muse_glimmer.cpp:
-//   lo = max(0, startPos + qi - window + 1)
-//   mask[qi][p % ringRows] = 0 for p in [lo, startPos + qi], else -inf
-//
-// Inverted so each thread owns one slot: the unique position >= lo congruent to
-// s (mod ringRows) is p = lo + ((s - lo) mod ringRows), and the slot is live iff
-// p <= qp. Uniqueness holds because the caller guarantees
-// ringRows >= window + chunk, so a single query's live span never wraps onto
-// itself -- the same +1 margin that sizes the ring.
-__global__ void tsg_fill_ring_mask_f16_kernel(
-    __half* __restrict__ mask, int ringRows, int N, int startPos, int window)
-{
-    const int qi = blockIdx.x;
-    if (qi >= N) return;
-
-    const int qp = startPos + qi;
-    int lo = (window > 0) ? (qp - window + 1) : 0;
-    if (lo < 0) lo = 0;
-
-    __half* row = mask + (size_t) qi * ringRows;
-    const __half zero = __float2half(0.0f);
-    const __half ninf = __float2half(-INFINITY);
-    const int lo_mod = lo % ringRows;
-    for (int s = threadIdx.x; s < ringRows; s += blockDim.x)
-    {
-        int off = s - lo_mod;
-        if (off < 0) off += ringRows;
-        row[s] = (lo + off <= qp) ? zero : ninf;
-    }
-}
-
-// Fill one [ringRows, N] F16 ring mask on stream 0. Same batching contract as
-// tsg_cuda_fill_causal_mask_f16: not synchronized, call tsg_cuda_sync_stream0.
-extern "C" bool tsg_cuda_fill_ring_mask_f16(
-    void* mask_dev, int ringRows, int N, int startPos, int window)
-{
-    if (mask_dev == nullptr || ringRows <= 0 || N <= 0) return false;
-    const int threads = 256;
-    tsg_fill_ring_mask_f16_kernel<<<(unsigned) N, threads, 0, 0>>>(
-        (__half*) mask_dev, ringRows, N, startPos, window);
-    return cudaGetLastError() == cudaSuccess;
-}
-
-// ---------------------------------------------------------------------------
 // Highest NVIDIA compute capability among the visible devices, encoded exactly
 // the way ggml-cuda encodes it (major*100 + minor*10; 8.6 -> 860, 12.0 -> 1200,
 // GGML_CUDA_CC_ADA_LOVELACE == 890). ggml_cuda_get_best_fattn_kernel's choice

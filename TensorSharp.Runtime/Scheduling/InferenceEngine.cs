@@ -175,6 +175,13 @@ namespace TensorSharp.Runtime.Scheduling
         internal BlockPool Pool => _pool;
         /// <summary>The radix prefix cache, or null when it does not serve this model.</summary>
         internal PrefixCache.PrefixCacheCoordinator? RadixCache => _executor.RadixCache;
+
+        /// <summary>Tests: the executor's batched verifies (<see cref="BatchExecutor.SpecVerifyObserverForTests"/>).</summary>
+        internal Action<BatchedVerifyRecord>? SpecVerifyObserverForTests
+        {
+            get => _executor.SpecVerifyObserverForTests;
+            set => _executor.SpecVerifyObserverForTests = value;
+        }
         public long TotalCompleted => Interlocked.Read(ref _totalCompleted);
         public long TotalSubmitted => Interlocked.Read(ref _totalSubmitted);
         public long TotalStepsRun => Interlocked.Read(ref _totalStepsRun);

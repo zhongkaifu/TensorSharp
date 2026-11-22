@@ -1,0 +1,87 @@
+{
+  "lane": "ggml_cuda|linux-x64|NVIDIA RTX PRO 4500 Blackwell",
+  "set": "cuda",
+  "about": "The legacy Muse-Glimmer model and vision tower on this lane: its teacher-forced argmax agreement with the lane's llama.cpp image goldens (and the distribution of every position's largest |our log-probability - llama.cpp's| over llama.cpp's listed top tokens), and on the quantized-product lanes each picture's 1 - cosine between the legacy tower's rows and the F32 tower's. InferenceWeb.Tests/MuseGlimmerVisionParityTests.cs holds the runtime family to them.",
+  "producer": "MuseGlimmerModel and MuseGlimmerVisionEncoder (legacy)",
+  "provenance": "TensorSharp s4fix follow-up on fc70b540 (wip/glimmer-s4fix), ggml d9fe7bff, CUDA 13.2 (nvcc 13.2.86), driver 595.112.07, NVIDIA RTX PRO 4500 Blackwell (sm_120), linux-x64",
+  "frozenUtc": "2026-11-20T23:23:32.6665074Z",
+  "model": {
+    "file": "Muse-Glimmer-30B-UD-IQ2_XXS.gguf",
+    "sha256": "3e9bd0e609df9d0121ba18c6556de496e7be880184cf22c5dbafbc0600875ad9"
+  },
+  "mmproj": {
+    "file": "mmproj-Muse-Glimmer-30B-Q8_0.gguf"
+  },
+  "llamaCpp": "d3c3e242c16b8cbf51400fad410cd69b22d64f35",
+  "imagePrompts": {
+    "agree": 207,
+    "positions": 212,
+    "agreement": 0.9764150943396226,
+    "topDelta": {
+      "mean": 0.32030360864615026,
+      "p50": 0.2732730170461295,
+      "p90": 0.5748658195515466,
+      "p99": 0.9562823874842845,
+      "max": 1.0656416695199429
+    }
+  },
+  "rowsVsF32": {
+    "reference": "the graph tower with F32 products on direct CUDA",
+    "images": [
+      {
+        "name": "number-7319.png",
+        "width": 448,
+        "height": 224,
+        "oneMinusCos": 0.0008339053526066342
+      },
+      {
+        "name": "shapes-red-circle.jpg",
+        "width": 448,
+        "height": 448,
+        "oneMinusCos": 0.0024691496720702366
+      },
+      {
+        "name": "word-ocean.jpg",
+        "width": 560,
+        "height": 196,
+        "oneMinusCos": 0.0015945195301328985
+      },
+      {
+        "name": "count-green-squares.png",
+        "width": 448,
+        "height": 448,
+        "oneMinusCos": 0.0011560670841440635
+      },
+      {
+        "name": "wide-left-right.png",
+        "width": 448,
+        "height": 168,
+        "oneMinusCos": 0.003732161846115245
+      },
+      {
+        "name": "tall-top-bottom.png",
+        "width": 168,
+        "height": 448,
+        "oneMinusCos": 0.001199064287663698
+      },
+      {
+        "name": "synthetic 336x336",
+        "width": 336,
+        "height": 336,
+        "oneMinusCos": 0.0028621820289406186
+      },
+      {
+        "name": "synthetic 1036x1036",
+        "width": 1036,
+        "height": 1036,
+        "oneMinusCos": 0.004671655409054232
+      },
+      {
+        "name": "synthetic 588x868",
+        "width": 588,
+        "height": 868,
+        "oneMinusCos": 0.0034194863767453842
+      }
+    ]
+  }
+}

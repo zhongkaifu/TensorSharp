@@ -35,7 +35,7 @@ namespace TensorSharp.Models.Graph
         internal NetworkBuilder(NetworkGraph graph, bool record)
         {
             _graph = graph;
-            _b = new GraphProgramBuilder(record);
+            _b = new GraphProgramBuilder(record) { FloatProducts = graph.FloatProducts };
             _bindsHost = graph.Executor.Capabilities.BindsHostPointers;
         }
 

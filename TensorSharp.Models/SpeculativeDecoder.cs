@@ -107,6 +107,11 @@ namespace TensorSharp.Models
         /// <summary>Wall-clock seconds the last GenerateGreedy call spent past prefill.</summary>
         public double LastDecodeSeconds { get; private set; }
 
+        /// <summary>Tests: each verify step as the trunk ran it: the position of the token the window starts from, and the
+        /// step's outcome (its window, the drafts accepted, the token drawn after them, and the verify rows that drew
+        /// them).</summary>
+        internal Action<int, SpeculativeStepOutcome>? VerifyObserverForTests { get; set; }
+
         /// <summary>
         /// Decode <paramref name="model"/> with an explicit algorithm - the
         /// general form. Any <see cref="ISpeculator"/> works, including one that
@@ -433,6 +438,9 @@ namespace TensorSharp.Models
                             return;
                         continue;
                     }
+
+                    if (outcome.VerifiedWindow != null)
+                        VerifyObserverForTests?.Invoke(n, outcome);
 
                     // The trunk has already committed the accepted prefix plus the
                     // corrected/bonus token, so advance the position before emitting:

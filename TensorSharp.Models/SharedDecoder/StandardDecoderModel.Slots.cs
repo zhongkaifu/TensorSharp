@@ -267,6 +267,12 @@ namespace TensorSharp.Models
         /// <summary>Tests: the cells a request's slot holds (null where it has none).</summary>
         internal int? SlotCapacityForTests(string requestId) => TryGetSlot(requestId, out Slot slot) ? slot.Capacity : null;
 
+        /// <summary>Tests, probes: the positions a request's slot holds (null where it has none).</summary>
+        internal int? SlotLengthForTests(string requestId) => TryGetSlot(requestId, out Slot slot) ? slot.Length : null;
+
+        /// <summary>Tests, probes: the cells of the active cache (the bound request's slot, else the primary).</summary>
+        internal int ActiveCacheCapacityForTests => _cacheCapacity;
+
         /// <summary>Tests: the bytes a cell of a slot's caches takes (every entry's K and V).</summary>
         internal long CacheBytesPerCellForTests => CacheBytesPerCell();
 
@@ -490,19 +496,39 @@ namespace TensorSharp.Models
         private static long DeviceHeadroom(long totalBytes) => Math.Max(1L << 30, totalBytes / 32);
 
         /// <summary>The device's free and total bytes (the GGML backend's report; tests substitute their own).</summary>
-        internal Func<(long Free, long Total)?> DeviceMemoryProbe { get; set; } = static ()
+        internal Func<(long Free, long Total)?> DeviceMemoryProbe { get; set; } = GgmlDeviceMemory;
+
+        private static readonly Func<(long Free, long Total)?> GgmlDeviceMemory = static ()
             => GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0 ? (free, total) : null;
 
-        /// <summary>What the device lacks for <paramref name="needBytes"/> beside its headroom, after the kept graph arenas
-        /// are released and then the idle slots' device copies dropped (0 when it fits or is not measured).</summary>
+        /// <summary>The bytes claimed ahead of use on the device the GGML backend reports (<see cref="GpuMemoryBudget.Reserve"/>,
+        /// <see cref="GpuMemoryBudget.GgmlDevice"/>: a loaded vision tower's weights before their upload and the compute of the
+        /// largest image it accepts), which a new slot leaves free beside the headroom. A test's probe sees only the
+        /// reservations on the device it names (<see cref="ReservationDeviceForTests"/>), none by default.</summary>
+        private long GgmlReservedBytes
+        {
+            get
+            {
+                (BackendType Backend, int Device)? device = ReservationDeviceForTests;
+                if (device == null && ReferenceEquals(DeviceMemoryProbe, GgmlDeviceMemory))
+                    device = (_backend, GpuMemoryBudget.GgmlDevice);
+                return device is { } d ? GpuMemoryBudget.ReservedBytes(d.Backend, d.Device) : 0;
+            }
+        }
+
+        /// <summary>What the device lacks for <paramref name="needBytes"/> beside its headroom and the bytes reserved on it,
+        /// after the kept graph arenas are released and then the idle slots' device copies dropped (0 when it fits or is not
+        /// measured).</summary>
         private long DeviceDeficit(long needBytes)
         {
             if (needBytes <= 0 || DeviceMemoryProbe() is not { } memory) return 0;
-            long deficit = Math.Max(0, needBytes + DeviceHeadroom(memory.Total) - memory.Free);
+            long reserved = GgmlReservedBytes;
+            long Short((long Free, long Total) m) => Math.Max(0, needBytes + DeviceHeadroom(m.Total) + reserved - m.Free);
+            long deficit = Short(memory);
             if (deficit > 0 && GgmlBasicOps.ReleaseKeptArenas() > 0 && DeviceMemoryProbe() is { } after)
-                deficit = Math.Max(0, needBytes + DeviceHeadroom(after.Total) - after.Free);
+                deficit = Short(after);
             if (deficit > 0 && DropIdleSlotDeviceCopies() > 0 && DeviceMemoryProbe() is { } dropped)
-                deficit = Math.Max(0, needBytes + DeviceHeadroom(dropped.Total) - dropped.Free);
+                deficit = Short(dropped);
             return deficit;
         }
 
@@ -1204,12 +1230,27 @@ namespace TensorSharp.Models
                     "which its sliding-window ring caches take in steps.");
             int step = _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
             for (int s = 0; s < n; s++) rounds = Math.Max(rounds, ((chunks[s]?.Length ?? 0) + step - 1) / step);
+            // A chunk whose rows its request's drafter follows (FollowPlainPrompt, FollowUnspeculatedPrompt) is followed in every
+            // round: registered once for the chunk, the registration the first round took left the later rounds' rows out of
+            // the drafter, so a Muse-Glimmer prompt past 512 rows reached its DFlash ring as its first 512 (the prompt's tail
+            // missing, no carry held): 302 drafts kept after a 520-token prompt where legacy, from the same text, kept 409.
+            int[] followedEnds = TakeFollowedPrompts(requestIds, out bool[] followedAside);
+            void FollowRound(List<int> owners)
+            {
+                if (followedEnds == null) return;
+                foreach (int s in owners)
+                {
+                    if (followedEnds[s] == DFlashNoFollow) continue;
+                    if (followedAside != null && followedAside[s]) FollowUnspeculatedPrompt(requestIds[s], followedEnds[s]);
+                    else FollowPlainPrompt(requestIds[s], followedEnds[s]);
+                }
+            }
             // Plain prompts' rounds overlap on the device (IGraphExecutor.OverlapSteps): a round that ends no request's chunk runs
             // no head and hands the host nothing, so its run returns with its work queued while the next round is embedded,
             // traced and built. The slots hold their whole chunks first, so no round grows them.
             IDisposable overlap = null;
             if (OverlapPromptSteps && rounds > 1 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null
-                && (_followPromptRequests == null || !requestIds.Any(_followPromptRequests.ContainsKey)) && _slots != null
+                && followedEnds == null && _slots != null
                 && requestIds.All(id => _slots.ContainsKey(id)))
             {
                 for (int s = 0; s < n; s++)
@@ -1250,6 +1291,7 @@ namespace TensorSharp.Models
                             Hidden = rowIO.Hidden == null ? null : hidden.ToArray(),
                         };
                     var logits = new float[ids.Count][];
+                    FollowRound(owners);
                     if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits, null, roundRowIO))
                     {
                         if (round == 0) return false;
@@ -1262,6 +1304,11 @@ namespace TensorSharp.Models
             finally
             {
                 overlap?.Dispose();
+                // A request with no rows in this step keeps its registration for its next chunk.
+                var idle = new List<int>();
+                for (int s = 0; s < n; s++)
+                    if ((chunks[s]?.Length ?? 0) == 0) idle.Add(s);
+                FollowRound(idle);
             }
             return true;
         }

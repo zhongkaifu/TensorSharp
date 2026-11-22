@@ -1,0 +1,41 @@
+// UD-IQ2_XXS (10.7 GB): the quant validated on a 48 GB Mac (ggml_metal, MLX) and as the cross-device anchor on CUDA.
+// Metadata-only source verification: config/regression/source-pins.json.
+// Public project-linked publisher, immutable revision plus SHA256 for every file.
+// No quality/device qualification is implied. The local runner budgets the complete shard group.
+// Projector optional for text, required and hash-verified for image tests. The DFlash drafter (dflash-kquant.gguf, the same
+// repository and revision) is pinned and engages by itself, as --draft-model does; drop "draft-model" for plain decoding.
+{
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/muse-glimmer-30b"
+  },
+  "backend": "ggml_metal",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/Muse-Glimmer-30B-UD-IQ2_XXS.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/resolve/faa5b025c584459c13febfa5c59883516710ae39/Muse-Glimmer-30B-UD-IQ2_XXS.gguf"
+    ],
+    "sha256": "3e9bd0e609df9d0121ba18c6556de496e7be880184cf22c5dbafbc0600875ad9"
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/resolve/faa5b025c584459c13febfa5c59883516710ae39/mmproj-Muse-Glimmer-30B-Q8_0.gguf"
+    ],
+    "sha256": "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2",
+    "optional": true
+  },
+  "draft-model": {
+    "path": "${root}/dflash-kquant.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/resolve/faa5b025c584459c13febfa5c59883516710ae39/dflash-kquant.gguf"
+    ],
+    "sha256": "27d9a805fa29b943cfb6ad4843367cd4eaaaf06bd452d8cc3e00a2cd18a677bc"
+  }
+}

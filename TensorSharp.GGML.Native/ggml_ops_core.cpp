@@ -3403,7 +3403,6 @@ extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
 extern "C" void TSGgml_GptOssResetDecodeCache();
 extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
 extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
-extern "C" void TSGgml_MuseGlimmerResetDecodeCache();
 extern "C" void TSGgml_DFlashResetCaches();
 extern "C" void TSGgml_QwenImage21ResetForwardCache();
 extern "C" void TSGgml_QwenImage21ReleasePrefixCaches();
@@ -3431,11 +3430,10 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // The same holds for the persistent graphs TSGgml_InvalidateHostBuffer drops when
     // it frees ONE device copy; this wipe frees all of them. They used to survive a
     // model unload until TSGgml_Shutdown. Their keys are raw host addresses (DFlash:
-    // drafter weight + ring row, Muse-Glimmer and Gemma 4: norm weight + KV), so a model
+    // drafter weight + ring row, Gemma 4: norm weight + KV), so a model
     // loaded afterwards whose allocations landed on the old addresses replayed a graph
     // bound to freed MTLBuffers. Each rebuilds on its next call.
     TSGgml_DFlashResetCaches();
-    TSGgml_MuseGlimmerResetDecodeCache();
     TSGgml_Gemma4ResetDecodeCache();
     TSGgml_Gemma4ResetBatchedDecodeCache();
     TSGgml_Gemma4ResetMoEBatchedDecodeCache();
@@ -3592,7 +3590,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     TSGgml_GptOssInvalidateKvCache(nullptr, nullptr);
     // Same contract for the other whole-model graph caches: each parks a ggml
     // context + backend buffer that must be released before the backend is.
-    TSGgml_MuseGlimmerResetDecodeCache();
     TSGgml_DFlashResetCaches();
     TSGgml_WanResetForwardCache();
     TSGgml_NemotronMamba2PrefillClear();
@@ -4050,10 +4047,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
-    // Muse-Glimmer's persistent decode graphs bind the KV device copies the same
-    // way. Its C# side resets them around its own grow/truncate/inject, but the
-    // per-op fallback invalidates the caches it writes without doing so.
-    TSGgml_MuseGlimmerResetDecodeCache();
 }
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)

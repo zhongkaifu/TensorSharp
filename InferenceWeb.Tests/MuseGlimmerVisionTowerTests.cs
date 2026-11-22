@@ -1,0 +1,388 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using TensorSharp;
+using TensorSharp.Cpu;
+using TensorSharp.Cuda;
+using TensorSharp.GGML;
+using TensorSharp.MLX;
+using TensorSharp.Models;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace InferenceWeb.Tests;
+
+/// <summary>
+/// The Muse-Glimmer / Muse Spark vision tower as a graph program (<see cref="MuseGlimmerVisionTower"/>, stage S4 of
+/// docs/design/muse-glimmer-unified.md) against the legacy per-op tower's rows, frozen on the managed backend before stage S9
+/// deleted that tower (<see cref="MuseGlimmerLegacySynthetic"/>), over a synthetic mmproj laid out as the real one
+/// (<see cref="MuseGlimmerVisionSynthetic"/>: Q8_0
+/// products, windows of 4 x 4 patches, layers 0-2 windowed and 3-4 global): square and non-square grids from one window to
+/// six, F16 and F32 keys and values on GGML, several images on one tower, a large image split into programs, attention in
+/// pieces.
+/// </summary>
+public sealed class MuseGlimmerVisionTowerTests(ITestOutputHelper output) : IDisposable
+{
+    /// <summary>
+    /// The bound on each image's relative L2 distance and largest difference over the largest legacy value, against the legacy
+    /// tower's rows frozen on the managed backend, over the F32-product fixture. The towers run different kernels for the same
+    /// arithmetic: GGML's flash attention reads F16 keys and values (llama.cpp's mtmd and legacy's fused CUDA block do too;
+    /// legacy's per-op GGML attention is F32 products), the executors' rotary and exact GELU stand in for legacy's host loops
+    /// (its GELU is a 1.5e-7 erf approximation), and reduction orders differ. Measured on the M5 Pro against legacy on the
+    /// same executor while legacy existed (worst over the grids): managed 6.1e-7, ggml_cpu 1.3e-4 (3.9e-7 with F32 keys and
+    /// values), ggml_metal 5.7e-4 (4.5e-4), MLX 6.1e-4; against the frozen managed rows (since S9): managed 6.1e-7, ggml_cpu 1.3e-4, ggml_metal 1.6e-3, MLX 4.2e-3. Legacy's own spread
+    /// between those executors was 4.1e-3 (MLX against managed; Metal against managed 1.8e-3), measured before S9: the bound,
+    /// 2e-3, is under it and three times the worst tower distance.
+    /// </summary>
+    internal const double ParityBound = 2e-3;
+
+    /// <summary>
+    /// The bound against the legacy tower's frozen managed rows on an executor other than the managed one, over the F32-product
+    /// fixture: legacy's own spread between its executors, measured before stage S9 deleted it (4.1e-3 on the M5 Pro, MLX
+    /// against managed; under 6e-3, three times <see cref="ParityBound"/>, on the RTX PRO 4500 Blackwell box). The tower on an
+    /// executor rounds as legacy did there: measured on the M5 Pro, ggml_cpu 1.3e-4, ggml_metal 1.6e-3 (1.7e-3 with F32 keys
+    /// and values), MLX 4.2e-3.
+    /// </summary>
+    internal const double FrozenReferenceBound = 6e-3;
+
+    /// <summary>
+    /// The bound over the Q8_0-product fixture (the real mmproj's format), which checks that the tower reads block weights on
+    /// every executor, against legacy's rows frozen on the managed backend (which multiplies F32 copies of the weights): the executors whose
+    /// Q8_0 products quantize their activations (ggml-cpu, ggml-cuda, the managed executor's integer dot) leave 2.2e-2 between
+    /// legacy's own runs on this fixture's random weights (legacy managed against legacy ggml_cpu), and the tower is within
+    /// 2.1e-2 of managed legacy on ggml_cuda and ggml_vulkan, 3.0e-2 of legacy on ggml_cpu; a wrong block layout or
+    /// orientation is O(1).
+    /// </summary>
+    internal const double Q8ProductBound = 5e-2;
+
+    /// <summary>Patch grids (across, down): one window (4 x 4), four (8 x 8), six with clipped edges (6 x 10, 12 x 6), a strip
+    /// (10 x 2: three windows) and a column (2 x 6: two).</summary>
+    internal static readonly (int W, int H)[] Grids = { (4, 4), (8, 8), (6, 10), (10, 2), (2, 6), (12, 6) };
+
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-mg-vtower-" + Guid.NewGuid().ToString("N"));
+    private string _mmproj;
+
+    private string Mmproj => _mmproj ??= MuseGlimmerLegacySynthetic.WriteTowerFixture("q8", _dir);
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
+
+    /// <summary>One executor's allocator (and the cleanup GGML's shared caches need between lanes).</summary>
+    internal sealed class Lane : IDisposable
+    {
+        private readonly IDisposable _owner;
+
+        public Lane(BackendType backend)
+        {
+            Backend = backend;
+            switch (backend)
+            {
+                case BackendType.Cpu:
+                    Allocator = new CpuAllocator(BlasEnum.DotNet);
+                    break;
+                case BackendType.Mlx:
+                    var mlx = new MlxAllocator();
+                    _owner = mlx;
+                    Allocator = mlx;
+                    break;
+                case BackendType.Cuda:
+                    var cuda = new CudaAllocator();
+                    _owner = cuda;
+                    Allocator = cuda;
+                    break;
+                default:
+                    GgmlBackendType g = backend switch
+                    {
+                        BackendType.GgmlMetal => GgmlBackendType.Metal,
+                        BackendType.GgmlCuda => GgmlBackendType.Cuda,
+                        BackendType.GgmlVulkan => GgmlBackendType.Vulkan,
+                        _ => GgmlBackendType.Cpu,
+                    };
+                    Allocator = new GgmlAllocator(new GgmlContext([0], g), 0);
+                    Ggml = true;
+                    break;
+            }
+        }
+
+        public BackendType Backend { get; }
+        public IAllocator Allocator { get; }
+        public bool Ggml { get; }
+
+        public void Dispose()
+        {
+            _owner?.Dispose();
+            if (Ggml)
+            {
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                GgmlBasicOps.ClearHostBufferCache();
+            }
+        }
+    }
+
+    /// <summary>The legacy tower's rows for one grid, frozen on the managed backend (<see cref="MuseGlimmerLegacySynthetic"/>).</summary>
+    private static float[] Legacy(string fixture, string mmproj, (int W, int H) grid, uint seed)
+        => MuseGlimmerLegacySynthetic.TowerRows(fixture, mmproj, grid.W, grid.H, seed);
+
+    internal static MuseGlimmerVisionTower Tower(Lane lane, string mmproj)
+    {
+        using var gguf = new GgufFile(mmproj);
+        return new MuseGlimmerVisionTower(gguf, lane.Allocator, lane.Backend);
+    }
+
+    internal static (double RelL2, double RelMax) Distance(float[] reference, float[] actual)
+    {
+        Assert.Equal(reference.Length, actual.Length);
+        double d2 = 0, r2 = 0, dmax = 0, rmax = 0;
+        for (int i = 0; i < reference.Length; i++)
+        {
+            double d = (double)actual[i] - reference[i];
+            Assert.False(double.IsNaN(d) || double.IsInfinity(d), $"value {i} is not finite ({actual[i]})");
+            d2 += d * d;
+            r2 += (double)reference[i] * reference[i];
+            dmax = Math.Max(dmax, Math.Abs(d));
+            rmax = Math.Max(rmax, Math.Abs(reference[i]));
+        }
+        return (Math.Sqrt(d2 / Math.Max(r2, 1e-30)), dmax / Math.Max(rmax, 1e-30));
+    }
+
+    private static (int Width, int Height, float[] Pixels) Image((int W, int H) grid, uint seed)
+    {
+        int width = grid.W * MuseGlimmerVisionSynthetic.Patch, height = grid.H * MuseGlimmerVisionSynthetic.Patch;
+        return (width, height, MuseGlimmerVisionSynthetic.Pixels(width, height, seed));
+    }
+
+    private string _mmprojF32;
+
+    /// <summary>The fixture with F32 products (the parity gates).</summary>
+    private string MmprojF32 => _mmprojF32 ??= MuseGlimmerLegacySynthetic.WriteTowerFixture("f32", _dir);
+
+    /// <summary>
+    /// Every grid through the tower on <paramref name="backend"/> over the F32-product fixture: within <see cref="ParityBound"/>
+    /// of the legacy tower's rows frozen on the managed backend there, within <see cref="FrozenReferenceBound"/> elsewhere. On GGML the tower also runs with F32 keys and values, which takes it to legacy's
+    /// per-op attention (the F16 keys and values are the only difference there).
+    /// </summary>
+    private void Verify(BackendType backend)
+    {
+        using var lane = new Lane(backend);
+        using MuseGlimmerVisionTower tower = Tower(lane, MmprojF32);
+        using MuseGlimmerVisionTower f32Kv = Tower(lane, MmprojF32);
+        f32Kv.Graph.AttentionHalfKv = false;
+        output.WriteLine($"executor {tower.Graph.Executor.GetType().Name} ({backend}); F16 keys and values: {tower.Graph.AttentionHalfKv}");
+        double worst = 0, worstF32Kv = 0;
+        uint seed = 1;
+        foreach (var grid in Grids)
+        {
+            var (w, h, px) = Image(grid, seed++);
+            float[] reference = Legacy("f32", MmprojF32, grid, seed - 1);
+            float[] a = tower.EncodeToHost(px, w, h, out int tokens);
+            float[] c = f32Kv.EncodeToHost(px, w, h, out _);
+            Assert.Equal(grid.W * grid.H / 4, tokens);
+            Assert.Equal(tokens * 48, a.Length);
+            var da = Distance(reference, a);
+            var dc = Distance(reference, c);
+            int windows = tower.GeometryOf(grid.W, grid.H).WindowCount;
+            output.WriteLine($"  grid {grid.W}x{grid.H} ({windows} window{(windows == 1 ? "" : "s")}): relL2 {da.RelL2:E2} max {da.RelMax:E2}; " +
+                $"F32 keys and values {Math.Max(dc.RelL2, dc.RelMax):E2}");
+            worst = Math.Max(worst, Math.Max(da.RelL2, da.RelMax));
+            worstF32Kv = Math.Max(worstF32Kv, Math.Max(dc.RelL2, dc.RelMax));
+        }
+        double bound = backend == BackendType.Cpu ? ParityBound : FrozenReferenceBound;
+        output.WriteLine($"  worst vs legacy's frozen managed rows {worst:E3} (bound {bound:E1}); with F32 keys and values {worstF32Kv:E3}");
+        Assert.True(worst <= bound, $"{backend}: {worst:E3} from the legacy tower's frozen rows (bound {bound:E1})");
+        Assert.True(worstF32Kv <= bound, $"{backend}: with F32 keys and values {worstF32Kv:E3} from the legacy tower's frozen rows");
+    }
+
+    /// <summary>
+    /// The Q8_0-product fixture (the real mmproj's format) on <paramref name="backend"/>: within <see cref="Q8ProductBound"/> of
+    /// legacy's rows frozen on the managed backend. (Legacy's own GGML tower was O(1) off that reference on ggml_cuda and
+    /// ggml_vulkan on this fixture's non-square grids, 0.44-1.11 on an RTX PRO 4500 Blackwell where the graph tower is within
+    /// 2.1e-2: a defect of the legacy tower, which stage S9 deleted.) On direct
+    /// CUDA the tower multiplies F32 copies of the weights' values (<see cref="TensorSharp.Graph.GraphProgram.FloatProducts"/>),
+    /// managed legacy's arithmetic, so it is held to <see cref="ParityBound"/> there (6.4e-7 measured).
+    /// </summary>
+    private void VerifyQ8(BackendType backend)
+    {
+        using var lane = new Lane(backend);
+        using MuseGlimmerVisionTower tower = Tower(lane, Mmproj);
+        double worst = 0;
+        uint seed = 1;
+        foreach (var grid in Grids)
+        {
+            var (w, h, px) = Image(grid, seed++);
+            float[] reference = Legacy("q8", Mmproj, grid, seed - 1);
+            var d = Distance(reference, tower.EncodeToHost(px, w, h, out _));
+            output.WriteLine($"  grid {grid.W}x{grid.H}: tower {Math.Max(d.RelL2, d.RelMax):E2} from legacy's frozen managed rows");
+            worst = Math.Max(worst, Math.Max(d.RelL2, d.RelMax));
+        }
+        output.WriteLine($"Q8_0 products on {backend}: worst {worst:E3} from the managed legacy tower's frozen rows (bound " +
+            $"{(backend == BackendType.Cuda ? ParityBound : Q8ProductBound):E1})");
+        double bound = backend == BackendType.Cuda ? ParityBound : Q8ProductBound;
+        Assert.True(worst <= bound, $"{backend}: with Q8_0 products {worst:E3} from the managed legacy tower (bound {bound:E1})");
+    }
+
+    [Fact]
+    public void TowerOnTheManagedBackendGivesTheLegacyTowersFrozenRows() => Verify(BackendType.Cpu);
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void TowerOnGgmlCpuGivesTheLegacyTowersFrozenRows() => Verify(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TowerOnGgmlMetalGivesTheLegacyTowersFrozenRows() => Verify(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TowerOnGgmlCudaGivesTheLegacyTowersFrozenRows() => Verify(BackendType.GgmlCuda);
+
+    [GgmlFact(BackendType.GgmlVulkan)]
+    public void TowerOnGgmlVulkanGivesTheLegacyTowersFrozenRows() => Verify(BackendType.GgmlVulkan);
+
+    [MlxFact]
+    public void TowerOnMlxGivesTheLegacyTowersFrozenRows() => Verify(BackendType.Mlx);
+
+    [CudaFact]
+    public void TowerOnDirectCudaGivesTheLegacyTowersFrozenRows() => Verify(BackendType.Cuda);
+
+    [Fact]
+    public void TowerReadsQ8ProductsOnTheManagedBackend() => VerifyQ8(BackendType.Cpu);
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void TowerReadsQ8ProductsOnGgmlCpu() => VerifyQ8(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TowerReadsQ8ProductsOnGgmlMetal() => VerifyQ8(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TowerReadsQ8ProductsOnGgmlCuda() => VerifyQ8(BackendType.GgmlCuda);
+
+    [GgmlFact(BackendType.GgmlVulkan)]
+    public void TowerReadsQ8ProductsOnGgmlVulkan() => VerifyQ8(BackendType.GgmlVulkan);
+
+    [MlxFact]
+    public void TowerReadsQ8ProductsOnMlx() => VerifyQ8(BackendType.Mlx);
+
+    [CudaFact]
+    public void TowerReadsQ8ProductsOnDirectCuda() => VerifyQ8(BackendType.Cuda);
+
+    /// <summary>A tower on a backend whose caches are sized from the device's free memory (ggml_cuda, ggml_vulkan, ggml_metal,
+    /// direct CUDA) claims its weights and the compute of the largest image it accepts on that device when it loads
+    /// (<see cref="GpuMemoryBudget.Reserve"/>), only the compute once an image has uploaded the weights, and nothing once
+    /// disposed; the managed, ggml_cpu and MLX towers claim nothing. Each lane this process can open: the managed backend,
+    /// the pinned GGML backend, MLX and direct CUDA.</summary>
+    [Fact]
+    public void TheTowerClaimsItsDeviceMemoryOnTheBackendsThatSizeCachesFromIt()
+    {
+        var backends = new List<BackendType> { BackendType.Cpu, TestGates.PinnedGgmlBackend };
+        if (TestGates.MlxSkip == null) backends.Add(BackendType.Mlx);
+        if (TestGates.CudaSkip == null) backends.Add(BackendType.Cuda);
+        foreach (BackendType backend in backends)
+        {
+            using var lane = new Lane(backend);
+            MuseGlimmerVisionTower tower = Tower(lane, Mmproj);
+            bool claims = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal or BackendType.Cuda;
+            long weights = tower.Weights.QuantizedBytes + tower.Weights.DenseBytes;
+            long compute = tower.ComputeBytes((long)MuseGlimmerVisionTower.MaxTokens * tower.MergeSize * tower.MergeSize);
+            output.WriteLine($"{backend}: claims {tower.ReservedBytes} bytes at load ({weights} of weights, {compute} of compute)");
+            Assert.Equal(compute, tower.ReservedComputeBytes);
+            Assert.True(compute > 0);
+            Assert.Equal(claims ? weights + compute : 0, tower.ReservedBytes);
+            if (claims)
+            {
+                int device = lane.Allocator is CudaAllocator cuda ? cuda.DeviceId : GpuMemoryBudget.GgmlDevice;
+                Assert.True(GpuMemoryBudget.ReservedBytes(backend, device) >= tower.ReservedBytes, "the claim is on the device's readings");
+            }
+            var (w, h, px) = Image((4, 4), 3);
+            tower.EncodeToHost(px, w, h, out _);
+            Assert.Equal(claims ? compute : 0, tower.ReservedBytes);
+            tower.Dispose();
+            Assert.Equal(0, tower.ReservedBytes);
+        }
+    }
+
+    /// <summary>Several images on one tower: each geometry's program is compiled once and replayed, a replay gives the rows a
+    /// fresh tower gives, and another geometry in between changes nothing.</summary>
+    [Fact]
+    public void SeveralImagesOnOneTowerReplayTheirPrograms()
+    {
+        foreach (BackendType backend in new[] { BackendType.Cpu, TestGates.PinnedGgmlBackend })
+        {
+            using var lane = new Lane(backend);
+            using MuseGlimmerVisionTower tower = Tower(lane, MmprojF32);
+            var (wa, ha, pa) = Image((6, 10), 11);
+            var (wb, hb, pb) = Image((8, 8), 12);
+            var (wc, hc, pc) = Image((6, 10), 13);
+            float[] a1 = tower.EncodeToHost(pa, wa, ha, out _);
+            float[] b = tower.EncodeToHost(pb, wb, hb, out _);
+            float[] a2 = tower.EncodeToHost(pa, wa, ha, out _);
+            float[] c = tower.EncodeToHost(pc, wc, hc, out _);
+            using MuseGlimmerVisionTower fresh = Tower(lane, MmprojF32);
+            float[] cFresh = fresh.EncodeToHost(pc, wc, hc, out _);
+            float[] bFresh = fresh.EncodeToHost(pb, wb, hb, out _);
+            output.WriteLine($"{backend}: {tower.Graph.Builds} builds, {tower.Graph.Replays} replays over 4 images");
+            Assert.Equal(a1, a2);
+            Assert.Equal(cFresh, c);
+            Assert.Equal(bFresh, b);
+            Assert.NotEqual(a1, c);
+            if (tower.Graph.Executor.Capabilities.Replays) Assert.Equal(2, tower.Graph.Builds);
+        }
+    }
+
+    /// <summary>A large image with a yield callback runs as programs over consecutive layer ranges, the callback between
+    /// them, and gives the rows of one program.</summary>
+    [Fact]
+    public void ALargeImageSplitIntoProgramsGivesTheRowsOfOne()
+    {
+        foreach (BackendType backend in new[] { BackendType.Cpu, TestGates.PinnedGgmlBackend })
+        {
+            using var lane = new Lane(backend);
+            using MuseGlimmerVisionTower tower = Tower(lane, MmprojF32);
+            var (w, h, px) = Image((12, 6), 21);
+            float[] one = tower.EncodeToHost(px, w, h, out _, betweenParts: null);
+            Assert.Equal(1, tower.LastParts);
+            tower.YieldPatches = 16;
+            int yields = 0;
+            float[] split = tower.EncodeToHost(px, w, h, out _, betweenParts: () => yields++);
+            Assert.Equal(5, tower.LastParts);
+            Assert.Equal(4, yields);
+            var d = Distance(one, split);
+            output.WriteLine($"{backend}: 5 programs vs one: relL2 {d.RelL2:E2}, max {d.RelMax:E2}");
+            Assert.True(Math.Max(d.RelL2, d.RelMax) <= 1e-6, $"{backend}: split programs {Math.Max(d.RelL2, d.RelMax):E3} from one");
+        }
+    }
+
+    /// <summary>The managed executor's attention in pieces of query rows (its score budget) gives the rows of one piece.</summary>
+    [Fact]
+    public void AttentionInPiecesGivesTheRowsOfOnePiece()
+    {
+        using var lane = new Lane(BackendType.Cpu);
+        using MuseGlimmerVisionTower whole = Tower(lane, MmprojF32);
+        using MuseGlimmerVisionTower pieces = Tower(lane, MmprojF32);
+        pieces.AttentionChunkRows = 5;
+        var (w, h, px) = Image((8, 8), 31);
+        var d = Distance(whole.EncodeToHost(px, w, h, out _), pieces.EncodeToHost(px, w, h, out _));
+        output.WriteLine($"pieces of 5 rows vs one: relL2 {d.RelL2:E2}, max {d.RelMax:E2}");
+        Assert.True(Math.Max(d.RelL2, d.RelMax) <= 1e-6);
+    }
+
+    /// <summary>The window order, windows and merge gather of a clipped grid, by hand: 6 x 10 patches in windows of 4.</summary>
+    [Fact]
+    public void WindowsGroupThePatchesOfEachWindowTogether()
+    {
+        int[] order = MuseGlimmerVisionGrid.WindowOrder(6, 10, 4, out int[] windows);
+        Assert.Equal(new[] { 0, 16, 24, 40, 48, 56, 60 }, windows);
+        Assert.Equal(new[] { 0, 1, 2, 3, 6, 7, 8, 9 }, order.Take(8));
+        Assert.Equal(new[] { 4, 5, 10, 11 }, order.Skip(16).Take(4));
+        Assert.Equal(Enumerable.Range(0, 60), order.OrderBy(x => x));
+        int[] gather = MuseGlimmerVisionGrid.MergeGather(6, 10, 2, order);
+        // Block (0, 0) is raster patches 0, 1, 6, 7: window-order rows 0, 1, 4, 5.
+        Assert.Equal(new[] { 0, 1, 4, 5 }, gather.Take(4));
+    }
+}
+

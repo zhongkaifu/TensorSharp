@@ -53,6 +53,8 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["qwen35"] = typeof(Qwen35RuntimeTests),
         // LFM3's short-conv layers rewind only to their length or to zero, as Qwen 3.5's recurrent layers do.
         ["lfm3"] = typeof(Lfm3RuntimeTests),
+        // Muse-Glimmer's sliding-window rings bound its rewinds (RingsKeepTruncation); its suites lap the rings on purpose.
+        ["muse-glimmer"] = typeof(MuseGlimmerRuntimeConformanceTests),
         // Inkling 2 keeps short-conv state on every layer; it declares its placements and expert offload as gaps.
         ["inkling2"] = typeof(Inkling2RuntimeTests),
     };
@@ -147,14 +149,21 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// graphs above are opt-in): the same logits as one device, decode replays, and speculation.</summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
     [MemberData(nameof(Families))]
-    public void RankGraphsOnGgmlMatchOneDevice(string family)
+    public void RankGraphsOnGgmlMatchOneDevice(string family) => AssertRankGraphsMatchOneDevice(family, BackendType.GgmlCuda);
+
+    /// <summary>The same over two ggml_vulkan GPUs, whose partials sum through host staging (no device collective).</summary>
+    [GgmlTheory(BackendType.GgmlVulkan, Devices = 2)]
+    [MemberData(nameof(Families))]
+    public void RankGraphsOnGgmlVulkanMatchOneDevice(string family) => AssertRankGraphsMatchOneDevice(family, BackendType.GgmlVulkan);
+
+    private void AssertRankGraphsMatchOneDevice(string family, BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(family, keyLength: 64);
         List<float[]> single;
-        using (var one = Create(family, path, 1, 1, BackendType.GgmlCuda))
+        using (var one = Create(family, path, 1, 1, backend))
             single = Script(one);
-        using ModelBase tp = CreateGgmlTensorParallel(family, path);
+        using ModelBase tp = CreateGgmlTensorParallel(family, path, backend);
         var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(tp);
         Assert.Equal(2, sdm.Mesh.TensorParallel);
         List<float[]> actual = Script(tp);
@@ -162,6 +171,11 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         for (int i = 0; i < single.Count; i++)
             // ggml's kernels split each row-parallel product differently per rank (1.5e-4 / 2.2e-4 measured on 2x A40).
             Assert.True(RelL2(actual[i], single[i]) <= 1e-3, $"{family} tp2 rank graphs row {i}: relL2 {RelL2(actual[i], single[i]):E2}");
+        // Each rank scores its slice of the untied head, and the whole head stays on the host: a verify step's all-row logits
+        // bind it on rank 0 when they first run, and speculation on these graphs still emits plain greedy's tokens.
+        Assert.True(sdm.HeadSplitByVocabulary && sdm.WholeHeadStaysOnHost, $"{family}: the head is not split by vocabulary with the whole head on the host");
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => CreateGgmlTensorParallel(family, path, backend), $"{family} tp2 rank graphs on {backend}",
+            tieTolerance: 1e-2);
     }
 
     /// <summary>Speculation on per-rank graphs over two simulated devices matches plain greedy decoding.</summary>
@@ -174,10 +188,10 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     }
 
     /// <summary>A GGML tensor-parallel group of two (the model builds it: no group is passed).</summary>
-    private static ModelBase CreateGgmlTensorParallel(string family, string path) => family switch
+    private static ModelBase CreateGgmlTensorParallel(string family, string path, BackendType backend = BackendType.GgmlCuda) => family switch
     {
-        "mistral3" => new Mistral3Model(path, BackendType.GgmlCuda, 2, null, 1),
-        "hunyuan-dense" => new HunyuanDenseModel(path, BackendType.GgmlCuda, 2, null, 1),
+        "mistral3" => new Mistral3Model(path, backend, 2, null, 1),
+        "hunyuan-dense" => new HunyuanDenseModel(path, backend, 2, null, 1),
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
     };
 

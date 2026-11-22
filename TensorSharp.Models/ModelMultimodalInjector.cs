@@ -601,14 +601,11 @@ namespace TensorSharp.Models
         /// the encoder's merged-patch count for that image; the filler rows are overwritten
         /// by the projected vision embeddings before the layer loop. This mirrors llama.cpp's
         /// mtmd chunking for PROJECTOR_TYPE_MUSE_GLIMMER (img_beg "&lt;|image_start|&gt;",
-        /// img_end "&lt;|image_end|&gt;").
+        /// img_end "&lt;|image_end|&gt;"). Muse Spark publishes the same vision tower and
+        /// image-token contract, so image caching and placeholder expansion are shared by
+        /// both models (<see cref="IMuseGlimmerVisionTower"/>).
         /// </summary>
-        internal List<int> ProcessMuseGlimmerHistory(MuseGlimmerModel model, List<ChatMessage> history, List<int> inputTokens)
-            => ProcessMuseGlimmerHistory(model.VisionEncoder, history, inputTokens);
-
-        // Muse Spark publishes the same Muse-Glimmer vision tower and image-token
-        // contract. Keep image caching/placeholder expansion shared by both models.
-        internal List<int> ProcessMuseGlimmerHistory(MuseGlimmerVisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessMuseGlimmerHistory(IMuseGlimmerVisionTower encoder, List<ChatMessage> history, List<int> inputTokens)
         {
             if (encoder == null)
                 return inputTokens;
@@ -619,7 +616,6 @@ namespace TensorSharp.Models
             if (patchId < 0 || imageStartId < 0 || imageEndId < 0)
                 return inputTokens;
 
-            var processor = encoder.ImageProcessor;
             int searchFrom = 0;
 
             foreach (var message in history)
@@ -629,7 +625,7 @@ namespace TensorSharp.Models
 
                 foreach (var imagePath in message.ImagePaths)
                 {
-                    CachedEmbedding cached = GetOrCreateMuseGlimmerVisionEmbedding(encoder, processor, imagePath);
+                    CachedEmbedding cached = GetOrCreateMuseGlimmerVisionEmbedding(encoder, imagePath);
                     int tokenPosition = FindTokenPosition(inputTokens, patchId, searchFrom);
                     if (tokenPosition < 0)
                         continue;
@@ -648,13 +644,15 @@ namespace TensorSharp.Models
             return inputTokens;
         }
 
-        private CachedEmbedding GetOrCreateMuseGlimmerVisionEmbedding(
-            MuseGlimmerVisionEncoder encoder, MuseGlimmerImageProcessor processor, string imagePath)
+        /// <summary>An image's rows: decoded and stretched off the model's GPU lock (host work), encoded under it with the
+        /// lock yielded between the tower's parts.</summary>
+        private CachedEmbedding GetOrCreateMuseGlimmerVisionEmbedding(IMuseGlimmerVisionTower encoder, string imagePath)
         {
             return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
             {
-                var (pixels, imageWidth, imageHeight) = processor.ProcessImage(fullPath);
-                Tensor embeddings = encoder.Encode(pixels, imageWidth, imageHeight);
+                MuseGlimmerImageProcessor processor = encoder.ImageProcessor;
+                var (pixels, imageWidth, imageHeight) = _model.RunOutsideGpuComputeLock(() => processor.ProcessImage(fullPath));
+                Tensor embeddings = encoder.Encode(pixels, imageWidth, imageHeight, _model.YieldGpuComputeLock);
                 return CreateCachedEmbedding(fullPath, embeddings);
             });
         }

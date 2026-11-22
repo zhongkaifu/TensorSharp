@@ -33,6 +33,11 @@ Scenarios beyond plain chat:
   --tensoragent --cookie C [--reopen-before 3]   TensorAgent's loopback host: sessions bound to a saved
                       conversation, and the chat reopened (a new session) before the named turns
 
+--replay REPORT re-sends a finished run's last turn (its whole history up to the last user message, as
+the client sent it) once and compares the reply with the run's: run it against a FRESH server (a new
+process, --no-prefix-cache) to check that the cached conversation's last turn answers exactly as a
+re-prefill of the same conversation does. The report keeps the run's history for that ("history").
+
 --echo-reasoning sends the previous replies' reasoning back (OpenAI `reasoning_content`,
 Ollama `thinking`, Responses `reasoning` items); the Web UI always sends `thinking`.
 --tools adds a client tool declaration (OpenAI/Responses/Ollama) so tool-capable templates
@@ -394,6 +399,7 @@ def main():
     ap.add_argument("--pause", type=float, default=0.3, help="seconds to wait between turns")
     ap.add_argument("--model", help="the hosted model name (default: the first of /api/tags)")
     ap.add_argument("--label", default="")
+    ap.add_argument("--replay", help="a finished run's report: re-send its last turn once and compare the reply (see above)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     global COOKIE
@@ -413,6 +419,8 @@ def main():
         args.session, args.conversation = created.get("sessionId"), created.get("conversationId")
     elif args.surface == "webui":
         args.session = http(args.url + "/api/sessions", {}).get("sessionId")
+    if args.replay:
+        return replay(args)
     history = [{"role": "system", "content": args.system}] if args.system else []
     turns = {"chat": TURNS, "tools": TOOL_TURNS, "code": CODE_TURNS}[args.task]
     if args.task == "tools":
@@ -495,9 +503,42 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         config = {k: (sorted(v) if isinstance(v, set) else v) for k, v in vars(args).items() if k not in ("system", "uploaded")}
-        json.dump({"configuration": config, "turns": rows}, f,
+        json.dump({"configuration": config, "turns": rows, "history": history}, f,
                   ensure_ascii=False, indent=1)
     return 0
+
+
+def replay(args):
+    with open(args.replay, encoding="utf-8") as f:
+        report = json.load(f)
+    history = report.get("history")
+    if not history:
+        print(f"{args.replay} keeps no history (written before --replay existed)", file=sys.stderr)
+        return 2
+    last_user = max(i for i, m in enumerate(history) if m.get("role") == "user")
+    sent = history[:last_user + 1]
+    want = report["turns"][-1]
+    cfg = report["configuration"]
+    for key in ("think", "max_tokens", "plain", "reasoning_effort", "tools"):
+        if key in cfg:
+            setattr(args, key, cfg[key])
+    args.turn_index = sum(1 for m in sent if m.get("role") == "user") - 1
+    if args.surface == "webui":
+        args.session = http(args.url + "/api/sessions", {}).get("sessionId")
+    t0 = time.time()
+    msg, prompt, reused, completion = run_turn(args, sent, None)
+    got, expected = msg.get("content", ""), want.get("answer", "")
+    same = got == expected
+    first = next((i for i in range(min(len(got), len(expected))) if got[i] != expected[i]), min(len(got), len(expected)))
+    print(f"replay of turn {want['turn']} ({len(sent)} messages): prompt={prompt} reused={reused} completion={completion} "
+          f"elapsedSec={time.time() - t0:.1f}; reply {'IDENTICAL to' if same else f'differs at character {first} from'} "
+          f"the cached run's ({len(got)} vs {len(expected)} characters)", flush=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump({"replayOf": os.path.abspath(args.replay), "turn": want["turn"], "prompt": prompt, "reused": reused,
+                   "completion": completion, "identical": same, "firstDifference": None if same else first,
+                   "answer": got, "cachedAnswer": expected}, f, ensure_ascii=False, indent=1)
+    return 0 if same else 1
 
 
 if __name__ == "__main__":

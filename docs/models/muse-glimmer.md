@@ -5,17 +5,17 @@
 | Property | Value |
 |---|---|
 | GGUF architecture key | `muse-glimmer` (also `muse_glimmer`) |
-| Source class | [`MuseGlimmerModel`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.cs) (single-sequence) |
-| Speculative drafter | [`MuseGlimmerModel.DFlash.cs`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.DFlash.cs) + [`DFlashConfig`](../../TensorSharp.Models/Speculative/DFlashConfig.cs) |
-| Vision encoder | [`MuseGlimmerVisionEncoder`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerVisionEncoder.cs) |
+| Source class | [`MuseGlimmerRuntimeModel`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerRuntimeModel.cs) on the [shared decoder runtime](../design/unified-execution.md) (since 2026-11; [the migration](../design/muse-glimmer-unified.md)) |
+| Speculative drafter | the runtime's shared block drafter ([`StandardDecoderModel.BlockDraft.cs`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.BlockDraft.cs)) + [`DFlashConfig`](../../TensorSharp.Models/Speculative/DFlashConfig.cs); n-gram needs no drafter |
+| Vision encoder | [`MuseGlimmerVisionTower`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerVisionTower.cs) (graph programs on every executor, shared with Muse Spark) |
 | Image processor | [`MuseGlimmerImageProcessor`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerImageProcessor.cs) |
 | Example models | Muse-Glimmer-30B |
 | Modalities | Text, image |
 | Thinking mode | Yes (the chat template emits an `assistant to=self` reasoning channel) |
 | Tool calling | Yes (ATEM XML markup in the chat template); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
-| Batched / paged forward | No (single-sequence) |
-| Fused whole-model kernel | GGML CUDA / Vulkan / Metal / CPU (persistent decode graph on all four) |
-| Tensor parallelism | Yes — GGML CUDA / Vulkan, `--tp 2` max (the 30B has 2 KV heads) |
+| Batched forward, continuous batching | Yes (the runtime's unified step: per-request slots, the prefix cache, checkpoints and checkpoint files) |
+| Whole-step graphs | GGML CUDA / Vulkan / Metal / CPU, MLX, direct CUDA (`--backend cuda`); the managed CPU per op |
+| Tensor parallelism | Yes — `--tp 2` max (the 30B has 2 KV heads), per-rank graphs on GGML CUDA / Vulkan; `--layer-split N` and hybrid TP x layer split on the runtime's placements |
 
 ## Quick start
 
@@ -36,11 +36,17 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
   --draft-model models/dflash-kquant.gguf \
   --spec-draft 15 --input prompt.txt --backend ggml_cuda
+
+# n-gram speculation without a drafter (strongest where the answer quotes its prompt)
+dotnet run --project TensorSharp.Cli -c Release -- \
+  --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
+  --spec --spec-type ngram --input prompt.txt --backend ggml_metal
 ```
 
-`--draft-model` can also be supplied as `TS_SPEC_DRAFT_MODEL`. Speculation
-on this model needs that drafter: without it, `--spec` (the weight-free n-gram
-drafter included) serves standard decode.
+`--draft-model` can also be supplied as `TS_SPEC_DRAFT_MODEL`. Without a
+drafter, `--spec --spec-type ngram` drafts by suffix match over the context
+(strong when the answer quotes its prompt). The drafter is declined under
+`--tp` (the CLI warns and decodes plainly; the server exits 2).
 
 ### Structured output
 
@@ -66,6 +72,39 @@ RTX PRO 6000): 38/45, and every answer header written (41) was `to=user<|message
 The seven failures all ended at `max_tokens` 256: the reasoning restates the
 prompt before it answers, and Muse-Glimmer declares no thinking-budget end
 token that could close it early.
+
+## The shared decoder runtime (since 2026-11)
+
+Muse-Glimmer runs on the [shared decoder runtime](../design/unified-execution.md) (`MuseGlimmerRuntimeModel`), like
+Qwen 3.5 and LFM3; the legacy model and its native graphs were deleted once it had moved (2026-11-20). The migration and its
+evidence are in [docs/design/muse-glimmer-unified.md](../design/muse-glimmer-unified.md). What it brings:
+
+* **Every placement and executor:** one device on GGML CUDA / Vulkan / Metal / CPU, MLX and direct CUDA (`--backend cuda`,
+  whole-step graphs where legacy ran per op), `--tp 2`, `--layer-split N` and hybrid placements.
+* **Serving:** continuous batching (concurrent requests in one step instead of taking turns), the Radix prefix cache with
+  exact-token reuse (also across an image span), prompt-end checkpoints and checkpoint files that survive a restart.
+* **Speculation** through the shared layer: DFlash with its `dflash-kquant.gguf` drafter (with batching too; 7 drafts and no
+  confidence gate on ggml_metal, the drafter's whole block on MLX), and n-gram without any drafter.
+* **Memory:** the 39 sliding-window layers keep rings of 2560 cells (window 2048 plus a 512-row prompt step), where legacy
+  kept 4352 rows; prompt steps carry at most 512 rows a sequence. On MLX the steps carry 1024 rows over 3072-cell rings:
+  prefill 5.0-5.4% faster at 4K-16K, decode unchanged, peak wired still under legacy's. So do they on direct CUDA (one
+  GPU): prefill 1.25x at 4K and 1.22x at 16K (UD-IQ2_XXS; 1.26x / 1.23x on UD-Q4_K_XL), decode unchanged, every scenario's
+  peak VRAM within legacy's +5% (a server holding a 4K prompt the closest, +2.9-4.7%).
+
+Measured on an M5 Pro (48 GB), UD-IQ2_XXS unless noted, the runtime against the legacy model in one binary (ABBA):
+
+| Backend | prefill 512 / 4K / 16K (tok/s) | decode at 512 / 4K / 16K | real generation (CLI, 93-token prompt x 512) | peak memory |
+|---|---|---|---|---|
+| ggml_metal | 401 / 392 / 369 (legacy 399 / 385 / 355) | 21.5 / 21.2 / 19.9 (legacy 21.4 / 21.2 / 19.8) | TTFT 415 ms (423), 21.8 tok/s (21.8) | 13.8-15.0 GB wired (15.9-17.0) |
+| ggml_metal, UD-Q4_K_XL | 401 / 387 / 367 (391 / 375 / 357) | 18.0 / 17.5 / 16.9 (17.9 / 17.5 / 16.8) | 383 ms (418), 18.0 tok/s (17.9) | 19.2-19.6 GB (20.1-21.3) |
+| MLX | 439 / 416 / 414 (425 / 396 / 372) | 21.2 / 20.4 / 19.9 (20.5 / 19.5 / 17.8) | 375 ms (456), 21.4 tok/s (20.7) | 15.9-18.3 GB (16.0-19.9) |
+| ggml_cpu | 8.7 / 8.6 / - (8.6 / 8.5 / -) | 6.8 / 6.5 / - (6.9 / 6.2-6.7 / -) | 10.8 s (11.0 s), 6.9 tok/s (6.8) | 13.4 GB resident (21.8) |
+
+On ggml_cuda (RTX PRO 4500) the runtime prefilled 3.6-28% and decoded 2.8-7.0% faster than legacy on both UD quants, and
+18-22% faster on ggml_vulkan; direct CUDA, which legacy ran per op, prefills 3.4-13x and decodes 2.1-3.7x faster. The
+quality gates (llama.cpp parity, perplexity within 0.06% of legacy on every backend, teacher-forced probes across the
+rings' wrap) are in the design document. Sections 2-6 below keep their history: their performance figures and engineering
+notes describe the legacy model they were measured on, and the files, classes and switches they name were deleted with it.
 
 ## 1. Text architecture
 
@@ -109,6 +148,17 @@ approximation), learned 32x32 position embedding.
   merged tokens), then the image is resized to `grid * 28` px with a
   Pillow-compatible **Lanczos-3** filter and normalized with the mmproj's
   `image_mean` / `image_std` (0.5 / 0.5).
+* **Position grid read transposed.** The learned 32x32 table is bilinearly
+  resampled (half-pixel centres) to the grid with its axes swapped, then read in
+  raster order: patch `t` of a `gridW x gridH` grid takes the table's row
+  `t / gridH` (that axis stretched over `gridW`) and column `t % gridH`. The model
+  was trained so (the reference feeds `grid_sample` a `meshgrid(..., indexing="xy")`);
+  HF transformers (#50847) and llama.cpp (#32433, since d3c3e242c) read it this way.
+  Square grids are unaffected; the untransposed order is wrong on every other grid.
+  A tap that falls off the table weighs nothing (the reference's `grid_sample`
+  zero padding, which transformers, vLLM and SGLang reproduce). That matters only
+  where a side has more than 32 patches (above 448 px): llama.cpp's clamped
+  `ggml_interpolate` gives those edge patches the full edge row instead.
 * **Sparse window attention.** Patches are permuted into 32x32 windows (the
   window side is `sqrt(position_embd_rows)`), edge windows clipped. Layers where
   `(il + 1) % 4 == 0` or `il == n_layer - 1` attend globally; the rest attend
@@ -664,7 +714,7 @@ Muse-Glimmer that runs the fused kernel and the ring on any GPU lane),
   default chunk, which covers the engine's 16-token live-cache rewind. A deeper one is refused
   — `CanTruncateKVCache`/`TryTruncateKVCache` say no and the turn re-prefills,
   `TruncateKVCache` throws. An unwrapped ring, a uniform cache and a drop to 0
-  rewind to any depth, as before (`KvBlockTransferRingTests`).
+  rewind to any depth, as before (tests removed with the legacy model in S9).
 * **Prefix reuse across requests** goes through the Radix prefix cache (the
   default mode) as a page family: cached KV blocks plus the resident primary
   cache (`MuseGlimmerModel.PrefixCache.cs`). A rewind of the resident cache is
@@ -742,16 +792,16 @@ layer's per-rank caches), so multi-turn reuse there works as it does on one GPU.
 
 ## 7. Environment variables
 
+The legacy model's switches (`TS_MUSE_GLIMMER_PREFILL_CHUNK`, `TS_MUSE_GLIMMER_SWA_RING`, `TS_MUSE_GLIMMER_SWA_ROWS`,
+`TS_MUSE_GLIMMER_LAYER_TRACE` with `_POS` / `_N` / `_DIR`, `TS_MUSE_GLIMMER_VENC_TRACE`, `TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`
+and `TS_MLX_KV_MATERIALIZE_INTERVAL`) were removed with it: the shared decoder runtime sizes its rings and prompt steps
+itself (below), and setting one of them stops the CLI and the server at startup with a message that names what to use
+instead (the probe `eng/validation/MuseGlimmerKvGrowProbe` and `TS_GGML_NODE_PROFILE` for the traces).
+
 | Variable | Effect |
 |---|---|
-| `TS_MUSE_GLIMMER_VENC_TRACE` | `1` = per-stage checksums of the vision residual stream |
-| `TS_MUSE_GLIMMER_LAYER_TRACE` | `1` = residual checksum entering every layer (fused and per-op emit the same format, so diffing localizes a divergence to a layer) |
-| `TS_MUSE_GLIMMER_LAYER_TRACE_POS` / `_N` / `_DIR` | first traced position / how many forwards / raw F32 dump dir |
-| `TS_MLX_EVAL_EVERY_N_LAYERS` | MLX per-op lazy-graph flush interval (Muse-Glimmer default 4, `0` disables) |
-| `TS_PREFILL_CHUNK` | Prompt chunk size for `ForwardRefill` (default 2048) |
-| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | Tokens per prefill forward (default 2048, `0` disables chunking) |
-| `TS_MUSE_GLIMMER_SWA_RING` | `0` = size every layer for the full context instead of ringing the SWA layers (GPU backends; GgmlCpu is always uniform) |
-| `TS_MUSE_GLIMMER_SWA_ROWS` | Override the SWA ring size in rows (diagnostics) |
-| `TS_DFLASH_PREFILL_CHUNK` | Tokens per **trunk** forward while a DFlash prefill catches the drafter up (default 1024) |
+| `TS_PREFILL_CHUNK` | Prompt chunk size for `ForwardRefill` (default 2048); a chunk still runs in prompt steps of at most 512 rows a sequence on the sliding-window rings (1024 on MLX and direct CUDA) |
+| `TS_MLX_EVAL_EVERY_N_LAYERS` | MLX layer-boundary `async_eval` cadence (the runtime's default) |
+| `TS_DFLASH_*` | the shared DFlash drafter's knobs (see [speculative decoding](../speculative_decoding.md)) |
 | `TS_KV_FATTN_COPY` | `0` = never materialize a padded KV window (reproduces the ggml-cuda flash-attention **vec** fault); `force` = always materialize it |
 | `TS_GGML_CPU_THREADS` | Thread count of the shared ggml CPU backend's prompt pool, and of its decode pool too when set alone (default: all physical cores, all but one on an Apple CPU with performance and efficiency cores; decode steps there run on all but two, `TS_GGML_CPU_DECODE_THREADS`: see the [env var matrix](../env_var_feature_matrix.md)) |

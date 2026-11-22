@@ -144,6 +144,11 @@ namespace TensorSharp.Graph
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>
         protected abstract Tensor QuantizedMatMul(IGraphWeight weight, Tensor x);
 
+        /// <summary>While a compiled program runs: its block-format products keep their activations in F32
+        /// (<see cref="GraphProgram.FloatProducts"/>). An executor whose products would round them reads it in
+        /// <see cref="QuantizedMatMul"/>.</summary>
+        protected bool FloatProducts { get; private set; }
+
         /// <summary>The managed product of a weight's host blocks with host rows (x [rows, Ne0] -> [rows, Ne1]),
         /// registered by the assembly that holds the managed kernels. A backend without a kernel for a weight's
         /// format runs it through here, as its per-op path does.</summary>
@@ -1247,6 +1252,8 @@ namespace TensorSharp.Graph
                 return _x.OnBackendThread(() =>
                 {
                     var session = new Session(_x, _dead, _x.LivenessOf(_program));
+                    bool floatProducts = _x.FloatProducts;
+                    _x.FloatProducts = _program.FloatProducts;
                     try
                     {
                         int node = 0;
@@ -1275,6 +1282,7 @@ namespace TensorSharp.Graph
                     }
                     finally
                     {
+                        _x.FloatProducts = floatProducts;
                         session.Dispose();
                     }
                 });
@@ -2660,46 +2668,52 @@ namespace TensorSharp.Graph
             long cols = x.Sizes[^1], rows = x.ElementCount() / cols;
             float[] v = x.GetElementsAsFloat((int)x.ElementCount());
             var picked = new int[rows * k];
-            if (k <= TopKSelectMaxPicks)
-            {
-                var best = new float[k];
-                for (long r = 0; r < rows; r++)
-                {
-                    long b = r * cols;
-                    Span<int> ids = picked.AsSpan((int)(r * k), k);
-                    int count = 0;
-                    for (int c = 0; c < cols; c++)
-                    {
-                        float value = v[b + c];
-                        // CompareTo orders NaN below every number, as the sort did; an equal value ranks after the earlier index.
-                        if (count == k && value.CompareTo(best[k - 1]) <= 0) continue;
-                        int at = count < k ? count : k - 1;
-                        while (at > 0 && value.CompareTo(best[at - 1]) > 0)
-                        {
-                            best[at] = best[at - 1];
-                            ids[at] = ids[at - 1];
-                            at--;
-                        }
-                        best[at] = value;
-                        ids[at] = c;
-                        if (count < k) count++;
-                    }
-                }
-                return new Value { Tensor = IntTensor(picked, Sizes(stackalloc long[] { k, rows }), run), Ints = picked };
-            }
-            var order = new int[cols];
-            for (long r = 0; r < rows; r++)
-            {
-                for (int c = 0; c < cols; c++) order[c] = c;
-                long b = r * cols;
-                Array.Sort(order, (i, j) => v[b + j].CompareTo(v[b + i]) is var cmp && cmp != 0 ? cmp : i.CompareTo(j));
-                Array.Copy(order, 0, picked, r * k, k);
-            }
+            TopKRows(v, rows, cols, k, picked);
             return new Value { Tensor = IntTensor(picked, Sizes(stackalloc long[] { k, rows }), run), Ints = picked };
         }
 
-        /// <summary>Picks <see cref="TopK"/> selects in one pass over a row; more sort the row.</summary>
-        private const int TopKSelectMaxPicks = 64;
+        /// <summary>Picks up to which a row is selected in one pass rather than sorted whole.</summary>
+        internal const int TopKSelectionMax = 64;
+
+        /// <summary>
+        /// Each row's <paramref name="k"/> largest values' columns into <paramref name="picked"/> [rows, k], largest first, a tie to
+        /// the lower column (float.CompareTo's order: a NaN below every number). Up to <see cref="TopKSelectionMax"/> picks a row is
+        /// one pass keeping the picks in order, the same columns a whole sort gives: the MLX executor's plain DFlash drafts (one pick
+        /// over a 202,048-token vocabulary, 15 rows a block) sorted each row with a comparer, about 300 ms a block on an M5 Pro.
+        /// </summary>
+        internal static void TopKRows(float[] v, long rows, long cols, int k, int[] picked)
+        {
+            if (k > TopKSelectionMax)
+            {
+                var order = new int[cols];
+                for (long r = 0; r < rows; r++)
+                {
+                    for (int c = 0; c < cols; c++) order[c] = c;
+                    long b = r * cols;
+                    Array.Sort(order, (i, j) => v[b + j].CompareTo(v[b + i]) is var cmp && cmp != 0 ? cmp : i.CompareTo(j));
+                    Array.Copy(order, 0, picked, r * k, k);
+                }
+                return;
+            }
+            for (long r = 0; r < rows; r++)
+            {
+                long b = r * cols, at = r * k;
+                int held = 0;
+                for (int c = 0; c < cols; c++)
+                {
+                    float value = v[b + c];
+                    // A later column ranks above a kept one only by a larger value (ties keep the lower column).
+                    if (held == k && value.CompareTo(v[b + picked[at + k - 1]]) <= 0) continue;
+                    int i = held < k ? held++ : k - 1;
+                    while (i > 0 && value.CompareTo(v[b + picked[at + i - 1]]) > 0)
+                    {
+                        picked[at + i] = picked[at + i - 1];
+                        i--;
+                    }
+                    picked[at + i] = c;
+                }
+            }
+        }
 
         /// <summary>ggml's rotary over x [d, heads, tokens] at positions [tokens] (multi-axis: [4 * tokens],
         /// axis-major); ip = dims, mode, n_ctx_orig[, sections]; fp = base, freq_scale, ext_factor,

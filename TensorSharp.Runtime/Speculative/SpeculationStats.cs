@@ -107,5 +107,19 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>False when the step ran as a plain single-token decode.</summary>
         public bool UsedSpeculation { get; init; }
+
+        /// <summary>The verify forward's tokens on a speculative step, in the shape the trunk verified them: the token the
+        /// step started from, then every draft (accepted or not). Null on a plain step. Tests recompute the target's rows over
+        /// it.</summary>
+        public int[]? VerifiedWindow { get; init; }
+
+        /// <summary>The verify forward's rows on a speculative step, where the trunk returned them: [window rows x vocab]
+        /// logits, row r the target's products for the token after window token r. The executor's buffer, valid until its
+        /// next step. Null where the trunk drew each row on the device (<see cref="VerifiedDraws"/>) or on a plain step. Tests
+        /// read the row that drew a token.</summary>
+        public float[]? VerifiedLogits { get; init; }
+
+        /// <summary>The verify forward's per-row argmax, where the trunk drew each row on the device; null otherwise.</summary>
+        public int[]? VerifiedDraws { get; init; }
     }
 }

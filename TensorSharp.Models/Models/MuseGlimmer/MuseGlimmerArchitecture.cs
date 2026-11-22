@@ -11,26 +11,26 @@ namespace TensorSharp.Models
     /// <summary>Muse-Glimmer architecture plug-in.</summary>
     internal static class MuseGlimmerArchitecture
     {
+        /// <summary>
+        /// The family on the shared decoder runtime (<see cref="MuseGlimmerRuntimeModel"/>), which <see cref="Descriptor"/>'s factory
+        /// builds: every placement (one device, --tp, whole-layer stages, their hybrid), continuous batching, the prefix cache and
+        /// checkpoints, DFlash and n-gram speculation, images. Tests and the KV-grow probe build it here from a GGUF. (The legacy
+        /// model it replaced in stage S8 of docs/design/muse-glimmer-unified.md was deleted in S9.)
+        /// </summary>
+        internal static ModelBase CreateRuntimeModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1, string draftModelPath = null)
+            => new MuseGlimmerRuntimeModel(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
+
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
             Id = "muse-glimmer",
             DisplayName = "Muse-Glimmer",
             Aliases = new[] { "muse-glimmer", "muse_glimmer" },
-            Factory = c => new MuseGlimmerModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
+            // The shared decoder runtime serves every placement on every backend: one device, --tp (2 KV heads, so at most 2),
+            // whole-layer stages, their hybrid; continuous batching, the prefix cache, DFlash and n-gram speculation, images.
+            Factory = c => CreateRuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
             ProjectorFileHints = new[] { "*mmproj*Muse*Glimmer*.gguf" },
-            Serving = new ServingContract
-            {
-                Implementation = ServingImplementation.Bespoke,
-                HasRoutedExperts = false,
-                ContinuousBatching = MechanismSupport.None(
-                    "Muse-Glimmer has no batched forward; concurrent requests take turns through the per-sequence KV swap."),
-                TensorParallel = MechanismSupport.On(ServingBackends.GgmlMultiDevice)
-                    .When((tp, _) => tp <= 2 ? null : "Muse-Glimmer has 2 KV heads, so --tp is at most 2.")
-                    .ElsewhereGap("Muse-Glimmer tensor parallelism runs on ggml_cuda or ggml_vulkan only."),
-                LayerSplit = MechanismSupport.None("Muse-Glimmer does not implement whole-layer placement; use --tp 2."),
-                HybridParallel = MechanismSupport.None("Muse-Glimmer does not implement whole-layer placement, so it cannot combine it with --tp."),
-                ExpertOffload = MechanismSupport.NotApplicable("dense: no routed experts"),
-            },
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
         };
     }
 }

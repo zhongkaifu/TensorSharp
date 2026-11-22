@@ -320,13 +320,23 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image,
             // 32 for the same reason as Qwen3.8 27B: a dense 15.9 GB read for every token
             // beside the app. MEASURED in the Mac app (M5 Pro, ggml_metal, chat-e2e.py's
-            // seven scenarios): footprint 10.9 GB at its highest, about 8 GB of it the
-            // vision tower, which loads whenever its file is installed.
+            // seven scenarios): footprint 10.9 GB at its highest (2026-09-30, the legacy model).
+            // Re-measured 2026-11-20 on the shared decoder runtime, the entry's settings, beside
+            // the legacy model in the same session: footprint 13.4 GB at its highest (legacy
+            // 12.7), system wired 22.5 GB (legacy 26.6); the vision tower loads whenever its file
+            // is installed. The 0.7 GB more footprint is ggml-metal buffers (vmmap's "shared
+            // memory", +0.6 GB dirty, +91 buffers after an image turn): the graph tower keeps its
+            // programs' compute for replay (0.26-0.38 GB for chat-e2e's 1350-row image by its sizing), with
+            // the runtime's step graphs; the caches are small (2 KV heads: 54 MB of rings). The
+            // legacy per-op tower wired 4-5 GB more during an image, outside its footprint, so the
+            // app causes less memory on the runtime.
             MinDeviceMemoryGB = 32,
             ContextLength = 32768,
             // q8_0 MEASURED on ggml_metal: a 1,542-word answer (2,404 tokens) that grew the
             // full-attention layers past 8,192 rows mid-reply came out clean, at 17.0 tok/s
-            // against the CLI's 17.2.
+            // against the CLI's 17.2. On the runtime (2026-11-20) the story turn decodes at 17.0
+            // tok/s (legacy 17.1), and a new chat reuses 99.7% of its prompt (legacy 62%: its
+            // ring capped reuse at 4,352 tokens), first token 0.8 s against 8.2 s.
             KvCacheDtype = "q8_0",
             LeanCaches = true,
             // The model card's recommendation (the GGUF carries no sampling metadata).

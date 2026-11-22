@@ -311,7 +311,7 @@ speculator). Speculation engages only for solo (non-concurrent) sequences and on
 where the model declares it profitable, which is decided per model: Qwen
 3.5/3.6/3.8 and GLM 5.2 / GLM-5.3 on every backend, GLM-5.3-Flash (n-gram only)
 where its KDA rollback is available, Gemma 4 on the ggml backends and `cuda`, Qwen
-3.8 Flash Next on every backend it loads on, DeepSeek V4 / V4.1 and Muse-Glimmer
+3.8 Flash Next on every backend it loads on, Muse-Glimmer on every backend, DeepSeek V4 / V4.1
 only with their drafter loaded. Nemotron-H refuses every speculator, and GPT OSS,
 Mistral 3 and Hunyuan Dense have no speculative trunk, so not even
 n-gram runs there. They are not registered in `EnvVarMatrix.All` and are not
@@ -341,19 +341,17 @@ speculation algorithm and speculator weights — is documented in
 
 ## Out-of-Matrix Muse-Glimmer & DFlash Knobs
 
-Muse-Glimmer's fused whole-model kernel and its DFlash block drafter each have an
-A/B switch, plus long-context sizing knobs. None are registered in
-`EnvVarMatrix.All`. The full list, including the layer-trace knobs, is in the
-[Muse-Glimmer card](models/muse-glimmer.md#7-environment-variables).
+The DFlash block drafter's knobs below are read by the shared drafter; none are registered in `EnvVarMatrix.All`. The
+legacy Muse-Glimmer model's switches (`TS_MUSE_GLIMMER_PREFILL_CHUNK`, `_SWA_RING`, `_SWA_ROWS`, the layer and vision
+traces, `TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`, `TS_MLX_KV_MATERIALIZE_INTERVAL`) were removed with it in 2026-11: setting one
+stops the server or CLI at startup with a message naming the replacement (`RemovedEnvironmentVariables` in
+`TensorSharp.Runtime/RemovedCliFlags.cs`); see the [Muse-Glimmer card](models/muse-glimmer.md#7-environment-variables).
 `TS_DFLASH_BATCHED_INJECT` was removed in 2026-11 and now stops the server or CLI at startup: it was read only by a
 ggml_cuda deferred inject that nothing started. A batched speculative step drafts every request's block in one program and
 writes every request's ring catch-up in one, wherever the drafter runs as graph programs.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | Muse-Glimmer | Tokens per prefill forward; `0` disables chunking | `2048` | not registered | no |
-| `TS_MUSE_GLIMMER_SWA_RING` | Muse-Glimmer (fused) | Ring the 39 sliding-window layers at `pad(n_swa + chunk + 1, 256)` rows instead of sizing every layer for the full context | ON | not registered | no |
-| `TS_MUSE_GLIMMER_SWA_ROWS` | Muse-Glimmer (fused) | Override the SWA ring size in rows (diagnostics) | auto | not registered | no |
 | `TS_DFLASH_PREFILL_CHUNK` | any DFlash drafter | Tokens per speculative prefill forward (drives the TRUNK, not only the drafter) | `1024`, capped by the drafter ring and the trunk's own window | not registered | no |
 | `TS_DFLASH_SELECTOR` | DFlash2 drafter | `0` drafts by per-position argmax instead of the candidate lattice (attribution only - the weights were trained with it) | ON | not registered | no |
 | `TS_DFLASH_CONV` | DFlash2 drafter | `0` drops the grouped dynamic convolution (attribution only, as above) | ON | not registered | no |

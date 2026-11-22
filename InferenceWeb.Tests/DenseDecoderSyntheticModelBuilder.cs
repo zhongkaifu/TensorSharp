@@ -56,6 +56,11 @@ public sealed class DenseDecoderSyntheticModelBuilder
     /// <summary>Store one layer's matrices as F16 while all other weights remain F32.</summary>
     public int? HalfPrecisionLayer { get; init; }
 
+    /// <summary>Add the "sandwich" block norms every layer's attention and feed-forward outputs take before the residual
+    /// add (<c>post_attention_norm.weight</c>, <c>post_ffw_norm.weight</c>), which a family declares through
+    /// <c>MixerPostNormWeight</c> / <c>FfnPostNormWeight</c>.</summary>
+    public bool IncludePostNorms { get; init; }
+
     /// <summary>
     /// Rewrite tensors before they are written (a LoRA test's merged-weights twin): called
     /// with each GGUF tensor name and its values as the file would store them (an F16 layer's
@@ -138,6 +143,11 @@ public sealed class DenseDecoderSyntheticModelBuilder
             t.Add(Gen(p + "ffn_gate.weight", 0.08f, Hidden, FfnLength));
             t.Add(Gen(p + "ffn_up.weight", 0.08f, Hidden, FfnLength));
             t.Add(Gen(p + "ffn_down.weight", 0.08f, FfnLength, Hidden));
+            if (IncludePostNorms)
+            {
+                t.Add(Gen(p + "post_attention_norm.weight", 0.2f, Hidden, offset: 1f));
+                t.Add(Gen(p + "post_ffw_norm.weight", 0.2f, Hidden, offset: 1f));
+            }
         }
         return t;
     }

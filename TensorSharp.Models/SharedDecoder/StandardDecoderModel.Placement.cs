@@ -83,6 +83,7 @@ namespace TensorSharp.Models
                     throw new InvalidOperationException($"Tensor parallelism needs a group of {tp} devices.");
                 _mesh = new DeviceMesh(1, tp, d => _tpGroup.GetAllocator(d), _tpGroup, null);
                 _rankGraphs = RankGraphsServe(tp);
+                _rankSumsCrossHost = _rankGraphs && ExecutorFor(_mesh.Allocator(0, 0)) is IRankedGraphExecutor ranked && ranked.RanksSumOnHost(tp);
                 if (_rankGraphs)
                 {
                     // A streaming executor sums each partial as the last rank hands it in; a compiling one (GGML) runs
@@ -116,6 +117,13 @@ namespace TensorSharp.Models
 
         /// <summary>Whether this model's tensor-parallel steps run as per-rank graphs (see <see cref="_rankGraphs"/>).</summary>
         protected bool RankGraphs => _rankGraphs;
+
+        /// <summary>Per-rank graphs whose all-reduces go through host memory (<see cref="IRankedGraphExecutor.RanksSumOnHost"/>):
+        /// every step pays a host round trip a reduction, two a layer.</summary>
+        private bool _rankSumsCrossHost;
+
+        /// <summary>Whether this placement's per-rank sums cross the host (see <see cref="_rankSumsCrossHost"/>).</summary>
+        internal bool RankSumsCrossHost => _rankSumsCrossHost;
 
         /// <summary>Whether the family's lowering traces one rank's shard (its local heads, sharded weights and per-rank
         /// state); default: families without recurrent layers, whose blocks the runtime emits.</summary>
@@ -341,7 +349,8 @@ namespace TensorSharp.Models
         /// Per-rank graphs: each rank keeps a contiguous slice of the untied head's vocabulary rows, so every rank scores
         /// its share of the vocabulary at once and the host joins the slices. Rank 0 ran the whole head: on Qwen3.5-9B
         /// `--tp 2` that was ~1.9 ms of a ~11 ms decode step (2x A40), the main gap to Qwen35Model, which split it the
-        /// same way. The whole head stays for the draft heads and the per-op path; a tied head (the embedding) is not
+        /// same way. The whole head stays for the draft heads, the all-row logits of verify steps and the per-op path (on
+        /// the host until one of them runs, <see cref="PrepareRankGraphResidency"/>); a tied head (the embedding) is not
         /// split.
         /// </summary>
         private unsafe void ShardHeadByVocab()
@@ -530,6 +539,13 @@ namespace TensorSharp.Models
         /// executor finds a weight under its own allocator); the head stays on rank 0, which runs it. Host copies of the
         /// replicated weights are kept (the per-op embedding and sampling read them); the shards' are released.
         /// </summary>
+        /// <remarks>
+        /// Where every rank holds its vocabulary slice of the head (<see cref="ShardHeadByVocab"/>), the whole head is not
+        /// preloaded: the slices score every step's last rows. Its other readers (the all-row logits of a speculative
+        /// verify step, a draft model's head, the per-op path) bind it on rank 0 from the kept host copy when they first
+        /// run, so they pay its device copy only when they are used. A draft layer in the model reads it every draft step,
+        /// so with one the whole head stays resident.
+        /// </remarks>
         private void PrepareRankGraphResidency()
         {
             bool ggml = _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
@@ -568,10 +584,12 @@ namespace TensorSharp.Models
                 }
             else
                 _mesh.RunPerRank(0, PreloadShards);
+            bool wholeHeadOnHost = WholeHeadStaysOnHost;
             foreach (var kv in _quantWeights)
             {
                 QuantizedWeight weight = kv.Value;
                 if (!weight.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key) || kv.Key == "token_embd.weight") continue;
+                if (wholeHeadOnHost && kv.Key == "output.weight") continue;
                 int holders = IsHeadWeight(kv.Key) ? 1 : ranks;
                 for (int r = 0; r < holders; r++)
                 {
@@ -587,6 +605,9 @@ namespace TensorSharp.Models
             for (int r = 0; r < bytes.Length; r++)
                 Console.WriteLine($"  Rank {r}: {bytes[r] / 1024 / 1024} MB of quantized weights resident.");
         }
+
+        /// <summary>Per-rank graphs leave the whole untied head on the host (see <see cref="PrepareRankGraphResidency"/>).</summary>
+        internal bool WholeHeadStaysOnHost => _rankGraphs && _vocabHeadRows != null && DraftLayerCount <= 0;
 
         private static bool Preload(QuantizedWeight weight, IAllocator allocator, bool ggml)
         {

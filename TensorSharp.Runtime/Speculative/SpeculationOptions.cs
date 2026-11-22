@@ -62,6 +62,12 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         public float? MinDraftProb { get; init; }
 
+        /// <summary>
+        /// Tests: the cost governor measures nothing and never parks the drafter (TS_SPEC_ADAPTIVE=0 without the process
+        /// environment), so an engine test's drafts do not depend on how long its steps took on the machine. No host sets it.
+        /// </summary>
+        internal bool GovernorDisabledForTests { get; init; }
+
         /// <summary>Default draft window: 8. A confidence gate stops drafting at
         /// the first low-confidence token, so a longer window only extends
         /// confident streaks - measured 1.21x vs 1.08x (window 4) on

@@ -1819,7 +1819,7 @@ namespace TensorSharp.Models
                 int logits = EmitLogits(step, step.MatMul(headName, final), rows);
                 outputs.Logits = request.GreedyIds
                     ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), rows)
-                    : step.Output(logits, (long)Config.VocabSize * rows);
+                    : step.Output(EmitLogitTransform(step, logits), (long)Config.VocabSize * rows);
             }
             else if (request.LastRowLogits || request.LastRowHidden)
             {
@@ -1840,13 +1840,30 @@ namespace TensorSharp.Models
                 int logits = EmitLogits(step, step.MatMul(headName, selected), n);
                 outputs.Logits = request.GreedyIds
                     ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), n)
-                    : step.Output(logits, (long)Config.VocabSize * n);
+                    : step.Output(EmitLogitTransform(step, logits), (long)Config.VocabSize * n);
             }
         }
 
         /// <summary>What a family applies to the head's logits [vocab, rows] before they are read or sampled: a final logit
         /// softcap (Inkling 2: 30 tanh(logits / 30)); <paramref name="rows"/> is the logits' columns. Default: nothing.</summary>
         protected virtual int EmitLogits(GraphStep step, int logits, int rows) => logits;
+
+        /// <summary>The head's logit transform over <paramref name="logits"/> (<see cref="LogitScale"/>, then
+        /// <see cref="FinalLogitSoftcap"/>): a scale, then a scale by 1/cap, tanh and a scale by cap, the nodes llama.cpp's graphs
+        /// and the legacy Muse-Glimmer head emit. No nodes for a family without one. A greedy head (<see cref="GreedyHead"/>)
+        /// takes the raw logits: the transform keeps their order.</summary>
+        private int EmitLogitTransform(GraphStep step, int logits)
+        {
+            float scale = LogitScale, cap = FinalLogitSoftcap;
+            if (scale > 0f && scale != 1f)
+                logits = step.Op(GraphOp.Scale, stackalloc[] { logits }, default, stackalloc[] { scale });
+            if (cap > 0f)
+            {
+                logits = step.Op(GraphOp.Scale, stackalloc[] { logits }, default, stackalloc[] { 1f / cap });
+                logits = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Tanh, logits) }, default, stackalloc[] { cap });
+            }
+            return logits;
+        }
 
         /// <summary>A greedy head over <paramref name="logits"/> [vocab, rows] (<see cref="GraphCapabilities.GreedyIdOutputs"/>):
         /// TopK with Ip { 1, 1 }, over the request's suppression mask where it has one.</summary>
@@ -1943,7 +1960,7 @@ namespace TensorSharp.Models
                     : step.Op(GraphOp.GetRows, final, step.ConstantInputI32((int[])last.Clone(), n));
                 if (r == 0 && request.LastRowHidden)
                     outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 ? step.Op(GraphOp.Cont, selected) : selected, (long)hiddenSize * n);
-                outputs.RankLogits[r] = step.Output(step.MatMul(VocabHeadName, selected), (long)_vocabHeadRows[r] * n);
+                outputs.RankLogits[r] = step.Output(EmitLogitTransform(step, step.MatMul(VocabHeadName, selected)), (long)_vocabHeadRows[r] * n);
             }
         }
 
@@ -2323,7 +2340,8 @@ namespace TensorSharp.Models
         /// hidden size where a family keeps hyper-connections).</summary>
         protected virtual int StreamWidth => Config.HiddenSize;
 
-        /// <summary>The residual stream entering the stack from the embedded rows [hidden, rows].</summary>
+        /// <summary>The residual stream entering the stack from the embedded rows [hidden, rows] (media rows already injected).
+        /// A family that changes it declares the per-op twin too (<see cref="ApplyStreamInput"/>).</summary>
         protected virtual int EmitStreamInput(GraphStep step, int embedded) => embedded;
 
         /// <summary>A block's input [hidden, rows] from the stream; <paramref name="context"/> carries what the
@@ -2335,13 +2353,15 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The stream after a block's output [hidden, rows] joins it. Default: the residual add, after the block's
-        /// post-norm where the family has one (<see cref="MixerPostNormWeight"/>, <see cref="FfnPostNormWeight"/>). The normed
+        /// post-norm where the family has one (<see cref="MixerPostNormWeight"/>, <see cref="FfnPostNormWeight"/>, at
+        /// <see cref="PostNormEps"/>). The normed
         /// output is the add's first operand: ggml-metal fuses RMS_NORM + MUL + ADD only when each fused node's first source is
         /// the previous node (llama.cpp's LFM3 graph swapped its adds for that, e574a17b0).</summary>
         protected virtual int EmitBlockOutput(GraphStep step, int layer, int stream, BlockSite site, int context, int output)
         {
             string post = site == BlockSite.Mixer ? MixerPostNormWeight(layer) : FfnPostNormWeight(layer);
-            return post == null ? step.Op(GraphOp.Add, stream, output) : step.Op(GraphOp.Add, step.RmsNorm(output, post), stream);
+            return post == null ? step.Op(GraphOp.Add, stream, output)
+                : step.Op(GraphOp.Add, step.RmsNorm(output, step.Weight(post), PostNormEps(layer, site)), stream);
         }
 
         /// <summary>The head's input [hidden, rows] from the stream. Default: the output norm.</summary>
@@ -2970,6 +2990,15 @@ namespace TensorSharp.Models
         /// <summary>Tests: short chunks attend the bucket window around their length, as before capacity windows.</summary>
         internal bool CapacityWindowsDisabledForTests { get; set; }
 
+        /// <summary>
+        /// Tests and the F32 reference tool (eng/validation/MuseGlimmerF32Reference): the model's step programs keep their
+        /// block-format products' activations in F32 (<see cref="GraphProgram.FloatProducts"/>). On the managed backend each such
+        /// product then multiplies the weight's exactly dequantized values by F32 rows, the arithmetic of a per-op path that
+        /// dequantized its weights at load, instead of the managed kernels' integer dot over quantized activations. Set it before
+        /// the model's first step: a step's program is built with the flag it has then.
+        /// </summary>
+        internal bool FloatProductsForTests { get; set; }
+
         private readonly Dictionary<IAllocator, IGraphExecutor> _graphExecutors = new(ReferenceEqualityComparer.Instance);
 
         /// <summary>The backend's graph executor plugin for the current stage's allocator, or null. An executor that binds
@@ -3025,7 +3054,7 @@ namespace TensorSharp.Models
 
             internal GraphStep(StandardDecoderModel model, int rows, Slot[] slots, int[] first, int[] counts, int[] starts,
                 bool decode, bool snapshots, bool record)
-                : base(record)
+                : base(record, model.FloatProductsForTests)
             {
                 RecurrentSnapshots = snapshots;
                 _m = model;

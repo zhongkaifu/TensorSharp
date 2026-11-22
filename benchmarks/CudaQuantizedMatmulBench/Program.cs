@@ -34,6 +34,12 @@ if (HasArg("--moe-fusion"))
     return 0;
 }
 
+if (HasArg("--dense-rows"))
+{
+    DenseRowsBench.Run(allocator, warmup, iterations);
+    return 0;
+}
+
 if (qwenKernelsOnly)
 {
     DecodeKernelBench.RunQwen(allocator, warmup, iterations);

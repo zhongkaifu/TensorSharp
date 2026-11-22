@@ -5,13 +5,21 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Builds a tiny, deterministic Muse-Glimmer GGUF: four blocks (three sliding-window,
+// Builds a tiny, deterministic Muse-Glimmer GGUF: four blocks by default (three sliding-window,
 // one full NoPE), two KV heads, the attention output gate, the four per-layer norms
 // and a softcapped LM head. Every 2D projection is F16, which the GGML backends store
 // quantized-resident, so the model runs the whole-model fused kernel - and on a GPU
 // backend its sliding-window layers get the ring KV cache - exactly as the 30B does,
 // in milliseconds per forward. Weights come from a name-seeded generator, so two
-// files written with the same options are bit-identical.
+// files written with the same options are bit-identical, and the default options write
+// the bytes they always wrote.
+//
+// The options make the parts of the architecture a reimplementation can get wrong
+// visible in the logits (the frozen legacy goldens, MuseGlimmerGoldens.cs): more blocks
+// (two full layers among the sliding-window ones), a real logit_scale and a head large
+// enough to reach the softcap's curve, a tied head, and small block-output projections,
+// whose RMS is then close enough to the 1e-8 / 1e-5 epsilons for the post norms' epsilon
+// to show.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -34,7 +42,35 @@ public sealed class MuseGlimmerSyntheticModelBuilder
     public int SlidingWindow { get; init; } = 64;
     public int ContextLength { get; init; } = 8192;
 
-    public int VocabSize => ByteTokens;
+    /// <summary>Decoder blocks; with the pattern period of 4, block l is a sliding-window layer when l % 4 &lt; 3.</summary>
+    public int BlockCount { get; init; } = NumBlocks;
+
+    /// <summary>muse-glimmer.logit_scale (the 30B ships 0.19612).</summary>
+    public float LogitScale { get; init; } = 1f;
+
+    /// <summary>muse-glimmer.final_logit_softcapping.</summary>
+    public float Softcap { get; init; } = 20f;
+
+    /// <summary>No output.weight: the head is token_embd.weight.</summary>
+    public bool TiedOutput { get; init; }
+
+    /// <summary>The range of token_embd.weight's values (uniform in [-scale, scale)).</summary>
+    public float EmbeddingScale { get; init; } = 1.0f;
+
+    /// <summary>The range of output.weight's values.</summary>
+    public float HeadScale { get; init; } = 0.08f;
+
+    /// <summary>The range of attn_output.weight's and ffn_down.weight's values: the block outputs the post norms take.</summary>
+    public float BlockOutputScale { get; init; } = 0.08f;
+
+    /// <summary>Three control tokens after the byte tokens, as the 30B's vocabulary has them: <c>&lt;|patch|&gt;</c> (the
+    /// template's image placeholder), <c>&lt;|image_start|&gt;</c> and <c>&lt;|image_end|&gt;</c> (the span the injector
+    /// expands it to).</summary>
+    public bool ImageTokens { get; init; }
+
+    internal static readonly string[] ImageTokenNames = { "<|patch|>", "<|image_start|>", "<|image_end|>" };
+
+    public int VocabSize => ByteTokens + (ImageTokens ? ImageTokenNames.Length : 0);
 
     public string Write(string path)
     {
@@ -51,11 +87,12 @@ public sealed class MuseGlimmerSyntheticModelBuilder
         int kvDim = NumKvHeads * HeadDim;
         var t = new List<(string, ulong[], float[], Kind)>
         {
-            Gen("token_embd.weight", Kind.F16, 1.0f, Hidden, VocabSize),
+            Gen("token_embd.weight", Kind.F16, EmbeddingScale, Hidden, VocabSize),
             Gen("output_norm.weight", Kind.F32, 0.2f, Hidden, offset: 1f),
-            Gen("output.weight", Kind.F16, 0.08f, Hidden, VocabSize),
         };
-        for (int l = 0; l < NumBlocks; l++)
+        if (!TiedOutput)
+            t.Add(Gen("output.weight", Kind.F16, HeadScale, Hidden, VocabSize));
+        for (int l = 0; l < BlockCount; l++)
         {
             string p = $"blk.{l}.";
             t.Add(Gen(p + "attn_norm.weight", Kind.F32, 0.2f, Hidden, offset: 1f));
@@ -65,12 +102,12 @@ public sealed class MuseGlimmerSyntheticModelBuilder
             t.Add(Gen(p + "attn_gate.weight", Kind.F16, 0.08f, Hidden, qDim));
             t.Add(Gen(p + "attn_q_norm.weight", Kind.F32, 0.2f, HeadDim, offset: 1f));
             t.Add(Gen(p + "attn_k_norm.weight", Kind.F32, 0.2f, HeadDim, offset: 1f));
-            t.Add(Gen(p + "attn_output.weight", Kind.F16, 0.08f, qDim, Hidden));
+            t.Add(Gen(p + "attn_output.weight", Kind.F16, BlockOutputScale, qDim, Hidden));
             t.Add(Gen(p + "post_attention_norm.weight", Kind.F32, 0.2f, Hidden, offset: 1f));
             t.Add(Gen(p + "ffn_norm.weight", Kind.F32, 0.2f, Hidden, offset: 1f));
             t.Add(Gen(p + "ffn_gate.weight", Kind.F16, 0.08f, Hidden, FfnLength));
             t.Add(Gen(p + "ffn_up.weight", Kind.F16, 0.08f, Hidden, FfnLength));
-            t.Add(Gen(p + "ffn_down.weight", Kind.F16, 0.08f, FfnLength, Hidden));
+            t.Add(Gen(p + "ffn_down.weight", Kind.F16, BlockOutputScale, FfnLength, Hidden));
             t.Add(Gen(p + "post_ffw_norm.weight", Kind.F32, 0.2f, Hidden, offset: 1f));
         }
         return t;
@@ -102,7 +139,7 @@ public sealed class MuseGlimmerSyntheticModelBuilder
         var kv = new List<(string, Action<BinaryWriter>)>
         {
             ("general.architecture", Str(a)),
-            ($"{a}.block_count", U32(NumBlocks)),
+            ($"{a}.block_count", U32((uint)BlockCount)),
             ($"{a}.context_length", U32((uint)ContextLength)),
             ($"{a}.embedding_length", U32(Hidden)),
             ($"{a}.feed_forward_length", U32(FfnLength)),
@@ -112,8 +149,8 @@ public sealed class MuseGlimmerSyntheticModelBuilder
             ($"{a}.attention.value_length", U32(HeadDim)),
             ($"{a}.rope.freq_base", F32(500000f)),
             ($"{a}.attention.layer_norm_rms_epsilon", F32(1e-5f)),
-            ($"{a}.final_logit_softcapping", F32(20f)),
-            ($"{a}.logit_scale", F32(1f)),
+            ($"{a}.final_logit_softcapping", F32(Softcap)),
+            ($"{a}.logit_scale", F32(LogitScale)),
             ($"{a}.attention.sliding_window", U32((uint)SlidingWindow)),
             ($"{a}.attention.sliding_window_pattern", U32(4)),
         };
@@ -122,6 +159,14 @@ public sealed class MuseGlimmerSyntheticModelBuilder
         foreach (int cp in ByteToUnicode()) tokens.Add(char.ConvertFromUtf32(cp));
         var types = new List<int>();
         for (int i = 0; i < ByteTokens; i++) types.Add(1);
+        if (ImageTokens)
+        {
+            foreach (string name in ImageTokenNames)
+            {
+                tokens.Add(name);
+                types.Add(3);
+            }
+        }
 
         kv.Add(("tokenizer.ggml.model", Str("gpt2")));
         kv.Add(("tokenizer.ggml.pre", Str("llama4")));

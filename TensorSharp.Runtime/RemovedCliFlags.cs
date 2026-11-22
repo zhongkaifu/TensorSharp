@@ -199,7 +199,7 @@ namespace TensorSharp.Runtime
             ("TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS", "every MLX model reads TS_MLX_EVAL_EVERY_N_LAYERS."),
             ("TS_MLX_MUSE_GLIMMER_EVAL_EVERY_N_LAYERS", "every MLX model reads TS_MLX_EVAL_EVERY_N_LAYERS."),
             ("TS_MLX_GEMMA4_LOCAL_KV_MATERIALIZE_INTERVAL", "Gemma 4 reads TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL."),
-            ("TS_MLX_MUSE_GLIMMER_KV_MATERIALIZE", "Muse-Glimmer reads TS_MLX_KV_MATERIALIZE_INTERVAL."),
+            ("TS_MLX_MUSE_GLIMMER_KV_MATERIALIZE", MuseGlimmerLegacyRemoved),
             ("TS_MLX_PIPELINED_DECODE",
                 "the CLI benchmark always uses the pipelined greedy decode where the model supports it."),
             // Switches that turned off a retained (replayed) whole-model graph or its pieces.
@@ -429,6 +429,24 @@ namespace TensorSharp.Runtime
                 + "the F32 override was removed."),
             ("TS_MUSE_GLIMMER_GELU_TANH",
                 "the Muse-Glimmer vision tower always uses the reference erf GELU; the tanh approximation was removed."),
+            // The legacy Muse-Glimmer model (stage S9 of docs/design/muse-glimmer-unified.md): the shared decoder runtime
+            // sizes its rings and prompt steps itself and reads none of these.
+            ("TS_MUSE_GLIMMER_PREFILL_CHUNK",
+                "Muse-Glimmer runs on the shared decoder runtime, whose prompt steps follow TS_SCHED_MAX_BATCHED_TOKENS and its "
+                + "sliding-window rings (512 rows a step); the legacy model's prefill chunk was removed with it."),
+            ("TS_MUSE_GLIMMER_SWA_RING", MuseGlimmerRingsRemoved),
+            ("TS_MUSE_GLIMMER_SWA_ROWS", MuseGlimmerRingsRemoved),
+            ("TS_MUSE_GLIMMER_LAYER_TRACE", MuseGlimmerTraceRemoved),
+            ("TS_MUSE_GLIMMER_LAYER_TRACE_POS", MuseGlimmerTraceRemoved),
+            ("TS_MUSE_GLIMMER_LAYER_TRACE_N", MuseGlimmerTraceRemoved),
+            ("TS_MUSE_GLIMMER_LAYER_TRACE_DIR", MuseGlimmerTraceRemoved),
+            ("TS_MUSE_GLIMMER_VENC_TRACE",
+                "the legacy Muse-Glimmer per-op vision tower that printed the trace was removed; the graph tower runs on every "
+                + "backend and TS_GGML_NODE_PROFILE profiles its GGML programs."),
+            ("TS_MUSE_GLIMMER_MLX_STAGE_PROFILE",
+                "the legacy Muse-Glimmer MLX pipelined decode it profiled was removed; Muse-Glimmer decodes on the shared "
+                + "decoder runtime on MLX too."),
+            ("TS_MLX_KV_MATERIALIZE_INTERVAL", MuseGlimmerLegacyRemoved),
             ("TS_DFLASH_FUSED", DefaultPathSwitchRemoved),
             ("TS_DFLASH_BATCHED_INJECT",
                 "a batched speculative step writes every request's DFlash ring catch-up in one graph program wherever the "
@@ -623,6 +641,18 @@ namespace TensorSharp.Runtime
 
         private const string GptOssSwitchRemoved =
             "GPT-OSS always takes its fused and batched paths where the backend supports them; the switch was removed.";
+
+        private const string MuseGlimmerLegacyRemoved =
+            "Muse-Glimmer runs on the shared decoder runtime on every backend, MLX included; the legacy Muse-Glimmer model "
+            + "that read it was removed.";
+
+        private const string MuseGlimmerRingsRemoved =
+            "Muse-Glimmer's 39 sliding-window layers always keep the shared decoder runtime's rings (the window plus a "
+            + "512-row prompt step); the legacy model's ring switches were removed with it.";
+
+        private const string MuseGlimmerTraceRemoved =
+            "the legacy Muse-Glimmer graph that wrote the layer trace was removed; eng/validation/MuseGlimmerKvGrowProbe "
+            + "compares logits (--logits-ref) and TS_GGML_NODE_PROFILE profiles the runtime's GGML programs.";
 
         private const string PerModelBatchedRemoved =
             "--no-continuous-batching (TS_SCHED_DISABLE_BATCHED=1) forces the per-sequence path for every model.";

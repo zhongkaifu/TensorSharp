@@ -264,6 +264,11 @@ namespace TensorSharp.Graph
         /// <summary>Whether steps over <paramref name="ranks"/> devices can run here (the devices' collective is up).</summary>
         bool RunsRanks(int ranks);
 
+        /// <summary>Whether the ranks' all-reduces over <paramref name="ranks"/> devices go through host memory (ggml-vulkan's
+        /// collective, or a CUDA group whose NCCL / peer path is not usable). Each step then pays a host round trip a
+        /// reduction, so the runtime takes wider prompt steps there (<c>StandardDecoderModel.RingStepRowsForPlacement</c>).</summary>
+        bool RanksSumOnHost(int ranks);
+
         /// <summary>Compile <paramref name="program"/> for rank <paramref name="rank"/>'s device.</summary>
         IGraphPlan CompileForRank(GraphProgram program, int rank);
 

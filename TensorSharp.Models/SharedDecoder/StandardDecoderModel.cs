@@ -277,6 +277,49 @@ namespace TensorSharp.Models
         /// post_ffw_norm), or null (the default). The per-op path then runs the feed-forward without its fused residual.</summary>
         protected virtual string FfnPostNormWeight(int layer) => null;
 
+        /// <summary>The epsilon of <paramref name="layer"/>'s post-norm at <paramref name="site"/> (<see cref="MixerPostNormWeight"/>,
+        /// <see cref="FfnPostNormWeight"/>), on every path: the graph's <see cref="EmitBlockOutput"/>, the per-op layer and the
+        /// tensor-parallel layer. Default the model's <c>Config.Eps</c>; Muse-Glimmer's post norms take 1e-8.</summary>
+        protected virtual float PostNormEps(int layer, BlockSite site) => Config.Eps;
+
+        /// <summary>
+        /// The head's logit multiplier: every logit the head returns is multiplied by it, before <see cref="FinalLogitSoftcap"/>
+        /// (Muse-Glimmer's <c>logit_scale</c>). 1 (the default), or not positive: none. The runtime applies the transform on
+        /// every path that returns logits (the graph's last-row, all-row and multi-sequence heads, the tensor-parallel
+        /// vocabulary-split head, the per-op head), so the logits, the log-probabilities and the sampler see it; a head that
+        /// returns greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>) and the speculators' draft
+        /// heads read the raw logits, whose order the transform keeps.
+        /// </summary>
+        protected virtual float LogitScale => 1f;
+
+        /// <summary>The head's tanh softcap: logits become <c>cap * tanh(logits / cap)</c>, after <see cref="LogitScale"/>
+        /// (Muse-Glimmer's and Gemma 4's <c>final_logit_softcapping</c>). 0 (the default), or negative: none.</summary>
+        protected virtual float FinalLogitSoftcap => 0f;
+
+        /// <summary>The per-op counterpart of <see cref="EmitLogitTransform"/>: <see cref="LogitScale"/>, then
+        /// <see cref="FinalLogitSoftcap"/>, on <paramref name="logits"/> in place (llama.cpp's and the legacy Muse-Glimmer head's
+        /// order of operations: a scale, then a scale by 1/cap, tanh and a scale by cap).</summary>
+        private void ApplyLogitTransform(Tensor logits)
+        {
+            float scale = LogitScale, cap = FinalLogitSoftcap;
+            if (scale > 0f && scale != 1f)
+                Ops.Mul(logits, logits, scale);
+            if (cap > 0f)
+            {
+                Ops.Mul(logits, logits, 1f / cap);
+                Ops.Tanh(logits, logits);
+                Ops.Mul(logits, logits, cap);
+            }
+        }
+
+        /// <summary>
+        /// The per-op counterpart of <see cref="EmitStreamInput"/>: what a family applies, in place, to the embedded rows
+        /// <paramref name="embedded"/> [rows, hidden] (media rows already injected) before the first layer reads them, on a path
+        /// that does not run as a graph (a declined executor, a multi-node pipeline's first stage, the per-op tensor-parallel
+        /// layers). Muse-Glimmer's weightless input RMSNorm; Gemma 4's sqrt(hidden) scale. Default: nothing.
+        /// </summary>
+        protected virtual void ApplyStreamInput(Tensor embedded) { }
+
         // ---------------------------------------------------------------- geometry
 
         protected int KeyDim => _keyDim;
@@ -478,6 +521,16 @@ namespace TensorSharp.Models
         /// <summary>A family whose prompt steps overlap (<see cref="OverlapsPromptSteps"/>) embeds them on the host on ggml-cuda
         /// and ggml-vulkan too: the device lookup was a graph of its own whose download waited for the step before it.</summary>
         protected override bool EmbedsPromptRowsOnHost => OverlapsPromptSteps && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
+
+        /// <summary>
+        /// The direct-CUDA startup warmup prefills 64 tokens, past the CUDA graph executor's decode-size products (up to 32 rows:
+        /// the row-invariant decode kernels of the K-quants, Q8_0, IQ4_XS and the IQ2 / IQ3 formats). The shared 32 had run
+        /// those alone, so the prompt route (the F16 tensor-core GEMM over dequantized weights) was first used by the first
+        /// request: Muse-Glimmer-30B UD-IQ2_XXS's first 53-token prompt step took 360.9 ms against 262.9 after a 64-token
+        /// warmup, and the later prompts' 242-247 ms either way (RTX PRO 4500 Blackwell). TS_PREFILL_WARMUP_LEN still
+        /// overrides it.
+        /// </summary>
+        protected override int NativeCudaPrefillWarmupLength => Math.Max(base.NativeCudaPrefillWarmupLength, 64);
 
         private Tensor EmbedStep(int[] tokens)
         {
@@ -896,7 +949,7 @@ namespace TensorSharp.Models
                 float[] Project(Tensor hidden) => ProjectRows(hidden, new[] { seqLen - 1 });
                 // Single-device stages run layer by layer; tensor-parallel stages run on this node's mesh.
                 _logitsBuffer = _mesh.TensorParallel == 1
-                    ? ForwardLayerPipeline(tokens, Embed, runLayer: (hidden, layer) => LayerOnOneDevice(hidden, layer, positions, null), Project)
+                    ? ForwardLayerPipeline(tokens, Embed, runLayer: (hidden, layer) => LayerOnOneDevice(StreamAt(hidden, layer), layer, positions, null), Project)
                     : ForwardLayerPipeline(tokens, Embed, runLocalLayers: hidden => RunLayers(hidden, positions, batch: null), Project);
                 _cacheSeqLen += seqLen;
                 _forwardCount++;
@@ -905,15 +958,18 @@ namespace TensorSharp.Models
             finally { _forwardSw.Stop(); }
         }
 
-        /// <summary>Run every local layer, moving the activation between stages.</summary>
+        /// <summary>Run every local layer, moving the activation between stages. Where the layers start at the first one,
+        /// <paramref name="hidden"/> is the embedded rows, which become the residual stream first (<see cref="ApplyStreamInput"/>).</summary>
         private Tensor RunLayers(Tensor hidden, TokenPositions positions, SlotBatch batch, Action<int, Tensor> beforeLayer = null)
         {
             int stage = 0;
             Tensor[] ranks = null;
-            if (_mesh.TensorParallel > 1)
-                ranks = Replicate(hidden, 0);
             // A node of a multi-node pipeline runs its own layers, starting on its first local stage.
             int first = LayerPlacement?.FirstLayer ?? 0, end = LayerPlacement?.EndLayer ?? Config.NumLayers;
+            if (first == 0)
+                ApplyStreamInput(hidden);
+            if (_mesh.TensorParallel > 1)
+                ranks = Replicate(hidden, 0);
             for (int layer = first; layer < end; layer++)
             {
                 int s = _mesh.StageOf(layer);
@@ -956,6 +1012,15 @@ namespace TensorSharp.Models
                 EnterStage(last);
                 hidden = MoveTo(hidden, _mesh.Allocator(last, 0));
             }
+            return hidden;
+        }
+
+        /// <summary>A single-device stage's input to <paramref name="layer"/>: the embedded rows become the residual stream
+        /// before the first layer (<see cref="ApplyStreamInput"/>), in place.</summary>
+        private Tensor StreamAt(Tensor hidden, int layer)
+        {
+            if (layer == 0)
+                ApplyStreamInput(hidden);
             return hidden;
         }
 
@@ -1005,6 +1070,7 @@ namespace TensorSharp.Models
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor logits = LinearForward(selected, "output.weight") ?? LinearForward(selected, "token_embd.weight");
+            ApplyLogitTransform(logits);
             _lmHeadTicks += Stopwatch.GetTimestamp() - t0;
             selected.Dispose();
             long t1 = Stopwatch.GetTimestamp();
@@ -1033,7 +1099,7 @@ namespace TensorSharp.Models
             // A sandwich block norms the mixer's output before the residual add (the fused add + norm below then adds it).
             if (MixerPostNormWeight(layer) is { } mixPost)
             {
-                Tensor post = RMSNormOp(attn, mixPost);
+                Tensor post = RMSNormOp(attn, mixPost, PostNormEps(layer, BlockSite.Mixer));
                 attn.Dispose();
                 attn = post;
             }
@@ -1077,7 +1143,7 @@ namespace TensorSharp.Models
             }
             if (ffnPost != null)
             {
-                Tensor post = RMSNormOp(ffn, ffnPost);
+                Tensor post = RMSNormOp(ffn, ffnPost, PostNormEps(layer, BlockSite.Ffn));
                 ffn.Dispose();
                 ffn = post;
             }
@@ -1106,11 +1172,12 @@ namespace TensorSharp.Models
             });
             _mesh.AllReduce(stage, partial);
             Tensor mixPost = MixerPostNormWeight(layer) is { } mixPostName ? _weights[mixPostName] : null;
+            float mixPostEps = mixPost != null ? PostNormEps(layer, BlockSite.Mixer) : 0f;
             _mesh.RunPerRank(stage, r =>
             {
                 if (mixPost != null)
                 {
-                    Tensor normed = Ops.RMSNorm(null, partial[r], Replica(mixPost, stage, r), null, Config.Eps);
+                    Tensor normed = Ops.RMSNorm(null, partial[r], Replica(mixPost, stage, r), null, mixPostEps);
                     partial[r].Dispose();
                     partial[r] = normed;
                 }
@@ -1121,6 +1188,7 @@ namespace TensorSharp.Models
 
             Tensor ffnNorm = _weights[FfnNormWeight(layer)];
             Tensor ffnPost = FfnPostNormWeight(layer) is { } ffnPostName ? _weights[ffnPostName] : null;
+            float ffnPostEps = ffnPost != null ? PostNormEps(layer, BlockSite.Ffn) : 0f;
             if (_moeLayer[layer])
             {
                 // Routing is identical on every rank (replicated input and router): decide it
@@ -1148,7 +1216,7 @@ namespace TensorSharp.Models
             {
                 if (ffnPost != null)
                 {
-                    Tensor normed = Ops.RMSNorm(null, partial[r], Replica(ffnPost, stage, r), null, Config.Eps);
+                    Tensor normed = Ops.RMSNorm(null, partial[r], Replica(ffnPost, stage, r), null, ffnPostEps);
                     partial[r].Dispose();
                     partial[r] = normed;
                 }

@@ -231,6 +231,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/mi
   <h3 id="muse-glimmer">Muse-Glimmer (text + image, thinking, tools, DFlash drafting)</h3>
   <pre data-lang="bash"><code>hf download unsloth/Muse-Glimmer-30B-GGUF Muse-Glimmer-30B-UD-IQ2_XXS.gguf --local-dir models
 hf download unsloth/Muse-Glimmer-30B-GGUF mmproj-Muse-Glimmer-30B-Q8_0.gguf --local-dir models
+hf download unsloth/Muse-Glimmer-30B-GGUF dflash-kquant.gguf --local-dir models
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
     --input prompt.txt --max-tokens 256 --backend ggml_cuda
@@ -240,7 +241,10 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-U
     --max-tokens 300 --backend ggml_cuda
 # DFlash speculative decoding (optional drafter GGUF from the same repo)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
-    --draft-model models/dflash-kquant.gguf --spec-draft 15 --input prompt.txt --backend ggml_cuda</code></pre>
+    --draft-model models/dflash-kquant.gguf --spec-draft 15 --input prompt.txt --backend ggml_cuda
+# n-gram speculation, no drafter (strongest where the answer quotes its prompt)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
+    --spec --spec-type ngram --input prompt.txt --backend ggml_cuda</code></pre>
 
   <h3 id="muse-spark">Muse Spark (816B sparse MoE, text + image, thinking, tools)</h3>
   <p>Unsloth's <a href="https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF" target="_blank" rel="noopener">Muse-Spark-Open-816B-A42B</a> declares <code>general.architecture = muse-spark</code> (alias <code>muse_spark</code>): 816B parameters with about 42B active per token, 62 blocks at hidden width 8192, 128 query / 16 KV heads at head dim 64, and 256 routed experts with top-8 sigmoid routing and a 4096-wide expert latent. 46 layers use a 2048-token sliding window with RoPE; the other 16 are global NoPE layers. The metadata advertises 1,048,576 tokens of context, which is <em>not</em> validated: without <code>MAX_CONTEXT</code> the native executor caps the context to the largest size that fits and logs it, and with <code>MAX_CONTEXT</code> set a size that does not fit is refused. This is a <strong>multi-GPU server</strong> model: the measured setup is ten A40s (46 GB each) holding every expert of the UD-IQ3_XXS quant in GPU memory; on fewer GPUs, the expert stacks that do not fit go to host memory, which then has to be large. It is not in the TensorAgent catalog.</p>

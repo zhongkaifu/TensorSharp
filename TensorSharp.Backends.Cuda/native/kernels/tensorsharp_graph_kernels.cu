@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 36
+#define TS_GRAPH_KERNELS_VERSION 38
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1863,6 +1863,29 @@ extern "C" __global__ void ts_graph_sqrt_f32(const float* __restrict__ x, float*
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
         y[i] = sqrtf(x[i]);
+}
+
+// ggml_gelu_erf: 0.5 x (1 + erf(x / sqrt 2)), elementwise over n contiguous floats (ggml-cuda's op_gelu_erf).
+extern "C" __global__ void ts_graph_gelu_erf_f32(const float* __restrict__ x, float* __restrict__ y, long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    const float v = x[i];
+    y[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
+}
+
+// A q8_0 weight's blocks as F32, each value code * d in F32 as ggml's dequantize_row_q8_0 computes it (the product of a
+// float-activation program multiplies these). One warp a block of 32 values: launch blocks / 8 blocks of 256 threads.
+extern "C" __global__ void ts_graph_q8_0_weight_to_f32(const uint8_t* __restrict__ src, float* __restrict__ dst, long long blocks)
+{
+    const long long b = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (b >= blocks)
+        return;
+    const uint8_t* blk = src + b * 34;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const int lane = threadIdx.x & 31;
+    dst[b * 32 + lane] = (float)(int8_t)blk[2 + lane] * d;
 }
 
 // ggml_softplus: x > 20 ? x : log(1 + exp(x)), elementwise over n contiguous floats.

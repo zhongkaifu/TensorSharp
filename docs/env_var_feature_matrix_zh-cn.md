@@ -278,7 +278,7 @@ MiniMax-H3-Image 运行在共享扩散运行时上，其驻留计划、VAE 程�
 Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1 DSpark 路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证；
 以及无需权重的 n-gram 投机器）。投机仅对单序列（无并发）请求生效，且只在模型声明有收益时启用，这由各
 模型自己决定：Qwen 3.5/3.6/3.8 与 GLM 5.2 / GLM-5.3 在所有后端上，GLM-5.3-Flash（仅 n-gram）在其 KDA
-回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其可加载的所有后端上，DeepSeek V4 / V4.1 与 Muse-Glimmer 只在加载了各自草稿器时。Nemotron-H
+回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其可加载的所有后端上，Muse-Glimmer 在所有后端上，DeepSeek V4 / V4.1 只在加载了各自草稿器时。Nemotron-H
 拒绝一切投机器，GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
 它们未注册在 `EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫描——矩阵特性目录目前
 没有投机解码特性，请用显式运行来验证这些变量。
@@ -302,8 +302,10 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 
 ## 矩阵外的 Muse-Glimmer 与 DFlash 开关
 
-Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有一个 A/B 开关，另外还有
-长上下文的尺寸开关。这些都没有注册进 `EnvVarMatrix.All`。完整清单（含逐层追踪开关）见
+下面是共享 DFlash 块级草稿模型读取的开关，都没有注册进 `EnvVarMatrix.All`。旧 Muse-Glimmer 模型的开关
+（`TS_MUSE_GLIMMER_PREFILL_CHUNK`、`_SWA_RING`、`_SWA_ROWS`、逐层与视觉追踪开关、`TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`、
+`TS_MLX_KV_MATERIALIZE_INTERVAL`）已于 2026-11 随旧模型一并移除：设置其中任何一个，服务器或 CLI 都会在启动时报错并给出
+替代方式（见 `TensorSharp.Runtime/RemovedCliFlags.cs` 中的 `RemovedEnvironmentVariables`）；另见
 [Muse-Glimmer 卡片](models/muse-glimmer_zh-cn.md#7-环境变量)。
 `TS_DFLASH_BATCHED_INJECT` 已于 2026-11 移除，现在设置会让服务端或 CLI 在启动时报错退出：只有一个从未被启动的
 ggml_cuda 延迟注入读取它。批处理投机步在草稿模型以图程序运行的地方，用一个程序为所有请求起草块，并用一个程序写入
@@ -311,9 +313,6 @@ ggml_cuda 延迟注入读取它。批处理投机步在草稿模型以图程序�
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描取值 | 默认是否扫描 |
 |---|---|---|---|---|---|
-| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | Muse-Glimmer | 每次 prefill 前向的 token 数；`0` 关闭分块 | `2048` | 未注册 | 否 |
-| `TS_MUSE_GLIMMER_SWA_RING` | Muse-Glimmer（融合） | 把 39 个滑动窗口层按 `pad(n_swa + chunk + 1, 256)` 行做环，而不是所有层都按完整上下文分配 | 开 | 未注册 | 否 |
-| `TS_MUSE_GLIMMER_SWA_ROWS` | Muse-Glimmer（融合） | 覆盖 SWA 环的行数（诊断用） | 自动 | 未注册 | 否 |
 | `TS_DFLASH_PREFILL_CHUNK` | 任意 DFlash 草稿器 | 每次投机 prefill 前向的 token 数（驱动的是**主干**，不只是草稿器） | `1024`，并受草稿器环形缓冲与主干自身窗口的限制 | 未注册 | 否 |
 | `TS_DFLASH_SELECTOR` | DFlash2 草稿器 | `0` 改为按逐位置 argmax 起草，而不走候选格（仅用于归因分析——权重本来就是带着它训练的） | 开 | 未注册 | 否 |
 | `TS_DFLASH_CONV` | DFlash2 草稿器 | `0` 去掉分组动态卷积（同上，仅用于归因分析） | 开 | 未注册 | 否 |

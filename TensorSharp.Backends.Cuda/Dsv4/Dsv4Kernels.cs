@@ -74,6 +74,12 @@ namespace TensorSharp.Cuda
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
         private readonly IntPtr denseQ81RowsMulti;
+        // IQ2_XXS / IQ2_S q8_1 rows decoding each group once for every row: [format (0 IQ2_XXS, 1 IQ2_S) * 4 + log2 rows - 1]
+        // for calls of up to 2, 4, 8 and 16 rows (optional: a module before them has none).
+        private readonly IntPtr[] denseQ81Iq2Rows = new IntPtr[8];
+        // The IQ3 formats' rows over F32 activations, the kernels for calls of up to 1, 2, 4, 8 and 16 rows (optional: a module
+        // before them has none).
+        private readonly IntPtr[] denseF32Rows = new IntPtr[10];   // [format (0 IQ3_XXS, 1 IQ3_S) * 5 + log2 rows]
         // Decode once, dot every row (optional): [R (rows a pass, 1..8), W index (1, 2, 4 warps an output)]. A module from
         // before the 3/5/6/7-row instantiations fills those widths with the next power of two's kernel.
         private readonly IntPtr[,] denseFast = new IntPtr[9, 3];
@@ -349,6 +355,25 @@ namespace TensorSharp.Cuda
                 denseQ81RowsSplitK = module.GetFunction("ts_dsv4_dense_q81_rows_splitk_f32");
                 try { denseQ81RowsMulti = module.GetFunction("ts_dsv4_dense_q81_rows_multi_f32"); }
                 catch (CudaException ex) when (ex.ErrorCode == 500) { denseQ81RowsMulti = IntPtr.Zero; }
+                try
+                {
+                    for (int i = 0; i < denseQ81Iq2Rows.Length; i++)
+                        denseQ81Iq2Rows[i] = module.GetFunction($"ts_dsv4_dense_q81_rows_r{2 << (i % 4)}_{(i < 4 ? "iq2xxs" : "iq2s")}_f32");
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { Array.Clear(denseQ81Iq2Rows); }
+                try
+                {
+                    for (int i = 0; i < denseF32Rows.Length; i++)
+                    {
+                        int k = i % 5, r = 1 << k;
+                        string format = i < 5 ? "iq3xxs" : "iq3s";
+                        denseF32Rows[i] = module.GetFunction($"ts_dsv4_dense_f32_rows_r{r}_{format}_f32");
+                        // The activation tiles are dynamic shared memory: up to 72 KB at 16 rows, past the default 48.
+                        CudaDriverApi.cuFuncSetAttribute(denseF32Rows[i], CuFuncAttributeMaxDynamicSharedSizeBytes,
+                            r * DenseF32RowsTileBytes(k)).ThrowOnError();
+                    }
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { Array.Clear(denseF32Rows); }
                 try
                 {
                     int[] rs = { 1, 2, 4, 8 }, ws = { 1, 2, 4 };
@@ -1078,6 +1103,43 @@ namespace TensorSharp.Cuda
                 _ => false,
             });
 
+        /// <summary>Whether <see cref="DenseF32Rows"/> runs this weight layout at this input width: IQ3_XXS and IQ3_S, in whole
+        /// 256-value super-blocks.</summary>
+        public static bool DenseF32RowsSupports(int wtype, int inDim) => wtype is 18 or 21 && inDim > 0 && inDim % 256 == 0;
+
+        /// <summary>Shared memory a row of the activation tile takes in <see cref="DenseF32Rows"/>'s kernel <paramref name="k"/>
+        /// (for up to 1 &lt;&lt; k rows): 128, 64 or 32 units (the kernels' TILE) of 32 floats at a stride of 36.</summary>
+        private static int DenseF32RowsTileBytes(int k) => (k == 0 ? 128 : k == 1 ? 64 : 32) * 36 * sizeof(float);
+        private const int CuFuncAttributeMaxDynamicSharedSizeBytes = 8;
+
+        /// <summary>The module has <see cref="DenseF32Rows"/>'s kernel (one built before it has not).</summary>
+        public bool HasDenseF32Rows => denseF32Rows[^1] != IntPtr.Zero;
+
+        /// <summary>
+        /// out[rows, outDim] = x[rows, inDim] x w^T for 1 to <see cref="DenseMultiMaxRows"/> rows of F32 activations against an
+        /// IQ3_XXS or IQ3_S weight (<see cref="DenseF32RowsSupports"/>), the weights read once a call. Each row's sum is the
+        /// one-row call's, bit for bit, whatever the row count. The q8_1 rows of <see cref="DenseQ81Rows"/> round the activations
+        /// to 8 bits first, which these formats' products do not take on a lane held to float activations. Reads only the
+        /// buffers passed, so it can be captured. x must be 16-byte aligned (whole rows of a contiguous F32 tensor).
+        /// </summary>
+        public void DenseF32Rows(IntPtr w, IntPtr x, IntPtr output, int wtype, int outDim, int inDim, long rowBytes, int rows,
+            IntPtr stream)
+        {
+            if (!HasDenseF32Rows)
+                throw new InvalidOperationException("This dsv4 kernel module has no ts_dsv4_dense_f32_rows kernels.");
+            if (!DenseF32RowsSupports(wtype, inDim))
+                throw new ArgumentException($"DenseF32Rows reads IQ3_XXS and IQ3_S rows in 256-value super-blocks, not type {wtype} at {inDim}.");
+            if (rows < 1 || rows > DenseMultiMaxRows)
+                throw new ArgumentOutOfRangeException(nameof(rows), rows, $"1 to {DenseMultiMaxRows} rows a call.");
+            IntPtr a0 = w, a1 = x, a2 = output;
+            int a3 = wtype, a4 = outDim, a5 = inDim; long a6 = rowBytes; int a7 = rows;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
+            // The kernel for the smallest power of two at or above the row count: eight warps a block, two output rows a warp
+            // (TS_DSV4_F32_ROWS_OUT), and a tile of every row in shared memory.
+            int k = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : rows <= 8 ? 3 : 4;
+            Launch(denseF32Rows[(wtype == 18 ? 0 : 5) + k], CeilDiv(outDim, 16), 1, 1, BlockSize, (uint)(rows * DenseF32RowsTileBytes(k)), stream, args);
+        }
+
         /// <summary>Dense projections up to this many output rows (and inputs at least this long) run split-K.</summary>
         private const int SplitKMaxOutDim = 2048, SplitKMinInDim = 1024;
 
@@ -1140,6 +1202,16 @@ namespace TensorSharp.Cuda
             // looping over the rows left the GPU too few blocks, and the shared expert slowed down.) One row takes it too:
             // the one-row kernel's warps walk four output rows each, 80 blocks for 2560 outputs. The shared expert's
             // 640 -> 2560 Q4_0 down projection took 3.44 us at one row there (2.37 at two rows); 2.01 us here (RTX 5090).
+            // Two or more rows of an IQ2_XXS / IQ2_S weight: each group decoded once for every row, each row the multi kernel's
+            // bits (a 9-row n-gram verify of Muse-Glimmer-30B had spent 60 ms of its 100 there, the multi kernel decoding the
+            // grid again for each row).
+            if (rows >= 2 && rows <= DenseMultiMaxRows && _denseMulti && (wtype == 16 || wtype == 22)
+                && denseQ81Iq2Rows[(wtype == 16 ? 0 : 4) + 3] != IntPtr.Zero)
+            {
+                int k = rows <= 2 ? 0 : rows <= 4 ? 1 : rows <= 8 ? 2 : 3;
+                Launch(denseQ81Iq2Rows[(wtype == 16 ? 0 : 4) + k], CeilDiv(outDim, 8), 1, 1, BlockSize, 0, stream, args);
+                return;
+            }
             if (rows <= DenseMultiMaxRows && denseQ81RowsMulti != IntPtr.Zero && _denseMulti)
                 Launch(denseQ81RowsMulti, CeilDiv(outDim, 8), 1, 1, BlockSize, 0, stream, args);
             else

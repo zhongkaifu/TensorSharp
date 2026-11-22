@@ -330,8 +330,8 @@ namespace TensorSharp.Server.Host.Hosting
                     "carries; 'draft-head' and 'block' pin one explicitly; 'ngram' needs no trained weights, " +
                     "drafting by suffix match over the context (strong when the answer quotes its input: " +
                     "summarizing, editing, structured output, agentic loops). N-gram still needs a trunk that " +
-                    "can verify a draft window: Qwen 3.5/3.6/3.8, Qwen 3.8 Flash Next, Gemma 4 and GLM-5.x have " +
-                    "one; DeepSeek V4/V4.1 and Muse-Glimmer only while their --draft-model drafter is loaded; " +
+                    "can verify a draft window: Qwen 3.5/3.6/3.8, Qwen 3.8 Flash Next, Gemma 4, GLM-5.x and Muse-Glimmer have " +
+                    "one; DeepSeek V4/V4.1 only while their --draft-model drafter is loaded; " +
                     "GPT-OSS, Mistral 3 and Hunyuan Dense have no " +
                     "speculative path at all; Nemotron-H refuses every speculator.",
                     "--spec --spec-type ngram"),

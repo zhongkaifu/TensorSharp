@@ -44,7 +44,7 @@
 // probabilities. Off by default (CudaGraphExecutor.PromptAttention8Enabled).
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 14
+#define TS_FLASH_PREFILL_VERSION 15
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -701,7 +701,7 @@ TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256, half, false)
 // the device when the step is recorded). One launch for what were `rows` one-row launches, each row through the same
 // code as ts_flash_prefill_f16_d<hd> with nq = 1, so a row's sums are the decode row's bit for bit. Every row splits its
 // keys as its own length's bucket says (ts_fp_rule_splits over the query heads of one KV head, as the decode row at its
-// position); a selection's rows run the launch's splits (bucket 0).
+// position); a selection's row as its own listed count's says, cellCount[z] (the launch's splits with bucket 0).
 //   q, out  [rows][nHead][HD] F32;  partial  rows x nHead x splits x (HD + 2) floats (combined over rows * nHead).
 // With cells (a sparse attention's selection): row z's keys are cells[z * cellStride ..], cellCount[z] of them, each with
 // its value in the mask row cellMask[z * cellStride ..] added (len and floor unused; none without cellMask).
@@ -721,8 +721,7 @@ TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256, half, false)
             splits, partial != nullptr ? partial + (long long)z * nHead * splits * (HD + 2) : nullptr, out + at, nullptr, \
             listed ? cells + (long long)z * cellStride : nullptr, listed ? cellCount + z : nullptr, \
             listed && cellMask != nullptr ? cellMask + (long long)z * cellStride : nullptr, \
-            listed ? ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms) \
-                : ts_fp_rule_splits(splits, rowLen, windowKeys, bucket, nHead / nKv, nKv, sms)); \
+            ts_fp_rule_splits(splits, listed ? cellCount[z] : rowLen, windowKeys, bucket, nHead / nKv, nKv, sms)); \
     }
 
 TS_FP_ATTN_ROWS(ts_flash_decode_rows_f16_d128, 128, half, false)
@@ -1775,4 +1774,32 @@ extern "C" __global__ void ts_flash_window_combine_seqs_f32(const ts_fp_window_c
         den = fmaf(ps[hd + 1], w, den);
     }
     a.out[z][base * hd + x] = den > 0.0f ? num / den : 0.0f;
+}
+
+// ts_flash_prefill_combine_f32 over a selection's rows (ts_flash_decode_rows_* with cells and bucket > 0): output (t, head)
+// combines the splits its row ran - its own listed count's, cellCount[t], under the bucket rule - as the decode row over
+// the same cells combines them.
+// Launch: grid rows * nHead, block HD.
+extern "C" __global__ void ts_flash_listed_combine_f32(const float* __restrict__ partial, int splits, int hd, float* __restrict__ out,
+    const int* __restrict__ cellCount, int nHead, int windowKeys, int bucket, int ruleRows, int nKv, int sms)
+{
+    const long long base = blockIdx.x;
+    const int t = (int)(base / nHead);
+    const int live = ts_fp_rule_splits(splits, cellCount[t], windowKeys, bucket, ruleRows, nKv, sms);
+    if (live <= 1)
+        return;
+    const float* p = partial + base * splits * (hd + 2);
+    float mx = -INFINITY;
+    for (int s = 0; s < live; ++s)
+        mx = fmaxf(mx, p[s * (hd + 2) + hd]);
+    float num = 0.0f, den = 0.0f;
+    const int x = threadIdx.x;
+    for (int s = 0; s < live; ++s)
+    {
+        const float* ps = p + s * (hd + 2);
+        const float w = mx == -INFINITY ? 0.0f : expf(ps[hd] - mx);
+        num = fmaf(ps[x], w, num);
+        den = fmaf(ps[hd + 1], w, den);
+    }
+    out[base * hd + x] = den > 0.0f ? num / den : 0.0f;
 }

@@ -29,7 +29,8 @@ namespace TensorSharp.Runtime.Speculative
     /// So measure both and let the numbers decide. A round measures speculation
     /// first (so the very first decode step still speculates), then takes a
     /// short plain baseline, then judges. A win holds for
-    /// <see cref="WinRecheckInterval"/> steps; a loss parks drafting for a
+    /// <see cref="WinRecheckInterval"/> steps, a wide one longer each time it is
+    /// confirmed (<see cref="WideWinFactor"/>); a loss parks drafting for a
     /// backed-off interval and re-probes, so a pair that becomes profitable
     /// later (longer context, different prompt) is picked back up. Overhead when
     /// speculation is a loss is bounded by one probe per park interval.
@@ -58,6 +59,29 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>Plain steps measured per round, for the baseline to compare against.</summary>
         private const int CalibrationPlainSteps = 3;
+
+        /// <summary>
+        /// Plain steps measured by a round that re-checks a WIDE win (<see cref="WideWinFactor"/>): one. Every plain step a
+        /// winning round takes gives up the tokens a speculative step would have made in its time - about three where
+        /// drafting wins threefold - and a round that re-checks a wide margin only needs to see it still there. Its verdict
+        /// reads the long-run evidence as well, which holds every plain sample so far.
+        /// </summary>
+        private const int WideWinCalibrationPlainSteps = 1;
+        private int PlainStepsThisRound => _wideWin ? WideWinCalibrationPlainSteps : CalibrationPlainSteps;
+
+        /// <summary>
+        /// A win is WIDE when speculation costs at most 1/this of plain decoding a token, on the round and on the long-run
+        /// evidence alike. Such a win's hold grows by <see cref="WinHoldGrowth"/> each time it is confirmed, up to
+        /// <see cref="MaxWinRecheckInterval"/>, and its re-check takes <see cref="WideWinCalibrationPlainSteps"/>; any other
+        /// verdict - a narrow win, a loss, a hold that stops winning - starts the hold over at <see cref="WinRecheckInterval"/>.
+        /// A hold is not blind (<see cref="WinWindow"/>): a wide win that stops winning parks within its window, whatever is left
+        /// of the hold.
+        /// </summary>
+        private const double WideWinFactor = 1.5;
+        private const int WinHoldGrowth = 4;
+        private const int MaxWinRecheckInterval = 4096;
+        private int _winHold = WinRecheckInterval;
+        private bool _wideWin;
 
         /// <summary>
         /// A probe ends early, as a loss, when its first this-many measured
@@ -268,7 +292,7 @@ namespace TensorSharp.Runtime.Speculative
                 return _specWins;
             if (_specSamples < ProbeStepsThisRound)
                 return true;                        // measuring speculation
-            if (_plainSamples < CalibrationPlainSteps)
+            if (_plainSamples < PlainStepsThisRound)
                 return false;                       // measuring the plain baseline
             return _specWins;
         }
@@ -313,6 +337,8 @@ namespace TensorSharp.Runtime.Speculative
                         {
                             // The win stopped being one: park with the usual backoff.
                             _specWins = false;
+                            _winHold = WinRecheckInterval;
+                            _wideWin = false;
                             Losses++;
                             _consecutiveLosses++;
                             _parkedRemaining = Math.Min(ParkedProbeInterval, FirstParkInterval << Math.Min(_consecutiveLosses - 1, 5));
@@ -344,6 +370,8 @@ namespace TensorSharp.Runtime.Speculative
                     && _specSamples < ProbeStepsThisRound)
                 {
                     _specWins = false;
+                    _winHold = WinRecheckInterval;
+                    _wideWin = false;
                     Losses++;
                     _consecutiveLosses++;
                     _parkedRemaining = Math.Min(ParkedProbeInterval, FirstParkInterval << Math.Min(_consecutiveLosses - 1, 5));
@@ -357,7 +385,7 @@ namespace TensorSharp.Runtime.Speculative
                 RecordPlainSample(elapsedTicks, tokensEmitted);
             }
 
-            if (_specSamples < ProbeStepsThisRound || _plainSamples < CalibrationPlainSteps)
+            if (_specSamples < ProbeStepsThisRound || _plainSamples < PlainStepsThisRound)
                 return;
 
             // Trim the worst speculative sample (a graph rebuild that will not
@@ -381,7 +409,11 @@ namespace TensorSharp.Runtime.Speculative
             _parkedRemaining = _specWins
                 ? 0
                 : Math.Min(ParkedProbeInterval, FirstParkInterval << Math.Min(_consecutiveLosses - 1, 5));
-            _recheckRemaining = _specWins ? WinRecheckInterval : 0;
+            // A wide win (on the round and the evidence) holds longer each time it is confirmed; anything else starts over.
+            _wideWin = _specWins && specMs * WideWinFactor <= plainMs
+                && EvidenceSpecMs > 0 && EvidenceSpecMs * WideWinFactor <= EvidencePlainMs;
+            _winHold = _wideWin ? Math.Min(MaxWinRecheckInterval, _winHold * WinHoldGrowth) : WinRecheckInterval;
+            _recheckRemaining = _specWins ? _winHold : 0;
             ResetRound();
         }
 
@@ -413,6 +445,8 @@ namespace TensorSharp.Runtime.Speculative
             _parkedRemaining = _recheckRemaining = 0;
             _consecutiveLosses = 0;
             _specWins = true;
+            _winHold = WinRecheckInterval;
+            _wideWin = false;
             Wins = Losses = ParkedSteps = 0;
             _evSpecTicks = _evSpecTokens = _evPlainTicks = _evPlainTokens = 0;
             // A fresh governor has measured nothing; leaving the last run's

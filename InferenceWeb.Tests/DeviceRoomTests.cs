@@ -157,6 +157,21 @@ public sealed class DeviceRoomTests : IDisposable
         Assert.Equal(1, model.SlotRefusals);
     }
 
+    /// <summary>A lone request short of its room before any conversation was retained (no prefix cache attached, or none
+    /// finished yet) is refused with the numbers. The estimate of what releasing conversations could free walked the retained
+    /// conversations, of which there were none yet, and threw a NullReferenceException (a 131,072-cell Muse-Glimmer slot on
+    /// an RTX PRO 4500, no prefix cache).</summary>
+    [Fact]
+    public void ARequestShortOfRoomBeforeAnyConversationIsRetainedIsRefused()
+    {
+        using Qwen35RuntimeModel model = Create();
+        model.DeviceRoomForTests = () => (GB / 2, 16 * GB);
+        model.RetainedPayloadBytesForTests = _ => 0;   // the release estimate runs as it does on a device
+        var refused = Assert.Throws<InvalidOperationException>(() => ((IUnifiedBatchModel)model).EnsureSequenceSlot("lone", 2048));
+        Assert.Contains("refused before any of it ran", refused.Message);
+        Assert.False(model.HasFusedSequenceCache("lone"));
+    }
+
     /// <summary>Where releasing every finished conversation the prefix cache keeps would not make a slot's room, none is
     /// released: a new request beside a running one waits with them all kept, and a checkpoint is declined with them all kept
     /// (they had all been released first, their next turns prefilling again for nothing).</summary>

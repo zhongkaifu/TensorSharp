@@ -865,11 +865,13 @@ namespace TensorSharp.Cuda
             using Tensor permuted = q.Permute(1, 0, 2);
             using Tensor qc = Ops.NewContiguous(permuted);
             IntPtr dyn = selection ? IntPtr.Zero : CudaDecodeDynParams.GetActiveDevicePtr(cuda, kc.Storage);
-            // A selection's rows split their selection's width; the others are launched with the splits of the bucket window the
-            // window's length falls in (a recorded launch holds those of its whole window, the length read on the device), the
-            // most any of its rows runs: each row runs its own length's bucket window's (the bucket rule on the device), as the
-            // decode row at its position does.
-            int splits = flash.Splits(heads / kvHeads, kvHeads, selection ? (mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv)
+            // Each row runs its own length's bucket window's splits (the bucket rule on the device), as the decode row at its
+            // position does: a selection's row its listed count's, the launch holding those of the selection's bound
+            // (SelectionKeys); the others' length is the window's less the rows after them, the launch holding the splits of
+            // the bucket window the window's length falls in (a recorded launch those of its whole window, the length read on
+            // the device), the most any of its rows runs.
+            int selectionKeys = selection ? SelectionKeys(mask.KvMax, nkv) : 0;
+            int splits = flash.Splits(heads / kvHeads, kvHeads, selection ? selectionKeys
                 : dyn != IntPtr.Zero ? nkv : CudaFlashPrefillKernels.BucketKeys(nkv, keys, DecodeWindowBucket));
             using Tensor cells = selection ? new Tensor(Allocator, DType.Int32, nq, nkv) : null;
             using Tensor count = selection ? new Tensor(Allocator, DType.Int32, nq) : null;
@@ -893,10 +895,24 @@ namespace TensorSharp.Cuda
                 selection ? nkv : keys, selection ? 0 : floor, heads, kvHeads, d, scale, splits,
                 partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream, dyn,
                 selection ? Ptr(cells) : IntPtr.Zero, selection ? Ptr(count) : IntPtr.Zero, selection ? Ptr(rows) : IntPtr.Zero, nkv,
-                windowKeys: nkv, bucket: selection ? 0 : DecodeWindowBucket, q8: q8));
+                windowKeys: selection ? selectionKeys : nkv, bucket: DecodeWindowBucket, q8: q8));
             attended = output;
             return true;
         }
+
+        /// <summary>
+        /// The keys a selection's launch holds splits for (<see cref="CudaFlashPrefillKernels.Splits"/>): the selection's bound
+        /// <paramref name="kvMax"/> (the most cells a row keeps: a sliding window's band, a sparse attention's budget) where it has
+        /// one, else the whole <paramref name="windowKeys"/>-key window, rounded up to the decode bucket. Each row runs the splits
+        /// the bucket rule gives its own listed count, read on the device, as a row over a window runs its own length's.
+        /// <para>The splits had come from the bound clipped to the window, and every row ran all of them. The kernel shares a row's
+        /// cells among its splits, so a row summed its cells in another grouping in a smaller cache. Muse-Glimmer-30B's
+        /// 2,048-key band ran 2 splits over a 256-cell capacity window where a 1,024-cell window ran 8, and the first decode step
+        /// after a 200-token prompt parted by up to 0.12 in a logit (MuseGlimmerRuntimeKvTests). A verify window of 9-16 rows,
+        /// whose band is classified on the host and runs the bucket rule, parted from the decode rows from position 64 on.</para>
+        /// </summary>
+        private int SelectionKeys(int kvMax, int windowKeys)
+            => CudaFlashPrefillKernels.BucketKeys(int.MaxValue, kvMax > 0 ? kvMax : windowKeys, DecodeWindowBucket);
 
         /// <summary>A verify window's attention held back inside a region of several sequences' attentions: its operands (each a
         /// reference of its own) and <see cref="CudaFlashPrefillKernels.LaunchDecodeRows"/>'s arguments.</summary>
@@ -1028,13 +1044,16 @@ namespace TensorSharp.Cuda
             using var cells = new Tensor(Allocator, DType.Int32, nkv);
             using var count = new Tensor(Allocator, DType.Int32, 1);
             Launch(new[] { row }, new[] { cells, count }, (kn, stream) => kn.LaunchMaskCells(Ptr(row), Ptr(cells), Ptr(count), 1, nkv, stream));
-            int splits = flash.Splits(heads / kvHeads, kvHeads, mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv);
+            // The splits the bucket rule gives the listed count (read on the device, so a recorded step replays each position's),
+            // as a row over a window splits its own length; the launch holds those of the selection's bound (SelectionKeys).
+            int selectionKeys = SelectionKeys(mask.KvMax, nkv);
+            int splits = flash.Splits(heads / kvHeads, kvHeads, selectionKeys);
             var result = new Tensor(Allocator, DType.Float32, 1, heads, d);
             using Tensor partial = splits > 1 ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, splits)) : null;
             Tensor[] written = partial == null ? new[] { result } : new[] { result, partial };
             Launch(new[] { qc, kc, vc, cells, count, row }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, 1, nkv, 0,
-                heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(result), stream, IntPtr.Zero,
-                Ptr(cells), Ptr(count), Ptr(row)));
+                heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(result), stream, Ptr(count),
+                Ptr(cells), Ptr(count), Ptr(row), windowKeys: selectionKeys, bucket: DecodeWindowBucket));
             attended = result;
             return true;
         }
@@ -1589,8 +1608,10 @@ namespace TensorSharp.Cuda
             }
             else
             {
-                // The splits the ops' flash path takes over the mask's window, bounded by the selection's width.
-                int splits = flash.Splits(group, kvHeads, kvMax > 0 ? Math.Min(kvMax, window) : window);
+                // The splits the ops' flash path takes: the bucket rule over each row's listed count, the launch holding those
+                // of the selection's bound.
+                int selectionKeys = SelectionKeys(kvMax, window);
+                int splits = flash.Splits(group, kvHeads, selectionKeys);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(count, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { output } : new[] { output, partial };
@@ -1599,10 +1620,11 @@ namespace TensorSharp.Cuda
                 {
                     if (count == 1)
                         flash.LaunchAttention(Ptr(q), Ptr(kc), Ptr(vc), cap, 1, window, 0, heads, kvHeads, d, scale, splits, partialPtr,
-                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount));
+                            Ptr(output), stream, Ptr(cellCount), Ptr(cells), Ptr(cellCount), windowKeys: selectionKeys, bucket: DecodeWindowBucket);
                     else
                         flash.LaunchDecodeRows(Ptr(q), Ptr(kc), Ptr(vc), cap, count, window, 0, heads, kvHeads, d, scale, splits, partialPtr,
-                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount), IntPtr.Zero, stride);
+                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount), IntPtr.Zero, stride, windowKeys: selectionKeys,
+                            bucket: DecodeWindowBucket);
                 });
             }
             results[0] = output;
@@ -2048,6 +2070,20 @@ namespace TensorSharp.Cuda
                 return base.Sqrt(x);
             var result = new Tensor(Allocator, DType.Float32, x.Sizes);
             Launch(new[] { x }, result, (k, stream) => k.LaunchSqrt(Ptr(x), Ptr(result), x.ElementCount(), stream));
+            return result;
+        }
+
+        /// <summary>ggml_gelu_erf as one kernel. The generic decomposition's abs and exp have no CUDA kernels: each ran on the
+        /// element-by-element host fallback, a device-to-host and back round trip: a Muse-Glimmer vision tower's 52 GELUs over
+        /// [patches, 8960] kept a 448 x 224 image's encode at 16.6 s, 0.15 s of it on the device (RTX PRO 4500 Blackwell, nsys).</summary>
+        protected override Tensor GeluErf(Tensor x)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || x.Storage is not CudaStorage || x.ElementType != DType.Float32)
+                return base.GeluErf(x);
+            using Tensor dense = x.IsContiguous() ? x.CopyRef() : Ops.NewContiguous(x);
+            var result = new Tensor(Allocator, DType.Float32, x.Sizes);
+            Launch(new[] { dense }, result, (k, stream) => k.LaunchGeluErf(Ptr(dense), Ptr(result), dense.ElementCount(), stream));
             return result;
         }
 
@@ -4694,6 +4730,35 @@ namespace TensorSharp.Cuda
             return product;
         }
 
+        /// <summary>The dense row kernels over q8_1 rows for a decode-size product of the IQ2 formats: IQ2_XXS and IQ2_XS
+        /// (Dsv4Kernels.DenseQ81RowsSupports), and IQ2_S where the module decodes the low-bit IQ formats. Null otherwise, for
+        /// any format DecodeOnce takes, and in a program whose products keep their activations in F32 (FloatProducts): these
+        /// kernels read q8_1 rows, and such a program keeps the F32 route it had. The IQ3 formats take
+        /// <see cref="DenseF32Rows"/>.</summary>
+        private Dsv4Kernels DenseRows(int type, long inDim, IGraphWeight weight)
+        {
+            if (FloatProducts) return null;
+            if (type is not (16 or 17 or 22) || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0 || inDim > int.MaxValue) return null;
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing((CudaAllocator)Allocator))) return null;
+            Dsv4Kernels dk = MoeKernels;
+            if (dk == null) return null;
+            bool reads = type == 22 ? dk.DecodesLowBitIqExperts && inDim % 256 == 0 : Dsv4Kernels.DenseQ81RowsSupports(type, (int)inDim);
+            return reads ? dk : null;
+        }
+
+        /// <summary>The dense row kernels over F32 activations (Dsv4Kernels.DenseF32Rows) for a decode-size product of the IQ3
+        /// formats, IQ3_XXS and IQ3_S. Null for other formats, where the module has no such kernel, and in a FloatProducts
+        /// program (which keeps the F32 route it had).</summary>
+        private Dsv4Kernels DenseF32Rows(int type, long inDim, IGraphWeight weight)
+        {
+            if (FloatProducts) return null;
+            if (type is not (18 or 21) || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0 || inDim > int.MaxValue
+                || !Dsv4Kernels.DenseF32RowsSupports(type, (int)inDim)) return null;
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing((CudaAllocator)Allocator))) return null;
+            Dsv4Kernels dk = MoeKernels;
+            return dk != null && dk.HasDenseF32Rows ? dk : null;
+        }
+
         private Dsv4Kernels DecodeOnce(int type, long inDim, long rows, IGraphWeight weight)
         {
             if (rows > 8 || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0) return null;
@@ -4740,10 +4805,42 @@ namespace TensorSharp.Cuda
         /// rows run on them in pieces of that many.</summary>
         private const int DecodeOnceRows = 8, DenseDecodeRows = 32;
 
+        /// <summary>
+        /// A program whose products keep their activations in F32 (<see cref="TensorGraphExecutor.FloatProducts"/>, a vision tower
+        /// held to its F32 oracle): a q8_0 weight's values as F32 (code * d, ggml's dequantize_row_q8_0) times the F32 rows on
+        /// cuBLAS in F32, the arithmetic of a per-op tower that dequantized its weights at load. The weight stays resident in
+        /// q8_0; its F32 copy lives for the call. The executor's own products quantize the activations to q8_1 (the int8
+        /// tensor-core GEMM, up to 512 rows) or round them to half (the F16 GEMM past that): over the 50 layers of the
+        /// Muse-Glimmer tower that left its rows at cosine 0.9975 (worst row 0.94) from the F32 per-op tower's on a 448 x 168
+        /// image and 0.9999-0.99999 on 448 x 448 and larger ones; with the F32 copies, cosine 1.0000000 on all nine images
+        /// (relative L2 1e-5 to 3e-5), in 0.1-0.35x the per-op tower's time (RTX PRO 4500 Blackwell).
+        /// </summary>
+        private Tensor FloatQ8Product(IGraphWeight weight, Tensor x)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;
+            if (Kernels == null || weight.Format != GraphFormat.Q8_0 || weight.Ne2 > 1 || inDim % 32 != 0 || inDim > int.MaxValue
+                || outDim > int.MaxValue || rows < 1 || rows > int.MaxValue || weight.Bytes != outDim * (inDim / 32) * 34
+                || x.Storage is not CudaStorage || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() != rows * inDim
+                || weight.CacheKey == IntPtr.Zero || CudaGraphCapture.IsCapturing(cuda)
+                || !CudaQuantizedOps.TryEnsureResident(cuda, weight.CacheKey, weight.Data, weight.Format, inDim, outDim, weight.Bytes, out _, out _)
+                || !CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type) || type != GraphFormat.Q8_0)
+                return null;
+            using var values = new Tensor(Allocator, DType.Float32, outDim, inDim);
+            var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+            Launch(new[] { x, values }, product, (k, stream) =>
+            {
+                k.LaunchQ8WeightToF32(wPtr, Ptr(values), outDim * (inDim / 32), stream);
+                CudaQuantizedOps.RunF32Gemm(cuda, Ptr(values), Ptr(x), Ptr(product), (int)inDim, (int)outDim, (int)rows);
+            });
+            return product;
+        }
+
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
             if (_deferredNorms.Count > 0 && DeferredNormProduct(weight, x) is { } normedProduct) return normedProduct;
             ReadNow(x);
+            if (FloatProducts && FloatQ8Product(weight, x) is { } floatProduct) return floatProduct;
             var cuda = (CudaAllocator)Allocator;
             long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;
             // A decode-size product chooses its kernel by the weight's resident copy: made resident first, so a weight's first
@@ -4821,11 +4918,36 @@ namespace TensorSharp.Cuda
                 ((CudaStorage)product.Storage).MarkDeviceModified();
                 return product;
             }
+            // The IQ3 formats at decode size (decode steps, verify windows, several sequences' steps) over the step's F32 rows,
+            // up to 16 a call on Dsv4Kernels.DenseF32Rows: each row's sum is the one-row call's, bit for bit, and each weight row
+            // is read once a call. These had run one row on an F32 matvec and several on the scalar batched F32 kernel, so a
+            // verify row was not the decode step's and a verify window cost 2.6-7x a decode step. The IQ2 formats go to the q8_1
+            // dense rows below, but these do not: Muse-Glimmer-30B's UD-IQ2_XXS keeps FFN down in IQ3_XXS and attention output
+            // in IQ3_S, and with their one-row products over q8_1 rows the direct-CUDA image prompts' top-k log-probabilities
+            // moved from llama.cpp's by 0.1432 nat on average against 0.1163 over float activations (bound 0.1370), where the
+            // IQ2 formats' q8_1 rows changed no measured figure.
+            if (rows >= 1 && rows <= DenseDecodeRows && x.Storage is CudaStorage fs && x.ElementType == DType.Float32 && x.IsContiguous()
+                && x.ElementCount() == rows * inDim && inDim <= int.MaxValue && outDim <= int.MaxValue && cuda.Kernels != null
+                && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr fPtr, out int fType)
+                && DenseF32Rows(fType, inDim, weight) is { } f32Kernels)
+            {
+                var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+                ((CudaStorage)product.Storage).EnsureDeviceCurrent();
+                fs.EnsureDeviceCurrent();
+                cuda.Context.MakeCurrent();
+                for (long first = 0; first < rows; first += Dsv4Kernels.DenseMultiMaxRows)
+                    f32Kernels.DenseF32Rows(fPtr, Ptr(x) + (nint)(first * inDim * sizeof(float)), Ptr(product) + (nint)(first * outDim * sizeof(float)),
+                        fType, (int)outDim, (int)inDim, weight.Bytes / outDim, (int)Math.Min(Dsv4Kernels.DenseMultiMaxRows, rows - first),
+                        cuda.Stream.Handle);
+                ((CudaStorage)product.Storage).MarkDeviceModified();
+                return product;
+            }
             // A decode-size product over q8_1 activations the step already quantized (or quantizes now, once).
             if (rows >= 1 && rows <= DenseDecodeRows && x.Storage is CudaStorage xs && x.ElementType == DType.Float32 && x.IsContiguous()
                 && x.ElementCount() == rows * inDim && inDim % 32 == 0 && inDim <= int.MaxValue && outDim <= int.MaxValue
                 && cuda.Kernels != null && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type)
                 && (DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not null
+                    || DenseRows(type, inDim, weight) is not null
                     || (rows <= 16 && CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows))))
             {
                 Tensor xq = QuantizedOnce(cuda, x, xs, inDim, rows);
@@ -4845,6 +4967,24 @@ namespace TensorSharp.Cuda
                     for (long first = 0; first < rows; first += DecodeOnceRows)
                         dk.DenseQ81Rows(wPtr, Ptr(xq) + (nint)(first * qRow), Ptr(product) + (nint)(first * outDim * sizeof(float)), type,
                             (int)outDim, (int)inDim, weight.Bytes / outDim, (int)Math.Min(DecodeOnceRows, rows - first), cuda.Stream.Handle);
+                    ((CudaStorage)product.Storage).MarkDeviceModified();
+                    return product;
+                }
+                // A format the decode-once kernels do not read but the direct engines' dense row kernels do (the IQ2 formats of
+                // Unsloth's dynamic quants: Muse-Glimmer-30B's UD-IQ2_XXS keeps attention Q and gate in IQ2_XXS, FFN gate and up in
+                // IQ2_S): every row on Dsv4Kernels.DenseQ81Rows, up to 16 a call. Each row's dot is the one-row kernel's, bit for
+                // bit, and each weight row is read once per call. These had run one row on a q8_1 matvec and several on the scalar
+                // batched F32 kernel or a block per row, so a verify row was not the decode step's. A prompt chunk past 32 rows
+                // keeps the F16 tensor-core GEMM: its rows keep float activations, as the lane's first-position parity with
+                // llama.cpp's Metal set needs (the same kernels over a prompt's q8_1 rows put Muse-Glimmer's first positions
+                // 0.51-2.47 nats from it, against the test's bound of 0.15).
+                if (DenseRows(type, inDim, weight) is { } rowsKernels)
+                {
+                    long qRow = inDim / 32 * CudaKernels.Q81BlockBytes;
+                    for (long first = 0; first < rows; first += Dsv4Kernels.DenseMultiMaxRows)
+                        rowsKernels.DenseQ81Rows(wPtr, Ptr(xq) + (nint)(first * qRow), Ptr(product) + (nint)(first * outDim * sizeof(float)),
+                            type, (int)outDim, (int)inDim, weight.Bytes / outDim, (int)Math.Min(Dsv4Kernels.DenseMultiMaxRows, rows - first),
+                            cuda.Stream.Handle);
                     ((CudaStorage)product.Storage).MarkDeviceModified();
                     return product;
                 }

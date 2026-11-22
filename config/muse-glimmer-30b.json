@@ -1,7 +1,8 @@
 // Metadata-only source verification: config/regression/source-pins.json.
 // Public project-linked publisher, immutable revision plus SHA256 for every file.
 // No quality/device qualification is implied. The local runner budgets the complete shard group.
-// Projector optional for text, required and hash-verified for image tests; no learned draft enabled.
+// Projector optional for text, required and hash-verified for image tests. The DFlash drafter (dflash-kquant.gguf, the same
+// repository and revision) is pinned and engages by itself, as --draft-model does; drop "draft-model" for plain decoding.
 {
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
@@ -28,5 +29,12 @@
     ],
     "sha256": "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2",
     "optional": true
+  },
+  "draft-model": {
+    "path": "${root}/dflash-kquant.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/resolve/faa5b025c584459c13febfa5c59883516710ae39/dflash-kquant.gguf"
+    ],
+    "sha256": "27d9a805fa29b943cfb6ad4843367cd4eaaaf06bd452d8cc3e00a2cd18a677bc"
   }
 }

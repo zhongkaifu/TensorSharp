@@ -33,7 +33,6 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(GptOssModel))]
     [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(Mistral3Model))]
-    [InlineData(typeof(MuseGlimmerModel))]
     [InlineData(typeof(NemotronModel))]
     public void EveryEngineServedFamily_EnablesTreeWithoutAdvertisingUnavailableEndStates(Type family)
     {
@@ -75,7 +74,7 @@ public sealed class PrefixCacheFamilyCoverageTests
     {
         Type[] engineServed = typeof(ModelBase).Assembly.GetTypes()
             .Where(t => !t.IsAbstract && typeof(ModelBase).IsAssignableFrom(t)
-                        && (typeof(IBatchedPagedModel).IsAssignableFrom(t) || t == typeof(MuseGlimmerModel)))
+                        && typeof(IBatchedPagedModel).IsAssignableFrom(t))
             .OrderBy(t => t.Name)
             .ToArray();
         Assert.NotEmpty(engineServed);
@@ -86,8 +85,8 @@ public sealed class PrefixCacheFamilyCoverageTests
         }
         Assert.Equal(
             new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4Model", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
-                    "Inkling2RuntimeModel", "Lfm3RuntimeModel", "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerModel", "MuseSparkModel", "NemotronModel",
-                    "Qwen35RuntimeModel", "Qwen4ExpRuntimeModel" },
+                    "Inkling2RuntimeModel", "Lfm3RuntimeModel", "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerRuntimeModel",
+                    "MuseSparkModel", "NemotronModel", "Qwen35RuntimeModel", "Qwen4ExpRuntimeModel" },
             engineServed.Select(t => t.Name).ToArray());
     }
 
@@ -99,13 +98,9 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(Qwen35RuntimeModel))]
     [InlineData(typeof(Qwen4ExpRuntimeModel))]
+    [InlineData(typeof(MuseGlimmerRuntimeModel))]
     public void HolderFamilies_UseTheHolderAdapter(Type family)
         => Assert.True(typeof(IHolderPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IHolderPrefixCacheModel");
-
-    [Theory]
-    [InlineData(typeof(MuseGlimmerModel))]
-    public void PageFamilies_RefuseEveryEndStateMember(Type family)
-        => Assert.True(typeof(IPageOnlyPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IPageOnlyPrefixCacheModel");
 
     /// <summary>Nemotron-H keeps each finished batched sequence's Mamba2 slot beside its pool blocks
     /// (<see cref="PrefixCacheCapabilities.PagedEndStates"/>), so it implements the end-state members itself.</summary>

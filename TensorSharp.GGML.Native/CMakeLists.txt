@@ -339,9 +339,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gemma4_batched.cpp
     ggml_ops_gemma4_verify.cpp
     ggml_ops_gemma4_moe.cpp
-    ggml_ops_muse_glimmer.cpp
     ggml_ops_muse_spark.cpp
-    ggml_ops_muse_glimmer_vision.cpp
     ggml_ops_minimax_m3_vision.cpp
     ggml_ops_dflash.cpp
     ggml_ops_dspine.cpp

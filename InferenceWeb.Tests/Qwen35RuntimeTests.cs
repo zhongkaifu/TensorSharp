@@ -410,14 +410,24 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense", KvCacheDtype.F16)]
     [InlineData("dense-tied", KvCacheDtype.F16)]
     [InlineData("moe-tp", KvCacheDtype.F32)]
-    public void GgmlCudaRankGraphsMatchOneDevice(string variant, KvCacheDtype kv)
+    public void GgmlCudaRankGraphsMatchOneDevice(string variant, KvCacheDtype kv) => GgmlRankGraphsMatchOneDevice(BackendType.GgmlCuda, variant, kv);
+
+    /// <summary>The same over two ggml_vulkan GPUs, whose partials sum through host staging (no device collective).</summary>
+    [GgmlTheory(BackendType.GgmlVulkan, Devices = 2)]
+    [InlineData("dense", KvCacheDtype.F32)]
+    [InlineData("dense", KvCacheDtype.F16)]
+    [InlineData("dense-tied", KvCacheDtype.F16)]
+    [InlineData("moe-tp", KvCacheDtype.F32)]
+    public void GgmlVulkanRankGraphsMatchOneDevice(string variant, KvCacheDtype kv) => GgmlRankGraphsMatchOneDevice(BackendType.GgmlVulkan, variant, kv);
+
+    private void GgmlRankGraphsMatchOneDevice(BackendType backend, string variant, KvCacheDtype kv)
     {
         KvCacheDtypeConfig.RestoreForTests(kv, true);
         string path = Fixture(variant);
         List<float[]> reference;
-        using (var single = Create(path, backend: BackendType.GgmlCuda))
+        using (var single = Create(path, backend: backend))
             reference = Script(single);
-        using var placed = new Qwen35RuntimeModel(path, BackendType.GgmlCuda, 2, null, 1);
+        using var placed = new Qwen35RuntimeModel(path, backend, 2, null, 1);
         Assert.Equal(2, placed.Mesh.TensorParallel);
         List<float[]> actual = Script(placed);
         Assert.True(placed.GraphRuns > 0 && placed.GraphReplays > 0, $"{variant}: the per-rank graphs did not run and replay");
@@ -2714,6 +2724,39 @@ public sealed class Qwen35RuntimeTests : IDisposable
             "the running request is untouched by the refusal");
 
         memory = (64 * gb, 64 * gb);
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        Assert.Equal(0, unified.EnsureSequenceSlot("second", 64));
+    }
+
+    /// <summary>Memory claimed on the GGML device (<see cref="GpuMemoryBudget.Reserve"/>: a loaded vision tower's weights before
+    /// the first image uploads them, and its largest image's compute) counts as taken: a second request's slot that fits the
+    /// free memory beside the headroom only with the claim counted as free waits, and the prefix cache is asked for the
+    /// difference; once the claim is given up the slot is made (ggml_cuda, and ggml_metal's working set). The model names a
+    /// device no real reading uses, so the claim reaches no other test.</summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlCuda)]
+    public void NewSlotsLeaveReservedDeviceMemoryOnCuda(BackendType backend) => AssertSlotsLeaveReservedDeviceMemory(backend);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlMetal)]
+    public void NewSlotsLeaveReservedDeviceMemoryOnMetal(BackendType backend) => AssertSlotsLeaveReservedDeviceMemory(backend);
+
+    private void AssertSlotsLeaveReservedDeviceMemory(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var model = Create(Fixture("dense"), backend: backend);
+        const long gb = 1L << 30;
+        const int device = 1 << 20;
+        model.DeviceMemoryProbe = () => (8 * gb, 64 * gb);   // 2 GB headroom
+        model.ReservationDeviceForTests = (backend, device);
+        var unified = (IUnifiedBatchModel)model;
+        Assert.Equal(0, unified.EnsureSequenceSlot("lone", 64));
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        using (GpuMemoryBudget.Reserve(backend, device, "a vision tower", 7 * gb))
+        {
+            Assert.True(model.DeviceSlotDeficitBytes >= gb, "the claim is what the device lacks of its headroom");
+            Assert.Throws<TensorSharp.Runtime.Scheduling.SequenceSlotUnavailableException>(() => unified.EnsureSequenceSlot("second", 64));
+        }
         Assert.Equal(0, model.DeviceSlotDeficitBytes);
         Assert.Equal(0, unified.EnsureSequenceSlot("second", 64));
     }

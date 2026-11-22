@@ -3105,7 +3105,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             var profile = SpeculationGovernorFactory.Describe(target, speculator,
                 CanUseFixedGovernorGreedyProfile(sequence, FirstTokenLogitsDump.IsArmed || _cbDebug),
-                SpeculationCostGovernor.AdaptiveEnvironmentSnapshot);
+                Speculation.GovernorDisabledForTests ? "0" : SpeculationCostGovernor.AdaptiveEnvironmentSnapshot);
             return SpeculationGovernorFactory.Share(ref _sharedGovernor, ref _sharedGovernorProfile, profile);
         }
 
@@ -3646,6 +3646,9 @@ namespace TensorSharp.Runtime.Scheduling
         /// sequence's window in one trunk forward).</summary>
         internal long BatchedSpeculativeSteps => _batchedSpecSteps;
 
+        /// <summary>Tests: each batched verify as the trunk ran it (<see cref="BatchedVerifyRecord"/>).</summary>
+        internal Action<BatchedVerifyRecord>? SpecVerifyObserverForTests { get; set; }
+
         /// <summary>
         /// One speculative step for SEVERAL decoding sequences on their per-request
         /// holders: each drafts a window with its own drafter state, the trunk
@@ -3763,6 +3766,9 @@ namespace TensorSharp.Runtime.Scheduling
                 kMaxes = new int[n];
             }
             long started = Timestamp();
+            // A step serving one sequence is its solo decode step, which the cost governor judges (SpeculativeExecution.
+            // BeginSoloBatchStep): a step it declines verifies the anchor alone, and the step's time is its sample.
+            bool solo = n == 1;
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
@@ -3771,13 +3777,14 @@ namespace TensorSharp.Runtime.Scheduling
                 requestIds[i] = seq.RequestId;
                 positions[i] = prev;
                 anchors[i] = peeked[i];
+                bool governorAllows = !solo || ctx.Exec.BeginSoloBatchStep();
                 // Same window caps as the solo step: the token budget after the anchor,
                 // the blocks the scheduler reserved, no window from a stop token, and
                 // none from a token the repetition guard is about to stop at.
                 int kMax = Math.Min(window - 1, Math.Min(
                     seq.MaxNewTokens - seq.OutputTokens.Count - 1,
                     seq.BlockTable.FreeSlotsInCurrentBlocks - 1));
-                if (IsStop(seq, anchors[i]))
+                if (IsStop(seq, anchors[i]) || !governorAllows)
                     kMax = 0;
                 if (kMax > 0 && stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true))
                 {
@@ -3991,6 +3998,8 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             batched.CommitBatchedSpecVerify(requestIds, positions, kept);
+            SpecVerifyObserverForTests?.Invoke(new BatchedVerifyRecord((string[])requestIds.Clone(), (int[])positions.Clone(), window,
+                (int[])tokens.Clone(), (int[])kept.Clone(), sampledVerify ? null : (int[])drawn.Clone(), sampledVerify ? rowLogits : null, vocab));
             long committed = Timestamp();
             // The anchors' and rows' draws, the acceptance and the trunk's commit of the kept rows.
             long commitTicks = committed - verified;
@@ -4004,6 +4013,9 @@ namespace TensorSharp.Runtime.Scheduling
                 batched.BindDraftState(seq.RequestId);
                 ctx.Exec.CommitBatch(anchors[i], positions[i], drafts[i], m,
                     rowFeatures, (long)i * window * feat, verifyTicks / n, commitTicks / n);
+                // The solo step's sample: its draft, verify, draws, commit and the drafter's catch-up.
+                if (solo)
+                    ctx.Exec.EndSoloBatchStep(kept[i], Timestamp() - started);
                 int next = nexts[i];
                 seq.LastLogits = null;
                 seq.AdvanceComputedTokens(kept[i]);
@@ -5578,4 +5590,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// logits, not just the last position.</summary>
         public float[]? CaptureLogitsAll { get; init; }
     }
+
+    /// <summary>One batched verify as the trunk ran it (<see cref="BatchExecutor.SpecVerifyObserverForTests"/>): the requests,
+    /// the positions of their windows' first tokens, the window's rows, the windows' tokens (request i's from i * window, padded
+    /// with its last draft), the rows each kept (its window's first token and its accepted drafts), and the rows' draws: the
+    /// device's argmax of each row on a greedy verify, or every row's logits ([requests x window x vocab], valid only during
+    /// the callback) on a sampled one.</summary>
+    internal sealed record BatchedVerifyRecord(string[] Ids, int[] Positions, int Window, int[] Tokens, int[] Kept, int[]? Drawn,
+        float[]? Logits, int Vocab);
 }

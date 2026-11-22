@@ -29,22 +29,16 @@ namespace TensorSharp.Models
     /// instead of <c>ElementType.Size()</c>, which is the only safe way to address
     /// Q8_0 at offsets other than zero.
     ///
-    /// A cache tensor is addressed one of two ways:
-    ///  - LINEAR (the default): row index == absolute token position, so the tensor
-    ///    must have at least <c>startToken + tokenCount</c> rows.
-    ///  - RING: row index == <c>position % rows</c>, and only the most recent
-    ///    <c>rows</c> positions are physically present. Muse-Glimmer sizes its
-    ///    sliding-window layers this way (see <c>MuseGlimmerModel._kvSwaRows</c>) so
-    ///    a 64K context does not pay for 64K rows on the 39 layers that never look
-    ///    back further than the window. Callers opt in per model by passing
-    ///    <c>ringRows</c>; a tensor is treated as a ring exactly when its row count
-    ///    equals that value.
+    /// A cache tensor's row index is the absolute token position, so the tensor must
+    /// have at least <c>startToken + tokenCount</c> rows. (Ring addressing, row
+    /// <c>position % rows</c>, served only the legacy Muse-Glimmer model and went with
+    /// it in stage S9 of docs/design/muse-glimmer-unified.md.)
     ///
     /// Every range is validated against each tensor's OWN row count before a single
-    /// byte moves. That check is what stops a short ring layer from being addressed
-    /// as if it had the full context's rows - which read past the end of the
-    /// storage and faulted the process (AccessViolationException in
-    /// <c>Buffer.MemoryCopy</c>) once a Muse-Glimmer sequence passed the ring size.
+    /// byte moves. That check is what stops a short layer from being addressed as if
+    /// it had the full context's rows - which read past the end of the storage and
+    /// faulted the process (AccessViolationException in <c>Buffer.MemoryCopy</c>)
+    /// once a legacy Muse-Glimmer sequence passed its ring size.
     /// </summary>
     internal static class KvBlockTransfer
     {
@@ -66,8 +60,6 @@ namespace TensorSharp.Models
             return total;
         }
 
-        /// <param name="ringRows">Row count that identifies a ring-addressed layer,
-        /// or 0 when every layer is linear. See the type remarks.</param>
         public static bool Extract(
             IAllocator allocator,
             Tensor[] kCache,
@@ -75,8 +67,7 @@ namespace TensorSharp.Models
             int currentSeqLen,
             int startToken,
             int tokenCount,
-            Span<byte> destination,
-            int ringRows = 0)
+            Span<byte> destination)
         {
             if (!ValidateArgs(kCache, vCache, tokenCount))
                 return false;
@@ -88,21 +79,19 @@ namespace TensorSharp.Models
             // Validate every layer BEFORE moving any bytes: a mid-way bail-out would
             // leave the caller holding a half-written block that looks like a failure
             // but has already clobbered its scratch buffer.
-            if (!ValidateRows(kCache, vCache, currentSeqLen, startToken, tokenCount, ringRows, reading: true))
+            if (!ValidateRows(kCache, vCache, startToken, tokenCount))
                 return false;
 
             int offset = 0;
             foreach (var t in EnumerateUniqueStorageTensors(kCache, vCache))
             {
-                if (!CopyOneOut(t, RowStart(t, startToken, ringRows), tokenCount, destination[offset..], out int written))
+                if (!CopyOneOut(t, startToken, tokenCount, destination[offset..], out int written))
                     return false;
                 offset += written;
             }
             return true;
         }
 
-        /// <param name="ringRows">Row count that identifies a ring-addressed layer,
-        /// or 0 when every layer is linear. See the type remarks.</param>
         public static bool Inject(
             IAllocator allocator,
             Tensor[] kCache,
@@ -110,28 +99,24 @@ namespace TensorSharp.Models
             int currentSeqLen,
             int destToken,
             int tokenCount,
-            ReadOnlySpan<byte> source,
-            int ringRows = 0)
+            ReadOnlySpan<byte> source)
         {
             if (!ValidateArgs(kCache, vCache, tokenCount))
                 return false;
             // We only permit appending in order. Higher-level code resets the cache
-            // before restoration and accumulates blocks from position 0 onward. That
-            // ordering is also what makes ring layers restorable: replaying the
-            // positions in the order the original forward wrote them leaves the ring
-            // holding exactly the rows a real prefill would have left.
+            // before restoration and accumulates blocks from position 0 onward.
             if (destToken != currentSeqLen)
                 return false;
             long expected = ComputeBlockByteSize(kCache, vCache, tokenCount);
             if (source.Length != expected)
                 return false;
-            if (!ValidateRows(kCache, vCache, currentSeqLen, destToken, tokenCount, ringRows, reading: false))
+            if (!ValidateRows(kCache, vCache, destToken, tokenCount))
                 return false;
 
             int offset = 0;
             foreach (var t in EnumerateUniqueStorageTensors(kCache, vCache))
             {
-                if (!CopyOneIn(t, RowStart(t, destToken, ringRows), tokenCount, source[offset..], out int read))
+                if (!CopyOneIn(t, destToken, tokenCount, source[offset..], out int read))
                     return false;
                 offset += read;
             }
@@ -196,43 +181,16 @@ namespace TensorSharp.Models
         /// of bounds - whenever the requested positions are not addressable in that
         /// tensor's own rows.
         /// </summary>
-        private static bool ValidateRows(
-            Tensor[] kCache,
-            Tensor[] vCache,
-            int currentSeqLen,
-            int position,
-            int tokenCount,
-            int ringRows,
-            bool reading)
+        private static bool ValidateRows(Tensor[] kCache, Tensor[] vCache, int position, int tokenCount)
         {
             foreach (var t in EnumerateUniqueStorageTensors(kCache, vCache))
             {
                 long rows = t.Sizes[1];
-                if (rows <= 0)
+                if (rows <= 0 || (long)position + tokenCount > rows)
                     return false;
-                if (IsRing(t, ringRows))
-                {
-                    // A block wider than the ring would alias onto itself.
-                    if (tokenCount > rows)
-                        return false;
-                    // The ring physically holds only [currentSeqLen - rows, currentSeqLen).
-                    // Anything older has been overwritten and cannot be recovered.
-                    if (reading && (long)currentSeqLen - position > rows)
-                        return false;
-                }
-                else if ((long)position + tokenCount > rows)
-                {
-                    return false;
-                }
             }
             return true;
         }
-
-        private static bool IsRing(Tensor tensor, int ringRows)
-            => ringRows > 0 && tensor.Sizes[1] == ringRows;
-
-        private static long RowStart(Tensor tensor, int position, int ringRows)
-            => IsRing(tensor, ringRows) ? position % tensor.Sizes[1] : position;
 
         private static long PerLayerBlockBytes(Tensor tensor, int tokenCount)
         {
@@ -262,7 +220,7 @@ namespace TensorSharp.Models
             long blockBytes = numKVHeads * tokenCount * rowBytes;
             if (destination.Length < blockBytes)
                 return false;
-            if (rowStart < 0 || rowStart >= rows || tokenCount > rows)
+            if (rowStart < 0 || rowStart + tokenCount > rows)
                 return false;
 
             // Read only: PtrAtElement would mark a direct-CUDA cache host-dirty, and the next K/V
@@ -270,12 +228,6 @@ namespace TensorSharp.Models
             IntPtr storageBase = cacheTensor.Storage.PtrAtElementForRead(0);
             if (storageBase == IntPtr.Zero)
                 return false;
-
-            // On a ring layer the run [rowStart, rowStart+tokenCount) can spill past
-            // the last row and continue at row 0; split it so both halves stay inside
-            // the head's row span. Linear layers always take the first branch only.
-            long headRows = Math.Min(tokenCount, rows - rowStart);
-            long wrapRows = tokenCount - headRows;
 
             unsafe
             {
@@ -291,16 +243,7 @@ namespace TensorSharp.Models
                             src + headBase + rowStart * rowBytes,
                             dstBase + dstOffset,
                             destination.Length - dstOffset,
-                            headRows * rowBytes);
-                        if (wrapRows > 0)
-                        {
-                            long wrapDst = dstOffset + headRows * rowBytes;
-                            Buffer.MemoryCopy(
-                                src + headBase,
-                                dstBase + wrapDst,
-                                destination.Length - wrapDst,
-                                wrapRows * rowBytes);
-                        }
+                            perHead);
                     }
                 }
             }
@@ -320,15 +263,13 @@ namespace TensorSharp.Models
             long blockBytes = numKVHeads * tokenCount * rowBytes;
             if (source.Length < blockBytes)
                 return false;
-            if (rowStart < 0 || rowStart >= rows || tokenCount > rows)
+            if (rowStart < 0 || rowStart + tokenCount > rows)
                 return false;
 
             IntPtr storageBase = cacheTensor.Storage.PtrAtElement(0);
             if (storageBase == IntPtr.Zero)
                 return false;
 
-            long headRows = Math.Min(tokenCount, rows - rowStart);
-            long wrapRows = tokenCount - headRows;
             long storageBytes = cacheTensor.Storage.ByteLength;
 
             unsafe
@@ -346,15 +287,7 @@ namespace TensorSharp.Models
                             srcBase + srcOffset,
                             dst + dstOffset,
                             storageBytes - dstOffset,
-                            headRows * rowBytes);
-                        if (wrapRows > 0)
-                        {
-                            Buffer.MemoryCopy(
-                                srcBase + srcOffset + headRows * rowBytes,
-                                dst + headBase,
-                                storageBytes - headBase,
-                                wrapRows * rowBytes);
-                        }
+                            perHead);
                     }
                 }
             }

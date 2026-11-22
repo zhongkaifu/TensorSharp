@@ -328,6 +328,15 @@ namespace TensorSharp.Cuda
                 computeType, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
         }
 
+        /// <summary>F32 activations [rows, inDim] times an F32 weight [outDim, inDim] (row-major, on the device) to F32 [rows,
+        /// outDim], on cuBLAS with F32 operands and F32 math (<c>CUBLAS_COMPUTE_32F_PEDANTIC</c>, as for an F32 weight's resident
+        /// product).</summary>
+        internal static void RunF32Gemm(CudaAllocator allocator, IntPtr weightF32, IntPtr inputPtr, IntPtr resultPtr, int inDim, int outDim, int rows)
+        {
+            allocator.Context.MakeCurrent();
+            RunGemm(allocator, weightF32, CublasApi.CUDA_R_32F, inputPtr, CublasApi.CUDA_R_32F, resultPtr, inDim, outDim, rows);
+        }
+
         /// <summary>
         /// A prompt-size product through an F16 copy of the weight dequantized for the call and the tensor-core GEMM (the
         /// route <see cref="RunResidentMatmul"/> takes for large batches), for a layout the shared route does not list

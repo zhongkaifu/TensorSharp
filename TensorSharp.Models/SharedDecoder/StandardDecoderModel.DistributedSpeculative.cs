@@ -126,6 +126,7 @@ namespace TensorSharp.Models
                 float[] logits = _mesh.TensorParallel == 1
                     ? ForwardLayerPipeline(tokens, Embed, runLayer: (hidden, layer) =>
                     {
+                        hidden = StreamAt(hidden, layer);
                         Capture(layer, hidden);
                         return LayerOnOneDevice(hidden, layer, positions, null);
                     }, Project, outputFloats)

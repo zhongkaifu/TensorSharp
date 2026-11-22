@@ -25,6 +25,43 @@
           "size_bytes": 2051685088,
           "sha256": "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2",
           "role": "projector"
+        },
+        {
+          "path": "dflash-kquant.gguf",
+          "size_bytes": 1631205312,
+          "sha256": "27d9a805fa29b943cfb6ad4843367cd4eaaaf06bd452d8cc3e00a2cd18a677bc",
+          "role": "drafter"
+        }
+      ]
+    },
+    {
+      "repository": "unsloth/Muse-Glimmer-30B-GGUF",
+      "revision": "faa5b025c584459c13febfa5c59883516710ae39",
+      "architecture": "muse-glimmer",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/Muse-Glimmer-30B-GGUF/revision/faa5b025c584459c13febfa5c59883516710ae39?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/tree/faa5b025c584459c13febfa5c59883516710ae39",
+      "metadata_sha256": "5f351da9fe22cc74b98d31d0fbcaf1fa78eda1113c211bd51d326916fcaeb4bc",
+      "metadata_bytes": 13872,
+      "gated": false,
+      "config": "config/muse-glimmer-30b-iq2xxs.json",
+      "files": [
+        {
+          "path": "Muse-Glimmer-30B-UD-IQ2_XXS.gguf",
+          "size_bytes": 10746373152,
+          "sha256": "3e9bd0e609df9d0121ba18c6556de496e7be880184cf22c5dbafbc0600875ad9",
+          "role": "weights"
+        },
+        {
+          "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+          "size_bytes": 2051685088,
+          "sha256": "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2",
+          "role": "projector"
+        },
+        {
+          "path": "dflash-kquant.gguf",
+          "size_bytes": 1631205312,
+          "sha256": "27d9a805fa29b943cfb6ad4843367cd4eaaaf06bd452d8cc3e00a2cd18a677bc",
+          "role": "drafter"
         }
       ]
     },
