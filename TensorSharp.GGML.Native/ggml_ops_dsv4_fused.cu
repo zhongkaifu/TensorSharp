@@ -1106,7 +1106,7 @@ static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, g
             d->device_launch(d->object, node, (void *) stream, c->device);
             CUDA_CHECK(cudaSetDevice(c->device));
         }
-        else if (d->kind == TSG_MSA_ATTENTION)
+        else if (d->kind == TSG_MSA_ATTENTION || d->cuda_compute != nullptr)   // MiniMax-M3 MSA; Inkling 2 (tsg_inkling_fused.h)
         {
             GGML_ASSERT(d->cuda_compute != nullptr);
             d->cuda_compute(node, c->cuda_backend);

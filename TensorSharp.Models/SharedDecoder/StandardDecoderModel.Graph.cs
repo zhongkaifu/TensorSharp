@@ -2424,6 +2424,11 @@ namespace TensorSharp.Models
         /// ([<paramref name="keys"/>, its rows], F16, causal) unless the family narrows it (Qwen 3.8's QSA selection).</summary>
         protected virtual int EmitAttentionMask(GraphStep step, int layer, int x, int s, int mask, int keys) => mask;
 
+        /// <summary>True where <see cref="EmitAttentionCore"/> attends the decode rows' cache windows with a kernel of the
+        /// family's own that reads a strided window (not the backend's flash attention): the windows are then views, never
+        /// the contiguous copies ggml-cuda's flash attention needs of a strict sub-range (a KvWindow gqa of -1).</summary>
+        protected virtual bool AttendsStridedWindows => false;
+
         /// <summary>Which positions an attention's keys hold, for a family whose scores depend on the query-key distance:
         /// key j holds position <see cref="FirstPosition"/> + j where <see cref="Ring"/> is 0; otherwise the keys are a ring's
         /// cells, cell c holding the latest position p &lt;= <see cref="RowStart"/> + <see cref="Rows"/> - 1 with p mod Ring = c
@@ -2667,7 +2672,7 @@ namespace TensorSharp.Models
                     int rowsAt = step.RingWriteRows(start, count, s, ring);
                     step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, rowsAt));
                     step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, rowsAt));
-                    int gqa = heads / kvHeads;
+                    int gqa = AttendsStridedWindows ? -1 : heads / kvHeads;
                     int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, ring, kvType, count, gqa });
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
                     int mask = step.RingBandMask(ring, start, count, s, band);
@@ -2746,7 +2751,7 @@ namespace TensorSharp.Models
                     int first = band > 0 && !capacity ? SlidingWindowFirstCell(start, band, stepRows) : 0;
                     if (band > 0 && !capacity) step.LimitAdvance(start, first + stepRows + band - 1, s);
                     int keys = window - first;
-                    int gqa = heads / kvHeads;
+                    int gqa = AttendsStridedWindows ? -1 : heads / kvHeads;
                     int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, first, keys, kvType, count, gqa });
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, first, keys, kvType, count, gqa });
                     bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));

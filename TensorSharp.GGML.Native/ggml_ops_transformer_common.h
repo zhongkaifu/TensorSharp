@@ -312,6 +312,10 @@ namespace tsg
     {
         if (g_backend_type != BACKEND_TYPE_CUDA)
             return false;
+        // A ratio of -1: the window is read by a kernel of the family's own that takes strided views (Inkling 2's fused
+        // attention, StandardDecoderModel.AttendsStridedWindows), not by flash attention.
+        if (fattn_gqa_ratio < 0)
+            return false;
         // Diagnostic kill-switch (TS_KV_FATTN_COPY=0): hand flash attention the
         // raw strided views again. This is how the fault is REPRODUCED for an
         // A/B inside one binary - never set it in production.

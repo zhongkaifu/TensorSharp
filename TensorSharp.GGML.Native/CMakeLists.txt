@@ -447,6 +447,10 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu ggml_ops_deepseek41_tp_cuda.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_minimax_msa.cu)
+    # Inkling 2's fused stages (tsg_cuda_inkling_fused.cu), launched by the fused-op backend.
+    list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_inkling_fused.cu tsg_cuda_graph_keys.cu)
+    # ggml-cuda's graph table as ggml-cuda sees it (its directory alone defines GGML_CUDA_USE_GRAPHS; GGML_CUDA_GRAPHS is on).
+    set_source_files_properties(tsg_cuda_graph_keys.cu PROPERTIES COMPILE_DEFINITIONS GGML_CUDA_USE_GRAPHS)
     # MiniMax-H3's wide Q4_K projections on cuBLAS BF16 (tsg_cuda_q4k_gemm.cu).
     list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_q4k_gemm.cu)
     # MiniMax-H3's fused DiT stages: attention prep, modulation, gated residual (tsg_cuda_h3_fused.cu).

@@ -101,6 +101,9 @@ namespace TensorSharp.Graph
         /// The shared runtime gives prompt chunks' masks so (more rows than a verify window: never replayed, advanced or
         /// recorded); decode rows and verify windows keep their host values, which their advances move on.</summary>
         public bool StructuralCausalMasks { get; init; }
+        /// <summary>Serves <see cref="GraphFusion.InklingAttention"/> regions (a relative-bias attention whose keys are
+        /// found from the positions: no mask, no distance index) as one kernel.</summary>
+        public bool RelativeBiasAttention { get; init; }
     }
 
     /// <summary>A stable identity for a storage object, for program signatures of executors that bind

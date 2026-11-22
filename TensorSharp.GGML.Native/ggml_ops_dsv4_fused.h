@@ -87,6 +87,7 @@ struct tsg_dsv4_fused_desc
     uint64_t magic = TSG_DSV4_FUSED_MAGIC;
     int32_t  kind = 0;
     int32_t  i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+    int32_t  i4 = 0, i5 = 0;   // kinds that need more integers (Inkling 2's attention)
     float    f0 = 0.0f, f1 = 0.0f;
     // TSG_DSV41_TP_MOE only. Function pointers keep the fused backend free of
     // a link dependency on the TP executor. Neither hook lets an exception out

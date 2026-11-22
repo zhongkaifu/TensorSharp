@@ -145,12 +145,15 @@ namespace TensorSharp.Models
         {
             int h = Config.HiddenSize;
             float scale = 1.0f / MathF.Sqrt(h);
+            step.BeginFused(GraphFusion.InklingMix, stackalloc[] { states, query }, default, stackalloc[] { MixEps, scale });
             int s = RmsNoWeight(step, step.Cont(states), MixEps);                                   // [h, n, rows]
             int scores = step.Op(GraphOp.MulMat, query, s);                                      // [queries, n, rows]
             scores = step.Cont(step.Permute(scores, 1, 0, 2, 3));                                    // [n, queries, rows]
             int probs = step.Op(GraphOp.SoftMaxExt, stackalloc[] { scores }, default, stackalloc[] { scale, 0f });
             int sT = step.Cont(step.Transpose(s));                                                   // [n, h, rows]
-            return step.Op(GraphOp.MulMat, sT, probs);                                               // [h, queries, rows]
+            int mix = step.Op(GraphOp.MulMat, sT, probs);                                            // [h, queries, rows]
+            step.EndFused(stackalloc[] { mix });
+            return mix;
         }
 
         private int QueryWeight(GraphStep step, string name, int queries)
@@ -170,11 +173,19 @@ namespace TensorSharp.Models
         /// <summary><c>x - tanh(W_forget g) x + tanh(W_gain g) m</c>, <c>g = W_down [rms(x); rms(m)]</c>.</summary>
         private int Control(GraphStep step, int layer, int x, int message, string controller)
         {
+            string down = LayerName(layer, $"loop_{controller}_ctrl_down.weight"), gainW = LayerName(layer, $"loop_{controller}_ctrl_gain.weight"),
+                forgetW = LayerName(layer, $"loop_{controller}_ctrl_forget.weight");
+            x = step.Cont(x);
+            message = step.Cont(message);
+            step.BeginFused(GraphFusion.InklingControl, stackalloc[] { x, message, step.Weight(down), step.Weight(gainW), step.Weight(forgetW) },
+                default, stackalloc[] { MixEps });
             int g = step.Op(GraphOp.Concat, stackalloc[] { RmsNoWeight(step, x, MixEps), RmsNoWeight(step, message, MixEps) }, stackalloc long[] { 0 });
-            g = step.MatMul(LayerName(layer, $"loop_{controller}_ctrl_down.weight"), g);
-            int gain = step.Op(GraphOp.Tanh, step.MatMul(LayerName(layer, $"loop_{controller}_ctrl_gain.weight"), g));
-            int forget = step.Op(GraphOp.Tanh, step.MatMul(LayerName(layer, $"loop_{controller}_ctrl_forget.weight"), g));
-            return step.Op(GraphOp.Add, step.Op(GraphOp.Sub, x, step.Op(GraphOp.Mul, forget, x)), step.Op(GraphOp.Mul, gain, message));
+            g = step.MatMul(down, g);
+            int gain = step.Op(GraphOp.Tanh, step.MatMul(gainW, g));
+            int forget = step.Op(GraphOp.Tanh, step.MatMul(forgetW, g));
+            int y = step.Op(GraphOp.Add, step.Op(GraphOp.Sub, x, step.Op(GraphOp.Mul, forget, x)), step.Op(GraphOp.Mul, gain, message));
+            step.EndFused(stackalloc[] { y });
+            return y;
         }
 
         // ---------------------------------------------------------------- block inputs and outputs
@@ -297,7 +308,7 @@ namespace TensorSharp.Models
                 int ds = dynamic < 0 ? -1 : step.Cont(n == 1 ? dynamic : step.View2(dynamic, width, count, width * f, first * width * f));
                 // A verify window leaves the live window as it was and writes its inputs into the state's history at the window's
                 // own pitch, the layer's four convolutions each at its channels: the commit takes the accepted rows' window
-                // (CommitShortConvWindows).
+                // (CommitShortConvWindows). Its rows run as ops; a fused kernel advances the window.
                 bool verifying = step.RecurrentSnapshots && count > 1;
                 int historyLeaf = -1;
                 if (verifying)
@@ -305,6 +316,10 @@ namespace TensorSharp.Models
                     if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
                     historyLeaf = step.State(state.ConvHistory, GraphFormat.F32, history + state.SnapshotCapacity, _convChannels);
                 }
+                else if (ds >= 0)
+                    step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xs, window, kernel, ds }, stackalloc long[] { heads }, stackalloc[] { scale });
+                else
+                    step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xs, window, kernel }, stackalloc long[] { 0 }, stackalloc[] { scale });
                 int convIn = step.Op(GraphOp.Concat, stackalloc[] { window, step.Transpose(xs) }, stackalloc long[] { 0 });   // [taps - 1 + count, channels]
                 int conv = step.Op(GraphOp.SsmConv, convIn, kernel);                                               // [channels, count]
                 long pitch = (history + count) * f;
@@ -325,6 +340,7 @@ namespace TensorSharp.Models
                     // convIn is a fresh contiguous [taps - 1 + count, channels]: its last taps - 1 columns are the new window.
                     step.Effect(step.Op(GraphOp.Cpy, step.View2(convIn, history, channels, pitch, count * f), window));
                 int y = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Add, xs, conv) }, default, stackalloc[] { scale });
+                if (!verifying) step.EndFused(stackalloc[] { y });
                 output = output < 0 ? y : step.Op(GraphOp.Concat, stackalloc[] { output, y }, stackalloc long[] { 1 });
             }
             return output;
@@ -338,6 +354,18 @@ namespace TensorSharp.Models
         /// <paramref name="threshold"/>, after the optional per-channel scale.</summary>
         private int Clip(GraphStep step, int x, string scale, float threshold)
         {
+            x = step.Cont(x);
+            if (scale != null)
+                step.BeginFused(GraphFusion.InklingClip, stackalloc[] { x, step.Weight(scale) }, stackalloc long[] { 1 }, stackalloc[] { threshold });
+            else
+                step.BeginFused(GraphFusion.InklingClip, stackalloc[] { x }, stackalloc long[] { 0 }, stackalloc[] { threshold });
+            int y = ClipOps(step, x, scale, threshold);
+            step.EndFused(stackalloc[] { y });
+            return y;
+        }
+
+        private int ClipOps(GraphStep step, int x, string scale, float threshold)
+        {
             if (scale != null) x = step.Op(GraphOp.Mul, x, step.Weight(scale));
             int norm = step.Op(GraphOp.Sqrt, step.Op(GraphOp.SumRows, step.Op(GraphOp.Sqr, x)));                 // [1, heads, rows]
             int biased = step.Op(GraphOp.ScaleBias, stackalloc[] { norm }, default, stackalloc[] { 1f, 1e-6f });
@@ -347,9 +375,15 @@ namespace TensorSharp.Models
             return step.Op(GraphOp.Mul, x, factor);
         }
 
-        /// <summary>The full layers' log-scaled positions [1, 1, rows]: 1 + alpha log(max(1, (pos + 1) / floor)).</summary>
+        /// <summary>The full layers' log-scaled positions [1, 1, rows]: 1 + alpha log(max(1, (pos + 1) / floor)), read from the
+        /// table by the step's positions (an input the runtime advances), so a decode step advances without a trace.</summary>
         private int LogScale(GraphStep step)
         {
+            if (step.Positions >= 0 && _tauTable != null)
+            {
+                int table = step.TensorWeight(_tauTable, 1, _tauTable.Sizes[0]);
+                return step.Reshape(step.Op(GraphOp.GetRows, table, step.Positions), 1, 1, step.Rows);
+            }
             var tau = new float[step.Rows];
             for (int s = 0; s < step.Sequences; s++)
                 for (int i = 0; i < step.Counts[s]; i++)
@@ -364,6 +398,24 @@ namespace TensorSharp.Models
         // gathered by EmitAttentionCore for each sequence of the same layer.
         private GraphStep _tableStep;
         private int _tableLayer = -1, _table = -1;
+        // The fused attention's bias table (FusedAttention): B r - t [extent + 1, heads, rows], each (head, row) contiguous.
+        private int _fusedTable = -1;
+
+        /// <summary>The attention runs as one kernel (GraphFusion.InklingAttention): an executor that serves it
+        /// (<see cref="GraphCapabilities.RelativeBiasAttention"/>) over F16 or F32 caches, unless TS_INKLING_FUSED_ATTENTION=0.
+        /// The kernel finds each row's keys from the positions, so no mask or distance index is built.</summary>
+        private bool FusedAttention => GraphExecutor?.Capabilities.RelativeBiasAttention == true && !FusedAttentionDisabled
+                                       && KvCacheGraphType is GraphFormat.F16 or GraphFormat.F32
+                                       && _headDim == 128 && Config.NumHeads % Config.NumKVHeads == 0 && Config.NumHeads / Config.NumKVHeads <= 8;
+
+        private static readonly bool FusedAttentionDisabled = Environment.GetEnvironmentVariable("TS_INKLING_FUSED_ATTENTION") == "0";
+
+        /// <summary>Decode steps depend on the positions only through the step's own inputs once the attention reads them on
+        /// the device (its keys found from the positions, tau read by them): such a step advances without a trace.</summary>
+        protected override bool DecodeStepsAdvance => FusedAttention;
+
+        // The fused attention reads the cache windows at their strides: a decode step copies none.
+        protected override bool AttendsStridedWindows => FusedAttention;
 
         private static int Input(GraphStep step, int packed, int j, int hidden)
         {
@@ -396,9 +448,23 @@ namespace TensorSharp.Models
             // key's bias takes - t and a zero sink closes the softmax (llama.cpp's inkling2.cpp).
             int t = step.MatMul(LayerName(layer, "attn_sink_proj.weight"), xq);                                     // [heads, rows]
             int extent = ExtentOf(layer);
+            if (FusedAttention)
+            {
+                // The kernel gathers each score's bias from the row's table: no permute, no distance index.
+                int fused = step.Op(GraphOp.MulMat, step.TensorWeight(_relTables[PhysicalLayer(layer)], _relDim, extent + 1), r);
+                _fusedTable = step.Op(GraphOp.Sub, fused, step.Reshape(t, 1, heads, rows));                          // [extent + 1, heads, rows]
+                _table = -1;
+                _tableStep = step;
+                _tableLayer = layer;
+                q = step.Cont(q);
+                k = step.Cont(k);
+                v = step.Cont(v);
+                return true;
+            }
             int table = step.Op(GraphOp.MulMat, step.TensorWeight(_relTables[PhysicalLayer(layer)], _relDim, extent + 1), r);   // [extent + 1, heads, rows]
             table = step.Op(GraphOp.Sub, table, step.Reshape(t, 1, heads, rows));
             _table = step.Cont(step.Permute(table, 1, 0, 2, 3));                                                    // [heads, extent + 1, rows]
+            _fusedTable = -1;
             _tableStep = step;
             _tableLayer = layer;
             q = step.Cont(q);
@@ -425,6 +491,8 @@ namespace TensorSharp.Models
             int heads = Config.NumHeads, count = step.Counts[s], extent = ExtentOf(layer), d = _headDim;
             const long f = sizeof(float);
             int qc = step.Cont(q);                                                                                    // [d, count, heads]
+            if (_fusedTable >= 0)
+                return FusedAttentionCore(step, layer, s, qc, k, v, layout, scale, count, extent);
             // A cache window may hold F16 or block-quantized rows, which do not transpose: the values widen first.
             int v32 = step.Op(GraphOp.Cast, stackalloc[] { v }, stackalloc long[] { GraphFormat.F32 });
             int vT = step.Cont(step.Transpose(v32));                                                                  // [keys, dv, kvHeads]
@@ -450,6 +518,28 @@ namespace TensorSharp.Models
                 output = output < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
             }
             return step.Cont(step.Permute(output, 0, 2, 1, 3));                                                        // [dv, heads, count]
+        }
+
+        /// <summary>
+        /// One sequence's attention as one kernel (GraphFusion.InklingAttention): the keys a row sees come from the layout
+        /// (a ring's cells or a linear window from its first position), the band and the attention floor, and each score's
+        /// bias is gathered from the row's table (B r - t by distance). The region's ops are a placeholder of the result's shape: the family emits it
+        /// only where it is served (<see cref="FusedAttention"/>), and the executor fails the build where it cannot serve it.
+        /// </summary>
+        private int FusedAttentionCore(GraphStep step, int layer, int s, int qc, int k, int v, in AttentionKeys layout, float scale,
+            int count, int extent)
+        {
+            int heads = Config.NumHeads, d = _headDim;
+            const long f = sizeof(float);
+            long first = step.First[s], width = extent + 1;
+            int table = step.Sequences == 1 ? _fusedTable
+                : step.View3(_fusedTable, width, heads, count, width * f, width * heads * f, first * width * heads * f);
+            long ring = layout.Ring, firstKey = layout.Ring > 0 ? 0 : layout.FirstPosition;
+            step.BeginFused(GraphFusion.InklingAttention, stackalloc[] { qc, k, v, table, step.Positions },
+                stackalloc long[] { ring, extent, SlidingWindow(layer), firstKey, step.FloorOf(s), first }, stackalloc[] { scale });
+            int placeholder = step.Op(GraphOp.Scale, stackalloc[] { step.Cont(step.Permute(qc, 0, 2, 1, 3)) }, default, stackalloc[] { 0f });
+            step.EndFused(stackalloc[] { placeholder });
+            return placeholder;                                                                                       // [dv, heads, count]
         }
 
         /// <summary>Rows [first, first + len) of sequence <paramref name="s"/>: each key's relative bias [keys, len, heads].</summary>
@@ -502,8 +592,13 @@ namespace TensorSharp.Models
             const long f = sizeof(float);
 
             int logits = step.MatMul(LayerName(layer, "ffn_gate_inp.weight"), x);                                     // [E, rows]
+            int bias = step.Weight(LayerName(layer, "exp_probs_b.bias"));
+            // Tests that force the routes or read them back take them from the router's ops: no fused router then.
+            bool fusedRoute = ForcedRoutesForTests == null && DeviceRoutesForTests == null;
+            if (fusedRoute)
+                step.BeginFused(GraphFusion.InklingRoute, stackalloc[] { logits, bias }, stackalloc long[] { k }, stackalloc[] { _expertScale });
             int probs = step.Op(GraphOp.Sigmoid, logits);
-            int selection = step.Op(GraphOp.Add, probs, step.Weight(LayerName(layer, "exp_probs_b.bias")));
+            int selection = step.Op(GraphOp.Add, probs, bias);
             int forced = EmitForcedRoutes(step, layer, k, experts);                                                  // tests
             int selected = forced >= 0 ? forced : step.Op(GraphOp.TopK, stackalloc[] { selection }, stackalloc long[] { k });   // [K, rows]
             EmitDeviceRoutes(step, layer, selected, selection, k, experts);                                          // tests
@@ -511,9 +606,11 @@ namespace TensorSharp.Models
             int sum = step.Op(GraphOp.ScaleBias, stackalloc[] { step.Op(GraphOp.SumRows, picked) }, default, stackalloc[] { 1f, 1e-20f });
             int weights = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Div, picked, sum) }, default, stackalloc[] { _expertScale });
             weights = step.Reshape(weights, 1, k, rows);
+            if (fusedRoute) step.EndFused(stackalloc[] { selected, weights });
 
             int input = step.Reshape(x, h, 1, rows);
             int gateUp = step.Op(GraphOp.MulMatId, step.Experts(LayerName(layer, "ffn_gate_up_exps.weight")), input, selected);   // [2 ff, K, rows]
+            step.BeginFused(GraphFusion.InklingSitu, stackalloc[] { gateUp }, default, stackalloc[] { _situBeta, _situLinearBeta });
             int g = step.Cont(step.View3(gateUp, ff, k, rows, 2L * ff * f, 2L * ff * k * f, 0));
             int u = step.Cont(step.View3(gateUp, ff, k, rows, 2L * ff * f, 2L * ff * k * f, ff * f));
             int act = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Tanh, step.Op(GraphOp.Scale, stackalloc[] { g }, default, stackalloc[] { 1f / _situBeta })) },
@@ -523,7 +620,9 @@ namespace TensorSharp.Models
                 u = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Tanh, step.Op(GraphOp.Scale, stackalloc[] { u }, default, stackalloc[] { 1f / _situLinearBeta })) },
                     default, stackalloc[] { _situLinearBeta });
             act = step.Op(GraphOp.Mul, act, u);                                                                       // [ff, K, rows]
+            step.EndFused(stackalloc[] { act });
             int down = step.Op(GraphOp.MulMatId, step.Experts(LayerName(layer, "ffn_down_exps.weight")), act, selected);       // [h, K, rows]
+            step.BeginFused(GraphFusion.InklingExpertSum, stackalloc[] { down, weights });
             down = step.Op(GraphOp.Mul, down, weights);
             long rowBytes = h * f;
             int output = -1;
@@ -532,7 +631,9 @@ namespace TensorSharp.Models
                 int slice = step.View2(down, h, rows, rowBytes * k, j * rowBytes);
                 output = output < 0 ? slice : step.Op(GraphOp.Add, output, slice);
             }
-            return step.Cont(output);
+            output = step.Cont(output);
+            step.EndFused(stackalloc[] { output });
+            return output;
         }
 
         /// <summary>The padded vocabulary's first <c>vocab_size_unpadded</c> logits, softcapped: cap tanh(logits / cap).</summary>
