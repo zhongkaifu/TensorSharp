@@ -627,6 +627,29 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.DoesNotContain(Package, result.Content, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void AFailedImportOfASkillsScriptNamesTheCallThatRunsIt()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var context = new SkillToolContext(registry.Skills)
+        {
+            ScriptRunner = new RecordingScriptRunner(),
+            CodeRunner = new TracebackCodeRunner("ModuleNotFoundError: No module named 'research'"),
+        };
+        SkillToolResult shell = SkillTools.Execute(Call("shell", ("command", "python3 -c \"import research\"")), context);
+        Assert.Contains("[TensorSharp host] research is the 'research' skill's script scripts/research.py, not a module to import. "
+            + "Run it with " + ResearchCall + ".", shell.Content, StringComparison.Ordinal);
+
+        // Another module is not a skill's script.
+        var other = new SkillToolContext(registry.Skills)
+        {
+            ScriptRunner = new RecordingScriptRunner(),
+            CodeRunner = new TracebackCodeRunner("ModuleNotFoundError: No module named 'yaml'"),
+        };
+        Assert.DoesNotContain("[TensorSharp host]", SkillTools.Execute(Call("shell", ("command", "python3 x.py")), other).Content, StringComparison.Ordinal);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;
@@ -742,6 +765,17 @@ public sealed class SkillHubInstallTests : IDisposable
             Runs.Add((skill.Id, relativePath, arguments.ToArray(), packages?.ToArray() ?? Array.Empty<string>()));
             return new SkillToolResult(true, "price=1", skill.Id, relativePath);
         }
+    }
+
+    /// <summary>A shell whose every command fails with the given traceback line.</summary>
+    private sealed class TracebackCodeRunner(string error) : ICodeRunner
+    {
+        public bool CanRun => true;
+        public string? UnavailableReason => null;
+        public ToolFunction Declare() => new() { Name = "shell" };
+        public SkillToolResult Execute(ToolCall call, IReadOnlyList<CodeInputFile>? inputFiles = null,
+            Action<string>? onOutput = null, SessionWorkspace? workspace = null, IReadOnlyList<string>? skillDirectories = null) =>
+            new(false, "exit 1 (0s)\n\nTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n" + error + "\n", null, null);
     }
 
     private sealed class RefusingCodeRunner : ICodeRunner

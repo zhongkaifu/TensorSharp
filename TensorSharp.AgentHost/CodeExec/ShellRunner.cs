@@ -599,7 +599,7 @@ namespace TensorSharp.AgentHost.CodeExec
 
             Dictionary<string, (long Length, DateTime WriteTime)> before = workspace.SnapshotWorkFiles();
             ConfinedResult result = RunWithAutoInstall(
-                launch, workspace, notes, onOutput, out AutoInstallOutcome installedFor);
+                launch, workspace, notes, onOutput, out AutoInstallOutcome installedFor, request.ReadablePaths);
             session.RecordOutcome(typed, result.Ok);
 
             // Everything the command created or changed becomes content the model is
@@ -718,7 +718,8 @@ namespace TensorSharp.AgentHost.CodeExec
         /// </summary>
         private ConfinedResult RunWithAutoInstall(
             ShellLaunch launch, SessionWorkspace workspace, List<string> notes,
-            Action<string>? onOutput, out AutoInstallOutcome installedFor)
+            Action<string>? onOutput, out AutoInstallOutcome installedFor,
+            IReadOnlyList<string>? skillDirectories = null)
         {
             // The whole CALL's deadline, not each process's. launch.Timeout bounds one
             // run; without a budget across the loop, a command asking for 20s could spend
@@ -765,6 +766,18 @@ namespace TensorSharp.AgentHost.CodeExec
                         $"'{module}' is your own file at {ownFile}, not a package — it was not installed. "
                         + "It failed to import because its directory is not on the import path: run the "
                         + "program from that directory, or put the file beside the program that imports it.");
+                    return result;
+                }
+
+                // Nor a reachable skill's own script, imported by its file name (`import research`
+                // after reading research/scripts/research.py). The package index's project of that
+                // name is unrelated to the skill: installing it would put an arbitrary package where
+                // the model meant the skill's script, a name-squatting hazard, so it is never done.
+                if (SkillScriptModuleFor(skillDirectories, module) is { } skillScript)
+                {
+                    notes.Add(
+                        $"'{module}' is a skill's script ({skillScript}), not a package, so nothing was installed. "
+                        + "A skill's script runs with skills_run, not as an import.");
                     return result;
                 }
 
@@ -875,6 +888,39 @@ namespace TensorSharp.AgentHost.CodeExec
         /// further would be walking the workspace on a path that must stay cheap.
         /// </para>
         /// </summary>
+        /// <summary>
+        /// The reachable skill script a failed import named, as <c>skill-dir/scripts/x.py</c>, or
+        /// null: <c>x.py</c> or the package <c>x/</c> at a skill directory's root or in its
+        /// <c>scripts/</c>. The directories are the request's readable skill directories.
+        /// </summary>
+        internal static string? SkillScriptModuleFor(IReadOnlyList<string>? skillDirectories, string module)
+        {
+            if (skillDirectories is not { Count: > 0 } || module.Length == 0 || module.IndexOfAny(new[] { '/', '\\', '.' }) >= 0)
+                return null;
+            foreach (string directory in skillDirectories)
+            {
+                foreach (string candidate in new[]
+                {
+                    Path.Combine("scripts", module + ".py"),
+                    module + ".py",
+                    Path.Combine("scripts", module, "__init__.py"),
+                    Path.Combine(module, "__init__.py"),
+                })
+                {
+                    try
+                    {
+                        if (File.Exists(Path.Combine(directory, candidate)))
+                            return Path.GetFileName(directory.TrimEnd('/', '\\')) + "/" + candidate.Replace('\\', '/');
+                    }
+                    catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+                    {
+                        // An unreadable skill directory names nothing.
+                    }
+                }
+            }
+            return null;
+        }
+
         private static string? LocalModuleFor(SessionWorkspace workspace, string module)
         {
             if (module.Length == 0 || module.IndexOfAny(new[] { '/', '\\', '.' }) >= 0)

@@ -498,7 +498,46 @@ namespace TensorSharp.AgentHost.Skills
                         + JsonSerializer.Serialize(missing.Arguments, ReadableArguments) + ").",
                 };
             }
+            // `import research` after reading research/scripts/research.py: the runner installs
+            // nothing for a skill's script (ShellRunner), and this names how it does run.
+            else if (TensorSharp.AgentHost.CodeExec.CodeDiagnostics.TryFindMissingModule(shell.Content, out _, out string module)
+                && ImportedSkillScript(module, context) is { } imported)
+            {
+                shell = shell with
+                {
+                    Content = shell.Content + "\n\n[TensorSharp host] " + module + " is the '" + imported.Skill.Id
+                        + "' skill's script " + imported.Path + ", not a module to import. Run it with "
+                        + RunCallFor(imported.Skill, imported.Path, context) + ".",
+                };
+            }
             return shell;
+        }
+
+        /// <summary>The one reachable skill script named <c>module.py</c>, or null when none or several are.</summary>
+        private static (Skill Skill, string Path)? ImportedSkillScript(string module, SkillToolContext context)
+        {
+            if (module.Length == 0 || module.Contains('.'))
+                return null;
+            (Skill, string)[] matches = context.Reachable
+                .SelectMany(skill => skill.Files
+                    .Where(file => file.Kind == SkillFileKind.Script
+                        && string.Equals(Path.GetFileName(file.Path), module + ".py", SkillPathGuard.PathComparison))
+                    .Select(file => (skill, file.Path)))
+                .ToArray();
+            return matches.Length == 1 ? matches[0] : null;
+        }
+
+        /// <summary>
+        /// The call that runs <paramref name="path"/> of <paramref name="skill"/>: the skill's
+        /// declared <c>provides-call</c> when it names that script, otherwise the plain
+        /// <c>skills_run</c> with the arguments left to fill in.
+        /// </summary>
+        internal static string RunCallFor(Skill skill, string path, SkillToolContext context)
+        {
+            if (skill.Manifest.Metadata.TryGetValue("provides-call", out string? declared)
+                && declared.Contains("path=\"" + path + "\"", StringComparison.Ordinal))
+                return declared.Trim();
+            return RunToolName + "(skill=\"" + skill.Id + "\", path=\"" + path + "\", args=[\"<arguments>\"])";
         }
 
         /// <summary>Arguments as a model types them: no \u0022 for a quote, no \uXXXX for a non-ASCII letter.</summary>
