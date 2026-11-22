@@ -81,7 +81,8 @@ public sealed class CatalogTests
                 else
                 {
                     Assert.StartsWith("https://huggingface.co/", f.Url);
-                    Assert.Matches(@"/resolve/(main|[0-9a-f]{40})/[^\s]+$", f.Url);
+                    // A commit, never a branch (EveryDownloadIsPinnedToACommit).
+                    Assert.Matches(@"/resolve/[0-9a-f]{12,40}/[^\s]+$", f.Url);
                 }
                 // A size read from a pointer file (~130 bytes) instead of the object is the
                 // mistake this catches. Loose tokenizer files are genuinely small - MiniMax-H3's
@@ -113,6 +114,85 @@ public sealed class CatalogTests
             Assert.NotEmpty(m.License);
         }
     }
+
+    /// <summary>
+    /// Every Hugging Face URL of both catalogs (each model's files, companions and drafters, each LoRA plug-in's
+    /// files, and the license pages shown before a download) names a commit, never a branch. A branch moves under
+    /// the hash the catalog verifies: ggml-org re-uploaded the Gemma 4 E2B and E4B files on 2026-11-08 and
+    /// 2026-11-12, and from then on a fresh install of those entries from <c>resolve/main</c> got other bytes and
+    /// failed its sha256 check.
+    /// </summary>
+    [Fact]
+    public void EveryDownloadIsPinnedToACommit()
+    {
+        var urls = new List<(string Owner, string Url)>();
+        foreach (CatalogModel m in ModelCatalog.BuiltIn)
+        {
+            urls.AddRange(m.Files.Where(f => f.Url.Length > 0).Select(f => ($"{m.Id}/{f.FileName}", f.Url)));
+            if (m.LicenseTerms is { } terms)
+                urls.Add(($"{m.Id} license", terms.Url));
+        }
+        foreach (CatalogLora lora in LoraCatalog.BuiltIn)
+        {
+            urls.AddRange(lora.Files.Select(f => ($"lora {lora.Id}/{f.FileName}", f.Url)));
+            if (lora.LicenseTerms is { } terms)
+                urls.Add(($"lora {lora.Id} license", terms.Url));
+        }
+
+        // Both catalogs are walked: a phone entry's weights, a desktop entry's later shard, and a plug-in.
+        Assert.Contains(urls, u => u.Owner == "gemma-4-e2b-q8/gemma-4-E2B-it-Q8_0.gguf");
+        Assert.Contains(urls, u => u.Owner == "qwen3.8-flash-next-iq1m/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf");
+        Assert.Contains(urls, u => u.Owner.StartsWith("lora ", StringComparison.Ordinal));
+        string[] unpinned = urls.Where(u => !IsPinnedHuggingFaceUrl(u.Url)).Select(u => $"{u.Owner}: {u.Url}").ToArray();
+        Assert.True(unpinned.Length == 0, "not pinned to a commit:\n" + string.Join("\n", unpinned));
+    }
+
+    /// <summary>
+    /// The catalog's source names no branch either, in a URL no entry lists today (a helper, a constant), where
+    /// <see cref="EveryDownloadIsPinnedToACommit"/> cannot see it. An interpolated revision is checked there.
+    /// </summary>
+    [Fact]
+    public void CatalogSourceNamesNoBranch()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "TensorSharp.slnx"))) directory = directory.Parent;
+        Assert.NotNull(directory);
+        string catalog = Path.Combine(directory!.FullName, "TensorAgent", "src", "TensorAgent.Core", "Catalog");
+        string[] sources = Directory.GetFiles(catalog, "*.cs");
+        Assert.Contains(sources, s => Path.GetFileName(s) == "ModelCatalog.cs");
+
+        var unpinned = new List<string>();
+        foreach (string source in sources)
+        {
+            foreach (Match m in Regex.Matches(File.ReadAllText(source), @"huggingface\.co/[^\s""]*?/(?:resolve|blob)/(?<rev>[^/\s""]+)/"))
+            {
+                string rev = m.Groups["rev"].Value;
+                if (!rev.StartsWith('{') && !Regex.IsMatch(rev, "^[0-9a-f]{12,40}$"))
+                    unpinned.Add($"{Path.GetFileName(source)}: {m.Value}");
+            }
+        }
+        Assert.True(unpinned.Count == 0, "not pinned to a commit:\n" + string.Join("\n", unpinned));
+    }
+
+    [Theory]
+    [InlineData("https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/6938c58e698502037401a5f19f6905f2fb2f7dee/gemma-4-E2B-it-Q8_0.gguf", true)]
+    [InlineData("https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/6938c58e6985/gemma-4-E2B-it-Q8_0.gguf", true)]
+    [InlineData("https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/UD-IQ1_M/x.gguf", true)]
+    [InlineData("https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/8ced60068623def5b74b4d10558117cb61d6482d/LICENSE", true)]
+    [InlineData("https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q8_0.gguf", false)]
+    [InlineData("https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/main/LICENSE", false)]
+    [InlineData("https://huggingface.co/unsloth/MiniMax-H3-GGUF/resolve/refs%2Fpr%2F7/vae/x.safetensors", false)]
+    [InlineData("https://huggingface.co/o/r/resolve/v1.0/x.gguf", false)]
+    // A short id below 12 digits can become ambiguous as a repository grows; commit ids are lower-case hex.
+    [InlineData("https://huggingface.co/o/r/resolve/6938c58e698/x.gguf", false)]
+    [InlineData("https://huggingface.co/o/r/resolve/6938C58E698502037401A5F19F6905F2FB2F7DEE/x.gguf", false)]
+    [InlineData("https://huggingface.co/o/r/resolve/6938c58e698502037401a5f19f6905f2fb2f7dee/", false)]
+    [InlineData("https://example.com/o/r/resolve/6938c58e698502037401a5f19f6905f2fb2f7dee/x.gguf", false)]
+    public void APinIsACommitNeverABranch(string url, bool pinned) => Assert.Equal(pinned, IsPinnedHuggingFaceUrl(url));
+
+    /// <summary>A Hugging Face file URL at a commit: 12 to 40 lower-case hex digits, as a commit id is written.</summary>
+    private static bool IsPinnedHuggingFaceUrl(string url) =>
+        Regex.IsMatch(url, @"^https://huggingface\.co/[^/\s]+/[^/\s]+/(?:resolve|blob)/[0-9a-f]{12,40}/[^\s]+$");
 
     [Fact]
     public void ProjectorsAreDistinctFromWeights()
