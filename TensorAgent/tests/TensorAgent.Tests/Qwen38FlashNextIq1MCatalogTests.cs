@@ -11,7 +11,7 @@ namespace TensorAgent.Tests;
 public sealed class Qwen38FlashNextIq1MCatalogTests : IDisposable
 {
     private const string Id = "qwen3.8-flash-next-iq1m";
-    private const string Repo = "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/";
+    private const string Repo = "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/";
     private readonly string _root = Path.Combine(Path.GetTempPath(), "tensoragent-flash-iq1m-" + Guid.NewGuid().ToString("N"));
 
     private static CatalogModel Model => ModelCatalog.Find(Id)!;

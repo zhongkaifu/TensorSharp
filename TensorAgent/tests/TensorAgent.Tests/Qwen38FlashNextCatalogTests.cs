@@ -22,7 +22,7 @@ namespace TensorAgent.Tests;
 public sealed class Qwen38FlashNextCatalogTests : IDisposable
 {
     private const string Id = "qwen3.8-flash-next-q2kxl";
-    private const string Repo = "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-Q2_K_XL/";
+    private const string Repo = "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/UD-Q2_K_XL/";
 
     private readonly string _root = Path.Combine(
         Path.GetTempPath(), "tensoragent-q4e-" + Guid.NewGuid().ToString("N"));

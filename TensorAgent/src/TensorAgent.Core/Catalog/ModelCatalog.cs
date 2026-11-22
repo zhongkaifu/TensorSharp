@@ -35,7 +35,8 @@ namespace TensorAgent.Core.Catalog;
 /// </para>
 /// <para>
 /// Qwen3.8 Flash Next's Q2_K_XL shards were read on 2026-10-01 and IQ1_M shards/projector
-/// on 2026-10-03 at unsloth/Qwen3.8-Flash-Next-GGUF main = 38bb39ee97821de2c9009abb7e93950eec396e66.
+/// on 2026-10-03 at unsloth/Qwen3.8-Flash-Next-GGUF main = 38bb39ee97821de2c9009abb7e93950eec396e66,
+/// and are downloaded from 766911a6, the configs' revision, which serves the same bytes.
 /// </para>
 /// <para>
 /// The 24 and 32 GB tiers are desktop tiers, including Windows and macOS. Their dense
@@ -72,7 +73,16 @@ public static partial class ModelCatalog
     // 2026-11-19 to list the model with its terms shown and accepted at download (decision D9).
     private const string MiniMaxH3ImageLicense = "catalog.license.minimaxH3Image";
 
-    private static string Hf(string repo, string file) => $"https://huggingface.co/{repo}/resolve/main/{file}";
+    // A download pinned to a commit whose file has the entry's size and sha256, never to a branch: a publisher can
+    // replace a file under the same name, and then no fresh install can match the hash. ggml-org re-uploaded its
+    // Gemma 4 E2B and E4B files on 2026-11-08 and 2026-11-12, and main stopped serving the bytes these entries
+    // verify. CatalogTests.EveryDownloadIsPinnedToACommit holds every URL of both catalogs to this.
+    private static string Hf(string repo, string commit, string file) => $"https://huggingface.co/{repo}/resolve/{commit}/{file}";
+
+    // Unsloth's Flash Next files for the three Flash Next entries, at the revision config/qwen3.8-flash-next*.json
+    // download them from. The repository replaced its UD-Q2_K_XL and UD-IQ1_M files on 2026-11-04, so main no
+    // longer serves these shards.
+    private const string FlashNextCommit = "766911a6b7369840a91dbcd95f9f997acaab6cd6";
 
     public static IReadOnlyList<CatalogModel> BuiltIn { get; } = new[]
     {
@@ -84,13 +94,14 @@ public static partial class ModelCatalog
             Kind = CatalogArchitectureKind.Dense,
             Parameters = "catalog.model.gemma4E2b.parameters",
             Quantization = "Q8_0",
+            // ggml-org's upload of 2026-10-19 (6938c58e). Its 2026-11-08 and 2026-11-12 uploads changed both files.
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "gemma-4-E2B-it-Q8_0.gguf",
-                    Hf("ggml-org/gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q8_0.gguf"),
+                    Hf("ggml-org/gemma-4-E2B-it-GGUF", "6938c58e698502037401a5f19f6905f2fb2f7dee", "gemma-4-E2B-it-Q8_0.gguf"),
                     4_967_497_152, "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a"),
                 new CatalogFile(CatalogFileRole.Projector, "mmproj-gemma-4-E2B-it-Q8_0.gguf",
-                    Hf("ggml-org/gemma-4-E2B-it-GGUF", "mmproj-gemma-4-E2B-it-Q8_0.gguf"),
+                    Hf("ggml-org/gemma-4-E2B-it-GGUF", "6938c58e698502037401a5f19f6905f2fb2f7dee", "mmproj-gemma-4-E2B-it-Q8_0.gguf"),
                     557_368_064, "9406f99c16d68cda4f1f0552192dcc99021ea1fc6d2fd50b1dc3ccf30d04b292"),
                 new CatalogFile(CatalogFileRole.Draft, "mtp-gemma-4-E2B-it-Q8_0.gguf",
                     "https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/b4243c156154b6dca9324415f8c7ccc098b4aed1/mtp-gemma-4-E2B-it-Q8_0.gguf",
@@ -123,16 +134,19 @@ public static partial class ModelCatalog
             Kind = CatalogArchitectureKind.Dense,
             Parameters = "catalog.model.gemma4E4b.parameters",
             Quantization = "IQ4_XS",
+            // Unsloth's weights at the revision the shipped configs read that repository at (its head); ggml-org's
+            // projector and MTP head at its upload of 2026-10-19 (a69f018d), whose 2026-11-08 and 2026-11-12 uploads
+            // changed the projector.
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "gemma-4-E4B-it-IQ4_XS.gguf",
-                    Hf("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-IQ4_XS.gguf"),
+                    Hf("unsloth/gemma-4-E4B-it-GGUF", "bfc15c382204943c3a8fff0c750b94ae2364d7a3", "gemma-4-E4B-it-IQ4_XS.gguf"),
                     4_715_416_704, "0847f7300471e9a61abaeb46b45b3d61e393af8fa6d6aa70c563623773670dd9"),
                 new CatalogFile(CatalogFileRole.Projector, "mmproj-gemma-4-E4B-it-Q8_0.gguf",
-                    Hf("ggml-org/gemma-4-E4B-it-GGUF", "mmproj-gemma-4-E4B-it-Q8_0.gguf"),
+                    Hf("ggml-org/gemma-4-E4B-it-GGUF", "a69f018d7678a2b9f5e705f8903d6fb29b9b25dc", "mmproj-gemma-4-E4B-it-Q8_0.gguf"),
                     559_874_816, "197f49a93027f9843772bd24a6a9e0be2a32a788de5a3def330e9c585d86edd1"),
                 new CatalogFile(CatalogFileRole.Draft, "mtp-gemma-4-E4B-it-Q8_0.gguf",
-                    Hf("ggml-org/gemma-4-E4B-it-GGUF", "mtp-gemma-4-E4B-it-Q8_0.gguf"),
+                    Hf("ggml-org/gemma-4-E4B-it-GGUF", "a69f018d7678a2b9f5e705f8903d6fb29b9b25dc", "mtp-gemma-4-E4B-it-Q8_0.gguf"),
                     98_653_280, "f38ae62962657c7a6303c49bbb147e9ae23634e911cfa532fac0818c2e18b665", Optional: true),
             },
             Modalities = CatalogModalities.Image | CatalogModalities.Audio | CatalogModalities.Video,
@@ -166,10 +180,10 @@ public static partial class ModelCatalog
                 // losslessly to GGML Q2_0, so the dense PTQ1_0 packing is simply the
                 // smaller download (5.95 GB against 7.21 GB) for the same resident model.
                 new CatalogFile(CatalogFileRole.Weights, "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-                    Hf("prism-ml/Ternary-Bonsai-2-27B-gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"),
+                    Hf("prism-ml/Ternary-Bonsai-2-27B-gguf", "b072e1d3b35a0a630cece372c2127528e0994386", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"),
                     5_946_648_928, "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"),
                 new CatalogFile(CatalogFileRole.Projector, "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
-                    Hf("prism-ml/Ternary-Bonsai-2-27B-gguf", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"),
+                    Hf("prism-ml/Ternary-Bonsai-2-27B-gguf", "b072e1d3b35a0a630cece372c2127528e0994386", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"),
                     629_246_976, "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903", Optional: true),
             },
             Modalities = CatalogModalities.Image,
@@ -199,10 +213,10 @@ public static partial class ModelCatalog
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "Qwen3.5-9B-IQ4_XS.gguf",
-                    Hf("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-IQ4_XS.gguf"),
+                    Hf("unsloth/Qwen3.5-9B-GGUF", "3885219b6810b007914f3a7950a8d1b469d598a5", "Qwen3.5-9B-IQ4_XS.gguf"),
                     5_168_653_536, "7e918aeca06c52bcb528ea6b04b4ec957e75ee8c0a73138854c0dfcf371ea429"),
                 new CatalogFile(CatalogFileRole.Projector, "mmproj-F16.gguf",
-                    Hf("unsloth/Qwen3.5-9B-GGUF", "mmproj-F16.gguf"),
+                    Hf("unsloth/Qwen3.5-9B-GGUF", "3885219b6810b007914f3a7950a8d1b469d598a5", "mmproj-F16.gguf"),
                     918_166_080, "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f", Optional: true),
             },
             Modalities = CatalogModalities.Image | CatalogModalities.Video,
@@ -307,10 +321,10 @@ public static partial class ModelCatalog
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
-                    Hf("unsloth/Muse-Glimmer-30B-GGUF", "Muse-Glimmer-30B-UD-Q4_K_XL.gguf"),
+                    Hf("unsloth/Muse-Glimmer-30B-GGUF", "faa5b025c584459c13febfa5c59883516710ae39", "Muse-Glimmer-30B-UD-Q4_K_XL.gguf"),
                     15_878_222_368, "82bece304887a313ece08400bc030f6066c7bff5b906b0cd40308ec8a409fd38"),
                 new CatalogFile(CatalogFileRole.Projector, "mmproj-Muse-Glimmer-30B-Q8_0.gguf",
-                    Hf("unsloth/Muse-Glimmer-30B-GGUF", "mmproj-Muse-Glimmer-30B-Q8_0.gguf"),
+                    Hf("unsloth/Muse-Glimmer-30B-GGUF", "faa5b025c584459c13febfa5c59883516710ae39", "mmproj-Muse-Glimmer-30B-Q8_0.gguf"),
                     2_051_685_088, "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2", Optional: true),
                 // DFlash is optional: acceleration depends on backend and sampler.
                 new CatalogFile(CatalogFileRole.Draft, "dflash-kquant.gguf",
@@ -360,10 +374,12 @@ public static partial class ModelCatalog
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
-                    Hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"),
+                    Hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF", "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+                        "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"),
                     37_623_740_192, "69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720"),
                 new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
-                    Hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"),
+                    Hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF", "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+                        "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"),
                     28_800_138_432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
                 FlashNextProjector(),
                 FlashNextDFlash2Draft(),
@@ -405,13 +421,13 @@ public static partial class ModelCatalog
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
-                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"),
+                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", FlashNextCommit, "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"),
                     10_946_624, "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86"),
                 new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf",
-                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf"),
+                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", FlashNextCommit, "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf"),
                     49_979_779_296, "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6"),
                 new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf",
-                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf"),
+                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", FlashNextCommit, "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf"),
                     28_878_402_944, "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9"),
                 FlashNextProjector(),
                 FlashNextDraft(),
@@ -460,13 +476,13 @@ public static partial class ModelCatalog
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
-                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"),
+                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", FlashNextCommit, "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"),
                     10_946_624, "6584f289c808a486ac33aef20906774bcf6616785535c03b842072951e5112d2"),
                 new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
-                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf"),
+                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", FlashNextCommit, "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf"),
                     49_988_981_792, "a7cbafba2cbc1ccde484ed05e1bbeaef4d67e0924ef51cc8b8de18e62edb5586"),
                 new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
-                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf"),
+                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", FlashNextCommit, "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf"),
                     24_538_827_360, "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203"),
                 FlashNextProjector(),
                 FlashNextDraft(),
@@ -503,7 +519,7 @@ public static partial class ModelCatalog
             Files = new[]
             {
                 new CatalogFile(CatalogFileRole.Weights, "qwen_image_2.1_Q4_K_M.gguf",
-                    Hf("Abiray/Qwen-Image-2.1-GGUF", "qwen_image_2.1_Q4_K_M.gguf"),
+                    Hf("Abiray/Qwen-Image-2.1-GGUF", "c9dd12108f53974cd1e0abd708df042d6df0ca8d", "qwen_image_2.1_Q4_K_M.gguf"),
                     4_189_343_904, "dc956c958fbfa1d5c64ec316d7e865283d17d97a9eb332a4a74a4d63afaae9a5"),
                 QwenImage21TextEncoder(),
                 QwenImage21Vae(),
@@ -554,10 +570,10 @@ public static partial class ModelCatalog
             id: "minimax-h3-fl2va-q4k",
             displayName: "MiniMax-H3",
             denoiser: new CatalogFile(CatalogFileRole.Weights, "minimax_h3_fl2va_pruned-Q4_K.gguf",
-                Hf("unsloth/MiniMax-H3-GGUF", "minimax_h3_fl2va_pruned-Q4_K.gguf"),
+                Hf("unsloth/MiniMax-H3-GGUF", MiniMaxH3GgufCommit, "minimax_h3_fl2va_pruned-Q4_K.gguf"),
                 11_420_663_904, "dd948e08ad0ba3c71bd42f368e283dd82e790f5122a63b276e22a3e0283d0c10"),
             referenceDenoiser: new CatalogFile(CatalogFileRole.SecondaryWeights, "minimax_h3_ref2va_pruned-Q4_K.gguf",
-                Hf("unsloth/MiniMax-H3-GGUF", "minimax_h3_ref2va_pruned-Q4_K.gguf"),
+                Hf("unsloth/MiniMax-H3-GGUF", MiniMaxH3GgufCommit, "minimax_h3_ref2va_pruned-Q4_K.gguf"),
                 11_381_096_544, "2fa5840021cf6967843eaeefde9aaa277e540de02986d5ee3d5b0e6a7a8c9dec"),
             modalities: CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
             notes: "catalog.model.minimaxH3.notes"),
@@ -637,7 +653,7 @@ public static partial class ModelCatalog
     };
 
     private static CatalogFile FlashNextProjector() => new(CatalogFileRole.Projector, "mmproj-BF16.gguf",
-        Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "mmproj-BF16.gguf"),
+        Hf("unsloth/Qwen3.8-Flash-Next-GGUF", FlashNextCommit, "mmproj-BF16.gguf"),
         907_542_944, "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355", Optional: true);
 
     // The shared-vocabulary head is supported; the repository's other MTP exports are not interchangeable.
@@ -656,7 +672,10 @@ public static partial class ModelCatalog
     // H3 reads, and carrying the Qwen3-VL vision tower that presents a photo to the prompt) and the loose tokenizer
     // files its GGUF does not carry. One definition, so every entry lists the same bytes and an installation with
     // one entry links the others' copies (ModelStore.SharedCopy) instead of fetching 18.2 GB again. Pinned at
-    // unsloth/MiniMax-H3-GGUF d629413c and MiniMaxAI/MiniMax-H3 42ed227e, the revisions the configs download.
+    // unsloth/MiniMax-H3-GGUF d629413c and MiniMaxAI/MiniMax-H3 42ed227e, the revisions the configs download. The
+    // MiniMax-H3 entry downloads its denoisers and VAEs from the same d629413c, as config/minimax-h3-fl2va.json does.
+    // (Unsloth squashed that repository's history into babc040e on 2026-10-16; Hugging Face still serves d629413c,
+    // and babc040e holds the same files.)
     private const string MiniMaxH3GgufCommit = "d629413c2e5b51b38c453668b75ca3b06ca92703";
     private const string MiniMaxH3ProcessorCommit = "42ed227ee7df40d41602854ae760620d6eb651fe";
 
@@ -763,12 +782,12 @@ public static partial class ModelCatalog
             referenceDenoiser,
             MiniMaxH3TextEncoder(),
             new CatalogFile(CatalogFileRole.Vae, "minimax_h3_video_vae_fp16.safetensors",
-                Hf("unsloth/MiniMax-H3-GGUF", "vae/minimax_h3_video_vae_fp16.safetensors"),
+                Hf("unsloth/MiniMax-H3-GGUF", MiniMaxH3GgufCommit, "vae/minimax_h3_video_vae_fp16.safetensors"),
                 5_207_808_496, "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522"),
             // Required, not optional: without it every clip is silent, and an optional file of
             // a role the Models page never offers could not be added later.
             new CatalogFile(CatalogFileRole.AudioVae, "minimax_h3_audio_vae_fp32.safetensors",
-                Hf("unsloth/MiniMax-H3-GGUF", "vae/minimax_h3_audio_vae_fp32.safetensors"),
+                Hf("unsloth/MiniMax-H3-GGUF", MiniMaxH3GgufCommit, "vae/minimax_h3_audio_vae_fp32.safetensors"),
                 605_254_808, "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"),
             .. MiniMaxH3Tokenizer(),
         ],

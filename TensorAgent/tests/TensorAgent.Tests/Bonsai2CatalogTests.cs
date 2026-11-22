@@ -6,7 +6,7 @@ namespace TensorAgent.Tests;
 
 public sealed class Bonsai2CatalogTests : IDisposable
 {
-    private const string Repo = "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/";
+    private const string Repo = "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/b072e1d3b35a0a630cece372c2127528e0994386/";
 
     private readonly string _root = Path.Combine(
         Path.GetTempPath(), "tensoragent-bonsai2-" + Guid.NewGuid().ToString("N"));
