@@ -91,9 +91,37 @@ query rows so its scores stay bounded.
 
 Synthetic checkpoints (`Inkling2RuntimeTests`, `Inkling2ReferenceTests`) against a double-precision reference
 (`Inkling2Reference.cs`): managed CPU and ggml_cpu agree to relL2 1e-6 on the plain stack and 1e-5..3e-5 through the
-loop, for the prompt chunk and for token-at-a-time decode. ggml_cuda is looser on the synthetic loop (up to 1.6e-1),
-whose random weights make the three passes amplify rounding. Greedy speculative decoding with scripted drafts (some
+loop, for the prompt chunk and for token-at-a-time decode. Greedy speculative decoding with scripted drafts (some
 accepted, some rejected) emits exactly plain greedy's tokens on both synthetic models, the sliding rings wrapping.
+
+The GPU backends are checked along their own routes. Their F32 products of a prompt chunk round their operands
+(ggml-cuda's cuBLAS handles take TF32 math; ggml-metal stages `kernel_mul_mm_f32_f32`'s tiles in half from 17 rows;
+ggml-vulkan likewise), and top-k routing is discontinuous: the synthetic prompt has a route whose third and fourth
+selection scores are 1.35e-4 apart (position 7, layer 4), which ggml_cuda, ggml_vulkan and ggml_metal all flipped,
+moving every later row by 5e-2 against the reference (the loop by up to 0.7). The tests read the routes and router
+scores back from the device (`DeviceRoutesForTests`, a test seam that makes them graph outputs) and run the reference
+along them:
+
+- **Routes.** Every device route must be the top-k of the device's own scores. Per layer run, the scores' RMS and
+  largest deviation from the reference's must stay within 4x what `SelectionScorePerturbation` measured on the three
+  GPU backends over 12 random fixtures x 3 prompts. Those measurements grow from RMS 2e-4 at the first layer to
+  3e-3 at the plain stack's last, and to 2e-2 at the loop's last.
+- **Inversions.** A route may leave out an expert the reference ranks above one it takes by at most twice that largest
+  deviation.
+- **Logits.** Along those routes the plain stack agrees to 1e-3..9e-3 and the loop to 3e-3..1e-1 (bounds 1e-2 and 0.3).
+- **A slip is caught.** A device that reads exp_probs_b negated misses the score tolerances by more than 10x from the
+  first layer on.
+
+Batched slots against each request alone on a GPU backend run with both sides' routers replaced by the reference's
+routes (`ForcedRoutesForTests`), so the batched and lone kernels' rounding cannot split a tie two ways; the experts stay
+sparse and per row.
+
+ggml-metal's matrix-matrix expert product, which it takes from 32 rows, has kernels for 1, 2, 4, 5, 6, 8, 9, 10, 16
+and 22 routes a row only. The fixture's top-3 had aborted the test host there (`kernel not found`). The graph builder
+now runs such a product with every (route, row) a row of its own with one route, which is bit for bit the routes' own
+products (`NetworkGraphSpeechFoundationTests.ExpertsAtAnyRouteCount*`); Inkling 2 Mini's top-8 takes one product as
+before.
+
 The same suite is the family's dedicated conformance suite (`SharedRuntimeConformanceTests.DedicatedSuites`): batched
 slots match each sequence alone (managed 1e-5 plain, 5e-5 looped), three requests served together through the engine
 give each one's greedy stream, and a shared-prefix checkpoint continues exactly when cloned, written to a file and read
