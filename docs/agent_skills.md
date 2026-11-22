@@ -117,6 +117,9 @@ round is needed; an optional `revision` must match. It never overwrites a skill:
 hit's exact install call. After installation the package selector also resolves to
 the installed skill, whatever name it was installed under; `owner/name` means that
 publisher's hit, and `owner/repo` in the search's `owner` filter filters by the owner.
+`skills_inspect`/`skills_install` given an installed skill's name instead of a hub
+package (`research`, `research@skill-hub`) answer that it needs no install, with the
+call that uses it.
 One turn installs at most two new skills (`SkillMarketplaceSession.MaxInstallsPerRequest`);
 a further install is answered with the two it has, to use. The commit is looked up as
 the bare id (`application/vnd.github.sha`), so a monorepo whose last commit is huge

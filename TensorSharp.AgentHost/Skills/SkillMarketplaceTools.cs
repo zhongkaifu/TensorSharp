@@ -496,7 +496,7 @@ public static class SkillMarketplaceTools
     private static SkillToolResult Inspect(ToolCall call, SkillToolContext context, SkillMarketplaceSession session,
         CancellationToken cancellationToken)
     {
-        string package = ResolvePackage(call, session, out string? argumentError) ?? throw new ArgumentException(argumentError);
+        string package = ResolvePackage(call, session, context, out string? argumentError) ?? throw new ArgumentException(argumentError);
         if (FailedRepository(package, session, context) is { } known)
             return SkillToolResult.Failure(known);
         SkillPackageInspection inspection;
@@ -524,7 +524,7 @@ public static class SkillMarketplaceTools
         if (!session.CanInstall)
             return SkillToolResult.Failure("This host's skill library is read-only; nothing can be installed. "
                 + "Continue with the installed skills and other tools.");
-        string? package = ResolvePackage(call, session, out string? argumentError);
+        string? package = ResolvePackage(call, session, context, out string? argumentError);
         if (package == null)
             return SkillToolResult.Failure(argumentError!);
 
@@ -747,7 +747,7 @@ public static class SkillMarketplaceTools
     /// <c>owner/repository</c>, or skills.sh page from this request's searches is mapped to
     /// it, because a model copying the wrong field is the commonest way this call failed.
     /// </summary>
-    private static string? ResolvePackage(ToolCall call, SkillMarketplaceSession session, out string? error)
+    private static string? ResolvePackage(ToolCall call, SkillMarketplaceSession session, SkillToolContext context, out string? error)
     {
         error = null;
         string? given = Argument(call, "package") ?? Argument(call, "skill") ?? Argument(call, "name");
@@ -761,6 +761,18 @@ public static class SkillMarketplaceTools
             return hit.Package;
         if (given.Count(c => c == '@') == 1 && given.Contains('/'))
             return given;
+        // An installed skill's name where a hub package belongs ("research", "research@skill-hub"):
+        // it needs no install, so say how to use it instead of quoting an unrelated search hit.
+        foreach (string part in given.Split('@', '/'))
+        {
+            if (part.Length > 0 && context.TryResolve(part, out Skill? local, out _) && local != null)
+            {
+                bool runs = SkillCompatibility.Assess(local, SkillHostProfile.From(context)).CanRun;
+                error = $"'{local.Id}' is a skill installed here, not a hub package, so it needs no install or inspection. "
+                    + "Use it: " + CallFor(local, context, runs) + ".";
+                return null;
+            }
+        }
         error = $"'{given}' is not a package. Use owner/repository@skill-name exactly as skills_search printed it"
             + (session.NextHit(string.Empty) is { } first ? ", for example " + InstallCall(first.Package) + "." : "; search first.");
         return null;

@@ -611,6 +611,22 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.DoesNotContain("no data source", scripted.Content, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("skills_inspect", "research")]
+    [InlineData("skills_install", "research@skill-hub")]
+    public void AnInstalledSkillsNameGivenAsAPackageIsAnsweredWithHowToUseIt(string tool, string package)
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock report")), context).Ok);
+        SkillToolResult result = SkillTools.Execute(Call(tool, ("package", package)), context);
+        Assert.False(result.Ok);
+        Assert.Contains("'research' is a skill installed here, not a hub package, so it needs no install or inspection. "
+            + "Use it: " + ResearchCall + ".", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain(Package, result.Content, StringComparison.Ordinal);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;
