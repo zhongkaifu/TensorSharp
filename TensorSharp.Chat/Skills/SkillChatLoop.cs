@@ -718,8 +718,13 @@ namespace TensorSharp.Server.Skills
             return ids;
         }
 
-        /// <summary>How much of the raw stream a round keeps, for naming a loop.</summary>
-        private const int RawTailChars = 4096;
+        /// <summary>
+        /// How much of the raw stream a round keeps, for naming a loop. It must hold four
+        /// copies of the longest unit the engine stops: a block of
+        /// <see cref="RepetitionGuard.MaxBlockPeriod"/> tokens can be about 16K characters.
+        /// The buffer lives for one round and holds at most twice this.
+        /// </summary>
+        private const int RawTailChars = 65536;
 
         /// <summary>
         /// "the output repeated `","+` 43 times in a row", found in the raw tail of the
@@ -735,7 +740,7 @@ namespace TensorSharp.Server.Skills
                     shown = shown.Substring(0, 48) + "…";
                 return $"the output repeated `{shown}` {repeats} times in a row";
             }
-            return "the output repeated the same short sequence over and over";
+            return "the output repeated the same sequence over and over";
         }
 
         /// <summary>
