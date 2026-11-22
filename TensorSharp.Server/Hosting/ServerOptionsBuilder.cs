@@ -645,6 +645,36 @@ public static class ServerOptionsBuilder
     }
 
     /// <summary>
+    /// Translate <c>--nvfp4-prompt-activations &lt;fp4|q8&gt;</c> into the process-wide
+    /// <see cref="TensorSharp.Models.Nvfp4PromptActivationsConfig"/>, which each model captures when it is made: how its
+    /// NVFP4 prompt-row products quantize their activations. Last one wins. Returns true when the flag was present.
+    /// </summary>
+    public static bool ApplyNvfp4PromptActivationsCliFlag(string[] args)
+    {
+        if (ReadNvfp4PromptActivationsCliFlag(args) is not { } activations)
+            return false;
+        TensorSharp.Models.Nvfp4PromptActivationsConfig.Set(activations);
+        return true;
+    }
+
+    /// <summary>The value of the last <c>--nvfp4-prompt-activations</c> in <paramref name="args"/> (a --config file's
+    /// tokens come first), or null without one; throws for a value other than fp4 or q8.</summary>
+    public static Nvfp4PromptActivations? ReadNvfp4PromptActivationsCliFlag(string[] args)
+    {
+        Nvfp4PromptActivations? found = null;
+        for (int i = 0; args != null && i < args.Length; i++)
+        {
+            if (TryReadOption(args, ref i, TensorSharp.Models.Nvfp4PromptActivationsConfig.OptionName, out string? value))
+            {
+                if (!TensorSharp.Models.Nvfp4PromptActivationsConfig.TryParse(value, out var activations))
+                    throw new ArgumentException(TensorSharp.Models.Nvfp4PromptActivationsConfig.Refusal(value ?? string.Empty));
+                found = activations;
+            }
+        }
+        return found;
+    }
+
+    /// <summary>
     /// Translate <c>--n-cpu-moe &lt;N&gt;</c> / <c>-ncmoe</c> / <c>--cpu-moe</c> /
     /// <c>-cmoe</c> / <c>--cpu-moe-threads &lt;N&gt;</c> into the process-wide
     /// <see cref="TensorSharp.Models.MoeCpuOffloadConfig"/>, so the routed
@@ -1495,6 +1525,11 @@ public static class ServerOptionsBuilder
             {
                 continue;
             }
+            // Consumed by ApplyNvfp4PromptActivationsCliFlag(args) in the same earlier pass.
+            if (TryReadOption(args, ref i, TensorSharp.Models.Nvfp4PromptActivationsConfig.OptionName, out _))
+            {
+                continue;
+            }
             // The MoE CPU offload flags are consumed by
             // ApplyMoeCpuOffloadCliFlags(args) in a separate earlier pass.
             if (TryReadOption(args, ref i, "--n-cpu-moe", out _) ||
@@ -1666,7 +1701,7 @@ public static class ServerOptionsBuilder
             "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", QwenImageVariantFlag.Flag,
             "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae", "--video-upscaler", "--video-diffusion-vae",
             "--video-width", "--video-height", "--video-steps", "--video-mode",
-            "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",
+            "--kv-cache-dtype", TensorSharp.Models.Nvfp4PromptActivationsConfig.OptionName, "--gpu-device", "--list-gpus", "--help",
             TensorSharp.Graph.PromptAttentionConfig.Flag, TensorSharp.Graph.DiffusionProductsConfig.Flag,
             "--tp", "--tp-node-id", "--tp-peers",
             "--upload-max-mb", "--upload-quota-mb", "--upload-ttl-hours",

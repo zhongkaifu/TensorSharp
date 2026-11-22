@@ -384,4 +384,14 @@ public sealed partial class Lfm3RuntimeTests
     [CudaFact]
     public void Nvfp4FeedForwardsOnDirectCudaMatchTheManagedReference()
         => AssertNvfp4(BackendType.Cuda, configure: m => ((TensorSharp.Cuda.CudaAllocator)m.DirectAllocatorForTelemetry).AllNvfp4RowsOnMatvecForTests = true);
+
+    /// <summary>--nvfp4-prompt-activations q8 on direct CUDA, without the seam: prompt rows on the W4A8 GEMM (q8_1 activations
+    /// on the int8 tensor cores) where the FP4 tensor cores would take them, the NVFP4 matvec and dequantizing GEMM elsewhere,
+    /// all within the class bound of 8-bit activations.</summary>
+    [CudaFact]
+    public void Nvfp4FeedForwardsWithEightBitPromptActivationsOnDirectCudaMatchTheManagedReference()
+    {
+        using (Nvfp4PromptActivationsConfig.ForCurrentFlowInTests(Nvfp4PromptActivations.Q8))
+            AssertNvfp4(BackendType.Cuda);
+    }
 }

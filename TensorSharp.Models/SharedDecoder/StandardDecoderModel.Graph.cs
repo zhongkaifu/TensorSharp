@@ -3056,6 +3056,9 @@ namespace TensorSharp.Models
                 bool decode, bool snapshots, bool record)
                 : base(record, model.FloatProductsForTests)
             {
+                // The model's --nvfp4-prompt-activations q8: every product of this step's NVFP4 weights quantizes its rows to
+                // 8 bits (the GGML executor asks ggml for it per product).
+                if (model.Q8Nvfp4ActivationsOnGgml) MarkQ8Nvfp4Activations();
                 RecurrentSnapshots = snapshots;
                 _m = model;
                 _record = record;
