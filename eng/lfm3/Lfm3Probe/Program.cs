@@ -59,6 +59,14 @@ BackendType Backend(string name) => name switch
     _ => throw new ArgumentException("unknown backend " + name),
 };
 KvCacheDtypeConfig.ConfigureFromEnvironment();
+// --nvfp4-prompt-activations fp4|q8 anywhere on the line, as the CLI takes it: the models made below capture it.
+if (Array.IndexOf(args, Nvfp4PromptActivationsConfig.OptionName) is int nvfp4At && nvfp4At >= 0)
+{
+    if (nvfp4At + 1 >= args.Length || !Nvfp4PromptActivationsConfig.TryParse(args[nvfp4At + 1], out var activations))
+        throw new ArgumentException(Nvfp4PromptActivationsConfig.Refusal(nvfp4At + 1 < args.Length ? args[nvfp4At + 1] : ""));
+    Nvfp4PromptActivationsConfig.Set(activations);
+    args = args.Where((_, i) => i != nvfp4At && i != nvfp4At + 1).ToArray();
+}
 switch (args[0])
 {
     case "ppl" when args.Length >= 6:

@@ -183,6 +183,43 @@ namespace TensorSharp.Models
         /// </summary>
         protected KvCacheDtype _kvCacheDtype = KvCacheDtypeConfig.Current;
 
+        /// <summary>How this model's NVFP4 products quantize their prompt rows' activations: captured at construction from
+        /// <see cref="Nvfp4PromptActivationsConfig.Current"/> (<c>--nvfp4-prompt-activations</c>).</summary>
+        public Nvfp4PromptActivations Nvfp4PromptActivations { get; } = Nvfp4PromptActivationsConfig.Current;
+
+        /// <summary>Whether this family's forward on a GGML backend applies <see cref="Nvfp4PromptActivations"/> to all of
+        /// its NVFP4 products: the shared decoder runtime's graphs and per-op products do (StandardDecoderModel); a family
+        /// with a native forward of its own keeps ggml's default activations there. Direct CUDA applies it to every family's
+        /// products (CudaAllocator).</summary>
+        protected virtual bool AppliesNvfp4PromptActivationsOnGgml => false;
+
+        /// <summary>The GGML per-op NVFP4 products ask for 8-bit activations (<see cref="Nvfp4PromptActivations"/>, where this
+        /// family applies it).</summary>
+        private protected bool Q8Nvfp4ActivationsOnGgml
+            => Nvfp4PromptActivations == Nvfp4PromptActivations.Q8 && AppliesNvfp4PromptActivationsOnGgml;
+
+        /// <summary>A CUDA allocator this model computes on runs its NVFP4 prompt products with the model's activations.</summary>
+        private protected void ApplyNvfp4PromptActivations(IAllocator allocator)
+        {
+            if (allocator is CudaAllocator cuda) cuda.Nvfp4PromptActivations = Nvfp4PromptActivations;
+        }
+
+        /// <summary>One line at load when <c>--nvfp4-prompt-activations q8</c> is set: where it takes effect for this model.</summary>
+        private void ReportNvfp4PromptActivations(BackendType backend)
+        {
+            if (Nvfp4PromptActivations != Nvfp4PromptActivations.Q8) return;
+            string effect = backend switch
+            {
+                BackendType.Cuda => "applied by the direct CUDA NVFP4 products on GPUs with FP4 tensor cores (CC 12.x); " +
+                    "elsewhere they use 8-bit activations already",
+                BackendType.GgmlCuda when AppliesNvfp4PromptActivationsOnGgml => "applied by ggml-cuda's NVFP4 products on GPUs " +
+                    "with FP4 tensor cores (CC 12.x); elsewhere they use 8-bit activations already",
+                BackendType.GgmlCuda => "no effect: this family's ggml_cuda forward keeps ggml's default NVFP4 activations",
+                _ => "no effect: this backend has no 4-bit activation route, its NVFP4 products use 8-bit activations already",
+            };
+            Console.WriteLine($"{Nvfp4PromptActivationsConfig.OptionName} q8: {effect}.");
+        }
+
         /// <summary>
         /// Pick a model-aligned default KV-cache dtype based on the dominant
         /// weight quantization tier seen in <paramref name="quantWeights"/>
@@ -467,6 +504,11 @@ namespace TensorSharp.Models
             }
             Console.WriteLine($"Backend: {backend}");
             if (IsGgmlBackend) EnterLiveGgmlModels();
+            ApplyNvfp4PromptActivations(_allocator);
+            if (backend == BackendType.Cuda && DistributedControlGroup is { } cudaGroup)
+                for (int r = 1; r < cudaGroup.Degree; r++)
+                    ApplyNvfp4PromptActivations(cudaGroup.GetAllocator(r));
+            ReportNvfp4PromptActivations(backend);
 
             // Tell the kernels about the whole cluster, not just this process.
             // Expert parallelism is sharded by the GLOBAL degree, so a kernel
@@ -2080,7 +2122,7 @@ namespace TensorSharp.Models
                 int outDim = (int)qw.Ne1;
                 result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
                 if (IsGgmlBackend)
-                    GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, Q8Nvfp4ActivationsOnGgml);
                 else
                     AddmmQuantManaged(result, input, qw);
                 // NVFP4 scale2 sidecar ("<base>.scale"): the true weight is
@@ -2319,7 +2361,8 @@ namespace TensorSharp.Models
                 // after a preload it is an opaque handle rather than the host
                 // pointer. Passing Data would miss the resident copy and re-upload
                 // the weight on every call.
-                GgmlBasicOps.AddmmQuant(result, input, weight.CacheKey, weight.GgmlType, weight.Ne0, weight.Ne1, weight.RawBytes);
+                GgmlBasicOps.AddmmQuant(result, input, weight.CacheKey, weight.GgmlType, weight.Ne0, weight.Ne1, weight.RawBytes,
+                    Q8Nvfp4ActivationsOnGgml);
                 return;
             }
 

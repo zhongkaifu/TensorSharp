@@ -242,6 +242,8 @@ try
     // Must run before the startup model is loaded so InitKVCache sees the choice.
     TensorSharp.Models.KvCacheDtypeConfig.ConfigureFromEnvironment();
     kvCacheDtypeFlagApplied = ServerOptionsBuilder.ApplyKvCacheDtypeCliFlag(args);
+    // --nvfp4-prompt-activations: captured by every model made from here on.
+    ServerOptionsBuilder.ApplyNvfp4PromptActivationsCliFlag(args);
     // Translate --n-cpu-moe / --cpu-moe into MoeCpuOffloadConfig (or honor the
     // TS_N_CPU_MOE / TS_CPU_MOE env vars). Must run before the startup model is
     // loaded: weight residency is decided while preparing the quantized weights.

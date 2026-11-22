@@ -52,7 +52,10 @@ public abstract partial class ModelBase
         if (LayerSplitGroup == null && _backend == BackendType.Cuda) RefuseLayerSplitPastTheCudaDevices();
         _layerAllocators = new IAllocator[LayerSplitDegree];
         for (int rank = 0; rank < _layerAllocators.Length; rank++)
+        {
             _layerAllocators[rank] = LayerSplitGroup?.GetAllocator(rank * stageDevices) ?? CreateLayerDeviceAllocator(rank);
+            ApplyNvfp4PromptActivations(_layerAllocators[rank]);
+        }
 
         if (LayerSplitGroup != null)
         {

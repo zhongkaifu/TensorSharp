@@ -631,7 +631,10 @@ namespace TensorSharp.GGML
         /// The quantized weight data is stored in native GGUF format with GGML type.
         /// ne0 = inDim (shared dimension), ne1 = outDim.
         /// </summary>
-        public static void AddmmQuant(Tensor result, Tensor m1, IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes)
+        /// <param name="q8Nvfp4Activations">An NVFP4 product quantizes its activation rows to 8 bits (the model's
+        /// <see cref="Nvfp4PromptActivations.Q8"/>): ggml is asked for it per product, as for a program's.</param>
+        public static void AddmmQuant(Tensor result, Tensor m1, IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes,
+            bool q8Nvfp4Activations = false)
         {
             if (result.DimensionCount != 2 || m1.DimensionCount != 2)
                 throw new ArgumentException("AddmmQuant requires 2D tensors for result and m1.");
@@ -658,7 +661,7 @@ namespace TensorSharp.GGML
             if (result.Storage is GgmlStorage resultStorage)
                 GgmlNative.SetActiveRankIfUnpinned(resultStorage.DeviceId);
 
-            GgmlNative.AddmmQuant(resultView, m1View, weightData, ggmlType, ne0, ne1, rawBytes);
+            GgmlNative.AddmmQuant(resultView, m1View, weightData, ggmlType, ne0, ne1, rawBytes, q8Nvfp4Activations);
         }
 
         /// <summary>Number of GPUs the given GGML backend can address.</summary>

@@ -807,6 +807,16 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [MlxFact]
     public void Nvfp4FeedForwardsOnMlxMatchTheManagedReference() => AssertNvfp4(BackendType.Mlx);
 
+    /// <summary>--nvfp4-prompt-activations q8 on the pinned GGML backend: the prompt rows' NVFP4 products keep 8-bit activations
+    /// (ggml-cuda's q8 route where it would run W4A4, on CC 12.x; every other route has them already), so the class bound of
+    /// 8-bit activations holds on every GPU, the W4A4 class bound's place included.</summary>
+    [Fact]
+    public void Nvfp4FeedForwardsWithEightBitPromptActivationsOnThePinnedGgmlBackendMatchTheManagedReference()
+    {
+        using (Nvfp4PromptActivationsConfig.ForCurrentFlowInTests(Nvfp4PromptActivations.Q8))
+            AssertNvfp4(TestGates.PinnedGgmlBackend, Tolerance("nvfp4", TestGates.PinnedGgmlBackend));
+    }
+
     private void AssertNvfp4(BackendType backend, double tolerance = 0, Action<ModelBase> configure = null)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

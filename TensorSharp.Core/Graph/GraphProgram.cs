@@ -391,7 +391,8 @@ namespace TensorSharp.Graph
     public sealed class GraphProgram
     {
         internal GraphProgram(GraphNode[] entries, int nodeCount, long[] outputFloats, bool replayable, bool reorder,
-            int[]? tensorParallelRanks, (ulong, ulong) signature, bool floatProducts = false, bool wideTokenProducts = false)
+            int[]? tensorParallelRanks, (ulong, ulong) signature, bool floatProducts = false, bool wideTokenProducts = false,
+            bool q8Nvfp4Activations = false)
         {
             Entries = entries;
             NodeCount = nodeCount;
@@ -402,6 +403,7 @@ namespace TensorSharp.Graph
             Signature = signature;
             FloatProducts = floatProducts;
             WideTokenProducts = wideTokenProducts;
+            Q8Nvfp4Activations = q8Nvfp4Activations;
         }
 
         public IReadOnlyList<GraphNode> Entries { get; }
@@ -431,6 +433,12 @@ namespace TensorSharp.Graph
         /// products, cuDNN attention, and the diffusion-transformer regions as its fused nodes; elsewhere it changes
         /// nothing.</summary>
         public bool WideTokenProducts { get; }
+        /// <summary>The program's NVFP4 products quantize their activation rows to 8 bits, prompt rows included (the model's
+        /// <see cref="Nvfp4PromptActivations.Q8"/>; <see cref="GraphProgramBuilder.MarkQ8Nvfp4Activations"/>). The GGML
+        /// executor asks ggml for it per product (<c>ggml_prec_set_src(product, GGML_PREC_Q8, 1)</c>), which ggml-cuda's
+        /// product kernels honour on Blackwell instead of their native NVFP4 activations; on every other route the
+        /// activations are 8-bit already.</summary>
+        public bool Q8Nvfp4Activations { get; }
     }
 
     /// <summary>
@@ -445,6 +453,7 @@ namespace TensorSharp.Graph
         private ulong _s1 = 14695981039346656037UL, _s2 = 0x9E3779B97F4A7C15UL;
         private bool _signatureOnly;
         private bool _wideTokenProducts;
+        private bool _q8Nvfp4Activations;
 
         public GraphProgramBuilder(bool record) => _entries = record ? new List<GraphNode>() : null;
 
@@ -462,6 +471,20 @@ namespace TensorSharp.Graph
 
         /// <summary>Whether <see cref="MarkWideTokenProducts"/> was called.</summary>
         public bool WideTokenProducts => _wideTokenProducts;
+
+        /// <summary>The program will carry <see cref="GraphProgram.Q8Nvfp4Activations"/>. Part of the signature; before any
+        /// entry, as <see cref="MarkWideTokenProducts"/>.</summary>
+        public void MarkQ8Nvfp4Activations()
+        {
+            if (NodeCount != 0 || _outputs.Count != 0)
+                throw new InvalidOperationException("Q8Nvfp4Activations is a program attribute: mark it before the first entry.");
+            if (_q8Nvfp4Activations) return;
+            _q8Nvfp4Activations = true;
+            Mix(10);
+        }
+
+        /// <summary>Whether <see cref="MarkQ8Nvfp4Activations"/> was called.</summary>
+        public bool Q8Nvfp4Activations => _q8Nvfp4Activations;
 
         public bool Recording => _entries != null;
 
@@ -602,7 +625,7 @@ namespace TensorSharp.Graph
         {
             if (_entries == null) throw new InvalidOperationException("A hash-only trace has no program.");
             return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature,
-                floatProducts: _floatProducts, wideTokenProducts: _wideTokenProducts);
+                floatProducts: _floatProducts, wideTokenProducts: _wideTokenProducts, q8Nvfp4Activations: _q8Nvfp4Activations);
         }
     }
 }

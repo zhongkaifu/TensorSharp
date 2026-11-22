@@ -106,6 +106,15 @@ namespace TensorSharp.GGML
                 throw new InvalidOperationException("ggml graph WideTokenProducts failed: " + GgmlBasicOps.LastNativeError());
         }
 
+        /// <summary>The program's NVFP4 products quantize their activation rows to 8 bits
+        /// (<see cref="TensorSharp.Graph.GraphProgram.Q8Nvfp4Activations"/>): every such product asks ggml for q8 activations.
+        /// Before the first node.</summary>
+        public void MarkQ8Nvfp4Activations()
+        {
+            if (GgmlNative.TSGgml_GraphQ8Nvfp4Activations(Handle, 1) == 0)
+                throw new InvalidOperationException("ggml graph Q8Nvfp4Activations failed: " + GgmlBasicOps.LastNativeError());
+        }
+
         /// <summary>Nodes emitted so far.</summary>
         public int NodeCount { get; private set; }
 
@@ -380,6 +389,10 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_GraphWideTokenProducts(IntPtr graph, int on);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial int TSGgml_GraphQ8Nvfp4Activations(IntPtr graph, int on);
 
         [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

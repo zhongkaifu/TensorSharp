@@ -530,6 +530,119 @@ public sealed class CudaNvfp4MatmulTests
 
     /// <summary>Rows of an NVFP4 table gathered on the device (the planar layout's lookup where weights are planar) equal
     /// the host's dequantization.</summary>
+    /// <summary>
+    /// Prompt rows with 8-bit activations (an allocator under <see cref="Nvfp4PromptActivations.Q8"/>, a model's
+    /// --nvfp4-prompt-activations q8): the W4A8 GEMM computes the q8 matvec's products at any number of rows, on the F16
+    /// tensor cores TMA-fed from 49 rows of weights in 16-row groups (200 x 512, 129 x 1040), on the int8 tensor cores
+    /// otherwise (17 and 33 rows; 100 and 4100 weight rows). Held to the dequantized weights times the activations rounded as the matvec rounds them (q8_1, F32
+    /// scales) within 1e-4 relative L2, the matvec's own bound, and to the matvec seam's rows (the same quantizer, 16 rows a
+    /// call) within 1e-5 of the largest value: only the order of the F32 sums differs. Tiles cut at both edges (token and
+    /// weight rows not multiples of the tile) and one or several K steps.
+    /// </summary>
+    [CudaTheory(Fp4TensorCores = true)]
+    [InlineData(256, 64, 17)]
+    [InlineData(512, 100, 65)]
+    [InlineData(5120, 512, 200)]
+    [InlineData(1024, 4100, 33)]
+    [InlineData(2048, 1040, 129)]
+    public void PromptRowsWithEightBitActivationsGiveTheMatvecsProducts(int inDim, int outDim, int rows)
+    {
+        long rowBytes = inDim / 64 * BlockBytes;
+        byte[] weights = Nvfp4Rows(outDim, inDim, seed: 23);
+        var act = new float[rows, inDim];
+        for (int t = 0; t < rows; t++)
+            for (int k = 0; k < inDim; k++)
+                act[t, k] = MathF.Sin(0.0173f * (k + 1) * (t + 2)) + 0.3f * MathF.Cos(0.061f * k - 3 * t);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            Assert.True(allocator.Fp4Kernels != null, "the gate found the FP4 tensor-core products on GPU 0, but this allocator did not load them");
+            allocator.Nvfp4PromptActivations = Nvfp4PromptActivations.Q8;
+            using var input = Tensor.FromArray(allocator, act);
+            float[] Run()
+            {
+                using var y = new Tensor(allocator, DType.Float32, rows, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(y, input, host, host, Nvfp4, inDim, outDim, weights.Length));
+                return y.GetElementsAsFloat(rows * outDim);
+            }
+            float[] gemm = Run();
+            allocator.AllNvfp4RowsOnMatvecForTests = true;
+            float[] matvec = Run();
+            allocator.AllNvfp4RowsOnMatvecForTests = false;
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+
+            float[,] reference = QuantizeDequantizeQ8_1(act, storeScaleAsHalf: false);
+            var wRow = new float[inDim];
+            double num = 0, den = 0, apart = 0, largest = 0;
+            for (int o = 0; o < outDim; o++)
+            {
+                NativeDequant.DequantizeToFloat32(Nvfp4, weights, checked((int)(o * rowBytes)), wRow, 0, inDim);
+                for (int t = 0; t < rows; t++)
+                {
+                    double want = 0;
+                    for (int k = 0; k < inDim; k++)
+                        want += (double)wRow[k] * reference[t, k];
+                    double d = gemm[t * outDim + o] - want;
+                    num += d * d;
+                    den += want * want;
+                    apart = Math.Max(apart, Math.Abs((double)gemm[t * outDim + o] - matvec[t * outDim + o]));
+                    largest = Math.Max(largest, Math.Abs(want));
+                }
+            }
+            double rel = Math.Sqrt(num / den);
+            _output.WriteLine($"W4A8 {rows} x {inDim} -> {outDim}: relative L2 {rel:E2} against the dequantized operands; " +
+                $"{apart / largest:E2} of the largest value from the matvec's rows");
+            Assert.True(rel <= 1e-4, $"W4A8 {rows} x {inDim} -> {outDim}: {rel:E2} from the dequantized operands");
+            Assert.True(apart <= 1e-5 * largest, $"W4A8 {rows} x {inDim} -> {outDim}: {apart / largest:E2} from the matvec's rows");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    /// <summary>Under <see cref="Nvfp4PromptActivations.Q8"/> the routes that write NVFP4 activation planes (the fused gate|up
+    /// epilogue, the SwiGLU quantizer's down projection, a writer's planes) decline, so their products run on the W4A8 GEMM
+    /// instead; under the default they take the rows.</summary>
+    [CudaFact(Fp4TensorCores = true)]
+    public void TheNvfp4ActivationRoutesDeclineUnderEightBitActivations()
+    {
+        using var allocator = new CudaAllocator();
+        Assert.True(allocator.Fp4Kernels != null, "the gate found the FP4 tensor-core products on GPU 0, but this allocator did not load them");
+        const int ff = 512, inDim = 1024, rows = 100;
+        byte[] gateUp = Nvfp4Rows(2 * ff, inDim, seed: 29), down = Nvfp4Rows(inDim, ff, seed: 31);
+        IntPtr hostGateUp = Marshal.AllocHGlobal(gateUp.Length), hostDown = Marshal.AllocHGlobal(down.Length);
+        try
+        {
+            Marshal.Copy(gateUp, 0, hostGateUp, gateUp.Length);
+            Marshal.Copy(down, 0, hostDown, down.Length);
+            using var x = new Tensor(allocator, DType.Float32, rows, inDim);
+            using var gu = new Tensor(allocator, DType.Float32, rows, 2 * ff);
+            using var act = new Tensor(allocator, DType.Float32, rows, ff);
+            using var y = new Tensor(allocator, DType.Float32, rows, inDim);
+            Ops.Fill(x, 0.25f);
+            Ops.Fill(gu, 0.5f);
+            foreach (Nvfp4PromptActivations activations in new[] { Nvfp4PromptActivations.Q8, Nvfp4PromptActivations.Fp4 })
+            {
+                allocator.Nvfp4PromptActivations = activations;
+                bool fp4 = activations == Nvfp4PromptActivations.Fp4;
+                Assert.Equal(fp4, allocator.Nvfp4ActivationRows(rows));
+                Assert.Equal(fp4, CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(act, x, hostGateUp, hostGateUp, Nvfp4, inDim, 2 * ff, gateUp.Length));
+                Assert.Equal(fp4, CudaQuantizedOps.TryAddmmSwiGluNvfp4(y, gu, hostDown, hostDown, Nvfp4, ff, inDim, down.Length));
+            }
+            Assert.False(allocator.Nvfp4ActivationRows(CudaFp4Kernels.GemvMaxRows));   // decode rows: the matvec either way
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, hostGateUp);
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, hostDown);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(hostGateUp);
+            Marshal.FreeHGlobal(hostDown);
+        }
+    }
+
     [CudaFact]
     public void GatheredRowsMatchTheHostDequantization()
     {

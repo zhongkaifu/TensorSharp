@@ -593,6 +593,7 @@ TestMatrix 配置中 sweep。
 | `TENSORSHARP_CUDA_DEVICE_BUDGET_MB` | 直连 `cuda` 后端 | 分配器与模型容量检查可使用的显存（MB）：其总量至多为该值，空闲量至多为该值减去整个设备的已用量（NVML 能识别该设备时取 NVML 的读数，否则取 cuMemGetInfo 的）。池的大块缓存预算、模型的预留余量（1/32，至少 1 GB）以及每次 slot、检查点和拷贝的容量检查都由它推出。会超出该值的分配会先交还缓存的大块、缓存的小块，再交还该设备上模型可释放的内存（与遇到显存不足错误时相同）；仍不够时照常分配。未设置时自动读取独占显存：NVML（nvml.dll / libnvidia-ml.so.1，存在时才加载）约束 cuMemGetInfo——在 Windows（WDDM）上后者的总量包含共享系统内存，空闲量只计调用进程自己；在 Windows 上，会超出独占显存的分配也会这样先交还内存，而不是溢出到共享内存（已无可交还时警告一次）。在 Linux 上，除非设置了该值，这一保护不启用：那里设备满时分配会直接失败，显存不足回收流程照旧运行。缺少 NVML（Windows 上会有警告）或设备与其他进程共用时，可设为略低于独占显存；这是唯一的写法（没有 CLI 或服务器参数） | 未设置（设备的独占显存） | 未注册 | 否 |
 | `TENSORSHARP_CUDA_NVML` | 直连 `cuda` 后端 | `0` 不加载 NVML：容量检查只读取 cuMemGetInfo（设置了 `TENSORSHARP_CUDA_DEVICE_BUDGET_MB` 时再受其约束） | 未设置（存在 NVML 时使用） | 未注册 | 否 |
 | `TS_CUDA_PROFILE` | 直连 `cuda` 后端 | 退出时打印 CPU 回退算子与主机↔设备同步计数（`1`），含调用点归因（`2`） | 关闭 | 未注册 | 否 |
+| 无：仅 `--nvfp4-prompt-activations fp4\|q8` | CC 12.x GPU 上的 NVFP4 模型：`--backend cuda`（每个模型族）与 `ggml_cuda`（共享解码运行时上的模型族），CLI 与服务器 | prompt 行 NVFP4 矩阵乘的激活：`fp4` 在 FP4 Tensor Core 上以 W4A4 运行，`q8` 以 8 位激活按 W4A8 运行（与 decode 行相同）。每个模型在加载时读取；其他情况下 `q8` 会记录它不起作用。若设置了 ggml 自己的 `GGML_CUDA_MMQ_PREC`（`q4` / `q8`），它会在 `ggml_cuda` 上对整个进程覆盖这一选择 | `fp4` | 未注册 | 否 |
 
 ## 矩阵外的知识库配置
 

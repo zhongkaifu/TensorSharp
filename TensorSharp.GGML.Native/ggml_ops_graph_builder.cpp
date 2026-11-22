@@ -478,6 +478,9 @@ namespace
         // The program's products have thousands of rows (GraphProgram.WideTokenProducts): on ggml_cuda its run takes the DiT
         // offload's wide routes and it may serve the DiT regions in the graph. Set before the first node.
         bool wide_token_products = false;
+        // The program's NVFP4 products quantize their activations to 8 bits (GraphProgram.Q8Nvfp4Activations): build()
+        // requests GGML_PREC_Q8 for src1 of every MUL_MAT and MUL_MAT_ID on an NVFP4 matrix. Set before the first node.
+        bool q8_nvfp4_activations = false;
         int dit_regions = 0;                                     // regions served as DiT offload nodes
         // A modulation or gated residual of this graph ran its ops because its segment table is not one the fused kernels
         // take (more than tsg_h3_fused_max_segments(), or not on the host): MiniMax-H3's native DiT then builds the whole
@@ -2117,6 +2120,18 @@ namespace
         // head never reads its last block's sum, yet the other ranks' reduce needs its partial (and the ranks must cut
         // their graphs at the same boundaries).
         for (ggml_tensor* t : g->tp_partials) ggml_build_forward_expand(g->graph, t);
+        // 8-bit activations for the NVFP4 products (the model's --nvfp4-prompt-activations q8): ggml's per-op request, which
+        // ggml-cuda's product kernels honour on Blackwell instead of their native NVFP4 activations (mmq.cu,
+        // ggml_cuda_mmq_get_prec_src1, and the fused gate/up product reads it from both of its products). Every other route
+        // quantizes them to 8 bits anyway. A view of a weight keeps its type, so a row block of one is found too.
+        if (g->q8_nvfp4_activations)
+            for (int i = 0; i < ggml_graph_n_nodes(g->graph); i++)
+            {
+                ggml_tensor* node = ggml_graph_node(g->graph, i);
+                if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != nullptr
+                    && node->src[0]->type == GGML_TYPE_NVFP4 && !ggml_prec_set_src(node, GGML_PREC_Q8, 1))
+                    throw std::runtime_error("graph builder: an NVFP4 product refused the q8 activation precision");
+            }
         // Before allocation: reordering after lifetime planning would invalidate the alias plan (and a
         // reorder would move nodes across a pause).
         if (g->reorder && g->host_moe.empty()) optimize_graph_for_metal(g->ctx, g->graph);
@@ -2518,6 +2533,20 @@ TSG_EXPORT int TSGgml_GraphWideTokenProducts(void* handle, int on)
         return 0;
     }
     g->wide_token_products = on != 0;
+    return 1;
+}
+
+// The program's NVFP4 products quantize their activations to 8 bits (GraphProgram.Q8Nvfp4Activations), set before its first
+// node: build() asks ggml for GGML_PREC_Q8 activations on every product of an NVFP4 matrix.
+TSG_EXPORT int TSGgml_GraphQ8Nvfp4Activations(void* handle, int on)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    if (g == nullptr || g->built || !g->nodes.empty())
+    {
+        set_last_error("graph builder: Q8Nvfp4Activations is set on a graph before its first node.");
+        return 0;
+    }
+    g->q8_nvfp4_activations = on != 0;
     return 1;
 }
 

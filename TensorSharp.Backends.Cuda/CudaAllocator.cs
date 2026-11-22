@@ -257,6 +257,16 @@ namespace TensorSharp.Cuda
 
         private int nvfp4MatvecRows = CudaFp4Kernels.GemvMaxRows;
 
+        /// <summary>How this allocator's NVFP4 products quantize the activations of more rows than the matvec takes: the
+        /// model's <c>--nvfp4-prompt-activations</c> (set when it creates the allocator). <see cref="Nvfp4PromptActivations.Q8"/>
+        /// runs them on the W4A8 GEMM (<see cref="CudaFp4Kernels.GemmW4A8"/>), with the matvec's q8_1 rows, and
+        /// the routes that write NVFP4 activation planes decline (<see cref="Nvfp4ActivationRows"/>).</summary>
+        public Nvfp4PromptActivations Nvfp4PromptActivations { get; set; }
+
+        /// <summary>Whether a product of <paramref name="rows"/> rows of an NVFP4 matrix quantizes them to NVFP4 for the FP4
+        /// tensor cores: more rows than the matvec takes, under <see cref="Nvfp4PromptActivations.Fp4"/>.</summary>
+        internal bool Nvfp4ActivationRows(long rows) => rows > Nvfp4MatvecRows && Nvfp4PromptActivations == Nvfp4PromptActivations.Fp4;
+
         /// <summary>Test seam, never set by the product: every NVFP4 product runs on the q8 matvec (<see cref="CudaFp4Kernels.GemvMaxRows"/>
         /// rows a call), so prompt rows keep q8 activations as decode rows do instead of NVFP4 ones on the FP4 GEMMs. It measures what
         /// the prompt path's NVFP4 activations cost (eng/LongContextQualityProbe's q8act arm).</summary>

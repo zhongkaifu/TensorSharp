@@ -22,7 +22,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FP4_VERSION in tensorsharp_fp4_kernels.cu: bump both together whenever a kernel is added or
         /// changes its signature.</summary>
-        public const int CurrentVersion = 7;
+        public const int CurrentVersion = 9;
 
         /// <summary>K values one GEMM stage takes: a planar matrix's row width must be a multiple of it.</summary>
         public const int StageK = 256;
@@ -52,10 +52,10 @@ namespace TensorSharp.Cuda
 
         private readonly IntPtr _gemm32SwiGlu, _gemm64SwiGlu;
         private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _quantSwiGlu, _addRmsNorm, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _tma256SwiGlu,
-            _tma128SwiGlu, _getRows;
+            _tma128SwiGlu, _getRows, _gemmW4A8, _quantQ81F16, _gemmW4A8Tma;
         private readonly IntPtr[] _gemv = new IntPtr[GemvMaxRows + 1];
         private readonly int[] _gemvRows = new int[GemvMaxRows + 1];
-        private readonly int _smem32, _smem64, _smem128, _smemTma256, _smemTma128;
+        private readonly int _smem32, _smem64, _smem128, _smemTma256, _smemTma128, _smemW4A8Tma;
 
         private CudaFp4Kernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -83,6 +83,9 @@ namespace TensorSharp.Cuda
             _gemm32SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_32_swiglu");
             _gemm64SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_64_swiglu");
             _getRows = module.GetFunction("ts_fp4_get_rows_f32");
+            _gemmW4A8 = module.GetFunction("ts_fp4_gemm_w4a8");
+            _quantQ81F16 = module.GetFunction("ts_fp4_quantize_q81_f16");
+            _gemmW4A8Tma = module.GetFunction("ts_fp4_gemm_w4a8_tma");
             for (int n = 1; n <= GemvMaxRows; n++)
                 _gemv[n] = module.GetFunction($"ts_fp4_gemv_nvfp4_{n}");
             RunProbe(module.GetFunction("ts_fp4_gemv_rows_per_warp"), host, GemvMaxRows + 1);
@@ -92,11 +95,14 @@ namespace TensorSharp.Cuda
             (_smem32, _smem64, _smem128) = (host[0], host[1], host[2]);
             RunProbe(module.GetFunction("ts_fp4_gemm_tma_smem_bytes"), host, 2);
             (_smemTma256, _smemTma128) = (host[0], host[1]);
+            RunProbe(module.GetFunction("ts_fp4_gemm_w4a8_tma_smem_bytes"), host, 1);
+            _smemW4A8Tma = host[0];
             CudaDriverApi.cuFuncSetAttribute(_quantNvfp4, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_quantSwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_addRmsNorm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             foreach (var (fn, smem) in new[] { (_gemm32, _smem32), (_gemm64, _smem64), (_gemm128, _smem128), (_tma256, _smemTma256), (_tma128, _smemTma128),
-                         (_tma256SwiGlu, _smemTma256), (_tma128SwiGlu, _smemTma128), (_gemm32SwiGlu, _smem32), (_gemm64SwiGlu, _smem64) })
+                         (_tma256SwiGlu, _smemTma256), (_tma128SwiGlu, _smemTma128), (_gemm32SwiGlu, _smem32), (_gemm64SwiGlu, _smem64),
+                         (_gemmW4A8Tma, _smemW4A8Tma) })
                 CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem).ThrowOnError();
         }
 
@@ -177,6 +183,77 @@ namespace TensorSharp.Cuda
                 int a2 = outDim, a3 = k; float a6 = 1.0f;
                 void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
                 Launch(_gemv[rows], CeilDiv(outDim, 4 * _gemvRows[rows]), 1, 1, 128, 0, stream, args);
+            }
+        }
+
+        /// <summary>Rows of the int8 W4A8 GEMM's tiles (<see cref="GemmW4A8"/> where TMA cannot take the matrix), activation and
+        /// weight rows alike.</summary>
+        public const int W4A8TileRows = 64;
+
+        /// <summary>Token and weight rows of the TMA-fed W4A8 GEMM's tiles.</summary>
+        public const int W4A8TmaTileRows = 128;
+
+        /// <summary>Scratch bytes of <see cref="GemmW4A8"/>'s q8_1 activations: F16 integers (or int8 where TMA cannot take the
+        /// matrix), then one F32 scale per 32 values.</summary>
+        public static long W4A8ScratchBytes(int rows, int k) => (long)rows * k * 2 + (long)rows * (k / 32) * 4;
+
+        /// <summary>Fewest activation rows the TMA-fed W4A8 GEMM takes: below it the int8 GEMM's 64-row tiles are as fast or
+        /// faster (RTX PRO 4500, 5120 -> 17408: 0.146 against 0.162 ms at 17 rows, 0.155 against 0.164 at 32; 0.185 against
+        /// 0.167 at 64, 0.297 against 0.172 at 100).</summary>
+        public const int W4A8TmaMinRows = 49;
+
+        /// <summary>Whether the TMA-fed W4A8 GEMM takes the product: at least <see cref="W4A8TmaMinRows"/> rows, the scale
+        /// plane's rows 16-byte multiples (k a multiple of 256), whole 16-row groups of weights, and 16-byte aligned planes and
+        /// scratch.</summary>
+        public static bool TakesW4A8Tma(int rows, int outDim, int k, IntPtr planes, IntPtr scratch)
+            => rows >= W4A8TmaMinRows && k % 256 == 0 && outDim % 16 == 0
+               && ((planes | ScalePlane(planes, outDim, k) | scratch) & 15) == 0;
+
+        /// <summary>
+        /// y[rows, outDim] = x[rows, k] W^T for a planar NVFP4 matrix with 8-bit activations, for any number of rows: x quantized
+        /// to q8_1 into <paramref name="scratch"/> (<see cref="W4A8ScratchBytes"/> of <paramref name="rows"/>), then multiplied
+        /// with the matvec's quantities: each 16-value block's sum of activation integers times E2M1 values, scaled by its UE4M3
+        /// scale, then by the 32-value activation scale; only the order of the F32 sums differs.
+        /// <list type="bullet">
+        /// <item>Where TMA takes the matrix (<see cref="TakesW4A8Tma"/>): the integers as F16 and each weight as q * UE4M3 in F16
+        /// (both exact), on the F16 tensor cores, TMA-fed and warp-specialized, 128 x 128 a CTA.</item>
+        /// <item>Otherwise: on the int8 tensor cores (E2M1 as int8 at twice its value, its halved UE4M3 scale), 64 x 64 a
+        /// CTA.</item>
+        /// </list>
+        /// k a multiple of <see cref="StageK"/> (<see cref="TakesWidth"/>).
+        /// </summary>
+        public void GemmW4A8(IntPtr planes, int outDim, int k, IntPtr x, int rows, IntPtr scratch, IntPtr y, IntPtr stream)
+        {
+            bool tma = TakesW4A8Tma(rows, outDim, k, planes, scratch);
+            long valueBytes = (long)rows * k * (tma ? 2 : 1);
+            IntPtr xq = scratch, xd = scratch + (nint)valueBytes;
+            {
+                IntPtr a0 = x, a1 = xq, a2 = xd; int a3 = k, a4 = rows;
+                void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
+                Launch(tma ? _quantQ81F16 : _quantQ81, CeilDiv((long)rows * (k / 32) * 32, Block), 1, 1, Block, 0, stream, args);
+            }
+            if (tma)
+            {
+                // CUtensorMap is 128 bytes and 64-byte aligned: the F16 activations in 64-value (128-byte) boxes with the
+                // 128-byte swizzle, their F32 scales in 16-byte boxes (one tile's four), the weight codes in 64-byte boxes
+                // with the 64-byte swizzle and their scales in 16-byte boxes (two tiles' sixteen), as the W4A4 GEMM reads them.
+                byte* raw = stackalloc byte[4 * 128 + 64];
+                byte* maps = (byte*)(((nint)raw + 63) & ~(nint)63);
+                EncodeTma(maps, xq, (long)k * 2, rows, 128, W4A8TmaTileRows, 3);
+                EncodeTma(maps + 128, xd, (long)(k / 32) * 4, rows, 16, W4A8TmaTileRows, 0);
+                EncodeTma(maps + 256, planes, k / 2, outDim, 64, W4A8TmaTileRows, 2);
+                EncodeTma(maps + 384, ScalePlane(planes, outDim, k), k / 16, outDim, 16, W4A8TmaTileRows, 0);
+                IntPtr a5 = y;
+                int a1 = outDim, a2 = k, a3 = rows; float a4 = 1.0f;
+                void** args = stackalloc void*[] { maps, &a1, &a2, &a3, &a4, &a5 };
+                Launch(_gemmW4A8Tma, CeilDiv(rows, W4A8TmaTileRows), CeilDiv(outDim, W4A8TmaTileRows), 1, 384, _smemW4A8Tma, stream, args);
+                return;
+            }
+            {
+                IntPtr a0 = planes, a1 = ScalePlane(planes, outDim, k), a4 = xq, a5 = xd, a8 = y;
+                int a2 = outDim, a3 = k, a6 = rows; float a7 = 1.0f;
+                void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
+                Launch(_gemmW4A8, CeilDiv(outDim, W4A8TileRows), CeilDiv(rows, W4A8TileRows), 1, 128, 0, stream, args);
             }
         }
 

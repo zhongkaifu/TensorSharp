@@ -904,7 +904,9 @@ namespace TensorSharp.Cuda
         /// <summary>
         /// result[rows, outDim] = input[rows, inDim] W^T for an NVFP4 matrix in the planar layout: up to 16 rows (decode steps,
         /// verify windows) on the q8 matvec; more quantized to NVFP4 and multiplied on the FP4 tensor cores, TMA-fed from 65
-        /// rows, otherwise through the cp.async GEMM split over K (up to 64 rows) as far as one wave of CTAs.
+        /// rows, otherwise through the cp.async GEMM split over K (up to 64 rows) as far as one wave of CTAs. Under the model's
+        /// <see cref="Nvfp4PromptActivations.Q8"/> the rows past the matvec's keep its q8_1 activations instead, on the W4A8
+        /// GEMM (<see cref="CudaFp4Kernels.GemmW4A8"/>).
         /// </summary>
         private static void RunNvfp4Planar(CudaAllocator allocator, IntPtr planes, IntPtr inputPtr, IntPtr resultPtr, int inDim,
             int outDim, int rows)
@@ -921,6 +923,12 @@ namespace TensorSharp.Cuda
                 for (int first = 0; first < rows; first += slice)
                     fp4.Gemv(planes, outDim, inDim, inputPtr + (nint)((long)first * inDim * sizeof(float)), Math.Min(slice, rows - first), scratch,
                         resultPtr + (nint)((long)first * outDim * sizeof(float)), stream);
+                return;
+            }
+            if (allocator.Nvfp4PromptActivations == Nvfp4PromptActivations.Q8)
+            {
+                fp4.GemmW4A8(planes, outDim, inDim, inputPtr, rows, EnsureQ81Scratch(allocator, CudaFp4Kernels.W4A8ScratchBytes(rows, inDim)),
+                    resultPtr, stream);
                 return;
             }
             var (codes, scales, rowScale) = Fp4Activations(allocator, rows, inDim);
@@ -966,7 +974,7 @@ namespace TensorSharp.Cuda
         {
             if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
                 || !CudaKernelOps.TryGetContiguousRows(gateUp, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
-                || rows != inputRows || cols != ne1 || inputCols != 2 * ne0 || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows
+                || rows != inputRows || cols != ne1 || inputCols != 2 * ne0 || !resultStorage.AllocatorImpl.Nvfp4ActivationRows(rows)
                 || result.ElementType != DType.Float32 || gateUp.ElementType != DType.Float32)
                 return false;
             CudaAllocator allocator = resultStorage.AllocatorImpl;
@@ -997,7 +1005,7 @@ namespace TensorSharp.Cuda
         internal static bool TryAddmmNvfp4Planes(Tensor result, IntPtr planes, int outDim, int k, Nvfp4ActivationWriter quantize)
         {
             if (!CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
-                || cols != outDim || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows || result.ElementType != DType.Float32
+                || cols != outDim || !resultStorage.AllocatorImpl.Nvfp4ActivationRows(rows) || result.ElementType != DType.Float32
                 || !CudaFp4Kernels.TakesWidth(k))
                 return false;
             CudaAllocator allocator = resultStorage.AllocatorImpl;
@@ -1029,7 +1037,7 @@ namespace TensorSharp.Cuda
             if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
                 || !CudaKernelOps.TryGetContiguousRows(input, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
                 || rows != inputRows || 2L * cols != ne1 || inputCols != ne0
-                || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows
+                || !resultStorage.AllocatorImpl.Nvfp4ActivationRows(rows)
                 || result.ElementType != DType.Float32 || input.ElementType != DType.Float32)
                 return false;
             CudaAllocator allocator = resultStorage.AllocatorImpl;

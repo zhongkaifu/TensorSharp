@@ -84,6 +84,9 @@ namespace TensorSharp.Models
         /// its own size: the plan follows the nodes' agreed topology and each node runs its layers on its local mesh.</summary>
         protected override bool RunsMixedNodeShapes => true;
 
+        /// <summary>The runtime's graphs (GraphStep) and per-op products apply the model's NVFP4 prompt activations.</summary>
+        protected override bool AppliesNvfp4PromptActivationsOnGgml => true;
+
         private static bool IsHybrid(int tp, ITensorParallelGroup group, int stages)
             => group is not ILayerSplitGroup && stages > 1 && (tp > 1 || group != null);
 

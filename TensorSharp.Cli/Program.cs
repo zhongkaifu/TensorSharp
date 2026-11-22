@@ -701,6 +701,14 @@ namespace TensorSharp.Cli
                                 TensorSharp.Graph.DiffusionProductsConfig.Name(products));
                             break;
                         }
+                    case Nvfp4PromptActivationsConfig.OptionName:
+                        {
+                            string value = args[++i];
+                            if (!Nvfp4PromptActivationsConfig.TryParse(value, out Nvfp4PromptActivations activations))
+                                throw new ArgumentException(Nvfp4PromptActivationsConfig.Refusal(value));
+                            Nvfp4PromptActivationsConfig.Set(activations);
+                            break;
+                        }
                     case "--kv-cache-dtype":
                         {
                             string kvDtypeStr = args[++i];

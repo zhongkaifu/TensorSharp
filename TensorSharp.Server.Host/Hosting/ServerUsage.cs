@@ -271,6 +271,15 @@ namespace TensorSharp.Server.Host.Hosting
                     "memory. Default: auto — the backend/model pick (KV_CACHE_DTYPE env var overrides).",
                     "--kv-cache-dtype q8_0"),
             }),
+            ("NVFP4 models", new[]
+            {
+                new OptionHelp(TensorSharp.Models.Nvfp4PromptActivationsConfig.OptionName + " <a>",
+                    "Activations of an NVFP4 model's prompt-row products: fp4 (the default, as llama.cpp: W4A4 on the FP4 " +
+                    "tensor cores of CC 12.x GPUs) or q8 (W4A8: 8-bit activations, as decode rows use; lower perplexity, " +
+                    "slower prompts). Takes effect on CC 12.x GPUs with --backend cuda and ggml_cuda; elsewhere prompt rows " +
+                    "use 8-bit activations either way. Default: fp4.",
+                    TensorSharp.Models.Nvfp4PromptActivationsConfig.OptionName + " q8"),
+            }),
             ("Prompt attention (--backend cuda)", new[]
             {
                 new OptionHelp(TensorSharp.Graph.PromptAttentionConfig.Flag + " <p>",
