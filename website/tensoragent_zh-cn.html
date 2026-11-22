@@ -116,7 +116,7 @@ Get-FileHash .\tensoragent-desktop-V-win-x64-cpu.msi -Algorithm SHA256</code></p
   <p>使用支持工具的聊天模型，尝试<em>“把这些开销整理成 CSV，用 Python 检查合计。”</em>应直接附上输入文件，而不是期待 Mac 沙盒命令读取无关文件夹。浏览器任务需要启用相应设置，然后可以说<em>“使用 Playwright 技能访问 example.com 并总结页面。”</em>首次使用可能下载 npm 软件包与浏览器。自动化浏览器使用独立会话，不会继承日常浏览器的登录状态。见<a href="agentic_zh-cn.html#playwright">浏览器配置与技能限制</a>。</p>
 
   <h3 id="find-skills">发现新技能</h3>
-  <p>在设置中开启 <strong>Network</strong>，让 <code>find-skills</code> 可用于聊天，再要求查找所需能力。模型先搜索、检查包说明与兼容性，再安装该请求检查过的提交。安装不执行仓库代码，也不覆盖现有技能；运行脚本仍需要现有执行权限与依赖。新增 <code>grill-me</code>、<code>grill-with-docs</code>、<code>tdd</code> 与 <code>handoff</code>；共享包共 17 个。 <a href="agentic_zh-cn.html#find-skills">宿主条件与验证 →</a></p>
+  <p>在设置中开启 <strong>Network</strong>，直接提出任务即可。没有已安装技能可用时，模型可以搜索技能中心，把找到的技能固定到一个提交安装并在同一轮中使用；对话中会显示 <em>Installed owner/repo@name from … @ commit</em>，技能面板会显示每个技能的来源。安装不执行仓库代码，也不覆盖现有技能；运行脚本仍需开启运行代码，iOS 上需要外部程序或编译型包的技能会被拒绝并说明原因。新增 <code>grill-me</code>、<code>grill-with-docs</code>、<code>tdd</code> 与 <code>handoff</code>；共享包共 17 个。 <a href="agentic_zh-cn.html#find-skills">宿主条件与验证 →</a></p>
 
   <h2 id="update-uninstall">7 · 更新、备份或卸载</h2>
   <p><strong>更新：</strong>退出 TensorAgent，从<a href="https://github.com/zhongkaifu/TensorSharp/releases/latest" target="_blank" rel="noopener">最新发行版</a>下载匹配平台的新版，校验后重新安装。Mac 替换应用程序文件夹中的应用；Windows 运行新的 MSI；ZIP 版请解压到新文件夹并使用新副本。更新由用户手动执行。模型、设置和聊天存储在安装目录之外。</p>

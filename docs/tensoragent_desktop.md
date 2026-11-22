@@ -194,13 +194,15 @@ and context; their tested profile is Gemma 4 E4B, 16K context and 24 tool rounds
 See the [skill audit](agent_skills.md#audited-skillssh-bundle) for actual coverage.
 
 **Find and install a skill.** Enable **Settings → Sandbox → Allow network access**,
-keep skills enabled, and ask `Find, install and use a skill for this task` or
-select `find-skills`. Native tools search skills.sh, inspect a public GitHub
-package and its immutable revision, then install the inspected package without
-Node.js, npm or Git. The installing request can immediately read the new skill.
-An explicit empty skill selection disables discovery. Installation does not
-prepare dependencies: running the installed workflow still needs its tools,
-code permissions and credentials. The Skills sheet also accepts ZIP files and
+keep skills enabled, and ask for the task. When no installed skill covers it, the
+model can search skills.sh and install a found skill pinned to one commit, then use
+it in the same turn, without Node.js, npm or Git and without you asking for the
+installation separately (the network switch turns this off). The turn shows
+`Installed <package> from <url> @ <commit>`, and the Skills sheet shows where each
+hub skill came from. An explicit empty skill selection disables discovery.
+Installing runs nothing: scripts run through `skills_run` under Run code, which
+installs a script's PEP 723 dependencies first; credentials and other programs a
+workflow needs are still yours to provide. The Skills sheet also accepts ZIP files and
 ZIP/list URLs. [Discovery details and validation limits](agent_skills.md#discover-and-install-community-skills)
 include the sampled model-output failures; installation alone is not a task pass.
 

@@ -108,13 +108,13 @@
   <p><code>--skills-dir</code>（可重复）或 <code>TS_SKILLS_DIR</code> 显式指定技能根目录。两者都未给出时，CLI 与服务端会从当前工作目录向上直到 Git 仓库根目录，依次查找每个已存在的 <code>.agents/skills</code> 目录（离得最近的优先；不在仓库内时只检查当前工作目录），另外还有二进制文件旁边的 <code>skills</code> 目录（不存在时自动创建）。CLI 最后才查找这个目录。在服务端，它同时是上传目录，因此总会被扫描，而且最先扫描：同名时上传的技能优先；即使用 <code>--skills-dir</code> 或 <code>TS_SKILLS_DIR</code> 替换了 <code>.agents/skills</code> 默认根，它也仍在列表中。个人或全局技能目录绝不会被隐式导入。</p>
 
   <h3 id="find-skills">发现、检查并安装社区技能</h3>
-  <p>内置 <code>find-skills</code> 使用共享 .NET 工具搜索 skills.sh、检查公开 GitHub 包，并安装检查过的固定提交；发现/安装不需要 Node、Git 或子进程。TensorAgent 开启 <strong>Network</strong>，服务端设置 <code>--skills-allow-network</code>；当前请求还必须能访问 <code>find-skills</code>。显式空技能选择会关闭这些工具。</p>
+  <p>内置 <code>find-skills</code> 使用共享 .NET 工具搜索 skills.sh，把公开 GitHub 包固定到一个提交安装，并在同一轮中使用；发现/安装不需要 Node、Git 或子进程。TensorAgent 开启 <strong>Network</strong>，服务端设置 <code>--skills-allow-network</code>；请求还须能访问 <code>find-skills</code>（默认可以）。显式空技能选择会关闭这些工具。<strong>默认行为：</strong>找到合适技能后直接安装并使用，无需用户另行要求安装；网络开关即关闭方式。</p>
   <div class="table-scroll"><table><thead><tr><th>工具</th><th>行为</th></tr></thead><tbody>
-    <tr><td><code>skills_search(query, owner?)</code></td><td>返回包标识、来源、链接与安装次数；安装次数不证明质量。</td></tr>
-    <tr><td><code>skills_inspect(package)</code></td><td>获取固定提交的说明、兼容性、许可与文件清单，不执行仓库代码。</td></tr>
-    <tr><td><code>skills_install(package, revision?)</code></td><td>仅安装同请求检查过的提交，不覆盖同名技能；需要宿主的可写安装目录。</td></tr>
+    <tr><td><code>skills_search(query, owner?)</code></td><td>每条结果给出包名、安装次数、<code>status</code> 和下一步的确切调用：<code>skills_install(package="…")</code>，已安装时为 <code>skills_read</code>。安装次数不证明质量。</td></tr>
+    <tr><td><code>skills_inspect(package)</code></td><td>可选：获取固定提交的说明、兼容性、许可与文件清单，不执行仓库代码。</td></tr>
+    <tr><td><code>skills_install(package, revision?)</code></td><td>自行检查并按单个提交安装，返回 <code>Installed owner/repo@name from &lt;url&gt; @ &lt;commit&gt;</code>、能否在本机运行、说明内容（作为第三方工具输出）与下一步调用。已安装的包直接复用，重名时安装为 <code>&lt;owner&gt;-&lt;name&gt;</code>，失效条目会给出搜索结果中的下一个。</td></tr>
   </tbody></table></div>
-  <p>包名使用 <code>owner/repository@manifest-name</code>。服务端与 TensorAgent 配置可写注册表；CLI 默认只读，提供搜索/检查。安装请求立即获得新技能，其他活跃请求保留原范围；后续请求再通过普通发现获得它。安装本身不授予代码/脚本执行权限，外部依赖仍可能不可用。</p>
+  <p>包名使用 <code>owner/repository@manifest-name</code>。压缩包必须带有固定提交的 ID；来源会被记录并显示在技能页和对话中。中心技能的文本绝不进入系统提示词。安装不执行任何代码；脚本只能经沙盒中的 <code>skills_run</code> 运行，它会先安装 PEP 723 内联依赖，技能自带的 <code>uv run {baseDir}/scripts/…</code> 命令也按 <code>skills_run</code> 执行。iOS 上需要外部程序或编译型包的技能会被拒绝，返回 <code>Cannot run on iOS: …</code> 及下一个可尝试的结果。每轮最多新安装两个技能。其他智能体的工具名（<code>WebSearch</code>、<code>Bash</code>、<code>Read</code> 等）会映射到本机的调用；只有说明、没有脚本的中心技能会被告知当前数据从哪里获取；重复的搜索、工作区未变时重复的 shell 命令或已失败的调用，直接返回第一次的结果。CLI 默认注册表只读，提供搜索/检查。</p>
   <p>当前共享包共 <strong>17</strong> 个，新增 <code>find-skills</code>、<code>grill-me</code>、<code>grill-with-docs</code>、<code>tdd</code> 与 <code>handoff</code>。静态兼容性检查判定 15 个适合进程内移动宿主；<code>playwright</code> 与 <code>web-artifacts-builder</code> 不进入移动目录。静态判定与成功安装都不是模型任务质量证明：Gemma 4 E4B Q8 的受控 macOS Metal 工作流为 3/4 完整任务通过，一个 HTML 按钮语义失败；没有原生 GUI、Windows 或真实 iOS 的全工作流结论。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/agent_skills.md">协议、审计来源与验证限制 →</a></p>
 
   <h2 id="code-tools">四个代码工具，默认关闭</h2>
@@ -167,7 +167,7 @@
     <tbody>
       <tr><td><code>--code-exec-allow-network</code></td><td>关闭</td><td>让所有模型生成命令使用不受域名过滤的宿主 IP 网络，包括 LAN / loopback 服务。</td></tr>
       <tr><td><code>--skills-allow-network</code></td><td>关闭</td><td>只为已经获准执行的技能脚本开放网络；不会影响 <code>shell</code>。</td></tr>
-      <tr><td><code>--code-exec-allow-install</code></td><td>关闭</td><td>允许宿主代为执行可识别的 pip / npm 安装。宿主读取并校验包名，只用预构建 wheel / 禁用 npm 脚本，并从模型命令中移除安装部分。</td></tr>
+      <tr><td><code>--code-exec-allow-install</code></td><td>关闭</td><td>允许宿主代为执行可识别的 pip / npm 安装。宿主读取并校验包名，只用预构建 wheel（macOS 上另可在沙盒中构建纯 Python 源码包）/ 禁用 npm 脚本，并从模型命令中移除安装部分。</td></tr>
     </tbody>
   </table>
   </div>
