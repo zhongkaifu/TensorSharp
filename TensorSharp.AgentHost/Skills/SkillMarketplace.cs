@@ -171,8 +171,17 @@ public sealed class SkillMarketplace : IDisposable
         // Asked for the commit id alone (application/vnd.github.sha): the full commit JSON
         // carries the commit's whole file list and diff, which for a large commit in a skills
         // monorepo exceeded the JSON limit and made the package uninstallable.
-        byte[] commit = await DownloadAsync(CommitUri(id), _options.MaxJsonBytes, cancellationToken,
-            accept: "application/vnd.github.sha").ConfigureAwait(false);
+        byte[] commit;
+        try
+        {
+            commit = await DownloadAsync(CommitUri(id), _options.MaxJsonBytes, cancellationToken,
+                accept: "application/vnd.github.sha").ConfigureAwait(false);
+        }
+        catch (SkillInstallException ex) when (ex.HttpStatus is 404 or 410 or 451)
+        {
+            // No such repository (or it is gone): no skill in it can be fetched.
+            throw AsRepositoryWide(ex);
+        }
         string? revision;
         string text = Encoding.UTF8.GetString(commit).Trim();
         if (text.StartsWith('{'))
@@ -185,7 +194,7 @@ public sealed class SkillMarketplace : IDisposable
             revision = text;
         }
         if (revision == null || !RevisionPattern.IsMatch(revision))
-            throw new SkillInstallException("GitHub did not return an immutable 40-character commit revision.");
+            throw new SkillInstallException("GitHub did not return an immutable 40-character commit revision.") { RepositoryWide = true };
         PackageCache prepared = await FetchPackageAsync(id, revision.ToLowerInvariant(), cancellationToken).ConfigureAwait(false);
         CachePackage(id.Package, prepared);
         return prepared.Inspection;
@@ -272,7 +281,17 @@ public sealed class SkillMarketplace : IDisposable
 
     private async Task<PackageCache> FetchPackageAsync(PackageId id, string revision, CancellationToken cancellationToken)
     {
-        byte[] archive = await DownloadAsync(ArchiveUri(id, revision), _options.MaxArchiveBytes, cancellationToken).ConfigureAwait(false);
+        byte[] archive;
+        try
+        {
+            archive = await DownloadAsync(ArchiveUri(id, revision), _options.MaxArchiveBytes, cancellationToken).ConfigureAwait(false);
+        }
+        catch (SkillInstallException ex) when (ex.HttpStatus is not (403 or 429))
+        {
+            // The archive is the whole repository's (missing, or over the download limit). A
+            // refused request (rate limit) is about this host's requests, not the repository.
+            throw AsRepositoryWide(ex);
+        }
         try
         {
             using var memory = new MemoryStream(archive, writable: false);
@@ -282,8 +301,19 @@ public sealed class SkillMarketplace : IDisposable
             // proxy answering with another snapshot of the repository is refused.
             if (!string.Equals(zip.Comment?.Trim(), revision, StringComparison.OrdinalIgnoreCase))
                 throw new SkillInstallException(
-                    $"The archive GitHub returned is not commit {revision} (it is labelled '{Clip(zip.Comment, 64)}'); nothing was installed.");
-            ValidateEntries(zip);
+                    $"The archive GitHub returned is not commit {revision} (it is labelled '{Clip(zip.Comment, 64)}'); nothing was installed.")
+                {
+                    RepositoryWide = true,
+                };
+            try
+            {
+                ValidateEntries(zip);
+            }
+            catch (SkillInstallException ex)
+            {
+                // Every limit here is the repository archive's, whichever skill was asked for.
+                throw AsRepositoryWide(ex);
+            }
             var matches = new List<(string Directory, SkillManifest Manifest)>();
             foreach (ZipArchiveEntry entry in zip.Entries)
             {
@@ -363,9 +393,16 @@ public sealed class SkillMarketplace : IDisposable
         }
         catch (InvalidDataException ex)
         {
-            throw new SkillInstallException("The GitHub download is not a valid skill ZIP archive: " + ex.Message, ex);
+            throw new SkillInstallException("The GitHub download is not a valid skill ZIP archive: " + ex.Message, ex)
+            {
+                RepositoryWide = true,
+            };
         }
     }
+
+    private static SkillInstallException AsRepositoryWide(SkillInstallException ex) => ex.RepositoryWide
+        ? ex
+        : new SkillInstallException(ex.Message, ex) { HttpStatus = ex.HttpStatus, RepositoryWide = true };
 
     private void ValidateEntries(ZipArchive zip)
     {

@@ -942,5 +942,12 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>The HTTP status a remote source answered with, when that is what failed.</summary>
         public int? HttpStatus { get; init; }
+
+        /// <summary>
+        /// The failure belongs to the whole repository, not to the one skill asked for: it is
+        /// not on GitHub, or its archive is over a limit or is not the pinned commit. Every other
+        /// skill in that repository is in the same archive, so it would fail the same way.
+        /// </summary>
+        public bool RepositoryWide { get; init; }
     }
 }

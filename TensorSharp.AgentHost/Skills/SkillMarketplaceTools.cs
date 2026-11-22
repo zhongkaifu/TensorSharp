@@ -25,6 +25,8 @@ public sealed class SkillMarketplaceSession
     private readonly Dictionary<string, SkillPackageInspection> _inspected = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<SkillSearchResult> _hits = new();
     private readonly HashSet<string> _failed = new(StringComparer.OrdinalIgnoreCase);
+    // owner/repository -> why its archive could not be used. Per turn, like the rest of this state.
+    private readonly Dictionary<string, string> _failedRepositories = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _installedAs = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _gate = new();
 
@@ -76,9 +78,42 @@ public sealed class SkillMarketplaceSession
         }
     }
 
-    internal void MarkFailed(string package)
+    internal void MarkFailed(string package, SkillInstallException? reason = null)
     {
-        lock (_gate) _failed.Add(package);
+        lock (_gate)
+        {
+            _failed.Add(package);
+            // A failure of the repository's archive is every one of its skills' failure: the
+            // nvidia/skills monorepo is over the entry limit, and naming its next skill as the
+            // "next result" sent a small model through eleven identical failures in one turn.
+            if (reason?.RepositoryWide == true && RepositoryOf(package) is { } repository)
+                _failedRepositories.TryAdd(repository, reason.Message);
+        }
+    }
+
+    /// <summary>The <c>owner/repository</c> of a package selector, or null.</summary>
+    internal static string? RepositoryOf(string package)
+    {
+        int at = package.LastIndexOf('@');
+        int slash = package.IndexOf('/');
+        return at > 0 && slash > 0 && slash < at ? package[..at].Trim() : null;
+    }
+
+    /// <summary>Whether this turn already found <paramref name="package"/>'s repository unusable, and why.</summary>
+    internal bool TryFailedRepository(string package, out string repository, out string reason)
+    {
+        repository = RepositoryOf(package) ?? string.Empty;
+        lock (_gate)
+            return _failedRepositories.TryGetValue(repository, out reason!);
+    }
+
+    /// <summary>How many of this turn's hits, other than <paramref name="package"/>, are in its repository.</summary>
+    internal int SiblingHits(string package)
+    {
+        string? repository = RepositoryOf(package);
+        lock (_gate)
+            return repository == null ? 0 : _hits.Count(h => string.Equals(h.Source, repository, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase));
     }
 
     internal void RecordInstalled(string package, string skillId)
@@ -153,7 +188,8 @@ public sealed class SkillMarketplaceSession
 
     /// <summary>
     /// The hit to try after <paramref name="package"/> failed: the next one from the same
-    /// search order that has not failed and is not that package. Null when none is left.
+    /// search order that has not failed, is not that package, and is not in a repository
+    /// whose archive already failed this turn. Null when none is left.
     /// </summary>
     internal SkillSearchResult? NextHit(string package)
     {
@@ -161,7 +197,8 @@ public sealed class SkillMarketplaceSession
         {
             int at = _hits.FindIndex(h => string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase));
             List<SkillSearchResult> after = (at < 0 ? _hits : _hits.Skip(at + 1).Concat(_hits.Take(at)))
-                .Where(h => !_failed.Contains(h.Package) && !string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase))
+                .Where(h => !_failed.Contains(h.Package) && !_failedRepositories.ContainsKey(h.Source)
+                    && !string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase))
                 .ToList();
             // A hit whose name shares a word with the one that failed ("unit-converter" after
             // another "unit-converter") is the likelier substitute than whatever came next.
@@ -333,6 +370,8 @@ public static class SkillMarketplaceTools
         CancellationToken cancellationToken)
     {
         string package = ResolvePackage(call, session, out string? argumentError) ?? throw new ArgumentException(argumentError);
+        if (FailedRepository(package, session) is { } known)
+            return SkillToolResult.Failure(known);
         SkillPackageInspection inspection;
         try
         {
@@ -340,7 +379,7 @@ public static class SkillMarketplaceTools
         }
         catch (SkillInstallException ex)
         {
-            session.MarkFailed(package);
+            session.MarkFailed(package, ex);
             return SkillToolResult.Failure(Unavailable(package, ex, session));
         }
         string inspectedContent = FormatInspection(inspection, context.MaxReadBytes,
@@ -368,6 +407,9 @@ public static class SkillMarketplaceTools
                 + "the most one turn may install. Use one of them now: its instructions are in its install result above"
                 + $", or read them again with skills_read(skill=\"{newly[^1]}\").");
 
+        if (FailedRepository(package, session) is { } known)
+            return SkillToolResult.Failure(known);
+
         string? revision = Argument(call, "revision");
         SkillPackageInspection? inspection = session.TryGetInspection(package, revision);
         if (inspection == null)
@@ -382,7 +424,7 @@ public static class SkillMarketplaceTools
             }
             catch (SkillInstallException ex)
             {
-                session.MarkFailed(package);
+                session.MarkFailed(package, ex);
                 return SkillToolResult.Failure(Unavailable(package, ex, session));
             }
             if (!string.IsNullOrWhiteSpace(revision) && !string.Equals(revision.Trim(), inspection.Revision, StringComparison.OrdinalIgnoreCase))
@@ -425,7 +467,7 @@ public static class SkillMarketplaceTools
         }
         catch (SkillInstallException ex)
         {
-            session.MarkFailed(package);
+            session.MarkFailed(package, ex);
             return SkillToolResult.Failure(ex.Message.StartsWith("Not installed:", StringComparison.Ordinal)
                 ? ex.Message + NextSentence(session, package)
                 : Unavailable(package, ex, session));
@@ -482,7 +524,36 @@ public static class SkillMarketplaceTools
             : ex.HttpStatus is 403 or 429
                 ? $"{package} cannot be fetched right now: GitHub refused the request (HTTP {ex.HttpStatus}, usually its rate limit)."
                 : $"{package} cannot be installed: {ex.Message}";
-        return why + NextSentence(session, package);
+        return why + SkippedSiblings(package, ex, session) + NextSentence(session, package);
+    }
+
+    /// <summary>
+    /// For a failure of the whole repository: that its other results were skipped, and why.
+    /// Said in the result so a model that copies a sibling's install line anyway knows the
+    /// answer before it asks.
+    /// </summary>
+    private static string SkippedSiblings(string package, SkillInstallException ex, SkillMarketplaceSession session)
+    {
+        if (!ex.RepositoryWide || SkillMarketplaceSession.RepositoryOf(package) is not { } repository)
+            return string.Empty;
+        int siblings = session.SiblingHits(package);
+        return siblings == 0
+            ? string.Empty
+            : $" The other {siblings.ToString(CultureInfo.InvariantCulture)} result{(siblings == 1 ? " is" : "s are")} in {repository} too, "
+              + "in the same repository archive, so they would fail the same way and were skipped.";
+    }
+
+    /// <summary>
+    /// A package whose repository already failed in this turn: answered from that failure,
+    /// without fetching the same archive again.
+    /// </summary>
+    private static string? FailedRepository(string package, SkillMarketplaceSession session)
+    {
+        if (!session.TryFailedRepository(package, out string repository, out string reason))
+            return null;
+        session.MarkFailed(package);
+        return $"{package} cannot be installed: {repository} already failed earlier in this turn ({reason.TrimEnd('.')}), "
+            + "and every skill in it is in that same repository archive." + NextSentence(session, package);
     }
 
     private static string NextSentence(SkillMarketplaceSession session, string package) =>

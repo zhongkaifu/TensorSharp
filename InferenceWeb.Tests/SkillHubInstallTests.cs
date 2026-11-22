@@ -43,12 +43,39 @@ public sealed class SkillHubInstallTests : IDisposable
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 
-    private SkillRegistry Registry() => new(new SkillRegistryOptions
+    private SkillRegistry Registry(SkillMarketplace? marketplace = null) => new(new SkillRegistryOptions
     {
         Roots = new[] { Path.Combine(_root, "bundled") },
         InstallDirectory = Path.Combine(_root, "installed"),
-        Marketplace = _marketplace,
+        Marketplace = marketplace ?? _marketplace,
     });
+
+    private const string ResearchCall = "skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"<question>\"])";
+
+    /// <summary>A bundled skill that declares the host's web search call, as TensorAgent's research skill does.</summary>
+    private void BundleResearch(string description = "Use for web searches and current information lookups.")
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", "research", "scripts"));
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "SKILL.md"),
+            "---\nname: research\ndescription: " + description + "\nmetadata:\n  provides-tools: WebSearch, WebFetch\n"
+            + "  provides-call: '" + ResearchCall + "'\n---\nRun it.\n");
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "scripts", "research.py"), "print('notes')\n");
+    }
+
+    private void Bundle(string name, string description)
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", name));
+        File.WriteAllText(Path.Combine(_root, "bundled", name, "SKILL.md"),
+            "---\nname: " + name + "\ndescription: " + description + "\n---\nDo it.\n");
+    }
+
+    /// <summary>A request context that can run skill scripts, as on a host with Run code on.</summary>
+    private SkillToolContext RunnableContext(SkillRegistry registry, SkillMarketplace? marketplace = null) =>
+        new(registry.Skills)
+        {
+            Marketplace = new SkillMarketplaceSession(marketplace ?? _marketplace, registry),
+            ScriptRunner = new RecordingScriptRunner(),
+        };
 
     /// <summary>A server request that names no skill: discovery on, network on, the default planner.</summary>
     private SkillRequestPlan Plan(SkillRegistry registry, bool network = true, SessionWorkspace? workspace = null)
@@ -300,6 +327,48 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.Contains("get them with skills_run(skill=\"research\"", run.Content, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void ARepositoryOverTheArchiveLimitSkipsItsOtherResultsAndNamesAnotherRepositorysHit()
+    {
+        using var limited = new SkillMarketplace(_http, new SkillMarketplaceOptions
+        {
+            TemporaryDirectory = _root,
+            ArchiveLimits = new SkillArchiveLimits { MaxEntries = 16 },
+        });
+        // Three skills of one monorepo whose archive is over the entry limit, then one elsewhere.
+        // The siblings share the word "stock" with the failed one, which used to make the next
+        // of them the "next result".
+        _hub.Hits = """[{"name":"stock-quote","source":"big/mono","installs":90},{"name":"stock-chart","source":"big/mono","installs":80},{"name":"stock-news","source":"big/mono","installs":70},{"name":"stock-report","source":"fixture/hub","installs":10}]""";
+        _hub.OversizedRepository = "mono";
+        SkillRegistry registry = Registry(limited);
+        SkillToolContext context = RunnableContext(registry, limited);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock quote")), context).Ok);
+
+        SkillToolResult first = SkillTools.Execute(Call("skills_install", ("package", "big/mono@stock-quote")), context);
+        Assert.False(first.Ok);
+        Assert.Contains("exceeds the entry limit", first.Content, StringComparison.Ordinal);
+        Assert.Contains("The other 2 results are in big/mono too, in the same repository archive, so they would fail the "
+            + "same way and were skipped.", first.Content, StringComparison.Ordinal);
+        Assert.Contains("Next result, if it fits the task: " + InstallLine(Package) + ";", first.Content, StringComparison.Ordinal);
+
+        // A sibling asked for anyway is answered from this turn's failure, without fetching that archive again.
+        int archives = _hub.Requests.Count(uri => uri.Host == "codeload.github.com");
+        SkillToolResult sibling = SkillTools.Execute(Call("skills_install", ("package", "big/mono@stock-chart")), context);
+        Assert.False(sibling.Ok);
+        Assert.Contains("big/mono already failed earlier in this turn", sibling.Content, StringComparison.Ordinal);
+        Assert.Contains("Next result, if it fits the task: " + InstallLine(Package) + ";", sibling.Content, StringComparison.Ordinal);
+        Assert.Equal(archives, _hub.Requests.Count(uri => uri.Host == "codeload.github.com"));
+        Assert.True(SkillTools.Execute(Call("skills_install", ("package", Package)), context).Ok);
+
+        // The memory is the turn's: a new request tries the repository again.
+        archives = _hub.Requests.Count(uri => uri.Host == "codeload.github.com");
+        SkillToolContext nextTurn = RunnableContext(registry, limited);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock quote")), nextTurn).Ok);
+        SkillToolResult retried = SkillTools.Execute(Call("skills_install", ("package", "big/mono@stock-chart")), nextTurn);
+        Assert.Contains("exceeds the entry limit", retried.Content, StringComparison.Ordinal);
+        Assert.Equal(archives + 1, _hub.Requests.Count(uri => uri.Host == "codeload.github.com"));
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;
@@ -439,6 +508,8 @@ public sealed class SkillHubInstallTests : IDisposable
         public (string Source, string Name) Skill { get; set; } = ("fixture/hub", "stock-report");
         public (string Name, string Manifest, string ScriptPath, string Script)? ExtraSkill { get; set; }
         public string ArchiveComment { get; set; } = Revision;
+        /// <summary>A repository whose archive holds more entries than a small limit (a skills monorepo).</summary>
+        public string? OversizedRepository { get; set; }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -484,6 +555,9 @@ public sealed class SkillHubInstallTests : IDisposable
                     Add("skills/" + extra.Name + "/SKILL.md", extra.Manifest);
                     Add("skills/" + extra.Name + "/" + extra.ScriptPath, extra.Script);
                 }
+                if (repository == OversizedRepository)
+                    for (int i = 0; i < 32; i++)
+                        Add("docs/page-" + i.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".md", "page\n");
             }
             return output.ToArray();
         }

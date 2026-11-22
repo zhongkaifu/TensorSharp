@@ -95,7 +95,14 @@ round is needed; an optional `revision` must match. It never overwrites a skill:
   is rewritten, and the original name is recorded;
 - a stale hub entry (GitHub answers 404), a rate limit, or a package this host
   refuses ends with `Next: skills_install(package="…")` naming the next result of
-  this request's search, so the model can follow it without reasoning one out.
+  this request's search, so the model can follow it without reasoning one out;
+- a failure of the repository itself — not on GitHub, its archive over the size or
+  entry limits, or not the pinned commit — is remembered for the rest of the turn by
+  `owner/repo`. Its other search results are skipped as the next result, the result
+  says how many were skipped and why, and installing one of them anyway is answered
+  from that failure without downloading the archive again. (A skills monorepo over
+  the entry limit had sent a small model through eleven identical failures, one per
+  sibling skill.)
 
 `skills_read`/`skills_run` on a search hit that is not installed answer with that
 hit's exact install call. After installation the package selector also resolves to
