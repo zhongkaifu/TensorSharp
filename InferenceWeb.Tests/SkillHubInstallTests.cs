@@ -593,6 +593,24 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.False(SkillCommandTranslation.TryFindMissingSkillScript("cd x && python3 research.py", context, out _));
     }
 
+    [Fact]
+    public void AnInstructionsOnlyPackageInspectedNamesWhereCurrentFiguresComeFrom()
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"advice","source":"fixture/hub","installs":30}]""";
+        _hub.ExtraSkill = ("advice", "---\nname: advice\ndescription: Stock advice.\n---\nWeigh valuation and momentum.\n", "notes.md", "n\n");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        SkillToolResult advice = SkillTools.Execute(Call("skills_inspect", ("package", "fixture/hub@advice")), context);
+        Assert.True(advice.Ok, advice.Content);
+        Assert.Contains("This skill ships no scripts and no data source", advice.Content, StringComparison.Ordinal);
+        Assert.Contains("get them with " + ResearchCall, advice.Content, StringComparison.Ordinal);
+        // A package with scripts brings its own data path.
+        SkillToolResult scripted = SkillTools.Execute(Call("skills_inspect", ("package", Package)), context);
+        Assert.True(scripted.Ok, scripted.Content);
+        Assert.DoesNotContain("no data source", scripted.Content, StringComparison.Ordinal);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;

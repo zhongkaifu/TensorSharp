@@ -511,6 +511,9 @@ public static class SkillMarketplaceTools
         }
         string inspectedContent = FormatInspection(inspection, context.MaxReadBytes,
             session.CanInstall ? InstallCall(inspection.Package) : null);
+        // A plain line after the JSON, so the call in it reaches the model with its quotes as written.
+        if (SkillTools.CurrentFactsNote(inspection, context) is { } facts)
+            inspectedContent += "\n" + facts;
         session.Remember(inspection);
         return SkillToolResult.Success(inspectedContent);
     }

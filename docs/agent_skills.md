@@ -127,9 +127,10 @@ A hub skill written for another agent names that agent's tools. Reading its
 `shell`, `Read`/`Write`/`Edit` → the file tools, and a tool a reachable skill declares
 it provides — metadata `provides-tools` and `provides-call`; the bundled `research`
 skill provides `WebSearch` and `WebFetch` — with that skill's exact call. A hub
-skill that ships no scripts holds no data, so its result says where current figures
-come from in this conversation (that web-search call) or that they cannot be checked,
-instead of leaving the model to state prices from memory.
+skill that ships no scripts holds no data, so its result — when it is installed, read,
+or inspected without being installed — says where current figures come from in this
+conversation (that web-search call) or that they cannot be checked, instead of leaving
+the model to state prices from memory.
 
 **Provenance and visibility.** Each hub install is recorded in
 `.hub-sources.json` in the install directory (package, GitHub URL, commit,

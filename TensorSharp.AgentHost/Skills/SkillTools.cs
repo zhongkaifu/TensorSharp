@@ -809,6 +809,19 @@ namespace TensorSharp.AgentHost.Skills
         {
             if (skill.Source == null || skill.Files.Any(f => f.Kind == SkillFileKind.Script))
                 return null;
+            return CurrentFactsNote(context);
+        }
+
+        /// <summary>
+        /// The same note for a hub package inspected but not installed: its files are listed
+        /// by path. A small model inspected an instructions-only stock skill and answered with
+        /// prices it made up.
+        /// </summary>
+        internal static string? CurrentFactsNote(SkillPackageInspection inspection, SkillToolContext context) =>
+            inspection.Files.Any(path => Skill.ClassifyFile(path) == SkillFileKind.Script) ? null : CurrentFactsNote(context);
+
+        private static string CurrentFactsNote(SkillToolContext context)
+        {
             string? search = ProvidedCall("WebSearch", context);
             return search != null
                 ? "This skill ships no scripts and no data source, so it holds no current figures (prices, rates, "
