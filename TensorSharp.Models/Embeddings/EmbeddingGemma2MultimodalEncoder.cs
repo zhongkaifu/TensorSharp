@@ -370,8 +370,12 @@ public sealed class EmbeddingGemma2MultimodalEncoder : IEmbeddingModel
     {
         if (ModelBase.LiveGgmlModels > 0)
         {
-            GgmlBasicOps.ReleaseHostRanges(_context.PoolRanges(), Array.Empty<IntPtr>());
-            GgmlBasicOps.ResetSharedGraphCaches();
+            // While no live model runs a step: the shared graph caches go too.
+            ModelBase.RunWhileGgmlModelsAreIdle(null, () =>
+            {
+                GgmlBasicOps.ReleaseHostRanges(_context.PoolRanges(), Array.Empty<IntPtr>());
+                GgmlBasicOps.ResetSharedGraphCaches();
+            });
             return;
         }
         GgmlBasicOps.ReleaseReuseComputeBuffers();

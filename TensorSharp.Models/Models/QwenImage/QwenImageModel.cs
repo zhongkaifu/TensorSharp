@@ -382,12 +382,16 @@ namespace TensorSharp.Models.QwenImage
         internal void ReleaseComputeBuffers()
         {
             if (!UsesGgml) return;
-            GgmlBasicOps.ReleaseReuseComputeBuffers();
             // This model's device memory and its loaded stages' (the transformer's weights, the decoder's), not the
-            // process's: another model of the process keeps its own (it had been the whole-process wipe).
+            // process's: another model of the process keeps its own (it had been the whole-process wipe). The shared scratch
+            // and graph caches go while no other model runs a step.
             var owners = new System.Collections.Generic.List<IGgmlHostMemoryOwner> { this };
             _pipeline21?.AddLoadedStages(owners);
-            GgmlOwnerRelease.Release(owners.ToArray());
+            RunWhileOtherGgmlModelsAreIdle(() =>
+            {
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                GgmlOwnerRelease.Release(owners.ToArray());
+            });
         }
 
         /// <summary>The text encoder's and decoder's GGUF mappings (the transformer's is its own model's).</summary>

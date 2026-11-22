@@ -9,7 +9,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using TensorSharp;
+using System.Threading;
 using TensorSharp.Models;
+using TensorSharp.Runtime.Scheduling;
 using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
@@ -122,6 +124,140 @@ public sealed class ModelLoadUnloadCycleTests : IDisposable
         AssertSame(uninterrupted, carried, $"lfm3 kept loaded on {backend}");
         _output.WriteLine($"{backend}: lfm3 kept loaded through {others.Length} other loads and disposes mid-sequence, " +
             "every step bit for bit an uninterrupted run's");
+    }
+
+    /// <summary>
+    /// A model decoding on another thread as an engine worker does (each step under its <see cref="ModelBase.GpuComputeLock"/>,
+    /// yielding to registered waiters before it takes the lock) while two other models are loaded, run and disposed beside
+    /// it mid-sequence: every step is an uninterrupted run's, bit for bit, with no crash. The others load and run between
+    /// its steps; their disposes run beside them. A dispose's release of what models share (the graph scratch and graph
+    /// caches) ran while the disposing thread held the decoding model's step lock: it waited for the step in progress, so
+    /// no step computed over the memory it freed.
+    /// </summary>
+    [Fact]
+    public void AModelDecodingOnAnotherThreadCarriesOnExactlyWhileOthersAreDisposed()
+    {
+        BackendType backend = TestGates.PinnedGgmlBackend;
+        Dictionary<string, string> paths = Fixtures();
+        int[] tokens = Enumerable.Range(0, 24).Select(i => 41 + 7 * i).ToArray();
+        List<float[]> uninterrupted;
+        using (ModelBase alone = ModelBase.Create(paths["lfm3"], backend))
+            uninterrupted = DecodeSteps(alone, tokens, null);
+
+        using ModelBase kept = ModelBase.Create(paths["lfm3"], backend);
+        var decoding = new ManualResetEventSlim();
+        var carried = new List<float[]>();
+        Exception failure = null;
+        var worker = new Thread(() =>
+        {
+            try
+            {
+                lock (kept.GpuComputeLock)
+                {
+                    kept.ResetKVCache();
+                    carried.Add((float[])kept.ForwardPrompt(Prompt).Clone());
+                }
+                for (int i = 0; i < tokens.Length; i++)
+                {
+                    if (i == 2) decoding.Set();
+                    GpuLockWaiters.YieldToWaiters(kept.GpuComputeLock, TimeSpan.FromSeconds(5));
+                    lock (kept.GpuComputeLock)
+                        carried.Add((float[])kept.Forward(new[] { tokens[i] }).Clone());
+                }
+            }
+            catch (Exception e)
+            {
+                failure = e;
+            }
+            finally
+            {
+                decoding.Set();
+            }
+        });
+        worker.Start();
+        Assert.True(decoding.Wait(TimeSpan.FromMinutes(2)), "the worker never reached its third decode step");
+        // The others load and run under the worker's step lock, as a second engine would take turns with it (two models'
+        // graphs computing at once is not what this tests); each is disposed without it, so its release must take it.
+        string probePath = Path.Combine(_dir, "release-probe.gguf");
+        SyntheticGguf.Write(probePath, [new SyntheticGguf.Str { Key = "general.architecture", V = "probe" }], []);
+        ModelBase other;
+        ReleaseProbe probe;
+        lock (kept.GpuComputeLock)
+        {
+            other = ModelBase.Create(paths["qwen35"], backend);
+            Rows(other);
+        }
+        other.Dispose();
+        lock (kept.GpuComputeLock)
+            probe = new ReleaseProbe(probePath, backend, kept);
+        probe.Dispose();
+        Assert.True(worker.Join(TimeSpan.FromMinutes(5)), "the worker did not finish");
+        Assert.Null(failure);
+        Assert.True(probe.Released, "the probe's dispose ran no cross-model release (no other live model?)");
+        Assert.True(probe.HeldTheDecodingModelsLock, "the shared release ran without the decoding model's step lock");
+        AssertSame(uninterrupted, carried, $"lfm3 decoding on another thread on {backend}");
+        _output.WriteLine($"{backend}: lfm3 decoded {tokens.Length} steps on another thread while qwen35 and a probe were " +
+            "disposed beside it, bit for bit an uninterrupted run's; the release held its step lock");
+    }
+
+    /// <summary>
+    /// A model that is retiring (an unload drains its uses) may still be finishing a media encode under its step lock:
+    /// another model's dispose waits for that lock before it frees what models share, rather than skipping a model that is
+    /// on its way out. Only a model whose dispose has begun is skipped (its disposer may hold its lock).
+    /// </summary>
+    [Fact]
+    public void AReleaseWaitsForARetiringModelThatStillHoldsItsLock()
+    {
+        BackendType backend = TestGates.PinnedGgmlBackend;
+        string probePath = Path.Combine(_dir, "release-probe.gguf");
+        SyntheticGguf.Write(probePath, [new SyntheticGguf.Str { Key = "general.architecture", V = "probe" }], []);
+        using var retiring = new ReleaseProbe(probePath, backend, null);
+        var probe = new ReleaseProbe(probePath, backend, retiring);
+        retiring.BeginRetirement();
+        var holding = new ManualResetEventSlim();
+        var encoder = new Thread(() =>
+        {
+            lock (retiring.GpuComputeLock)
+            {
+                holding.Set();
+                // Until the dispose below waits for this lock, then some of its 20 ms tries longer: a release that skipped
+                // a retiring model would have run by then without it.
+                SpinWait.SpinUntil(() => GpuLockWaiters.Count(retiring.GpuComputeLock) > 0, TimeSpan.FromMinutes(1));
+                Thread.Sleep(200);
+            }
+        });
+        encoder.Start();
+        Assert.True(holding.Wait(TimeSpan.FromMinutes(1)), "the encoder never took the retiring model's lock");
+        probe.Dispose();
+        Assert.True(encoder.Join(TimeSpan.FromMinutes(2)), "the encoder did not finish");
+        Assert.True(probe.Released, "the probe's dispose ran no cross-model release (no other live model?)");
+        Assert.True(probe.HeldTheDecodingModelsLock, "the shared release ran without the retiring model's step lock");
+        _output.WriteLine($"{backend}: a dispose beside a retiring model waited for the encode holding its lock");
+    }
+
+    /// <summary>A model with no weights whose dispose reports whether its cross-model release held another model's step
+    /// lock.</summary>
+    private sealed class ReleaseProbe : ModelBase
+    {
+        private readonly ModelBase _decoding;
+
+        public ReleaseProbe(string path, BackendType backend, ModelBase decoding) : base(path, backend)
+        {
+            _decoding = decoding;
+            Config = new ModelConfig { Architecture = "probe" };
+        }
+
+        public bool Released { get; private set; }
+        public bool HeldTheDecodingModelsLock { get; private set; }
+
+        internal override void InsideCrossModelReleaseForTests()
+        {
+            Released = true;
+            HeldTheDecodingModelsLock = _decoding != null && Monitor.IsEntered(_decoding.GpuComputeLock);
+        }
+
+        protected override float[] ForwardCore(int[] tokens) => [];
+        protected override void ResetKVCacheCore() { }
     }
 
     /// <summary>The pairs whose kept model crashed the process on ggml_cuda (SIGSEGV in TSGgml_GraphRun) when the other was

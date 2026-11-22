@@ -3604,21 +3604,104 @@ namespace TensorSharp.Models
         /// their pool blocks can already be handed out again and the model's allocator is still open.</summary>
         internal virtual void AfterDenseWeightsFreedForTests() { }
 
-        // GGML models of this process not yet disposed: the last one out may clear the process-wide caches.
+        // GGML models of this process not yet disposed, in the order they were made: the last one out may clear the
+        // process-wide caches, and a cross-model release takes the others' step locks in this order.
+        private static readonly List<ModelBase> s_liveGgml = new();
         private static int s_liveGgmlModels;
         private int _countedLiveGgml;
+        // One cross-model release at a time (RunWhileOtherGgmlModelsAreIdle).
+        private static readonly object s_crossModelRelease = new();
+        // This model's thread holds its step lock while it waits for a cross-model release of its own: it runs no step.
+        private volatile bool _awaitingCrossModelRelease;
+        // Dispose has begun: the model runs no step again (its disposer may hold its step lock).
+        private volatile bool _disposeBegun;
 
         /// <summary>GGML models constructed and not yet disposed in this process.</summary>
         internal static int LiveGgmlModels => Volatile.Read(ref s_liveGgmlModels);
 
         private void EnterLiveGgmlModels()
         {
-            if (Interlocked.Exchange(ref _countedLiveGgml, 1) == 0) Interlocked.Increment(ref s_liveGgmlModels);
+            if (Interlocked.Exchange(ref _countedLiveGgml, 1) != 0) return;
+            lock (s_liveGgml) s_liveGgml.Add(this);
+            Interlocked.Increment(ref s_liveGgmlModels);
         }
 
         /// <summary>This model leaves the live GGML models: true when another one is still live.</summary>
         private bool LeaveLiveGgmlModels()
-            => Interlocked.Exchange(ref _countedLiveGgml, 0) == 1 ? Interlocked.Decrement(ref s_liveGgmlModels) > 0 : LiveGgmlModels > 0;
+        {
+            if (Interlocked.Exchange(ref _countedLiveGgml, 0) != 1) return LiveGgmlModels > 0;
+            lock (s_liveGgml) s_liveGgml.Remove(this);
+            return Interlocked.Decrement(ref s_liveGgmlModels) > 0;
+        }
+
+        /// <summary>The locks a step or a media preparation of this model holds while it drives the backend.</summary>
+        private IEnumerable<object> StepLocks()
+        {
+            yield return GpuComputeLock;
+            if (!ReferenceEquals(MediaPreparationLock, GpuComputeLock)) yield return MediaPreparationLock;
+        }
+
+        /// <summary>Test seam: called inside <see cref="RunWhileOtherGgmlModelsAreIdle"/>, while the other models' step locks
+        /// are held.</summary>
+        internal virtual void InsideCrossModelReleaseForTests() { }
+
+        /// <summary>
+        /// Runs <paramref name="release"/> while no other live GGML model of the process runs a step or a media preparation:
+        /// it holds each one's step locks (<see cref="GpuComputeLock"/>, and <see cref="MediaPreparationLock"/> where that is
+        /// another lock), taken in the order the models were made and registered with <see cref="GpuLockWaiters"/>, so an
+        /// engine worker lets it in at its next step boundary. A release that frees what every model shares (the graph
+        /// scratch, the graph caches kept by shape or host address) must not run under another model's step: a graph that
+        /// step is computing would read freed memory. The other models' plans are bound to their own device copies, which a
+        /// release leaves, and the shared caches rebuild on their next call.
+        /// A model whose <see cref="Dispose"/> has begun runs no step, nor does one whose thread is parked here waiting for a
+        /// release of its own: their locks are not waited for (the disposer, or two releases each holding their own model's
+        /// lock, would otherwise wait for each other). A model that is only retiring (<see cref="IsRetiring"/>) may still be
+        /// finishing a media encode under its lock, which is waited for.
+        /// </summary>
+        internal void RunWhileOtherGgmlModelsAreIdle(Action release) => RunWhileGgmlModelsAreIdle(this, release);
+
+        /// <inheritdoc cref="RunWhileOtherGgmlModelsAreIdle"/>
+        /// <param name="self">The model the release is made for (its locks are not taken), or null for an owner that is no
+        /// model (an encoder of its own).</param>
+        internal static void RunWhileGgmlModelsAreIdle(ModelBase self, Action release)
+        {
+            ArgumentNullException.ThrowIfNull(release);
+            if (self != null) self._awaitingCrossModelRelease = true;
+            Monitor.Enter(s_crossModelRelease);
+            var held = new List<object>();
+            try
+            {
+                if (self != null) self._awaitingCrossModelRelease = false;
+                ModelBase[] others;
+                lock (s_liveGgml) others = s_liveGgml.Where(m => !ReferenceEquals(m, self)).ToArray();
+                foreach (ModelBase other in others)
+                    foreach (object stepLock in other.StepLocks())
+                    {
+                        if (Monitor.IsEntered(stepLock)) continue;   // this thread holds it already (re-entrant)
+                        GpuLockWaiters.Enter(stepLock);
+                        try
+                        {
+                            bool taken = false;
+                            // Waits for the step in progress; stops waiting for a model whose dispose began meanwhile, or
+                            // whose thread parked to wait for a release of its own.
+                            while (!(taken = Monitor.TryEnter(stepLock, 20)) && !other._disposeBegun && !other._awaitingCrossModelRelease) { }
+                            if (taken) held.Add(stepLock);
+                        }
+                        finally
+                        {
+                            GpuLockWaiters.Exit(stepLock);
+                        }
+                    }
+                self?.InsideCrossModelReleaseForTests();
+                release();
+            }
+            finally
+            {
+                for (int i = held.Count - 1; i >= 0; i--) Monitor.Exit(held[i]);
+                Monitor.Exit(s_crossModelRelease);
+                if (self != null) self._awaitingCrossModelRelease = false;
+            }
+        }
 
         /// <summary>
         /// The host memory this model owns, which its GGML device copies and the backend's other records are keyed inside:
@@ -3664,11 +3747,15 @@ namespace TensorSharp.Models
             if (!IsGgmlBackend)
                 return;
             OnBeforeReleaseGgmlDeviceResidency();
-            GgmlOwnerRelease.Release(this);
+            RunWhileOtherGgmlModelsAreIdle(() => GgmlOwnerRelease.Release(this));
         }
 
         public virtual void Dispose()
         {
+            // No step runs on a model being disposed: a cross-model release of another model does not wait for its locks
+            // (RunWhileOtherGgmlModelsAreIdle), which the thread disposing it may hold.
+            _disposeBegun = true;
+            BeginRetirement();
             // Release any distributed worker nodes before tearing down the TP
             // group, so every driver exit path (normal or exception) lets the
             // workers leave their loops cleanly.
@@ -3690,8 +3777,11 @@ namespace TensorSharp.Models
                 // under the plans bound to them, and its device-resident state (KV caches) with them: its next step read
                 // freed device memory (a SIGSEGV in TSGgml_GraphRun on ggml_cuda) or lost its context. The shared graph
                 // scratch goes as with the last model (see below): the others grow it again on their next prompt.
-                GgmlOwnerRelease.Release(this);
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                RunWhileOtherGgmlModelsAreIdle(() =>
+                {
+                    GgmlOwnerRelease.Release(this);
+                    GgmlBasicOps.ReleaseReuseComputeBuffers();
+                });
             }
             else if (IsGgmlBackend)
             {

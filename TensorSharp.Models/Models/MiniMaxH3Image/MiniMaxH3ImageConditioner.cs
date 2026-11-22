@@ -240,7 +240,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public void ReleaseWorkspace()
         {
             lock (_gate)
-                if (!_disposed) GgmlBasicOps.ReleaseReuseComputeBuffers();
+                if (!_disposed) ReleaseSharedScratch();
         }
 
         public void ReleaseDevice()
@@ -250,9 +250,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 if (_disposed) return;
                 _encoder.ReleaseDeviceResidency();
                 if (_visionUsed) _encoder.Vision.ReleaseDeviceResidency();
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                ReleaseSharedScratch();
             }
         }
+
+        // The reuse allocator is every GGML model's: it goes while no live model of the process runs a step.
+        private static void ReleaseSharedScratch() => ModelBase.RunWhileGgmlModelsAreIdle(null, GgmlBasicOps.ReleaseReuseComputeBuffers);
 
         public void Dispose()
         {
