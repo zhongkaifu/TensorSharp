@@ -1545,10 +1545,12 @@ public sealed class MainPage : ContentPage
                     int[] after = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
                     Say($"speechcheck turn {turn} scroll held={(held >= 0 ? "yes" : "never scrolled")} scrolledAtText={scrolledAt} "
                         + $"heldTop={held} maxDriftPx={maxDrift} jumpShown={jumpShown} viewportPx={viewport} scrollablePx={scrollable} "
-                        + $"afterJumpFromBottomPx={(after.Length == 3 ? after[1] - after[0] - after[2] : -1)}");
+                        + $"afterJumpFromBottomPx={(after.Length == 3 ? after[1] - after[0] - after[2] : -1)} "
+                        + DescribeTouches(timeline, held));
                 }
                 else
-                    Say($"speechcheck turn {turn} follow polls={followPolls} offBottomOver60px={followMisses}");
+                    Say($"speechcheck turn {turn} follow polls={followPolls} offBottomOver60px={followMisses} "
+                        + DescribeTouches(timeline, -1));
                 string diagnostics = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
                     "window.TensorAgent && window.TensorAgent.diagnostics ? window.TensorAgent.diagnostics() : 'nopage'"));
                 try
@@ -1654,6 +1656,45 @@ public sealed class MainPage : ContentPage
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
         {
             return "unreadable timeline: " + ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// The real touches (and wheel turns) the page saw during the turn, from its scroll trace: a finger on the phone
+    /// moves the chat by itself, so a drift or a missed follow is only the page's when no touch came first. For a
+    /// held chat, also how far it moved from <paramref name="held"/> after the probe's own (synthetic) touch and
+    /// before the first real one.
+    /// </summary>
+    private static string DescribeTouches(string timeline, int held)
+    {
+        try
+        {
+            using JsonDocument d = JsonDocument.Parse(timeline);
+            if (d.RootElement.ValueKind != JsonValueKind.Object || !d.RootElement.TryGetProperty("scrolls", out JsonElement s))
+                return "touches=untracked";
+            var rows = s.EnumerateArray().Select(x => (At: x[0].GetInt32(), Why: x[1].GetString(), Top: x[2].GetInt32(),
+                Height: x[3].GetInt32(), Client: x[4].GetInt32())).ToArray();
+            var real = rows.Where(x => x.Why is "touch" or "wheel").ToArray();
+            string touches = $"touches={real.Length} firstTouchMs={(real.Length > 0 ? real[0].At : -1)}";
+            if (held < 0)
+            {
+                int untilTouch = real.Length > 0 ? real[0].At : int.MaxValue;
+                int offMax = rows.Where(x => x.Why == "scroll" && x.At < untilTouch && x.Height > x.Client)
+                    .Select(x => x.Height - x.Top - x.Client).DefaultIfEmpty(0).Max();
+                return touches + $" offBottomBeforeTouchMaxPx={offMax}";
+            }
+            int probe = Array.FindIndex(rows, x => x.Why == "touch-synthetic");
+            if (probe < 0)
+                return touches + " driftBeforeTouchPx=untracked";
+            int from = rows[probe].At + 300, to = real.FirstOrDefault(x => x.At > rows[probe].At).At;
+            if (to <= rows[probe].At) to = int.MaxValue;
+            int drift = rows.Where(x => x.Why == "scroll" && x.At > from && x.At < to)
+                .Select(x => Math.Abs(x.Top - held)).DefaultIfEmpty(0).Max();
+            return touches + $" driftBeforeTouchPx={drift} untouchedMs={(to == int.MaxValue ? -1 : to - rows[probe].At)}";
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or IndexOutOfRangeException)
+        {
+            return "touches=unreadable";
         }
     }
 

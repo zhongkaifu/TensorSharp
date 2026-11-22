@@ -197,13 +197,17 @@
     stickBottom = atBottom(24);
     paintJump();
   }
-  chat.addEventListener('touchstart', function () { touching = true; userInput(); }, { passive: true });
+  chat.addEventListener('touchstart', function (e) {
+    touching = true; userInput();
+    speechLogScroll(e && e.isTrusted === false ? 'touch-synthetic' : 'touch');
+  }, { passive: true });
   chat.addEventListener('touchmove', function () { userInput(); stickBottom = false; paintJump(); }, { passive: true });
   function touchEnded() { touching = false; userInput(); if (atBottom(24)) { stickBottom = true; paintJump(); } }
   chat.addEventListener('touchend', touchEnded, { passive: true });
   chat.addEventListener('touchcancel', touchEnded, { passive: true });
   chat.addEventListener('wheel', function (e) {
     userInput();
+    speechLogScroll('wheel');
     if (e && e.deltaY < 0) { stickBottom = false; paintJump(); }
   }, { passive: true });
   document.addEventListener('keydown', function (e) {
