@@ -166,7 +166,10 @@ dependencies, and a shell command that is exactly the skill's own line —
 `uv run [--with pkg] {baseDir}/scripts/x.py ARGS`, or `python3 $SKILL_DIR/…` —
 is run as `skills_run` of that script, because a shell here has neither the
 placeholder's directory nor a network socket. `{baseDir}`-style placeholders in a
-`skills_run` path are dropped.
+`skills_run` path are dropped. A plain `python3 x.py ARGS` is the model's own program
+and runs as written; when `x.py` is not in the working directory but is exactly one
+reachable skill's script (by its path in the skill or its file name), the result adds
+the exact `skills_run(skill=…, path=…, args=[…])` call with the command's arguments.
 
 **Source distributions.** On macOS, where the install sandbox confines writes and
 pins the network to the package index (the egress proxy), pip prefers wheels and

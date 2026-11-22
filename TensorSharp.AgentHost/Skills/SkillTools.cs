@@ -484,8 +484,21 @@ namespace TensorSharp.AgentHost.Skills
                     skillDirectories.Add(skill.RootDirectory);
             }
 
-            return runner.Execute(
+            SkillToolResult shell = runner.Execute(
                 call, context.CodeInputFiles, onOutput, context.Workspace, skillDirectories);
+            // `python3 research.py …` typed after reading a skill's script: the working
+            // directory is not the skill's, so the file is not there. Name the exact call.
+            if (SkillCommandTranslation.TryFindMissingSkillScript(ReadString(call, "command"), context, out var missing))
+            {
+                shell = shell with
+                {
+                    Content = shell.Content + "\n\n[TensorSharp host] " + missing.Written + " is not in this conversation's working "
+                        + "directory: it is the '" + missing.Skill.Id + "' skill's script " + missing.Path + ". Run it with "
+                        + RunToolName + "(skill=\"" + missing.Skill.Id + "\", path=\"" + missing.Path + "\", args="
+                        + JsonSerializer.Serialize(missing.Arguments, ReadableArguments) + ").",
+                };
+            }
+            return shell;
         }
 
         /// <summary>Arguments as a model types them: no \u0022 for a quote, no \uXXXX for a non-ASCII letter.</summary>

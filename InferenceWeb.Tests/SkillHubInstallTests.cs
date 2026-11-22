@@ -568,6 +568,31 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.Equal("price=1", plain.Content);
     }
 
+    [Fact]
+    public void AShellCommandThatNamesASkillsScriptOutsideTheWorkspaceIsToldTheExactCall()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        SessionWorkspace workspace = new SessionWorkspaceManager(Path.Combine(_root, "sessions")).GetOrCreate("shell");
+        var context = new SkillToolContext(registry.Skills)
+        {
+            ScriptRunner = new RecordingScriptRunner(),
+            CodeRunner = new RefusingCodeRunner(),
+            Workspace = workspace,
+        };
+        SkillToolResult shell = SkillTools.Execute(Call("shell", ("command", "python3 research.py \"Nvidia stock\" --out notes.md")), context);
+        Assert.Contains("[TensorSharp host] research.py is not in this conversation's working directory: it is the 'research' "
+            + "skill's script scripts/research.py. Run it with skills_run(skill=\"research\", path=\"scripts/research.py\", "
+            + "args=[\"Nvidia stock\",\"--out\",\"notes.md\"]).", shell.Content, StringComparison.Ordinal);
+
+        // The model's own file of that name is its own program.
+        File.WriteAllText(Path.Combine(workspace.WorkDirectory, "research.py"), "print(1)\n");
+        SkillToolResult own = SkillTools.Execute(Call("shell", ("command", "python3 research.py")), context);
+        Assert.DoesNotContain("[TensorSharp host]", own.Content, StringComparison.Ordinal);
+        Assert.False(SkillCommandTranslation.TryFindMissingSkillScript("python3 other.py", context, out _));
+        Assert.False(SkillCommandTranslation.TryFindMissingSkillScript("cd x && python3 research.py", context, out _));
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;
