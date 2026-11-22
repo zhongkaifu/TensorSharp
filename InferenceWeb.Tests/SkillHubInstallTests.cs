@@ -538,6 +538,36 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.DoesNotContain("Web search here", plain.Content, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void AnOptionAndItsValueInOneArgumentAreSplitForTheScript()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var runner = new RecordingScriptRunner();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = runner };
+        // As a small model wrote it: the array inside a string, "--out notes.md" as one element.
+        SkillToolResult ran = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", "[\"Nvidia stock\", \"--out notes.md\"]")), context);
+        Assert.True(ran.Ok, ran.Content);
+        Assert.Equal(new[] { "Nvidia stock", "--out", "notes.md" }, runner.Runs.Single().Arguments);
+        // The result says so, with the shape to use.
+        Assert.Contains("[TensorSharp host] Each of \"--out notes.md\" was split into an option and its value, two arguments: "
+            + "give each argument its own array element, as in [\"--out\",\"notes.md\"].", ran.Content, StringComparison.Ordinal);
+
+        // Only the first whitespace after a bare option token; the rest is one value.
+        Assert.Equal(new[] { "--title", "My Report" }, SkillTools.SplitJoinedOptions(new[] { "--title My Report" }));
+        Assert.Equal(new[] { "-o", "x y" }, SkillTools.SplitJoinedOptions(new[] { "-o x y" }));
+        // Kept whole: '=' or a quote before the space, no whitespace, not an option, a value.
+        string[] whole = { "--title=A B", "--name\"x y\"", "\"--out notes.md\"", "--verbose", "-5 apples", "plain words", "--" };
+        Assert.Equal(whole, SkillTools.SplitJoinedOptions(whole, out IReadOnlyList<string> joined));
+        Assert.Empty(joined);
+        // Nothing to split: the result is the script's own.
+        runner.Runs.Clear();
+        SkillToolResult plain = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", new[] { "Nvidia stock", "--out", "notes.md" })), context);
+        Assert.Equal("price=1", plain.Content);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;

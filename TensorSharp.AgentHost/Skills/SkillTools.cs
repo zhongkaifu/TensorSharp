@@ -488,6 +488,12 @@ namespace TensorSharp.AgentHost.Skills
                 call, context.CodeInputFiles, onOutput, context.Workspace, skillDirectories);
         }
 
+        /// <summary>Arguments as a model types them: no \u0022 for a quote, no \uXXXX for a non-ASCII letter.</summary>
+        private static readonly JsonSerializerOptions ReadableArguments = new()
+        {
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
+
         /// <param name="onToolOutput">
         /// Live tap for a tool that runs a process: called per stdout/stderr line while
         /// it executes, so a host can stream what is happening. Null taps nothing, and
@@ -878,7 +884,17 @@ namespace TensorSharp.AgentHost.Skills
                     + "instructions to carry out with this conversation's other tools."
                     + (CurrentFactsNote(skill, context) is { } facts ? " " + facts : string.Empty));
             }
-            return context.ScriptRunner.Run(skill, path, args, onOutput, ReadPackagesArgument(call));
+            args = SplitJoinedOptions(args, out IReadOnlyList<string> joined);
+            SkillToolResult ran = context.ScriptRunner.Run(skill, path, args, onOutput, ReadPackagesArgument(call));
+            if (joined.Count == 0)
+                return ran;
+            // Said, so the model learns the shape: one array element per argument.
+            return ran with
+            {
+                Content = ran.Content + "\n\n[TensorSharp host] Each of " + string.Join(", ", joined.Select(j => JsonSerializer.Serialize(j, ReadableArguments)))
+                    + " was split into an option and its value, two arguments: give each argument its own array element, "
+                    + "as in " + JsonSerializer.Serialize(SplitJoinedOptions(new[] { joined[0] }), ReadableArguments) + ".",
+            };
         }
 
         /// <summary>
@@ -919,6 +935,49 @@ namespace TensorSharp.AgentHost.Skills
 
             return ReadArgumentList(call, name);
         }
+
+        /// <summary>
+        /// An option and its value written as one element of an argument array —
+        /// <c>args=["Nvidia stock", "--out notes.md"]</c> — split back into the two arguments
+        /// a command line would have given. No option name holds whitespace, so such an
+        /// element cannot have been meant as one argument; argparse read it as a missing
+        /// <c>--out</c>, and a small model repeated the same call until the turn ended.
+        /// An element with <c>=</c> in its option part (<c>--title=A B</c>) is left whole.
+        /// </summary>
+        internal static IReadOnlyList<string> SplitJoinedOptions(IReadOnlyList<string> arguments) =>
+            SplitJoinedOptions(arguments, out _);
+
+        /// <param name="arguments">The script's arguments.</param>
+        /// <param name="joined">The elements that were split, as they were given.</param>
+        internal static IReadOnlyList<string> SplitJoinedOptions(IReadOnlyList<string> arguments, out IReadOnlyList<string> joined)
+        {
+            List<string>? split = null;
+            List<string>? given = null;
+            for (int i = 0; i < arguments.Count; i++)
+            {
+                // Only the first whitespace after a bare option token: the rest stays one value
+                // ("--title My Report" -> "--title", "My Report"). A quote or '=' before that
+                // whitespace, or no whitespace at all, keeps the element whole.
+                System.Text.RegularExpressions.Match option = JoinedOption.Match(arguments[i]);
+                if (option.Success)
+                {
+                    split ??= arguments.Take(i).ToList();
+                    (given ??= new List<string>()).Add(arguments[i]);
+                    split.Add(option.Groups[1].Value);
+                    split.Add(option.Groups[2].Value);
+                }
+                else
+                {
+                    split?.Add(arguments[i]);
+                }
+            }
+            joined = (IReadOnlyList<string>?)given ?? Array.Empty<string>();
+            return split ?? arguments;
+        }
+
+        private static readonly System.Text.RegularExpressions.Regex JoinedOption = new(
+            @"^(--?[A-Za-z][\w-]*)\s+(\S.*?)\s*$",
+            System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
         /// <summary>
         /// The optional <c>packages</c> argument of <see cref="RunToolName"/>: a
