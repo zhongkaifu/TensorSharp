@@ -60,6 +60,7 @@
   "page.speech.saveFailed": "Das Audio konnte nicht gesichert werden: {error}",
   "page.speech.failed": "Das Vorlesen der Antwort wurde abgebrochen, daher wurde nur ein Teil gesprochen: {error}",
   "page.speech.notSaved": "Das Audio der Antwort konnte nicht gespeichert werden und lässt sich daher nicht erneut abspielen.",
+  "page.chat.jumpToLatest": "Zum Neuesten springen",
   "page.image.generatedAlt": "generiertes Bild",
   "page.image.compareOriginal": "Mit Original vergleichen",
   "page.image.showResult": "Ergebnis anzeigen",

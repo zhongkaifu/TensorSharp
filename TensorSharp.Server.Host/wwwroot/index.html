@@ -233,7 +233,18 @@ button.primary:hover { background: var(--accent-hover); }
   display: flex;
   flex-direction: column;
   gap: 16px;
+  /* What the reader is looking at stays put while the answer below it grows. */
+  overflow-anchor: auto;
 }
+
+/* Back to the newest line, while the reader is above it during an answer. */
+#jump-to-latest {
+  position: absolute; right: var(--layout-gutter); top: -52px; z-index: 5;
+  width: 40px; height: 40px; border-radius: 50%;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  font-size: 20px; line-height: 1; cursor: pointer; box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
+}
+#jump-to-latest[hidden] { display: none; }
 
 .message {
   display: flex;
@@ -432,6 +443,7 @@ button.primary:hover { background: var(--accent-hover); }
 }
 
 #input-area {
+  position: relative;
   padding: 16px var(--layout-gutter);
   background: var(--surface);
   border-top: 1px solid var(--border);
@@ -1351,6 +1363,7 @@ button.primary:hover { background: var(--accent-hover); }
   </div>
 
   <div id="input-area">
+    <button id="jump-to-latest" type="button" hidden title="Jump to the latest" aria-label="Jump to the latest">&#x2193;</button>
     <div class="attachments" id="attachments"></div>
     <div class="attachments" id="skill-chips"></div>
     <div class="model-switcher" id="model-switcher">
@@ -1459,18 +1472,58 @@ function isChatNearBottom() {
   return chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight <= autoScrollThreshold;
 }
 
+// The chat follows its newest line while the reader is at the bottom, and stops the moment they scroll away -- by
+// touch, wheel or key -- until they come back to the bottom or click the arrow. It used to decide on every scroll
+// event, its own included, that "within 32 px of the bottom" meant following, so a short scroll up during an answer
+// was taken back on the next frame and the chat shook under the reader.
+let chatTouching = false;
+let chatInputAt = 0;
+let chatScrolledTo = -1;
+const jumpToLatest = document.getElementById('jump-to-latest');
+
+function paintJumpToLatest() {
+  if (jumpToLatest) jumpToLatest.hidden = shouldAutoScroll || isChatNearBottom();
+}
+
 function updateAutoScrollState() {
-  shouldAutoScroll = isChatNearBottom();
+  if (chatContainer.scrollTop === chatScrolledTo) return; // this page's own, or the content growing under it
+  chatScrolledTo = -1;
+  // The reader's own scroll (or its momentum), or the bottom reached any way at all.
+  if (chatTouching || Date.now() - chatInputAt < 1500 || isChatNearBottom()) shouldAutoScroll = isChatNearBottom();
+  paintJumpToLatest();
 }
 
 function scrollChatToBottom(force = false) {
-  if (force || shouldAutoScroll) {
+  // Never under a finger: a drag or its glide is the reader's.
+  if (force || (shouldAutoScroll && !chatTouching)) {
     chatContainer.scrollTop = chatContainer.scrollHeight;
+    chatScrolledTo = chatContainer.scrollTop;
     shouldAutoScroll = true;
   }
+  paintJumpToLatest();
 }
 
 chatContainer.addEventListener('scroll', updateAutoScrollState);
+chatContainer.addEventListener('touchstart', () => { chatTouching = true; chatInputAt = Date.now(); }, { passive: true });
+chatContainer.addEventListener('touchmove', () => { chatInputAt = Date.now(); shouldAutoScroll = false; paintJumpToLatest(); }, { passive: true });
+for (const end of ['touchend', 'touchcancel']) {
+  chatContainer.addEventListener(end, () => {
+    chatTouching = false;
+    chatInputAt = Date.now();
+    if (isChatNearBottom()) shouldAutoScroll = true;
+    paintJumpToLatest();
+  }, { passive: true });
+}
+chatContainer.addEventListener('wheel', e => {
+  chatInputAt = Date.now();
+  if (e.deltaY < 0) { shouldAutoScroll = false; paintJumpToLatest(); }
+}, { passive: true });
+document.addEventListener('keydown', e => {
+  if (!['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' '].includes(e.key)) return;
+  const tag = e.target && e.target.tagName;
+  if (tag !== 'TEXTAREA' && tag !== 'INPUT' && tag !== 'SELECT') chatInputAt = Date.now();
+});
+if (jumpToLatest) jumpToLatest.addEventListener('click', () => { chatTouching = false; scrollChatToBottom(true); });
 
 messageInput.addEventListener('keydown', e => {
   // Enter can confirm an IME candidate; only submit after composition has ended.

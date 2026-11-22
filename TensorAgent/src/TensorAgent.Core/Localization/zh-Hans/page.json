@@ -60,6 +60,7 @@
   "page.speech.saveFailed": "无法保存音频：{error}",
   "page.speech.failed": "回复的朗读中断了，只朗读了一部分：{error}",
   "page.speech.notSaved": "无法保存回复的音频，因此不能再次播放。",
+  "page.chat.jumpToLatest": "跳到最新",
   "page.image.generatedAlt": "生成的图像",
   "page.image.compareOriginal": "对比原图",
   "page.image.showResult": "显示结果",

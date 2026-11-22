@@ -60,6 +60,7 @@
   "page.speech.saveFailed": "오디오를 저장하지 못했습니다: {error}",
   "page.speech.failed": "답변 읽기가 중단되어 일부만 읽었습니다: {error}",
   "page.speech.notSaved": "답변 오디오를 저장하지 못해 다시 재생할 수 없습니다.",
+  "page.chat.jumpToLatest": "최신 내용으로 이동",
   "page.image.generatedAlt": "생성된 이미지",
   "page.image.compareOriginal": "원본과 비교",
   "page.image.showResult": "결과 표시",
