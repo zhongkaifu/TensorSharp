@@ -1459,22 +1459,67 @@ public sealed class MainPage : ContentPage
                 await _webView.EvaluateJavaScriptAsync(
                     "window.TensorAgent.send(); if (document.activeElement) document.activeElement.blur(); true");
                 Say($"speechcheck turn {turn} sent: {prompt}");
-                string timeline = "null";
                 bool sessionSaid = false;
-                for (int i = 0; i < 1200; i++)
+                // The scroll check (the first turn): once the answer is long enough to scroll, scroll it up as a finger
+                // would, mid-stream, and watch whether the chat holds there for the rest of the stream; the other turns
+                // check that the chat follows the newest line all the way down.
+                bool scrollCheck = turn == 1 && Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_SCROLL_CHECK") != "0";
+                int held = -1, maxDrift = 0, scrolledAt = -1, followMisses = 0, followPolls = 0;
+                for (int i = 0; i < 2400; i++)
                 {
                     await Task.Delay(250);
-                    timeline = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
-                        "window.TensorAgent.speechTimeline ? window.TensorAgent.speechTimeline() : 'null'"));
-                    if (!sessionSaid && timeline.Contains("\"chunkAt\":[", StringComparison.Ordinal)
-                        && !timeline.Contains("\"chunkAt\":[]", StringComparison.Ordinal))
+                    string status = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                        "window.TensorAgent.speechStatus ? window.TensorAgent.speechStatus() : 'null'"));
+                    string[] parts = status.Split(',');
+                    if (parts.Length != 3)
+                        continue;
+                    int done = int.Parse(parts[0]), chunks = int.Parse(parts[1]), texts = int.Parse(parts[2]);
+                    if (!sessionSaid && chunks > 0)
                     {
                         sessionSaid = true;
                         Say($"speechcheck turn {turn} audio-session while speaking " + DescribeAudioSession());
                     }
-                    if (!timeline.Contains("\"done\":-1", StringComparison.Ordinal))
+                    int[] chat = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                    if (done < 0 && chat.Length == 3)
+                    {
+                        if (scrollCheck && held < 0 && texts >= 40 && chat[1] > chat[2] + 500)
+                        {
+                            await _webView.EvaluateJavaScriptAsync(
+                                "(function(){var c=document.getElementById('chat');c.dispatchEvent(new Event('touchstart'));"
+                                + "c.dispatchEvent(new Event('touchmove'));c.scrollTop=Math.max(0,c.scrollTop-300);"
+                                + "c.dispatchEvent(new Event('scroll'));c.dispatchEvent(new Event('touchend'));return c.scrollTop;})()");
+                            await Task.Delay(300);
+                            held = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)))[0];
+                            scrolledAt = texts;
+                        }
+                        else if (held >= 0)
+                            maxDrift = Math.Max(maxDrift, Math.Abs(chat[0] - held));
+                        else if (!scrollCheck && chat[1] > chat[2])
+                        {
+                            followPolls++;
+                            if (chat[1] - chat[0] - chat[2] > 60) followMisses++;
+                        }
+                    }
+                    if (done >= 0)
                         break;
                 }
+                string timeline = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent.speechTimeline ? window.TensorAgent.speechTimeline() : 'null'"));
+                if (scrollCheck)
+                {
+                    int[] end = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                    if (held >= 0 && end.Length == 3)
+                        maxDrift = Math.Max(maxDrift, Math.Abs(end[0] - held));
+                    string jumpShown = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                        "(function(){var b=document.querySelector('.jump-latest');var shown=!!b&&!b.hidden;if(b&&shown)b.click();return shown;})()"));
+                    await Task.Delay(600);
+                    int[] after = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                    Say($"speechcheck turn {turn} scroll held={(held >= 0 ? "yes" : "never scrolled")} scrolledAtText={scrolledAt} "
+                        + $"heldTop={held} maxDriftPx={maxDrift} jumpShown={jumpShown} "
+                        + $"afterJumpFromBottomPx={(after.Length == 3 ? after[1] - after[0] - after[2] : -1)}");
+                }
+                else
+                    Say($"speechcheck turn {turn} follow polls={followPolls} offBottomOver60px={followMisses}");
                 string diagnostics = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
                     "window.TensorAgent && window.TensorAgent.diagnostics ? window.TensorAgent.diagnostics() : 'nopage'"));
                 try
@@ -1525,6 +1570,22 @@ public sealed class MainPage : ContentPage
         }
     }
 
+    /// <summary>The chat's scrollTop, scrollHeight and clientHeight, as the speech check reads them.</summary>
+    private const string ChatScrollScript =
+        "(function(){var c=document.getElementById('chat');return c.scrollTop+','+c.scrollHeight+','+c.clientHeight;})()";
+
+    private static int[] ChatScroll(string answer)
+    {
+        string[] parts = answer.Split(',');
+        var values = new int[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+            if (!double.TryParse(parts[i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double v))
+                return Array.Empty<int>();
+            else
+                values[i] = (int)Math.Round(v);
+        return values;
+    }
+
     /// <summary>The turn's timeline in the numbers that matter: time to the first text, the first speech the page
     /// had and when it was scheduled to sound, the last text, and how much speech arrived before the text ended.</summary>
     private static string SummarizeSpeechTimeline(string timeline)
@@ -1539,10 +1600,24 @@ public sealed class MainPage : ContentPage
             int[] startAt = r.GetProperty("startAt").EnumerateArray().Select(e => e.GetInt32()).ToArray();
             int lastText = r.GetProperty("lastText").GetInt32();
             int beforeLast = chunkAt.Count(t => t <= lastText);
+            // How far the queued speech ran ahead of the playhead while the text was still being written, and every
+            // silence after the first chunk (the queue ran dry): [when, how long, which chunk].
+            int[] lead = r.TryGetProperty("leadAt", out JsonElement leads) ? leads.EnumerateArray().Select(e => e.GetInt32()).ToArray() : [];
+            int[] leadWhileText = lead.Where((_, i) => i < chunkAt.Length && chunkAt[i] <= lastText).ToArray();
+            JsonElement[] gaps = r.TryGetProperty("gaps", out JsonElement g) ? g.EnumerateArray().ToArray() : [];
+            int[] gapMs = gaps.Select(x => x[1].GetInt32()).ToArray();
+            string paints = r.TryGetProperty("paints", out JsonElement p)
+                ? $"paints={p.GetInt32()} paintMs={r.GetProperty("paintMs").GetDouble():F0} paintMaxMs={r.GetProperty("paintMaxMs").GetDouble():F1} "
+                : "";
             return $"firstText={r.GetProperty("firstText").GetInt32()}ms lastText={lastText}ms texts={r.GetProperty("texts").GetInt32()} "
                 + $"chunks={chunkAt.Length} firstChunk={(chunkAt.Length > 0 ? chunkAt[0] : -1)}ms "
                 + $"firstScheduledStart={(startAt.Length > 0 ? startAt[0] : -1)}ms chunksBeforeLastText={beforeLast} "
                 + $"lastChunk={(chunkAt.Length > 0 ? chunkAt[^1] : -1)}ms done={r.GetProperty("done").GetInt32()}ms "
+                + $"leadWhileTextMin={(leadWhileText.Length > 1 ? leadWhileText.Skip(1).Min() : -1)}ms "
+                + $"leadWhileTextLast={(leadWhileText.Length > 0 ? leadWhileText[^1] : -1)}ms "
+                + $"gaps={gapMs.Length} gapTotalMs={gapMs.Sum()} gapMaxMs={(gapMs.Length > 0 ? gapMs.Max() : 0)} "
+                + $"gapsOver50ms=[{string.Join(",", gaps.Where(x => x[1].GetInt32() > 50).Select(x => $"{x[0].GetInt32()}:{x[1].GetInt32()}"))}] "
+                + paints
                 + $"noPlayer={r.GetProperty("noPlayer").GetInt32()} states={r.GetProperty("states").GetRawText()}";
         }
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
