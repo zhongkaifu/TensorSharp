@@ -52,6 +52,15 @@ namespace TensorSharp.AgentHost.CodeExec
         bool IsProvided(CodeLanguage language, string package) => false;
 
         /// <summary>
+        /// Why <paramref name="package"/> can never be installed on this host — for
+        /// example a package that ships compiled code on a host that loads only the
+        /// extensions built into the app — or null when it can be, or when that is only
+        /// known by trying. Lets a skill's needs be checked before it is installed or run.
+        /// The default (a pip host, which builds or downloads anything) knows of nothing.
+        /// </summary>
+        string? ExplainUnavailable(CodeLanguage language, string package) => null;
+
+        /// <summary>
         /// Install <paramref name="packages"/> into <paramref name="workspace"/>'s
         /// environment.
         /// </summary>

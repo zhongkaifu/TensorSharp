@@ -1,6 +1,9 @@
 ---
 name: research
 description: Use for web searches and current information lookups, finding sources, and fact-checking without being given any URLs. Network switch must be on; no API key.
+metadata:
+  provides-tools: WebSearch, WebFetch
+  provides-call: 'skills_run(skill="research", path="scripts/research.py", args=["<question>", "--out", "notes.md"]), then read notes.md'
 ---
 
 # Research

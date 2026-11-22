@@ -233,21 +233,26 @@ namespace TensorSharp.AgentHost.Skills
         /// </summary>
         /// <param name="sourceDirectory">A directory containing <c>SKILL.md</c>.</param>
         /// <param name="overwrite">Replace an existing installed skill of the same name.</param>
+        /// <param name="source">
+        /// Hub provenance to record with it (<see cref="SkillMarketplace"/>), or null for a
+        /// skill that did not come from the hub; null also clears any earlier record.
+        /// </param>
         /// <exception cref="InvalidOperationException">Installation is disabled, or the name is already taken.</exception>
         /// <exception cref="SkillInstallException">The directory is not a usable skill.</exception>
-        public Skill InstallFromDirectory(string sourceDirectory, bool overwrite = false)
+        public Skill InstallFromDirectory(string sourceDirectory, bool overwrite = false, SkillSource? source = null)
         {
             if (!CanInstall)
                 throw new InvalidOperationException("This registry is read-only: no install directory is configured.");
             if (string.IsNullOrWhiteSpace(sourceDirectory) || !Directory.Exists(sourceDirectory))
                 throw new SkillInstallException($"'{sourceDirectory}' is not a directory.");
 
-            string source = SkillPathGuard.NormalizeDirectory(sourceDirectory);
-            string manifestPath = Path.Combine(source, SkillManifestParser.SkillFileName);
+            SkillSource? provenance = source;
+            string sourceRoot = SkillPathGuard.NormalizeDirectory(sourceDirectory);
+            string manifestPath = Path.Combine(sourceRoot, SkillManifestParser.SkillFileName);
             if (!File.Exists(manifestPath))
                 throw new SkillInstallException($"'{sourceDirectory}' has no {SkillManifestParser.SkillFileName}.");
 
-            if (!TryLoad(source, SkillOrigin.Installed, null, out Skill? staged, out string? error))
+            if (!TryLoad(sourceRoot, SkillOrigin.Installed, null, out Skill? staged, out string? error))
                 throw new SkillInstallException(error ?? "the skill could not be read");
 
             lock (_writeGate)
@@ -259,13 +264,14 @@ namespace TensorSharp.AgentHost.Skills
                 string destination = ReserveInstallDirectory(staged!.Manifest.Name, overwrite);
                 try
                 {
-                    CopyTree(source, destination, staged.Manifest.Name);
+                    CopyTree(sourceRoot, destination, staged.Manifest.Name);
                 }
                 catch
                 {
                     TryDeleteDirectory(destination);
                     throw;
                 }
+                RecordSource(staged.Manifest.Name, provenance);
 
                 Index built = Build();
                 _index = built;
@@ -331,6 +337,7 @@ namespace TensorSharp.AgentHost.Skills
                 ForgetRemoved(staged!.Manifest.Name);
                 string destination = ReserveInstallDirectory(staged!.Manifest.Name, overwrite);
                     Directory.Move(skillRoot, destination);
+                    RecordSource(staged.Manifest.Name, null);
 
                     Index built = Build();
                     _index = built;
@@ -368,6 +375,7 @@ namespace TensorSharp.AgentHost.Skills
                 if (skill.Origin == SkillOrigin.Installed)
                 {
                     TryDeleteDirectory(skill.RootDirectory);
+                    RecordSource(skill.Id, null);
                 }
                 else if (_options.RemovedRecordFile is { Length: > 0 })
                 {
@@ -387,6 +395,92 @@ namespace TensorSharp.AgentHost.Skills
                 _index = Build();
                 _logger.LogInformation(LogEventIds.SkillRemoved, "skills.removed id={SkillId}", skill.Id);
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// The installed skill that came from hub package <paramref name="package"/>
+        /// (<c>owner/repository@skill-name</c>), whatever name it was installed under.
+        /// </summary>
+        public bool TryGetInstalledPackage(string? package, out Skill skill)
+        {
+            skill = null!;
+            if (string.IsNullOrWhiteSpace(package))
+                return false;
+            string wanted = package.Trim();
+            foreach (Skill candidate in _index.Ordered)
+            {
+                if (candidate.Source is { } source
+                    && string.Equals(source.Package, wanted, StringComparison.OrdinalIgnoreCase))
+                {
+                    skill = candidate;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// The provenance record for hub installs: one JSON file in the install directory,
+        /// keyed by skill id. It sits beside the skill directories rather than inside one, so
+        /// it is never part of a skill's own files, and a root-level file is not a skill.
+        /// </summary>
+        internal const string SourcesFileName = ".hub-sources.json";
+
+        private string? SourcesFile => CanInstall ? Path.Combine(_options.InstallDirectory!, SourcesFileName) : null;
+
+        private Dictionary<string, SkillSource> ReadSources()
+        {
+            var sources = new Dictionary<string, SkillSource>(StringComparer.OrdinalIgnoreCase);
+            string? file = SourcesFile;
+            if (file == null || !File.Exists(file))
+                return sources;
+            try
+            {
+                var stored = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, SkillSource>>(
+                    File.ReadAllText(file));
+                if (stored != null)
+                {
+                    foreach ((string id, SkillSource source) in stored)
+                    {
+                        if (source != null && !string.IsNullOrWhiteSpace(source.Package))
+                            sources[id] = source;
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
+            {
+                // An unreadable record loses the provenance line, not the skills.
+                _logger.LogWarning(LogEventIds.SkillRejected,
+                    "skills.sources.unreadable file={File} reason={Reason}", file, ex.Message);
+            }
+            return sources;
+        }
+
+        /// <summary>Record (or, with null, forget) the hub provenance of one installed skill. Call under the write gate.</summary>
+        private void RecordSource(string id, SkillSource? source)
+        {
+            string? file = SourcesFile;
+            if (file == null)
+                return;
+            Dictionary<string, SkillSource> sources = ReadSources();
+            bool changed = source == null ? sources.Remove(id) : true;
+            if (source != null)
+                sources[id] = source;
+            if (!changed)
+                return;
+            try
+            {
+                Directory.CreateDirectory(_options.InstallDirectory!);
+                string temporary = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllText(temporary, System.Text.Json.JsonSerializer.Serialize(sources,
+                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+                File.Move(temporary, file, overwrite: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogWarning(LogEventIds.SkillRejected,
+                    "skills.sources.unwritable file={File} reason={Reason}", file, ex.Message);
             }
         }
 
@@ -470,6 +564,7 @@ namespace TensorSharp.AgentHost.Skills
                 ? StringComparer.Ordinal
                 : StringComparer.OrdinalIgnoreCase);
             HashSet<string> removed = RemovedIds();
+            Dictionary<string, SkillSource> sources = ReadSources();
 
             foreach ((string root, SkillOrigin origin) in EnumerateRoots())
             {
@@ -524,6 +619,15 @@ namespace TensorSharp.AgentHost.Skills
                         errors.Add(new SkillLoadError(dir,
                             $"skipped: '{skill.Id}' is already provided by {winner.RootDirectory}, which takes precedence"));
                         continue;
+                    }
+
+                    // Only a skill in the install directory can carry hub provenance: the
+                    // record names a directory this registry wrote, never an operator root.
+                    if (origin == SkillOrigin.Installed
+                        && sources.TryGetValue(skill.Id, out SkillSource? provenance)
+                        && string.Equals(Path.GetFileName(dir), skill.Id, StringComparison.OrdinalIgnoreCase))
+                    {
+                        skill.Source = provenance;
                     }
 
                     byId[skill.Id] = skill;
@@ -835,5 +939,8 @@ namespace TensorSharp.AgentHost.Skills
         public SkillInstallException(string message) : base(message) { }
 
         public SkillInstallException(string message, Exception inner) : base(message, inner) { }
+
+        /// <summary>The HTTP status a remote source answered with, when that is what failed.</summary>
+        public int? HttpStatus { get; init; }
     }
 }

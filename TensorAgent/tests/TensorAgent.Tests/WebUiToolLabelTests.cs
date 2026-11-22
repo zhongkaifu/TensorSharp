@@ -53,6 +53,8 @@ public sealed class WebUiToolLabelTests
         // dispatches it, so a model that calls it by habit still produces its frames.
         string[] hostTools = SkillToolNames.CodeTools
             .Concat(new[] { SkillTools.ListToolName, SkillTools.ReadToolName, SkillTools.RunToolName })
+            // The hub tools run on the host too, so they stream progress like the others.
+            .Concat(new[] { SkillMarketplaceTools.SearchToolName, SkillMarketplaceTools.InspectToolName, SkillMarketplaceTools.InstallToolName })
             .Concat(MultiAgentTools.Create().Select(tool => tool.Name))
             .Distinct(StringComparer.Ordinal)
             .OrderBy(name => name, StringComparer.Ordinal)

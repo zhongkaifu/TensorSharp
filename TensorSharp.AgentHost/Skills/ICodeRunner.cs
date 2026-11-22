@@ -176,6 +176,13 @@ namespace TensorSharp.AgentHost.Skills
         bool CanInstallPackagesFor(string language) => CanInstallPackages;
 
         /// <summary>
+        /// Why <paramref name="package"/> can never be used on this host, or null when it
+        /// can be or that is only known by trying (see
+        /// <see cref="CodeExec.IPackageInstaller.ExplainUnavailable"/>).
+        /// </summary>
+        string? ExplainUnavailablePackage(string language, string package) => null;
+
+        /// <summary>
         /// Install <paramref name="packages"/> into <paramref name="workspace"/>'s
         /// environment, under the same rules every host-built install obeys (wheels
         /// only, confined, allow-list honored). Exists so a skill SCRIPT's missing

@@ -200,6 +200,32 @@ internal sealed class InstallHookPackageInstaller : IPackageInstaller
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Built-in packages are always usable. Anything else is asked of the index the
+    /// same way an install would ask (<see cref="WheelInstaller.ExplainUnavailableAsync"/>),
+    /// so "pandas ships compiled code" is known before a skill that needs it is installed.
+    /// </remarks>
+    public string? ExplainUnavailable(CodeLanguage language, string package)
+    {
+        if (language != CodeLanguage.Python)
+            return language == CodeLanguage.JavaScript
+                ? "TensorAgent on this device installs Python packages only, not npm packages"
+                : null;
+        if (IsProvided(language, package) || _hook is not WheelInstaller wheels)
+            return null;
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        try
+        {
+            string? why = wheels.ExplainUnavailableAsync(package, deadline.Token).GetAwaiter().GetResult();
+            return why == null ? null : $"{package}: {why}";
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc />
     public string? Install(
         SessionWorkspace workspace,
         CodeLanguage language,

@@ -87,9 +87,11 @@ public sealed class FindSkillsWorkflowTests : IDisposable
             Assert.Contains("network policy", result.Content);
         }
         allowed = true;
-        var invalid = SkillTools.Execute(new() { Name = "skills_install", Arguments = new() { ["package"] = "owner/repo@demo" } }, plan.ToolContext);
+        // Once the policy allows it the call proceeds to its own validation (no network here:
+        // the package is not one), which names the exact form a package takes.
+        var invalid = SkillTools.Execute(new() { Name = "skills_install", Arguments = new() { ["package"] = "demo" } }, plan.ToolContext);
         Assert.False(invalid.Ok);
-        Assert.Contains("skills_inspect", invalid.Content);
+        Assert.Contains("owner/repository@skill-name", invalid.Content);
     }
 
     [Fact]

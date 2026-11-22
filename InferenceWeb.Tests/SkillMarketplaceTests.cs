@@ -35,6 +35,8 @@ public sealed class SkillMarketplaceTests : IDisposable
         using var memory = new MemoryStream();
         using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, leaveOpen: true))
         {
+            // GitHub labels an archive with its commit; the client checks it.
+            archive.Comment = Revision;
             foreach (var file in files)
             {
                 ZipArchiveEntry entry = archive.CreateEntry(file.Path, CompressionLevel.Fastest);

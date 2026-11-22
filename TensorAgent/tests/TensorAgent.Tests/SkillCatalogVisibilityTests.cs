@@ -274,7 +274,7 @@ public sealed class SkillCatalogVisibilityTests
             entry => entry.StartsWith("- find-skills:", StringComparison.Ordinal));
 
         Assert.Equal("- find-skills: " + skill.Description, line);
-        Assert.Contains("Find, inspect and install skills", line, StringComparison.Ordinal);
+        Assert.Contains("Find, install and use a hub skill", line, StringComparison.Ordinal);
         Assert.Contains("Network switch", line, StringComparison.Ordinal);
         Assert.Empty(plan.Prompt.Inlined);
         Assert.DoesNotContain(skill.Manifest.Body, plan.Prompt.Instructions, StringComparison.Ordinal);

@@ -854,6 +854,8 @@ namespace TensorSharp.Server.Skills
         public string Path { get; init; }
         /// <summary>The error the call returned, or null for a skill file that was read.</summary>
         public string Error { get; init; }
+        /// <summary>A call answered from its first result whatever that was (a search, a shell command).</summary>
+        public bool AnyResult { get; init; }
         public int AskedAgain { get; set; }
     }
 }
