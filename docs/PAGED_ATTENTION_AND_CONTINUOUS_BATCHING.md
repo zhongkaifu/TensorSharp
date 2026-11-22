@@ -128,7 +128,24 @@ BlockPool + PagedKvStorage   (managed host memory)
    A waiting request is admitted only when the free pool can hold its whole prompt on top of the prompt blocks the running requests still have to allocate; otherwise it stays queued until one finishes (a lone request is always admitted).
 6. If the pool is under pressure (decode growth is not reserved), the scheduler can preempt a running sequence that ranks below the one needing blocks (lower priority, or submitted later), commit its full blocks, free the remainder, and requeue it. A sequence never preempts an older one: it waits a step instead, so a full pool drains oldest-first rather than livelocking long prefills against each other.
 7. `BatchExecutor` executes the scheduled step. It asks `ExecutionPlanner` for the step's `ExecutionPlan` and runs the first candidate path that accepts the step (see [Execution Planning](#execution-planning-capability-model)).
-8. The engine emits sampled tokens to the request handle, checks EOS / max-tokens / abort state, and releases blocks for completed sequences.
+8. The engine emits sampled tokens to the request handle, checks EOS / max-tokens / abort state and the repetition guard, and releases blocks for completed sequences.
+
+The repetition guard (`RepetitionGuard`) ends a generation that has locked into an exact loop, with finish
+reason `repetition`. It is asked after every emitted token, on the output tokens only, and it has two rules:
+
+- **A short unit:** up to 64 tokens, repeated at least 8 times over at least 128 tokens. Examples are
+  `","+` 43 times, or 128 copies of one token.
+- **A long block:** 65 to 4,096 tokens, with the last `max(4096, 4 × period)` tokens an exact copy of the
+  block over and over. That is 18 copies of a 222-token block, and at least four of any block. This
+  rule runs only once the output is 4,096 tokens long, and then every 64 tokens. Each check reads a fixed
+  window at the end of the output, so its cost does not grow with the reply.
+
+Both rules need copies that are identical token for token. Output that repeats its structure but changes
+something in each copy is never stopped: CSV rows, a table, getters, a list, or sections under the same
+headings. One looping round of a tool-call body (an `apply_patch` file, say) is stopped the same way, and
+the skills loop tells the model what repeated and lets it try once more. `TS_SCHED_STOP_REPETITION=0`
+turns the guard off for the host. A request that sets `ignore_eos` runs to its token limit with the guard
+off (`SamplingConfig.StopRepetition = false`).
 
 Prefix adoption is capped so at least one prompt token still runs through the
 model. That keeps logits fresh for sampling even when the entire visible prefix

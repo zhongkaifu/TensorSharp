@@ -1142,6 +1142,38 @@ public sealed class SkillCompletionGuardTests : IDisposable
         Assert.True(done.RepetitionExplained);
     }
 
+    /// <summary>
+    /// The long-period case, from TensorSharp.Server: LFM3-Omni 2B, after a refused spawn_agent,
+    /// wrote an apply_patch body that repeated one 747-character markdown block until the client
+    /// gave up. The engine's block rule now stops such a round. The note to the model must still
+    /// quote what repeated and how often, so the raw tail has to hold enough copies of the block.
+    /// It held 4 to 8 KB before, which is fewer than four copies of a block this long, and the
+    /// note said "the same short sequence".
+    /// </summary>
+    [Fact]
+    public async Task ARoundStoppedForABlockLoop_QuotesTheBlockAndHowOftenItRepeated()
+    {
+        SessionWorkspace workspace = _workspaces.GetOrCreate("block-looping");
+        var runner = new ArtifactRunner(_artifacts, ArtifactMode.None);
+        SkillRequestPlan plan = Plan(runner, workspace, guarded: false);
+        string looping = "<think>The worker role was refused.</think>Let me write the design file directly."
+            + ObservedBlockLoop.Stream(copies: 20);
+        var replay = new ReplayGeneration(looping, "<think>use a script instead</think>Written differently.")
+        {
+            FinishReasons = new[] { "repetition", "stop" },
+        };
+
+        List<ChatStreamUpdate> updates = await Run(plan, replay.Invoke);
+
+        Assert.Equal(2, replay.Calls);
+        Assert.Equal(0, runner.Executions);
+        string shown = ObservedBlockLoop.Block.Replace("\n", "\\n", StringComparison.Ordinal).Substring(0, 48) + "…";
+        string secondHistory = replay.Histories[1];
+        Assert.Contains("Host: your previous output was stopped because it began repeating itself", secondHistory, StringComparison.Ordinal);
+        Assert.Contains($"repeated `{shown}` 20 times in a row", secondHistory, StringComparison.Ordinal);
+        Assert.Contains("Written differently.", Content(updates), StringComparison.Ordinal);
+    }
+
     private SkillRequestPlan Plan(
         ArtifactRunner runner,
         SessionWorkspace workspace,

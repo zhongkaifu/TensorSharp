@@ -708,7 +708,14 @@ legitimately repetitive structure), the reply limit was hundreds of thousands of
 tokens, and a loop never reaches end-of-sequence. The engine now watches every
 generation for an exact loop — a unit of at most 64 tokens, repeated at least eight
 times and over at least 128 tokens — and ends it with the finish reason
-`repetition` (`RepetitionGuard`). A tool-calling turn then tells the model what
+`repetition` (`RepetitionGuard`). A loop can also have a long unit. On
+TensorSharp.Server, LFM3-Omni 2B wrote an `apply_patch` file that repeated one
+16-line block 520 times, 115,498 tokens in 17 minutes. With the phone's
+262,144-token limit that would be hours. So a block of up to 4,096 tokens counts
+too, once the copies are identical for at least 4,096 tokens and number at least
+four. Output that repeats its structure but changes something in every copy is
+never stopped: CSV rows, tables, lists, getters, sections with the same headings.
+A tool-calling turn then tells the model what
 repeated and how often, runs nothing from that round, and lets it try once more,
 differently; a plain answer ends with a one-line note instead of a wall of the
 same phrase.

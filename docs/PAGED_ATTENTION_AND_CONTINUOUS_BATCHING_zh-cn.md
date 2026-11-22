@@ -115,7 +115,21 @@ BlockPool + PagedKvStorage   (托管主机内存)
    只有当空闲块在扣除运行中请求尚需分配的 prompt 块之后，仍能容纳等待请求的整段 prompt 时，才会接纳它；否则它留在队列中，直到有请求结束（单独一个请求总会被接纳）。
 6. 块池压力较大时（decode 增长不预留），调度器可以抢占排名低于需要块的那个序列的运行序列（优先级更低，或同优先级但提交更晚），提交其完整块、释放剩余块，并重新排入等待队列。序列绝不抢占比它更早的序列：它会等待一步，因此块池满时按从旧到新的顺序排空，而不是让长 prefill 彼此抢占形成活锁。
 7. `BatchExecutor` 执行本步工作。它向 `ExecutionPlanner` 请求本步的 `ExecutionPlan`，并运行第一个接受该步的候选路径（见 [执行规划](#执行规划capability-model)）。
-8. 引擎把采样 token 发给 request handle，检查 EOS / max-tokens / abort 状态，并释放已完成序列的块。
+8. 引擎把采样 token 发给 request handle，检查 EOS / max-tokens / abort 状态和重复保护，并释放已完成序列的块。
+
+重复保护（`RepetitionGuard`）会结束陷入精确循环的生成，结束原因为 `repetition`。每输出一个 token 检查一次，
+只看输出 token，有两条规则：
+
+- **短单元**：不超过 64 个 token，至少重复 8 次，且至少覆盖 128 个 token。例如 `","+` 重复 43 次，或同一个
+  token 连续 128 次。
+- **长块**：65 到 4,096 个 token，输出末尾的 `max(4096, 4 × 周期)` 个 token 必须是该块的逐字重复。也就是
+  222 个 token 的块为 18 份，任何块至少 4 份。这条规则在输出达到 4,096 个 token 后才运行，之后每 64 个 token
+  检查一次。每次只读取输出末尾固定大小的窗口，所以开销不随回复变长而增长。
+
+两条规则都要求各份内容逐 token 完全相同。结构重复但每份都有变化的输出永远不会被停止：CSV 行、表格、
+getter、列表，或标题相同的各个章节。工具调用参数（例如 `apply_patch` 写入的文件）里的循环也会这样被停止，
+skills 循环会告诉模型重复了什么，并让它再试一次。`TS_SCHED_STOP_REPETITION=0` 为整个主机关闭重复保护。
+设置了 `ignore_eos` 的请求会关闭重复保护（`SamplingConfig.StopRepetition = false`），一直生成到 token 上限。
 
 前缀采纳会保留至少一个 prompt token 重新送入模型。这样即使可见前缀已经全部
 命中前缀缓存，也能产生新的 logits 用于采样。
