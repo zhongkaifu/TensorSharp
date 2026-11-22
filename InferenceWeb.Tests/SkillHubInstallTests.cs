@@ -154,17 +154,38 @@ public sealed class SkillHubInstallTests : IDisposable
     }
 
     [Fact]
-    public void ANameTakenByADifferentSkillInstallsUnderThePublisherQualifiedName()
+    public void ANameTakenByASkillThatRunsHereIsAnsweredWithThatSkillAndSaysHowToGetTheHubOne()
     {
-        Directory.CreateDirectory(Path.Combine(_root, "bundled", "research"));
-        File.WriteAllText(Path.Combine(_root, "bundled", "research", "SKILL.md"),
-            "---\nname: research\ndescription: The host's own research skill.\n---\nLocal.\n");
+        BundleResearch();
         _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
         _hub.Skill = ("acme/tools", "research");
         SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        context.UserRequest = "Please do research on Nvidia and tell me if I should buy its stock now.";
 
-        SkillToolResult installed = SkillTools.Execute(
-            Call("skills_install", ("package", "acme/tools@research")), Plan(registry).ToolContext);
+        SkillToolResult answer = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), context);
+        Assert.False(answer.Ok);
+        Assert.Contains("this host already has a skill called 'research' that runs here. Use it: " + ResearchCall + ".",
+            answer.Content, StringComparison.Ordinal);
+        Assert.Contains("The hub skill acme/tools@research is a different one; to install it anyway, the user can ask for "
+            + "acme/tools@research by name.", answer.Content, StringComparison.Ordinal);
+        Assert.False(registry.TryGet("acme-research", out _));
+        Assert.DoesNotContain(_hub.Requests, uri => uri.Host is "api.github.com" or "codeload.github.com");
+    }
+
+    [Theory]
+    [InlineData("Install acme/tools@research and use it.")]
+    [InlineData("Use the research skill from acme/tools.")]
+    public void ANameTakenByADifferentSkillInstallsUnderThePublisherQualifiedNameWhenTheUserNamesThePackage(string request)
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
+        _hub.Skill = ("acme/tools", "research");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        context.UserRequest = request;
+
+        SkillToolResult installed = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), context);
         Assert.True(installed.Ok, installed.Content);
         Assert.Contains("as skill \"acme-research\"", installed.Content, StringComparison.Ordinal);
         Assert.Contains("already called 'research'", installed.Content, StringComparison.Ordinal);
@@ -173,7 +194,73 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.StartsWith("---\nname: acme-research\n", File.ReadAllText(Path.Combine(renamed.RootDirectory, "SKILL.md")));
         Assert.True(registry.TryGet("research", out Skill local));
         Assert.Null(local.Source);
-        Assert.Equal("Local.", local.Manifest.Body.Trim());
+        Assert.Equal("Run it.", local.Manifest.Body.Trim());
+
+        // A later turn that does not name it is pointed at the skill that runs here, and told the copy exists.
+        SkillToolContext later = RunnableContext(registry);
+        later.UserRequest = "Research Nvidia's stock.";
+        SkillToolResult again = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), later);
+        Assert.False(again.Ok);
+        Assert.Contains("Use it: " + ResearchCall, again.Content, StringComparison.Ordinal);
+        Assert.Contains("is a different one, installed here as 'acme-research'", again.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ANameTakenByASkillThatCannotRunHereStillInstallsUnderThePublisherQualifiedName()
+    {
+        // The skill already here needs a program this in-process host can never launch.
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", "research", "scripts"));
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "SKILL.md"),
+            "---\nname: research\ndescription: Research with a browser.\nmetadata: {\"openclaw\":{\"requires\":{\"bins\":[\"chromium\"]}}}\n---\nRun it.\n");
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "scripts", "run.sh"), "chromium --headless\n");
+        _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
+        _hub.Skill = ("acme/tools", "research");
+        SkillRegistry registry = Registry();
+        SessionWorkspace workspace = new SessionWorkspaceManager(Path.Combine(_root, "sessions")).GetOrCreate("in-process");
+        var context = new SkillToolContext(registry.Skills)
+        {
+            Marketplace = new SkillMarketplaceSession(_marketplace, registry),
+            Workspace = workspace,
+            ScriptRunner = new SkillScriptRunner(new SkillScriptRunnerOptions
+            {
+                Backend = new FakeShellBackend { Sandbox = new InProcessSandbox(new SkillSandboxCapabilities(true, true, true, true)) },
+                Workspace = workspace,
+            }),
+            UserRequest = "Research Nvidia.",
+        };
+        SkillToolResult installed = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), context);
+        Assert.True(installed.Ok, installed.Content);
+        Assert.Contains("as skill \"acme-research\"", installed.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TheChatLoopGivesTheToolsTheUsersLatestMessage()
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
+        _hub.Skill = ("acme/tools", "research");
+        SkillRegistry registry = Registry();
+        SkillRequestPlan plan = Plan(registry);
+        int round = 0;
+        async IAsyncEnumerable<ChatStreamUpdate> Generate(List<ChatMessage> messages, List<ToolFunction> tools,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        {
+            string text = round++ == 0
+                ? "<tool_call>{\"name\":\"skills_install\",\"arguments\":{\"package\":\"acme/tools@research\"}}</tool_call>"
+                : "Installed.";
+            yield return ChatStreamUpdate.Text(text);
+            await Task.Yield();
+            yield return new ChatStreamUpdate("", true, 10, 20, 5, 0, 0, 0, "stop");
+        }
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "Research Nvidia." },
+            new() { Role = "assistant", Content = "Which source?" },
+            new() { Role = "user", Content = "Install acme/tools@research and use that." },
+        };
+        await foreach (var _ in SkillChatLoop.RunAsync("nemotron_h_moe", messages, plan, true, Generate, null, CancellationToken.None)) { }
+        Assert.Equal("Install acme/tools@research and use that.", plan.ToolContext.UserRequest);
+        Assert.True(registry.TryGet("acme-research", out _));
     }
 
     [Fact]

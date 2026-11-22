@@ -250,6 +250,7 @@ namespace TensorSharp.AgentHost.Skills
             ArgumentNullException.ThrowIfNull(context);
             ArgumentNullException.ThrowIfNull(generate);
             options ??= SkillAgentLoopOptions.Default;
+            context.UserRequest ??= SkillToolContext.LatestUserText(messages);
 
             if (options.AgentSession == null && options.MultiAgent?.Enabled == true)
             {

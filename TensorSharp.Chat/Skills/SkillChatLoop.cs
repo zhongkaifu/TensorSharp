@@ -103,6 +103,7 @@ namespace TensorSharp.Server.Skills
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             var working = new List<ChatMessage>(messages);
+            plan.ToolContext.UserRequest ??= SkillToolContext.LatestUserText(messages);
             int maxRounds = Math.Max(1, plan.LoopOptions.MaxRounds);
             bool guardCompletion = plan.CompletionRequirement != null;
             bool repetitionRetried = false;

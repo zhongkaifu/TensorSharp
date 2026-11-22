@@ -1184,6 +1184,18 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>Network discovery and installation explicitly enabled for this request.</summary>
         public SkillMarketplaceSession? Marketplace { get; init; }
 
+        /// <summary>
+        /// The user's latest message, as written, set by the tool loop when a turn starts. A tool
+        /// reads it only to tell what the user asked for by name (an exact hub package), never
+        /// to guess intent; null when the host's loop does not set it.
+        /// </summary>
+        public string? UserRequest { get; set; }
+
+        /// <summary>The latest user message with text in <paramref name="messages"/>, or null.</summary>
+        public static string? LatestUserText(IEnumerable<ChatMessage>? messages) =>
+            messages?.LastOrDefault(m => m != null && string.Equals(m.Role, "user", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(m.Content))?.Content;
+
         /// <summary>Grant only the skill this request installed; never rescan another request's scope.</summary>
         internal void GrantInstalled(Skill skill)
         {

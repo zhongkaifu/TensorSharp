@@ -104,6 +104,8 @@ public sealed class FindSkillsHostTests : IDisposable
             }, plan.LoopOptions);
 
         Assert.False(result.HitRoundLimit);
+        // The loop hands the tools the user's own words (what an exact package request is read from).
+        Assert.Equal("Find, install and use a skill to multiply 6 by 7 and save the report.", plan.ToolContext.UserRequest);
         Assert.Equal(workflow.Length + 1, result.Rounds);
         Assert.Equal(workflow.Length, result.Invocations.Count);
         Assert.All(result.Invocations, invocation => Assert.True(invocation.Ok, invocation.Tool));

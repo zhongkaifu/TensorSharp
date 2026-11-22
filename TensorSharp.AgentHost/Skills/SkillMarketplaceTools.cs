@@ -525,6 +525,13 @@ public static class SkillMarketplaceTools
         if (package == null)
             return SkillToolResult.Failure(argumentError!);
 
+        // A skill of the same name is already here and runs here: use it. Installing the hub
+        // one as <owner>-<name> beside it put two skills with one name in a small model's
+        // context ("mattpocock-research" next to the bundled "research"), and it conflated
+        // them: it reported the bundled one as having no scripts and looped on that.
+        if (SameNameHere(package, context, session) is { } sameName)
+            return SkillToolResult.Failure(sameName);
+
         // Installed before — by an earlier turn, or under another name: use that copy.
         if (session.Registry.TryGetInstalledPackage(package, out Skill existing))
             return Installed(existing, context, session, package, alreadyInstalled: true);
@@ -641,6 +648,47 @@ public static class SkillMarketplaceTools
               .Append("\", path=\"").Append(script.Value.Path).Append("\", args=\"...\")");
         sb.Append('.');
         return SkillToolResult.Success(sb.ToString(), skill.Id, source?.Describe() ?? package);
+    }
+
+    /// <summary>
+    /// The answer to installing <paramref name="package"/> when a different skill of its name
+    /// is already here and can run here, or null to install as usual: when the user's latest
+    /// message names this package (or its repository), or when the skill already here cannot
+    /// run. The hub's skill stays reachable: the answer says how the user can ask for it.
+    /// </summary>
+    private static string? SameNameHere(string package, SkillToolContext context, SkillMarketplaceSession session)
+    {
+        int at = package.LastIndexOf('@');
+        if (at < 0 || !session.Registry.TryGet(package[(at + 1)..], out Skill taken)
+            || string.Equals(taken.Source?.Package, package, StringComparison.OrdinalIgnoreCase)
+            || UserNamed(context.UserRequest, package))
+            return null;
+        if (!SkillCompatibility.Assess(taken, SkillHostProfile.From(context)).CanRun)
+            return null;
+        string copy = session.Registry.TryGetInstalledPackage(package, out Skill installed)
+            ? $", installed here as '{installed.Id}'"
+            : string.Empty;
+        return $"Not installed: this host already has a skill called '{taken.Id}' that runs here. Use it: "
+            + CallFor(taken, context, runs: true) + $". The hub skill {package} is a different one{copy}; to install it "
+            + $"anyway, the user can ask for {package} by name.";
+    }
+
+    /// <summary>
+    /// Whether the user's own words name <paramref name="package"/>: the selector itself, its
+    /// <c>owner/repository</c>, or <c>owner/name</c>. Only a literal mention counts.
+    /// </summary>
+    internal static bool UserNamed(string? request, string package)
+    {
+        if (string.IsNullOrWhiteSpace(request))
+            return false;
+        int at = package.LastIndexOf('@');
+        string? repository = SkillMarketplaceSession.RepositoryOf(package);
+        if (at < 0 || repository == null)
+            return request.Contains(package, StringComparison.OrdinalIgnoreCase);
+        string ownerAndName = repository.Split('/')[0] + "/" + package[(at + 1)..];
+        return request.Contains(package, StringComparison.OrdinalIgnoreCase)
+            || request.Contains(repository, StringComparison.OrdinalIgnoreCase)
+            || request.Contains(ownerAndName, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>Why a package could not be used, and the exact next thing to try.</summary>

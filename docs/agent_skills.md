@@ -90,9 +90,17 @@ round is needed; an optional `revision` must match. It never overwrites a skill:
 
 - a package installed before (by an earlier conversation, under any name) is reused
   and reported `Already installed`, with no download;
-- a name already taken by a different skill installs the package as
-  `<owner>-<name>`. Only the frontmatter `name` line of the downloaded `SKILL.md`
-  is rewritten, and the original name is recorded;
+- a name already taken by a different skill that can run on this host is **not
+  installed**: the result names that skill's exact call, and says that the hub skill
+  is a different one and that the user can ask for it by its package to install it
+  anyway (and, when it is already installed under another name, which one). This
+  is the default since a small model, given both TensorAgent's `research` and a hub
+  `research` installed beside it as `mattpocock-research`, conflated the two names
+  and looped;
+- when the user's latest message names the package (`owner/repo@name`, `owner/repo`
+  or `owner/name`), or when the skill holding the name cannot run here, the package
+  is installed as `<owner>-<name>`. Only the frontmatter `name` line of the
+  downloaded `SKILL.md` is rewritten, and the original name is recorded;
 - a stale hub entry (GitHub answers 404), a rate limit, or a package this host
   refuses ends with `Next: skills_install(package="…")` naming the next result of
   this request's search, so the model can follow it without reasoning one out.
