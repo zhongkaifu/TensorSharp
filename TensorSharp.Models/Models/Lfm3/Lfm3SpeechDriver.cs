@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 using TensorSharp.Models.Audio;
 using TensorSharp.Runtime.Scheduling;
@@ -42,9 +43,10 @@ namespace TensorSharp.Models.Lfm3
             _tokens = tokens ?? throw new ArgumentNullException(nameof(tokens));
             _turn = new Lfm3SpeechTurn(tokens, lastPromptToken, continuing);
             _sampler = speech.CreateSampler(seed, sampling);
-            _rentCodec = rentCodec ?? (() => speech.CreateCodecStream());
-            _returnCodec = returnCodec ?? (c => c.Dispose());
             _computeLock = computeLock ?? new object();
+            _rentCodec = rentCodec ?? (() => speech.CreateCodecStream());
+            // A stream nobody pools frees its device state: between the engine's steps (DisposeBetweenSteps).
+            _returnCodec = returnCodec ?? (c => DisposeBetweenSteps(c, _computeLock));
             Seed = seed;
         }
 
@@ -159,12 +161,26 @@ namespace TensorSharp.Models.Lfm3
                 _codec = null;
             }
             if (codec == null) return;
-            // The stream's device state is written by the engine's steps: give it back between them.
-            lock (_computeLock)
-            {
-                codec.Reset();
-                _returnCodec(codec);
-            }
+            // Reset is host state only (the stream's position, its ISTFT tail): the next request that rents the stream does so
+            // inside a step and decodes from its cold start. It used to be done under the GPU lock, and that wait was what
+            // stopped a long spoken reply: the engine worker takes the lock for every step a few microseconds after
+            // releasing it, and a Monitor hands a released lock to whoever asks next, so this thread sat through the text
+            // reply's steps (2.5 s on an M5 Pro, until the text ended on a phone) - and the reply's next sentence, which
+            // is spoken only once this one's request has ended, waited with it.
+            codec.Reset();
+            _returnCodec(codec);
+        }
+
+        /// <summary>
+        /// Free <paramref name="codec"/>'s device state between the engine's steps: registered as a waiter
+        /// (<see cref="GpuLockWaiters"/>), so the worker lets this thread in at its next step boundary instead of taking the
+        /// lock again first.
+        /// </summary>
+        internal static void DisposeBetweenSteps(Lfm3CodecStream codec, object computeLock)
+        {
+            GpuLockWaiters.EnterBetweenSteps(computeLock);
+            try { codec.Dispose(); }
+            finally { Monitor.Exit(computeLock); }
         }
     }
 }

@@ -87,12 +87,13 @@ namespace TensorSharp.Server
 
         private readonly List<PieceTiming> _timings = new();
 
-        /// <summary>One spoken piece's timeline (<see cref="Timings"/>); -1 where it did not get that far.</summary>
+        /// <summary>One spoken piece's timeline (<see cref="Timings"/>); -1 where it did not get that far. The gap between a
+        /// piece's last audio and the next piece's start (when the next was already queued) is time the speech made nothing.</summary>
         public readonly record struct PieceTiming(int Index, int Chars, double QueuedMs, double StartMs, double FirstAudioMs,
-            double EndMs, double AudioSeconds)
+            double LastAudioMs, double EndMs, double AudioSeconds)
         {
             public override string ToString() => FormattableString.Invariant(
-                $"#{Index} {Chars}ch queued={QueuedMs:F0} start={StartMs:F0} first={FirstAudioMs:F0} end={EndMs:F0} audio={AudioSeconds:F2}s");
+                $"#{Index} {Chars}ch queued={QueuedMs:F0} start={StartMs:F0} first={FirstAudioMs:F0} last={LastAudioMs:F0} end={EndMs:F0} audio={AudioSeconds:F2}s");
         }
 
         /// <summary>Visible answer text, as it streams.</summary>
@@ -167,7 +168,7 @@ namespace TensorSharp.Server
                 int index = 0;
                 await foreach ((string piece, double queuedMs) in _pieces.Reader.ReadAllAsync(token).ConfigureAwait(false))
                 {
-                    double startMs = _clock.Elapsed.TotalMilliseconds, firstMs = -1;
+                    double startMs = _clock.Elapsed.TotalMilliseconds, firstMs = -1, lastMs = -1;
                     long samplesBefore = Samples;
                     await foreach (ChatStreamUpdate update in _speak(piece, index, token).WithCancellation(token).ConfigureAwait(false))
                     {
@@ -178,14 +179,15 @@ namespace TensorSharp.Server
                             continue;
                         }
                         if (update.Audio is not { Length: > 0 } samples) continue;
-                        if (firstMs < 0) firstMs = _clock.Elapsed.TotalMilliseconds;
+                        lastMs = _clock.Elapsed.TotalMilliseconds;
+                        if (firstMs < 0) firstMs = lastMs;
                         if (FirstAudioMs < 0) FirstAudioMs = firstMs;
                         Samples += samples.Length;
                         if (update.AudioSampleRate > 0) SampleRate = update.AudioSampleRate;
                         _audio.Writer.TryWrite(update);
                     }
                     lock (_timings)
-                        _timings.Add(new PieceTiming(index, piece.Length, queuedMs, startMs, firstMs, _clock.Elapsed.TotalMilliseconds,
+                        _timings.Add(new PieceTiming(index, piece.Length, queuedMs, startMs, firstMs, lastMs, _clock.Elapsed.TotalMilliseconds,
                             (Samples - samplesBefore) / (double)Math.Max(1, SampleRate)));
                     lock (_spoken) _spoken.Add(piece);
                     Pieces = ++index;

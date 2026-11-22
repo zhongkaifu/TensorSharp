@@ -140,9 +140,13 @@ namespace TensorSharp.Models
         {
             lock (GpuComputeLock)
             {
-                while (_codecPool.Count > 0) _codecPool.Pop().Dispose();
-                _speech?.Dispose();
-                _speech = null;
+                // The pool's own lock too: a stream comes back to it without the GPU lock (ReturnCodec).
+                lock (_codecPool)
+                {
+                    while (_codecPool.Count > 0) _codecPool.Pop().Dispose();
+                    _speech?.Dispose();
+                    _speech = null;
+                }
             }
         }
 
@@ -153,6 +157,12 @@ namespace TensorSharp.Models
             return _speech.CreateCodecStream();
         }
 
+        /// <summary>
+        /// A finished request's codec stream (reset by its driver), back to the pool for the next one - without the GPU lock,
+        /// which a request ending in the middle of another one's steps would wait seconds for (see Lfm3SpeechDriver.Dispose).
+        /// One the pool has no room for, or that comes back after the speech output was unloaded, frees its device state
+        /// between steps.
+        /// </summary>
         private void ReturnCodec(Lfm3CodecStream codec)
         {
             lock (_codecPool)
@@ -163,7 +173,7 @@ namespace TensorSharp.Models
                     return;
                 }
             }
-            codec.Dispose();
+            Lfm3SpeechDriver.DisposeBetweenSteps(codec, GpuComputeLock);
         }
 
         // ---------------------------------------------------------------- ISpeechOutputModel

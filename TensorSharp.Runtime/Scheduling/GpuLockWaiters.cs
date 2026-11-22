@@ -52,6 +52,19 @@ namespace TensorSharp.Runtime.Scheduling
             => gpuLock != null && s_waiters.TryGetValue(gpuLock, out var box) ? Volatile.Read(ref box.Value) : 0;
 
         /// <summary>
+        /// Take <paramref name="gpuLock"/> from a thread that is not the engine worker, as a registered waiter, so the worker
+        /// lets it in at its next step boundary (<see cref="YieldToWaiters"/>). A bare <c>lock</c> statement there can wait for
+        /// as long as the worker keeps stepping: a released <see cref="Monitor"/> goes to whoever asks next, and the worker asks
+        /// again microseconds later. Release it with <see cref="Monitor.Exit(object)"/>.
+        /// </summary>
+        public static void EnterBetweenSteps(object gpuLock)
+        {
+            Enter(gpuLock);
+            try { Monitor.Enter(gpuLock); }
+            finally { Exit(gpuLock); }
+        }
+
+        /// <summary>
         /// Called by the engine worker before it takes <paramref name="gpuLock"/> for a step:
         /// while another thread is waiting for the lock, give it the chance to take it, for at
         /// most <paramref name="maxWait"/>. Free when nobody waits.
