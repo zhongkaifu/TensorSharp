@@ -503,6 +503,35 @@ public sealed class FakeShellBackendTests : IDisposable
         Assert.Contains("parsed", result.Content, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void AnImportOfASkillsScriptName_IsNeverInstalledFromThePackageIndex()
+    {
+        // `import research` after reading the research skill's scripts/research.py: the package
+        // index's "research" is an unrelated project, and installing it would be name-squatting.
+        string skill = Path.Combine(_base, "skills", "research");
+        Directory.CreateDirectory(Path.Combine(skill, "scripts"));
+        File.WriteAllText(Path.Combine(skill, "scripts", "research.py"), "print('notes')\n");
+        FakeShellBackend backend = Backend();
+        var installer = new RecordingInstaller();
+        using var runner = Runner(backend, o => o.AllowInstall = true, installer);
+        backend.Answer = _ => FakeShellBackend.Ok(string.Empty,
+            "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'research'\n", exitCode: 1);
+
+        CodeExecResult result = runner.Run(
+            new ShellRequest("python3 -c \"import research\"") { ReadablePaths = new[] { skill } }, Workspace());
+
+        Assert.False(result.Ok);
+        Assert.Empty(installer.Requests);
+        Assert.Single(backend.Launches);
+        Assert.Contains("'research' is a skill's script (research/scripts/research.py), not a package, so nothing was installed. "
+            + "A skill's script runs with skills_run, not as an import.", result.Content, StringComparison.Ordinal);
+
+        // A module no reachable skill ships is still the installer's, as before.
+        Assert.Null(ShellRunner.SkillScriptModuleFor(new[] { skill }, "yaml"));
+        Assert.Null(ShellRunner.SkillScriptModuleFor(null, "research"));
+        Assert.Null(ShellRunner.SkillScriptModuleFor(new[] { skill }, "research.sub"));
+    }
+
     // ---- the file tools are the host's alone ------------------------------------
 
     [Fact]

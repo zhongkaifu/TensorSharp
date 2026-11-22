@@ -37,9 +37,10 @@ while the Network switch is on, records where every installed skill came from, a
 shows each install in the conversation.
 
 1. Call the result's install line exactly. The host inspects and installs the
-   skill pinned to one Git commit, never overwrites an existing skill (a name that is
-   already taken is installed under `<owner>-<name>`), and runs nothing. If the result
-   says the entry cannot be installed, it names the next call to try; make that call.
+   skill pinned to one Git commit, never overwrites an existing skill (a name taken by
+   a skill that runs here is answered with that skill's call; otherwise the package is
+   installed under `<owner>-<name>`), and runs nothing. If the result says the entry
+   cannot be installed, it names the next call to try; make that call.
 2. The install result contains the skill's instructions, whether it can run on this
    host, and the next call. Follow the instructions immediately; read further
    resources with `skills_read(skill="<installed id>", path="...")`.

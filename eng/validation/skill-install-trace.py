@@ -22,6 +22,11 @@ Two sources make up the trace, both read after the turn ends:
 Usage:
   skill-install-trace.py --log <app stdout log> --prompt "..." --out trace.json
   skill-install-trace.py --base http://127.0.0.1:5000/ --log server.log --prompt "..." --out trace.json
+  skill-install-trace.py --log device-console.log --log-only --out trace.json
+
+--log-only sends nothing: it reads a whole log that a turn already wrote, such as the
+console of a device launched with TENSORAGENT_DEMO_PROMPT (a phone's loopback host is not
+reachable from the Mac, so its trace can only come from the console).
 
 The --log of TensorAgent also supplies the Debug build's entry URL and launch token.
 Output belongs in ignored artifacts/ or docs/validation/. This is a model integration
@@ -173,14 +178,31 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base", help="host URL; default: the entry URL in --log")
     p.add_argument("--log", required=True, help="the host's console log (read for the rounds and, for TensorAgent, the token)")
-    p.add_argument("--prompt", required=True)
+    p.add_argument("--connection-file", help="connection.json of eng/validation/TensorAgentHost (its baseUrl and cookie)")
+    p.add_argument("--prompt", help="the turn to send (required unless --log-only)")
+    p.add_argument("--log-only", action="store_true", help="send nothing; trace the turns already in --log")
     p.add_argument("--max-tokens", type=int, default=262144)
     p.add_argument("--think", action="store_true")
     p.add_argument("--timeout", type=float, default=3600)
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
 
-    base, token = (a.base, None) if a.base else entry_from_log(a.log)
+    if a.log_only:
+        rounds, tools = rounds_from_log(a.log, 0)
+        trace = {"log": a.log, "rounds": rounds, "toolLog": tools, "toolResults": tool_results(rounds)}
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps(trace, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"{len(rounds)} rounds")
+        for line in tools:
+            print("  log:", line[:200])
+        return
+    if not a.prompt:
+        p.error("--prompt is required unless --log-only")
+    if a.connection_file:
+        connection = json.loads(Path(a.connection_file).read_text(encoding="utf-8"))
+        base, token = connection["baseUrl"], connection["cookie"].split("=", 1)[1]
+    else:
+        base, token = (a.base, None) if a.base else entry_from_log(a.log)
     if not base:
         sys.exit(f"No 'entry URL' line in {a.log}; pass --base for a TensorSharp.Server.")
     offset = Path(a.log).stat().st_size

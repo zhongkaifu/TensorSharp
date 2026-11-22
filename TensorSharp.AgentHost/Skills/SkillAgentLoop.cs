@@ -250,6 +250,7 @@ namespace TensorSharp.AgentHost.Skills
             ArgumentNullException.ThrowIfNull(context);
             ArgumentNullException.ThrowIfNull(generate);
             options ??= SkillAgentLoopOptions.Default;
+            context.UserRequest ??= SkillToolContext.LatestUserText(messages);
 
             if (options.AgentSession == null && options.MultiAgent?.Enabled == true)
             {
@@ -301,7 +302,8 @@ namespace TensorSharp.AgentHost.Skills
                     calls, options.ClientTools,
                     out List<ToolCall> skillCalls,
                     out List<ToolCall> clientCalls,
-                    out List<ToolCall> unknownCalls);
+                    out List<ToolCall> unknownCalls,
+                    context);
                 bool originalAccessAllowedThisRound = CanAccessOriginal();
 
                 if (skillCalls.Count == 0 && unknownCalls.Count == 0)
@@ -452,7 +454,7 @@ namespace TensorSharp.AgentHost.Skills
             SkillTools.Partition(
                 output.Parsed?.ToolCalls, options.ClientTools,
                 out List<ToolCall> finalOurs, out List<ToolCall> finalClientCalls,
-                out List<ToolCall> finalUnknown);
+                out List<ToolCall> finalUnknown, context);
 
             // The model was told to answer and asked for another tool instead. Those
             // calls are dropped here — nothing is left to run them — so a reply that was

@@ -81,7 +81,7 @@ host's sandbox and under its Run code switch (`--skills-allow-exec` on the serve
 
 | Tool | Behavior |
 | --- | --- |
-| `skills_search(query, owner?)` | Searches skills.sh. Each hit carries its `package`, install count, `status` (`installed` or `not installed`) and the exact next call: `install` = `skills_install(package="owner/repo@name")`, or `use` = `skills_read(skill="…")` for a package already installed here. The result says the hits are not installed skills. Successful searches are cached for five minutes with a bounded entry count. |
+| `skills_search(query, owner?)` | First lists up to three skills already installed here that share a meaningful word with the query (its name or description; function words, words under three characters and generic words such as "skill", "agent", "user" and "tools" do not count), skills that can run on this host first and a name match before a description match, each with its exact call: the call it declares (`provides-call`, such as the bundled `research` skill's) or `skills_read(skill="…")`. Then it searches skills.sh. Each hit carries its `package`, install count, `status` (`installed` or `not installed`) and the exact next call: `install` = `skills_install(package="owner/repo@name")`, or `use` = `skills_read(skill="…")` for a package already installed here. The result says the hits are not installed skills. A search with no hub hit names the host's web search call when a skill provides one, and says to search with words for the task rather than its subject. Successful searches are cached for five minutes with a bounded entry count. |
 | `skills_inspect(package)` | Optional. Downloads the package at an immutable commit and returns its instructions, compatibility, license and file list, with the install call to use next. The entire response fits the request's read budget. No repository code is executed. |
 | `skills_install(package, revision?)` | Installs the package into the host's writable skill library and returns, in one result, the provenance line `Installed owner/repo@name from https://github.com/owner/repo/tree/<commit>/<path> @ <commit>`, whether it can run on this host, the skill's instructions (marked as third-party content) and the next call. |
 
@@ -90,17 +90,36 @@ round is needed; an optional `revision` must match. It never overwrites a skill:
 
 - a package installed before (by an earlier conversation, under any name) is reused
   and reported `Already installed`, with no download;
-- a name already taken by a different skill installs the package as
-  `<owner>-<name>`. Only the frontmatter `name` line of the downloaded `SKILL.md`
-  is rewritten, and the original name is recorded;
+- a name already taken by a different skill that can run on this host is **not
+  installed**: the result names that skill's exact call, and says that the hub skill
+  is a different one and that the user can ask for it by its package to install it
+  anyway (and, when it is already installed under another name, which one). This
+  is the default since a small model, given both TensorAgent's `research` and a hub
+  `research` installed beside it as `mattpocock-research`, conflated the two names
+  and looped;
+- when the user's latest message names the package (`owner/repo@name`, `owner/repo`
+  or `owner/name`), or when the skill holding the name cannot run here, the package
+  is installed as `<owner>-<name>`. Only the frontmatter `name` line of the
+  downloaded `SKILL.md` is rewritten, and the original name is recorded;
 - a stale hub entry (GitHub answers 404), a rate limit, or a package this host
   refuses ends with `Next: skills_install(package="…")` naming the next result of
   this request's search, so the model can follow it without reasoning one out.
+  When nothing is left, the result names the host's web search call, if any;
+- a failure of the repository itself — not on GitHub, its archive over the size or
+  entry limits, or not the pinned commit — is remembered for the rest of the turn by
+  `owner/repo`. Its other search results are skipped as the next result, the result
+  says how many were skipped and why, and installing one of them anyway is answered
+  from that failure without downloading the archive again. (A skills monorepo over
+  the entry limit had sent a small model through eleven identical failures, one per
+  sibling skill.)
 
 `skills_read`/`skills_run` on a search hit that is not installed answer with that
 hit's exact install call. After installation the package selector also resolves to
 the installed skill, whatever name it was installed under; `owner/name` means that
 publisher's hit, and `owner/repo` in the search's `owner` filter filters by the owner.
+`skills_inspect`/`skills_install` given an installed skill's name instead of a hub
+package (`research`, `research@skill-hub`) answer that it needs no install, with the
+call that uses it.
 One turn installs at most two new skills (`SkillMarketplaceSession.MaxInstallsPerRequest`);
 a further install is answered with the two it has, to use. The commit is looked up as
 the bare id (`application/vnd.github.sha`), so a monorepo whose last commit is huge
@@ -111,9 +130,34 @@ A hub skill written for another agent names that agent's tools. Reading its
 `shell`, `Read`/`Write`/`Edit` → the file tools, and a tool a reachable skill declares
 it provides — metadata `provides-tools` and `provides-call`; the bundled `research`
 skill provides `WebSearch` and `WebFetch` — with that skill's exact call. A hub
-skill that ships no scripts holds no data, so its result says where current figures
-come from in this conversation (that web-search call) or that they cannot be checked,
-instead of leaving the model to state prices from memory.
+skill that ships no scripts holds no data, so its result — when it is installed, read,
+or inspected without being installed — says where current figures come from in this
+conversation (that web-search call) or that they cannot be checked, instead of leaving
+the model to state prices from memory.
+
+**Provided tools are real tools.** When `skills_run` is enabled and a reachable skill that
+can run on this host declares `provides-tools` and a `provides-call` the host reads exactly
+(`skills_run(skill="…", path="…", args=[…, "<placeholder>", …])`, optionally followed by
+`, then read <file>`), each provided tool is declared to the model as a tool of its own
+with one string parameter: `WebSearch` becomes `web_search(query)`, `WebFetch` becomes
+`web_fetch(url)`, and any other name becomes its snake-case name with an `input`
+parameter. Its description is the providing skill's own description line. A call runs the
+declared call through `skills_run` (the same sandbox and Run code switch) with the
+parameter in the placeholder's place, and returns the script's output followed by the
+file the declared call says to read (up to 24 KB; the rest is a `read_file` away). With
+the bundled research skill, `web_search` and `web_fetch` run `research.py`, and the
+result carries `notes.md`. A name another tool already has is not taken, and an
+identical call in the same turn is answered from its first result. This is the default
+since a 2B model fetched current data in 6 of 6 traced turns with `web_search`, against
+4 of 6 when it had to fill `skills_run(skill, path, args=[…])` itself, and 0 of 6 before
+these changes. Plain questions and skill tasks did not call it.
+
+Wherever the host shows such a declared call (that
+note, a search with no hub hit, the installed-skills lines, the tool mapping, a script read),
+its placeholder arguments (`"<question>"`) are filled with the user's latest message,
+whitespace collapsed and at most 300 characters, so the call can be copied as it is. A
+`skills_run` that still passes a placeholder, as it was given, is not run: the answer is the
+filled call.
 
 **Provenance and visibility.** Each hub install is recorded in
 `.hub-sources.json` in the install directory (package, GitHub URL, commit,
@@ -150,7 +194,10 @@ dependencies, and a shell command that is exactly the skill's own line —
 `uv run [--with pkg] {baseDir}/scripts/x.py ARGS`, or `python3 $SKILL_DIR/…` —
 is run as `skills_run` of that script, because a shell here has neither the
 placeholder's directory nor a network socket. `{baseDir}`-style placeholders in a
-`skills_run` path are dropped.
+`skills_run` path are dropped. A plain `python3 x.py ARGS` is the model's own program
+and runs as written; when `x.py` is not in the working directory but is exactly one
+reachable skill's script (by its path in the skill or its file name), the result adds
+the exact `skills_run(skill=…, path=…, args=[…])` call with the command's arguments.
 
 **Source distributions.** On macOS, where the install sandbox confines writes and
 pins the network to the package index (the egress proxy), pip prefers wheels and
@@ -445,7 +492,18 @@ gets a short block appended. It is labelled
 ready-made `skills_run` argument example for the skill's first bundled script. The
 block exists because portable skills often show another agent's install path
 (`$CODEX_HOME/skills/...`), and a shell cannot find the bundle there. `skills_run`
-resolves the registered skill directory itself.
+resolves the registered skill directory itself. A read of one of a skill's scripts (with
+`skills_run` enabled and the skill able to run here) starts with one line, before the
+source, naming the `skills_run` call that runs it: a small model asked for a provided
+call's script path with `skills_read`, received 12 KB of source, and typed the script into
+the shell.
+
+`skills_run` takes `args` as an array (or a JSON array in a string, or shell-style
+words). An element that is an option and its value written together, such as
+`"--out notes.md"`, is split into the two arguments a command line would pass; option
+names never contain whitespace, and an element with `=` in its option part
+(`--title=A B`) is kept whole. `args` that cannot be read at all, for a script that the
+skill's declared call names, are answered with that call, filled with the request.
 
 **The declarations are deliberately flat.** A `ToolParameter` carries a type
 name, a description and an enum, and nothing else. A caller's original JSON
@@ -650,7 +708,7 @@ thousand tokens ago is a capability it does not use.
 
 | What went wrong | Rounds it cost | What the host does now |
 |---|---|---|
-| First run dies on a missing import | 17 incidents / 68 rounds / 116 min | Installs it and re-runs the command **inside the same call** (`ShellRunner.RunWithAutoInstall`), bounded by 5 distinct packages and by the call's own `timeout_ms` |
+| First run dies on a missing import | 17 incidents / 68 rounds / 116 min | Installs it and re-runs the command **inside the same call** (`ShellRunner.RunWithAutoInstall`), bounded by 5 distinct packages and by the call's own `timeout_ms`. The install is of the import name (mapped for a few known packages, such as `yaml` to PyYAML), through the host's installer and its package allow-list, without the model asking for that package. Two names are never installed: the model's own file in the workspace, and a reachable skill's script (`import research` for the research skill's `scripts/research.py`). The package index's project of that name is unrelated to the skill, so installing it would be a name-squatting hazard; the result says the module is a skill's script and gives the `skills_run` call that runs it |
 | The model guessed a library's API | 10 incidents / 60 rounds | Reads the real API out of the installed package and appends it — `did you mean: notes_slide` plus the names the class actually has (`ApiProbe`). Measured at 100 ms on the real failing script |
 | A whole file re-typed to change one line | 38 re-emissions / ~52k output tokens | The current tool declarations and system prompt require `apply_patch` for every existing-file modification, including one-line changes in a single file; `write_file` is reserved for new files. The earlier logs recorded **zero** patch calls in ten opportunities despite a prefer-a-patch paragraph, so that historical observation is not evidence of compliance with the current prompt. |
 | A byte-identical failing command re-sent nine times | one whole turn | Says so, with the count (`AppendRepeatWarning`). The nine results had been identical except a scratch filename, which reads as new information |

@@ -43,12 +43,39 @@ public sealed class SkillHubInstallTests : IDisposable
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 
-    private SkillRegistry Registry() => new(new SkillRegistryOptions
+    private SkillRegistry Registry(SkillMarketplace? marketplace = null) => new(new SkillRegistryOptions
     {
         Roots = new[] { Path.Combine(_root, "bundled") },
         InstallDirectory = Path.Combine(_root, "installed"),
-        Marketplace = _marketplace,
+        Marketplace = marketplace ?? _marketplace,
     });
+
+    private const string ResearchCall = "skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"<question>\"])";
+
+    /// <summary>A bundled skill that declares the host's web search call, as TensorAgent's research skill does.</summary>
+    private void BundleResearch(string description = "Use for web searches and current information lookups.")
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", "research", "scripts"));
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "SKILL.md"),
+            "---\nname: research\ndescription: " + description + "\nmetadata:\n  provides-tools: WebSearch, WebFetch\n"
+            + "  provides-call: '" + ResearchCall + "'\n---\nRun it.\n");
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "scripts", "research.py"), "print('notes')\n");
+    }
+
+    private void Bundle(string name, string description)
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", name));
+        File.WriteAllText(Path.Combine(_root, "bundled", name, "SKILL.md"),
+            "---\nname: " + name + "\ndescription: " + description + "\n---\nDo it.\n");
+    }
+
+    /// <summary>A request context that can run skill scripts, as on a host with Run code on.</summary>
+    private SkillToolContext RunnableContext(SkillRegistry registry, SkillMarketplace? marketplace = null) =>
+        new(registry.Skills)
+        {
+            Marketplace = new SkillMarketplaceSession(marketplace ?? _marketplace, registry),
+            ScriptRunner = new RecordingScriptRunner(),
+        };
 
     /// <summary>A server request that names no skill: discovery on, network on, the default planner.</summary>
     private SkillRequestPlan Plan(SkillRegistry registry, bool network = true, SessionWorkspace? workspace = null)
@@ -127,17 +154,39 @@ public sealed class SkillHubInstallTests : IDisposable
     }
 
     [Fact]
-    public void ANameTakenByADifferentSkillInstallsUnderThePublisherQualifiedName()
+    public void ANameTakenByASkillThatRunsHereIsAnsweredWithThatSkillAndSaysHowToGetTheHubOne()
     {
-        Directory.CreateDirectory(Path.Combine(_root, "bundled", "research"));
-        File.WriteAllText(Path.Combine(_root, "bundled", "research", "SKILL.md"),
-            "---\nname: research\ndescription: The host's own research skill.\n---\nLocal.\n");
+        BundleResearch();
         _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
         _hub.Skill = ("acme/tools", "research");
         SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        context.UserRequest = "Please do research on Nvidia and tell me if I should buy its stock now.";
 
-        SkillToolResult installed = SkillTools.Execute(
-            Call("skills_install", ("package", "acme/tools@research")), Plan(registry).ToolContext);
+        SkillToolResult answer = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), context);
+        Assert.False(answer.Ok);
+        Assert.Contains("this host already has a skill called 'research' that runs here. Use it: skills_run(skill=\"research\", "
+            + "path=\"scripts/research.py\", args=[\"Please do research on Nvidia and tell me if I should buy its stock now.\"]).",
+            answer.Content, StringComparison.Ordinal);
+        Assert.Contains("The hub skill acme/tools@research is a different one; to install it anyway, the user can ask for "
+            + "acme/tools@research by name.", answer.Content, StringComparison.Ordinal);
+        Assert.False(registry.TryGet("acme-research", out _));
+        Assert.DoesNotContain(_hub.Requests, uri => uri.Host is "api.github.com" or "codeload.github.com");
+    }
+
+    [Theory]
+    [InlineData("Install acme/tools@research and use it.")]
+    [InlineData("Use the research skill from acme/tools.")]
+    public void ANameTakenByADifferentSkillInstallsUnderThePublisherQualifiedNameWhenTheUserNamesThePackage(string request)
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
+        _hub.Skill = ("acme/tools", "research");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        context.UserRequest = request;
+
+        SkillToolResult installed = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), context);
         Assert.True(installed.Ok, installed.Content);
         Assert.Contains("as skill \"acme-research\"", installed.Content, StringComparison.Ordinal);
         Assert.Contains("already called 'research'", installed.Content, StringComparison.Ordinal);
@@ -146,7 +195,74 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.StartsWith("---\nname: acme-research\n", File.ReadAllText(Path.Combine(renamed.RootDirectory, "SKILL.md")));
         Assert.True(registry.TryGet("research", out Skill local));
         Assert.Null(local.Source);
-        Assert.Equal("Local.", local.Manifest.Body.Trim());
+        Assert.Equal("Run it.", local.Manifest.Body.Trim());
+
+        // A later turn that does not name it is pointed at the skill that runs here, and told the copy exists.
+        SkillToolContext later = RunnableContext(registry);
+        later.UserRequest = "Research Nvidia's stock.";
+        SkillToolResult again = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), later);
+        Assert.False(again.Ok);
+        Assert.Contains("Use it: skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"Research Nvidia's stock.\"])",
+            again.Content, StringComparison.Ordinal);
+        Assert.Contains("is a different one, installed here as 'acme-research'", again.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ANameTakenByASkillThatCannotRunHereStillInstallsUnderThePublisherQualifiedName()
+    {
+        // The skill already here needs a program this in-process host can never launch.
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", "research", "scripts"));
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "SKILL.md"),
+            "---\nname: research\ndescription: Research with a browser.\nmetadata: {\"openclaw\":{\"requires\":{\"bins\":[\"chromium\"]}}}\n---\nRun it.\n");
+        File.WriteAllText(Path.Combine(_root, "bundled", "research", "scripts", "run.sh"), "chromium --headless\n");
+        _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
+        _hub.Skill = ("acme/tools", "research");
+        SkillRegistry registry = Registry();
+        SessionWorkspace workspace = new SessionWorkspaceManager(Path.Combine(_root, "sessions")).GetOrCreate("in-process");
+        var context = new SkillToolContext(registry.Skills)
+        {
+            Marketplace = new SkillMarketplaceSession(_marketplace, registry),
+            Workspace = workspace,
+            ScriptRunner = new SkillScriptRunner(new SkillScriptRunnerOptions
+            {
+                Backend = new FakeShellBackend { Sandbox = new InProcessSandbox(new SkillSandboxCapabilities(true, true, true, true)) },
+                Workspace = workspace,
+            }),
+            UserRequest = "Research Nvidia.",
+        };
+        SkillToolResult installed = SkillTools.Execute(Call("skills_install", ("package", "acme/tools@research")), context);
+        Assert.True(installed.Ok, installed.Content);
+        Assert.Contains("as skill \"acme-research\"", installed.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TheChatLoopGivesTheToolsTheUsersLatestMessage()
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"research","source":"acme/tools","installs":900}]""";
+        _hub.Skill = ("acme/tools", "research");
+        SkillRegistry registry = Registry();
+        SkillRequestPlan plan = Plan(registry);
+        int round = 0;
+        async IAsyncEnumerable<ChatStreamUpdate> Generate(List<ChatMessage> messages, List<ToolFunction> tools,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        {
+            string text = round++ == 0
+                ? "<tool_call>{\"name\":\"skills_install\",\"arguments\":{\"package\":\"acme/tools@research\"}}</tool_call>"
+                : "Installed.";
+            yield return ChatStreamUpdate.Text(text);
+            await Task.Yield();
+            yield return new ChatStreamUpdate("", true, 10, 20, 5, 0, 0, 0, "stop");
+        }
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "Research Nvidia." },
+            new() { Role = "assistant", Content = "Which source?" },
+            new() { Role = "user", Content = "Install acme/tools@research and use that." },
+        };
+        await foreach (var _ in SkillChatLoop.RunAsync("nemotron_h_moe", messages, plan, true, Generate, null, CancellationToken.None)) { }
+        Assert.Equal("Install acme/tools@research and use that.", plan.ToolContext.UserRequest);
+        Assert.True(registry.TryGet("acme-research", out _));
     }
 
     [Fact]
@@ -300,6 +416,333 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.Contains("get them with skills_run(skill=\"research\"", run.Content, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void ARepositoryOverTheArchiveLimitSkipsItsOtherResultsAndNamesAnotherRepositorysHit()
+    {
+        using var limited = new SkillMarketplace(_http, new SkillMarketplaceOptions
+        {
+            TemporaryDirectory = _root,
+            ArchiveLimits = new SkillArchiveLimits { MaxEntries = 16 },
+        });
+        // Three skills of one monorepo whose archive is over the entry limit, then one elsewhere.
+        // The siblings share the word "stock" with the failed one, which used to make the next
+        // of them the "next result".
+        _hub.Hits = """[{"name":"stock-quote","source":"big/mono","installs":90},{"name":"stock-chart","source":"big/mono","installs":80},{"name":"stock-news","source":"big/mono","installs":70},{"name":"stock-report","source":"fixture/hub","installs":10}]""";
+        _hub.OversizedRepository = "mono";
+        SkillRegistry registry = Registry(limited);
+        SkillToolContext context = RunnableContext(registry, limited);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock quote")), context).Ok);
+
+        SkillToolResult first = SkillTools.Execute(Call("skills_install", ("package", "big/mono@stock-quote")), context);
+        Assert.False(first.Ok);
+        Assert.Contains("exceeds the entry limit", first.Content, StringComparison.Ordinal);
+        Assert.Contains("The other 2 results are in big/mono too, in the same repository archive, so they would fail the "
+            + "same way and were skipped.", first.Content, StringComparison.Ordinal);
+        Assert.Contains("Next result, if it fits the task: " + InstallLine(Package) + ";", first.Content, StringComparison.Ordinal);
+
+        // A sibling asked for anyway is answered from this turn's failure, without fetching that archive again.
+        int archives = _hub.Requests.Count(uri => uri.Host == "codeload.github.com");
+        SkillToolResult sibling = SkillTools.Execute(Call("skills_install", ("package", "big/mono@stock-chart")), context);
+        Assert.False(sibling.Ok);
+        Assert.Contains("big/mono already failed earlier in this turn", sibling.Content, StringComparison.Ordinal);
+        Assert.Contains("Next result, if it fits the task: " + InstallLine(Package) + ";", sibling.Content, StringComparison.Ordinal);
+        Assert.Equal(archives, _hub.Requests.Count(uri => uri.Host == "codeload.github.com"));
+        Assert.True(SkillTools.Execute(Call("skills_install", ("package", Package)), context).Ok);
+
+        // The memory is the turn's: a new request tries the repository again.
+        archives = _hub.Requests.Count(uri => uri.Host == "codeload.github.com");
+        SkillToolContext nextTurn = RunnableContext(registry, limited);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock quote")), nextTurn).Ok);
+        SkillToolResult retried = SkillTools.Execute(Call("skills_install", ("package", "big/mono@stock-chart")), nextTurn);
+        Assert.Contains("exceeds the entry limit", retried.Content, StringComparison.Ordinal);
+        Assert.Equal(archives + 1, _hub.Requests.Count(uri => uri.Host == "codeload.github.com"));
+    }
+
+    [Fact]
+    public void WhenNoHubResultIsLeftTheResultNamesTheHostsWebSearch()
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"gone","source":"vanished/repo","installs":50}]""";
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock quote")), context).Ok);
+        SkillToolResult stale = SkillTools.Execute(Call("skills_install", ("package", "vanished/repo@gone")), context);
+        Assert.False(stale.Ok);
+        Assert.Contains("No other search result is left; search again with words for the task, or continue without a hub "
+            + "skill. Web search here: " + ResearchCall + ".", stale.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ASearchListsTheInstalledSkillsThatFitBeforeTheHubsAndANameMatchOutranksAGenericWord()
+    {
+        BundleResearch();
+        // Shares only "analysis" with the query, in its description.
+        Bundle("chart-maker", "Draw a chart for any analysis.");
+        Bundle("unit-converter", "Convert units of measure.");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+
+        SkillToolResult search = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research analysis skill")), context);
+        Assert.True(search.Ok, search.Content);
+        string[] lines = search.Content.Split('\n');
+        Assert.Equal("Installed here, no install needed; use one if it fits the task:", lines[0]);
+        Assert.StartsWith("- research: Use for web searches and current information lookups. Use: " + ResearchCall, lines[1], StringComparison.Ordinal);
+        Assert.StartsWith("- chart-maker: Draw a chart for any analysis. Use: skills_read(skill=\"chart-maker\")", lines[2], StringComparison.Ordinal);
+        Assert.DoesNotContain("unit-converter", search.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("- find-skills", search.Content, StringComparison.Ordinal);   // the search itself
+        Assert.Contains("1. " + Package + " (17 installs)", search.Content, StringComparison.Ordinal);
+        Assert.True(search.Content.IndexOf("- research:", StringComparison.Ordinal)
+            < search.Content.IndexOf("1. " + Package, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ASearchListsAtMostThreeInstalledSkillsAndIgnoresWordsThatSayNothing()
+    {
+        foreach (string name in new[] { "stock-a", "stock-b", "stock-c", "stock-d" })
+            Bundle(name, "Stock tool " + name + ".");
+        Bundle("helper", "An agent skill for the user, with tools.");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+
+        SkillToolResult search = SkillTools.Execute(Call("skills_search", ("query", "stocks")), context);
+        Assert.Equal(3, search.Content.Split('\n').Count(line => line.StartsWith("- stock-", StringComparison.Ordinal)));
+
+        SkillToolResult generic = SkillTools.Execute(Call("skills_search", ("query", "an agent skill for the user with tools")), context);
+        Assert.DoesNotContain("Installed here", generic.Content, StringComparison.Ordinal);
+
+        Assert.Equal(new[] { "nvidia", "research", "searches", "searche", "search" }.ToHashSet(),
+            SkillMarketplaceTools.MeaningfulWords("Nvidia: an agent's research skills & searches, to do"));
+    }
+
+    [Fact]
+    public void AZeroHitSearchNamesTheHostsWebSearchAndToSearchForTheTask()
+    {
+        BundleResearch();
+        _hub.Hits = "[]";
+        SkillRegistry registry = Registry();
+
+        // No installed skill shares a word with the query: the host's web search is named.
+        SkillToolResult none = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock")), RunnableContext(registry));
+        Assert.True(none.Ok, none.Content);
+        Assert.Equal("No hub skill matched. Web search here: " + ResearchCall + ".\n"
+            + "The hub matches what a skill does: search with words for the task, not its subject, or continue without a hub skill.",
+            none.Content);
+
+        // The research skill itself matches: it is listed once, with its call, and not named twice.
+        SkillToolResult listed = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research")), RunnableContext(registry));
+        Assert.StartsWith("Installed here, no install needed; use one if it fits the task:\n- research: ", listed.Content, StringComparison.Ordinal);
+        Assert.Equal(1, CountOf(listed.Content, ResearchCall));
+        Assert.Contains("No hub skill matched.\nThe hub matches what a skill does", listed.Content, StringComparison.Ordinal);
+
+        // Without skill scripts there is no call to name.
+        var noScripts = new SkillToolContext(registry.Skills) { Marketplace = new SkillMarketplaceSession(_marketplace, registry) };
+        SkillToolResult plain = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock")), noScripts);
+        Assert.DoesNotContain("Web search here", plain.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnOptionAndItsValueInOneArgumentAreSplitForTheScript()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var runner = new RecordingScriptRunner();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = runner };
+        // As a small model wrote it: the array inside a string, "--out notes.md" as one element.
+        SkillToolResult ran = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", "[\"Nvidia stock\", \"--out notes.md\"]")), context);
+        Assert.True(ran.Ok, ran.Content);
+        Assert.Equal(new[] { "Nvidia stock", "--out", "notes.md" }, runner.Runs.Single().Arguments);
+        // The result says so, with the shape to use.
+        Assert.Contains("[TensorSharp host] Each of \"--out notes.md\" was split into an option and its value, two arguments: "
+            + "give each argument its own array element, as in [\"--out\",\"notes.md\"].", ran.Content, StringComparison.Ordinal);
+
+        // Only the first whitespace after a bare option token; the rest is one value.
+        Assert.Equal(new[] { "--title", "My Report" }, SkillTools.SplitJoinedOptions(new[] { "--title My Report" }));
+        Assert.Equal(new[] { "-o", "x y" }, SkillTools.SplitJoinedOptions(new[] { "-o x y" }));
+        // Kept whole: '=' or a quote before the space, no whitespace, not an option, a value.
+        string[] whole = { "--title=A B", "--name\"x y\"", "\"--out notes.md\"", "--verbose", "-5 apples", "plain words", "--" };
+        Assert.Equal(whole, SkillTools.SplitJoinedOptions(whole, out IReadOnlyList<string> joined));
+        Assert.Empty(joined);
+        // Nothing to split: the result is the script's own.
+        runner.Runs.Clear();
+        SkillToolResult plain = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", new[] { "Nvidia stock", "--out", "notes.md" })), context);
+        Assert.Equal("price=1", plain.Content);
+    }
+
+    [Fact]
+    public void AShellCommandThatNamesASkillsScriptOutsideTheWorkspaceIsToldTheExactCall()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        SessionWorkspace workspace = new SessionWorkspaceManager(Path.Combine(_root, "sessions")).GetOrCreate("shell");
+        var context = new SkillToolContext(registry.Skills)
+        {
+            ScriptRunner = new RecordingScriptRunner(),
+            CodeRunner = new RefusingCodeRunner(),
+            Workspace = workspace,
+        };
+        SkillToolResult shell = SkillTools.Execute(Call("shell", ("command", "python3 research.py \"Nvidia stock\" --out notes.md")), context);
+        Assert.Contains("[TensorSharp host] research.py is not in this conversation's working directory: it is the 'research' "
+            + "skill's script scripts/research.py. Run it with skills_run(skill=\"research\", path=\"scripts/research.py\", "
+            + "args=[\"Nvidia stock\",\"--out\",\"notes.md\"]).", shell.Content, StringComparison.Ordinal);
+
+        // The model's own file of that name is its own program.
+        File.WriteAllText(Path.Combine(workspace.WorkDirectory, "research.py"), "print(1)\n");
+        SkillToolResult own = SkillTools.Execute(Call("shell", ("command", "python3 research.py")), context);
+        Assert.DoesNotContain("[TensorSharp host]", own.Content, StringComparison.Ordinal);
+        Assert.False(SkillCommandTranslation.TryFindMissingSkillScript("python3 other.py", context, out _));
+        Assert.False(SkillCommandTranslation.TryFindMissingSkillScript("cd x && python3 research.py", context, out _));
+    }
+
+    [Fact]
+    public void AnInstructionsOnlyPackageInspectedNamesWhereCurrentFiguresComeFrom()
+    {
+        BundleResearch();
+        _hub.Hits = """[{"name":"advice","source":"fixture/hub","installs":30}]""";
+        _hub.ExtraSkill = ("advice", "---\nname: advice\ndescription: Stock advice.\n---\nWeigh valuation and momentum.\n", "notes.md", "n\n");
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        SkillToolResult advice = SkillTools.Execute(Call("skills_inspect", ("package", "fixture/hub@advice")), context);
+        Assert.True(advice.Ok, advice.Content);
+        Assert.Contains("This skill ships no scripts and no data source", advice.Content, StringComparison.Ordinal);
+        Assert.Contains("get them with " + ResearchCall, advice.Content, StringComparison.Ordinal);
+        // A package with scripts brings its own data path.
+        SkillToolResult scripted = SkillTools.Execute(Call("skills_inspect", ("package", Package)), context);
+        Assert.True(scripted.Ok, scripted.Content);
+        Assert.DoesNotContain("no data source", scripted.Content, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("skills_inspect", "research")]
+    [InlineData("skills_install", "research@skill-hub")]
+    public void AnInstalledSkillsNameGivenAsAPackageIsAnsweredWithHowToUseIt(string tool, string package)
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        Assert.True(SkillTools.Execute(Call("skills_search", ("query", "stock report")), context).Ok);
+        SkillToolResult result = SkillTools.Execute(Call(tool, ("package", package)), context);
+        Assert.False(result.Ok);
+        Assert.Contains("'research' is a skill installed here, not a hub package, so it needs no install or inspection. "
+            + "Use it: " + ResearchCall + ".", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain(Package, result.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AFailedImportOfASkillsScriptNamesTheCallThatRunsIt()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var context = new SkillToolContext(registry.Skills)
+        {
+            ScriptRunner = new RecordingScriptRunner(),
+            CodeRunner = new TracebackCodeRunner("ModuleNotFoundError: No module named 'research'"),
+        };
+        SkillToolResult shell = SkillTools.Execute(Call("shell", ("command", "python3 -c \"import research\"")), context);
+        Assert.Contains("[TensorSharp host] research is the 'research' skill's script scripts/research.py, not a module to import. "
+            + "Run it with " + ResearchCall + ".", shell.Content, StringComparison.Ordinal);
+
+        // Another module is not a skill's script.
+        var other = new SkillToolContext(registry.Skills)
+        {
+            ScriptRunner = new RecordingScriptRunner(),
+            CodeRunner = new TracebackCodeRunner("ModuleNotFoundError: No module named 'yaml'"),
+        };
+        Assert.DoesNotContain("[TensorSharp host]", SkillTools.Execute(Call("shell", ("command", "python3 x.py")), other).Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReadingASkillsScriptSaysFirstHowItRuns()
+    {
+        BundleResearch();
+        Bundle("helper", "Helps.");
+        Directory.CreateDirectory(Path.Combine(_root, "bundled", "helper", "scripts"));
+        File.WriteAllText(Path.Combine(_root, "bundled", "helper", "scripts", "tool.py"), "print(1)\n");
+        SkillRegistry registry = Registry();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = new RecordingScriptRunner() };
+
+        SkillToolResult script = SkillTools.Execute(Call("skills_read", ("skill", "research"), ("path", "scripts/research.py")), context);
+        Assert.True(script.Ok, script.Content);
+        Assert.StartsWith("[TensorSharp host] scripts/research.py is the 'research' skill's script, to run, not instructions to "
+            + "read: run it with " + ResearchCall + ". Its source follows.\n\nSkill: research\n", script.Content, StringComparison.Ordinal);
+        // Without a declared call that names the script, the plain call with its arguments to fill in.
+        SkillToolResult tool = SkillTools.Execute(Call("skills_read", ("skill", "helper"), ("path", "scripts/tool.py")), context);
+        Assert.StartsWith("[TensorSharp host] scripts/tool.py is the 'helper' skill's script, to run, not instructions to read: "
+            + "run it with skills_run(skill=\"helper\", path=\"scripts/tool.py\", args=[\"<arguments>\"]).", tool.Content, StringComparison.Ordinal);
+
+        // Instructions, and a host that cannot run scripts, get the file as it is.
+        Assert.StartsWith("Skill: research\n", SkillTools.Execute(Call("skills_read", ("skill", "research")), context).Content, StringComparison.Ordinal);
+        var noScripts = new SkillToolContext(registry.Skills);
+        Assert.StartsWith("Skill: research\n", SkillTools.Execute(
+            Call("skills_read", ("skill", "research"), ("path", "scripts/research.py")), noScripts).Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheProvidedCallIsShownFilledWithTheUsersRequest()
+    {
+        BundleResearch();
+        _hub.Hits = "[]";
+        SkillRegistry registry = Registry();
+        SkillToolContext context = RunnableContext(registry);
+        context.UserRequest = "Please do research on Nvidia\n and tell me if I should buy its stock now.";
+        string filled = "skills_run(skill=\"research\", path=\"scripts/research.py\", "
+            + "args=[\"Please do research on Nvidia and tell me if I should buy its stock now.\"])";
+
+        // The zero-hit note, the installed block and a script read all carry the call as it can be copied.
+        Assert.Contains("Web search here: " + filled + ".",
+            SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock")), context).Content, StringComparison.Ordinal);
+        Assert.Contains("- research: Use for web searches and current information lookups. Use: " + filled,
+            SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research")), context).Content, StringComparison.Ordinal);
+        Assert.Contains("run it with " + filled + ". Its source follows.",
+            SkillTools.Execute(Call("skills_read", ("skill", "research"), ("path", "scripts/research.py")), context).Content, StringComparison.Ordinal);
+
+        // A long request is one argument of at most 300 characters, cut at a word.
+        string longRequest = string.Join(" ", Enumerable.Repeat("word", 200));
+        string text = SkillTools.RequestText(longRequest)!;
+        Assert.True(text.Length <= SkillTools.MaxFilledRequestChars, text.Length.ToString());
+        Assert.EndsWith("word", text, StringComparison.Ordinal);
+        Assert.Null(SkillTools.RequestText("  \n "));
+        Assert.Equal(new[] { "<question>" }, SkillTools.PlaceholdersOf(ResearchCall));
+    }
+
+    [Fact]
+    public void APlaceholderPassedAsItIsIsNotRunAndTheFilledCallIsTheAnswer()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var runner = new RecordingScriptRunner();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = runner, UserRequest = "Research heat pumps in cold climates." };
+        SkillToolResult left = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", new[] { "<question>", "--out", "notes.md" })), context);
+        Assert.False(left.Ok);
+        Assert.Empty(runner.Runs);
+        Assert.Contains("'args' still holds the placeholder <question> from the call, so nothing was run. Run it with the request "
+            + "itself: skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"Research heat pumps in cold climates.\"]).",
+            left.Content, StringComparison.Ordinal);
+
+        var unknown = new SkillToolContext(registry.Skills) { ScriptRunner = runner };
+        Assert.Contains("Put the request itself in its place.", SkillTools.Execute(Call("skills_run", ("skill", "research"),
+            ("path", "scripts/research.py"), ("args", new[] { "<question>" })), unknown).Content, StringComparison.Ordinal);
+        Assert.Empty(runner.Runs);
+    }
+
+    [Fact]
+    public void UnparseableArgsForADeclaredScriptEndWithTheFilledCall()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var runner = new RecordingScriptRunner();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = runner, UserRequest = "Research Nvidia." };
+        SkillToolResult bad = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", "[\"Nvidia\", \"--out\" \"--notes.md\"]")), context);
+        Assert.False(bad.Ok);
+        Assert.Empty(runner.Runs);
+        Assert.Contains("must be a valid JSON array", bad.Content, StringComparison.Ordinal);
+        Assert.EndsWith(" For this script: skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"Research Nvidia.\"]).",
+            bad.Content, StringComparison.Ordinal);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;
@@ -417,6 +860,17 @@ public sealed class SkillHubInstallTests : IDisposable
         }
     }
 
+    /// <summary>A shell whose every command fails with the given traceback line.</summary>
+    private sealed class TracebackCodeRunner(string error) : ICodeRunner
+    {
+        public bool CanRun => true;
+        public string? UnavailableReason => null;
+        public ToolFunction Declare() => new() { Name = "shell" };
+        public SkillToolResult Execute(ToolCall call, IReadOnlyList<CodeInputFile>? inputFiles = null,
+            Action<string>? onOutput = null, SessionWorkspace? workspace = null, IReadOnlyList<string>? skillDirectories = null) =>
+            new(false, "exit 1 (0s)\n\nTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n" + error + "\n", null, null);
+    }
+
     private sealed class RefusingCodeRunner : ICodeRunner
     {
         public int Calls { get; private set; }
@@ -439,6 +893,8 @@ public sealed class SkillHubInstallTests : IDisposable
         public (string Source, string Name) Skill { get; set; } = ("fixture/hub", "stock-report");
         public (string Name, string Manifest, string ScriptPath, string Script)? ExtraSkill { get; set; }
         public string ArchiveComment { get; set; } = Revision;
+        /// <summary>A repository whose archive holds more entries than a small limit (a skills monorepo).</summary>
+        public string? OversizedRepository { get; set; }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -484,6 +940,9 @@ public sealed class SkillHubInstallTests : IDisposable
                     Add("skills/" + extra.Name + "/SKILL.md", extra.Manifest);
                     Add("skills/" + extra.Name + "/" + extra.ScriptPath, extra.Script);
                 }
+                if (repository == OversizedRepository)
+                    for (int i = 0; i < 32; i++)
+                        Add("docs/page-" + i.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".md", "page\n");
             }
             return output.ToArray();
         }

@@ -120,12 +120,17 @@ namespace TensorSharp.AgentHost.Skills
         /// answered.
         /// </para>
         /// </param>
+        /// <param name="context">
+        /// The request's tool context, whose provided tools (<see cref="SkillToolContext.OfferProvidedTools"/>)
+        /// are this host's to answer too; null when there is none.
+        /// </param>
         public static void Partition(
             IEnumerable<ToolCall?>? calls,
             IReadOnlyCollection<ToolFunction>? clientTools,
             out List<ToolCall> builtIn,
             out List<ToolCall> client,
-            out List<ToolCall> unknown)
+            out List<ToolCall> unknown,
+            SkillToolContext? context = null)
         {
             builtIn = new List<ToolCall>();
             client = new List<ToolCall>();
@@ -157,7 +162,7 @@ namespace TensorSharp.AgentHost.Skills
                 // it here would be running something else entirely.
                 if (theirs != null && call.Name != null && theirs.Contains(call.Name))
                     client.Add(call);
-                else if (IsBuiltInTool(call.Name))
+                else if (IsBuiltInTool(call.Name) || context?.IsProvidedTool(call.Name) == true)
                     builtIn.Add(call);
                 else if (theirs == null)
                     client.Add(call);
@@ -484,9 +489,129 @@ namespace TensorSharp.AgentHost.Skills
                     skillDirectories.Add(skill.RootDirectory);
             }
 
-            return runner.Execute(
+            SkillToolResult shell = runner.Execute(
                 call, context.CodeInputFiles, onOutput, context.Workspace, skillDirectories);
+            // `python3 research.py …` typed after reading a skill's script: the working
+            // directory is not the skill's, so the file is not there. Name the exact call.
+            if (SkillCommandTranslation.TryFindMissingSkillScript(ReadString(call, "command"), context, out var missing))
+            {
+                shell = shell with
+                {
+                    Content = shell.Content + "\n\n[TensorSharp host] " + missing.Written + " is not in this conversation's working "
+                        + "directory: it is the '" + missing.Skill.Id + "' skill's script " + missing.Path + ". Run it with "
+                        + RunToolName + "(skill=\"" + missing.Skill.Id + "\", path=\"" + missing.Path + "\", args="
+                        + JsonSerializer.Serialize(missing.Arguments, ReadableArguments) + ").",
+                };
+            }
+            // `import research` after reading research/scripts/research.py: the runner installs
+            // nothing for a skill's script (ShellRunner), and this names how it does run.
+            else if (TensorSharp.AgentHost.CodeExec.CodeDiagnostics.TryFindMissingModule(shell.Content, out _, out string module)
+                && ImportedSkillScript(module, context) is { } imported)
+            {
+                shell = shell with
+                {
+                    Content = shell.Content + "\n\n[TensorSharp host] " + module + " is the '" + imported.Skill.Id
+                        + "' skill's script " + imported.Path + ", not a module to import. Run it with "
+                        + RunCallFor(imported.Skill, imported.Path, context) + ".",
+                };
+            }
+            return shell;
         }
+
+        /// <summary>The one reachable skill script named <c>module.py</c>, or null when none or several are.</summary>
+        private static (Skill Skill, string Path)? ImportedSkillScript(string module, SkillToolContext context)
+        {
+            if (module.Length == 0 || module.Contains('.'))
+                return null;
+            (Skill, string)[] matches = context.Reachable
+                .SelectMany(skill => skill.Files
+                    .Where(file => file.Kind == SkillFileKind.Script
+                        && string.Equals(Path.GetFileName(file.Path), module + ".py", SkillPathGuard.PathComparison))
+                    .Select(file => (skill, file.Path)))
+                .ToArray();
+            return matches.Length == 1 ? matches[0] : null;
+        }
+
+        /// <summary>
+        /// The call that runs <paramref name="path"/> of <paramref name="skill"/>: the skill's
+        /// declared <c>provides-call</c> when it names that script, otherwise the plain
+        /// <c>skills_run</c> with the arguments left to fill in.
+        /// </summary>
+        internal static string RunCallFor(Skill skill, string path, SkillToolContext context)
+        {
+            if (skill.Manifest.Metadata.TryGetValue("provides-call", out string? declared)
+                && declared.Contains("path=\"" + path + "\"", StringComparison.Ordinal))
+                return FillCall(declared.Trim(), context);
+            return RunToolName + "(skill=\"" + skill.Id + "\", path=\"" + path + "\", args=[\"<arguments>\"])";
+        }
+
+        /// <summary>
+        /// The filled declared call (<c>provides-call</c>) of the skill <paramref name="skillName"/>
+        /// when it names the script <paramref name="path"/>, or null.
+        /// </summary>
+        private static string? DeclaredCallFor(string? skillName, string? path, SkillToolContext context)
+        {
+            if (string.IsNullOrWhiteSpace(skillName) || string.IsNullOrWhiteSpace(path)
+                || !context.TryResolve(skillName, out Skill? skill, out _) || skill == null)
+                return null;
+            string relative = StripSkillPrefix(path, skill.Id);
+            return skill.Manifest.Metadata.TryGetValue("provides-call", out string? declared)
+                && declared.Contains("path=\"" + relative + "\"", StringComparison.Ordinal)
+                    ? FillCall(declared.Trim(), context)
+                    : null;
+        }
+
+        /// <summary>The most characters of the user's request a filled call carries.</summary>
+        internal const int MaxFilledRequestChars = 300;
+
+        /// <summary>A placeholder argument of a declared call, such as <c>"&lt;question&gt;"</c>, quotes included.</summary>
+        private static readonly System.Text.RegularExpressions.Regex CallPlaceholder = new(
+            "\"<[A-Za-z][A-Za-z0-9 _-]{0,40}>\"", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        /// <summary>
+        /// A skill's declared call (<c>provides-call</c>) with its placeholder arguments filled
+        /// with the user's latest message, so the call can be copied as it is. A small model
+        /// copied <c>args=["&lt;question&gt;", ...]</c> verbatim, and the research script
+        /// searched the web for the word "question". Unchanged when the turn's request is
+        /// unknown.
+        /// </summary>
+        internal static string FillCall(string declared, SkillToolContext context)
+        {
+            if (RequestText(context.UserRequest) is not { } request)
+                return declared;
+            string json = JsonSerializer.Serialize(request, ReadableArguments);
+            return CallPlaceholder.Replace(declared, _ => json);
+        }
+
+        /// <summary>The placeholder arguments of a declared call, without their quotes.</summary>
+        internal static IReadOnlyList<string> PlaceholdersOf(string declared) =>
+            CallPlaceholder.Matches(declared).Select(match => match.Value.Trim('"')).Distinct(StringComparer.Ordinal).ToArray();
+
+        /// <summary>
+        /// The user's request as one argument: whitespace collapsed, at most
+        /// <see cref="MaxFilledRequestChars"/> characters (cut at a word, never inside a
+        /// surrogate pair), or null when there is none.
+        /// </summary>
+        internal static string? RequestText(string? request)
+        {
+            if (string.IsNullOrWhiteSpace(request))
+                return null;
+            string text = string.Join(" ", request.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+            if (text.Length > MaxFilledRequestChars)
+            {
+                int end = text.LastIndexOf(' ', MaxFilledRequestChars);
+                if (end <= 0)
+                    end = char.IsHighSurrogate(text[MaxFilledRequestChars - 1]) ? MaxFilledRequestChars - 1 : MaxFilledRequestChars;
+                text = text.Substring(0, end);
+            }
+            return text.Trim();
+        }
+
+        /// <summary>Arguments as a model types them: no \u0022 for a quote, no \uXXXX for a non-ASCII letter.</summary>
+        private static readonly JsonSerializerOptions ReadableArguments = new()
+        {
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
 
         /// <param name="onToolOutput">
         /// Live tap for a tool that runs a process: called per stdout/stderr line while
@@ -530,6 +655,9 @@ namespace TensorSharp.AgentHost.Skills
                     // code tool is one edit, in the place that already holds the names.
                     _ when SkillToolNames.IsCodeTool(call.Name) =>
                         ExecuteCode(call, context, onToolOutput),
+
+                    _ when context.ProvidedToolNamed(call.Name) is { } provided =>
+                        provided.Execute(call, context, onToolOutput),
 
                     _ => SkillToolResult.Failure($"'{call.Name}' is not a tool this host answers."),
                 };
@@ -632,6 +760,17 @@ namespace TensorSharp.AgentHost.Skills
                 return SkillToolResult.Failure($"Cannot read '{path}' from skill '{skill.Id}': {error}");
 
             var sb = new StringBuilder();
+            // A skill's script read in place of running it: a small model asked for the
+            // provided call's path with skills_read, got 12 KB of source, and typed the script
+            // into the shell. Say first, before the source, how it runs.
+            if (content.OffsetBytes == 0 && context.ScriptRunner != null
+                && Skill.ClassifyFile(content.Path) == SkillFileKind.Script
+                && SkillCompatibility.Assess(skill, SkillHostProfile.From(context)).CanRun)
+            {
+                sb.Append("[TensorSharp host] ").Append(content.Path).Append(" is the '").Append(skill.Id)
+                  .Append("' skill's script, to run, not instructions to read: run it with ")
+                  .Append(RunCallFor(skill, content.Path, context)).Append(". Its source follows.\n\n");
+            }
             sb.Append("Skill: ").Append(skill.Id).Append('\n');
             sb.Append("File: ").Append(content.Path).Append('\n');
             if (content.Truncated || content.OffsetBytes > 0)
@@ -773,7 +912,7 @@ namespace TensorSharp.AgentHost.Skills
                     // or a compiled package would be advice the model cannot follow.
                     host ??= SkillHostProfile.From(context);
                     if (SkillCompatibility.Assess(provider, host).CanRun)
-                        return providedCall.Trim();
+                        return FillCall(providedCall.Trim(), context);
                 }
             }
             return null;
@@ -790,6 +929,19 @@ namespace TensorSharp.AgentHost.Skills
         {
             if (skill.Source == null || skill.Files.Any(f => f.Kind == SkillFileKind.Script))
                 return null;
+            return CurrentFactsNote(context);
+        }
+
+        /// <summary>
+        /// The same note for a hub package inspected but not installed: its files are listed
+        /// by path. A small model inspected an instructions-only stock skill and answered with
+        /// prices it made up.
+        /// </summary>
+        internal static string? CurrentFactsNote(SkillPackageInspection inspection, SkillToolContext context) =>
+            inspection.Files.Any(path => Skill.ClassifyFile(path) == SkillFileKind.Script) ? null : CurrentFactsNote(context);
+
+        private static string CurrentFactsNote(SkillToolContext context)
+        {
             string? search = ProvidedCall("WebSearch", context);
             return search != null
                 ? "This skill ships no scripts and no data source, so it holds no current figures (prices, rates, "
@@ -849,11 +1001,22 @@ namespace TensorSharp.AgentHost.Skills
 
             string? skillName = ReadString(call, "skill");
             string? path = ReadString(call, "path") ?? ReadString(call, "script");
-            IReadOnlyList<string>? canonicalArgs =
-                ReadRunArgumentList(call, "args", context.CodeInputFiles);
-            IReadOnlyList<string>? aliasedArgs = canonicalArgs is { Count: > 0 }
-                ? null
-                : ReadRunArgumentList(call, "arguments", context.CodeInputFiles);
+            IReadOnlyList<string>? canonicalArgs;
+            IReadOnlyList<string>? aliasedArgs;
+            try
+            {
+                canonicalArgs = ReadRunArgumentList(call, "args", context.CodeInputFiles);
+                aliasedArgs = canonicalArgs is { Count: > 0 }
+                    ? null
+                    : ReadRunArgumentList(call, "arguments", context.CodeInputFiles);
+            }
+            catch (Exception ex) when (ex is FormatException or ArgumentException
+                && DeclaredCallFor(skillName, path, context) is { } wellFormed)
+            {
+                // Unparseable args (["Nvidia", "--out" "--notes.md"], a missing comma) for a
+                // script the skill declares a call for: end with that call, well formed and filled.
+                return SkillToolResult.Failure(ex.Message + " For this script: " + wellFormed + ".");
+            }
             IReadOnlyList<string> args = canonicalArgs is { Count: > 0 }
                 ? canonicalArgs
                 : aliasedArgs is { Count: > 0 }
@@ -878,7 +1041,28 @@ namespace TensorSharp.AgentHost.Skills
                     + "instructions to carry out with this conversation's other tools."
                     + (CurrentFactsNote(skill, context) is { } facts ? " " + facts : string.Empty));
             }
-            return context.ScriptRunner.Run(skill, path, args, onOutput, ReadPackagesArgument(call));
+            // A placeholder of the skill's declared call passed as it is ("<question>"): the
+            // script would work on that word. Nothing runs; the answer is the call filled in.
+            if (skill.Manifest.Metadata.TryGetValue("provides-call", out string? declaredCall)
+                && PlaceholdersOf(declaredCall) is { Count: > 0 } placeholders
+                && args.FirstOrDefault(argument => placeholders.Contains(argument.Trim(), StringComparer.Ordinal)) is { } left)
+            {
+                return SkillToolResult.Failure($"'args' still holds the placeholder {left.Trim()} from the call, so nothing was run. "
+                    + (RequestText(context.UserRequest) != null
+                        ? "Run it with the request itself: " + FillCall(declaredCall.Trim(), context) + "."
+                        : "Put the request itself in its place."));
+            }
+            args = SplitJoinedOptions(args, out IReadOnlyList<string> joined);
+            SkillToolResult ran = context.ScriptRunner.Run(skill, path, args, onOutput, ReadPackagesArgument(call));
+            if (joined.Count == 0)
+                return ran;
+            // Said, so the model learns the shape: one array element per argument.
+            return ran with
+            {
+                Content = ran.Content + "\n\n[TensorSharp host] Each of " + string.Join(", ", joined.Select(j => JsonSerializer.Serialize(j, ReadableArguments)))
+                    + " was split into an option and its value, two arguments: give each argument its own array element, "
+                    + "as in " + JsonSerializer.Serialize(SplitJoinedOptions(new[] { joined[0] }), ReadableArguments) + ".",
+            };
         }
 
         /// <summary>
@@ -919,6 +1103,49 @@ namespace TensorSharp.AgentHost.Skills
 
             return ReadArgumentList(call, name);
         }
+
+        /// <summary>
+        /// An option and its value written as one element of an argument array —
+        /// <c>args=["Nvidia stock", "--out notes.md"]</c> — split back into the two arguments
+        /// a command line would have given. No option name holds whitespace, so such an
+        /// element cannot have been meant as one argument; argparse read it as a missing
+        /// <c>--out</c>, and a small model repeated the same call until the turn ended.
+        /// An element with <c>=</c> in its option part (<c>--title=A B</c>) is left whole.
+        /// </summary>
+        internal static IReadOnlyList<string> SplitJoinedOptions(IReadOnlyList<string> arguments) =>
+            SplitJoinedOptions(arguments, out _);
+
+        /// <param name="arguments">The script's arguments.</param>
+        /// <param name="joined">The elements that were split, as they were given.</param>
+        internal static IReadOnlyList<string> SplitJoinedOptions(IReadOnlyList<string> arguments, out IReadOnlyList<string> joined)
+        {
+            List<string>? split = null;
+            List<string>? given = null;
+            for (int i = 0; i < arguments.Count; i++)
+            {
+                // Only the first whitespace after a bare option token: the rest stays one value
+                // ("--title My Report" -> "--title", "My Report"). A quote or '=' before that
+                // whitespace, or no whitespace at all, keeps the element whole.
+                System.Text.RegularExpressions.Match option = JoinedOption.Match(arguments[i]);
+                if (option.Success)
+                {
+                    split ??= arguments.Take(i).ToList();
+                    (given ??= new List<string>()).Add(arguments[i]);
+                    split.Add(option.Groups[1].Value);
+                    split.Add(option.Groups[2].Value);
+                }
+                else
+                {
+                    split?.Add(arguments[i]);
+                }
+            }
+            joined = (IReadOnlyList<string>?)given ?? Array.Empty<string>();
+            return split ?? arguments;
+        }
+
+        private static readonly System.Text.RegularExpressions.Regex JoinedOption = new(
+            @"^(--?[A-Za-z][\w-]*)\s+(\S.*?)\s*$",
+            System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
         /// <summary>
         /// The optional <c>packages</c> argument of <see cref="RunToolName"/>: a
@@ -1183,6 +1410,37 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>Network discovery and installation explicitly enabled for this request.</summary>
         public SkillMarketplaceSession? Marketplace { get; init; }
+
+        /// <summary>
+        /// The user's latest message, as written, set by the tool loop when a turn starts. A tool
+        /// reads it only to tell what the user asked for by name (an exact hub package), never
+        /// to guess intent; null when the host's loop does not set it.
+        /// </summary>
+        public string? UserRequest { get; set; }
+
+        private IReadOnlyList<ProvidedTool> _provided = Array.Empty<ProvidedTool>();
+
+        /// <summary>
+        /// Declare the tools the reachable skills provide (<see cref="ProvidedTool"/>) for this
+        /// request, under names none of <paramref name="takenNames"/> has; empty when skill
+        /// scripts cannot run here or no reachable skill that runs here declares one.
+        /// </summary>
+        public IReadOnlyList<ToolFunction> OfferProvidedTools(IEnumerable<string?> takenNames)
+        {
+            _provided = ProvidedTool.For(this, takenNames.Where(n => !string.IsNullOrEmpty(n)).Select(n => n!));
+            return _provided.Select(tool => tool.Declare()).ToArray();
+        }
+
+        /// <summary>Whether <paramref name="name"/> is one of this request's provided tools.</summary>
+        public bool IsProvidedTool(string? name) => ProvidedToolNamed(name) != null;
+
+        internal ProvidedTool? ProvidedToolNamed(string? name) =>
+            name == null ? null : _provided.FirstOrDefault(tool => string.Equals(tool.Name, name, StringComparison.Ordinal));
+
+        /// <summary>The latest user message with text in <paramref name="messages"/>, or null.</summary>
+        public static string? LatestUserText(IEnumerable<ChatMessage>? messages) =>
+            messages?.LastOrDefault(m => m != null && string.Equals(m.Role, "user", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(m.Content))?.Content;
 
         /// <summary>Grant only the skill this request installed; never rescan another request's scope.</summary>
         internal void GrantInstalled(Skill skill)

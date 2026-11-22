@@ -25,6 +25,8 @@ public sealed class SkillMarketplaceSession
     private readonly Dictionary<string, SkillPackageInspection> _inspected = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<SkillSearchResult> _hits = new();
     private readonly HashSet<string> _failed = new(StringComparer.OrdinalIgnoreCase);
+    // owner/repository -> why its archive could not be used. Per turn, like the rest of this state.
+    private readonly Dictionary<string, string> _failedRepositories = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _installedAs = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _gate = new();
 
@@ -76,9 +78,42 @@ public sealed class SkillMarketplaceSession
         }
     }
 
-    internal void MarkFailed(string package)
+    internal void MarkFailed(string package, SkillInstallException? reason = null)
     {
-        lock (_gate) _failed.Add(package);
+        lock (_gate)
+        {
+            _failed.Add(package);
+            // A failure of the repository's archive is every one of its skills' failure: the
+            // nvidia/skills monorepo is over the entry limit, and naming its next skill as the
+            // "next result" sent a small model through eleven identical failures in one turn.
+            if (reason?.RepositoryWide == true && RepositoryOf(package) is { } repository)
+                _failedRepositories.TryAdd(repository, reason.Message);
+        }
+    }
+
+    /// <summary>The <c>owner/repository</c> of a package selector, or null.</summary>
+    internal static string? RepositoryOf(string package)
+    {
+        int at = package.LastIndexOf('@');
+        int slash = package.IndexOf('/');
+        return at > 0 && slash > 0 && slash < at ? package[..at].Trim() : null;
+    }
+
+    /// <summary>Whether this turn already found <paramref name="package"/>'s repository unusable, and why.</summary>
+    internal bool TryFailedRepository(string package, out string repository, out string reason)
+    {
+        repository = RepositoryOf(package) ?? string.Empty;
+        lock (_gate)
+            return _failedRepositories.TryGetValue(repository, out reason!);
+    }
+
+    /// <summary>How many of this turn's hits, other than <paramref name="package"/>, are in its repository.</summary>
+    internal int SiblingHits(string package)
+    {
+        string? repository = RepositoryOf(package);
+        lock (_gate)
+            return repository == null ? 0 : _hits.Count(h => string.Equals(h.Source, repository, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase));
     }
 
     internal void RecordInstalled(string package, string skillId)
@@ -153,7 +188,8 @@ public sealed class SkillMarketplaceSession
 
     /// <summary>
     /// The hit to try after <paramref name="package"/> failed: the next one from the same
-    /// search order that has not failed and is not that package. Null when none is left.
+    /// search order that has not failed, is not that package, and is not in a repository
+    /// whose archive already failed this turn. Null when none is left.
     /// </summary>
     internal SkillSearchResult? NextHit(string package)
     {
@@ -161,7 +197,8 @@ public sealed class SkillMarketplaceSession
         {
             int at = _hits.FindIndex(h => string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase));
             List<SkillSearchResult> after = (at < 0 ? _hits : _hits.Skip(at + 1).Concat(_hits.Take(at)))
-                .Where(h => !_failed.Contains(h.Package) && !string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase))
+                .Where(h => !_failed.Contains(h.Package) && !_failedRepositories.ContainsKey(h.Source)
+                    && !string.Equals(h.Package, package, StringComparison.OrdinalIgnoreCase))
                 .ToList();
             // A hit whose name shares a word with the one that failed ("unit-converter" after
             // another "unit-converter") is the likelier substitute than whatever came next.
@@ -295,16 +332,34 @@ public static class SkillMarketplaceTools
     private static SkillToolResult Search(ToolCall call, SkillToolContext context, SkillMarketplaceSession session,
         CancellationToken cancellationToken)
     {
+        string query = Argument(call, "query", true)!;
         IReadOnlyList<SkillSearchResult> results = session.Client.SearchAsync(
-                Argument(call, "query", true)!, Argument(call, "owner"), cancellationToken)
+                query, Argument(call, "owner"), cancellationToken)
             .GetAwaiter().GetResult();
         session.RememberHits(results);
         // Plain lines, not JSON: an install call written inside a JSON string reaches the
         // model with its quotes escaped (\u0022), and the line has to be copyable as is.
         var sb = new StringBuilder();
+        // What this host already has comes first. A hub search was the first call of every
+        // traced turn of a small model asked to research a company, with the bundled research
+        // skill (the phone's only working data path) in the catalog and never used.
+        IReadOnlyList<(Skill Skill, string Call)> local = InstalledMatches(query, context);
+        if (local.Count > 0)
+        {
+            sb.Append("Installed here, no install needed; use one if it fits the task:\n");
+            foreach ((Skill skill, string use) in local)
+                sb.Append("- ").Append(skill.Id).Append(": ")
+                  .Append(SkillTextBudget.Truncate(skill.Description, MaxInstalledDescriptionChars))
+                  .Append(" Use: ").Append(use).Append('\n');
+            sb.Append('\n');
+        }
         if (results.Count == 0)
         {
-            sb.Append("No hub skill matched. Search again with other words for what the skill should do, "
+            sb.Append("No hub skill matched.");
+            if (!local.Any(match => match.Call == SkillTools.ProvidedCall("WebSearch", context))
+                && SkillTools.ProvidedCall("WebSearch", context) is { } webSearch)
+                sb.Append(" Web search here: ").Append(webSearch).Append('.');
+            sb.Append("\nThe hub matches what a skill does: search with words for the task, not its subject, "
                 + "or continue without a hub skill.");
             return SkillToolResult.Success(sb.ToString());
         }
@@ -329,10 +384,121 @@ public static class SkillMarketplaceTools
         return SkillToolResult.Success(sb.ToString());
     }
 
+    /// <summary>Most installed skills a search result lists before the hub's.</summary>
+    private const int MaxInstalledMatches = 3;
+
+    /// <summary>How much of an installed skill's description its search line carries.</summary>
+    private const int MaxInstalledDescriptionChars = 120;
+
+    /// <summary>
+    /// Words too common to say what a skill does: function words, and the words nearly every
+    /// skill description uses about itself ("Use when the user asks…", "tools"). A query word
+    /// must have three characters or more and not be one of these to match an installed skill.
+    /// </summary>
+    private static readonly HashSet<string> NonMatchingWords = new(StringComparer.Ordinal)
+    {
+        "skill", "skills", "agent", "agents", "user", "users", "tool", "tools", "task", "tasks", "request", "requests",
+        "the", "and", "for", "with", "from", "into", "onto", "about", "that",
+        "this", "these", "those", "what", "which", "who", "whom", "whose", "how", "why", "when", "where", "can",
+        "could", "should", "would", "will", "shall", "may", "might", "must", "please", "tell", "you", "your", "our",
+        "its", "his", "her", "their", "them", "they", "are", "was", "were", "been", "being", "has", "have", "had",
+        "does", "did", "doing", "not", "now", "any", "all", "some", "use", "uses", "used", "using", "want", "need",
+        "get", "make", "help", "also", "just", "then", "than", "only", "very", "more", "most", "other", "such",
+        "out", "over", "under", "via", "per", "one", "two", "new", "own", "way", "like", "etc", "eg", "ie",
+    };
+
+    /// <summary>
+    /// The installed skills reachable in this request that share a meaningful word with the
+    /// query, each with its exact next call. Ranked: runs here first, then a match in the
+    /// skill's name before one only in its description, then one that ships scripts, then
+    /// one that came with this host. find-skills itself is the search and is never listed.
+    /// </summary>
+    internal static IReadOnlyList<(Skill Skill, string Call)> InstalledMatches(string query, SkillToolContext context)
+    {
+        HashSet<string> wanted = MeaningfulWords(query);
+        if (wanted.Count == 0)
+            return Array.Empty<(Skill, string)>();
+        SkillHostProfile? host = null;
+        var ranked = new List<(Skill Skill, bool Runs, int Name, int Description)>();
+        foreach (Skill skill in context.Reachable)
+        {
+            if (string.Equals(skill.Id, "find-skills", StringComparison.OrdinalIgnoreCase))
+                continue;
+            int name = MeaningfulWords(skill.Id).Count(wanted.Contains);
+            int description = MeaningfulWords(skill.Description).Count(wanted.Contains);
+            if (name == 0 && description == 0)
+                continue;
+            host ??= SkillHostProfile.From(context);
+            ranked.Add((skill, SkillCompatibility.Assess(skill, host).CanRun, name, description));
+        }
+        return ranked
+            .OrderByDescending(r => r.Runs)
+            .ThenByDescending(r => r.Name)
+            .ThenByDescending(r => r.Description)
+            .ThenByDescending(r => r.Skill.Files.Any(f => f.Kind == SkillFileKind.Script))
+            .ThenByDescending(r => r.Skill.Source == null)
+            .ThenBy(r => r.Skill.Id, StringComparer.Ordinal)
+            .Take(MaxInstalledMatches)
+            .Select(r => (r.Skill, CallFor(r.Skill, context, r.Runs)))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// The call that uses an installed skill: the exact call it declares (<c>provides-call</c>)
+    /// when it can run here, otherwise reading its instructions.
+    /// </summary>
+    private static string CallFor(Skill skill, SkillToolContext context, bool runs)
+    {
+        if (runs && context.ScriptRunner != null
+            && skill.Manifest.Metadata.TryGetValue("provides-call", out string? declared) && declared.Trim().Length > 0)
+            return SkillTools.FillCall(declared.Trim(), context);
+        return SkillTools.ReadToolName + "(skill=\"" + skill.Id + "\")";
+    }
+
+    /// <summary>
+    /// The words of <paramref name="text"/> that can say what a skill does: lower case, three
+    /// characters or more, none of <see cref="NonMatchingWords"/>, with a plural's "s" or
+    /// "es" also present without it ("stocks" matches "stock", "searches" matches "search").
+    /// </summary>
+    internal static HashSet<string> MeaningfulWords(string? text)
+    {
+        var words = new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrEmpty(text))
+            return words;
+        var current = new StringBuilder();
+        void Flush()
+        {
+            if (current.Length >= 3)
+            {
+                string word = current.ToString();
+                if (!NonMatchingWords.Contains(word))
+                {
+                    words.Add(word);
+                    if (word.Length > 4 && word.EndsWith("es", StringComparison.Ordinal))
+                        words.Add(word[..^2]);
+                    if (word.Length > 3 && word.EndsWith('s') && !word.EndsWith("ss", StringComparison.Ordinal))
+                        words.Add(word[..^1]);
+                }
+            }
+            current.Clear();
+        }
+        foreach (char c in text)
+        {
+            if (char.IsLetterOrDigit(c))
+                current.Append(char.ToLowerInvariant(c));
+            else
+                Flush();
+        }
+        Flush();
+        return words;
+    }
+
     private static SkillToolResult Inspect(ToolCall call, SkillToolContext context, SkillMarketplaceSession session,
         CancellationToken cancellationToken)
     {
-        string package = ResolvePackage(call, session, out string? argumentError) ?? throw new ArgumentException(argumentError);
+        string package = ResolvePackage(call, session, context, out string? argumentError) ?? throw new ArgumentException(argumentError);
+        if (FailedRepository(package, session, context) is { } known)
+            return SkillToolResult.Failure(known);
         SkillPackageInspection inspection;
         try
         {
@@ -340,11 +506,14 @@ public static class SkillMarketplaceTools
         }
         catch (SkillInstallException ex)
         {
-            session.MarkFailed(package);
-            return SkillToolResult.Failure(Unavailable(package, ex, session));
+            session.MarkFailed(package, ex);
+            return SkillToolResult.Failure(Unavailable(package, ex, session, context));
         }
         string inspectedContent = FormatInspection(inspection, context.MaxReadBytes,
             session.CanInstall ? InstallCall(inspection.Package) : null);
+        // A plain line after the JSON, so the call in it reaches the model with its quotes as written.
+        if (SkillTools.CurrentFactsNote(inspection, context) is { } facts)
+            inspectedContent += "\n" + facts;
         session.Remember(inspection);
         return SkillToolResult.Success(inspectedContent);
     }
@@ -355,9 +524,16 @@ public static class SkillMarketplaceTools
         if (!session.CanInstall)
             return SkillToolResult.Failure("This host's skill library is read-only; nothing can be installed. "
                 + "Continue with the installed skills and other tools.");
-        string? package = ResolvePackage(call, session, out string? argumentError);
+        string? package = ResolvePackage(call, session, context, out string? argumentError);
         if (package == null)
             return SkillToolResult.Failure(argumentError!);
+
+        // A skill of the same name is already here and runs here: use it. Installing the hub
+        // one as <owner>-<name> beside it put two skills with one name in a small model's
+        // context ("mattpocock-research" next to the bundled "research"), and it conflated
+        // them: it reported the bundled one as having no scripts and looped on that.
+        if (SameNameHere(package, context, session) is { } sameName)
+            return SkillToolResult.Failure(sameName);
 
         // Installed before — by an earlier turn, or under another name: use that copy.
         if (session.Registry.TryGetInstalledPackage(package, out Skill existing))
@@ -367,6 +543,9 @@ public static class SkillMarketplaceTools
             return SkillToolResult.Failure($"This turn has already installed {newly.Count} skills ({string.Join(", ", newly)}), "
                 + "the most one turn may install. Use one of them now: its instructions are in its install result above"
                 + $", or read them again with skills_read(skill=\"{newly[^1]}\").");
+
+        if (FailedRepository(package, session, context) is { } known)
+            return SkillToolResult.Failure(known);
 
         string? revision = Argument(call, "revision");
         SkillPackageInspection? inspection = session.TryGetInspection(package, revision);
@@ -382,8 +561,8 @@ public static class SkillMarketplaceTools
             }
             catch (SkillInstallException ex)
             {
-                session.MarkFailed(package);
-                return SkillToolResult.Failure(Unavailable(package, ex, session));
+                session.MarkFailed(package, ex);
+                return SkillToolResult.Failure(Unavailable(package, ex, session, context));
             }
             if (!string.IsNullOrWhiteSpace(revision) && !string.Equals(revision.Trim(), inspection.Revision, StringComparison.OrdinalIgnoreCase))
                 return SkillToolResult.Failure($"{package} is now at commit {inspection.Revision}, not {revision.Trim()}. "
@@ -404,7 +583,7 @@ public static class SkillMarketplaceTools
             if (installAs == null)
                 return SkillToolResult.Failure($"'{inspection.Manifest.Name}' is already a different skill here ({taken.Id}), "
                     + "and no other name is free. Use the installed one with skills_read(skill=\"" + taken.Id + "\")"
-                    + NextSentence(session, package));
+                    + NextSentence(session, package, context));
         }
 
         SkillHostProfile host = SkillHostProfile.From(context);
@@ -425,10 +604,10 @@ public static class SkillMarketplaceTools
         }
         catch (SkillInstallException ex)
         {
-            session.MarkFailed(package);
+            session.MarkFailed(package, ex);
             return SkillToolResult.Failure(ex.Message.StartsWith("Not installed:", StringComparison.Ordinal)
-                ? ex.Message + NextSentence(session, package)
-                : Unavailable(package, ex, session));
+                ? ex.Message + NextSentence(session, package, context)
+                : Unavailable(package, ex, session, context));
         }
         session.RecordNewInstall(installed.Skill.Id);
         return Installed(installed.Skill, context, session, package, alreadyInstalled: false, report, host);
@@ -474,30 +653,101 @@ public static class SkillMarketplaceTools
         return SkillToolResult.Success(sb.ToString(), skill.Id, source?.Describe() ?? package);
     }
 
+    /// <summary>
+    /// The answer to installing <paramref name="package"/> when a different skill of its name
+    /// is already here and can run here, or null to install as usual: when the user's latest
+    /// message names this package (or its repository), or when the skill already here cannot
+    /// run. The hub's skill stays reachable: the answer says how the user can ask for it.
+    /// </summary>
+    private static string? SameNameHere(string package, SkillToolContext context, SkillMarketplaceSession session)
+    {
+        int at = package.LastIndexOf('@');
+        if (at < 0 || !session.Registry.TryGet(package[(at + 1)..], out Skill taken)
+            || string.Equals(taken.Source?.Package, package, StringComparison.OrdinalIgnoreCase)
+            || UserNamed(context.UserRequest, package))
+            return null;
+        if (!SkillCompatibility.Assess(taken, SkillHostProfile.From(context)).CanRun)
+            return null;
+        string copy = session.Registry.TryGetInstalledPackage(package, out Skill installed)
+            ? $", installed here as '{installed.Id}'"
+            : string.Empty;
+        return $"Not installed: this host already has a skill called '{taken.Id}' that runs here. Use it: "
+            + CallFor(taken, context, runs: true) + $". The hub skill {package} is a different one{copy}; to install it "
+            + $"anyway, the user can ask for {package} by name.";
+    }
+
+    /// <summary>
+    /// Whether the user's own words name <paramref name="package"/>: the selector itself, its
+    /// <c>owner/repository</c>, or <c>owner/name</c>. Only a literal mention counts.
+    /// </summary>
+    internal static bool UserNamed(string? request, string package)
+    {
+        if (string.IsNullOrWhiteSpace(request))
+            return false;
+        int at = package.LastIndexOf('@');
+        string? repository = SkillMarketplaceSession.RepositoryOf(package);
+        if (at < 0 || repository == null)
+            return request.Contains(package, StringComparison.OrdinalIgnoreCase);
+        string ownerAndName = repository.Split('/')[0] + "/" + package[(at + 1)..];
+        return request.Contains(package, StringComparison.OrdinalIgnoreCase)
+            || request.Contains(repository, StringComparison.OrdinalIgnoreCase)
+            || request.Contains(ownerAndName, StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>Why a package could not be used, and the exact next thing to try.</summary>
-    private static string Unavailable(string package, SkillInstallException ex, SkillMarketplaceSession session)
+    private static string Unavailable(string package, SkillInstallException ex, SkillMarketplaceSession session, SkillToolContext context)
     {
         string why = ex.HttpStatus == 404
             ? $"{package} cannot be downloaded: its GitHub repository was not found (HTTP 404), so this hub entry is stale."
             : ex.HttpStatus is 403 or 429
                 ? $"{package} cannot be fetched right now: GitHub refused the request (HTTP {ex.HttpStatus}, usually its rate limit)."
                 : $"{package} cannot be installed: {ex.Message}";
-        return why + NextSentence(session, package);
+        return why + SkippedSiblings(package, ex, session) + NextSentence(session, package, context);
     }
 
-    private static string NextSentence(SkillMarketplaceSession session, string package) =>
+    /// <summary>
+    /// For a failure of the whole repository: that its other results were skipped, and why.
+    /// Said in the result so a model that copies a sibling's install line anyway knows the
+    /// answer before it asks.
+    /// </summary>
+    private static string SkippedSiblings(string package, SkillInstallException ex, SkillMarketplaceSession session)
+    {
+        if (!ex.RepositoryWide || SkillMarketplaceSession.RepositoryOf(package) is not { } repository)
+            return string.Empty;
+        int siblings = session.SiblingHits(package);
+        return siblings == 0
+            ? string.Empty
+            : $" The other {siblings.ToString(CultureInfo.InvariantCulture)} result{(siblings == 1 ? " is" : "s are")} in {repository} too, "
+              + "in the same repository archive, so they would fail the same way and were skipped.";
+    }
+
+    /// <summary>
+    /// A package whose repository already failed in this turn: answered from that failure,
+    /// without fetching the same archive again.
+    /// </summary>
+    private static string? FailedRepository(string package, SkillMarketplaceSession session, SkillToolContext context)
+    {
+        if (!session.TryFailedRepository(package, out string repository, out string reason))
+            return null;
+        session.MarkFailed(package);
+        return $"{package} cannot be installed: {repository} already failed earlier in this turn ({reason.TrimEnd('.')}), "
+            + "and every skill in it is in that same repository archive." + NextSentence(session, package, context);
+    }
+
+    private static string NextSentence(SkillMarketplaceSession session, string package, SkillToolContext context) =>
         session.NextHit(package) is { } next
             ? " Next result, if it fits the task: " + (session.Registry.TryGetInstalledPackage(next.Package, out Skill installed)
                 ? SkillTools.ReadToolName + "(skill=\"" + installed.Id + "\")"
                 : InstallCall(next.Package)) + "; otherwise continue without a hub skill."
-            : " No other search result is left; search again with other words or continue without a hub skill.";
+            : " No other search result is left; search again with words for the task, or continue without a hub skill."
+              + (SkillTools.ProvidedCall("WebSearch", context) is { } webSearch ? " Web search here: " + webSearch + "." : string.Empty);
 
     /// <summary>
     /// The package a call means. The exact selector is preferred; a hit's name,
     /// <c>owner/repository</c>, or skills.sh page from this request's searches is mapped to
     /// it, because a model copying the wrong field is the commonest way this call failed.
     /// </summary>
-    private static string? ResolvePackage(ToolCall call, SkillMarketplaceSession session, out string? error)
+    private static string? ResolvePackage(ToolCall call, SkillMarketplaceSession session, SkillToolContext context, out string? error)
     {
         error = null;
         string? given = Argument(call, "package") ?? Argument(call, "skill") ?? Argument(call, "name");
@@ -511,6 +761,18 @@ public static class SkillMarketplaceTools
             return hit.Package;
         if (given.Count(c => c == '@') == 1 && given.Contains('/'))
             return given;
+        // An installed skill's name where a hub package belongs ("research", "research@skill-hub"):
+        // it needs no install, so say how to use it instead of quoting an unrelated search hit.
+        foreach (string part in given.Split('@', '/'))
+        {
+            if (part.Length > 0 && context.TryResolve(part, out Skill? local, out _) && local != null)
+            {
+                bool runs = SkillCompatibility.Assess(local, SkillHostProfile.From(context)).CanRun;
+                error = $"'{local.Id}' is a skill installed here, not a hub package, so it needs no install or inspection. "
+                    + "Use it: " + CallFor(local, context, runs) + ".";
+                return null;
+            }
+        }
         error = $"'{given}' is not a package. Use owner/repository@skill-name exactly as skills_search printed it"
             + (session.NextHit(string.Empty) is { } first ? ", for example " + InstallCall(first.Package) + "." : "; search first.");
         return null;

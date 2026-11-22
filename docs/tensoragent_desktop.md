@@ -199,7 +199,12 @@ model can search skills.sh and install a found skill pinned to one commit, then 
 it in the same turn, without Node.js, npm or Git and without you asking for the
 installation separately (the network switch turns this off). The turn shows
 `Installed <package> from <url> @ <commit>`, and the Skills sheet shows where each
-hub skill came from. An explicit empty skill selection disables discovery.
+hub skill came from. A search lists the installed skills that fit first (the
+built-in `research` for a web lookup), and a hub skill whose name an installed skill
+already has is not installed beside it unless you ask for that package by name. With
+**Run code** on, the built-in research skill's web search and page reading are offered to
+the model as `web_search` and `web_fetch`, which run its script in the sandbox.
+An explicit empty skill selection disables discovery.
 Installing runs nothing: scripts run through `skills_run` under Run code, which
 installs a script's PEP 723 dependencies first; credentials and other programs a
 workflow needs are still yours to provide. The Skills sheet also accepts ZIP files and

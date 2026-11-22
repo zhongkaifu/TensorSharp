@@ -555,6 +555,12 @@ namespace TensorSharp.Server.Skills
                 Workspace = workspace,
             };
 
+            // A tool a reachable skill provides (web_search for the research skill's WebSearch)
+            // becomes a real tool with one string parameter, run through skills_run.
+            if (offerTools && context.ScriptRunner != null
+                && context.OfferProvidedTools(tools.Select(tool => tool.Name)) is { Count: > 0 } provided)
+                tools = tools.Concat(provided).ToList();
+
             var loopOptions = new SkillAgentLoopOptions
             {
                 MaxRounds = RoundsFor(options, offerCode),

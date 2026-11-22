@@ -142,6 +142,50 @@ namespace TensorSharp.AgentHost.Skills
             return true;
         }
 
+        internal readonly record struct MissingScript(
+            Skill Skill, string Path, string Written, IReadOnlyList<string> Arguments);
+
+        /// <summary>
+        /// A plain <c>python3 x.py ARGS</c> (or <c>python</c>) whose script is not in the
+        /// conversation's working directory but is exactly one reachable skill's script, by
+        /// its path in the skill (<c>scripts/x.py</c>) or by its file name (<c>x.py</c>). Not
+        /// run as that script — a plain relative path stays the model's own (see
+        /// <see cref="TryTranslate"/>) — only recognized, so the result can name the call.
+        /// </summary>
+        internal static bool TryFindMissingSkillScript(string? command, SkillToolContext context, out MissingScript missing)
+        {
+            missing = default;
+            if (string.IsNullOrWhiteSpace(command) || command.Length > 4096
+                || command.IndexOfAny(new[] { '\n', '\r', '|', ';', '>', '<', '`', '&' }) >= 0
+                || command.Contains("$(", StringComparison.Ordinal))
+                return false;
+            List<string> words = SkillScriptRunner.SplitArguments(command);
+            if (words.Count < 2 || words[0] is not ("python" or "python3"))
+                return false;
+            string written = words[1].Replace('\\', '/');
+            if (written.StartsWith('-') || Path.IsPathRooted(written) || written.Contains("..", StringComparison.Ordinal)
+                || !written.EndsWith(".py", StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (context.Workspace is { } workspace && File.Exists(Path.Combine(workspace.WorkDirectory, written)))
+                return false;
+            string trimmed = written.StartsWith("./", StringComparison.Ordinal) ? written.Substring(2) : written;
+            var matches = new List<(Skill Skill, string Path)>();
+            foreach (Skill skill in context.Reachable)
+            {
+                foreach (SkillFile file in skill.Files)
+                {
+                    if (file.Kind == SkillFileKind.Script
+                        && (string.Equals(file.Path, trimmed, SkillPathGuard.PathComparison)
+                            || (!trimmed.Contains('/') && string.Equals(Path.GetFileName(file.Path), trimmed, SkillPathGuard.PathComparison))))
+                        matches.Add((skill, file.Path));
+                }
+            }
+            if (matches.Count != 1)
+                return false;
+            missing = new MissingScript(matches[0].Skill, matches[0].Path, written, words.Skip(2).ToList());
+            return true;
+        }
+
         private static IEnumerable<string> Split(string value) =>
             value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
                 .Select(p => InlineScriptMetadata.ToInstallSpec(p.Trim()))

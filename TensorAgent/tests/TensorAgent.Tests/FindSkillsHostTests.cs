@@ -104,6 +104,8 @@ public sealed class FindSkillsHostTests : IDisposable
             }, plan.LoopOptions);
 
         Assert.False(result.HitRoundLimit);
+        // The loop hands the tools the user's own words (what an exact package request is read from).
+        Assert.Equal("Find, install and use a skill to multiply 6 by 7 and save the report.", plan.ToolContext.UserRequest);
         Assert.Equal(workflow.Length + 1, result.Rounds);
         Assert.Equal(workflow.Length, result.Invocations.Count);
         Assert.All(result.Invocations, invocation => Assert.True(invocation.Ok, invocation.Tool));
@@ -280,6 +282,24 @@ public sealed class FindSkillsHostTests : IDisposable
         Assert.Equal("WebSearch, WebFetch", research.Manifest.Metadata["provides-tools"]);
         Assert.StartsWith("skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"<question>\"",
             research.Manifest.Metadata["provides-call"], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ASearchWithTheSubjectStillLeadsToTheBundledResearchSkillOnTheInProcessHost()
+    {
+        // The phone's traced turns opened with skills_search("Nvidia stock research"): the hub had
+        // nothing for the subject, and the bundled research skill - the device's data path - was
+        // never used. The search now answers with it first, as its exact call.
+        AgentAppHost host = Start();
+        SkillRequestPlan plan = Plan(host);
+        Assert.True(host.Skills.TryGet("research", out Skill research));
+        SkillToolResult search = SkillTools.Execute(Call("skills_search", ("query", "Nvidia stock research")), plan.ToolContext);
+        Assert.True(search.Ok, search.Content);
+        string[] lines = search.Content.Split('\n');
+        Assert.Equal("Installed here, no install needed; use one if it fits the task:", lines[0]);
+        Assert.StartsWith("- research: ", lines[1], StringComparison.Ordinal);
+        Assert.EndsWith(" Use: " + research.Manifest.Metadata["provides-call"].Trim(), lines[1], StringComparison.Ordinal);
+        Assert.DoesNotContain("- find-skills", search.Content, StringComparison.Ordinal);
     }
 
     public void Dispose()

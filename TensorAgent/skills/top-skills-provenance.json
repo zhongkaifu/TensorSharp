@@ -292,7 +292,7 @@
       "revision": "13e4063a1cf913f5606d57d42ab83a86f5001e04",
       "path": "skills/find-skills",
       "license": "MIT",
-      "adaptations": "Native skills_search, skills_inspect and skills_install; request-local activation; host-managed installation; explicit compatibility and execution validation boundaries; 2026-11-21: a found skill is installed and used in the same turn under the host's network policy, with exact next calls in every result.",
+      "adaptations": "Native skills_search, skills_inspect and skills_install; request-local activation; host-managed installation; explicit compatibility and execution validation boundaries; 2026-11-21: a found skill is installed and used in the same turn under the host's network policy, with exact next calls in every result; 2026-11-22: a name taken by a skill that runs here is answered with that skill's call instead of a second, renamed copy.",
       "upstream_files": [
         {
           "skill": "find-skills",
@@ -307,7 +307,7 @@
       ],
       "integrated_files": {
         "LICENSE.txt": "661142e53c313d2bb5e1b055f5c0a39001450ff1b5e27b89dc4bc7de9a6352ca",
-        "SKILL.md": "4e1634e6e5f3203547aca71742830bc28eada71699d175c7c344c41b7a7c089f"
+        "SKILL.md": "8c685528a0d1d2d934297f332ec2d24bc178402233b3f8bcd72ad5f3b7438485"
       },
       "workflow_validation": {
         "date": "2026-10-15",

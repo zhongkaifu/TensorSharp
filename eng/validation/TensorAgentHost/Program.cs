@@ -7,18 +7,25 @@ using Microsoft.Extensions.Logging;
 using TensorAgent.Core.Catalog;
 using TensorAgent.Core.Hosting;
 using TensorAgent.Core.Settings;
+using TensorAgent.Core.Shell;
 using TensorSharp.Server;
 
 if (args.Contains("--help"))
 {
     Console.WriteLine("TensorAgentHost --root <evidence-dir> --skills <skills-dir> [--catalog-model <installed-id> | --weights <gguf>] [--mmproj <gguf>] [--backend ggml_metal] [--port 0] [--network] [--unconfined] [--context 32768] [--max-tokens 4096] [--web-root <dir>] [--stop-file <file>]");
+    Console.WriteLine("  iOS path on a desktop: --in-process --python-root <CPython prefix> [--phone] [--settings <a TensorAgent settings.json>]");
+    Console.WriteLine("    --in-process  the phone's execution: embedded Python and JavaScript in this process, no program launches");
+    Console.WriteLine("    --phone       the phone's device class (its engine memory budget and settings defaults), 12 GB tier");
+    Console.WriteLine("    --settings    take every setting from that file (a copy of a device's settings.json) instead of the overrides above");
+    Console.WriteLine("  --trace-log     also print the host's Information log (chat rounds, skill tool calls) for eng/validation/skill-install-trace.py;");
+    Console.WriteLine("                  it holds prompts and outputs, so its file belongs in ignored artifacts/ only");
     return 0;
 }
 
 var values = new Dictionary<string, string>(StringComparer.Ordinal);
 for (int i = 0; i < args.Length; i++)
 {
-    if (args[i] is "--network" or "--unconfined")
+    if (args[i] is "--network" or "--unconfined" or "--in-process" or "--phone" or "--trace-log")
         values[args[i]] = "true";
     else if (i + 1 < args.Length && args[i].StartsWith("--", StringComparison.Ordinal))
         values[args[i]] = args[++i];
@@ -35,24 +42,43 @@ CatalogModel? catalogModel = values.TryGetValue("--catalog-model", out string? c
     : null;
 if (catalogModel is not null && (values.ContainsKey("--weights") || values.ContainsKey("--mmproj")))
     throw new ArgumentException("--catalog-model uses the app's model store; it cannot be combined with --weights or --mmproj.");
+bool phone = values.ContainsKey("--phone");
+bool inProcess = values.ContainsKey("--in-process");
+if (values.ContainsKey("--python-root") && !inProcess)
+    throw new ArgumentException("--python-root is the embedded runtime of --in-process.");
 var paths = new AgentPaths(Path.Combine(root, "data"), Path.Combine(root, "cache"))
 {
     BundledSkillsDirectory = Required("--skills"),
-    DeviceMemoryGB = 32,
-    DeviceClass = DeviceClass.Desktop,
+    DeviceMemoryGB = phone ? 12 : 32,
+    DeviceClass = phone ? DeviceClass.Phone : DeviceClass.Desktop,
+    // The iOS execution path (InProcessShellBackend + EmbeddedPython) on this machine:
+    // the same SkillHostProfile as a phone, so a skill's verdicts and the shell's
+    // abilities are the phone's. The CPython prefix stands in for the app bundle's.
+    ExecutionMode = inProcess ? AgentExecutionMode.InProcess : AgentExecutionMode.Auto,
+    PythonRuntimeDirectory = inProcess ? Required("--python-root") : string.Empty,
 };
 paths.EnsureCreated();
-var settingsStore = new SettingsStore(paths.SettingsFile, AppSettings.DesktopDefaults);
-AppSettings settings = settingsStore.Load();
-settings.SelectedModelId = null;
-settings.AllowCodeExecution = true;
-settings.AllowUnconfinedExecution = values.ContainsKey("--unconfined");
-settings.AllowNetwork = values.ContainsKey("--network");
-settings.NetworkHosts.Clear();
-settings.ContextLength = Number("--context", 32768);
-settings.MaxTokens = Number("--max-tokens", 4096);
-settings.ToolTimeoutSeconds = 600;
-settings.SpeculativeDecoding = false;
+var settingsStore = new SettingsStore(paths.SettingsFile, phone ? null : AppSettings.DesktopDefaults);
+AppSettings settings;
+if (values.ContainsKey("--settings"))
+{
+    // A device's own settings, as they are: the reproduction is of that configuration.
+    settings = new SettingsStore(Required("--settings"), phone ? null : AppSettings.DesktopDefaults).Load();
+    settings.SelectedModelId = null;
+}
+else
+{
+    settings = settingsStore.Load();
+    settings.SelectedModelId = null;
+    settings.AllowCodeExecution = true;
+    settings.AllowUnconfinedExecution = values.ContainsKey("--unconfined");
+    settings.AllowNetwork = values.ContainsKey("--network");
+    settings.NetworkHosts.Clear();
+    settings.ContextLength = Number("--context", 32768);
+    settings.MaxTokens = Number("--max-tokens", 4096);
+    settings.ToolTimeoutSeconds = 600;
+    settings.SpeculativeDecoding = false;
+}
 settingsStore.Save(settings);
 // This launcher loads an arbitrary local GGUF through the HTTP route, without a
 // catalog entry whose UseModel path would normally apply the context budget.
@@ -82,7 +108,8 @@ if (webRoot is null)
     if (Directory.Exists(candidate))
         webRoot = candidate;
 }
-using var rankingLogging = LoggerFactory.Create(builder => builder.AddProvider(new RankingLogProvider()));
+bool traceLog = values.ContainsKey("--trace-log");
+using var rankingLogging = LoggerFactory.Create(builder => builder.AddProvider(new RankingLogProvider(traceLog)));
 using var host = new AgentAppHost(paths,
     loggerFactory: rankingLogging,
     webRoot: webRoot,
@@ -167,13 +194,16 @@ try
 catch (OperationCanceledException) { }
 return 0;
 
-// Only bounded, non-sensitive ranking diagnostics. Source text and authentication
-// material are never included by this logger.
-sealed class RankingLogProvider : ILoggerProvider
+// By default only bounded, non-sensitive ranking diagnostics: source text and
+// authentication material are never included. --trace-log adds the host's Information
+// entries in the console logger's layout ("info: Category[id]" then indented lines), which
+// is what skill-install-trace.py reads; those entries hold prompts and model output.
+sealed class RankingLogProvider(bool traceLog) : ILoggerProvider
 {
-    public ILogger CreateLogger(string categoryName) => new RankingLogger();
+    private static readonly object Gate = new();
+    public ILogger CreateLogger(string categoryName) => new RankingLogger(categoryName, traceLog);
     public void Dispose() { }
-    sealed class RankingLogger : ILogger
+    sealed class RankingLogger(string category, bool traceLog) : ILogger
     {
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
         public bool IsEnabled(LogLevel logLevel) => true;
@@ -181,7 +211,23 @@ sealed class RankingLogProvider : ILoggerProvider
             Func<TState, Exception?, string> formatter)
         {
             string message = formatter(state, exception);
-            if (message.StartsWith("Knowledge rerank ", StringComparison.Ordinal)) Console.WriteLine(message);
+            if (message.StartsWith("Knowledge rerank ", StringComparison.Ordinal))
+            {
+                Console.WriteLine(message);
+                return;
+            }
+            if (!traceLog || logLevel < LogLevel.Information)
+                return;
+            string level = logLevel switch
+            {
+                LogLevel.Information => "info",
+                LogLevel.Warning => "warn",
+                LogLevel.Error => "fail",
+                _ => "crit",
+            };
+            string body = string.Join("\n      ", message.Replace("\r", string.Empty).Split('\n'));
+            lock (Gate)
+                Console.WriteLine($"{level}: {category}[{eventId.Id}]\n      {body}");
         }
     }
 }
