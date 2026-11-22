@@ -483,7 +483,8 @@ the shell.
 words). An element that is an option and its value written together, such as
 `"--out notes.md"`, is split into the two arguments a command line would pass; option
 names never contain whitespace, and an element with `=` in its option part
-(`--title=A B`) is kept whole.
+(`--title=A B`) is kept whole. `args` that cannot be read at all, for a script that the
+skill's declared call names, are answered with that call, filled with the request.
 
 **The declarations are deliberately flat.** A `ToolParameter` carries a type
 name, a description and an enum, and nothing else. A caller's original JSON

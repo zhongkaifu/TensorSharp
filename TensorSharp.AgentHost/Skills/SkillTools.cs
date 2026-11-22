@@ -540,6 +540,22 @@ namespace TensorSharp.AgentHost.Skills
             return RunToolName + "(skill=\"" + skill.Id + "\", path=\"" + path + "\", args=[\"<arguments>\"])";
         }
 
+        /// <summary>
+        /// The filled declared call (<c>provides-call</c>) of the skill <paramref name="skillName"/>
+        /// when it names the script <paramref name="path"/>, or null.
+        /// </summary>
+        private static string? DeclaredCallFor(string? skillName, string? path, SkillToolContext context)
+        {
+            if (string.IsNullOrWhiteSpace(skillName) || string.IsNullOrWhiteSpace(path)
+                || !context.TryResolve(skillName, out Skill? skill, out _) || skill == null)
+                return null;
+            string relative = StripSkillPrefix(path, skill.Id);
+            return skill.Manifest.Metadata.TryGetValue("provides-call", out string? declared)
+                && declared.Contains("path=\"" + relative + "\"", StringComparison.Ordinal)
+                    ? FillCall(declared.Trim(), context)
+                    : null;
+        }
+
         /// <summary>The most characters of the user's request a filled call carries.</summary>
         internal const int MaxFilledRequestChars = 300;
 
@@ -977,11 +993,22 @@ namespace TensorSharp.AgentHost.Skills
 
             string? skillName = ReadString(call, "skill");
             string? path = ReadString(call, "path") ?? ReadString(call, "script");
-            IReadOnlyList<string>? canonicalArgs =
-                ReadRunArgumentList(call, "args", context.CodeInputFiles);
-            IReadOnlyList<string>? aliasedArgs = canonicalArgs is { Count: > 0 }
-                ? null
-                : ReadRunArgumentList(call, "arguments", context.CodeInputFiles);
+            IReadOnlyList<string>? canonicalArgs;
+            IReadOnlyList<string>? aliasedArgs;
+            try
+            {
+                canonicalArgs = ReadRunArgumentList(call, "args", context.CodeInputFiles);
+                aliasedArgs = canonicalArgs is { Count: > 0 }
+                    ? null
+                    : ReadRunArgumentList(call, "arguments", context.CodeInputFiles);
+            }
+            catch (Exception ex) when (ex is FormatException or ArgumentException
+                && DeclaredCallFor(skillName, path, context) is { } wellFormed)
+            {
+                // Unparseable args (["Nvidia", "--out" "--notes.md"], a missing comma) for a
+                // script the skill declares a call for: end with that call, well formed and filled.
+                return SkillToolResult.Failure(ex.Message + " For this script: " + wellFormed + ".");
+            }
             IReadOnlyList<string> args = canonicalArgs is { Count: > 0 }
                 ? canonicalArgs
                 : aliasedArgs is { Count: > 0 }

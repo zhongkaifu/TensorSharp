@@ -727,6 +727,22 @@ public sealed class SkillHubInstallTests : IDisposable
         Assert.Empty(runner.Runs);
     }
 
+    [Fact]
+    public void UnparseableArgsForADeclaredScriptEndWithTheFilledCall()
+    {
+        BundleResearch();
+        SkillRegistry registry = Registry();
+        var runner = new RecordingScriptRunner();
+        var context = new SkillToolContext(registry.Skills) { ScriptRunner = runner, UserRequest = "Research Nvidia." };
+        SkillToolResult bad = SkillTools.Execute(Call("skills_run", ("skill", "research"), ("path", "scripts/research.py"),
+            ("args", "[\"Nvidia\", \"--out\" \"--notes.md\"]")), context);
+        Assert.False(bad.Ok);
+        Assert.Empty(runner.Runs);
+        Assert.Contains("must be a valid JSON array", bad.Content, StringComparison.Ordinal);
+        Assert.EndsWith(" For this script: skills_run(skill=\"research\", path=\"scripts/research.py\", args=[\"Research Nvidia.\"]).",
+            bad.Content, StringComparison.Ordinal);
+    }
+
     private static int CountOf(string text, string part)
     {
         int count = 0;
