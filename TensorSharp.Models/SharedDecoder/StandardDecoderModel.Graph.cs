@@ -1319,6 +1319,7 @@ namespace TensorSharp.Models
                 advanceHidden: request.PositionTable == null ? hidden : null);
             if (graph == null) return false;
             CountDeviceRoutes(graph, outputs);
+            HandOverDeviceRoutes(graph, outputs, starts, counts);
             // A replayed graph's buffers are rewritten by its next run (the model-owned buffer
             // contract); a one-shot graph's arrays are the caller's.
             result = new GraphResult
@@ -1365,6 +1366,7 @@ namespace TensorSharp.Models
                     try
                     {
                         CountDeviceRoutes(graph, outputs);
+                        HandOverDeviceRoutes(graph, outputs, starts, counts);
                         if (outputs.Captures != null)
                             for (int c = 0; c < outputs.Captures.Length; c++)
                                 if (outputs.Captures[c] >= 0) captures[c] = (float[])graph.Outputs[outputs.Captures[c]].Clone();
@@ -1660,6 +1662,7 @@ namespace TensorSharp.Models
             public int[] RankLogits;   // each rank's slice of the vocabulary (a vocabulary-split head), in rank order
             public int[] Captures;   // -1: the captured layer is another stage's
             public (int Output, int Layer)[] Routes;   // resident MoE layers' top-K ids while device routes are recorded
+            public (int Layer, int Ids, int Scores)[] RouteOutputs;   // tests: DeviceRoutesForTests's outputs
             public int[] Draft;   // a block draft's results: its ids' outputs, then its confidences' (see EmitDFlashBlock)
             public int[] Trace;   // tests: a block's head logits, then each slot's candidates and scores (DFlashTraceForTests)
         }
@@ -1725,6 +1728,7 @@ namespace TensorSharp.Models
                 step.Boundary(h);
             }
             outputs.Routes = step.Routes;
+            outputs.RouteOutputs = step.RouteOutputs;
             if (!head)
             {
                 outputs.Hidden = step.Output(h, (long)width * rows);
@@ -1780,6 +1784,16 @@ namespace TensorSharp.Models
                 tapped = true;
             }
             return tapped && Array.TrueForAll(taps, x => x >= 0);
+        }
+
+        /// <summary>Tests: the routes a step's MoE layers recorded (<see cref="EmitDeviceRoutes"/>) go to
+        /// <see cref="DeviceRoutesForTests"/>, copied before the graph's outputs are written again.</summary>
+        private void HandOverDeviceRoutes(CachedGraph graph, in StepOutputs outputs, int[] starts, int[] counts)
+        {
+            if (outputs.RouteOutputs == null || DeviceRoutesForTests is not { } sink) return;
+            foreach ((int layer, int ids, int scores) in outputs.RouteOutputs)
+                sink(new DeviceRoutes(layer, Array.ConvertAll(graph.Outputs[ids], v => (int)v), (float[])graph.Outputs[scores].Clone(),
+                    (int[])starts.Clone(), (int[])counts.Clone()));
         }
 
         /// <summary>A profiling load's resident MoE layers: their recorded top-K ids go to the routing counters.</summary>
@@ -2854,6 +2868,71 @@ namespace TensorSharp.Models
         /// <summary>Tests: a host-served layer's selection runs as its ops, not as a <see cref="GraphFusion.MoeSelect"/> region.</summary>
         internal bool MoeSelectRegionDisabledForTests { get; set; }
 
+        /// <summary>Tests: one MoE layer's routes as a step's graph picked them on its device: each row's K expert ids and the
+        /// scores the router ranked the experts by ([experts, rows]), the rows in the step's order (sequence s's
+        /// <paramref name="Counts"/>[s] rows at positions <paramref name="Starts"/>[s] on).</summary>
+        internal readonly record struct DeviceRoutes(int Layer, int[] Ids, float[] Scores, int[] Starts, int[] Counts);
+
+        /// <summary>
+        /// Tests: set, the MoE layers of a family that emits its MoE from plain graph ops (Inkling 2) make their routes and
+        /// scores outputs of the step's graph (another graph than an unset model's), handed over after each step of the
+        /// single-device and staged paths. <see cref="EmitMoe"/>'s routed-experts region may run as one kernel that keeps its
+        /// routes on the device, so it records none. Null: nothing is emitted for them.
+        /// </summary>
+        internal Action<DeviceRoutes> DeviceRoutesForTests { get; set; }
+
+        /// <summary>
+        /// Tests: set, a family that emits its MoE from plain graph ops (Inkling 2) routes each row to the K experts this
+        /// gives for (layer, the request whose slot the row's sequence is in, or null for the primary cache's, the row's
+        /// position), a per-run graph input in place of its router's top-K; the weights still come from the router's
+        /// probabilities of those experts. Batched and lone runs of the same requests then take the same routes, which ties
+        /// between near-equal scores no longer split. Null: the top-K.
+        /// </summary>
+        internal Func<int, string, int, int[]> ForcedRoutesForTests { get; set; }
+
+        /// <summary>The routes <see cref="ForcedRoutesForTests"/> gives this step's rows, I32 [K, rows]; -1 when it is unset.</summary>
+        protected int EmitForcedRoutes(GraphStep step, int layer, int k, int experts)
+        {
+            if (ForcedRoutesForTests is not { } routes) return -1;
+            var ids = new int[k * step.Rows];
+            for (int s = 0; s < step.Sequences; s++)
+                for (int i = 0; i < step.Counts[s]; i++)
+                {
+                    int position = step.Starts[s] + i;
+                    string request = RequestOfSlot(step.Slots[s]);
+                    int[] r = routes(layer, request, position);
+                    if (r == null || r.Length != k || Array.Exists(r, e => e < 0 || e >= experts))
+                        throw new InvalidOperationException(
+                            $"{Config.Architecture}: the forced routes of layer {layer}, request {request ?? "(primary)"}, position {position} are not {k} of {experts} experts.");
+                    r.CopyTo(ids, (step.First[s] + i) * k);
+                }
+            return step.InputI32(ids, k, step.Rows);
+        }
+
+        /// <summary>The request whose slot <paramref name="slot"/> is (its caches), or null for the primary cache's.</summary>
+        private string RequestOfSlot(Slot slot)
+        {
+            if (_slots != null)
+                foreach (KeyValuePair<string, Slot> e in _slots)
+                    if (ReferenceEquals(e.Value.K, slot.K)) return e.Key;
+            return _activeKey != null && ReferenceEquals(slot.K, _cacheK) ? _activeKey : null;
+        }
+
+        /// <summary>For <see cref="DeviceRoutesForTests"/>: layer <paramref name="layer"/>'s routes <paramref name="selected"/>
+        /// (I32 [K, rows]) and the scores they were picked by (<paramref name="scores"/> [experts, rows]) as outputs. The ids
+        /// leave as F32 values gathered from 0 .. experts - 1, which every executor reads back alike (an I32 output is its bits
+        /// on GGML, its values on the managed executor). Nothing when the seam is unset.</summary>
+        protected void EmitDeviceRoutes(GraphStep step, int layer, int selected, int scores, int k, int experts)
+        {
+            if (DeviceRoutesForTests == null) return;
+            int rows = step.Rows;
+            var iota = new float[(long)experts * rows];
+            for (int i = 0; i < iota.Length; i++) iota[i] = i % experts;
+            int table = step.ConstantInputF32(iota, 1, experts, rows);
+            int ids = step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.GetRows, table, selected)), (long)k * rows);
+            step.RecordRouteOutputs(layer, ids, step.Output(step.Op(GraphOp.Cont, scores), (long)experts * rows));
+        }
+
         private int EmitMoe(GraphStep step, int layer, int x)
         {
             string p = LayerName(layer, "");
@@ -3129,6 +3208,15 @@ namespace TensorSharp.Models
 
             /// <summary>The route outputs this emission recorded (null: none).</summary>
             internal (int Output, int Layer)[] Routes => _routes?.ToArray();
+
+            /// <summary>Tests: outputs <paramref name="ids"/> and <paramref name="scores"/> hold layer <paramref name="layer"/>'s
+            /// routes and router scores (<see cref="EmitDeviceRoutes"/>).</summary>
+            internal void RecordRouteOutputs(int layer, int ids, int scores) => (_routeOutputs ??= new()).Add((layer, ids, scores));
+
+            private List<(int Layer, int Ids, int Scores)> _routeOutputs;
+
+            /// <summary>The outputs <see cref="RecordRouteOutputs"/> recorded (null: none).</summary>
+            internal (int Layer, int Ids, int Scores)[] RouteOutputs => _routeOutputs?.ToArray();
 
             // ---- leaves
 

@@ -82,7 +82,18 @@ internal sealed class Inkling2Reference
         /// <summary>Output logits before the softcap: the largest |z| and the sum of |z| / cap.</summary>
         public double MaxAbsPreSoftcap, PreSoftcapRatioSum;
         public long LogitCount;
+        /// <summary>Set (not null), every token routing: its position, layer run, chosen experts and selection scores.</summary>
+        public List<Routing> RoutingLog;
     }
+
+    /// <summary>One token's routing in one layer run (the runtime's layer index: <see cref="Schedule"/>'s order): the chosen
+    /// experts and the scores they were picked by (sigmoid probability plus exp_probs_b, per expert).</summary>
+    public sealed record Routing(int Position, int Run, int[] Chosen, double[] Scores);
+
+    /// <summary>Set, a routing takes the experts this gives for (position, layer run) instead of its top-k (null: the top-k);
+    /// the weights are still the chosen experts' normalized probabilities. Tests run the reference along the routes a
+    /// device picked.</summary>
+    public Func<int, int, int[]> RouteOverride { get; set; }
 
     private static readonly string[] CtrlNames = { "q", "k", "v", "ffn" };
     private const double MixEps = 1e-6;   // ggml_rms_norm(..., 1e-6f) in mix() and control()
@@ -345,13 +356,14 @@ internal sealed class Inkling2Reference
         }
 
         var blocks = new List<double[][]>();
+        int run = 0;   // the layer run: the runtime's layer index
         if (!c.Looped)
         {
-            for (int l = 0; l < c.Layers; l++) cur = Layer(state.Slots[l], l, cur, blocks, null, null, p0, counters);
+            for (int l = 0; l < c.Layers; l++) cur = Layer(state.Slots[l], l, cur, blocks, null, null, p0, counters, run++);
         }
         else
         {
-            for (int l = 0; l < c.LoopStart; l++) cur = Layer(state.Slots[l], l, cur, blocks, null, null, p0, counters);
+            for (int l = 0; l < c.LoopStart; l++) cur = Layer(state.Slots[l], l, cur, blocks, null, null, p0, counters, run++);
             // every pass starts from the prelude output and blocks
             double[][] prelude = cur;
             var preludeBlocks = new List<double[][]>(blocks);
@@ -368,9 +380,9 @@ internal sealed class Inkling2Reference
                     blocks = new List<double[][]>(preludeBlocks);
                 }
                 for (int ip = c.LoopStart; ip < c.LoopEnd; ip++)
-                    cur = Layer(state.Slots[Slot(pass, ip)], ip, cur, blocks, bank, bankOut, p0, counters);
+                    cur = Layer(state.Slots[Slot(pass, ip)], ip, cur, blocks, bank, bankOut, p0, counters, run++);
             }
-            for (int l = c.LoopEnd; l < c.Layers; l++) cur = Layer(state.Slots[l], l, cur, blocks, null, null, p0, counters);
+            for (int l = c.LoopEnd; l < c.Layers; l++) cur = Layer(state.Slots[l], l, cur, blocks, null, null, p0, counters, run++);
         }
 
         // output: mix, norm, lm_head, softcap, drop the padded vocabulary
@@ -402,7 +414,7 @@ internal sealed class Inkling2Reference
     /// <summary>Physical layer <paramref name="l"/> over the chunk (llama.cpp's build_layer with ip = l), its state in
     /// <paramref name="st"/>; with a bank, a later loop pass that reads messages.</summary>
     private double[][] Layer(SlotState st, int l, double[][] cur, List<double[][]> blocks, List<double[][]> bank, double[][] bankOut,
-        int p0, Counters counters)
+        int p0, Counters counters, int run)
     {
         var c = Cfg;
         string p = $"blk.{l}.";
@@ -591,7 +603,7 @@ internal sealed class Inkling2Reference
             double[] x = Mix(BlocksAt(blocks, t), ffnInp[t], ffnQuery, 1)[0];
             if (messages != null) x = Control(x, messages[t][3], p, 3);
             x = RmsNorm(x, W(p + "ffn_norm.weight"), c.Eps);
-            moe[t] = Moe(p, x, counters);
+            moe[t] = Moe(p, x, counters, p0 + t, run);
         }
         double[][] ffnOut = Convolve(moe, ref st.ConvFfn, W(p + "ffn_post_conv.weight"), null, 1);
         var result = new double[T][];
@@ -603,7 +615,7 @@ internal sealed class Inkling2Reference
     /// Sigmoid routing (F32 router in llama.cpp), top-k by p + exp_probs_b (the bias selects only), weights
     /// p / (sum + 1e-20) * expert_weights_scale, SITU on the fused gate_up (gate = the first ff rows), down, weighted sum.
     /// </summary>
-    private double[] Moe(string p, double[] x, Counters counters)
+    private double[] Moe(string p, double[] x, Counters counters, int position, int run)
     {
         var c = Cfg;
         int H = c.Hidden, E = c.Experts, ff = c.ExpertFf, k = c.ExpertsUsed;
@@ -616,7 +628,10 @@ internal sealed class Inkling2Reference
             probs[e] = Sigmoid(logits[e]);
             selection[e] = probs[e] + b[e];
         }
-        int[] chosen = TopK(selection, k);
+        int[] chosen = RouteOverride?.Invoke(position, run) ?? TopK(selection, k);
+        if (chosen.Length != k || chosen.Distinct().Count() != k || chosen.Any(e => e < 0 || e >= E))
+            throw new ArgumentException($"routing at position {position}, run {run}: {k} distinct experts below {E} expected");
+        counters.RoutingLog?.Add(new Routing(position, run, chosen, selection));
         int[] unbiased = TopK(probs, k);
         counters.Routings++;
         if (!chosen.OrderBy(e => e).SequenceEqual(unbiased.OrderBy(e => e))) counters.RoutingsChangedByBias++;

@@ -18,15 +18,22 @@ namespace InferenceWeb.Tests;
 /// </summary>
 internal static class SlotParity
 {
-    public static void AssertBatchedSlotsMatchAlone(Func<ModelBase> create, double tolerance, string label)
+    /// <summary>The requests' ids in the batched model, their prompts and the tokens each then decodes one at a time.</summary>
+    public static readonly string[] RequestIds = { "a", "b", "c" };
+
+    public static readonly int[][] Prompts =
     {
-        int[][] prompts =
-        {
-            Enumerable.Range(0, 19).Select(i => 65 + (i * 7) % 50).ToArray(),
-            Enumerable.Range(0, 6).Select(i => 97 + (i * 5) % 26).ToArray(),
-            Enumerable.Range(0, 13).Select(i => 48 + (i * 3) % 10).ToArray(),
-        };
-        int[][] decode = { new[] { 11, 12, 13, 14 }, new[] { 21, 22, 23, 24 }, new[] { 31, 32, 33, 34 } };
+        Enumerable.Range(0, 19).Select(i => 65 + (i * 7) % 50).ToArray(),
+        Enumerable.Range(0, 6).Select(i => 97 + (i * 5) % 26).ToArray(),
+        Enumerable.Range(0, 13).Select(i => 48 + (i * 3) % 10).ToArray(),
+    };
+
+    public static readonly int[][] DecodeTokens = { new[] { 11, 12, 13, 14 }, new[] { 21, 22, 23, 24 }, new[] { 31, 32, 33, 34 } };
+
+    /// <param name="beforeAlone">Called with each request's index before it runs alone on the primary cache (no request bound).</param>
+    public static void AssertBatchedSlotsMatchAlone(Func<ModelBase> create, double tolerance, string label, Action<int> beforeAlone = null)
+    {
+        int[][] prompts = Prompts, decode = DecodeTokens;
 
         // Alone: each request on the primary cache, prefill then one token at a time.
         var alone = new List<float[]>[prompts.Length];
@@ -34,6 +41,7 @@ internal static class SlotParity
         {
             for (int s = 0; s < prompts.Length; s++)
             {
+                beforeAlone?.Invoke(s);
                 reference.ResetKVCache();
                 alone[s] = new List<float[]> { (float[])reference.Forward(prompts[s]).Clone() };
                 foreach (int token in decode[s])
@@ -44,7 +52,7 @@ internal static class SlotParity
         using ModelBase model = create();
         var slots = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
         Assert.True(slots.SupportsPerSequenceFusedForward);
-        string[] ids = { "a", "b", "c" };
+        string[] ids = RequestIds;
         foreach (string id in ids)
             Assert.True(slots.BindSequenceCache(id), "a new request gets a fresh slot");
 

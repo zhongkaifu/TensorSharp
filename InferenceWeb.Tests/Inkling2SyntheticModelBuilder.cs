@@ -16,7 +16,8 @@ namespace InferenceWeb.Tests;
 /// The default dims are chosen so a prompt of ~20 tokens reaches every mechanism: the window (6) slides, distances past
 /// the global layers' extent (8) hit the zero column, tau departs from 1 at position 4 (floor 4), the clips cut some rows
 /// and not others, the selection bias changes some routings, and the loop core [2, 6) runs three passes. Weights depend
-/// only on their names (<see cref="SyntheticGguf.Gen"/>), so the loop and plain variants share every tensor they both have.
+/// only on their names and <see cref="Seed"/> (<see cref="SyntheticGguf.Gen"/>), so the loop and plain variants share every
+/// tensor they both have.
 /// </para>
 /// </summary>
 internal sealed class Inkling2SyntheticModelBuilder
@@ -75,6 +76,13 @@ internal sealed class Inkling2SyntheticModelBuilder
     /// of the core.</summary>
     public int Slots => Layers + (Looped ? (LoopCount - 1) * (LoopEnd - LoopStart) : 0);
 
+    /// <summary>0: every tensor's values are seeded by its name (the fixture every test so far used); otherwise by its name
+    /// salted with the seed, for a sample of fixtures of the same shape.</summary>
+    public int Seed { get; init; }
+
+    /// <summary>exp_probs_b's scale: -1 negates the selection bias, a routing slip the route checks must catch.</summary>
+    public float ExpertBiasScale { get; init; } = 1f;
+
     /// <summary>Every tensor with its F32 values, as <see cref="Write"/> stores them.</summary>
     public List<Tensor> Tensors()
     {
@@ -82,62 +90,72 @@ internal sealed class Inkling2SyntheticModelBuilder
         int H = Hidden, d = HeadDim, taps = ConvTaps, rel = RelativeLength;
         var t = new List<Tensor>
         {
-            Gen("token_embd.weight", 1.0f, H, VocabPadded),
-            GenAround("token_embd_norm.weight", 1f, 0.1f, H),
-            Gen("output.weight", 1.0f, H, VocabPadded),
-            GenAround("output_norm.weight", 1f, 0.1f, H),
-            Gen("output_res_query.weight", 2.0f, H),
+            G("token_embd.weight", 1.0f, H, VocabPadded),
+            GA("token_embd_norm.weight", 1f, 0.1f, H),
+            G("output.weight", 1.0f, H, VocabPadded),
+            GA("output_norm.weight", 1f, 0.1f, H),
+            G("output_res_query.weight", 2.0f, H),
         };
         for (int l = 0; l < Layers; l++)
         {
             string p = $"blk.{l}.";
             int qd = Heads * d, kvd = KvHeads * d;
-            t.Add(Gen(p + "attn_q.weight", 0.25f, H, qd));
-            t.Add(Gen(p + "attn_k.weight", 0.5f, H, kvd));
-            t.Add(Gen(p + "attn_v.weight", 0.3f, H, kvd));
-            t.Add(Gen(p + "attn_output.weight", 0.6f, qd, H));
-            t.Add(Gen(p + "attn_gate.weight", 0.3f, H, qd));
-            t.Add(GenAround(p + "attn_q_clip.weight", 1f, 0.3f, d, Heads));
-            t.Add(Gen(p + "attn_sink_proj.weight", 0.3f, H, Heads));
-            t.Add(Gen(p + "attn_rel.weight", 0.4f, H, rel * Heads));
-            t.Add(Gen(p + "attn_rel_bias.weight", 1.0f, rel, Extent(l)));
-            t.Add(GenAround(p + "attn_rel_clip.weight", 1f, 0.3f, rel, Heads));
-            t.Add(Gen(p + "attn_k_conv.weight", 0.5f, taps, kvd));
-            t.Add(Gen(p + "attn_v_conv.weight", 0.5f, taps, kvd));
-            t.Add(Gen(p + "attn_post_conv.weight", 0.5f, taps, H));
-            t.Add(Gen(p + "ffn_post_conv.weight", 0.5f, taps, H));
+            t.Add(G(p + "attn_q.weight", 0.25f, H, qd));
+            t.Add(G(p + "attn_k.weight", 0.5f, H, kvd));
+            t.Add(G(p + "attn_v.weight", 0.3f, H, kvd));
+            t.Add(G(p + "attn_output.weight", 0.6f, qd, H));
+            t.Add(G(p + "attn_gate.weight", 0.3f, H, qd));
+            t.Add(GA(p + "attn_q_clip.weight", 1f, 0.3f, d, Heads));
+            t.Add(G(p + "attn_sink_proj.weight", 0.3f, H, Heads));
+            t.Add(G(p + "attn_rel.weight", 0.4f, H, rel * Heads));
+            t.Add(G(p + "attn_rel_bias.weight", 1.0f, rel, Extent(l)));
+            t.Add(GA(p + "attn_rel_clip.weight", 1f, 0.3f, rel, Heads));
+            t.Add(G(p + "attn_k_conv.weight", 0.5f, taps, kvd));
+            t.Add(G(p + "attn_v_conv.weight", 0.5f, taps, kvd));
+            t.Add(G(p + "attn_post_conv.weight", 0.5f, taps, H));
+            t.Add(G(p + "ffn_post_conv.weight", 0.5f, taps, H));
             if (IsSliding(l))
             {
-                t.Add(GenAround(p + "attn_norm.weight", 1f, 0.1f, H));
+                t.Add(GA(p + "attn_norm.weight", 1f, 0.1f, H));
             }
             else
             {
-                t.Add(GenAround(p + "attn_q_inp_norm.weight", 1f, 0.1f, H));
-                t.Add(GenAround(p + "attn_k_inp_norm.weight", 1f, 0.1f, H));
-                t.Add(GenAround(p + "attn_v_inp_norm.weight", 1f, 0.1f, H));
-                t.Add(Gen(p + "attn_k_conv_proj.weight", 0.1f, H, taps * KvHeads));
-                t.Add(Gen(p + "attn_v_conv_proj.weight", 0.1f, H, taps * KvHeads));
+                t.Add(GA(p + "attn_q_inp_norm.weight", 1f, 0.1f, H));
+                t.Add(GA(p + "attn_k_inp_norm.weight", 1f, 0.1f, H));
+                t.Add(GA(p + "attn_v_inp_norm.weight", 1f, 0.1f, H));
+                t.Add(G(p + "attn_k_conv_proj.weight", 0.1f, H, taps * KvHeads));
+                t.Add(G(p + "attn_v_conv_proj.weight", 0.1f, H, taps * KvHeads));
             }
             if (l > 0)
-                t.Add(IsSliding(l) ? Gen(p + "attn_res_query.weight", 2.0f, H) : Gen(p + "attn_res_query.weight", 2.0f, H, 3));
-            t.Add(Gen(p + "ffn_res_query.weight", 2.0f, H));
-            t.Add(GenAround(p + "ffn_norm.weight", 1f, 0.1f, H));
-            t.Add(Gen(p + "ffn_gate_inp.weight", 0.3f, H, Experts));
-            t.Add(Gen(p + "exp_probs_b.bias", 0.15f, Experts));
-            t.Add(Gen(p + "ffn_gate_up_exps.weight", 0.3f, H, 2 * ExpertFf, Experts));
-            t.Add(Gen(p + "ffn_down_exps.weight", 0.3f, ExpertFf, H, Experts));
+                t.Add(IsSliding(l) ? G(p + "attn_res_query.weight", 2.0f, H) : G(p + "attn_res_query.weight", 2.0f, H, 3));
+            t.Add(G(p + "ffn_res_query.weight", 2.0f, H));
+            t.Add(GA(p + "ffn_norm.weight", 1f, 0.1f, H));
+            t.Add(G(p + "ffn_gate_inp.weight", 0.3f, H, Experts));
+            t.Add(G(p + "exp_probs_b.bias", 0.15f * ExpertBiasScale, Experts));
+            t.Add(G(p + "ffn_gate_up_exps.weight", 0.3f, H, 2 * ExpertFf, Experts));
+            t.Add(G(p + "ffn_down_exps.weight", 0.3f, ExpertFf, H, Experts));
             if (IsLoopCore(l))
             {
-                t.Add(Gen(p + "loop_msg_query.weight", 2.0f, H, 4));
+                t.Add(G(p + "loop_msg_query.weight", 2.0f, H, 4));
                 foreach (string c in new[] { "q", "k", "v", "ffn" })
                 {
-                    t.Add(Gen(p + $"loop_{c}_ctrl_down.weight", 0.15f, 2 * H, GateRank));
-                    t.Add(Gen(p + $"loop_{c}_ctrl_gain.weight", 0.5f, GateRank, H));
-                    t.Add(Gen(p + $"loop_{c}_ctrl_forget.weight", 0.5f, GateRank, H));
+                    t.Add(G(p + $"loop_{c}_ctrl_down.weight", 0.15f, 2 * H, GateRank));
+                    t.Add(G(p + $"loop_{c}_ctrl_gain.weight", 0.5f, GateRank, H));
+                    t.Add(G(p + $"loop_{c}_ctrl_forget.weight", 0.5f, GateRank, H));
                 }
             }
         }
         return t;
+
+        // Seed 0: the values come from the names alone; another seed salts each name (the tensor keeps its own).
+        Tensor G(string name, float scale, params int[] dims) => Named(Gen(Salted(name), scale, dims), name);
+        Tensor GA(string name, float center, float scale, params int[] dims) => Named(GenAround(Salted(name), center, scale, dims), name);
+        string Salted(string name) => Seed == 0 ? name : $"{name}#seed{Seed}";
+        static Tensor Named(Tensor tensor, string name)
+        {
+            tensor.Name = name;
+            return tensor;
+        }
     }
 
     /// <summary>The metadata, keyed as convert_hf_to_gguf writes the real checkpoint (prefix = the architecture).</summary>

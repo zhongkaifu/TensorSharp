@@ -504,7 +504,9 @@ namespace TensorSharp.Models
             int logits = step.MatMul(LayerName(layer, "ffn_gate_inp.weight"), x);                                     // [E, rows]
             int probs = step.Op(GraphOp.Sigmoid, logits);
             int selection = step.Op(GraphOp.Add, probs, step.Weight(LayerName(layer, "exp_probs_b.bias")));
-            int selected = step.Op(GraphOp.TopK, stackalloc[] { selection }, stackalloc long[] { k });               // [K, rows]
+            int forced = EmitForcedRoutes(step, layer, k, experts);                                                  // tests
+            int selected = forced >= 0 ? forced : step.Op(GraphOp.TopK, stackalloc[] { selection }, stackalloc long[] { k });   // [K, rows]
+            EmitDeviceRoutes(step, layer, selected, selection, k, experts);                                          // tests
             int picked = step.Reshape(step.Op(GraphOp.GetRows, step.Reshape(probs, 1, experts, rows), selected), k, rows);
             int sum = step.Op(GraphOp.ScaleBias, stackalloc[] { step.Op(GraphOp.SumRows, picked) }, default, stackalloc[] { 1f, 1e-20f });
             int weights = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Div, picked, sum) }, default, stackalloc[] { _expertScale });
