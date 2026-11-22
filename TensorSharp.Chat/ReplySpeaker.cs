@@ -39,6 +39,7 @@ namespace TensorSharp.Server
             new UnboundedChannelOptions { SingleReader = false, SingleWriter = true });
         private readonly CancellationTokenSource _cancel;
         private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private readonly Func<double> _now;
         private readonly object _gate = new();
         private readonly List<string> _spoken = new();
         private bool _closed;
@@ -46,14 +47,51 @@ namespace TensorSharp.Server
 
         /// <param name="speak">Speaks one piece (its text, its index in the reply): audio updates, then a terminal update
         /// with the piece's frames.</param>
+        /// <param name="maxLeadSeconds">While the text is still being written, start the next piece only once the speech
+        /// made so far is less than this far ahead of its playback (estimated from the first audio on, as a listener hears
+        /// it); null speaks every piece as soon as it is cut. Speech and text share the engine, so speech made far ahead of
+        /// the listener only slows the text down.</param>
         public ReplySpeaker(Func<string, int, CancellationToken, IAsyncEnumerable<ChatStreamUpdate>> speak,
-            SpeechTextSegmenter segmenter, CancellationToken cancellationToken)
+            SpeechTextSegmenter segmenter, CancellationToken cancellationToken, double? maxLeadSeconds = null)
+            : this(speak, segmenter, cancellationToken, maxLeadSeconds, null)
         {
+        }
+
+        /// <summary>The cap a web chat's spoken turn uses (WebUiChatService): enough lead to ride out a sentence boundary on
+        /// a phone, little enough that the text keeps most of the engine.</summary>
+        public const double DefaultMaxLeadSeconds = 3.0;
+
+        /// <param name="clockMs">Test seam: the speaker's clock in milliseconds (a Stopwatch by default).</param>
+        internal ReplySpeaker(Func<string, int, CancellationToken, IAsyncEnumerable<ChatStreamUpdate>> speak,
+            SpeechTextSegmenter segmenter, CancellationToken cancellationToken, double? maxLeadSeconds, Func<double> clockMs)
+        {
+            _now = clockMs ?? (() => _clock.Elapsed.TotalMilliseconds);
             _speak = speak ?? throw new ArgumentNullException(nameof(speak));
             _segmenter = segmenter ?? new SpeechTextSegmenter();
             _cancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            if (maxLeadSeconds is double cap && !(cap > 0)) throw new ArgumentOutOfRangeException(nameof(maxLeadSeconds), "more than 0");
+            MaxLeadSeconds = maxLeadSeconds;
             Completion = Task.Run(SpeakAsync, CancellationToken.None);
         }
+
+        /// <summary>See the constructor: how far ahead of its playback the speech may run while the text is written.</summary>
+        public double? MaxLeadSeconds { get; }
+
+        /// <summary>How far the speech made so far is ahead of its playback: seconds of audio made, less the time since the
+        /// first audio (when a listener started hearing it). 0 before the first audio.</summary>
+        public double LeadSeconds
+        {
+            get
+            {
+                if (FirstAudioMs < 0 || SampleRate <= 0) return 0;
+                return Samples / (double)SampleRate - (_now() - FirstAudioMs) / 1000.0;
+            }
+        }
+
+        /// <summary>Time spent holding pieces back for <see cref="MaxLeadSeconds"/>, in milliseconds.</summary>
+        public double HeldMs { get; private set; }
+
+        private volatile bool _textDone;
 
         /// <summary>Every piece spoken (after <see cref="Complete"/>), the speech's error, or its cancellation.</summary>
         public Task Completion { get; }
@@ -103,7 +141,7 @@ namespace TensorSharp.Server
             lock (_gate)
             {
                 if (_closed) return;
-                foreach (string piece in _segmenter.Append(text)) _pieces.Writer.TryWrite((piece, _clock.Elapsed.TotalMilliseconds));
+                foreach (string piece in _segmenter.Append(text)) _pieces.Writer.TryWrite((piece, _now()));
             }
         }
 
@@ -123,7 +161,7 @@ namespace TensorSharp.Server
             lock (_gate)
             {
                 if (_closed) return;
-                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite((piece, _clock.Elapsed.TotalMilliseconds));
+                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite((piece, _now()));
             }
         }
 
@@ -134,7 +172,8 @@ namespace TensorSharp.Server
             {
                 if (_closed) return;
                 _closed = true;
-                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite((piece, _clock.Elapsed.TotalMilliseconds));
+                _textDone = true;
+                foreach (string piece in _segmenter.Flush()) _pieces.Writer.TryWrite((piece, _now()));
                 _pieces.Writer.TryComplete();
             }
         }
@@ -168,7 +207,16 @@ namespace TensorSharp.Server
                 int index = 0;
                 await foreach ((string piece, double queuedMs) in _pieces.Reader.ReadAllAsync(token).ConfigureAwait(false))
                 {
-                    double startMs = _clock.Elapsed.TotalMilliseconds, firstMs = -1, lastMs = -1;
+                    // Far enough ahead of the listener while the text is still being written: let the text have the engine
+                    // until the lead is down to the cap (the rest of a reply whose text is done is spoken at once).
+                    if (MaxLeadSeconds is double cap)
+                    {
+                        double held = _now();
+                        while (!_textDone && LeadSeconds > cap)
+                            await Task.Delay(TimeSpan.FromMilliseconds(Math.Clamp((LeadSeconds - cap) * 1000, 20, 250)), token).ConfigureAwait(false);
+                        HeldMs += _now() - held;
+                    }
+                    double startMs = _now(), firstMs = -1, lastMs = -1;
                     long samplesBefore = Samples;
                     await foreach (ChatStreamUpdate update in _speak(piece, index, token).WithCancellation(token).ConfigureAwait(false))
                     {
@@ -179,7 +227,7 @@ namespace TensorSharp.Server
                             continue;
                         }
                         if (update.Audio is not { Length: > 0 } samples) continue;
-                        lastMs = _clock.Elapsed.TotalMilliseconds;
+                        lastMs = _now();
                         if (firstMs < 0) firstMs = lastMs;
                         if (FirstAudioMs < 0) FirstAudioMs = firstMs;
                         Samples += samples.Length;
@@ -187,7 +235,7 @@ namespace TensorSharp.Server
                         _audio.Writer.TryWrite(update);
                     }
                     lock (_timings)
-                        _timings.Add(new PieceTiming(index, piece.Length, queuedMs, startMs, firstMs, lastMs, _clock.Elapsed.TotalMilliseconds,
+                        _timings.Add(new PieceTiming(index, piece.Length, queuedMs, startMs, firstMs, lastMs, _now(),
                             (Samples - samplesBefore) / (double)Math.Max(1, SampleRate)));
                     lock (_spoken) _spoken.Add(piece);
                     Pieces = ++index;

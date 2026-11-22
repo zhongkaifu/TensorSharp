@@ -3857,8 +3857,10 @@ namespace TensorSharp.Chat
                     LogContent.Of(string.Join(" | ", spoken.Speaker.Spoken)));
                 // When each piece was cut, started, first heard and done (ms from the speech's start): a reply whose speech
                 // fell behind its playback shows here as a piece that started late or ran slower than its audio.
-                webUiLogger.LogInformation(LogEventIds.ChatCompleted, "/api/chat spoken turn pieces: session={SessionId} {Pieces}",
-                    chatSession.Id, string.Join("; ", spoken.Speaker.Timings));
+                webUiLogger.LogInformation(LogEventIds.ChatCompleted,
+                    "/api/chat spoken turn pieces: session={SessionId} maxLead={MaxLead} heldMs={HeldMs:F0} {Pieces}",
+                    chatSession.Id, spoken.Speaker.MaxLeadSeconds?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none",
+                    spoken.Speaker.HeldMs, string.Join("; ", spoken.Speaker.Timings));
             }
             foreach (object frame in finalFrames)
                 yield return frame;
@@ -3907,9 +3909,17 @@ namespace TensorSharp.Chat
                     Voice = options.Voice,
                     Language = speaker.SpeechLanguageOf(piece, language),
                 }, ct),
-                new TensorSharp.Models.Audio.SpeechTextSegmenter(), cancellationToken);
+                new TensorSharp.Models.Audio.SpeechTextSegmenter(), cancellationToken, SpeechMaxLeadSeconds);
             return new WebUiSpokenTurn(replySpeaker, language);
         }
+
+        /// <summary>
+        /// How far ahead of its playback a spoken web turn's speech may run while the text is still being written
+        /// (<see cref="ReplySpeaker.MaxLeadSeconds"/>): <see cref="ReplySpeaker.DefaultMaxLeadSeconds"/>. Speech and text
+        /// share the engine, and speech made far ahead of the listener only slowed the text; null (a test seam) speaks every
+        /// piece as soon as it is cut.
+        /// </summary>
+        internal double? SpeechMaxLeadSeconds { get; set; } = ReplySpeaker.DefaultMaxLeadSeconds;
 
         /// <summary>
         /// A finished spoken turn's audio: the whole of it as one WAV under the uploads (named by when it was spoken, the name
