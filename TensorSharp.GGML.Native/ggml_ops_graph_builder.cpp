@@ -569,6 +569,47 @@ namespace
         return ggml_mul_mat(g->ctx, w, x);
     }
 
+    // The routes a row picks that ggml-metal's matrix-matrix expert product has a kernel for: kernel_mul_mm_id_map0_ne20_N
+    // exists for these N only (src/ggml-metal/kernels/mul_mm.metal at d9fe7bf), its supports_op does not look at N, and a
+    // product of another N on that path aborts the process when it is encoded ("kernel not found"), as top-3 routing did.
+    bool metal_mul_mm_id_routes(std::int64_t n)
+    {
+        switch (n)
+        {
+        case 1: case 2: case 4: case 5: case 6: case 8: case 9: case 10: case 16: case 22: return true;
+        default: return false;
+        }
+    }
+
+    // ggml-metal takes the matrix-matrix path for a product of experts (ggml_metal_op_mul_mat_id_use_mm at d9fe7bf) from
+    // 32 rows of routes on, over experts of 64 columns or more and at most 1024 of them; below it the mat-vec kernels take
+    // any number of routes.
+    bool metal_mul_mm_id_path(const ggml_tensor* as, const ggml_tensor* ids)
+    {
+        return as->ne[0] >= 64 && as->ne[2] <= 1024 && ids->ne[1] >= 32;
+    }
+
+    /// The product of experts (ggml_mul_mat_id: as [ne0, ne1, experts], b [ne0, 1 or routes, rows], ids [routes, rows]).
+    /// On ggml-metal, where its matrix-matrix path has no kernel for the number of routes a row picks, every (route, row)
+    /// runs as a row of its own with one route: ids [1, routes x rows], each its own input row (a per-route input as it
+    /// lies, a shared one repeated for its routes), and the result [ne1, 1, routes x rows] is [ne1, routes, rows] as it
+    /// lies. ggml-metal's kernel tiles a product's (route, row) entries by expert whatever the routes a row, so each is the
+    /// same dot products over the same expert: the result is the one product's, at the one product's tiles. Everywhere
+    /// else, and for the numbers the kernels exist for, the one product.
+    ggml_tensor* experts_product(TsgGraph* g, ggml_tensor* as, ggml_tensor* b, ggml_tensor* ids)
+    {
+        ggml_context* ctx = g->ctx;
+        const std::int64_t routes = ids->ne[0], rows = ids->ne[1];
+        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL || metal_mul_mm_id_routes(routes) || !metal_mul_mm_id_path(as, ids)
+            || (b->ne[1] != 1 && b->ne[1] != routes))
+            return ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_tensor* flat_ids = ggml_reshape_2d(ctx, ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids), 1, routes * rows);
+        ggml_tensor* inputs = b->ne[1] == 1 ? ggml_repeat_4d(ctx, b, b->ne[0], routes, rows, 1)
+            : ggml_is_contiguous(b) ? b : ggml_cont(ctx, b);
+        ggml_tensor* r = ggml_mul_mat_id(ctx, as, ggml_reshape_3d(ctx, inputs, b->ne[0], 1, routes * rows), flat_ids);
+        return ggml_reshape_3d(ctx, r, r->ne[0], routes, rows);
+    }
+
     /// Routed experts from host memory (tsg::HostMoeSegment): the graph pauses after the router's outputs, the
     /// host computes the experts into moe_out, and an accelerator tier registered for the gate stack
     /// (ggml_ops_moe_hot_tier.cpp) runs the routes it holds in the next segment.
@@ -915,7 +956,7 @@ namespace
             if (ipar(0, 0) != 0) ggml_prec_set_acc(r, static_cast<ggml_prec>(ipar(0, 0)));
             return r;
         }
-        case OP_MUL_MAT_ID: need(3); return ggml_mul_mat_id(ctx, src(0), src(1), src(2));
+        case OP_MUL_MAT_ID: need(3); return experts_product(g, src(0), src(1), src(2));
         case OP_SILU: need(1); return ggml_silu(ctx, src(0));
         case OP_GELU: need(1); return ggml_gelu(ctx, src(0));
         case OP_GELU_QUICK: need(1); return ggml_gelu_quick(ctx, src(0));

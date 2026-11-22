@@ -101,6 +101,129 @@ public sealed class NetworkGraphSpeechFoundationTests
         if (lane.Graph.Executor.Capabilities.Replays) Assert.Equal(1, lane.Graph.Builds);
     }
 
+    /// <summary>Routes a row, rows, and whether each route has its own input row (a down projection's) or all share one.</summary>
+    public static IEnumerable<object[]> RouteCounts =>
+        from routes in new[] { 3, 7, 25 }
+        from rows in new[] { 4, 40 }
+        from perRoute in new[] { false, true }
+        select new object[] { routes, rows, perRoute };
+
+    [Theory]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountManaged(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.Managed, routes, rows, perRoute);
+
+    [Theory]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountReference(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.Reference, routes, rows, perRoute);
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountGgmlCpu(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.GgmlCpu, routes, rows, perRoute);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountGgmlMetal(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.GgmlMetal, routes, rows, perRoute);
+
+    [MlxTheory]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountMlx(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.Mlx, routes, rows, perRoute);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountGgmlCuda(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.GgmlCuda, routes, rows, perRoute);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountGgmlVulkan(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.GgmlVulkan, routes, rows, perRoute);
+
+    [CudaTheory]
+    [MemberData(nameof(RouteCounts))]
+    public void ExpertsAtAnyRouteCountDirectCuda(int routes, int rows, bool perRoute) => ExpertsAtAnyRouteCount(Lane.Cuda, routes, rows, perRoute);
+
+    /// <summary>A product over 3, 7 or 25 routes a row: ggml-metal's matrix-matrix expert kernels, which it takes from 32
+    /// rows over experts of 64 columns, exist for some route counts only (1, 2, 4, 5, 6, 8, 9, 10, 16, 22), and a program
+    /// with another count had aborted the process (Inkling 2's synthetic top-3 routing); the graph builder runs it there
+    /// with every (route, row) a row of its own with one route. 4 rows run on the mat-vec kernels, 40 on that path; each
+    /// (route, row) is checked against the matrix it picks of an F16 table of 32 [64 x 40] matrices (a row's routes all
+    /// different, as a router's top-k are: ggml-cuda asserts it). That computes what the one product does, bit for bit: on
+    /// ggml-metal it equals the routes' one-route products; on ggml_cpu, where one product takes every count, it equals
+    /// the routes' groups run as products of their own.</summary>
+    private static void ExpertsAtAnyRouteCount(Lane laneKind, int routes, int rows, bool perRoute)
+    {
+        using var lane = new LaneContext(laneKind);
+        const int Width = 64, Out = 40, Count = 32;
+        var rng = new Random(57 + 100 * routes + rows + (perRoute ? 1000 : 0));
+        MakeProductWeight(lane.Weights, "table", GraphFormat.F16, Width, Out * Count, rng);
+        float[] table = lane.Weights.ReadF32("table");
+        int inputs = perRoute ? routes : 1;
+        float[] x = Rand(rng, Width * inputs * rows);
+        var ids = new int[routes * rows];
+        for (int t = 0; t < rows; t++)
+        {
+            int[] order = Enumerable.Range(0, Count).OrderBy(_ => rng.Next()).ToArray();
+            Array.Copy(order, 0, ids, t * routes, routes);
+        }
+        if (!lane.Weights.Get("table").IsQuantized)
+        {
+            // Held dense on this backend (F16 on MLX): no stack is made (Experts).
+            lane.Graph.Run(b =>
+            {
+                Assert.False(b.Experts("table", Count).Valid);
+                b.Output(b.Input(x, Width, inputs * rows));
+            });
+            return;
+        }
+        float[] got = lane.Run(b => b.MulMatId(b.Experts("table", Count), b.Input(x, Width, inputs, rows), b.InputI32(ids, routes, rows)));
+        var expected = new float[Out * routes * rows];
+        for (int t = 0; t < rows; t++)
+            for (int j = 0; j < routes; j++)
+            {
+                int e = ids[t * routes + j], input = (t * inputs + (perRoute ? j : 0)) * Width;
+                for (int o = 0; o < Out; o++)
+                {
+                    double s = 0;
+                    for (int i = 0; i < Width; i++) s += (double)table[((long)e * Out + o) * Width + i] * x[input + i];
+                    expected[(t * routes + j) * Out + o] = (float)s;
+                }
+            }
+        string what = $"{laneKind} mul_mat_id over {routes} routes, {rows} rows{(perRoute ? ", an input a route" : "")}";
+        AssertClose(expected, got, 4e-3, what);
+        if (laneKind == Lane.GgmlMetal)
+            Assert.True(BitEqual(got, RouteGroups(lane, x, ids, routes, rows, inputs, Enumerable.Repeat(1, routes).ToArray())),
+                $"{what}: not bit for bit the one-route products");
+        else if (laneKind == Lane.GgmlCpu)
+            Assert.True(BitEqual(got, RouteGroups(lane, x, ids, routes, rows, inputs, routes switch { 3 => new[] { 2, 1 }, 7 => new[] { 6, 1 }, _ => new[] { 22, 3 } })),
+                $"{what}: not bit for bit its groups' products");
+    }
+
+    private static bool BitEqual(float[] a, float[] b)
+        => a.Length == b.Length && System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(a).SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(b));
+
+    /// <summary>The product of <see cref="ExpertsAtAnyRouteCount"/> as products of consecutive groups of routes of the given
+    /// sizes, each a program of its own, joined on the host into [out, routes, rows].</summary>
+    private static float[] RouteGroups(LaneContext lane, float[] x, int[] ids, int routes, int rows, int inputs, int[] groups)
+    {
+        const int Width = 64, Out = 40, Count = 32;
+        var result = new float[Out * routes * rows];
+        int first = 0;
+        foreach (int n in groups)
+        {
+            var groupIds = new int[n * rows];
+            var groupX = inputs == 1 ? x : new float[Width * n * rows];
+            for (int t = 0; t < rows; t++)
+            {
+                Array.Copy(ids, t * routes + first, groupIds, t * n, n);
+                if (inputs != 1) Array.Copy(x, (t * routes + first) * Width, groupX, t * n * Width, n * Width);
+            }
+            float[] part = lane.Run(b => b.MulMatId(b.Experts("table", Count), b.Input(groupX, Width, inputs == 1 ? 1 : n, rows),
+                b.InputI32(groupIds, n, rows)));
+            for (int t = 0; t < rows; t++) Array.Copy(part, t * n * Out, result, (t * routes + first) * Out, n * Out);
+            first += n;
+        }
+        Assert.Equal(routes, first);
+        return result;
+    }
+
     public static IEnumerable<object[]> AttentionKinds => new[] { "full", "sliding_prefix" }.Select(k => new object[] { k });
 
     [Theory]

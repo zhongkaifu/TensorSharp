@@ -964,6 +964,16 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   prompt, M5 Pro: 7.3-7.5 s before, 5.79-5.85 s after, `Qwen4ExpModel` 5.69-5.83 s (same text as before);
   Qwen3.5-0.8B perplexity 19.8009 for both paths, Qwen3.6-35B-A3B Q4_K_M 1,825 tokens 1.03 s against
   1.05 s.
+* **Products of experts on GGML (Metal):** ggml-metal's matrix-matrix `mul_mat_id`, which it takes from 32 rows over
+  experts of 64 columns or more, has kernels for 1, 2, 4, 5, 6, 8, 9, 10, 16 and 22 routes a row only. Its
+  `supports_op` does not check, and a product of another count aborts the process when it is encoded (Inkling 2's
+  synthetic top-3 did). The builder's `MulMatId` lowering (`experts_product`), which every family's expert products go
+  through, runs such a product with every (route, row) a row of its own with one route: ids `[1, routes x rows]`, a
+  per-route input as it lies or a shared one repeated for its routes, and the result `[ne1, routes, rows]` as it lies.
+  ggml-metal tiles a product's (route, row) entries by expert whatever the routes a row, so this is bit for bit the
+  routes' own products (`NetworkGraphSpeechFoundationTests.ExpertsAtAnyRouteCount*`). On an M5 Pro (Q8_0, 32 experts of
+  2304 x 2304, 512 rows) 7 routes take 3.26 ms against 3.08 for 8 and 3 routes 1.83 ms against 1.89 for 4. Every other
+  backend, the mat-vec path and the counts with kernels take one `ggml_mul_mat_id`.
 * **Diffusion-transformer regions on GGML (CUDA):** `AdaLnModulate`, `GatedResidual`, `TableRopeQkNorm` (the
   form that goes on through its attention), `LoraLinear` and a BF16/F16 `SwigluFfn` are served *inside* the
   graph in a program marked `WideTokenProducts`: the region becomes the DiT offload's `GGML_OP_CUSTOM` node
