@@ -107,6 +107,10 @@ public sealed class WebUiSpokenAgentTurnTests : IDisposable
         /// <summary>A plain reply a call (by its index) instead of the scripted tool round.</summary>
         public Func<int, string> PlainReply { get; init; }
 
+        /// <summary>A plain reply streamed piece by piece: its last piece is written only once the speech has made its first
+        /// audio (as a phone's engine writes the rest of a reply while the first sentence is being spoken).</summary>
+        public string[] PlainPieces { get; init; }
+
         public List<TurnCall> TurnCalls { get; } = new();
         public List<(List<ChatMessage> History, SpeechReplyOptions Speech)> DirectCalls { get; } = new();
         public List<TtsCall> TtsCalls { get; } = new();
@@ -128,6 +132,17 @@ public sealed class WebUiSpokenAgentTurnTests : IDisposable
         {
             TurnCalls.Add(new TurnCall(history, tools, enableThinking, skills));
             await Task.Yield();
+            if (PlainPieces != null)
+            {
+                for (int i = 0; i < PlainPieces.Length; i++)
+                {
+                    if (i == PlainPieces.Length - 1) await FirstAudioTaken.Task.WaitAsync(Patience, cancellationToken);
+                    await Task.Yield();
+                    yield return ChatStreamUpdate.Text(PlainPieces[i]);
+                }
+                yield return new ChatStreamUpdate("", true, 10, PlainPieces.Length, 0, 0, 0, 0, "stop");
+                yield break;
+            }
             if (PlainReply != null)
             {
                 yield return ChatStreamUpdate.Text(PlainReply(TurnCalls.Count - 1));
@@ -274,6 +289,36 @@ public sealed class WebUiSpokenAgentTurnTests : IDisposable
         Assert.Single(model.TurnCalls);
         Assert.Equal("Hello.", Assert.Single(model.TtsCalls).Text);
         Assert.DoesNotContain(frames, f => Has(f, "notice"));
+        Assert.StartsWith("audio_", Text(frames[^1], "audioId"), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A plain spoken reply, English or Chinese (both are spoken from the text, sentence by sentence): the first sentence's
+    /// audio reaches the page while the reply is still being written, between its text frames, not after the text. The
+    /// reply's last piece is only written once the speech has made its first audio, so a turn that held the speech back
+    /// until the text was done would never finish.
+    /// </summary>
+    [Theory]
+    [InlineData("en", "Why is the sky blue?", "Air scatters blue light the most. ", "Red light mostly ", "passes straight through.",
+        "Air scatters blue light the most.")]
+    [InlineData("zh", "为什么天空是蓝色的？", "空气最容易散射蓝光。", "红光则", "大多直接穿过。", "空气最容易散射蓝光。")]
+    public async Task APlainSpokenReplysFirstSentenceIsHeardWhileTheRestIsWritten(string language, string question,
+        string first, string second, string last, string firstSpoken)
+    {
+        var model = new AgentService { PlainPieces = new[] { first, second, last } };
+        var (chat, session) = Build(model, codeTools: false);
+        List<JsonElement> frames = await Frames(chat, Body(new { sessionId = session.Id, messages = Ask(question), speech = true }))
+            .WaitAsync(Patience);
+
+        Assert.Equal(first + second + last, string.Concat(frames.Where(f => Has(f, "token")).Select(f => Text(f, "token"))));
+        Assert.Equal(firstSpoken, model.TtsCalls[0].Text);
+        Assert.Equal(language == "zh" ? "zh" : null, model.TtsCalls[0].Language);
+        int firstAudio = frames.FindIndex(f => Has(f, "audio"));
+        int lastText = frames.FindIndex(f => Text(f, "token") == last);
+        Assert.True(firstAudio >= 0 && firstAudio < lastText, $"first audio frame {firstAudio}, last text frame {lastText}");
+        // Every piece's audio is sent before the turn's terminal frame, which names the one WAV that holds all of it.
+        Assert.Equal(model.TtsCalls.Count * 2, frames.Count(f => Has(f, "audio")));
+        Assert.True(frames.FindLastIndex(f => Has(f, "audio")) < frames.Count - 1);
         Assert.StartsWith("audio_", Text(frames[^1], "audioId"), StringComparison.Ordinal);
     }
 

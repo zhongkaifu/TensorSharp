@@ -60,6 +60,7 @@
   "page.speech.saveFailed": "Could not save the audio: {error}",
   "page.speech.failed": "The reply's speech stopped, so only part of it was spoken: {error}",
   "page.speech.notSaved": "The reply's audio could not be saved, so it cannot be played again.",
+  "page.chat.jumpToLatest": "Jump to the latest",
   "page.image.generatedAlt": "generated image",
   "page.image.compareOriginal": "Compare original",
   "page.image.showResult": "Show result",

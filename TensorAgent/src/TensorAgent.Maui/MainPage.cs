@@ -1147,6 +1147,7 @@ public sealed class MainPage : ContentPage
 
         await RunUiCheckAsync();
         await RunTtftProbeAsync();
+        await RunSpeechProbeAsync();
 
         // Screenshot hook: neither simctl nor devicectl can tap, so the menu -- the one
         // surface all of this app's navigation lives on -- can otherwise never appear in
@@ -1389,6 +1390,329 @@ public sealed class MainPage : ContentPage
         {
             Say("ttft FAIL " + ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Device E2E hook (Debug builds only): a spoken reply's timeline on this phone.
+    ///
+    /// <para>
+    /// Launched with <c>TENSORAGENT_SPEECH_CHECK=1</c> and a model that speaks (LFM3-Omni,
+    /// via <c>TENSORAGENT_USE_MODEL</c>). The question is whether the speech plays WHILE the
+    /// text is written, which only the phone can answer: it switches Speak replies on, sends
+    /// each prompt of <c>TENSORAGENT_SPEECH_PROMPTS</c> ('|'-separated; an English and a
+    /// Chinese one by default) in a new chat, and prints the page's own record of the turn
+    /// (<c>speechTimeline</c>: when the text and every chunk of speech reached the page, when
+    /// the player scheduled each one, and the AudioContext's states) beside the app's audio
+    /// session. One <c>speechcheck</c> line per fact, on stdout and in logs/speech.log. The
+    /// chats it made are deleted afterwards.
+    /// </para>
+    /// </summary>
+    private async Task RunSpeechProbeAsync()
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_CHECK"), "1", StringComparison.Ordinal))
+            return;
+
+        Core.Hosting.AgentAppHost app = _host.App;
+        string speechLog = Path.Combine(app.Paths.LogsDirectory, "speech.log");
+        void Say(string line)
+        {
+            Console.WriteLine("TensorAgent: " + line);
+            try { File.AppendAllText(speechLog, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff} {line}{Environment.NewLine}"); }
+            catch (Exception) { /* diagnostic only */ }
+        }
+        var made = new List<string>();
+        try
+        {
+            for (int i = 0; i < 360 && app.ModelLoad != Core.Hosting.AgentAppHost.ModelLoadState.Loaded; i++)
+                await Task.Delay(500);
+            for (int i = 0; i < 180 && !app.PrefixCacheIsWarm; i++)
+                await Task.Delay(500);
+            bool ready = false;
+            for (int i = 0; i < 60 && !ready; i++)
+            {
+                await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent && window.TensorAgent.refreshModel ? window.TensorAgent.refreshModel() : 0");
+                await Task.Delay(1000);
+                string? answer = await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent && window.TensorAgent.hasModel ? window.TensorAgent.hasModel() : false");
+                ready = answer is not null && answer.Contains("true", StringComparison.OrdinalIgnoreCase);
+            }
+            Say($"speechcheck model={app.ModelLoad} warm={app.PrefixCacheIsWarm} pageHasModel={ready}");
+            Say("speechcheck audio-session " + DescribeAudioSession());
+            string? speaking = await _webView.EvaluateJavaScriptAsync(
+                "window.TensorAgent.setSpeakReplies ? window.TensorAgent.setSpeakReplies(true) : 'nobridge'");
+            Say("speechcheck speak-replies " + speaking);
+            if (speaking is null || !speaking.Contains("true", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            string prompts = Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_PROMPTS") is { Length: > 0 } given
+                ? given
+                : "In three or four sentences, tell me why the sky is blue.|请用三四句话解释为什么天空是蓝色的。";
+            int turn = 0;
+            foreach (string prompt in prompts.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                turn++;
+                // A prompt that starts with '>' is sent in the same chat, after scrolling it up as a finger would: the
+                // reply to a message the user sends must be followed whatever they were reading.
+                bool sameChat = prompt.StartsWith('>');
+                string message = sameChat ? prompt[1..].Trim() : prompt;
+                if (sameChat)
+                {
+                    await _webView.EvaluateJavaScriptAsync(
+                        "(function(){var c=document.getElementById('chat');c.dispatchEvent(new Event('touchstart'));"
+                        + "c.dispatchEvent(new Event('touchmove'));c.scrollTop=Math.max(0,c.scrollTop-200);"
+                        + "c.dispatchEvent(new Event('scroll'));c.dispatchEvent(new Event('touchend'));return c.scrollTop;})()");
+                    await Task.Delay(600);
+                    Say($"speechcheck turn {turn} scrolled up before sending: chat scroll,height,client="
+                        + UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                }
+                else
+                {
+                    await _webView.EvaluateJavaScriptAsync("window.TensorAgent.openConversation(null)");
+                    await Task.Delay(2000);
+                }
+                await _webView.EvaluateJavaScriptAsync("document.getElementById('text').value = ''; true");
+                await CallBridgeAsync("insertText", new { text = message });
+                await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent.send(); if (document.activeElement) document.activeElement.blur(); true");
+                Say($"speechcheck turn {turn} sent: {prompt}");
+                bool sessionSaid = false;
+                // The scroll check (the first turn): once the answer is long enough to scroll, scroll it up as a finger
+                // would, mid-stream, and watch whether the chat holds there for the rest of the stream; the other turns
+                // check that the chat follows the newest line all the way down.
+                bool scrollCheck = turn == 1 && Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_SCROLL_CHECK") != "0";
+                // A window much bigger than a phone's (the Mac app's) may never have to scroll for a 400-word answer: the
+                // check can give the chat a phone's size instead (TENSORAGENT_SPEECH_CHAT_HEIGHT px tall, 390 px wide).
+                if (int.TryParse(Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_CHAT_HEIGHT"), out int chatHeight) && chatHeight > 0)
+                    await _webView.EvaluateJavaScriptAsync(
+                        "(function(){var c=document.getElementById('chat');c.style.flex='0 0 auto';"
+                        + $"c.style.height='{chatHeight}px';c.style.width='390px';c.style.alignSelf='center';return true;}})()");
+                int held = -1, maxDrift = 0, scrolledAt = -1, followMisses = 0, followPolls = 0, scrollable = 0, viewport = 0;
+                for (int i = 0; i < 2400; i++)
+                {
+                    await Task.Delay(250);
+                    string status = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                        "window.TensorAgent.speechStatus ? window.TensorAgent.speechStatus() : 'null'"));
+                    string[] parts = status.Split(',');
+                    if (parts.Length != 3)
+                        continue;
+                    int done = int.Parse(parts[0]), chunks = int.Parse(parts[1]), texts = int.Parse(parts[2]);
+                    if (!sessionSaid && chunks > 0)
+                    {
+                        sessionSaid = true;
+                        Say($"speechcheck turn {turn} audio-session while speaking " + DescribeAudioSession());
+                    }
+                    string scrollRaw = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript));
+                    int[] chat = ChatScroll(scrollRaw);
+                    if (i == 8) Say($"speechcheck turn {turn} chat scroll,height,client={scrollRaw}");
+                    if (done < 0 && chat.Length == 3)
+                    {
+                        scrollable = Math.Max(scrollable, chat[1] - chat[2]);
+                        viewport = chat[2];
+                        // As soon as there is something to scroll up through (a tall window, as on a Mac, takes longer).
+                        if (scrollCheck && held < 0 && texts >= 40 && chat[1] - chat[2] > 160)
+                        {
+                            await _webView.EvaluateJavaScriptAsync(
+                                "(function(){var c=document.getElementById('chat');c.dispatchEvent(new Event('touchstart'));"
+                                + "c.dispatchEvent(new Event('touchmove'));"
+                                + "c.scrollTop=Math.max(0,c.scrollTop-Math.min(300,c.scrollHeight-c.clientHeight-80));"
+                                + "c.dispatchEvent(new Event('scroll'));c.dispatchEvent(new Event('touchend'));return c.scrollTop;})()");
+                            await Task.Delay(300);
+                            held = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)))[0];
+                            scrolledAt = texts;
+                        }
+                        else if (held >= 0)
+                            maxDrift = Math.Max(maxDrift, Math.Abs(chat[0] - held));
+                        else if (!scrollCheck && chat[1] > chat[2])
+                        {
+                            followPolls++;
+                            if (chat[1] - chat[0] - chat[2] > 60) followMisses++;
+                        }
+                    }
+                    if (done >= 0)
+                        break;
+                }
+                string timeline = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent.speechTimeline ? window.TensorAgent.speechTimeline() : 'null'"));
+                if (scrollCheck)
+                {
+                    int[] end = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                    if (held >= 0 && end.Length == 3)
+                        maxDrift = Math.Max(maxDrift, Math.Abs(end[0] - held));
+                    string jumpShown = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                        "(function(){var b=document.querySelector('.jump-latest');var shown=!!b&&!b.hidden;if(b&&shown)b.click();return shown;})()"));
+                    await Task.Delay(600);
+                    int[] after = ChatScroll(UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(ChatScrollScript)));
+                    Say($"speechcheck turn {turn} scroll held={(held >= 0 ? "yes" : "never scrolled")} scrolledAtText={scrolledAt} "
+                        + $"heldTop={held} maxDriftPx={maxDrift} jumpShown={jumpShown} viewportPx={viewport} scrollablePx={scrollable} "
+                        + $"afterJumpFromBottomPx={(after.Length == 3 ? after[1] - after[0] - after[2] : -1)} "
+                        + DescribeTouches(timeline, held));
+                }
+                else
+                    Say($"speechcheck turn {turn} follow polls={followPolls} offBottomOver60px={followMisses} "
+                        + DescribeTouches(timeline, -1));
+                string diagnostics = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent && window.TensorAgent.diagnostics ? window.TensorAgent.diagnostics() : 'nopage'"));
+                try
+                {
+                    using JsonDocument d = JsonDocument.Parse(diagnostics);
+                    if (d.RootElement.TryGetProperty("conversation", out JsonElement c) && c.GetString() is { Length: > 0 } id)
+                        made.Add(id);
+                }
+                catch (JsonException) { }
+                Say($"speechcheck turn {turn} summary " + SummarizeSpeechTimeline(timeline));
+                Say($"speechcheck turn {turn} timeline " + timeline);
+                // Let the reply finish playing (the page gives the audio back once it has drained) before the next turn
+                // silences it, and say what the session is then - unless the run is about something else
+                // (TENSORAGENT_SPEECH_NO_DRAIN=1: the scroll checks).
+                string states = "null";
+                bool waitForDrain = Environment.GetEnvironmentVariable("TENSORAGENT_SPEECH_NO_DRAIN") != "1";
+                for (int i = 0; i < (waitForDrain ? 240 : 0); i++)
+                {
+                    await Task.Delay(500);
+                    states = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                        "window.TensorAgent.speechTimeline ? JSON.stringify(JSON.parse(window.TensorAgent.speechTimeline()).states.slice(-3)) : 'null'"));
+                    if (states.Contains("drained", StringComparison.Ordinal))
+                        break;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(3));
+                Say($"speechcheck turn {turn} after playback " + UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                    "window.TensorAgent.speechTimeline ? JSON.stringify(JSON.parse(window.TensorAgent.speechTimeline()).states.slice(-3)) : 'null'"))
+                    + " " + DescribeAudioSession());
+            }
+        }
+        catch (Exception ex)
+        {
+            Say("speechcheck FAIL " + ex.Message);
+        }
+        finally
+        {
+            if (made.Count > 0)
+            {
+                try
+                {
+                    using var client = new HttpClient { BaseAddress = new Uri(_host.BaseUrl) };
+                    client.DefaultRequestHeaders.Add("Cookie", $"tensoragent_token={_host.Token}");
+                    foreach (string id in made.Distinct())
+                        Say($"speechcheck deleted {id}: {(int)(await client.DeleteAsync("/api/agent/conversations/" + Uri.EscapeDataString(id))).StatusCode}");
+                    await _webView.EvaluateJavaScriptAsync("window.TensorAgent.openConversation(null)");
+                }
+                catch (Exception ex) { Say("speechcheck cleanup failed " + ex.Message); }
+            }
+            Say("speechcheck end");
+        }
+    }
+
+    /// <summary>The chat's scrollTop, scrollHeight and clientHeight, as the speech check reads them.</summary>
+    private const string ChatScrollScript =
+        "(function(){var c=document.getElementById('chat');return c.scrollTop+','+c.scrollHeight+','+c.clientHeight;})()";
+
+    private static int[] ChatScroll(string answer)
+    {
+        string[] parts = answer.Split(',');
+        var values = new int[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+            if (!double.TryParse(parts[i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double v))
+                return Array.Empty<int>();
+            else
+                values[i] = (int)Math.Round(v);
+        return values;
+    }
+
+    /// <summary>The turn's timeline in the numbers that matter: time to the first text, the first speech the page
+    /// had and when it was scheduled to sound, the last text, and how much speech arrived before the text ended.</summary>
+    private static string SummarizeSpeechTimeline(string timeline)
+    {
+        try
+        {
+            using JsonDocument d = JsonDocument.Parse(timeline);
+            JsonElement r = d.RootElement;
+            if (r.ValueKind != JsonValueKind.Object)
+                return "no timeline";
+            int[] chunkAt = r.GetProperty("chunkAt").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            int[] startAt = r.GetProperty("startAt").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            int lastText = r.GetProperty("lastText").GetInt32();
+            int beforeLast = chunkAt.Count(t => t <= lastText);
+            // How far the queued speech ran ahead of the playhead while the text was still being written, and every
+            // silence after the first chunk (the queue ran dry): [when, how long, which chunk].
+            int[] lead = r.TryGetProperty("leadAt", out JsonElement leads) ? leads.EnumerateArray().Select(e => e.GetInt32()).ToArray() : [];
+            int[] leadWhileText = lead.Where((_, i) => i < chunkAt.Length && chunkAt[i] <= lastText).ToArray();
+            JsonElement[] gaps = r.TryGetProperty("gaps", out JsonElement g) ? g.EnumerateArray().ToArray() : [];
+            int[] gapMs = gaps.Select(x => x[1].GetInt32()).ToArray();
+            string paints = r.TryGetProperty("paints", out JsonElement p)
+                ? $"paints={p.GetInt32()} paintMs={r.GetProperty("paintMs").GetDouble():F0} paintMaxMs={r.GetProperty("paintMaxMs").GetDouble():F1} "
+                : "";
+            return $"firstText={r.GetProperty("firstText").GetInt32()}ms lastText={lastText}ms texts={r.GetProperty("texts").GetInt32()} "
+                + $"chunks={chunkAt.Length} firstChunk={(chunkAt.Length > 0 ? chunkAt[0] : -1)}ms "
+                + $"firstScheduledStart={(startAt.Length > 0 ? startAt[0] : -1)}ms chunksBeforeLastText={beforeLast} "
+                + $"lastChunk={(chunkAt.Length > 0 ? chunkAt[^1] : -1)}ms done={r.GetProperty("done").GetInt32()}ms "
+                + $"leadWhileTextMin={(leadWhileText.Length > 1 ? leadWhileText.Skip(1).Min() : -1)}ms "
+                + $"leadWhileTextLast={(leadWhileText.Length > 0 ? leadWhileText[^1] : -1)}ms "
+                + $"gaps={gapMs.Length} gapTotalMs={gapMs.Sum()} gapMaxMs={(gapMs.Length > 0 ? gapMs.Max() : 0)} "
+                + $"gapsOver50ms=[{string.Join(",", gaps.Where(x => x[1].GetInt32() > 50).Select(x => $"{x[0].GetInt32()}:{x[1].GetInt32()}"))}] "
+                + paints
+                + $"noPlayer={r.GetProperty("noPlayer").GetInt32()} states={r.GetProperty("states").GetRawText()}";
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return "unreadable timeline: " + ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// The real touches (and wheel turns) the page saw during the turn, from its scroll trace: a finger on the phone
+    /// moves the chat by itself, so a drift or a missed follow is only the page's when no touch came first. For a
+    /// held chat, also how far it moved from <paramref name="held"/> after the probe's own (synthetic) touch and
+    /// before the first real one.
+    /// </summary>
+    private static string DescribeTouches(string timeline, int held)
+    {
+        try
+        {
+            using JsonDocument d = JsonDocument.Parse(timeline);
+            if (d.RootElement.ValueKind != JsonValueKind.Object || !d.RootElement.TryGetProperty("scrolls", out JsonElement s))
+                return "touches=untracked";
+            var rows = s.EnumerateArray().Select(x => (At: x[0].GetInt32(), Why: x[1].GetString(), Top: x[2].GetInt32(),
+                Height: x[3].GetInt32(), Client: x[4].GetInt32())).ToArray();
+            var real = rows.Where(x => x.Why is "touch" or "wheel").ToArray();
+            string touches = $"touches={real.Length} firstTouchMs={(real.Length > 0 ? real[0].At : -1)}";
+            if (held < 0)
+            {
+                int untilTouch = real.Length > 0 ? real[0].At : int.MaxValue;
+                int offMax = rows.Where(x => x.Why == "scroll" && x.At < untilTouch && x.Height > x.Client)
+                    .Select(x => x.Height - x.Top - x.Client).DefaultIfEmpty(0).Max();
+                return touches + $" offBottomBeforeTouchMaxPx={offMax}";
+            }
+            int probe = Array.FindIndex(rows, x => x.Why == "touch-synthetic");
+            if (probe < 0)
+                return touches + " driftBeforeTouchPx=untracked";
+            int from = rows[probe].At + 300, to = real.FirstOrDefault(x => x.At > rows[probe].At).At;
+            if (to <= rows[probe].At) to = int.MaxValue;
+            int drift = rows.Where(x => x.Why == "scroll" && x.At > from && x.At < to)
+                .Select(x => Math.Abs(x.Top - held)).DefaultIfEmpty(0).Max();
+            return touches + $" driftBeforeTouchPx={drift} untouchedMs={(to == int.MaxValue ? -1 : to - rows[probe].At)}";
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or IndexOutOfRangeException)
+        {
+            return "touches=unreadable";
+        }
+    }
+
+    /// <summary>The app's audio session and the chat WebView's media settings, for the speech probe.</summary>
+    private string DescribeAudioSession()
+    {
+#if IOS
+        AVFoundation.AVAudioSession session = AVFoundation.AVAudioSession.SharedInstance();
+        string web = _webView.Handler is Microsoft.Maui.Handlers.WebViewHandler handler
+            ? $"requiresUserAction={handler.PlatformView.Configuration.MediaTypesRequiringUserActionForPlayback} "
+              + $"inline={handler.PlatformView.Configuration.AllowsInlineMediaPlayback}"
+            : "no handler";
+        return $"category={session.Category} mode={session.Mode} options={session.CategoryOptions} "
+            + $"otherAudio={session.OtherAudioPlaying} silencedHint={session.SecondaryAudioShouldBeSilencedHint} "
+            + $"volume={session.OutputVolume:F2} route={string.Join(",", session.CurrentRoute.Outputs.Select(o => o.PortType))} {web}";
+#else
+        return "n/a";
+#endif
     }
 
     /// <summary>

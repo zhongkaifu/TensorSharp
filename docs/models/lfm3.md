@@ -509,7 +509,11 @@ Where to use it: CLI `--tts` / `--speech-out` (with `--speech-mode`, `--speech-t
 `--voice`, `--language`, `--seed`), `POST /v1/audio/speech`, `/v1/chat/completions` /
 `/v1/responses` with `modalities` `["text","audio"]` or `["audio"]`, and the web chat
 (`/api/chat` with `speech`: the bundled Web UI's and TensorAgent's **Speak replies** switch, which
-play the reply as it is generated and keep a player and a download) — see
+play the reply as it is generated and keep a player and a download; while a reply is spoken both pages ask WebKit
+for `navigator.audioSession.type = "playback"`, so an iPhone in Silent mode plays the live speech, which WebKit
+otherwise plays as ambient sound that Silent mode mutes, give the choice back (`"auto"`) once the reply's audio has
+played so the user's music or podcast can resume, and resume the audio after a call, Siri or the app going to the
+background interrupts it) — see
 [USAGE.md → Speech output](../../USAGE.md#speech-output-lfm3-omni). Voices are `female`
 and `male` (named in the system prompt; there is no speaker embedding); an unknown voice,
 OpenAI's default `alloy` included, is a 400 that lists them. A spoken chat reply's system
@@ -543,7 +547,12 @@ every spoken turn, in every language, is the request's text turn - reasoning, na
 catalog, the client's tools, the host's code tools, knowledge, sub-agents, every round of the tool
 loop, with the same frames - and its answer is spoken as it is written (`WebUiSpokenTurn`, over
 `ReplySpeaker`): each round's answer text goes through `SpeechTextSegmenter`, and each piece is a TTS
-request on the engine beside the generation, spoken in order. The text before a tool call is spoken
+request on the engine beside the generation, spoken in order. While the text is still being written,
+the next piece waits until the speech already made is less than 3 s ahead of what the listener has heard
+(`ReplySpeaker.DefaultMaxLeadSeconds`): speech and text share the engine, and speech made far ahead of the
+listener only slowed the text (a long English or Chinese answer's text went from 48-53 to 79-86 updates a second
+in the Mac app, and an English one's from about 17.6 to 23 on an iPhone 17 Pro Max, with no silence in the speech
+either way); once the text is done, the rest is spoken at once. The text before a tool call is spoken
 when the call begins, so the speech goes on while the tool runs; reasoning, tool calls and tool
 results are never spoken, nor are fenced code, table rows, emoji, markdown markers, a host note in the
 answer (`_(...)_`) or an inline code span of 40 characters or more; a URL is said as its host, a path

@@ -60,6 +60,7 @@
   "page.speech.saveFailed": "No se pudo guardar el audio: {error}",
   "page.speech.failed": "La voz de la respuesta se detuvo, así que solo se habló una parte: {error}",
   "page.speech.notSaved": "No se pudo guardar el audio de la respuesta, así que no se puede volver a reproducir.",
+  "page.chat.jumpToLatest": "Ir a lo más reciente",
   "page.image.generatedAlt": "imagen generada",
   "page.image.compareOriginal": "Comparar con el original",
   "page.image.showResult": "Mostrar resultado",

@@ -331,7 +331,9 @@ TTS（GGUF 的 `tokenizer.chat_template.tts`，在语音结束帧停止）。对
 用法：CLI `--tts` / `--speech-out`（配合 `--speech-mode`、`--speech-temperature`、`--voice`、`--language`、`--seed`）、
 `POST /v1/audio/speech`、带 `modalities` `["text","audio"]` 或 `["audio"]` 的 `/v1/chat/completions` /
 `/v1/responses`，以及网页聊天（带 `speech` 的 `/api/chat`：内置 Web UI 与 TensorAgent 的 **Speak replies** 开关，
-边生成边播放，并保留播放器与下载链接）——见 [USAGE_zh-cn.md → 语音输出](../../USAGE_zh-cn.md#语音输出lfm3-omni)。音色为 `female` 与 `male`
+边生成边播放，并保留播放器与下载链接；朗读回复期间两个页面都向 WebKit 请求 `navigator.audioSession.type = "playback"`，因此处于
+静音模式的 iPhone 也会播放实时语音（否则 WebKit 把它当作环境音播放，静音模式会将其静音），回复的音频播完后交还选择（`"auto"`），
+让用户的音乐或播客可以继续，并在来电、Siri 或应用进入后台打断音频后恢复播放）——见 [USAGE_zh-cn.md → 语音输出](../../USAGE_zh-cn.md#语音输出lfm3-omni)。音色为 `female` 与 `male`
 （写在系统提示中，没有说话人嵌入）；未知音色（包括 OpenAI 默认的 `alloy`）返回 400 并列出可用音色。语音对话回复的系统提示
 加上 llama.cpp 的 realtime 句子（“Speak in English using a female voice.”），交错回复再加上模型卡的
 “Respond with interleaved text and audio.”。
@@ -353,7 +355,10 @@ markdown 标记、表情符号与围栏代码不会朗读；第一段在满 8 �
 **语音轮次就是文本轮次。** 在 `/api/chat`（Web UI 与 TensorAgent 的 **Speak replies**）上，每个语音轮次（任何语言）都是该
 请求的文本轮次——推理、指定的技能与技能目录、客户端的工具、主机的代码工具、知识库、子代理以及工具循环的每一轮，帧也相同——
 其回答边写边说（`WebUiSpokenTurn`，基于 `ReplySpeaker`）：每一轮的回答文本经过 `SpeechTextSegmenter`，每一段作为一个 TTS
-请求与生成在引擎上并行，按顺序说出。工具调用之前的文字在调用开始时说出，因此工具运行时语音仍在继续；推理、工具调用与工具
+请求与生成在引擎上并行，按顺序说出。文本仍在生成时，下一段要等到已生成的语音领先听者已听到的部分不足 3 秒
+（`ReplySpeaker.DefaultMaxLeadSeconds`）才开始：语音与文本共用引擎，远远领先于听者的语音只会拖慢文本（一段较长的英文或中文回答，
+其文本在 Mac 应用中从每秒 48-53 次更新提升到 79-86 次，英文回答在 iPhone 17 Pro Max 上从约每秒 17.6 次提升到 23 次，两种情况下
+语音都没有任何停顿）；文本生成完毕后，其余部分立即说出。工具调用之前的文字在调用开始时说出，因此工具运行时语音仍在继续；推理、工具调用与工具
 结果从不朗读，代码块、表格行、表情符号、markdown 标记、主机写在回答中的说明（`_(...)_`）以及 40 个字符及以上的行内代码也
 不朗读；URL 读作其主机名，三段及以上的路径读作最后一段。该轮次保留一个涵盖其全部语音的 WAV 与音频 id。它的提示就是文本轮次
 的提示（没有语音说明），因此在对话中切换语音开关时每一轮都复用缓存的前缀；交错回复会把 “Speak using a female voice.

@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Models;
@@ -401,6 +402,56 @@ public sealed class SpeechOutputRuntimeTests : IDisposable
         Assert.True(driver.Next(null, new float[hidden], () => 0).IsStop);
         driver.Dispose();
         Assert.Equal("cancelled", driver.Next(null, new float[hidden], () => 0).StopReason);
+    }
+
+    /// <summary>
+    /// A finished request's driver gives its codec stream back (reset, to the pool) without waiting for the GPU lock. It
+    /// used to wait for it, and the engine worker - stepping the text reply beside the speech - takes that lock again a
+    /// few microseconds after releasing it, so the wait lasted until the text was done: the next sentence of a long
+    /// spoken reply, spoken only once the one before it has ended, waited with it, and the speech stopped mid-answer.
+    /// </summary>
+    [Fact]
+    public async Task AFinishedDriverGivesItsCodecBackWhileTheEngineHoldsTheGpuLock()
+    {
+        using var lane = new LaneContext(Lane.Managed);
+        using Lfm3SpeechOutput speech = Speech(lane);
+        int hidden = speech.Config.HiddenSize;
+        var gpu = new object();
+        var returned = new List<Lfm3CodecStream>();
+        Lfm3SpeechDriver driver = null;
+        // A driver that has spoken a frame, so it holds a stream (a random row can be the end of speech at once).
+        for (uint seed = 7; seed < 40 && driver == null; seed++)
+        {
+            var candidate = new Lfm3SpeechDriver(speech, Tokens(), Tokens().AudioStart, continuing: false, seed,
+                Lfm3SpeechSampling.Defaults(speech.Config), null, c => { lock (returned) returned.Add(c); }, gpu);
+            float[] h = Enumerable.Range(0, hidden).Select(i => (float)Math.Sin(i * 0.37 + seed)).ToArray();
+            if (!candidate.Next(null, h, () => throw new InvalidOperationException("TTS draws no text")).IsStop) driver = candidate;
+            else candidate.Dispose();
+        }
+        Assert.NotNull(driver);
+        lock (returned) returned.Clear();
+
+        // The engine's worker in the middle of another request's steps, holding the GPU lock until told to stop.
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var worker = new Thread(() => { lock (gpu) { held.Set(); release.Wait(); } }) { IsBackground = true };
+        worker.Start();
+        held.Wait();
+        try
+        {
+            Task disposed = Task.Run(driver.Dispose);
+            Assert.True(await Task.WhenAny(disposed, Task.Delay(TimeSpan.FromSeconds(30))) == disposed,
+                "the driver waited for the GPU lock to give its codec stream back");
+            await disposed;
+            lock (returned) Assert.Single(returned);
+        }
+        finally
+        {
+            release.Set();
+            worker.Join();
+        }
+        Assert.Equal("cancelled", driver.Next(null, new float[hidden], () => 0).StopReason);
+        returned[0].Dispose();
     }
 
     /// <summary>An interleaved reply: 6 text slots (logits asked for, control tokens not counted as transcript), then 12

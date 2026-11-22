@@ -32,6 +32,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Models;
+using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Models.Audio;
 using TensorSharp.Models.Video;
 
@@ -404,7 +405,10 @@ public sealed class AudioAdapter
         {
             return await Task.Run(() =>
             {
-                lock (owner.GpuComputeLock)
+                // Between the engine's steps, as a registered waiter: a bare lock here waited for as long as a chat
+                // reply kept the engine stepping (GpuLockWaiters.EnterBetweenSteps).
+                GpuLockWaiters.EnterBetweenSteps(owner.GpuComputeLock);
+                try
                 {
                     if (owner.IsRetiring)
                         return new Outcome<TResult>(default, Error(503, "The model is being unloaded.", "server_error"));
@@ -422,6 +426,10 @@ public sealed class AudioAdapter
                         _logger.LogError(ex, "Audio request failed");
                         return new Outcome<TResult>(default, Error(500, ex.Message, "server_error"));
                     }
+                }
+                finally
+                {
+                    Monitor.Exit(owner.GpuComputeLock);
                 }
             }).ConfigureAwait(false);
         }

@@ -152,8 +152,18 @@
     diag.push({ t: Date.now(), k: kind, d: detail == null ? '' : String(detail).slice(0, 160) });
     if (diag.length > 120) diag.shift();
   }
-  function atBottom() { return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 90; }
-  function toBottom() { chat.scrollTop = chat.scrollHeight; }
+  /** Whether the chat's last line is in view, give or take `px` (90: a line or two). */
+  function atBottom(px) { return chat.scrollHeight - chat.scrollTop - chat.clientHeight < (px == null ? 90 : px); }
+  // Where this page last scrolled the chat itself: the scroll event that follows is not the user's.
+  var scrolledTo = -1;
+  function toBottom() {
+    // Never under a finger: a drag or its momentum is the user's, and moving the chat
+    // beneath it is what made it shake and spring back to the bottom mid-answer.
+    if (touching) return;
+    chat.scrollTop = chat.scrollHeight;
+    scrolledTo = chat.scrollTop;
+    paintJump();
+  }
 
   // ---- the layout follows the VISIBLE viewport ----------------------------
   // The single most important line in this file for a phone. Without it the
@@ -172,8 +182,73 @@
   window.addEventListener('orientationchange', function () { setTimeout(applyVh, 200); });
   applyVh();
 
-  var stickBottom = true;
-  chat.addEventListener('scroll', function () { stickBottom = atBottom(); });
+  // ---- following the newest line ------------------------------------------
+  //
+  // The chat follows its newest line while the user is at the bottom, and stops the
+  // moment the user scrolls away from it -- by touch, wheel or key -- until they come back
+  // to the bottom, or tap the arrow that offers the way back. It used to decide on every
+  // scroll event, its own included, that "within 90 px of the bottom" meant following:
+  // a drag upward during an answer was taken back on the next paint, over and over, so the
+  // chat shook under the finger and could not be scrolled up while the model wrote.
+  var stickBottom = true, touching = false, lastInputAt = 0;
+  function userInput() { lastInputAt = Date.now(); }
+  function userScrolled() {
+    // The user's own scroll, or the momentum of one: follow again only at the very bottom.
+    stickBottom = atBottom(24);
+    paintJump();
+  }
+  chat.addEventListener('touchstart', function (e) {
+    touching = true; userInput();
+    speechLogScroll(e && e.isTrusted === false ? 'touch-synthetic' : 'touch');
+  }, { passive: true });
+  chat.addEventListener('touchmove', function () { userInput(); stickBottom = false; paintJump(); }, { passive: true });
+  function touchEnded() { touching = false; userInput(); if (atBottom(24)) { stickBottom = true; paintJump(); } }
+  chat.addEventListener('touchend', touchEnded, { passive: true });
+  chat.addEventListener('touchcancel', touchEnded, { passive: true });
+  chat.addEventListener('wheel', function (e) {
+    userInput();
+    speechLogScroll('wheel');
+    if (e && e.deltaY < 0) { stickBottom = false; paintJump(); }
+  }, { passive: true });
+  document.addEventListener('keydown', function (e) {
+    if (!e || ['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' '].indexOf(e.key) < 0) return;
+    var target = e.target && e.target.tagName;
+    if (target === 'TEXTAREA' || target === 'INPUT' || target === 'SELECT') return;
+    userInput();
+  });
+  chat.addEventListener('scroll', function () {
+    speechLogScroll('scroll');
+    if (chat.scrollTop === scrolledTo) return; // this page's own, or the content growing under it
+    scrolledTo = -1;
+    // A finger on the glass, or the glide after it, or a wheel or key a moment ago.
+    // Nothing else turns following back on: iOS moves a scroll view by itself now and then
+    // (measured on the phone: a chat held 80 px up drifted back down and started following).
+    if (touching || Date.now() - lastInputAt < 1500) userScrolled();
+  });
+
+  // The way back to the newest line, while the user is reading above it.
+  var jump = null;
+  function paintJump() {
+    if (!jump) return;
+    var away = !stickBottom && !atBottom(24);
+    if (jump.hidden === !away) return;
+    jump.hidden = !away;
+  }
+  (function () {
+    var composer = $('composer');
+    if (!composer) return;
+    jump = el('button', 'jump-latest', '↓');
+    jump.type = 'button';
+    jump.hidden = true;
+    jump.title = t('page.chat.jumpToLatest');
+    jump.setAttribute('aria-label', jump.title);
+    jump.addEventListener('click', function () {
+      stickBottom = true;
+      touching = false;
+      toBottom();
+    });
+    composer.appendChild(jump);
+  })();
   if (vv) vv.addEventListener('resize', function () { if (stickBottom) setTimeout(toBottom, 60); });
   text.addEventListener('focus', function () { if (stickBottom) { setTimeout(toBottom, 60); setTimeout(toBottom, 350); } });
 
@@ -255,6 +330,94 @@
   }
   function paragraph(lines) {
     return '<p>' + lines.join('<br>') + '</p>';
+  }
+
+  // ---- an answer, rendered as it is written ----------------------------------
+  //
+  // An answer used to be rendered whole into its bubble at every read: the cost of a paint
+  // grew with the answer, so a long reply's paints took more and more of the one thread that
+  // also schedules its speech, and laid the whole bubble out again each time. What render()
+  // makes of text before a blank line outside a code fence does not depend on what follows,
+  // so those settled blocks are rendered once, appended, and only the block still being
+  // written is rendered again (render(a + '\n\n' + b) is render(a) + render(b) there).
+
+  /** The last blank-line run of `md` that later text cannot change: [its start, its end], or null. */
+  function settledCut(md) {
+    // The same fences render() finds, in the same order.
+    var fence = /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)(?:```|$)/g, gap = /\n{2,}/g;
+    var cut = null, from = 0, m;
+    function runsBefore(end) {
+      gap.lastIndex = from;
+      for (var g = gap.exec(md); g && g.index < end; g = gap.exec(md))
+        if (g.index + g[0].length <= end) cut = [g.index, g.index + g[0].length];
+    }
+    while ((m = fence.exec(md))) {
+      runsBefore(m.index);
+      // A fence still open runs to the end: nothing from its opening on is settled.
+      if (m[0].slice(-3) !== '```') return cut;
+      from = m.index + m[0].length;
+      fence.lastIndex = from;
+    }
+    runsBefore(md.length);
+    return cut;
+  }
+
+  /**
+   * Show `md` in the view's bubble: the blocks that have settled since the last paint are
+   * appended, and the block still growing replaces itself. A text that is not the last one
+   * continued (a replace, a retraction), or a bubble something else has written into, is
+   * rendered again from the top. `whole` renders it in one piece, as a finished answer is.
+   * The text lives in a box of its own at the top of the bubble, so the picture, clip or
+   * spoken-reply player under it is left alone.
+   */
+  function renderAnswer(view, md, whole) {
+    var s = view.md;
+    if (!s || s.box.parentNode !== view.bubble) {
+      var box = el('div', 'md');
+      view.bubble.insertBefore(box, view.bubble.children[0] || null);
+      s = view.md = { box: box, parts: null, tail: null };
+    }
+    if (whole) {
+      s.box.innerHTML = render(md);
+      s.parts = s.tail = null;
+      return;
+    }
+    if (!s.parts || s.parts.parentNode !== s.box || s.tail.parentNode !== s.box
+        || md.length < s.done || md.slice(0, s.done) !== s.text) {
+      s.box.innerHTML = '';
+      s.parts = el('div', 'md');
+      s.tail = el('div', 'md');
+      s.box.appendChild(s.parts);
+      s.box.appendChild(s.tail);
+      // done/text: the settled text; run: where the blank-line run after it starts; from: where the next block starts.
+      s.done = 0; s.run = -1; s.from = 0; s.text = ''; s.html = ''; s.tailHtml = null;
+    }
+    var cut = settledCut(md);
+    if (cut && cut[0] > s.run) {
+      // A new blank line: the block before it is settled (an empty one too: render('') is a paragraph).
+      var part = el('div', 'md md-part'), html = render(md.slice(s.from, cut[0]));
+      part.innerHTML = html;
+      s.parts.appendChild(part);
+      s.html += html;
+      s.done = cut[0];
+      s.run = cut[0];
+      s.text = md.slice(0, cut[0]);
+    }
+    // The same run, perhaps grown by another newline: the live block starts after it.
+    if (cut && cut[0] === s.run) s.from = cut[1];
+    var tail = render(md.slice(s.from));
+    if (tail !== s.tailHtml) { s.tail.innerHTML = tail; s.tailHtml = tail; }
+  }
+
+  /** The finished answer, exactly as render() makes it: kept as it is when the pieces add up to that. */
+  function settleAnswer(view, md) {
+    var s = view.md;
+    if (s && s.box.parentNode === view.bubble && s.parts && s.parts.parentNode === s.box
+        && md.slice(0, s.done) === s.text && s.html + render(md.slice(s.from)) === render(md)) {
+      renderAnswer(view, md);
+      return;
+    }
+    renderAnswer(view, md, true);
   }
 
   // ---- attachments, as the transcript holds them ---------------------------
@@ -462,21 +625,92 @@
     picker.style.display = speaksReplies() && voices.length > 1 ? '' : 'none';
   }
 
+  /**
+   * Ask WebKit to play this page's sound as playback ('playback') or as it chooses
+   * ('auto'). Left to itself, WebKit plays Web Audio under the ambient audio-session
+   * category, which the iPhone's Silent mode (the Ring/Silent switch, or the Action
+   * button) mutes, while an <audio> element plays as media and is heard: so on a phone
+   * set to silent a reply's live chunks played into nothing and only the finished
+   * reply's player could be heard. The Audio Session API (navigator.audioSession,
+   * WebKit) is how a page asks for playback; where it is absent this does nothing.
+   *
+   * Playback does not mix: it pauses the user's music or podcast. So it is asked for
+   * only for a spoken reply -- from the tap that sends it and again with each of its
+   * chunks -- and given back ('auto') once that reply's audio has finished playing,
+   * which lets the other audio come back after every reply.
+   */
+  function speechSession(type) {
+    var session = navigator.audioSession;
+    if (!session) return;
+    try { if (session.type !== type) session.type = type; }
+    catch (e) { note('speech-session-failed', (e && e.message) || e); }
+  }
+
   var speechContext = null;
-  /** Create or resume the AudioContext inside a tap, so a reply's chunks may play. */
-  function primeSpeech() {
+  /**
+   * Create or resume the AudioContext inside a tap, so a reply's chunks may play;
+   * `forReply` (the send) also asks for playback, before the context resumes under it.
+   * The switch primes the context without it: an idle context must not pause the
+   * user's music.
+   */
+  function primeSpeech(forReply) {
     if (!speaksReplies()) return null;
     var Context = window.AudioContext || window.webkitAudioContext;
     if (!Context) return null;
+    if (forReply) speechSession('playback');
     try {
-      if (!speechContext || speechContext.state === 'closed') speechContext = new Context();
-      // 'suspended', or WebKit's 'interrupted' after the app was in the background.
-      if (speechContext.state !== 'running' && speechContext.resume) speechContext.resume();
+      if (!speechContext || speechContext.state === 'closed') {
+        var context = speechContext = new Context();
+        context.onstatechange = function () {
+          note('speech-context', context.state);
+          if (context === speechContext) speechLogState('statechange');
+        };
+      }
+      wakeSpeech();
     } catch (e) {
       note('speech-context-failed', (e && e.message) || e);
       speechContext = null;
     }
     return speechContext;
+  }
+
+  /**
+   * Resume the AudioContext when it is not running: 'suspended', or WebKit's
+   * 'interrupted' -- a call, Siri, dictation, or the app in the background, any of which
+   * can happen while a reply is being spoken. The send primes it, but a reply outlives
+   * the tap that sent it, and a chunk scheduled on a context that is not running is never
+   * heard. The app's WebView lets audio start without a gesture, so a resume here works
+   * there; a browser that still wants a tap leaves it suspended until the next one.
+   */
+  function wakeSpeech() {
+    var context = speechContext;
+    if (!context || context.state === 'running' || context.state === 'closed' || !context.resume) return;
+    try {
+      var resumed = context.resume();
+      if (resumed && resumed.catch) resumed.catch(function (e) { note('speech-resume-failed', (e && e.message) || e); });
+    } catch (e) {
+      note('speech-resume-failed', (e && e.message) || e);
+    }
+  }
+
+  /**
+   * The spoken replies are over for now: give the category back and let the context
+   * rest, so WebKit can end its audio session and the user's music or podcast resumes.
+   * Not while a reply is still sounding, nor while a spoken turn is still being answered
+   * (its chunks would only take both back). The next send, or chunk, wakes it.
+   */
+  function releaseSpeech(why) {
+    if (liveSpeech && liveSpeech.speaking()) return;
+    if (state.generating && speaksReplies()) return;
+    speechSession('auto');
+    var context = speechContext;
+    if (context && context.state === 'running' && context.suspend) {
+      try {
+        var suspended = context.suspend();
+        if (suspended && suspended.catch) suspended.catch(function () {});
+      } catch (e) { /* a context that will not rest is only a context left running */ }
+    }
+    speechLogState(why || 'released');
   }
 
   /** Base64 PCM16 little-endian mono to float samples. */
@@ -491,15 +725,68 @@
     return samples;
   }
 
+  /** The next display frame (a timer where there is none, as in a test), and its cancel. */
+  function nextFrame(fn) {
+    return window.requestAnimationFrame ? window.requestAnimationFrame(fn) : setTimeout(fn, 0);
+  }
+  function cancelFrame(id) {
+    if (window.cancelAnimationFrame) window.cancelAnimationFrame(id); else clearTimeout(id);
+  }
+  function clock() { return window.performance && performance.now ? performance.now() : Date.now(); }
+
+  // What the newest spoken turn did, for the app's device check: when its text and each
+  // chunk of its speech reached this page, when the player scheduled the chunk, how much
+  // speech was queued ahead of the playhead then (lead) and any silence before it (a gap:
+  // the queue ran dry), the AudioContext's states, and what the paints cost. Milliseconds
+  // since the send.
+  var speechLog = null;
+  function speechLogStart() {
+    speechLog = {
+      t0: Date.now(), firstText: -1, lastText: -1, texts: 0, done: -1,
+      chunkAt: [], startAt: [], leadAt: [], gaps: [], noPlayer: 0, states: [],
+      paints: 0, paintMs: 0, paintMaxMs: 0, scrolls: [],
+    };
+    speechLogState('send');
+  }
+  /** Every scroll event of a spoken turn, [ms, why, scrollTop, scrollHeight, clientHeight, following] (the last 300). */
+  function speechLogScroll(why) {
+    if (!speechLog) return;
+    speechLog.scrolls.push([speechLogAt(), why, Math.round(chat.scrollTop), chat.scrollHeight, chat.clientHeight, stickBottom ? 1 : 0]);
+    if (speechLog.scrolls.length > 300) speechLog.scrolls.shift();
+  }
+  function speechLogPaint(ms) {
+    if (!speechLog || speechLog.done >= 0) return;
+    speechLog.paints++;
+    speechLog.paintMs += ms;
+    if (ms > speechLog.paintMaxMs) speechLog.paintMaxMs = ms;
+  }
+  function speechLogAt() { return speechLog ? Date.now() - speechLog.t0 : -1; }
+  function speechLogState(when) {
+    if (!speechLog) return;
+    var s = speechContext ? speechContext.state : 'none';
+    var session = navigator.audioSession ? navigator.audioSession.type + '/' + navigator.audioSession.state : 'n/a';
+    var last = speechLog.states[speechLog.states.length - 1];
+    if (!last || last[2] !== s || last[3] !== session) speechLog.states.push([speechLogAt(), when, s, session]);
+  }
+
   var liveSpeech = null;
   function stopLiveSpeech() {
     if (liveSpeech) liveSpeech.stop();
     liveSpeech = null;
   }
 
-  /** Plays one reply's chunks back to back as they arrive; stop() silences it. */
-  function speechPlayer(context, onPlaying) {
-    var sources = [], nextAt = 0, stopped = false;
+  /**
+   * Plays one reply's chunks back to back as they arrive; stop() silences it. onDrained
+   * is called once, when the reply has ended (end(), its turn is over; or stop()) and
+   * nothing it scheduled is still sounding.
+   */
+  function speechPlayer(context, onPlaying, onDrained) {
+    var sources = [], nextAt = 0, stopped = false, ended = false, drained = false;
+    function drain() {
+      if (drained || !ended || sources.length) return;
+      drained = true;
+      if (onDrained) onDrained();
+    }
     return {
       push: function (base64, rate) {
         if (stopped || !base64 || !(rate > 0)) return;
@@ -510,22 +797,32 @@
         var source = context.createBufferSource();
         source.buffer = buffer;
         source.connect(context.destination);
+        // Silence before this chunk: the previous one has already finished playing.
+        var gap = nextAt > 0 && nextAt < context.currentTime ? context.currentTime + 0.05 - nextAt : 0;
         nextAt = Math.max(nextAt, context.currentTime + 0.05);
         source.start(nextAt);
+        var startsIn = nextAt - context.currentTime;
         nextAt += buffer.duration;
         sources.push(source);
         source.onended = function () {
           var at = sources.indexOf(source);
           if (at >= 0) sources.splice(at, 1);
-          if (!sources.length) onPlaying(false);
+          if (!sources.length) { onPlaying(false); drain(); }
         };
         onPlaying(true);
+        return { startsIn: startsIn, lead: nextAt - context.currentTime, gap: gap };
       },
+      /** Whether some of the reply is still scheduled to sound. */
+      speaking: function () { return !stopped && sources.length > 0; },
+      /** The reply's turn is over: no more chunks will come. */
+      end: function () { ended = true; drain(); },
       stop: function () {
         stopped = true;
         sources.forEach(function (source) { try { source.stop(); } catch (e) {} });
         sources = [];
         onPlaying(false);
+        ended = true;
+        drain();
       },
     };
   }
@@ -1155,6 +1452,9 @@
    */
   function openConversation(conversationId, options) {
     conversationOpening = true;
+    // Another chat, or a new one, starts at its newest line and follows it.
+    stickBottom = true;
+    paintJump();
     detach();
     state.interrupted = false;
     // A durable shared draft follows the composer between chats (its text already
@@ -1511,6 +1811,9 @@
   // ---- sending -------------------------------------------------------------
   function setGenerating(on) {
     state.generating = !!on;
+    // A turn that ended with nothing left to say (no speech, a refusal, a stop) gives the
+    // audio back now; one whose reply is still sounding does when the reply has drained.
+    if (!on) releaseSpeech('turn-ended');
     busy.className = on ? 'on' : '';
     paintSend();
     send.disabled = state.visionChecking || shareDiscarding || (!on && !state.model);
@@ -1535,7 +1838,11 @@
       note('send-is-stop', state.turn); stop(); return;
     }
     // Inside the tap: the only moment a WebView lets a spoken reply start playing.
-    primeSpeech();
+    primeSpeech(true);
+    if (speaksReplies()) speechLogStart();
+    // Whoever sends wants to see the reply: follow the newest line again.
+    stickBottom = true;
+    paintJump();
     if (pendingUploadCount) {
       notice(t('page.send.waitForUploads'));
       return;
@@ -2392,11 +2699,13 @@
     // Whether this reader has already asked for the turn again after an EOF that
     // carried no terminal frame; see ended().
     var reattached = false;
-    // Painted once per chunk rather than once per frame. A page re-attaching to a
-    // running turn is handed every frame so far in one read -- thousands, for a long
-    // answer -- and rendering the whole answer for each of them is what made the
-    // replay visibly stall on the phone.
-    var answerDirty = false, thinkingDirty = false;
+    // Painted at most once per display frame, after the reads it covers, rather than once
+    // per frame of the stream. A page re-attaching to a running turn is handed every frame
+    // so far in one read -- thousands, for a long answer -- and rendering the whole answer
+    // for each of them is what made the replay visibly stall on the phone; a spoken reply's
+    // chunks, which arrive between the tokens, are scheduled as they are read, before any
+    // of this.
+    var answerDirty = false, thinkingDirty = false, paintPending = 0;
 
     function pump() {
       return reader.read().then(null, function (e) { throw transportError(e); }).then(function (r) {
@@ -2413,17 +2722,36 @@
           try { f = JSON.parse(line.slice(6)); } catch (e) { return; }
           handle(f);
         });
-        paint();
+        remember();
+        schedulePaint();
         return pump();
       });
     }
+    /** Paint on the next display frame, once for however many reads arrive before it. */
+    function schedulePaint() {
+      if (paintPending) return;
+      paintPending = nextFrame(function () {
+        paintPending = 0;
+        // Superseded meanwhile: another reader owns the bubble now.
+        if (ctrl && ctrl !== state.abort) return;
+        paint();
+      });
+    }
     function paint() {
+      if (paintPending) { cancelFrame(paintPending); paintPending = 0; }
+      var began = clock();
       if (thinkingDirty && thinkBody) { thinkBody.textContent = thinking; thinkingDirty = false; }
       if (answerDirty) {
-        view.bubble.innerHTML = render(answer); view.answerSoFar = answer; answerDirty = false;
+        renderAnswer(view, answer); answerDirty = false;
         if (view.knowledgeSourceCandidates) showKnowledgeSources(view, view.knowledgeSourceCandidates, answer);
         if (view.speechBox) speechBoxOf(view);
       }
+      if (stickBottom) toBottom();
+      speechLogPaint(clock() - began);
+    }
+    /** What the turn has so far, for a steer or a page that leaves: kept with every read, painted or not. */
+    function remember() {
+      view.answerSoFar = answer;
       var entry = { role: 'assistant', content: answer };
       if (thinking) entry.thinking = thinking;
       if (view.knowledgeSources && view.knowledgeSources.length) entry.knowledgeSources = view.knowledgeSources;
@@ -2434,7 +2762,6 @@
       if (madeAudio) entry.audioUrl = madeAudio;
       if (madeSpeech) spokenEntry(entry);
       view.partialEntry = answer || thinking || made.length || madeImage || madeVideo ? entry : null;
-      if (stickBottom) toBottom();
     }
     /**
      * The stream ended and the host never said the turn was over. Ask whether it still
@@ -2486,7 +2813,7 @@
             var button = null;
             // One reply speaks at a time: a newer one silences the one before it.
             stopLiveSpeech();
-            view.liveSpeech = liveSpeech = speechPlayer(speechContext, function (playing) {
+            var player = speechPlayer(speechContext, function (playing) {
               if (!button) {
                 button = el('button', 'mini quiet speech-stop', t('page.speech.stop'));
                 button.type = 'button';
@@ -2494,14 +2821,41 @@
                 speechBoxOf(view).appendChild(button);
               }
               button.style.display = playing ? '' : 'none';
+            }, function () {
+              // The reply has been heard to the end (or stopped): the user's other audio
+              // may come back -- unless a newer reply is already speaking.
+              if (liveSpeech && liveSpeech !== player && liveSpeech.speaking()) return;
+              releaseSpeech('drained');
             });
+            view.liveSpeech = liveSpeech = player;
           }
+          var startsIn = null;
           if (view.liveSpeech) {
-            try { view.liveSpeech.push(f.audio, Number(f.sampleRate)); }
+            // Again with every chunk: a reply that outlives its tap (a page that attached
+            // to it again) or a reply before it that finished meanwhile and gave it back.
+            speechSession('playback');
+            wakeSpeech();
+            try { startsIn = view.liveSpeech.push(f.audio, Number(f.sampleRate)); }
             catch (e) { note('speech-play-failed', (e && e.message) || e); view.liveSpeech.stop(); }
+          }
+          if (speechLog) {
+            var heardAt = speechLogAt();
+            speechLog.chunkAt.push(heardAt);
+            if (startsIn) {
+              speechLog.startAt.push(Math.round(heardAt + startsIn.startsIn * 1000));
+              speechLog.leadAt.push(Math.round(startsIn.lead * 1000));
+              if (startsIn.gap > 0) speechLog.gaps.push([heardAt, Math.round(startsIn.gap * 1000), speechLog.chunkAt.length - 1]);
+            } else speechLog.noPlayer++;
+            speechLogState('chunk');
           }
         }
       }
+      if (f.token && speechLog) {
+        speechLog.texts++;
+        speechLog.lastText = speechLogAt();
+        if (speechLog.firstText < 0) speechLog.firstText = speechLog.lastText;
+      }
+      if (f.done === true && speechLog) { speechLog.done = speechLogAt(); speechLogState('done'); }
       view.noticesSaid = view.noticesSaid || {};
       if (typeof f.notice === 'string' && !view.noticesSaid[f.code || f.notice]) {
         // Said once in the turn (a replay of it too), in the page's language when it knows the case.
@@ -2648,7 +3002,7 @@
         madeImage = f.imageUrl || f.image;
         madeFrom = imageRecordOf(f);
         // The picture goes under the text, so the text has to be there first.
-        if (answerDirty) { view.bubble.innerHTML = render(answer); view.answerSoFar = answer; answerDirty = false; }
+        if (answerDirty) { renderAnswer(view, answer, true); view.answerSoFar = answer; answerDirty = false; }
         pictureOf(view).src = madeImage;
       }
       // A video model's turn (VideoTurns on the host): the description is read, the
@@ -2661,7 +3015,7 @@
         // and the clip plays it.
         madeAudio = f.audioUrl || null;
         // The clip goes under the text, so the text has to be there first.
-        if (answerDirty) { view.bubble.innerHTML = render(answer); view.answerSoFar = answer; answerDirty = false; }
+        if (answerDirty) { renderAnswer(view, answer, true); view.answerSoFar = answer; answerDirty = false; }
         clipOf(view).src = madeVideo;
         if (madeAudio) soundOf(view).src = madeAudio;
       }
@@ -2702,7 +3056,15 @@
     }
     function finish() {
       if (ctrl && ctrl.readerVersion !== state.readerVersion) { note('reader-retired', 'finish'); return; }
+      remember();
       paint();
+      // The finished answer as render() makes it in one piece (the incremental pieces
+      // nearly always add up to exactly that, and are then left as they are).
+      if (answer) {
+        settleAnswer(view, answer);
+        if (view.speechBox) speechBoxOf(view);
+        if (stickBottom) toBottom();
+      }
       note('finish', state.turn);
       stopWatchdog();
       recovery.attempts = 0;
@@ -2749,6 +3111,8 @@
       }
       if (answer) addCopy(view.turn, function () { return answer; });
       setGenerating(false);
+      // No more chunks: the reply gives the audio back once what it scheduled has played.
+      if (view.liveSpeech) view.liveSpeech.end();
       state.abort = null;
       state.turn = null;
       state.liveView = null;
@@ -3728,7 +4092,7 @@
   $('speech-toggle').addEventListener('change', function () {
     state.speakReplies = !!$('speech-toggle').checked && !!state.speechOutput;
     primeSpeech();
-    if (!state.speakReplies) stopLiveSpeech();
+    if (!state.speakReplies) { stopLiveSpeech(); speechSession('auto'); }
     paintSpeech();
   });
   $('speech-voice').addEventListener('change', function () {
@@ -5383,6 +5747,21 @@
 
     /** How many files are chipped under the composer. For tests and the app's own checks. */
     attachmentCount: function () { return state.attachments.length; },
+    /** Switch Speak replies, as the switch does; false when the model does not speak. For the app's own checks. */
+    setSpeakReplies: function (on) {
+      var toggle = $('speech-toggle');
+      if (toggle) { toggle.checked = !!on; toggle.dispatchEvent(new Event('change')); }
+      return speaksReplies();
+    },
+    /** The newest spoken turn in three numbers, cheap enough to poll while it streams: 'done,chunks,texts'. */
+    speechStatus: function () {
+      return speechLog ? speechLog.done + ',' + speechLog.chunkAt.length + ',' + speechLog.texts : 'null';
+    },
+    /** The newest spoken turn's timeline (see speechLog), as one JSON string, or 'null'. */
+    speechTimeline: function () {
+      if (speechLog) speechLogState('asked');
+      return JSON.stringify(speechLog);
+    },
 
     addAttachment: function (a) {
       if (!a || !a.ok) { notice((a && a.error) || t('page.upload.failed'), 'error'); return; }
@@ -5608,6 +5987,9 @@
   document.addEventListener('visibilitychange', function () {
     note('visibility', document.visibilityState);
     if (document.visibilityState !== 'visible') return;
+    // A reply still being spoken comes back with the app: WebKit interrupts the
+    // AudioContext while the app is away, and nothing else would resume it.
+    if (liveSpeech && liveSpeech.speaking()) wakeSpeech();
     // A moment later rather than inside the handler: WebKit on iOS 18 and later can
     // fail a fetch issued synchronously here with "Load failed" against a server that
     // is perfectly well, and the app's own check of its listener is under way at the

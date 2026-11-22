@@ -43,9 +43,14 @@
   // innerHTML is kept as the raw markup the page produced. The page renders its
   // own Markdown into it, so parsing would only re-implement a browser; what a
   // test needs is what was written, and that is what is stored.
+  // A test that needs to see what the page writes (how much, in what order) sets
+  // __page.onHtml(element, markup); it is called after every write.
   Object.defineProperty(Element.prototype, 'innerHTML', {
     get: function () { return this._html; },
-    set: function (v) { this._html = v == null ? '' : String(v); detachAll(this); this._text = ''; },
+    set: function (v) {
+      this._html = v == null ? '' : String(v); detachAll(this); this._text = '';
+      if (globalThis.__page && typeof globalThis.__page.onHtml === 'function') globalThis.__page.onHtml(this, this._html);
+    },
   });
 
   // As a browser does: an element whose markup is replaced no longer has a parent,

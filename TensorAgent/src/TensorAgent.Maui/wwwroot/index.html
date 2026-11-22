@@ -110,6 +110,9 @@ body { display: flex; flex-direction: column; }
   padding: 12px 12px 4px;
   display: flex; flex-direction: column; gap: 10px;
   overscroll-behavior: contain;
+  /* Only the user and the page scroll the chat: no anchoring adjustments of the browser's own
+     (on iOS a chat held above an answer drifted back down while it streamed). */
+  overflow-anchor: none;
 }
 
 .turn { display: flex; flex-direction: column; max-width: 100%; }
@@ -126,6 +129,10 @@ body { display: flex; flex-direction: column; }
 .me .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 5px; }
 .bot .bubble { background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
 .bubble p { margin: 0 0 8px; } .bubble p:last-child { margin-bottom: 0; }
+/* An answer being written: its settled blocks, each rendered once, then the block still
+   growing (tensoragent.js renderAnswer). The wrappers take no box of their own. */
+.bubble .md { display: contents; }
+.bubble .md-part p:last-child { margin-bottom: 8px; }
 /* An assistant turn exists before its first token does, and an empty rounded
    rectangle under the live-progress line reads as a broken reply rather than as
    one that has not started. */
@@ -320,11 +327,20 @@ body { display: flex; flex-direction: column; }
 
 /* ---- the composer ------------------------------------------------------- */
 #composer {
-  flex: 0 0 auto;
+  flex: 0 0 auto; position: relative;
   background: var(--surface);
   border-top: 1px solid var(--border);
   padding: 8px 10px calc(8px + var(--safe-bottom));
 }
+
+/* Back to the newest line, while the user reads above it during an answer. */
+.jump-latest {
+  position: absolute; right: 12px; top: -52px; z-index: 5;
+  width: 40px; height: 40px; border-radius: 50%;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  font-size: 20px; line-height: 1; box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+}
+.jump-latest[hidden] { display: none; }
 
 #chips {
   display: flex; flex-wrap: wrap; align-content: flex-start; gap: 6px; margin-bottom: 6px;
