@@ -10,7 +10,7 @@
 | Vision encoder | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | Image processor | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
 | Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE-family), Qwen3.6-27B / Qwen3.8-27B (dense); also [Bonsai2 27B](bonsai2.md) (PRISM PQ2_0 / PTQ1_0) |
-| Modalities | Text, image |
+| Modalities | Text, image, video (`video_url`, sampled into timed frame pairs; see § 4.6) |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
 | Batched / paged forward | **Default ON** — `--no-continuous-batching` forces the per-sequence KV-swap path. Includes a per-slot GatedDeltaNet recurrent-state pool. See §11. |
@@ -480,11 +480,50 @@ A SigLIP-style ViT with:
 
 On a GGML backend the whole tower, post-LN and merger run as one graph
 (`TSGgml_Qwen35VisionEncoderMergedBatchF32`): Q and K turn by ggml's vision rope straight from the QKV
-projection, bias adds broadcast, and the frame pairs of a video can share the graph. `TS_QWEN_VISION_ROPE=tables`
+projection, bias adds broadcast, and several video pairs can share the graph (§ 4.6). `TS_QWEN_VISION_ROPE=tables`
 keeps the cos/sin-table rotation (`TSGgml_Qwen35VisionEncoderMergedF32`). The per-block fused kernels
 (`FusedVisionAttention` and `FusedVisionMLP`) are the fallback; see § 8. On a CUDA GPU a 2,880-patch frame pair
 takes 166 ms through the graph (231 ms with the table rotation and materialized bias rows), and its output stays
 within 1.7e-3 relative L2 of the managed CPU tower.
+
+### 4.6 Video (`video_url`)
+
+The Qwen 3.5 / 3.6 / 3.8-27B projectors carry the tower's second temporal patch slice
+(`v.patch_embd.weight.1`), so the `qwen35` chat protocol samples OpenAI `video_url` parts into timed frames
+the way the Qwen3-VL processor does ([`QwenVideoFrames`](../../TensorSharp.Runtime/QwenVideoFrames.cs)):
+
+- frames at most 0.575 s apart share one temporal patch (a frame pair through the two conv slices), and an
+  odd last frame is paired with itself;
+- each pair is a `<t seconds><|vision_start|><|video_pad|>...<|vision_end|>` block whose M-RoPE positions
+  advance like an image's, so consecutive pairs carry increasing temporal coordinates;
+- the clip is resized as a whole against the processor's 25,165,824-pixel budget (`SmartResizeVideo`);
+- TensorSharp writes the sampled frame times as one line of text before the clip, which the Hugging Face
+  processor does not.
+
+`fps` / `max_frames` in the part (or `VIDEO_SAMPLE_FPS` / `VIDEO_MAX_FRAMES`) choose the frames; the
+processor's own rate is 2 frames per second. The pairs of a clip are encoded together
+(`Qwen35VisionEncoder.EncodeVideoPairs`): their frames are decoded in parallel and, on the GGML backends,
+the merged graph stacks up to `TS_QWEN_VISION_BATCH_PATCHES` (8,192) patches of pairs per call, with
+attention kept within each pair. Where OpenCvSharp's native library does not load (it is not shipped for every platform), frames
+are read through the `ffmpeg` / `ffprobe` executables
+([`FfmpegVideoDecoder`](../../TensorSharp.Models/Media/Desktop/FfmpegVideoDecoder.cs)).
+
+Loading the projector encodes one small blank frame pair on a GGML GPU backend (`WarmUp`, about 0.4 s), so
+the first clip does not pay the tower's one-time device setup (about 10 s on CUDA beside the language model).
+`TS_QWEN_VISION_WARMUP=0` skips it.
+
+Measured on one CUDA GPU (`ggml_cuda`) against vLLM 0.32, with three security-camera clips of 20-37 s at 2 frames
+per second (64 frames, 11.9K-12.5K prompt tokens), one request at a time, temperature 0.7 / top_p 0.8 / top_k 20 and
+thinking off:
+
+| | Qwen3.6-35B-A3B UD-Q4_K_M | vLLM, NVIDIA NVFP4 | Qwen3.8-27B UD-IQ3_XXS | vLLM, NVFP4 + DFlash |
+|---|---|---|---|---|
+| First token, a clip not seen before | 7.8-10.1 s | 3.6-3.8 s | 18.2-22.0 s | 10.5-14.7 s |
+| First token, another question about the same clip | 4.7-5.8 s | 1.9-2.6 s | 15.3-16.8 s | 7.5-8.1 s |
+| Decode after the video prompt | 66 tok/s | 71-75 tok/s | 21 tok/s | 27-33 tok/s |
+
+On 15 short questions about the clips, checked against answers written from the frames beforehand, TensorSharp
+answered 12 right on either model and vLLM 13.
 
 ## 5. Parameters and settings
 

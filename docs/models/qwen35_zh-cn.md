@@ -10,7 +10,7 @@
 | 视觉编码器 | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | 图像处理器 | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
 | 示例模型 | Qwen3.5-9B（dense hybrid）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE 系列）、Qwen3.6-27B / Qwen3.8-27B（dense）；另有 [Bonsai2 27B](bonsai2_zh-cn.md)（PRISM PQ2_0 / PTQ1_0） |
-| 模态 | 文本、图像 |
+| 模态 | 文本、图像、视频（`video_url`，采样为带时间的帧对，见 § 4.6） |
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是（`<tool_call>{...}</tool_call>`） |
 | 批处理 / 分页前向 | **默认启用** —— `--no-continuous-batching` 会强制走按序列 KV-swap 路径。带每槽位 GatedDeltaNet 递归状态池。详见 §11。 |
@@ -391,10 +391,42 @@ SigLIP 风格 ViT：
 - 多模态 projector（RMSNorm + Linear + GELU + Linear）映射到语言模型 hidden dim。
 
 GGML 后端上整个视觉塔、post-LN 与合并器作为一张图运行（`TSGgml_Qwen35VisionEncoderMergedBatchF32`）：Q 与 K
-直接在 QKV 投影上用 ggml 的视觉 rope 旋转，偏置加法走广播，一段视频的多个帧对可共用一张图。
+直接在 QKV 投影上用 ggml 的视觉 rope 旋转，偏置加法走广播，多个视频帧对可共用一张图（§ 4.6）。
 `TS_QWEN_VISION_ROPE=tables` 保留 cos/sin 表旋转（`TSGgml_Qwen35VisionEncoderMergedF32`）。逐 block 的融合 kernel
 （`FusedVisionAttention` 与 `FusedVisionMLP`）作为回退，见 § 8。在 CUDA GPU 上一对 2,880 patch 的帧经过这张图需要
 166 ms（使用表旋转和展开的偏置行时为 231 ms），输出与托管 CPU 视觉塔的相对 L2 误差在 1.7e-3 以内。
+
+### 4.6 视频（`video_url`）
+
+Qwen 3.5 / 3.6 / 3.8-27B 的投影器带有视觉塔的第二个时间 patch 切片（`v.patch_embd.weight.1`），因此 `qwen35`
+聊天协议按 Qwen3-VL 处理器的方式把 OpenAI `video_url` 部分采样为带时间的帧
+（[`QwenVideoFrames`](../../TensorSharp.Runtime/QwenVideoFrames.cs)）：
+
+- 相距不超过 0.575 s 的帧共用一个时间 patch（一对帧经过两个卷积切片），奇数的最后一帧与自身配对；
+- 每对帧是一个 `<t seconds><|vision_start|><|video_pad|>...<|vision_end|>` 块，其 M-RoPE 位置像图像一样推进，
+  所以相邻帧对的时间坐标递增；
+- 整段视频按处理器的 25,165,824 像素预算统一缩放（`SmartResizeVideo`）；
+- TensorSharp 会在视频前用一行文本写出采样帧的时间，Hugging Face 处理器没有这一行。
+
+部分中的 `fps` / `max_frames`（或 `VIDEO_SAMPLE_FPS` / `VIDEO_MAX_FRAMES`）决定取哪些帧；处理器自身的采样率是每秒
+2 帧。一段视频的帧对一起编码（`Qwen35VisionEncoder.EncodeVideoPairs`）：帧并行解码，在 GGML 后端上合并图每次最多
+堆叠 `TS_QWEN_VISION_BATCH_PATCHES`（8,192）个 patch 的帧对，attention 仍限于每对之内。在 OpenCvSharp 原生库
+无法加载的平台（并非每个平台都提供该库）上，通过 `ffmpeg` / `ffprobe` 可执行文件读帧
+（[`FfmpegVideoDecoder`](../../TensorSharp.Models/Media/Desktop/FfmpegVideoDecoder.cs)）。
+
+在 GGML GPU 后端上加载投影器时会编码一对小的空白帧（`WarmUp`，约 0.4 s），这样第一段视频不必承担视觉塔一次性的
+设备初始化（在 CUDA 上与语言模型同时运行时约 10 s）。`TS_QWEN_VISION_WARMUP=0` 跳过它。
+
+在一块 CUDA GPU（`ggml_cuda`）上对照 vLLM 0.32 测量：三段 20-37 s 的监控摄像头视频，每秒 2 帧（64 帧，提示
+11.9K-12.5K token），一次一个请求，temperature 0.7 / top_p 0.8 / top_k 20，关闭思维链：
+
+| | Qwen3.6-35B-A3B UD-Q4_K_M | vLLM，NVIDIA NVFP4 | Qwen3.8-27B UD-IQ3_XXS | vLLM，NVFP4 + DFlash |
+|---|---|---|---|---|
+| 首个 token，未见过的视频 | 7.8-10.1 s | 3.6-3.8 s | 18.2-22.0 s | 10.5-14.7 s |
+| 首个 token，同一视频的另一个问题 | 4.7-5.8 s | 1.9-2.6 s | 15.3-16.8 s | 7.5-8.1 s |
+| 视频提示之后的解码 | 66 tok/s | 71-75 tok/s | 21 tok/s | 27-33 tok/s |
+
+针对这些视频的 15 个简短问题，对照事先根据画面写好的答案，TensorSharp 在两个模型上都答对 12 个，vLLM 答对 13 个。
 
 ## 5. 参数与配置
 

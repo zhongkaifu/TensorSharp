@@ -32,7 +32,7 @@ Media in the input column is content the model receives; the output column disti
 | Family / card | Inputs | Output / task | Conditions and evidence |
 |---|---|---|---|
 | [Gemma 4](gemma4.md) | Text, image, video, audio | Text | Conditional: matching projector for media. Start with the E4B Q8_0 native-GGML lane. |
-| [Qwen 3.5 / 3.6 / 3.8 27B](qwen35.md) | Text, image | Text | Conditional: NextN needs a GGUF retaining its draft block; check variant and backend. |
+| [Qwen 3.5 / 3.6 / 3.8 27B](qwen35.md) | Text, image, video | Text | Conditional: NextN needs a GGUF retaining its draft block; check variant and backend. |
 | [Qwen3-VL](qwen3vl.md) | Text, image, video | Text | Conditional: media needs the matching projector (with its DeepStack mergers); media prompts run as whole-forward graphs. |
 | [Qwen 3.8 Flash Next](qwen38-flash-next.md) | Text, image, video | Text | Conditional: memory placement, tensor parallelism and the separate MTP head depend on quantization/backend. |
 | [Bonsai2 27B](bonsai2.md) | Text, image with projector | Text | Conditional: single-device GGML only. Recorded Metal and bounded CPU checks do not qualify other devices. |

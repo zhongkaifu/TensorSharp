@@ -11,7 +11,7 @@ using TensorSharp.Server.RequestParsers;
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Ordered video-frame input for the Qwen-VL families (Qwen 3.8 Flash Next <c>qwen4exp</c>, Qwen3-VL <c>qwen3vl</c>): the OpenAI
+/// Ordered video-frame input for the Qwen-VL families (Qwen 3.8 Flash Next <c>qwen4exp</c>, Qwen 3.5 / 3.6 <c>qwen35</c>, Qwen3-VL <c>qwen3vl</c>): the OpenAI
 /// <c>video_url</c> part is sampled into timed frames, the prompt renders them as the
 /// Qwen3-VL video layout (one <c>&lt;|video_pad|&gt;</c> block per temporal pair, each
 /// labelled with its time), and the injector's prompt layout
@@ -43,6 +43,8 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
 
     [Theory]
     [InlineData("qwen4exp")]
+    [InlineData("qwen35")]
+    [InlineData("qwen35moe")]
     [InlineData("qwen3vlmoe")]
     public void OpenAiVideo_IsAcceptedForQwenVLFamiliesAndRendersTimedPairsOncePerClip(string architecture)
     {
@@ -132,18 +134,18 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
     }
 
     [Fact]
-    public void Qwen35_StillRefusesVideoUrlRatherThanSilentlyDroppingIt()
+    public void AProtocolThatDoesNotSampleVideoStillRefusesVideoUrl()
     {
         var uploads = new UploadStoragePolicy(_directory);
         using var json = JsonDocument.Parse("""
             [{"role":"user","content":[
               {"type":"video_url","video_url":{"url":"data:video/mp4;base64,AQID","fps":1,"max_frames":2}}]}]
             """);
-        Assert.Throws<JsonException>(() => ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: "qwen35"));
+        Assert.False(ChatProtocolRegistry.For("hunyuan-dense")!.CapsVideoFrames);
+        Assert.Throws<JsonException>(() => ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: "hunyuan-dense"));
         Assert.Empty(_decoder.Requested);
-        Assert.True(ChatProtocolRegistry.For("qwen4exp")!.CapsVideoFrames);
-        Assert.True(ChatProtocolRegistry.For("qwen3vlmoe")!.CapsVideoFrames);
-        Assert.False(ChatProtocolRegistry.For("qwen35")!.CapsVideoFrames);
+        foreach (string qwen in new[] { "qwen4exp", "qwen35", "qwen35moe", "qwen3next", "qwen3vl", "qwen3vlmoe" })
+            Assert.True(ChatProtocolRegistry.For(qwen)!.CapsVideoFrames, qwen);
     }
 
     [Theory]
