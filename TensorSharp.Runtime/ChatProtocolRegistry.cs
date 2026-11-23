@@ -207,6 +207,9 @@ namespace TensorSharp.Runtime
                 // do not read it (Qwen 3.5 / 3.6, the Qwen3.8-9B distill) render the same
                 // either way.
                 RendersReasoningEffort = true,
+                // A `video_url` part is sampled into timed frames and rendered as the Qwen3-VL video layout, as for
+                // qwen4exp: the 3.5 / 3.6 tower is the same Qwen3-VL tower, temporal patch slices included.
+                CapsVideoFrames = true,
             });
 
             // Qwen3.8 Flash Next uses ChatML reasoning and the Qwen XML-style
