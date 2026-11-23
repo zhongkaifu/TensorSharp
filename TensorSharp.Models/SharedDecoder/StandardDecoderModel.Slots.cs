@@ -1225,9 +1225,9 @@ namespace TensorSharp.Models
         private bool TryForwardSlotsInRingSteps(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
             float[][] features, SlotRowIO rowIO = null)
         {
-            if (features != null && Array.Exists(features, f => f != null))
-                throw new NotSupportedException($"{Config.Architecture}: drafter features of a chunk longer than {_maxSequenceStepRows} rows, " +
-                    "which its sliding-window ring caches take in steps.");
+            // Drafter features come back round by round, into each sequence's buffer at its rows.
+            bool wantsFeatures = features != null && Array.Exists(features, f => f != null);
+            int featureWidth = wantsFeatures ? SpecFeatureSize : 0;
             int step = _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
             for (int s = 0; s < n; s++) rounds = Math.Max(rounds, ((chunks[s]?.Length ?? 0) + step - 1) / step);
             // A chunk whose rows its request's drafter follows (FollowPlainPrompt, FollowUnspeculatedPrompt) is followed in every
@@ -1250,7 +1250,7 @@ namespace TensorSharp.Models
             // traced and built. The slots hold their whole chunks first, so no round grows them.
             IDisposable overlap = null;
             if (OverlapPromptSteps && rounds > 1 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null
-                && followedEnds == null && _slots != null
+                && followedEnds == null && !wantsFeatures && _slots != null
                 && requestIds.All(id => _slots.ContainsKey(id)))
             {
                 for (int s = 0; s < n; s++)
@@ -1291,12 +1291,33 @@ namespace TensorSharp.Models
                             Hidden = rowIO.Hidden == null ? null : hidden.ToArray(),
                         };
                     var logits = new float[ids.Count][];
+                    // Each piece's rows the sequence's buffer holds (its chunk's last rows), captured by this round.
+                    float[][] roundFeatures = null;
+                    if (wantsFeatures)
+                    {
+                        roundFeatures = new float[ids.Count][];
+                        for (int i = 0; i < owners.Count; i++)
+                            if (features[owners[i]] != null) roundFeatures[i] = new float[(long)parts[i].Length * featureWidth];
+                    }
                     FollowRound(owners);
-                    if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits, null, roundRowIO))
+                    if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits, roundFeatures, roundRowIO))
                     {
                         if (round == 0) return false;
                         throw new InvalidOperationException($"{Config.Architecture}: round {round} of a batched step in ring steps declined after the first ran.");
                     }
+                    if (roundFeatures != null)
+                        for (int i = 0; i < owners.Count; i++)
+                        {
+                            float[] all = features[owners[i]], part = roundFeatures[i];
+                            if (all == null || part == null) continue;
+                            int length = chunks[owners[i]].Length, held = (int)Math.Min(length, all.LongLength / featureWidth);
+                            int at = round * step, firstHeld = length - held;
+                            for (int r = 0; r < parts[i].Length; r++)
+                            {
+                                int row = at + r - firstHeld;
+                                if (row >= 0) Array.Copy(part, (long)r * featureWidth, all, (long)row * featureWidth, featureWidth);
+                            }
+                        }
                     for (int i = 0; i < owners.Count; i++)
                         if ((round + 1) * step >= chunks[owners[i]].Length) outLogits[owners[i]] = logits[i];
                 }

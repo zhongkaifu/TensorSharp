@@ -132,9 +132,9 @@ namespace TensorSharp.Models
 
         public bool SpeculationProfitable => SpeculationRefusal == null;
 
-        public int SpecFeatureSize => HasDFlash ? DFlashSettings.FeatureSize : DraftFeatureWidth;
+        public int SpecFeatureSize => HasBlockFeatures ? BlockFeatureSize : DraftFeatureWidth;
 
-        public int SpecPrefillChunkSize => HasDFlash ? DFlashPrefillChunkSize : 0;
+        public int SpecPrefillChunkSize => HasDFlash ? DFlashPrefillChunkSize : FamilyDrafter?.PrefillChunkCap ?? 0;
 
         /// <summary>The bound slot is the active cache, so a verify runs on whichever request is bound.</summary>
         public bool SpecTrunkFollowsBoundCache => true;
@@ -156,7 +156,7 @@ namespace TensorSharp.Models
         /// elsewhere and for other drafters. Attention-only stacks take the speculator's own default.
         /// </summary>
         public virtual int SpecPreferredDraftWindow => !_anyRecurrent ? 0
-            : !HasDFlash ? 3
+            : !HasBlockFeatures ? 3
             : _backend == BackendType.GgmlCuda ? 7
             : _backend == BackendType.GgmlMetal ? 5
             : _backend == BackendType.Cuda ? 0 : 3;
@@ -217,16 +217,16 @@ namespace TensorSharp.Models
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             EnsureCacheCapacity(checked(start + rows));
             PrepareWrite(_cacheK, start);
-            bool dflash = HasDFlash;
+            bool dflash = HasBlockFeatures;
             // A buffer smaller than every row's DFlash features takes the last row's: the step returns only that row.
-            bool lastFeatureRow = dflash && hAllOut != null && hAllOut.LongLength < (long)rows * DFlashSettings.FeatureSize;
+            bool lastFeatureRow = dflash && hAllOut != null && hAllOut.LongLength < (long)rows * BlockFeatureSize;
             TokenPositions positions = BeginRotaryPositions(start, rows);
             var request = new GraphRequest
             {
                 PositionTable = positions.Table,
                 AllRowLogits = allLogitsRows,
                 LastRowLogits = !allLogitsRows,
-                CaptureLayers = dflash && hAllOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
+                CaptureLayers = dflash && hAllOut != null ? BlockFeatureLayers : Array.Empty<int>(),
                 CaptureTail = lastFeatureRow ? 1 : 0,
                 CaptureFinal = !dflash && hAllOut != null,
                 RecurrentSnapshots = _anyRecurrent && rows > 1 && rows <= SmallChunkRows,
@@ -385,9 +385,9 @@ namespace TensorSharp.Models
         {
             if (hAllOut == null || hAllOut.LongLength == 0) return;
             int hiddenSize = Config.HiddenSize;
-            if (HasDFlash)
+            if (HasBlockFeatures)
             {
-                int feat = DFlashSettings.FeatureSize;
+                int feat = BlockFeatureSize;
                 bool all = hAllOut.LongLength >= (long)rows * feat;
                 if (!all && hAllOut.LongLength < feat)
                     throw new ArgumentException($"DFlash hidden capture buffer holds {hAllOut.LongLength} floats; one feature row needs {feat}.", nameof(hAllOut));
@@ -584,19 +584,25 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- the draft head
 
-        public DraftHeadKind DraftHeadKind => HasDFlash ? DraftHeadKind.Block : HasDraftLayer ? DraftHeadKind.PerToken : DraftHeadKind.None;
+        public DraftHeadKind DraftHeadKind => HasDFlash || FamilyDrafter != null ? DraftHeadKind.Block : HasDraftLayer ? DraftHeadKind.PerToken : DraftHeadKind.None;
 
-        public int DraftBlockSize => HasDFlash ? DFlashSettings.MaxDraftTokens : 0;
+        public int DraftBlockSize => HasDFlash ? DFlashSettings.MaxDraftTokens : FamilyDrafter?.DraftTokens ?? 0;
 
         public bool DraftBlockIsCausal => HasDFlash && DFlashSettings.CausalBlock;
 
         public int DraftContextRows => HasDFlash && DFlashRingRows > 0 ? DFlashRingRows : int.MaxValue;
 
         public int DraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
-            => DFlashPropose(lastToken, hPrev, position, draftOut, confOut);
+            => FamilyDrafter is { } family ? family.DraftBlock(lastToken, hPrev, position, draftOut, confOut)
+                : DFlashPropose(lastToken, hPrev, position, draftOut, confOut);
 
         public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
+            if (FamilyDrafter is { } family)
+            {
+                family.CatchUp(tokens, hRows, startPos);
+                return;
+            }
             if (HasDFlash)
             {
                 DFlashCommit(tokens, hRows, startPos);

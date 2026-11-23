@@ -667,6 +667,18 @@ set_target_properties(GgmlOps PROPERTIES
     OUTPUT_NAME GgmlOps
 )
 
+# TensorSharp's own kernels take the architecture-specific ("a") targets where ggml-cuda's do, so the block-scaled FP4
+# MMA (tsg_cuda_inkling_fp4.cuh) is available to them.
+get_target_property(_tsg_ops_cuda_archs GgmlOps CUDA_ARCHITECTURES)
+if (_tsg_ops_cuda_archs)
+    set(_tsg_ops_cuda_archs_a "")
+    foreach (_tsg_arch IN LISTS _tsg_ops_cuda_archs)
+        string(REGEX REPLACE "^(12[01])(-real|-virtual)?$" "\\1a\\2" _tsg_arch "${_tsg_arch}")
+        list(APPEND _tsg_ops_cuda_archs_a "${_tsg_arch}")
+    endforeach()
+    set_target_properties(GgmlOps PROPERTIES CUDA_ARCHITECTURES "${_tsg_ops_cuda_archs_a}")
+endif()
+
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     # The CUDA 13 pre-check must probe the nvcc CMake itself would pick (PATH before
     # CUDA_PATH). Script-only: fake nvcc files, no toolkit and no GPU needed.

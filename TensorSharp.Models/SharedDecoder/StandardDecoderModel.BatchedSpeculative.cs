@@ -25,14 +25,15 @@ namespace TensorSharp.Models
 
         /// <summary>The widest window a verify takes per sequence: the rows a step writes by index and replays
         /// (<see cref="SmallChunkRows"/>), which the executor narrows to the drafter's block; on a stack whose rows
-        /// read their own experts, the sequences' share of <see cref="ExpertVerifyRows"/>, and below two rows each
-        /// (0) the sequences decode plainly together.</summary>
+        /// read their own experts, the sequences' share of <see cref="ExpertVerifyRowBudget"/> (at most
+        /// <see cref="ExpertVerifySequenceRows"/> each), and below two rows each (0) the sequences decode plainly together.</summary>
         public int BatchedSpecWindow(int sequences)
         {
             if (sequences < 1 || !SupportsUnifiedBatching || SpeculationRefusal != null || GraphUnsupportedReason() != null)
                 return 0;
             if (sequences == 1 || !RowsReadTheirOwnExperts) return SmallChunkRows;
-            int perSequence = ExpertVerifyRows / sequences;
+            int budget = ExpertVerifyRowsOverride > 0 ? ExpertVerifyRowsOverride : ExpertVerifyRowBudget;
+            int perSequence = Math.Min(budget / sequences, ExpertVerifySequenceRowsOverride > 0 ? ExpertVerifySequenceRowsOverride : ExpertVerifySequenceRows);
             return perSequence < 2 ? 0 : perSequence;
         }
 
@@ -45,7 +46,18 @@ namespace TensorSharp.Models
         /// direct engine's budget). Given every sequence its whole window, four Qwen3.8 Flash Next MTP conversations on an
         /// A40 decoded 23.6 tok/s each against the engine's 37.0.
         /// </summary>
-        private const int ExpertVerifyRows = 8;
+        protected virtual int ExpertVerifyRowBudget => 8;
+
+        /// <summary>The most rows of <see cref="ExpertVerifyRowBudget"/> one sequence of several takes.</summary>
+        protected virtual int ExpertVerifySequenceRows => int.MaxValue;
+
+        /// <summary>TS_SPEC_EXPERT_VERIFY_ROWS: the budget for every model (experiments).</summary>
+        private static readonly int ExpertVerifyRowsOverride = int.TryParse(Environment.GetEnvironmentVariable("TS_SPEC_EXPERT_VERIFY_ROWS"), out int rows) && rows > 0
+            ? rows : 0;
+
+        /// <summary>TS_SPEC_EXPERT_VERIFY_SEQ_ROWS: the most rows a sequence of several takes, for every model (experiments).</summary>
+        private static readonly int ExpertVerifySequenceRowsOverride = int.TryParse(Environment.GetEnvironmentVariable("TS_SPEC_EXPERT_VERIFY_SEQ_ROWS"), out int seqRows) && seqRows > 0
+            ? seqRows : 0;
 
         /// <summary>Routed experts at least 16 times those a row takes (Qwen3.8 Flash Next: 512 and 10): the widest window's
         /// rows read mostly different experts, where a small pool (8 and 2) is read whole by a few rows.</summary>
@@ -104,6 +116,7 @@ namespace TensorSharp.Models
         /// ring selected.</summary>
         public void BindDraftState(string requestId)
         {
+            FamilyDrafter?.Bind(requestId);
             BindDFlashRing(requestId);
             if (requestId != null && _slots != null && _slots.ContainsKey(requestId))
                 BindSequenceCache(requestId);
@@ -111,6 +124,7 @@ namespace TensorSharp.Models
 
         public void ReleaseDraftState(string requestId)
         {
+            FamilyDrafter?.Release(requestId);
             ReleaseDFlashRing(requestId);
             if (requestId != null) _followPromptRequests?.Remove(requestId);
         }
@@ -215,7 +229,7 @@ namespace TensorSharp.Models
             // A verify that keeps the rings in step itself (the caller takes no features): its windows' rows go into the
             // rings in its own program, else its features come back to the model for the commit (StandardDecoderModel.VerifyFollow.cs).
             _keptVerify = null;
-            bool keepsRings = dflash && featuresOut == null && BatchedSpecVerifyKeepsDrafter;
+            bool keepsRings = HasDFlash && featuresOut == null && BatchedSpecVerifyKeepsDrafter;
             DFlashFollowPlan ringFollow = keepsRings ? PlanDFlashVerifyFollow(requestIds, window) : null;
             float[] keptFeatures = keepsRings ? KeptVerifyFeatures(rows) : null;
             // A lone request's one-row step that captures its carry (no drafts yet) hands the draft layer its row when the
@@ -227,8 +241,8 @@ namespace TensorSharp.Models
                 LastRowLogits = false,
                 AllRowLogits = true,
                 GreedyIds = idsOut != null && GraphGreedyIds,
-                CaptureLayers = dflash && (featuresOut != null || keptFeatures != null) ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
-                CaptureFinal = !dflash && featuresOut != null,
+                CaptureLayers = HasBlockFeatures && (featuresOut != null || keptFeatures != null) ? BlockFeatureLayers : Array.Empty<int>(),
+                CaptureFinal = !HasBlockFeatures && featuresOut != null,
                 RecurrentSnapshots = _anyRecurrent && window > 1,
                 FollowDraft = follow,
                 DraftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], flat, media: false) : null,
@@ -298,14 +312,14 @@ namespace TensorSharp.Models
         private bool TryRunCapturingGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
             float[][] outLogits, float[][] features)
         {
-            bool dflash = HasDFlash;
+            bool dflash = HasBlockFeatures;
             int feat0 = SpecFeatureSize;
             // One sequence: the graph returns only the rows its drafter needs (features[0] holds that many).
             int tail = slots.Length == 1 && dflash && features[0] != null ? (int)Math.Min(counts[0], features[0].LongLength / feat0) : 0;
             var request = new GraphRequest
             {
                 LastRowLogits = true,
-                CaptureLayers = dflash ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
+                CaptureLayers = dflash ? BlockFeatureLayers : Array.Empty<int>(),
                 CaptureFinal = !dflash,
                 CaptureTail = tail,
                 // A unified step: prompt chunks and decode tokens, as the plain unified step marks them.

@@ -5,6 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using TensorSharp.Graph;
 
 namespace TensorSharp.Models
@@ -80,6 +82,10 @@ namespace TensorSharp.Models
         /// </summary>
         private int Rebuild(GraphStep step, int stream, int[] from)
         {
+            // In place on the ggml executors; the tensor executor's plan frees a node after its last reader, which an in-place
+            // write into a live node defeats, so it rebuilds the stream.
+            if (!StreamRebuilt && _backend is BackendType.GgmlCuda or BackendType.GgmlCpu or BackendType.GgmlMetal or BackendType.GgmlVulkan)
+                return WriteSlots(step, stream, from);
             int h = Config.HiddenSize, rows = step.Rows;
             long f = sizeof(float);
             int result = -1;
@@ -101,6 +107,41 @@ namespace TensorSharp.Models
                 result = result < 0 ? piece : step.Op(GraphOp.Concat, stackalloc[] { result, piece }, stackalloc long[] { 0 });
             }
             return result;
+        }
+
+        private static readonly bool StreamRebuilt = Environment.GetEnvironmentVariable("TS_INKLING_STREAM_REBUILD") == "1";
+
+        // The current slot's value the last FFN wrote (the next run's entry value), as its own tensor: a capture must not read
+        // it through the stream, which later runs overwrite in place.
+        private GraphStep _curStep;
+        private int _curLayer = -1, _curValue = -1;
+
+        /// <summary>
+        /// <see cref="Rebuild"/> in place: the slots that change are written into the stream by one SetRows whose source joins
+        /// their values (a moved slot's old value copied out), so every read of the old stream feeds the one write and the
+        /// slots that stay are not copied. The rows written are the stream's [hidden] rows r * slots + slot.
+        /// </summary>
+        private int WriteSlots(GraphStep step, int stream, int[] from)
+        {
+            int h = Config.HiddenSize, rows = step.Rows, slots = _streamSlots;
+            int source = -1, changed = 0;
+            Span<int> targets = stackalloc int[from.Length];
+            for (int i = 0; i < from.Length; i++)
+            {
+                if (from[i] < 0 && ~from[i] == i) continue;
+                int value = from[i] >= 0 ? step.Reshape(step.Cont(from[i]), h, rows) : StreamSlot(step, stream, ~from[i]);
+                source = source < 0 ? value : step.Op(GraphOp.Concat, stackalloc[] { source, value }, stackalloc long[] { 1 });
+                targets[changed++] = i;
+            }
+            if (changed == 0) return stream;
+            var index = new int[changed * rows];
+            for (int t = 0; t < changed; t++)
+                for (int r = 0; r < rows; r++)
+                    index[t * rows + r] = r * slots + targets[t];
+            int ids = step.ConstantInputI32(index, index.Length);
+            int dst = step.Reshape(stream, h, (long)slots * rows, 1);
+            int written = step.Op(GraphOp.SetRows, dst, step.Reshape(source, h, (long)changed * rows, 1), ids);
+            return step.Reshape(written, (long)slots * h, rows);
         }
 
         /// <summary>Every slot kept where it is (<see cref="Rebuild"/>'s identity), to change some.</summary>
@@ -246,6 +287,16 @@ namespace TensorSharp.Models
                 xk = step.RmsNorm(xk, LayerName(layer, "attn_k_inp_norm.weight"));
                 xv = step.RmsNorm(xv, LayerName(layer, "attn_v_inp_norm.weight"));
             }
+            if (step.Rows > PackedProductRows)
+            {
+                // A prompt step's projections read the three inputs as they are.
+                _inputStep = step;
+                _inputLayer = layer;
+                _inputQ = xq;
+                _inputK = xk;
+                _inputV = xv;
+                return xq;
+            }
             // The attention reads the three inputs packed [3 * hidden, rows] (EmitAttentionProjections).
             int qk = step.Op(GraphOp.Concat, stackalloc[] { xq, xk }, stackalloc long[] { 0 });
             return step.Op(GraphOp.Concat, stackalloc[] { qk, xv }, stackalloc long[] { 0 });
@@ -258,7 +309,11 @@ namespace TensorSharp.Models
             if (site == BlockSite.Ffn)
             {
                 int moe = Convolve(step, layer, output, 2 * _kvDim + h, h, "ffn_post_conv.weight", -1, 0);
-                from[Cur] = step.Op(GraphOp.Add, step.Cont(SlotView(step, stream, Cur)), moe);
+                from[Cur] = step.Op(GraphOp.Add, SlotView(step, stream, Cur), moe);
+                // The next run's entry value of the current slot, as its own tensor (EmitCaptureRow).
+                _curStep = step;
+                _curLayer = layer;
+                _curValue = from[Cur];
                 return Rebuild(step, stream, from);
             }
             int o = Convolve(step, layer, output, 2 * _kvDim, h, "attn_post_conv.weight", -1, 0);
@@ -270,7 +325,7 @@ namespace TensorSharp.Models
             }
             else
             {
-                from[Cur] = step.Op(GraphOp.Add, step.Cont(SlotView(step, stream, Cur)), o);
+                from[Cur] = step.Op(GraphOp.Add, SlotView(step, stream, Cur), o);
             }
             return Rebuild(step, stream, from);
         }
@@ -296,33 +351,83 @@ namespace TensorSharp.Models
             int kernel = step.Weight(LayerName(layer, weight));                                      // [taps, channels]
             float scale = 1.0f / MathF.Sqrt(taps * (dynamic >= 0 ? 2 : 1) + 1);
             int n = step.Sequences, output = -1;
+            // Several sequences, all verifying or none: one fused node (InklingConvBatch) over their leaves, its ops the
+            // per-sequence ones below without their own regions.
+            int[] leaves = null, histories = null;
+            bool batched = false;
+            if (n > 1 && n <= 16 && !ConvBatchDisabled)
+            {
+                bool all = true, none = true;
+                for (int s = 0; s < n; s++) { bool v = step.RecurrentSnapshots && step.Counts[s] > 1; all &= v; none &= !v; }
+                if (all || none)
+                {
+                    batched = true;
+                    leaves = new int[n];
+                    histories = all ? new int[n] : null;
+                    var inputs = new List<int> { x, kernel };
+                    if (dynamic >= 0) inputs.Add(dynamic);
+                    var ints = new List<long> { dynamic >= 0 ? heads : 0, all ? 1 : 0, n, offset, history };
+                    for (int s = 0; s < n; s++) ints.Add(step.Counts[s]);
+                    for (int s = 0; s < n; s++)
+                    {
+                        var st = (ShortConvState)step.SequenceState(s, layer);
+                        leaves[s] = step.State(st.Conv, GraphFormat.F32, history, _convChannels);
+                        inputs.Add(leaves[s]);
+                        if (all)
+                        {
+                            if (st.EnsureSpecBuffers(step.Counts[s])) NoteGraphBindingsChanged();
+                            histories[s] = step.State(st.ConvHistory, GraphFormat.F32, history + st.SnapshotCapacity, _convChannels);
+                            inputs.Add(histories[s]);
+                        }
+                    }
+                    step.BeginFused(GraphFusion.InklingConvBatch, CollectionsMarshal.AsSpan(inputs), CollectionsMarshal.AsSpan(ints), stackalloc[] { scale });
+                }
+            }
             for (int s = 0; s < n; s++)
             {
                 int count = step.Counts[s];
                 long first = step.First[s];
-                int xs = step.Cont(n == 1 ? x : step.View2(x, channels, count, channels * f, first * channels * f));
+                // One sequence's rows as they lie (the kernel reads them at their stride); the region's ops copy them.
+                long xRow = RowBytesOf(step, x, channels * f), dRow = dynamic < 0 ? 0 : RowBytesOf(step, dynamic, (long)taps * heads * f);
+                int xsIn = n == 1 ? x : step.View2(x, channels, count, xRow, first * xRow);
                 var state = (ShortConvState)step.SequenceState(s, layer);
-                int leaf = step.State(state.Conv, GraphFormat.F32, history, _convChannels);
+                int leaf = batched ? leaves[s] : step.State(state.Conv, GraphFormat.F32, history, _convChannels);
                 int window = step.View2(leaf, history, channels, history * f, offset * history * f);           // [taps - 1, channels]
                 long width = (long)taps * heads;
-                int ds = dynamic < 0 ? -1 : step.Cont(n == 1 ? dynamic : step.View2(dynamic, width, count, width * f, first * width * f));
+                int dsIn = dynamic < 0 ? -1 : n == 1 ? dynamic : step.View2(dynamic, width, count, dRow, first * dRow);
+                int xs = xsIn, ds = dsIn;
                 // A verify window leaves the live window as it was and writes its inputs into the state's history at the window's
                 // own pitch, the layer's four convolutions each at its channels: the commit takes the accepted rows' window
                 // (CommitShortConvWindows). Its rows run as ops; a fused kernel advances the window.
                 bool verifying = step.RecurrentSnapshots && count > 1;
                 int historyLeaf = -1;
+                long pitch = (history + count) * f;
                 if (verifying)
                 {
-                    if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
-                    historyLeaf = step.State(state.ConvHistory, GraphFormat.F32, history + state.SnapshotCapacity, _convChannels);
+                    if (!batched)
+                    {
+                        if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
+                        historyLeaf = step.State(state.ConvHistory, GraphFormat.F32, history + state.SnapshotCapacity, _convChannels);
+                    }
+                    else historyLeaf = histories[s];
+                    // The region writes the history itself (its kernel leaves the live window to the commit).
+                    int historyView = step.View2(historyLeaf, history + count, channels, pitch, offset * pitch);
+                    if (batched) { }
+                    else if (ds >= 0)
+                        step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xsIn, window, kernel, dsIn, historyView }, stackalloc long[] { heads, 1 }, stackalloc[] { scale });
+                    else
+                        step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xsIn, window, kernel, historyView }, stackalloc long[] { 0, 1 }, stackalloc[] { scale });
                 }
+                else if (batched) { }
                 else if (ds >= 0)
-                    step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xs, window, kernel, ds }, stackalloc long[] { heads }, stackalloc[] { scale });
+                    step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xsIn, window, kernel, dsIn }, stackalloc long[] { heads }, stackalloc[] { scale });
                 else
-                    step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xs, window, kernel }, stackalloc long[] { 0 }, stackalloc[] { scale });
+                    step.BeginFused(GraphFusion.InklingConv, stackalloc[] { xsIn, window, kernel }, stackalloc long[] { 0 }, stackalloc[] { scale });
+                // The region's ops read the rows contiguous.
+                xs = step.Cont(xsIn);
+                if (dsIn >= 0) ds = step.Cont(dsIn);
                 int convIn = step.Op(GraphOp.Concat, stackalloc[] { window, step.Transpose(xs) }, stackalloc long[] { 0 });   // [taps - 1 + count, channels]
                 int conv = step.Op(GraphOp.SsmConv, convIn, kernel);                                               // [channels, count]
-                long pitch = (history + count) * f;
                 if (ds >= 0)
                 {
                     int d3 = step.Reshape(ds, taps, heads, count);
@@ -340,11 +445,15 @@ namespace TensorSharp.Models
                     // convIn is a fresh contiguous [taps - 1 + count, channels]: its last taps - 1 columns are the new window.
                     step.Effect(step.Op(GraphOp.Cpy, step.View2(convIn, history, channels, pitch, count * f), window));
                 int y = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Add, xs, conv) }, default, stackalloc[] { scale });
-                if (!verifying) step.EndFused(stackalloc[] { y });
+                if (!batched) step.EndFused(stackalloc[] { y });
                 output = output < 0 ? y : step.Op(GraphOp.Concat, stackalloc[] { output, y }, stackalloc long[] { 1 });
             }
+            if (batched) step.EndFused(stackalloc[] { output });
             return output;
         }
+
+        /// <summary>TS_INKLING_CONV_BATCH=0: a batched step's sequences convolve one fused node each.</summary>
+        private static readonly bool ConvBatchDisabled = Environment.GetEnvironmentVariable("TS_INKLING_CONV_BATCH") == "0";
 
         // ---------------------------------------------------------------- attention
 
@@ -354,12 +463,13 @@ namespace TensorSharp.Models
         /// <paramref name="threshold"/>, after the optional per-channel scale.</summary>
         private int Clip(GraphStep step, int x, string scale, float threshold)
         {
-            x = step.Cont(x);
+            // x may be a packed product's slice [d, heads, rows] at its row stride: the kernel reads it there, the region's
+            // ops (other executors) copy it.
             if (scale != null)
                 step.BeginFused(GraphFusion.InklingClip, stackalloc[] { x, step.Weight(scale) }, stackalloc long[] { 1 }, stackalloc[] { threshold });
             else
                 step.BeginFused(GraphFusion.InklingClip, stackalloc[] { x }, stackalloc long[] { 0 }, stackalloc[] { threshold });
-            int y = ClipOps(step, x, scale, threshold);
+            int y = ClipOps(step, step.Cont(x), scale, threshold);
             step.EndFused(stackalloc[] { y });
             return y;
         }
@@ -397,9 +507,13 @@ namespace TensorSharp.Models
         // The current attention's relative table [heads, extent + 1, rows]: (B r - t), traced by EmitAttentionProjections and
         // gathered by EmitAttentionCore for each sequence of the same layer.
         private GraphStep _tableStep;
-        private int _tableLayer = -1, _table = -1;
-        // The fused attention's bias table (FusedAttention): B r - t [extent + 1, heads, rows], each (head, row) contiguous.
-        private int _fusedTable = -1;
+        private int _tableLayer = -1, _table = -1, _fusedSink = -1;
+        // The fused attention's bias table (FusedAttention): B r - t [extent + 1, heads, rows], each (head, row) contiguous; its
+        // element bytes (4, or 2 for a prompt step's F16 table).
+        private int _fusedTable = -1, _fusedTableBytes = 4;
+
+        /// <summary>TS_INKLING_REL_F16=0: prompt steps keep the F32 bias table.</summary>
+        private static readonly bool RelTableF16Disabled = Environment.GetEnvironmentVariable("TS_INKLING_REL_F16") == "0";
 
         /// <summary>The attention runs as one kernel (GraphFusion.InklingAttention): an executor that serves it
         /// (<see cref="GraphCapabilities.RelativeBiasAttention"/>) over F16 or F32 caches, unless TS_INKLING_FUSED_ATTENTION=0.
@@ -423,20 +537,147 @@ namespace TensorSharp.Models
             return step.Cont(step.View2(packed, hidden, step.Rows, 3L * hidden * f, j * hidden * f));
         }
 
+        /// <summary>Rows a step may read the packed projections with in one product a distinct input (decode steps, batched
+        /// sequences, verify windows); longer steps take one product a projection.</summary>
+        private const int PackedProductRows = 8;
+
+        /// <summary>Columns ggml's vector product kernel takes in one pass (MMVQ_MAX_BATCH_SIZE).</summary>
+        private const int VectorProductColumns = 8;
+
+        // The gate projection of the current attention, when the packed product made it (EmitAttentionOutput reads it).
+        private GraphStep _gateStep;
+        private int _gateLayer = -1, _gate = -1;
+
+        // A prompt step's attention inputs, unpacked (EmitBlockInput keeps them for the projections and the gate).
+        private GraphStep _inputStep;
+        private int _inputLayer = -1, _inputQ = -1, _inputK = -1, _inputV = -1;
+
+        private bool InputsKept(GraphStep step, int layer) => ReferenceEquals(step, _inputStep) && layer == _inputLayer;
+
+        /// <summary>Rows [first, first + count) of the step's columns of y [total, ...]: column <paramref name="column"/> of
+        /// the first step row, then every <paramref name="stride"/>-th. Contiguous for one row; copied for more.</summary>
+        private static int Slice(GraphStep step, int y, long total, long first, long count, int column, int stride)
+        {
+            const long f = sizeof(float);
+            if (step.Rows == 1) return step.View2(y, count, 1, count * f, (column * total + first) * f);
+            return step.Cont(step.View2(y, count, step.Rows, stride * total * f, (column * total + first) * f));
+        }
+
+        /// <summary>A slice as <see cref="Slice"/>'s, but a view at its row stride (never copied): for consumers that read rows at
+        /// a stride (the clip and convolution regions).</summary>
+        private int SliceView(GraphStep step, int y, long total, long first, long count, int column, int stride)
+        {
+            const long f = sizeof(float);
+            int view = step.View2(y, count, step.Rows, stride * total * f, (column * total + first) * f);
+            if (!ReferenceEquals(step, _sliceStep)) { _sliceStep = step; _sliceRows.Clear(); }
+            _sliceRows[view] = stride * total * f;
+            return view;
+        }
+
+        // The current step's strided slices and their row bytes (SliceView): Heads and the convolutions read them at their stride.
+        private GraphStep _sliceStep;
+        private readonly Dictionary<int, long> _sliceRows = new();
+
+        /// <summary>The row bytes of <paramref name="x"/>: a strided slice's, else <paramref name="dense"/>.</summary>
+        private long RowBytesOf(GraphStep step, int x, long dense)
+            => ReferenceEquals(step, _sliceStep) && _sliceRows.TryGetValue(x, out long bytes) ? bytes : dense;
+
+        /// <summary>x [d heads, rows] as [d, heads, rows]: a strided slice as a view at its row stride, else reshaped.</summary>
+        private int Heads(GraphStep step, int x, int d, int heads, int rows)
+        {
+            const long f = sizeof(float);
+            return ReferenceEquals(step, _sliceStep) && _sliceRows.TryGetValue(x, out long bytes)
+                ? step.View3(x, d, heads, rows, d * f, bytes, 0)
+                : step.Reshape(x, d, heads, rows);
+        }
+
+        /// <summary>The projections from the packed weight: q, gate, rel, sink, k, k_conv, v, v_conv (-1 where absent).</summary>
+        private void PackedProjections(GraphStep step, int layer, int x, int xq, int xk, int xv, ProjectionRows p, out int qy,
+            out int gy, out int ry, out int ty, out int ky, out int kDyn, out int vy, out int vDyn)
+        {
+            int h = Config.HiddenSize, rows = step.Rows;
+            string w = LayerName(layer, "attn_proj.weight");
+            int qn = p.Gate - p.Q, gn = p.Rel - p.Gate, rn = p.Sink - p.Rel, tn = p.K - p.Sink;
+            int kn = (p.KConv >= 0 ? p.KConv : p.V) - p.K, vn = (p.VConv >= 0 ? p.VConv : p.Total) - p.V;
+            // A sliding layer of the first pass reads one input for all three.
+            bool shared = IsSliding(layer) && !ReadsMessages(layer);
+            if (rows <= PackedProductRows && (shared || 3 * rows <= VectorProductColumns))
+            {
+                // One product: one column a row where the inputs are shared, else the three inputs as columns 3r, 3r + 1, 3r + 2
+                // (the packed x [3h, rows] is exactly that as [h, 3 rows]).
+                int y = shared ? step.MatMul(w, xq) : step.MatMul(w, step.Reshape(x, h, 3 * rows));
+                int stride = shared ? 1 : 3;
+                int kc = shared ? 0 : 1, vc = shared ? 0 : 2;
+                // q and rel go to the clip and k, v and their taps to the convolutions as views (read at their strides).
+                qy = SliceView(step, y, p.Total, p.Q, qn, 0, stride);
+                gy = Slice(step, y, p.Total, p.Gate, gn, 0, stride);
+                ry = SliceView(step, y, p.Total, p.Rel, rn, 0, stride);
+                ty = Slice(step, y, p.Total, p.Sink, tn, 0, stride);
+                ky = SliceView(step, y, p.Total, p.K, kn, kc, stride);
+                kDyn = p.KConv >= 0 ? SliceView(step, y, p.Total, p.KConv, p.V - p.KConv, kc, stride) : -1;
+                vy = SliceView(step, y, p.Total, p.V, vn, vc, stride);
+                vDyn = p.VConv >= 0 ? SliceView(step, y, p.Total, p.VConv, p.Total - p.VConv, vc, stride) : -1;
+                return;
+            }
+            if (rows <= PackedProductRows)
+            {
+                // One product a distinct input.
+                int a = step.MatMulRows(w, p.Q, p.K - p.Q, xq);
+                int b = step.MatMulRows(w, p.K, p.KRows, xk);
+                int c = step.MatMulRows(w, p.V, p.VRows, xv);
+                qy = SliceView(step, a, p.K, 0, qn, 0, 1);
+                gy = Slice(step, a, p.K, p.Gate, gn, 0, 1);
+                ry = SliceView(step, a, p.K, p.Rel, rn, 0, 1);
+                ty = Slice(step, a, p.K, p.Sink, tn, 0, 1);
+                ky = SliceView(step, b, p.KRows, 0, kn, 0, 1);
+                kDyn = p.KConv >= 0 ? SliceView(step, b, p.KRows, kn, p.V - p.KConv, 0, 1) : -1;
+                vy = SliceView(step, c, p.VRows, 0, vn, 0, 1);
+                vDyn = p.VConv >= 0 ? SliceView(step, c, p.VRows, vn, p.Total - p.VConv, 0, 1) : -1;
+                return;
+            }
+            // A prompt chunk: one product a projection, as with separate weights.
+            qy = step.MatMulRows(w, p.Q, qn, xq);
+            gy = step.MatMulRows(w, p.Gate, gn, xq);
+            ry = step.MatMulRows(w, p.Rel, rn, xq);
+            ty = step.MatMulRows(w, p.Sink, tn, xq);
+            ky = step.MatMulRows(w, p.K, kn, xk);
+            kDyn = p.KConv >= 0 ? step.MatMulRows(w, p.KConv, p.V - p.KConv, xk) : -1;
+            vy = step.MatMulRows(w, p.V, vn, xv);
+            vDyn = p.VConv >= 0 ? step.MatMulRows(w, p.VConv, p.Total - p.VConv, xv) : -1;
+        }
+
         protected override bool EmitAttentionProjections(GraphStep step, int layer, int x, out int q, out int k, out int v)
         {
             int h = Config.HiddenSize, heads = Config.NumHeads, kvHeads = Config.NumKVHeads, d = _headDim, rows = step.Rows;
             bool sliding = IsSliding(layer);
-            int xq = Input(step, x, 0, h), xk = Input(step, x, 1, h), xv = Input(step, x, 2, h);
+            bool kept = InputsKept(step, layer);
+            int xq = kept ? _inputQ : Input(step, x, 0, h), xk = kept ? _inputK : Input(step, x, 1, h), xv = kept ? _inputV : Input(step, x, 2, h);
 
-            q = Clip(step, step.Reshape(step.MatMul(LayerName(layer, "attn_q.weight"), xq), d, heads, rows), LayerName(layer, "attn_q_clip.weight"), _qkClip);
-            int kDyn = sliding ? -1 : step.MatMul(LayerName(layer, "attn_k_conv_proj.weight"), xk);
-            int kc = Convolve(step, layer, step.MatMul(LayerName(layer, "attn_k.weight"), xk), 0, _kvDim, "attn_k_conv.weight", kDyn, kvHeads);
+            int qy, ry, ty, ky, kDyn, vy, vDyn;
+            if (_projections?[PhysicalLayer(layer)] is { } packed)
+            {
+                PackedProjections(step, layer, x, xq, xk, xv, packed, out qy, out int gy, out ry, out ty, out ky, out kDyn, out vy, out vDyn);
+                _gateStep = step;
+                _gateLayer = layer;
+                _gate = gy;
+            }
+            else
+            {
+                qy = step.MatMul(LayerName(layer, "attn_q.weight"), xq);
+                kDyn = sliding ? -1 : step.MatMul(LayerName(layer, "attn_k_conv_proj.weight"), xk);
+                ky = step.MatMul(LayerName(layer, "attn_k.weight"), xk);
+                vDyn = sliding ? -1 : step.MatMul(LayerName(layer, "attn_v_conv_proj.weight"), xv);
+                vy = step.MatMul(LayerName(layer, "attn_v.weight"), xv);
+                ry = step.MatMul(LayerName(layer, "attn_rel.weight"), xq);
+                ty = step.MatMul(LayerName(layer, "attn_sink_proj.weight"), xq);
+                _gateLayer = -1;
+            }
+            q = Clip(step, Heads(step, qy, d, heads, rows), LayerName(layer, "attn_q_clip.weight"), _qkClip);
+            int kc = Convolve(step, layer, ky, 0, _kvDim, "attn_k_conv.weight", kDyn, kvHeads);
             k = Clip(step, step.Reshape(kc, d, kvHeads, rows), null, _qkClip);
-            int vDyn = sliding ? -1 : step.MatMul(LayerName(layer, "attn_v_conv_proj.weight"), xv);
-            int vc = Convolve(step, layer, step.MatMul(LayerName(layer, "attn_v.weight"), xv), _kvDim, _kvDim, "attn_v_conv.weight", vDyn, kvHeads);
+            int vc = Convolve(step, layer, vy, _kvDim, _kvDim, "attn_v_conv.weight", vDyn, kvHeads);
             v = RmsNoWeight(step, step.Reshape(vc, d, kvHeads, rows), Config.Eps);
-            int r = Clip(step, step.Reshape(step.MatMul(LayerName(layer, "attn_rel.weight"), xq), _relDim, heads, rows),
+            int r = Clip(step, Heads(step, ry, _relDim, heads, rows),
                 LayerName(layer, "attn_rel_clip.weight"), _relClip);
             if (!sliding)
             {
@@ -446,13 +687,27 @@ namespace TensorSharp.Models
             }
             // The sink logit t is per query: exp(s - t) / (1 + sum exp(s - t)) = exp(s) / (exp(t) + sum exp(s)), so every
             // key's bias takes - t and a zero sink closes the softmax (llama.cpp's inkling2.cpp).
-            int t = step.MatMul(LayerName(layer, "attn_sink_proj.weight"), xq);                                     // [heads, rows]
+            int t = ty;                                                                                               // [heads, rows]
             int extent = ExtentOf(layer);
             if (FusedAttention)
             {
                 // The kernel gathers each score's bias from the row's table: no permute, no distance index.
-                int fused = step.Op(GraphOp.MulMat, step.TensorWeight(_relTables[PhysicalLayer(layer)], _relDim, extent + 1), r);
-                _fusedTable = step.Op(GraphOp.Sub, fused, step.Reshape(t, 1, heads, rows));                          // [extent + 1, heads, rows]
+                // The kernel subtracts each row's sink logit t itself (_fusedSink), so the table is not written twice.
+                int relW = step.TensorWeight(_relTables[PhysicalLayer(layer)], _relDim, extent + 1);
+                // Prompt rows (every sequence past 16 rows: the kernels that read either) take the table in F16, half the bytes
+                // written and read (a 4,096-row step's table is 403 MB in F32 at each layer).
+                _fusedTableBytes = !RelTableF16Disabled && Array.TrueForAll(step.Counts, c => c > 16) ? 2 : 4;
+                if (_fusedTableBytes == 2)
+                {
+                    step.BeginFused(GraphFusion.InklingRelTable, stackalloc[] { relW, r }, default, default);
+                    int t32 = step.Op(GraphOp.MulMat, relW, r);
+                    int t16 = step.Op(GraphOp.Cast, stackalloc[] { t32 }, stackalloc long[] { GraphFormat.F16 });
+                    step.EndFused(stackalloc[] { t16 });
+                    _fusedTable = t16;                                                                                // [extent + 1, heads, rows] F16
+                }
+                else
+                    _fusedTable = step.Op(GraphOp.MulMat, relW, r);                                                   // [extent + 1, heads, rows]
+                _fusedSink = step.Cont(t);                                                                            // [heads, rows]
                 _table = -1;
                 _tableStep = step;
                 _tableLayer = layer;
@@ -490,9 +745,10 @@ namespace TensorSharp.Models
                 throw new InvalidOperationException($"{Config.Architecture}: attention for layer {layer} without its relative table.");
             int heads = Config.NumHeads, count = step.Counts[s], extent = ExtentOf(layer), d = _headDim;
             const long f = sizeof(float);
-            int qc = step.Cont(q);                                                                                    // [d, count, heads]
+            // The fused kernel reads the queries at their strides (a sequence's view of the step's rows): no copy.
             if (_fusedTable >= 0)
-                return FusedAttentionCore(step, layer, s, qc, k, v, layout, scale, count, extent);
+                return FusedAttentionCore(step, layer, s, q, k, v, layout, scale, count, extent);
+            int qc = step.Cont(q);                                                                                    // [d, count, heads]
             // A cache window may hold F16 or block-quantized rows, which do not transpose: the values widen first.
             int v32 = step.Op(GraphOp.Cast, stackalloc[] { v }, stackalloc long[] { GraphFormat.F32 });
             int vT = step.Cont(step.Transpose(v32));                                                                  // [keys, dv, kvHeads]
@@ -532,10 +788,12 @@ namespace TensorSharp.Models
             int heads = Config.NumHeads, d = _headDim;
             const long f = sizeof(float);
             long first = step.First[s], width = extent + 1;
+            long tb = _fusedTableBytes;
             int table = step.Sequences == 1 ? _fusedTable
-                : step.View3(_fusedTable, width, heads, count, width * f, width * heads * f, first * width * heads * f);
+                : step.View3(_fusedTable, width, heads, count, width * tb, width * heads * tb, first * width * heads * tb);
+            int sink = step.Sequences == 1 ? _fusedSink : step.View2(_fusedSink, heads, count, heads * f, first * heads * f);
             long ring = layout.Ring, firstKey = layout.Ring > 0 ? 0 : layout.FirstPosition;
-            step.BeginFused(GraphFusion.InklingAttention, stackalloc[] { qc, k, v, table, step.Positions },
+            step.BeginFused(GraphFusion.InklingAttention, stackalloc[] { qc, k, v, table, step.Positions, sink },
                 stackalloc long[] { ring, extent, SlidingWindow(layer), firstKey, step.FloorOf(s), first }, stackalloc[] { scale });
             int placeholder = step.Op(GraphOp.Scale, stackalloc[] { step.Cont(step.Permute(qc, 0, 2, 1, 3)) }, default, stackalloc[] { 0f });
             step.EndFused(stackalloc[] { placeholder });
@@ -572,7 +830,9 @@ namespace TensorSharp.Models
         /// <summary>attn [heads * d, rows] times sigmoid(attn_gate · xq), element-wise.</summary>
         protected override int EmitAttentionOutput(GraphStep step, int layer, int x, int attn)
         {
-            int gate = step.Op(GraphOp.Sigmoid, step.MatMul(LayerName(layer, "attn_gate.weight"), Input(step, x, 0, Config.HiddenSize)));
+            int projected = ReferenceEquals(step, _gateStep) && layer == _gateLayer ? _gate
+                : step.MatMul(LayerName(layer, "attn_gate.weight"), InputsKept(step, layer) ? _inputQ : Input(step, x, 0, Config.HiddenSize));
+            int gate = step.Op(GraphOp.Sigmoid, projected);
             return step.Op(GraphOp.Mul, step.Cont(attn), gate);
         }
 
@@ -609,8 +869,17 @@ namespace TensorSharp.Models
             if (fusedRoute) step.EndFused(stackalloc[] { selected, weights });
 
             int input = step.Reshape(x, h, 1, rows);
-            int gateUp = step.Op(GraphOp.MulMatId, step.Experts(LayerName(layer, "ffn_gate_up_exps.weight")), input, selected);   // [2 ff, K, rows]
-            step.BeginFused(GraphFusion.InklingSitu, stackalloc[] { gateUp }, default, stackalloc[] { _situBeta, _situLinearBeta });
+            int gateUp = ExpertProduct(step, LayerName(layer, "ffn_gate_up_exps.weight"), input, selected);          // [2 ff, K, rows]
+            // NVFP4 experts: each expert's outer scale (amax / denominator) multiplies its products; gate/up's before SITU,
+            // down's through the route weights.
+            int upScale = ExpertScales(step, layer, "ffn_gate_up_exps.scale", selected, k, rows);                          // [1, K, rows]
+            int downScale = ExpertScales(step, layer, "ffn_down_exps.scale", selected, k, rows);
+            if (downScale >= 0) weights = step.Op(GraphOp.Mul, weights, downScale);
+            if (upScale >= 0)
+                step.BeginFused(GraphFusion.InklingSitu, stackalloc[] { gateUp, upScale }, default, stackalloc[] { _situBeta, _situLinearBeta });
+            else
+                step.BeginFused(GraphFusion.InklingSitu, stackalloc[] { gateUp }, default, stackalloc[] { _situBeta, _situLinearBeta });
+            if (upScale >= 0) gateUp = step.Op(GraphOp.Mul, gateUp, upScale);
             int g = step.Cont(step.View3(gateUp, ff, k, rows, 2L * ff * f, 2L * ff * k * f, 0));
             int u = step.Cont(step.View3(gateUp, ff, k, rows, 2L * ff * f, 2L * ff * k * f, ff * f));
             int act = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Tanh, step.Op(GraphOp.Scale, stackalloc[] { g }, default, stackalloc[] { 1f / _situBeta })) },
@@ -621,7 +890,7 @@ namespace TensorSharp.Models
                     default, stackalloc[] { _situLinearBeta });
             act = step.Op(GraphOp.Mul, act, u);                                                                       // [ff, K, rows]
             step.EndFused(stackalloc[] { act });
-            int down = step.Op(GraphOp.MulMatId, step.Experts(LayerName(layer, "ffn_down_exps.weight")), act, selected);       // [h, K, rows]
+            int down = ExpertProduct(step, LayerName(layer, "ffn_down_exps.weight"), act, selected);                  // [h, K, rows]
             step.BeginFused(GraphFusion.InklingExpertSum, stackalloc[] { down, weights });
             down = step.Op(GraphOp.Mul, down, weights);
             long rowBytes = h * f;
@@ -634,6 +903,27 @@ namespace TensorSharp.Models
             output = step.Cont(output);
             step.EndFused(stackalloc[] { output });
             return output;
+        }
+
+        /// <summary>The routed experts' product (MulMatId) as the InklingExperts region: served for a few rows, each expert
+        /// the rows picked read once for all of its pairs.</summary>
+        private static int ExpertProduct(GraphStep step, string name, int input, int selected)
+        {
+            int experts = step.Experts(name);
+            step.BeginFused(GraphFusion.InklingExperts, stackalloc[] { experts, input, selected });
+            int product = step.Op(GraphOp.MulMatId, experts, input, selected);
+            step.EndFused(stackalloc[] { product });
+            return product;
+        }
+
+        /// <summary>The selected experts' outer scales [1, K, rows] from a per-expert F32 vector, or -1 where the layer has none.</summary>
+        private int ExpertScales(GraphStep step, int layer, string suffix, int selected, int k, int rows)
+        {
+            string name = LayerName(layer, suffix);
+            if (!_weights.TryGetValue(name, out Tensor vector)) return -1;
+            int table = step.Reshape(step.Weight(name), 1, vector.ElementCount());                                     // [1, E]
+            int picked = step.Op(GraphOp.GetRows, table, step.Reshape(selected, (long)k * rows));                    // [1, K rows]
+            return step.Reshape(picked, 1, k, rows);
         }
 
         /// <summary>The padded vocabulary's first <c>vocab_size_unpadded</c> logits, softcapped: cap tanh(logits / cap).</summary>

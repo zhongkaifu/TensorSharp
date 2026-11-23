@@ -61,7 +61,11 @@ namespace TensorSharp.Models
 
         /// <summary>Drafts <see cref="TryDraftBatch"/> fills per request: the drafter's whole block but its anchor row, as a
         /// lone request's draft runs it (DFlashPropose).</summary>
-        public int BatchDraftBlockWidth => HasDFlash && BatchedBlockDraftRefusal() == null ? DFlashSettings.MaxDraftTokens : 0;
+        public int BatchDraftBlockWidth => HasDFlash ? (BatchedBlockDraftRefusal() == null ? DFlashSettings.MaxDraftTokens : 0)
+            : BatchedBlockDraftDisabledForTests ? 0 : FamilyDrafter?.BatchDraftWidth ?? 0;
+
+        /// <summary>A family drafter that drafts only what narrower blocks hold (the windows' drafts).</summary>
+        public bool BatchDraftTakesNarrowBlocks => !HasDFlash && FamilyDrafter?.DraftsNarrowBatches == true;
 
         /// <summary>The lanes of the block program being run: a kept step refills each lane's mask from its ring's map and
         /// the selector's anchors from here.</summary>
@@ -80,6 +84,13 @@ namespace TensorSharp.Models
             int[][] tokensOut, float[][] confOut)
         {
             int m = requestIds?.Count ?? 0;
+            if (!HasDFlash && FamilyDrafter is { } family)
+            {
+                if (m < 2 || BatchedBlockDraftDisabledForTests) return false;
+                bool drafted = family.DraftBatch(requestIds, anchors, carries, positions, tokensOut, confOut);
+                if (drafted) BatchedBlockDrafts++;
+                return drafted;
+            }
             if (m < 1 || BatchedBlockDraftRefusal() != null) return false;
             DFlashConfig cfg = DFlashSettings;
             int gamma = cfg.MaxDraftTokens, b = gamma + 1, feat = cfg.FeatureSize;

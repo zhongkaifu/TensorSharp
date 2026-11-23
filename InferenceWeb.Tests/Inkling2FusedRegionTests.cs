@@ -227,11 +227,13 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         Check($"mix queries={queries} n={n}", got[0][0], want, 1e-5);
     }
 
-    [CudaFact]
-    public void ControllerMatchesItsOracle()
+    [CudaTheory]
+    [InlineData(2)]
+    [InlineData(40)]
+    public void ControllerMatchesItsOracle(int rows)
     {
         var rng = new Random(4);
-        int h = 2304, rank = 64, rows = 2;
+        int h = 2304, rank = 64;
         const float eps = 1e-6f;
         float[] x = Rand(rng, (long)h * rows, 2f), m = Rand(rng, (long)h * rows, 2f);
         float[] down = Rand(rng, 2L * h * rank, 0.05f), gain = Rand(rng, (long)rank * h, 0.2f), forget = Rand(rng, (long)rank * h, 0.2f);
@@ -263,14 +265,16 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         p.G.EndFused(stackalloc[] { y });
         var got = p.Run(new[] { y }, new[] { (long)want.Length }, 1, out int served);
         Assert.Equal(1, served);
-        Check("controller", got[0][0], want, 1e-5);
+        // A prompt chunk's rows (16 and more) run their products on tensor cores as 3xTF32 (near F32).
+        Check($"controller rows={rows}", got[0][0], want, rows >= 16 ? 5e-5 : 1e-5);
     }
 
     /// <summary>
-    /// The attention over a linear window and over a ring, for decode rows (split over the keys) and a prompt chunk (tensor
-    /// cores), with K/V contiguous or as a window of a larger cache (the strided views a decode step reads). Each score's
-    /// bias comes from the row's table T = B r - t; a row sees the keys at positions it reaches within the band (a ring's
-    /// sliding window) and a zero sink closes its softmax.
+    /// The attention over a linear window and over a ring, for decode rows (split over the keys) and prompt chunks (tensor
+    /// cores; 200 rows take several blocks, tiles every row sees and tiles past the bias extent), with K/V contiguous or as
+    /// a window of a larger cache (the strided views a decode step reads). Each score's bias is the row's table T = B r by
+    /// distance minus the row's sink logit t (the region's sixth input); a row sees the keys at positions it reaches within
+    /// the band (a ring's sliding window) and a zero sink closes its softmax.
     /// </summary>
     [CudaTheory]
     [InlineData(false, 1, 40, false)]
@@ -278,8 +282,15 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
     [InlineData(false, 20, 300, false)]
     [InlineData(false, 20, 300, true)]
     [InlineData(false, 80, 300, false)]
+    [InlineData(false, 200, 1000, false)]
+    [InlineData(false, 80, 9000, false)]
     [InlineData(true, 1, 300, false)]
     [InlineData(true, 3, 300, false)]
+    [InlineData(true, 8, 1500, false)]
+    [InlineData(false, 8, 2000, false)]
+    [InlineData(false, 16, 1000, true)]
+    [InlineData(false, 16, 2048, false)]
+    [InlineData(true, 12, 1500, false)]
     [InlineData(true, 20, 300, false)]
     public void AttentionMatchesItsOracle(bool ring, int rows, int endPosition, bool strided)
     {
@@ -292,7 +303,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         float[] q = Rand(rng, (long)d * rows * heads), r = Rand(rng, (long)rel * heads * rows, 0.5f), t = Rand(rng, (long)heads * rows, 0.5f);
         float[] b = Rand(rng, (long)rel * (extent + 1), 0.5f);
         for (int jj = 0; jj < rel; jj++) b[extent * rel + jj] = 0;
-        // T [extent + 1, heads, rows]: B r - t by distance (the family's MulMat and Sub).
+        // T [extent + 1, heads, rows]: B r by distance (the family's MulMat); the kernel takes t away.
         var table = new float[(long)(extent + 1) * heads * rows];
         for (int i = 0; i < rows; i++)
             for (int h = 0; h < heads; h++)
@@ -300,7 +311,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
                 {
                     double acc = 0;
                     for (int jj = 0; jj < rel; jj++) acc += r[((long)i * heads + h) * rel + jj] * (double)b[dist * rel + jj];
-                    table[((long)i * heads + h) * (extent + 1) + dist] = (float)(acc - t[(long)i * heads + h]);
+                    table[((long)i * heads + h) * (extent + 1) + dist] = (float)acc;
                 }
         Half[] k = Rand(rng, (long)d * capacity * kvh).Select(v => (Half)v).ToArray(), v = Rand(rng, (long)d * capacity * kvh).Select(x => (Half)x).ToArray();
         // Cell j's position: a ring's latest write of j; a linear window's j.
@@ -320,7 +331,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
                     for (int e = 0; e < d; e++) dot += q[((long)h * rows + i) * d + e] * (double)k[((long)g * capacity + j) * d + e];
                     long dist = p - kp;
                     int bi = dist < extent ? (int)dist : extent;
-                    sc.Add((dot * scale + table[((long)i * heads + h) * (extent + 1) + bi], j));
+                    sc.Add((dot * scale + table[((long)i * heads + h) * (extent + 1) + bi] - t[(long)i * heads + h], j));
                 }
                 double m = Math.Max(0, sc.Count == 0 ? 0 : sc.Max(x => x.S));
                 double sum = Math.Exp(-m) + sc.Sum(x => Math.Exp(x.S - m));
@@ -339,15 +350,17 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         }
         int ti = prog.Input(table, extent + 1, heads, rows);
         int pi = prog.Input(Enumerable.Range(rowStart, rows).ToArray(), rows);
-        prog.G.BeginFused(GraphFusion.InklingAttention, stackalloc[] { qi, ki, vi, ti, pi },
+        int si = prog.Input(t, heads, rows);
+        prog.G.BeginFused(GraphFusion.InklingAttention, stackalloc[] { qi, ki, vi, ti, pi, si },
             stackalloc long[] { ring ? cells : 0, extent, band, 0, 0, 0 }, stackalloc[] { scale });
         int y = prog.G.Op(GraphOp.Scale, stackalloc[] { prog.G.Op(GraphOp.Cont, prog.G.Op(GraphOp.Permute, stackalloc[] { qi },
             stackalloc long[] { 0, 2, 1, 3 })) }, default, stackalloc[] { 0f });
         prog.G.EndFused(stackalloc[] { y });
         var got = prog.Run(new[] { y }, new[] { (long)want.Length }, 1, out int served);
         Assert.Equal(1, served);
-        // Prompt chunks (more than 16 rows) round Q, K, V and the probabilities to F16 on tensor cores.
-        Check($"attention ring={ring} rows={rows} end={endPosition} strided={strided}", got[0][0], want, rows > 16 ? 1e-3 : 2e-4);
+        // Every window of more than one row (verify windows and prompt chunks) rounds Q and the probabilities to F16 on
+        // tensor cores; one row runs in F32.
+        Check($"attention ring={ring} rows={rows} end={endPosition} strided={strided}", got[0][0], want, rows > 1 ? 1e-3 : 2e-4);
     }
 
     [CudaFact]

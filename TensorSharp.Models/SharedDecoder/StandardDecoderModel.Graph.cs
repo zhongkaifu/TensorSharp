@@ -1426,7 +1426,7 @@ namespace TensorSharp.Models
         /// advanced (<see cref="TryAdvanceDecode"/>) instead of being traced.</param>
         /// <param name="attentionFloors">Each sequence's attention floor in place of <paramref name="attentionFloor"/>
         /// (GraphStep.AttentionFloors), or null.</param>
-        private CachedGraph RunTraced(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
+        private protected CachedGraph RunTraced(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
             bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
             bool deviceOutputs = false, string shape = null, Tensor advanceHidden = null, Tensor[] advanceInputs = null,
             int[] attentionFloors = null)
@@ -1653,7 +1653,7 @@ namespace TensorSharp.Models
             }
         }
 
-        private struct StepOutputs
+        internal struct StepOutputs
         {
             public int Logits, Final, Hidden;
             /// <summary>The output of the sequences' last final-normed rows, plus one (0: none), so every construction that
@@ -1713,7 +1713,7 @@ namespace TensorSharp.Models
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
-                        outputs.Captures[c] = EmitCaptureOutput(step, h, request);
+                        outputs.Captures[c] = EmitCaptureOutput(step, h, request, layer);
                 if (TapDFlashFollow(step, h, layer, targets, taps))
                     EmitDFlashFollow(step, taps, dflash);
                 h = EmitLayerPrologue(step, layer, h);
@@ -1813,7 +1813,7 @@ namespace TensorSharp.Models
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             for (int c = 0; c < request.CaptureLayers.Length; c++)
                 if (request.CaptureLayers[c] >= Config.NumLayers)
-                    outputs.Captures[c] = EmitCaptureOutput(step, h, request);
+                    outputs.Captures[c] = EmitCaptureOutput(step, h, request, request.CaptureLayers[c]);
             int final = -1;
             if (request.FollowDraft != DraftFollow.None)
             {
@@ -1923,7 +1923,7 @@ namespace TensorSharp.Models
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
-                        outputs.Captures[c] = EmitCaptureOutput(lead, h[0], request);
+                        outputs.Captures[c] = EmitCaptureOutput(lead, h[0], request, layer);
                 for (int r = 0; r < ranks; r++)
                 {
                     h[r] = EmitLayerPrologue(steps[r], layer, h[r]);
@@ -1959,7 +1959,7 @@ namespace TensorSharp.Models
             int n = lead.Sequences, rows = lead.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             for (int c = 0; c < request.CaptureLayers.Length; c++)
                 if (request.CaptureLayers[c] >= Config.NumLayers)
-                    outputs.Captures[c] = EmitCaptureOutput(lead, h[0], request);
+                    outputs.Captures[c] = EmitCaptureOutput(lead, h[0], request, request.CaptureLayers[c]);
             var last = new int[n];
             for (int s = 0; s < n; s++) last[s] = lead.First[s] + lead.Counts[s] - 1;
             outputs.RankLogits = new int[steps.Length];
@@ -2384,12 +2384,16 @@ namespace TensorSharp.Models
         /// <summary>A DFlash drafter's tapped row [hidden, rows] of the stream entering a layer. Default: the stream.</summary>
         protected virtual int EmitCaptureRow(GraphStep step, int stream) => stream;
 
+        /// <summary>A block drafter's captured row [hidden, rows] at <paramref name="layer"/>: the stream entering it, or
+        /// leaving the last layer where <paramref name="layer"/> is Config.NumLayers. Default: <see cref="EmitCaptureRow(GraphStep, int)"/>.</summary>
+        protected virtual int EmitCaptureRow(GraphStep step, int stream, int layer) => EmitCaptureRow(step, stream);
+
         /// <summary>A captured layer input as an output: every row's, or the step's last
         /// <see cref="GraphRequest.CaptureTail"/> rows' (copied out, so the rest is freed with the step).</summary>
-        private int EmitCaptureOutput(GraphStep step, int stream, GraphRequest request)
+        private int EmitCaptureOutput(GraphStep step, int stream, GraphRequest request, int layer)
         {
             int rows = step.Rows, hiddenSize = Config.HiddenSize;
-            int x = EmitCaptureRow(step, stream);
+            int x = EmitCaptureRow(step, stream, layer);
             int tail = request.CaptureTail > 0 && request.CaptureTail < rows ? request.CaptureTail : rows;
             if (tail < rows)
                 x = step.Cont(step.View2(x, hiddenSize, tail, hiddenSize * 4L, (rows - tail) * (long)hiddenSize * 4));
@@ -3050,7 +3054,16 @@ namespace TensorSharp.Models
         /// <summary>Rows a decode attention window grows by: 64 on Metal, whose padded tail costs
         /// more than a replay rebuild every 64 tokens (measured with Qwen 3.5's fused decode); 256
         /// (the flash-attention KV stride) elsewhere.</summary>
-        private int DecodeWindowStep => GraphExecutor?.Capabilities.DecodeWindowRows ?? 256;
+        private int DecodeWindowStep => DecodeWindowRowsOverride > 0 ? DecodeWindowRowsOverride : DecodeWindowRows(GraphExecutor?.Capabilities.DecodeWindowRows ?? 256);
+
+        /// <summary>The bucket a decode row's or verify window's attention window is padded to, given the executor's
+        /// (<paramref name="executorRows"/>): a family whose attention finds its keys from the positions may take wider
+        /// buckets, so its kept steps are traced again less often. Default: the executor's.</summary>
+        protected virtual int DecodeWindowRows(int executorRows) => executorRows;
+
+        /// <summary>TS_DECODE_WINDOW_ROWS: the bucket for every model (experiments).</summary>
+        private static readonly int DecodeWindowRowsOverride = int.TryParse(Environment.GetEnvironmentVariable("TS_DECODE_WINDOW_ROWS"), out int rows) && rows > 0
+            ? rows : 0;
 
         /// <summary>
         /// Whether a decode row's or verify window's padded attention window is its slot's whole capacity: where the executor's
