@@ -1373,6 +1373,18 @@ ggml_tensor* build_vision_attention(
     return ggml_permute(ctx, out, 0, 2, 1, 3); // [hd, heads, rows]
 }
 
+// Set while fused_qwen35_vision_encoder_f32_impl builds a graph the fused-op backend will run on CUDA. Its F16 linears
+// then run as tsg_linear_f16 (F16 operands, F32 accumulation on tensor cores, the bias, tanh GELU and residual in the
+// GEMM's epilogue) instead of ggml's mul_mat, which honours the F32 accumulation request below only by widening the
+// weights back to F32, plus separate bias, GELU and residual passes.
+static thread_local bool t_vision_owned_f16_linears = false;
+
+static bool vision_owned_linear(const ggml_tensor* w, const ggml_tensor* x)
+{
+    return t_vision_owned_f16_linears && w->type == GGML_TYPE_F16 && x->ne[2] == 1 && x->ne[3] == 1 &&
+        ((x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float)) || (x->type == GGML_TYPE_F16 && ggml_is_contiguous(x)));
+}
+
 // Vision linear. F16 weights run as tensor-core GEMMs; ggml-cuda accumulates an
 // F16 x F16 GEMM in F16 unless the node asks for F32, which a 1152-4608 wide
 // reduction over a 4000-patch image cannot afford. F32 weights are unchanged.
@@ -1395,6 +1407,16 @@ static ggml_tensor* vision_block_input(ggml_context* ctx, ggml_tensor* cur)
 static ggml_tensor* vision_add_bias(ggml_context* ctx, ggml_tensor* x, ggml_tensor* bias, int width)
 {
     return ggml_add(ctx, x, ggml_reshape_2d(ctx, bias, width, 1));
+}
+
+// w x + bias (+ residual), as one owned F16 linear where it applies.
+static ggml_tensor* vision_linear_bias(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, ggml_tensor* bias, int width,
+    ggml_tensor* residual = nullptr)
+{
+    if (vision_owned_linear(w, x))
+        return tsg_linear_f16(ctx, w, x, bias, residual, /*gelu=*/ false);
+    ggml_tensor* y = vision_add_bias(ctx, vision_linear(ctx, w, x), bias, width);
+    return residual != nullptr ? ggml_add(ctx, residual, y) : y;
 }
 
 // LN + QKV(+bias) + split + NeoX RoPE + flash-attn + out(+bias) + residual.
@@ -1430,8 +1452,7 @@ static ggml_tensor* build_vision_attn_subgraph(
 
     // QKV projection + bias
     ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
-    ggml_tensor* qkv = vision_linear(ctx, qkv_w_t, ln_2d);
-    ggml_tensor* qkv_biased = vision_add_bias(ctx, qkv, qkv_b_t, triple_hidden);
+    ggml_tensor* qkv_biased = vision_linear_bias(ctx, qkv_w_t, ln_2d, qkv_b_t, triple_hidden);
 
     // Split Q, K, V
     std::size_t row_bytes = static_cast<std::size_t>(triple_hidden) * sizeof(float);
@@ -1459,8 +1480,7 @@ static ggml_tensor* build_vision_attn_subgraph(
             patches, num_heads, head_dim, attn_scale, /*kv_f16=*/ false, owned_vision);
         if (!ggml_is_contiguous(attn_out))
             attn_out = ggml_cont(ctx, attn_out);
-        ggml_tensor* out_proj = vision_linear(ctx, out_w_t, ggml_reshape_2d(ctx, attn_out, hidden, rows));
-        return ggml_add(ctx, inp, vision_add_bias(ctx, out_proj, out_b_t, hidden));
+        return vision_linear_bias(ctx, out_w_t, ggml_reshape_2d(ctx, attn_out, hidden, rows), out_b_t, hidden, inp);
     }
     ggml_tensor* q_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, 0));
     ggml_tensor* k_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, d_bytes));
@@ -1504,11 +1524,8 @@ static ggml_tensor* build_vision_attn_subgraph(
     ggml_tensor* attn_flat = ggml_reshape_2d(ctx,
         ggml_is_contiguous(attn_out) ? attn_out : ggml_cont(ctx, attn_out), hidden, rows);
 
-    ggml_tensor* out_proj = vision_linear(ctx, out_w_t, attn_flat);
-    ggml_tensor* out_biased = vision_add_bias(ctx, out_proj, out_b_t, hidden);
-
     // Residual add (2D [hidden, rows] — equivalent to the flattened add).
-    return ggml_add(ctx, inp, out_biased);
+    return vision_linear_bias(ctx, out_w_t, attn_flat, out_b_t, hidden, inp);
 }
 
 // LN + up(+bias) + GELU + down(+bias) + residual.
@@ -1526,16 +1543,19 @@ static ggml_tensor* build_vision_mlp_subgraph(
     ggml_tensor* ln_out = ggml_add(ctx, scaled, ln_b_t);
 
     ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
-    ggml_tensor* fc1 = vision_linear(ctx, up_w_t, ln_2d);
-    ggml_tensor* fc1_bias = vision_add_bias(ctx, fc1, up_b_t, dff);
-
-    ggml_tensor* fc1_gelu = gelu_erf ? ggml_gelu_erf(ctx, fc1_bias) : ggml_gelu(ctx, fc1_bias);
+    // The owned F16 linear applies the tanh GELU in its epilogue and hands the F16 result straight to the down
+    // projection; the exact (erf) GELU stays a separate op.
+    ggml_tensor* fc1_gelu = !gelu_erf && vision_owned_linear(up_w_t, ln_2d)
+        ? tsg_linear_f16(ctx, up_w_t, ln_2d, up_b_t, nullptr, /*gelu=*/ true)
+        : nullptr;
+    if (fc1_gelu == nullptr)
+    {
+        ggml_tensor* fc1_bias = vision_linear_bias(ctx, up_w_t, ln_2d, up_b_t, dff);
+        fc1_gelu = gelu_erf ? ggml_gelu_erf(ctx, fc1_bias) : ggml_gelu(ctx, fc1_bias);
+    }
 
     ggml_tensor* fc1_2d = (rows == 1) ? ggml_reshape_2d(ctx, fc1_gelu, dff, 1) : fc1_gelu;
-    ggml_tensor* fc2 = vision_linear(ctx, down_w_t, fc1_2d);
-    ggml_tensor* fc2_bias = vision_add_bias(ctx, fc2, down_b_t, hidden);
-
-    return ggml_add(ctx, inp, fc2_bias);
+    return vision_linear_bias(ctx, down_w_t, fc1_2d, down_b_t, hidden, inp);
 }
 
 // ============================================================================
@@ -3806,6 +3826,12 @@ static int fused_qwen35_vision_encoder_f32_impl(
         upload_list.push_back({ t, data, bytes });
     };
 
+    // F16 linears on the owned CUDA backend run as tsg_linear_f16 (vision_linear_bias); reset however the build ends.
+    struct OwnedLinears {
+        explicit OwnedLinears(bool on) { t_vision_owned_f16_linears = on; }
+        ~OwnedLinears() { t_vision_owned_f16_linears = false; }
+    } owned_linears(owned_vision != 0 && linear_type == GGML_TYPE_F16);
+
     ggml_tensor* cur = hidden_binding.tensor;
     std::vector<ggml_tensor*> tap_rows;
     for (int b = 0; b < block_count; b++)
@@ -3872,9 +3898,9 @@ static int fused_qwen35_vision_encoder_f32_impl(
             bind_w(ds_fc2b, deepstack->fc2_b[tap], static_cast<std::size_t>(merger->fc2_ne1) * sizeof(float));
             ggml_tensor* merged_rows = ggml_reshape_2d(ctx, vision_block_input(ctx, cur), hidden * unit, rows / unit);
             ggml_tensor* normed = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, merged_rows, eps), ds_lnw), ds_lnb);
-            ggml_tensor* fc1 = ggml_add(ctx, vision_linear(ctx, ds_fc1w, normed), ds_fc1b);
+            ggml_tensor* fc1 = vision_linear_bias(ctx, ds_fc1w, normed, ds_fc1b, merger->fc1_ne1);
             fc1 = merger->gelu_erf != 0 ? ggml_gelu_erf(ctx, fc1) : ggml_gelu(ctx, fc1);
-            tap_rows.push_back(ggml_add(ctx, vision_linear(ctx, ds_fc2w, fc1), ds_fc2b));
+            tap_rows.push_back(vision_linear_bias(ctx, ds_fc2w, fc1, ds_fc2b, merger->fc2_ne1));
         }
     }
     if (static_cast<int>(tap_rows.size()) != taps)
@@ -3902,9 +3928,9 @@ static int fused_qwen35_vision_encoder_f32_impl(
 
         ggml_tensor* normed = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, vision_block_input(ctx, cur), eps), post_w), post_b);
         ggml_tensor* merged = ggml_reshape_2d(ctx, normed, hidden * unit, rows / unit);
-        ggml_tensor* fc1 = ggml_add(ctx, vision_linear(ctx, fc1_w, merged), fc1_b);
+        ggml_tensor* fc1 = vision_linear_bias(ctx, fc1_w, merged, fc1_b, merger->fc1_ne1);
         fc1 = merger->gelu_erf != 0 ? ggml_gelu_erf(ctx, fc1) : ggml_gelu(ctx, fc1);
-        cur = ggml_add(ctx, vision_linear(ctx, fc2_w, fc1), fc2_b);
+        cur = vision_linear_bias(ctx, fc2_w, fc1, fc2_b, merger->fc2_ne1);
         for (ggml_tensor* t : tap_rows)
             cur = ggml_concat(ctx, cur, t, 0);   // [main | tap 0 | ...] per merged row
         merged_binding = create_standard_binding(ctx, *merged_desc);

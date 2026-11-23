@@ -1054,14 +1054,15 @@ namespace TensorSharp.Models
 
         private bool _batchedEncoderFailed;
 
-        // Opt-in F16 copies of the linear weights for the merged CUDA graph (tensor-core
-        // GEMMs with F32 accumulation, half the resident weight memory; attention, norms
-        // and biases stay F32). Measured on a 4032-patch screenshot: no faster - the
-        // explicit F32 attention dominates - and relative L2 0.0021-0.0031 against F32,
-        // at the 0.003 compare-vision-embeddings gate. TS_QWEN_VISION_F16=1 enables.
+        // F16 copies of the linear weights for the merged CUDA graph (half the resident weight memory; attention,
+        // norms and biases stay F32). Where the graph runs on the fused-op backend (TensorSharp's tensor-core vision
+        // attention), each linear is one cuBLASLt GEMM on F16 operands with F32 accumulation and the bias, tanh GELU and
+        // residual in its epilogue (tsg_linear_f16): a 2,880-patch Qwen3-VL frame pair took 114 ms instead of 167 ms,
+        // within 1.8e-3 relative L2 of the managed CPU tower (1.7e-3 with F32 linears). Elsewhere ggml widens the
+        // weights back to F32. On by default on GGML CUDA; TS_QWEN_VISION_F16=0 keeps F32 linears.
         private bool UseF16Linears => _allocator is TensorSharp.GGML.GgmlAllocator ggml
             && ggml.Context.BackendType == TensorSharp.GGML.GgmlBackendType.Cuda
-            && Environment.GetEnvironmentVariable("TS_QWEN_VISION_F16") == "1";
+            && Environment.GetEnvironmentVariable("TS_QWEN_VISION_F16") != "0";
 
         private readonly Dictionary<Tensor, Tensor> _f16Linears = new();
 
@@ -1080,8 +1081,6 @@ namespace TensorSharp.Models
                 for (long i = start; i < end; i++)
                     ((ushort*)d)[i] = BitConverter.HalfToUInt16Bits((System.Half)((float*)s)[i]);
             });
-            if (_f16Linears.Count == 0)
-                Console.WriteLine("[qwen35-vision] merged encoder uses F16 linear weights (TS_QWEN_VISION_F16=1).");
             _f16Linears[weight] = half;
             return half;
         }

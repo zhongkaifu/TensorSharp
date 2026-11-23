@@ -482,9 +482,15 @@ On a GGML backend the whole tower, post-LN and merger run as one graph
 (`TSGgml_Qwen35VisionEncoderMergedBatchF32`): Q and K turn by ggml's vision rope straight from the QKV
 projection, bias adds broadcast, and several video pairs can share the graph (§ 4.6). `TS_QWEN_VISION_ROPE=tables`
 keeps the cos/sin-table rotation (`TSGgml_Qwen35VisionEncoderMergedF32`). The per-block fused kernels
-(`FusedVisionAttention` and `FusedVisionMLP`) are the fallback; see § 8. On a CUDA GPU a 2,880-patch frame pair
-takes 166 ms through the graph (231 ms with the table rotation and materialized bias rows), and its output stays
-within 1.7e-3 relative L2 of the managed CPU tower.
+(`FusedVisionAttention` and `FusedVisionMLP`) are the fallback; see § 8.
+
+On CUDA, where the graph runs on TensorSharp's tensor-core vision attention, the tower keeps F16 copies of its linear
+weights and every linear is one cuBLASLt GEMM on F16 operands with F32 accumulation, with the bias, the tanh GELU and the
+residual add in the GEMM's epilogue (`tsg_linear_f16`); the up projection hands its GELU output to the down projection
+in F16. ggml's own `mul_mat` honours an F32-accumulation request for F16 weights only by widening them back to F32, so
+F16 weights alone were no faster. `TS_QWEN_VISION_F16=0` keeps F32 linears. A 2,880-patch Qwen3-VL frame pair took
+114 ms through the graph (167 ms with F32 linears, 231 ms with the table rotation and materialized bias rows), within
+1.8e-3 relative L2 of the managed CPU tower (1.7e-3 with F32 linears; the vision-embedding comparison gates at 3e-3).
 
 ### 4.6 Video (`video_url`)
 
@@ -512,18 +518,23 @@ Loading the projector encodes one small blank frame pair on a GGML GPU backend (
 the first clip does not pay the tower's one-time device setup (about 10 s on CUDA beside the language model).
 `TS_QWEN_VISION_WARMUP=0` skips it.
 
+A clip sent again (an OpenAI client resends the whole data URI with every follow-up question) reuses the frames the
+server already sampled from it: the last 16 clips are remembered by content, sampling and upload directory, and an
+entry whose files a cleanup removed is sampled anew. That saved about a second of frame extraction per follow-up on
+64-frame 1280 x 720 clips, and the tower's embedding cache then skips the encode as well.
+
 Measured on one CUDA GPU (`ggml_cuda`) against vLLM 0.32, with three security-camera clips of 20-37 s at 2 frames
 per second (64 frames, 11.9K-12.5K prompt tokens), one request at a time, temperature 0.7 / top_p 0.8 / top_k 20 and
 thinking off:
 
 | | Qwen3.6-35B-A3B UD-Q4_K_M | vLLM, NVIDIA NVFP4 | Qwen3.8-27B UD-IQ3_XXS | vLLM, NVFP4 + DFlash |
 |---|---|---|---|---|
-| First token, a clip not seen before | 7.8-10.1 s | 3.6-3.8 s | 18.2-22.0 s | 10.5-14.7 s |
-| First token, another question about the same clip | 4.7-5.8 s | 1.9-2.6 s | 15.3-16.8 s | 7.5-8.1 s |
-| Decode after the video prompt | 66 tok/s | 71-75 tok/s | 21 tok/s | 27-33 tok/s |
+| First token, a clip not seen before | 7.2-8.4 s | 3.6-3.8 s | 17.5-20.4 s | 10.5-14.7 s |
+| First token, another question about the same clip | 3.7-4.2 s | 1.9-2.6 s | 14.1-15.3 s | 7.5-8.1 s |
+| Decode after the video prompt | 60-66 tok/s | 71-75 tok/s | 21 tok/s | 27-33 tok/s |
 
 On 15 short questions about the clips, checked against answers written from the frames beforehand, TensorSharp
-answered 12 right on either model and vLLM 13.
+answered 12 right on Qwen3.6 and 13 on Qwen3.8, vLLM 13 on each.
 
 ## 5. Parameters and settings
 

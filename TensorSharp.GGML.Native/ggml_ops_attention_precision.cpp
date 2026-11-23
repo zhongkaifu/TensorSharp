@@ -321,6 +321,75 @@ extern "C" ggml_tensor * tsg_vision_attention_mma(ggml_context * ctx, ggml_tenso
         scale, TSG_ATTN_VISION_MMA);
 }
 
+namespace {
+float gelu_tanh(float v) {
+    return 0.5f * v * (1.0f + std::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+}
+
+// tsg_linear_f16's F32 reference, from the operands the CUDA side multiplies: x and (with gelu) the bias rounded to F16.
+void linear_f16_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto & d = *static_cast<const tsg_dsv4_fused_desc *>(userdata);
+    const bool has_bias = d.i0 != 0, has_residual = d.i1 != 0, gelu = d.i2 != 0;
+    const ggml_tensor * w = dst->src[0], * x = dst->src[1];
+    int arg = 2;
+    const ggml_tensor * bias = has_bias ? dst->src[arg++] : nullptr;
+    const ggml_tensor * residual = has_residual ? dst->src[arg++] : nullptr;
+    const int64_t k_dim = w->ne[0], n_dim = w->ne[1], tokens = x->ne[1];
+    std::vector<float> row(static_cast<size_t>(k_dim));
+    for (int64_t t = tokens * ith / nth; t < tokens * (ith + 1) / nth; ++t) {
+        const char * xr = static_cast<const char *>(x->data) + t * x->nb[1];
+        for (int64_t k = 0; k < k_dim; ++k)
+            row[k] = x->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(reinterpret_cast<const ggml_fp16_t *>(xr)[k])
+                                              : ggml_fp16_to_fp32(ggml_fp32_to_fp16(reinterpret_cast<const float *>(xr)[k]));
+        for (int64_t n = 0; n < n_dim; ++n) {
+            const auto * wr = reinterpret_cast<const ggml_fp16_t *>(static_cast<const char *>(w->data) + n * w->nb[1]);
+            float acc = 0.0f;
+            for (int64_t k = 0; k < k_dim; ++k) acc += ggml_fp16_to_fp32(wr[k]) * row[k];
+            if (bias != nullptr) {
+                const float b = static_cast<const float *>(bias->data)[n];
+                acc += gelu ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(b)) : b;
+            }
+            if (gelu) {
+                static_cast<ggml_fp16_t *>(dst->data)[t * n_dim + n] = ggml_fp32_to_fp16(gelu_tanh(acc));
+                continue;
+            }
+            if (residual != nullptr) acc += static_cast<const float *>(residual->data)[t * n_dim + n];
+            static_cast<float *>(dst->data)[t * n_dim + n] = acc;
+        }
+    }
+}
+} // namespace
+
+extern "C" ggml_tensor * tsg_linear_f16(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * bias,
+    ggml_tensor * residual, bool gelu) {
+    GGML_ASSERT(w && x && w->type == GGML_TYPE_F16 && ggml_is_contiguous(w) && w->ne[2] == 1 && w->ne[3] == 1);
+    GGML_ASSERT(x->ne[0] == w->ne[0] && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT((x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float)) || (x->type == GGML_TYPE_F16 && ggml_is_contiguous(x)));
+    const int64_t k_dim = w->ne[0], n_dim = w->ne[1], tokens = x->ne[1];
+    GGML_ASSERT(k_dim <= INT_MAX && n_dim <= INT_MAX && tokens <= INT_MAX);
+    GGML_ASSERT(bias == nullptr || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_nelements(bias) == n_dim));
+    GGML_ASSERT(residual == nullptr || (!gelu && residual->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) &&
+                                        residual->ne[0] == n_dim && ggml_nelements(residual) == n_dim * tokens));
+    auto * desc = new (ggml_new_buffer(ctx, sizeof(tsg_dsv4_fused_desc))) tsg_dsv4_fused_desc;
+    desc->kind = TSG_VISION_LINEAR_F16;
+    desc->i0 = bias != nullptr;
+    desc->i1 = residual != nullptr;
+    desc->i2 = gelu;
+#ifdef TSG_GGML_USE_CUDA
+    desc->cuda_compute = tsg_linear_f16_cuda_compute;
+#endif
+    const auto sizes = tsg_linear_f16_sizes(k_dim, n_dim, tokens, x->type == GGML_TYPE_F32, gelu);
+    const size_t element = gelu ? 2 : 4;
+    const size_t bytes = sizes.out_bytes + sizes.x16_bytes + sizes.bias16_bytes;
+    ggml_tensor * args[4] = {w, x};
+    int n_args = 2;
+    if (bias != nullptr) args[n_args++] = bias;
+    if (residual != nullptr) args[n_args++] = residual;
+    ggml_tensor * node = ggml_custom_4d(ctx, gelu ? GGML_TYPE_F16 : GGML_TYPE_F32, int64_t((bytes + element - 1) / element),
+                                        1, 1, 1, args, n_args, linear_f16_cpu, GGML_N_TASKS_MAX, desc);
+    return ggml_view_2d(ctx, node, n_dim, tokens, size_t(n_dim) * element, 0);
+}
+
 extern "C" ggml_tensor * tsg_attention_f32_sparse(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
     ggml_tensor * mask, ggml_tensor * sinks, float scale, int capacity) {
     return attention_impl(ctx, q, k, v, mask, sinks, scale, capacity);

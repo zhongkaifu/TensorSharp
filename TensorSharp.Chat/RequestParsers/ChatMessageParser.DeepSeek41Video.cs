@@ -3,6 +3,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
 using System.Text.Json;
 using TensorSharp.Models.Media;
 using TensorSharp.Server.Hosting;
@@ -11,6 +13,52 @@ namespace TensorSharp.Server.RequestParsers
 {
     internal static partial class ChatMessageParser
     {
+        /// <summary>
+        /// Clips whose frames this process already sampled, by content, sampling and upload directory: a follow-up
+        /// question about the same clip (an OpenAI client resends the whole data URI every turn) reuses those frame files
+        /// instead of decoding and encoding every frame again, which took about a second for 64 frames of a 1280 x 720
+        /// clip. An entry whose files are gone (upload TTL cleanup) is sampled anew. The last
+        /// <see cref="SampledVideoCacheEntries"/> clips are kept.
+        /// </summary>
+        private sealed record SampledVideo(string VideoPath, string[] Frames, double[] Timestamps);
+
+        private const int SampledVideoCacheEntries = 16;
+        private static readonly LinkedList<(string Key, SampledVideo Clip)> s_sampledVideos = new();
+        private static readonly object s_sampledVideosLock = new();
+
+        private static SampledVideo FindSampledVideo(string key)
+        {
+            lock (s_sampledVideosLock)
+            {
+                for (var node = s_sampledVideos.First; node != null; node = node.Next)
+                {
+                    if (node.Value.Key != key)
+                        continue;
+                    s_sampledVideos.Remove(node);
+                    SampledVideo clip = node.Value.Clip;
+                    if (!File.Exists(clip.VideoPath) || !clip.Frames.All(File.Exists))
+                        return null;
+                    s_sampledVideos.AddFirst(node);
+                    return clip;
+                }
+                return null;
+            }
+        }
+
+        private static void RememberSampledVideo(string key, SampledVideo clip)
+        {
+            lock (s_sampledVideosLock)
+            {
+                for (var node = s_sampledVideos.First; node != null; node = node.Next)
+                {
+                    if (node.Value.Key == key) { s_sampledVideos.Remove(node); break; }
+                }
+                s_sampledVideos.AddFirst((key, clip));
+                while (s_sampledVideos.Count > SampledVideoCacheEntries)
+                    s_sampledVideos.RemoveLast();
+            }
+        }
+
         /// <summary>
         /// An OpenAI chat <c>video_url</c> part's object: <c>{"url": "data:video/...;base64,...", "fps"?, "max_frames"?}</c>.
         /// </summary>
@@ -75,6 +123,21 @@ namespace TensorSharp.Server.RequestParsers
             catch (FormatException ex) { throw new JsonException("video_url contains invalid base64.", ex); }
             if (data.Length == 0)
                 throw new JsonException("video_url contains an empty video.");
+            string cacheKey = null;
+            if (sampleFrames)
+            {
+                cacheKey = string.Join("|", Convert.ToHexString(SHA256.HashData(data)), extension,
+                    fps.ToString("R", System.Globalization.CultureInfo.InvariantCulture), maxFrames, uploads.DirectoryPath);
+                if (FindSampledVideo(cacheKey) is { } sampled)
+                {
+                    message.ImageTimestamps ??= new List<double?>(new double?[message.ImagePaths.Count]);
+                    message.ImagePaths.AddRange(sampled.Frames);
+                    foreach (double time in sampled.Timestamps) message.ImageTimestamps.Add(time);
+                    message.IsVideo = true;
+                    (message.VideoFilePaths ??= new List<string>()).Add(sampled.VideoPath);
+                    return;
+                }
+            }
             uploads.ReserveClientWriteOrThrow(data.Length);
             string prefix = Guid.NewGuid().ToString("N");
             string path = Path.Combine(uploads.DirectoryPath, prefix + extension);
@@ -104,6 +167,7 @@ namespace TensorSharp.Server.RequestParsers
                 foreach (double time in timestamps) message.ImageTimestamps.Add(time);
                 message.IsVideo = true;
                 (message.VideoFilePaths ??= new List<string>()).Add(path);
+                RememberSampledVideo(cacheKey, new SampledVideo(path, frames.ToArray(), timestamps.ToArray()));
             }
             catch (Exception ex)
             {

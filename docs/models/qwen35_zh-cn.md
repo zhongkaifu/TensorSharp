@@ -393,8 +393,14 @@ SigLIP 风格 ViT：
 GGML 后端上整个视觉塔、post-LN 与合并器作为一张图运行（`TSGgml_Qwen35VisionEncoderMergedBatchF32`）：Q 与 K
 直接在 QKV 投影上用 ggml 的视觉 rope 旋转，偏置加法走广播，多个视频帧对可共用一张图（§ 4.6）。
 `TS_QWEN_VISION_ROPE=tables` 保留 cos/sin 表旋转（`TSGgml_Qwen35VisionEncoderMergedF32`）。逐 block 的融合 kernel
-（`FusedVisionAttention` 与 `FusedVisionMLP`）作为回退，见 § 8。在 CUDA GPU 上一对 2,880 patch 的帧经过这张图需要
-166 ms（使用表旋转和展开的偏置行时为 231 ms），输出与托管 CPU 视觉塔的相对 L2 误差在 1.7e-3 以内。
+（`FusedVisionAttention` 与 `FusedVisionMLP`）作为回退，见 § 8。
+
+在 CUDA 上、图运行于 TensorSharp 的张量核视觉 attention 时，视觉塔保留线性层权重的 F16 副本，每个线性层是一次 cuBLASLt
+GEMM：F16 操作数、F32 累加，偏置、tanh GELU 与残差加法都在 GEMM 的 epilogue 中完成（`tsg_linear_f16`）；上投影以 F16
+把 GELU 输出直接交给下投影。ggml 自己的 `mul_mat` 对 F16 权重的 F32 累加请求只能通过把权重扩回 F32 来满足，所以单用
+F16 权重并不更快。`TS_QWEN_VISION_F16=0` 保留 F32 线性层。一对 2,880 patch 的 Qwen3-VL 帧经过这张图需要 114 ms
+（F32 线性层为 167 ms，使用表旋转和展开的偏置行时为 231 ms），与托管 CPU 视觉塔的相对 L2 误差在 1.8e-3 以内（F32
+线性层为 1.7e-3；视觉嵌入比较的门限为 3e-3）。
 
 ### 4.6 视频（`video_url`）
 
@@ -417,16 +423,20 @@ Qwen 3.5 / 3.6 / 3.8-27B 的投影器带有视觉塔的第二个时间 patch 切
 在 GGML GPU 后端上加载投影器时会编码一对小的空白帧（`WarmUp`，约 0.4 s），这样第一段视频不必承担视觉塔一次性的
 设备初始化（在 CUDA 上与语言模型同时运行时约 10 s）。`TS_QWEN_VISION_WARMUP=0` 跳过它。
 
+再次发送的视频（OpenAI 客户端在每个后续问题中都会重发完整的 data URI）会复用服务器已从中采样的帧：最近 16 段视频按
+内容、采样参数和上传目录记住，若某条记录的文件已被清理，则重新采样。对 64 帧 1280 x 720 的视频，每个后续问题省去约
+一秒的帧提取，之后视觉塔的嵌入缓存也会跳过编码。
+
 在一块 CUDA GPU（`ggml_cuda`）上对照 vLLM 0.32 测量：三段 20-37 s 的监控摄像头视频，每秒 2 帧（64 帧，提示
 11.9K-12.5K token），一次一个请求，temperature 0.7 / top_p 0.8 / top_k 20，关闭思维链：
 
 | | Qwen3.6-35B-A3B UD-Q4_K_M | vLLM，NVIDIA NVFP4 | Qwen3.8-27B UD-IQ3_XXS | vLLM，NVFP4 + DFlash |
 |---|---|---|---|---|
-| 首个 token，未见过的视频 | 7.8-10.1 s | 3.6-3.8 s | 18.2-22.0 s | 10.5-14.7 s |
-| 首个 token，同一视频的另一个问题 | 4.7-5.8 s | 1.9-2.6 s | 15.3-16.8 s | 7.5-8.1 s |
-| 视频提示之后的解码 | 66 tok/s | 71-75 tok/s | 21 tok/s | 27-33 tok/s |
+| 首个 token，未见过的视频 | 7.2-8.4 s | 3.6-3.8 s | 17.5-20.4 s | 10.5-14.7 s |
+| 首个 token，同一视频的另一个问题 | 3.7-4.2 s | 1.9-2.6 s | 14.1-15.3 s | 7.5-8.1 s |
+| 视频提示之后的解码 | 60-66 tok/s | 71-75 tok/s | 21 tok/s | 27-33 tok/s |
 
-针对这些视频的 15 个简短问题，对照事先根据画面写好的答案，TensorSharp 在两个模型上都答对 12 个，vLLM 答对 13 个。
+针对这些视频的 15 个简短问题，对照事先根据画面写好的答案，TensorSharp 在 Qwen3.6 上答对 12 个、在 Qwen3.8 上答对 13 个，vLLM 在两者上各答对 13 个。
 
 ## 5. 参数与配置
 
