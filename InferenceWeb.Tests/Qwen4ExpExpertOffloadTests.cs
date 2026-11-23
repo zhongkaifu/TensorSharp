@@ -103,21 +103,21 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         CheckGraphReference(backend, "prefill40-device", device);
         CheckGraphReference(backend, "prefill40-host4", half);
         CheckGraphReference(backend, "prefill40-host8", all);
-        AssertClose("--n-cpu-moe 4", half, device, Bound(backend, hostPrefill: true));
-        AssertClose("--cpu-moe", all, device, Bound(backend, hostPrefill: true));
+        AssertClose("--n-cpu-moe 4", half, device, Bound(backend));
+        AssertClose("--cpu-moe", all, device, Bound(backend));
     }
 
     /// <summary>Metal multiplies with F32 activations, so the host's Q8_K quantization is the only
     /// difference (measured 1.03e-3). ggml-cuda's MMQ quantizes activations to Q8_1 per 32 values,
     /// and a span cut changes which multiplies and adds it fuses (see q4e_nodes_ffn), so two
-    /// different roundings meet: measured 6.5e-3 with streamed prefill rows up to 1.5e-2 on an
-    /// A40, and 2.065e-2 at decode 4 on an RTX 3080 Laptop. The latter also occurs with the
-    /// original host graph (TS_HOST_MOE_DECODE=0); it is not introduced by the decode kernel.
-    /// Only host prefill uses the wider CUDA bound; streamed prefill retains 2e-2.
+    /// different roundings meet: measured 6.5e-3 on an A40, and 2.065e-2 at decode 4 on an RTX 3080
+    /// Laptop. The latter also occurs with the original host graph (TS_HOST_MOE_DECODE=0); it is not
+    /// introduced by the decode kernel. The host-prefill comparisons on ggml-cuda take 2.5e-2; streamed
+    /// prefill on ggml-cuda is judged against an F32 reference instead (<see cref="StreamedPrefill"/>).
     /// Compare that kernel against the host graph separately at 1e-6 via
     /// eng/validation/qwen4exp-offload-parity.py, retaining argmax equality in both checks.</summary>
-    private static double Bound(BackendType backend, bool hostPrefill = false)
-        => backend == BackendType.GgmlCuda ? (hostPrefill ? 2.5e-2 : 2e-2) : 5e-3;
+    private static double Bound(BackendType backend)
+        => backend == BackendType.GgmlCuda ? 2.5e-2 : 5e-3;
 
     /// <summary>Accelerator expert tiers on every offloaded layer (ggml_ops_moe_hot_tier.cpp). With a
     /// window wide enough for every route, the accelerator computes every expert from the compact
@@ -143,8 +143,8 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         float[][] narrow = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
             Assert.Equal(8, model.RegisterExpertTiersForTests(1, 2)));
         AssertClose("tier, window covers every route", wide, device, 1e-4);
-        AssertClose("tier, fixed slots only", fixedOnly, device, Bound(BackendType.GgmlMetal, hostPrefill: true));
-        AssertClose("tier, narrow window", narrow, device, Bound(BackendType.GgmlMetal, hostPrefill: true));
+        AssertClose("tier, fixed slots only", fixedOnly, device, Bound(BackendType.GgmlMetal));
+        AssertClose("tier, narrow window", narrow, device, Bound(BackendType.GgmlMetal));
     }
 
     /// <summary>A tier's held routes on Metal through tsm's grouped expert kernels (Strata's, tsm/kernels) against
@@ -489,7 +489,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
                 $"the {LongPrompt.Length}-token prompt's overflow did not run on the accelerator ({borrows} borrows)");
             AssertClose($"{fixedSlots}+{window} slots, prompt overflow on the accelerator", new[] { narrow[0] }, new[] { device[0] }, 1e-4);
             AssertClose($"{fixedSlots}+{window} slots, decode overflow on the host", narrow, device,
-                Bound(BackendType.GgmlMetal, hostPrefill: true));
+                Bound(BackendType.GgmlMetal));
         }
     }
 
@@ -615,7 +615,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
             var q = Assert.IsType<Qwen4ExpRuntimeModel>(model);
             Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
         });
-        AssertClose("tier, fixed slots only (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
+        AssertClose("tier, fixed slots only (CUDA)", tiered, device, Bound(BackendType.GgmlCuda));
     }
 
     /// <summary>A 100-token prompt is wider than a discrete GPU tier's old 64-row split and narrower than the 128 rows
@@ -632,7 +632,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
             var q = Assert.IsType<Qwen4ExpRuntimeModel>(model);
             Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
         });
-        AssertClose("tier, fixed slots only, 100-row prompt split (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
+        AssertClose("tier, fixed slots only, 100-row prompt split (CUDA)", tiered, device, Bound(BackendType.GgmlCuda));
     }
 
     /// <summary>Adaptive fixed slots (<c>TS_MOE_TIER_ADAPT=1</c>, discrete VRAM): 96 decode steps over a
@@ -664,9 +664,9 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         Assert.True(adaptiveHits > fixedHits, $"adaptive slots held no more routes ({adaptiveHits} vs {fixedHits})");
         // 96 steps on random weights meet near-ties (one measured at a normal 5.7e-3 step): a
         // differing argmax must be one the step's own deviation explains.
-        AssertClose("tier, fixed slots (long decode)", fixedRows, device, Bound(BackendType.GgmlCuda, hostPrefill: true),
+        AssertClose("tier, fixed slots (long decode)", fixedRows, device, Bound(BackendType.GgmlCuda),
             allowExplainedTies: true);
-        AssertClose("tier, adaptive slots", adaptive, device, Bound(BackendType.GgmlCuda, hostPrefill: true),
+        AssertClose("tier, adaptive slots", adaptive, device, Bound(BackendType.GgmlCuda),
             allowExplainedTies: true);
     }
 
@@ -710,8 +710,9 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     /// <summary>A 160-token prefill streams each offloaded layer's experts to the accelerator. The
     /// seam then reads a result the stream path published through an asynchronous download on
     /// Metal; before the drain was added it passed on the PREVIOUS layer's expert output (relative error 2e-2
-    /// at 16 tokens, a race at long prompts). Same kernels as the in-span chain, so the bound is
-    /// tight.</summary>
+    /// at 16 tokens, a race at long prompts). Same kernels as the in-span chain, so on Metal the bound is
+    /// tight. On ggml-cuda the two paths round in different places, so each is held to an F32 reference
+    /// instead (<see cref="StreamedExactShare"/>).</summary>
     [GgmlFact(BackendType.GgmlMetal)]
     public void StreamedPrefill_AnswersAsTheAccelerator_Metal() => StreamedPrefill(BackendType.GgmlMetal);
 
@@ -724,7 +725,64 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         float[][] all = Run(backend, MoeCpuOffloadConfig.SetAllLayers, LongPrompt);
         CheckGraphReference(backend, "prefill160-device", device);
         CheckGraphReference(backend, "prefill160-host8", all);
-        AssertClose("--cpu-moe, streamed prefill", all, device, Bound(backend));
+        if (backend == BackendType.GgmlCuda)
+            AssertNoFurtherFromExact("--cpu-moe, streamed prefill", all, device, ExactAnswer(LongPrompt));
+        else
+            AssertClose("--cpu-moe, streamed prefill", all, device, Bound(backend));
+    }
+
+    /// <summary>
+    /// How much further from the F32 reference (<see cref="ExactAnswer"/>) than the all-accelerator span a streamed prefill
+    /// on ggml-cuda may be, row by row (the prefill row, then each decode step): a ratio of the two rows' relative L2
+    /// errors.
+    /// <list type="bullet">
+    /// <item>Why a reference. ggml-cuda rounds the two paths in different places. Both quantize activations to Q8_1 for the
+    /// expert and projection products (MMQ). The all-accelerator span's prefill row also carries the F16 cache's rounding,
+    /// which the streamed span's does not: on an A40 (sm_86) the prefill row is 2.25e-2 from F32 for the span and 1.48e-2
+    /// streamed, and with an F32 cache 1.43e-2 and 1.46e-2 (the managed kernels' own Q8 products 1.37e-2).
+    /// The decode rows are 5.0e-3 to 6.8e-3 for both. So the two paths are 2.03e-2 apart at the prefill row, the sum of two
+    /// correct roundings, and over the 2e-2 bound set on the legacy engine (streamed rows up to 1.5e-2 on an A40). A bound on
+    /// their distance wide enough for both roundings would pass a defect of the same size.</item>
+    /// <item>The share. On the A40, over the test's fixture and three variants of it (BF16 experts, F32 projections, an F32
+    /// cache: 28 rows), the streamed row is at most 1.073 times the span's (1.054 on the test's own fixture). 1.25 leaves
+    /// 3.4 times that excess.</item>
+    /// <item>What it catches. A defect that adds an error e independent of the rounding fails once sqrt(s^2 + e^2) passes
+    /// 1.25 times the span's error d, at e above 0.75 d: about 4.5e-3 at the decode rows, which read the streamed prefill's
+    /// state. Measured on the A40: an error added to the true streamed answer, in a fixed random direction, passes at 0.5
+    /// times the span's error on every row (worst 1.22) and fails from 0.75 (1.33); a streamed run that routes each token
+    /// to 3 experts where the model routes 4 fails at 6.0 times, with its argmax unchanged at every row.</item>
+    /// </list>
+    /// </summary>
+    internal const double StreamedExactShare = 1.25;
+
+    /// <summary>The model's answer under exact arithmetic: the managed backend multiplying every block-format weight's
+    /// exactly dequantized values by F32 rows (StandardDecoderModel.FloatProductsForTests), with an F32 KV cache.</summary>
+    private float[][] ExactAnswer(int[] prompt)
+    {
+        using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        return Run(BackendType.Cpu, () => { }, prompt, model => ((StandardDecoderModel)model).FloatProductsForTests = true);
+    }
+
+    /// <summary>Row by row: the streamed answer's and the span's relative L2 errors against <paramref name="exact"/>, the
+    /// streamed one at most <see cref="StreamedExactShare"/> times the span's, and the two taking the same argmax.</summary>
+    private void AssertNoFurtherFromExact(string what, float[][] streamed, float[][] device, float[][] exact)
+    {
+        Assert.Equal(exact.Length, streamed.Length);
+        Assert.Equal(exact.Length, device.Length);
+        var failures = new List<string>();
+        for (int i = 0; i < exact.Length; i++)
+        {
+            Assert.All(streamed[i], v => Assert.True(float.IsFinite(v)));
+            double s = RelativeError(streamed[i], exact[i]), d = RelativeError(device[i], exact[i]);
+            string row = i == 0 ? "prefill" : $"decode {i}";
+            _output.WriteLine($"{what} {row}: relative error against F32 {s:E3}, the all-accelerator span's {d:E3} " +
+                $"({s / d:F3}x); argmax {ArgMax(streamed[i])} vs {ArgMax(device[i])} (F32 {ArgMax(exact[i])})");
+            Assert.Equal(ArgMax(device[i]), ArgMax(streamed[i]));
+            if (s > StreamedExactShare * d)
+                failures.Add($"{row}: {s:E3} against the span's {d:E3} ({s / d:F3}x)");
+        }
+        Assert.True(failures.Count == 0,
+            $"{what} is further from F32 than the all-accelerator span by more than {StreamedExactShare}x: {string.Join("; ", failures)}");
     }
 
     // The native environment switches are cached once per process. The validation tool

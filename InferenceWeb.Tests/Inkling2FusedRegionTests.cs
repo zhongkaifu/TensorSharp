@@ -95,7 +95,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
 
     private static double Sigmoid(double x) => 1.0 / (1.0 + Math.Exp(-x));
 
-    [CudaTheory]
+    [CudaTheory(GgmlBackend = BackendType.GgmlCuda)]
     [InlineData(true)]
     [InlineData(false)]
     public void ClipMatchesItsOracle(bool scaled)
@@ -124,7 +124,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         Check($"clip scaled={scaled}", got[0][0], want, 1e-5);
     }
 
-    [CudaTheory]
+    [CudaTheory(GgmlBackend = BackendType.GgmlCuda)]
     [InlineData(0)]
     [InlineData(8)]
     public void ConvolutionMatchesItsOracleAndAdvancesTheWindow(int heads)
@@ -179,7 +179,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
             Check($"conv heads={heads} run {run + 1}", got[run][0], expected[run], 1e-5);
     }
 
-    [CudaTheory]
+    [CudaTheory(GgmlBackend = BackendType.GgmlCuda)]
     [InlineData(1, 4)]
     [InlineData(3, 4)]
     [InlineData(4, 7)]
@@ -227,7 +227,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         Check($"mix queries={queries} n={n}", got[0][0], want, 1e-5);
     }
 
-    [CudaTheory]
+    [CudaTheory(GgmlBackend = BackendType.GgmlCuda)]
     [InlineData(2)]
     [InlineData(40)]
     public void ControllerMatchesItsOracle(int rows)
@@ -276,7 +276,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
     /// distance minus the row's sink logit t (the region's sixth input); a row sees the keys at positions it reaches within
     /// the band (a ring's sliding window) and a zero sink closes its softmax.
     /// </summary>
-    [CudaTheory]
+    [CudaTheory(GgmlBackend = BackendType.GgmlCuda)]
     [InlineData(false, 1, 40, false)]
     [InlineData(false, 1, 300, true)]
     [InlineData(false, 20, 300, false)]
@@ -363,7 +363,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         Check($"attention ring={ring} rows={rows} end={endPosition} strided={strided}", got[0][0], want, rows > 1 ? 1e-3 : 2e-4);
     }
 
-    [CudaFact]
+    [CudaFact(GgmlBackend = BackendType.GgmlCuda)]
     public void RouterMatchesItsOracle()
     {
         var rng = new Random(6);
@@ -392,7 +392,7 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         Check("router weights", got[0][1], want, 1e-6);
     }
 
-    [CudaFact]
+    [CudaFact(GgmlBackend = BackendType.GgmlCuda)]
     public void SituMatchesItsOracle()
     {
         var rng = new Random(7);
