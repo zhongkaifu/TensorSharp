@@ -52,6 +52,7 @@ namespace TensorSharp.Models.Architecture
             GlmDsaArchitecture.Descriptor,
             GlmDsaArchitecture.FlashDescriptor,
             MiniMaxM3Architecture.Descriptor,
+            RaonArchitecture.Descriptor,
 
             // Generative media.
             DiffusionGemmaArchitecture.Descriptor,

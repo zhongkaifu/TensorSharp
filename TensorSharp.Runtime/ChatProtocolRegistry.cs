@@ -238,6 +238,24 @@ namespace TensorSharp.Runtime
                 CapsVideoFrames = true,
             });
 
+            // KRAFTON Raon-1 nano: ChatML with a <think> block on every assistant turn and the Qwen3-Coder XML
+            // tool-call body. The GGUF template is used as shipped.
+            Register(new ChatProtocol
+            {
+                Id = "raon1nano",
+                Architectures = new[] { "raon1nano" },
+                CreateOutputParser = () => new Qwen35OutputParser(),
+                // The generation prompt opens `<think>\n` (thinking on) or writes the closed empty block
+                // `<think></think>\n\n` (off); cache replay restores that exact suffix.
+                AssistantGenerationSuffix = thinking => thinking ? "<think>\n" : "<think></think>\n\n",
+                EmitsEmptyThinkBlockForPastTurns = _ => true,
+                // role=tool renders independently of the assistant tool_calls field.
+                ToolCallRawSplicing = ToolCallRawSplicing.Always,
+                ThinkingGrammarActivationTrigger = "</think>",
+                ThinkingBudgetEndToken = "</think>",
+                ThinkingBudgetClosingText = HandOverToAnswer,
+            });
+
             // ---- Liquid LFM3 / LFM3-Omni -----------------------------------
             // One architecture name ("lfm3") for both checkpoints; the GGUF template
             // tells them apart (1.7B reasons by default, Omni does not, and only the

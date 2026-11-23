@@ -68,6 +68,7 @@
     <EmbeddedResource Include="Fixtures/DesktopSurface/create_surface.c" />
     <EmbeddedResource Include="Fixtures/WindowsKnownFolders/probe.py" />
     <EmbeddedResource Include="Fixtures/Lfm3Speech/*.json" />
+    <EmbeddedResource Include="Fixtures/Raon/hf_goldens.json" />
     <None Update="Fixtures/Images/edit-photo-1024x768.heic" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>

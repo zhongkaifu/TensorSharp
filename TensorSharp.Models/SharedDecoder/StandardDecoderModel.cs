@@ -232,6 +232,11 @@ namespace TensorSharp.Models
         /// </summary>
         protected virtual bool GatedAttentionOutput => false;
 
+        /// <summary>A graph-only family (<see cref="RequiresGraphs"/>) whose attention keys and values differ in width (Raon's
+        /// absorbed MLA: 576-wide keys, 512-wide values). The per-op attention paths assume equal widths, so only a family that
+        /// never runs them opts in. Default: no.</summary>
+        protected virtual bool AllowsUnequalKeyValueDims => false;
+
         /// <summary>Called once after loading and fusing, before sharding and device residency:
         /// the place to repack or derive weights from their host copies. Default: nothing.</summary>
         protected virtual void PrepareLoadedWeights() { }
@@ -441,7 +446,7 @@ namespace TensorSharp.Models
         /// multi-node layer split (hyperparameters, KV dtype); hashed by ModelBase.</param>
         protected void InitializeDecoder(int keyDim, int valueDim, string executionIdentity)
         {
-            if (keyDim != valueDim)
+            if (keyDim != valueDim && !AllowsUnequalKeyValueDims)
                 throw new NotSupportedException($"{Config.Architecture}: the shared decoder runtime needs equal key/value head dims, got {keyDim}/{valueDim}.");
             _keyDim = keyDim;
             _valueDim = valueDim;

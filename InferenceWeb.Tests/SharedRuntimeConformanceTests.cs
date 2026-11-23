@@ -57,11 +57,13 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["muse-glimmer"] = typeof(MuseGlimmerRuntimeConformanceTests),
         // Inkling 2 keeps short-conv state on every layer; it declares its placements and expert offload as gaps.
         ["inkling2"] = typeof(Inkling2RuntimeTests),
+        // Raon's RDA layers rewind only to their length or to zero; it declares its placements as gaps.
+        ["raon1nano"] = typeof(RaonRuntimeTests),
     };
 
     /// <summary>Shared-runtime families that run whole-forward graphs only (StandardDecoderModel.RequiresGraphs): their
     /// dedicated suite has no per-op path to compare the graphs with. A family leaves the list when it gains one.</summary>
-    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2" };
+    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano" };
 
     /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)
     /// does not declare.</summary>

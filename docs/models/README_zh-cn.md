@@ -39,6 +39,7 @@
 | [Nemotron-H / Omni](nemotron_zh-cn.md) | 文本；Omni 图像；有条件的音频 | 文本 | 条件支持：音频需要公开 GGUF 未附带的 Parakeet 伴随文件。不支持投机解码。 |
 | [Mistral 3](mistral3_zh-cn.md) | 文本、图像 | 文本 | 不支持：显式思考模式与工具。验证范围以具体检查点与后端为准。 |
 | [Hunyuan Dense](hunyuan-dense_zh-cn.md) | 文本 | 文本 | 已实现：单设备文本路径；不支持工具、张量并行与层切分。 |
+| [Raon-1 nano](raon_zh-cn.md) | 文本 | 文本 | 已实现：在 `cpu` 与各 GGML 后端上以单设备整模型前向图运行；Q8_0 已在 `ggml_cuda`、`ggml_cpu` 与 `cpu` 上对照 Transformers 验证。 |
 | [LFM3 / LFM3-Omni](lfm3_zh-cn.md) | 文本；Omni 借助投影器输入图像、视频、音频 | 文本；Omni 可输出语音（TTS 与语音聊天回复） | 有条件：聊天协议与 Omni 的图像、视频、音频输入已与 llama.cpp 端到端核对（Metal、MLX、CPU 路径，以及 NVIDIA A40 上的 ggml_cuda、直连 CUDA 与 ggml_vulkan；文本服务的场景也在 RTX PRO 4500 上运行）。NVFP4 配置的 FP4 张量核心路径（Blackwell）已在这块 RTX PRO 4500（sm_120）上运行。 |
 | [GLM 5.x](glm_zh-cn.md) | 文本；仅 5.3-Flash 支持图像 | 文本 | 条件支持：5.2/5.3 仅文本。NextN 不支持启用张量并行的运行；CPU 参考路径有数值限制。 |
 | [DeepSeek V4 Flash](deepseek4_zh-cn.md) | 文本 | 文本 | 条件支持：核对内存与放置；可选的 DSpark 投机解码需要匹配草稿器。 |
