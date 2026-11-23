@@ -40,10 +40,10 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// <summary>Every family on the shared runtime, with its synthetic fixture. A family that
     /// declares <c>ServingContract.SharedRuntime</c> must appear here
     /// (<see cref="ServingContractConformanceTests.EverySharedRuntimeFamilyHasAConformanceFixture"/>).</summary>
-    public static TheoryData<string> Families => new() { "mistral3", "hunyuan-dense" };
+    public static TheoryData<string> Families => new() { "mistral3", "hunyuan-dense", "qwen3vl" };
 
     /// <summary>The family ids in <see cref="Families"/>.</summary>
-    public static readonly string[] FamilyIds = { "mistral3", "hunyuan-dense" };
+    public static readonly string[] FamilyIds = { "mistral3", "hunyuan-dense", "qwen3vl" };
 
     /// <summary>Shared-runtime families the script here cannot drive, with the suite that proves the
     /// same mechanisms on the family's own synthetic fixtures. A recurrent stack rewinds only to its
@@ -86,7 +86,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     public static TheoryData<string, int, int> Placements()
     {
         var data = new TheoryData<string, int, int>();
-        foreach (string family in new[] { "mistral3", "hunyuan-dense" })
+        foreach (string family in new[] { "mistral3", "hunyuan-dense", "qwen3vl" })
         {
             data.Add(family, 2, 1);
             data.Add(family, 1, 2);
@@ -105,6 +105,12 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
             Architecture = "hunyuan-dense", PreTokenizer = "hunyuan-dense", IncludeMistralControlTokens = false,
             IncludeQkNorms = true, RopeBase = 10000f, LayerCount = Layers, KeyLength = keyLength,
         },
+        // Qwen3-VL MoE text (its DeepStack and M-RoPE media paths are Qwen3VLRuntimeTests'): routed experts, QK-norm.
+        "qwen3vl" => new DenseDecoderSyntheticModelBuilder
+        {
+            Architecture = "qwen3vlmoe", PreTokenizer = "qwen2", IncludeMistralControlTokens = false,
+            IncludeQkNorms = true, RopeBase = 10000f, LayerCount = Layers, KeyLength = keyLength, MoeExperts = 4, MoeTopK = 2,
+        },
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
     }).Write(Path.Combine(_dir, $"{family}-{keyLength}.gguf"));
 
@@ -115,6 +121,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         {
             "mistral3" => new Mistral3Model(path, backend, tp, group, stages),
             "hunyuan-dense" => new HunyuanDenseModel(path, backend, tp, group, stages),
+            "qwen3vl" => new Qwen3VLModel(path, backend, tp, group, stages),
             _ => throw new ArgumentOutOfRangeException(nameof(family)),
         };
     }
@@ -194,6 +201,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     {
         "mistral3" => new Mistral3Model(path, backend, 2, null, 1),
         "hunyuan-dense" => new HunyuanDenseModel(path, backend, 2, null, 1),
+        "qwen3vl" => new Qwen3VLModel(path, backend, 2, null, 1),
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
     };
 

@@ -52,9 +52,16 @@ namespace TensorSharp.Models
                     $"Set {LayerSplitPlan.DriverStageVariable}=first on every node to serve images.");
         }
 
+        /// <summary>A forward takes the queued media rows; its first row is KV index <paramref name="absoluteStart"/>. A
+        /// family that keeps data beside the rows for later layers (Qwen3-VL's DeepStack taps) anchors it here, once: a
+        /// forward split into pieces injects each piece's rows, the first piece starting at the forward's first row.
+        /// Default: nothing.</summary>
+        protected virtual void OnMediaInjected(int absoluteStart) { }
+
         private unsafe void InjectMedia(Tensor hidden, int absoluteStart)
         {
             if (_pendingMedia.Count == 0) return;
+            OnMediaInjected(absoluteStart);
             int dim = Config.HiddenSize, rows = (int)hidden.Sizes[0];
             float* destination = GetFloatPtr(hidden);
             try

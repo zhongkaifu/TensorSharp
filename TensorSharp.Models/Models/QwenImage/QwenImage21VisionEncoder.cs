@@ -41,7 +41,9 @@ namespace TensorSharp.Models
             using var merged = hidden.View(patches / unit, _hiddenSize * unit);
             using var normalized = LayerNormOp(merged, prefix + ".norm.weight", prefix + ".norm.bias");
             using var fc1 = LinearForwardWithBias(normalized, prefix + ".fc1.weight", prefix + ".fc1.bias");
-            ApplyVisionGelu(fc1);
+            // A merger's activation, as the final merger's: exact GELU for Qwen3-VL (mergerGeluErf), and the Qwen-Image
+            // tower's erf GELU there (ApplyVisionMergerGelu falls back to ApplyVisionGelu, which is erf on that tower).
+            ApplyVisionMergerGelu(fc1);
             return LinearForwardWithBias(fc1, prefix + ".fc2.weight", prefix + ".fc2.bias");
         }
         private void ApplyVisionGelu(Tensor tensor)

@@ -390,7 +390,11 @@ SigLIP 风格 ViT：
 - Spatial patch merging（`SpatialMergeSize × SpatialMergeSize` 邻居合并为一个 token）。
 - 多模态 projector（RMSNorm + Linear + GELU + Linear）映射到语言模型 hidden dim。
 
-GGML 后端上每个 block 走两个融合 kernel（`FusedVisionAttention` 与 `FusedVisionMLP`），见 § 8。
+GGML 后端上整个视觉塔、post-LN 与合并器作为一张图运行（`TSGgml_Qwen35VisionEncoderMergedBatchF32`）：Q 与 K
+直接在 QKV 投影上用 ggml 的视觉 rope 旋转，偏置加法走广播，一段视频的多个帧对可共用一张图。
+`TS_QWEN_VISION_ROPE=tables` 保留 cos/sin 表旋转（`TSGgml_Qwen35VisionEncoderMergedF32`）。逐 block 的融合 kernel
+（`FusedVisionAttention` 与 `FusedVisionMLP`）作为回退，见 § 8。在 CUDA GPU 上一对 2,880 patch 的帧经过这张图需要
+166 ms（使用表旋转和展开的偏置行时为 231 ms），输出与托管 CPU 视觉塔的相对 L2 误差在 1.7e-3 以内。
 
 ## 5. 参数与配置
 

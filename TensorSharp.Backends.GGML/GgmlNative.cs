@@ -1669,6 +1669,96 @@ internal enum GgmlIndexReductionOp
             public int Fc2Ne1;
         }
 
+        /// <summary>Mirror of the native TSGgmlVisionDeepStackArgs: Qwen3-VL's DeepStack mergers (up to four taps) folded
+        /// into the merged-encoder graph after their blocks.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct VisionDeepStackArgs
+        {
+            public const int Max = 4;
+            public int StructBytes;
+            public int Count;
+            public int Block0, Block1, Block2, Block3;
+            public IntPtr LnW0, LnW1, LnW2, LnW3;
+            public IntPtr LnB0, LnB1, LnB2, LnB3;
+            public IntPtr Fc1W0, Fc1W1, Fc1W2, Fc1W3;
+            public IntPtr Fc1B0, Fc1B1, Fc1B2, Fc1B3;
+            public IntPtr Fc2W0, Fc2W1, Fc2W2, Fc2W3;
+            public IntPtr Fc2B0, Fc2B1, Fc2B2, Fc2B3;
+
+            /// <summary>Set tap <paramref name="i"/> (0..3).</summary>
+            public void Set(int i, int block, IntPtr lnW, IntPtr lnB, IntPtr fc1W, IntPtr fc1B, IntPtr fc2W, IntPtr fc2B)
+            {
+                switch (i)
+                {
+                    case 0: Block0 = block; LnW0 = lnW; LnB0 = lnB; Fc1W0 = fc1W; Fc1B0 = fc1B; Fc2W0 = fc2W; Fc2B0 = fc2B; break;
+                    case 1: Block1 = block; LnW1 = lnW; LnB1 = lnB; Fc1W1 = fc1W; Fc1B1 = fc1B; Fc2W1 = fc2W; Fc2B1 = fc2B; break;
+                    case 2: Block2 = block; LnW2 = lnW; LnB2 = lnB; Fc1W2 = fc1W; Fc1B2 = fc1B; Fc2W2 = fc2W; Fc2B2 = fc2B; break;
+                    case 3: Block3 = block; LnW3 = lnW; LnB3 = lnB; Fc1W3 = fc1W; Fc1B3 = fc1B; Fc2W3 = fc2W; Fc2B3 = fc2B; break;
+                    default: throw new ArgumentOutOfRangeException(nameof(i));
+                }
+            }
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_Qwen35VisionEncoderMergedBatchF32(
+            GgmlTensorView2D hidden, GgmlTensorView2D merged, in VisionMergerArgs merger, VisionDeepStackArgs* deepStack,
+            int images, int* positions, float ropeTheta,
+            int blockCount, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W, IntPtr[] ln1B,
+            IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] outW, IntPtr[] outB,
+            IntPtr[] ln2W, IntPtr[] ln2B,
+            IntPtr[] upW, IntPtr[] upB,
+            IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes, int qkvBDim,
+            int outNe0, int outNe1, long outBytes, int outBDim,
+            int upNe0, int upNe1, long upBytes, int upBDim,
+            int downNe0, int downNe1, long downBytes, int downBDim, int geluErf, int linearWeightType);
+
+        /// <summary><see cref="Qwen35VisionEncoderMerged"/> over <paramref name="images"/> stacked same-sized images, with
+        /// Qwen3-VL's DeepStack taps in the same graph when <paramref name="deepStack"/> is given and ggml's vision rope from
+        /// <paramref name="positions"/> (4 per patch: row, column, row, column) when given, instead of the cos/sin tables.
+        /// False when the native library lacks the export or declines, so the caller falls back.</summary>
+        public static unsafe bool Qwen35VisionEncoderMergedBatch(
+            GgmlTensorView2D hidden, GgmlTensorView2D merged, in VisionMergerArgs merger, VisionDeepStackArgs? deepStack,
+            int images, int[] positions, float ropeTheta,
+            int blockCount, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W, IntPtr[] ln1B, IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] outW, IntPtr[] outB, IntPtr[] ln2W, IntPtr[] ln2B,
+            IntPtr[] upW, IntPtr[] upB, IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes, int qkvBDim,
+            int outNe0, int outNe1, long outBytes, int outBDim,
+            int upNe0, int upNe1, long upBytes, int upBDim,
+            int downNe0, int downNe1, long downBytes, int downBDim, bool geluErf, int linearWeightType)
+        {
+            if (positions != null && positions.Length != 4L * numPatches)
+                throw new ArgumentException("Vision rope positions hold four entries per patch.", nameof(positions));
+            try
+            {
+                VisionDeepStackArgs taps = deepStack.GetValueOrDefault();
+                fixed (int* pos = positions)
+                {
+                    return TSGgml_Qwen35VisionEncoderMergedBatchF32(hidden, merged, merger, deepStack.HasValue ? &taps : null,
+                        images, pos, ropeTheta,
+                        blockCount, eps, attnScale, numPatches, numHeads, headDim, halfDim,
+                        cosTable, sinTable, ln1W, ln1B, qkvW, qkvB, outW, outB, ln2W, ln2B, upW, upB, downW, downB,
+                        lnDim, qkvNe0, qkvNe1, qkvBytes, qkvBDim, outNe0, outNe1, outBytes, outBDim,
+                        upNe0, upNe1, upBytes, upBDim, downNe0, downNe1, downBytes, downBDim, geluErf ? 1 : 0, linearWeightType) != 0;
+                }
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
+        }
+
         public static bool Qwen35VisionEncoderMerged(
             GgmlTensorView2D hidden, GgmlTensorView2D merged, in VisionMergerArgs merger,
             int blockCount, float eps, float attnScale,

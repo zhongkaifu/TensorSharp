@@ -1384,7 +1384,32 @@ static ggml_tensor* vision_linear(ggml_context* ctx, ggml_tensor* w, ggml_tensor
     return y;
 }
 
-// LN + QKV(+bias) + split + NeoX RoPE(cos/sin tables) + flash-attn + out(+bias) + residual.
+// The residual stream as a block's input: graph intermediates are already contiguous, so only a
+// leaf (the bound input, possibly host-mapped) or a strided view is copied.
+static ggml_tensor* vision_block_input(ggml_context* ctx, ggml_tensor* cur)
+{
+    return cur->op == GGML_OP_NONE || !ggml_is_contiguous(cur) ? ggml_cont(ctx, cur) : cur;
+}
+
+// x + bias with the bias row broadcast by the add itself, the same sums without a materialized repeat.
+static ggml_tensor* vision_add_bias(ggml_context* ctx, ggml_tensor* x, ggml_tensor* bias, int width)
+{
+    return ggml_add(ctx, x, ggml_reshape_2d(ctx, bias, width, 1));
+}
+
+// LN + QKV(+bias) + split + NeoX RoPE + flash-attn + out(+bias) + residual.
+//
+// The rotary comes from the cos/sin tables (rows x half_dim, block order), or, with rope_pos, from
+// ggml's vision rope over the QKV projection's own Q and K views: one op each instead of a split
+// copy, two half copies, four multiplies, a sub, an add and a concat. rope_pos holds 4 int32 per
+// patch (row, column, row, column) and its rotation is the tables' exactly as math (the first
+// half_dim / 2 frequencies turn by the row, the rest by the column, base rope_theta); the angles are
+// computed on the device instead of read from the tables.
+//
+// images > 1 (rope_pos only) treats rows as that many independent images of rows / images patches
+// each, stacked: the linears and norms run over every row at once and attention stays within an
+// image (a 4-D batch). The owned CUDA kernels and the flash path take the batch; the explicit
+// CUDA/Vulkan fallback attends over all rows, so the caller must not batch on it.
 static ggml_tensor* build_vision_attn_subgraph(
     ggml_context* ctx, ggml_tensor* cur,
     ggml_tensor* ln_w_t, ggml_tensor* ln_b_t, float eps,
@@ -1392,10 +1417,11 @@ static ggml_tensor* build_vision_attn_subgraph(
     ggml_tensor* out_w_t, ggml_tensor* out_b_t,
     ggml_tensor* cos_t, ggml_tensor* sin_t,
     int rows, int hidden, int num_heads, int head_dim, int half_dim,
-    float attn_scale, int owned_vision = 0)
+    float attn_scale, int owned_vision = 0,
+    ggml_tensor* rope_pos = nullptr, int images = 1, float rope_theta = 10000.0f)
 {
     const int triple_hidden = 3 * hidden;
-    ggml_tensor* inp = ggml_cont(ctx, cur);
+    ggml_tensor* inp = vision_block_input(ctx, cur);
 
     // LayerNorm
     ggml_tensor* normed = ggml_norm(ctx, inp, eps);
@@ -1405,11 +1431,37 @@ static ggml_tensor* build_vision_attn_subgraph(
     // QKV projection + bias
     ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
     ggml_tensor* qkv = vision_linear(ctx, qkv_w_t, ln_2d);
-    ggml_tensor* qkv_biased = ggml_add(ctx, qkv, ggml_repeat(ctx, ggml_reshape_2d(ctx, qkv_b_t, triple_hidden, 1), qkv));
+    ggml_tensor* qkv_biased = vision_add_bias(ctx, qkv, qkv_b_t, triple_hidden);
 
     // Split Q, K, V
     std::size_t row_bytes = static_cast<std::size_t>(triple_hidden) * sizeof(float);
     std::size_t d_bytes = static_cast<std::size_t>(hidden) * sizeof(float);
+    if (rope_pos != nullptr)
+    {
+        const int patches = rows / images;
+        const std::size_t head_bytes = static_cast<std::size_t>(head_dim) * sizeof(float);
+        auto part = [&](std::size_t offset) {
+            return ggml_view_4d(ctx, qkv_biased, head_dim, num_heads, patches, images,
+                head_bytes, row_bytes, row_bytes * patches, offset);
+        };
+        int sections[GGML_MROPE_SECTIONS] = { half_dim / 2, half_dim / 2, 0, 0 };
+        auto rotate = [&](ggml_tensor* x) {
+            return ggml_rope_multi(ctx, x, rope_pos, nullptr, half_dim, sections, GGML_ROPE_TYPE_VISION,
+                0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        };
+        // [head_dim, patches, heads, images]: the layout every attention path below takes.
+        ggml_tensor* q_perm = ggml_permute(ctx, rotate(part(0)), 0, 2, 1, 3);
+        ggml_tensor* k_perm = ggml_permute(ctx, rotate(part(d_bytes)), 0, 2, 1, 3);
+        ggml_tensor* v_4d = part(2 * d_bytes);
+        if (owned_vision == 0)
+            v_4d = ggml_cont(ctx, v_4d);
+        ggml_tensor* attn_out = build_vision_attention(ctx, q_perm, k_perm, v_4d,
+            patches, num_heads, head_dim, attn_scale, /*kv_f16=*/ false, owned_vision);
+        if (!ggml_is_contiguous(attn_out))
+            attn_out = ggml_cont(ctx, attn_out);
+        ggml_tensor* out_proj = vision_linear(ctx, out_w_t, ggml_reshape_2d(ctx, attn_out, hidden, rows));
+        return ggml_add(ctx, inp, vision_add_bias(ctx, out_proj, out_b_t, hidden));
+    }
     ggml_tensor* q_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, 0));
     ggml_tensor* k_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, d_bytes));
     ggml_tensor* v_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, 2 * d_bytes));
@@ -1449,10 +1501,11 @@ static ggml_tensor* build_vision_attn_subgraph(
     // build_vision_attention for what enabling it is worth and what proves it safe.
     ggml_tensor* attn_out = build_vision_attention(ctx, q_perm, k_perm, v_3d,
         rows, num_heads, head_dim, attn_scale, /*kv_f16=*/ false, owned_vision);
-    ggml_tensor* attn_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, attn_out), hidden, rows);
+    ggml_tensor* attn_flat = ggml_reshape_2d(ctx,
+        ggml_is_contiguous(attn_out) ? attn_out : ggml_cont(ctx, attn_out), hidden, rows);
 
     ggml_tensor* out_proj = vision_linear(ctx, out_w_t, attn_flat);
-    ggml_tensor* out_biased = ggml_add(ctx, out_proj, ggml_repeat(ctx, ggml_reshape_2d(ctx, out_b_t, hidden, 1), out_proj));
+    ggml_tensor* out_biased = vision_add_bias(ctx, out_proj, out_b_t, hidden);
 
     // Residual add (2D [hidden, rows] — equivalent to the flattened add).
     return ggml_add(ctx, inp, out_biased);
@@ -1466,7 +1519,7 @@ static ggml_tensor* build_vision_mlp_subgraph(
     ggml_tensor* down_w_t, ggml_tensor* down_b_t,
     int rows, int hidden, int dff, bool gelu_erf = false)
 {
-    ggml_tensor* inp = ggml_cont(ctx, cur);
+    ggml_tensor* inp = vision_block_input(ctx, cur);
 
     ggml_tensor* normed = ggml_norm(ctx, inp, eps);
     ggml_tensor* scaled = ggml_mul(ctx, normed, ln_w_t);
@@ -1474,13 +1527,13 @@ static ggml_tensor* build_vision_mlp_subgraph(
 
     ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
     ggml_tensor* fc1 = vision_linear(ctx, up_w_t, ln_2d);
-    ggml_tensor* fc1_bias = ggml_add(ctx, fc1, ggml_repeat(ctx, ggml_reshape_2d(ctx, up_b_t, dff, 1), fc1));
+    ggml_tensor* fc1_bias = vision_add_bias(ctx, fc1, up_b_t, dff);
 
     ggml_tensor* fc1_gelu = gelu_erf ? ggml_gelu_erf(ctx, fc1_bias) : ggml_gelu(ctx, fc1_bias);
 
     ggml_tensor* fc1_2d = (rows == 1) ? ggml_reshape_2d(ctx, fc1_gelu, dff, 1) : fc1_gelu;
     ggml_tensor* fc2 = vision_linear(ctx, down_w_t, fc1_2d);
-    ggml_tensor* fc2_bias = ggml_add(ctx, fc2, ggml_repeat(ctx, ggml_reshape_2d(ctx, down_b_t, hidden, 1), fc2));
+    ggml_tensor* fc2_bias = vision_add_bias(ctx, fc2, down_b_t, hidden);
 
     return ggml_add(ctx, inp, fc2_bias);
 }
@@ -3551,6 +3604,24 @@ struct TSGgmlVisionMergerArgs
     std::int32_t fc2_ne1;
 };
 
+// Qwen3-VL's DeepStack mergers, folded into the merged-encoder graph: after each tap block, every `merge_unit`
+// consecutive patches of the residual stream as one row, LayerNorm over that row (unlike the final merger, whose norm
+// precedes the merge), then fc1 + GELU + fc2 at the final merger's widths and activation. Their rows follow the final
+// merger's in the output, [main | tap 0 | tap 1 | ...], the layout llama.cpp's qwen3vl_merger projector produces.
+constexpr int kVisionDeepStackMax = 4;
+struct TSGgmlVisionDeepStackArgs
+{
+    std::int32_t struct_bytes;
+    std::int32_t count;                         // 1..kVisionDeepStackMax
+    std::int32_t blocks[kVisionDeepStackMax];   // tap block indices, ascending
+    const float* ln_w[kVisionDeepStackMax];
+    const float* ln_b[kVisionDeepStackMax];
+    const float* fc1_w[kVisionDeepStackMax];
+    const float* fc1_b[kVisionDeepStackMax];
+    const float* fc2_w[kVisionDeepStackMax];
+    const float* fc2_b[kVisionDeepStackMax];
+};
+
 static int fused_qwen35_vision_encoder_f32_impl(
     const TensorView2DDesc& hidden_desc,
     int block_count, float eps, float attn_scale,
@@ -3569,8 +3640,34 @@ static int fused_qwen35_vision_encoder_f32_impl(
     int down_ne0, int down_ne1, std::size_t down_bytes, int down_b_dim,
     bool gelu_erf = false,
     const TSGgmlVisionMergerArgs* merger = nullptr, const TensorView2DDesc* merged_desc = nullptr,
-    ggml_type linear_type = GGML_TYPE_F32)
+    ggml_type linear_type = GGML_TYPE_F32, const TSGgmlVisionDeepStackArgs* deepstack = nullptr,
+    const std::int32_t* positions = nullptr, int images = 1, float rope_theta = 10000.0f)
 {
+    const int taps = deepstack != nullptr ? deepstack->count : 0;
+    // positions (4 int32 per patch: row, column, row, column) select ggml's vision rope instead of
+    // the cos/sin tables; images > 1 stacks that many same-sized images of num_patches rows each.
+    if (images < 1 || (images > 1 && positions == nullptr) ||
+        static_cast<std::int64_t>(hidden_desc.dim0) != static_cast<std::int64_t>(images) * num_patches ||
+        (positions == nullptr && (cos_table == nullptr || sin_table == nullptr)) ||
+        (positions != nullptr && !(rope_theta > 0.0f)))
+    {
+        set_last_error("vision_encoder: inconsistent image count, positions or rotary tables.");
+        return 0;
+    }
+    if (merger != nullptr && num_patches % merger->merge_unit != 0)
+    {
+        set_last_error("vision_encoder: an image's patch count is not a multiple of the merge unit.");
+        return 0;
+    }
+    if (deepstack != nullptr)
+    {
+        bool ok = merger != nullptr && deepstack->struct_bytes == static_cast<std::int32_t>(sizeof(TSGgmlVisionDeepStackArgs))
+            && taps >= 1 && taps <= kVisionDeepStackMax;
+        for (int i = 0; ok && i < taps; i++)
+            ok = deepstack->blocks[i] >= 0 && deepstack->blocks[i] < block_count && (i == 0 || deepstack->blocks[i] > deepstack->blocks[i - 1])
+                && deepstack->ln_w[i] && deepstack->ln_b[i] && deepstack->fc1_w[i] && deepstack->fc1_b[i] && deepstack->fc2_w[i] && deepstack->fc2_b[i];
+        if (!ok) { set_last_error("vision_encoder: inconsistent DeepStack arguments."); return 0; }
+    }
     if (linear_type != GGML_TYPE_F32 && linear_type != GGML_TYPE_F16)
     {
         set_last_error("vision_encoder: linear weights must be F32 or F16.");
@@ -3585,7 +3682,7 @@ static int fused_qwen35_vision_encoder_f32_impl(
             merged_desc == nullptr || !validate_desc(*merged_desc, "merged") || merger->merge_unit <= 0 ||
             hidden_desc.dim0 % merger->merge_unit != 0 || merger->ln_dim != hidden_desc.dim1 ||
             merger->fc1_ne0 != hidden_desc.dim1 * merger->merge_unit || merger->fc2_ne0 != merger->fc1_ne1 ||
-            merged_desc->dim0 != hidden_desc.dim0 / merger->merge_unit || merged_desc->dim1 != merger->fc2_ne1 ||
+            merged_desc->dim0 != hidden_desc.dim0 / merger->merge_unit || merged_desc->dim1 != merger->fc2_ne1 * (1 + taps) ||
             !merger->post_ln_w || !merger->post_ln_b || !merger->fc1_w || !merger->fc1_b || !merger->fc2_w || !merger->fc2_b)
         {
             set_last_error("vision_encoder: inconsistent merger arguments.");
@@ -3623,8 +3720,15 @@ static int fused_qwen35_vision_encoder_f32_impl(
         }
     }
 #endif
+    // Only the owned kernels and the flash path keep attention within each stacked image.
+    if (images > 1 && owned_vision == 0 &&
+        (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN))
+    {
+        set_last_error("vision_encoder: stacked images need the owned vision attention on this backend.");
+        return 0;
+    }
 
-    const int rows = hidden_desc.dim0;     // numPatches
+    const int rows = hidden_desc.dim0;     // images * numPatches
     const int hidden = hidden_desc.dim1;   // hiddenSize
     const int dff = up_ne1;                // intermediate_size
     const std::size_t cos_sin_elems = static_cast<std::size_t>(num_patches) * half_dim;
@@ -3656,13 +3760,25 @@ static int fused_qwen35_vision_encoder_f32_impl(
         hidden_binding = create_standard_binding(ctx, hidden_desc);
     if (!hidden_binding.storage) { set_last_error("vision_encoder: hidden bind failed."); return 0; }
 
-    // cos/sin tables: shared across all blocks. Uploaded after gallocr alloc, so
-    // mark as inputs (gallocr never reuses input memory → upload stays valid).
-    ggml_tensor* cos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cos_sin_elems);
-    ggml_tensor* sin_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cos_sin_elems);
-    if (!cos_t || !sin_t) { set_last_error("vision_encoder: cos/sin alloc failed."); return 0; }
-    ggml_set_input(cos_t);
-    ggml_set_input(sin_t);
+    // cos/sin tables (or the rope positions): shared across all blocks. Uploaded after gallocr
+    // alloc, so mark as inputs (gallocr never reuses input memory → upload stays valid).
+    ggml_tensor* cos_t = nullptr;
+    ggml_tensor* sin_t = nullptr;
+    ggml_tensor* pos_t = nullptr;
+    if (positions != nullptr)
+    {
+        pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<std::int64_t>(num_patches) * 4);
+        if (!pos_t) { set_last_error("vision_encoder: rope position alloc failed."); return 0; }
+        ggml_set_input(pos_t);
+    }
+    else
+    {
+        cos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cos_sin_elems);
+        sin_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cos_sin_elems);
+        if (!cos_t || !sin_t) { set_last_error("vision_encoder: cos/sin alloc failed."); return 0; }
+        ggml_set_input(cos_t);
+        ggml_set_input(sin_t);
+    }
 
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
     struct HostBinding { ggml_tensor* tensor; const void* data; std::size_t bytes; };
@@ -3691,6 +3807,7 @@ static int fused_qwen35_vision_encoder_f32_impl(
     };
 
     ggml_tensor* cur = hidden_binding.tensor;
+    std::vector<ggml_tensor*> tap_rows;
     for (int b = 0; b < block_count; b++)
     {
         ggml_tensor* ln1w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ln_dim);
@@ -3728,10 +3845,40 @@ static int fused_qwen35_vision_encoder_f32_impl(
 
         cur = build_vision_attn_subgraph(ctx, cur, ln1w_t, ln1b_t, eps,
             qkvw_t, qkvb_t, outw_t, outb_t, cos_t, sin_t,
-            rows, hidden, num_heads, head_dim, half_dim, attn_scale, owned_vision);
+            rows, hidden, num_heads, head_dim, half_dim, attn_scale, owned_vision,
+            pos_t, images, rope_theta);
         cur = build_vision_mlp_subgraph(ctx, cur, ln2w_t, ln2b_t, eps,
             upw_t, upb_t, downw_t, downb_t, rows, hidden, dff, gelu_erf);
+
+        const int tap = static_cast<int>(tap_rows.size());
+        if (tap < taps && deepstack->blocks[tap] == b)
+        {
+            // A DeepStack merger over this block's output: merge, then normalize the merged row.
+            const int unit = merger->merge_unit;
+            ggml_tensor* ds_lnw = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden * unit);
+            ggml_tensor* ds_lnb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden * unit);
+            ggml_tensor* ds_fc1w = ggml_new_tensor_2d(ctx, linear_type, merger->fc1_ne0, merger->fc1_ne1);
+            ggml_tensor* ds_fc1b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, merger->fc1_ne1);
+            ggml_tensor* ds_fc2w = ggml_new_tensor_2d(ctx, linear_type, merger->fc2_ne0, merger->fc2_ne1);
+            ggml_tensor* ds_fc2b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, merger->fc2_ne1);
+            if (!ds_lnw || !ds_lnb || !ds_fc1w || !ds_fc1b || !ds_fc2w || !ds_fc2b)
+            { set_last_error("vision_encoder: DeepStack tensor alloc failed."); return 0; }
+            const std::size_t ds_ln_bytes = static_cast<std::size_t>(hidden) * unit * sizeof(float);
+            bind_w(ds_lnw, deepstack->ln_w[tap], ds_ln_bytes);
+            bind_w(ds_lnb, deepstack->ln_b[tap], ds_ln_bytes);
+            bind_w(ds_fc1w, deepstack->fc1_w[tap], ggml_nbytes(ds_fc1w));
+            bind_w(ds_fc1b, deepstack->fc1_b[tap], static_cast<std::size_t>(merger->fc1_ne1) * sizeof(float));
+            bind_w(ds_fc2w, deepstack->fc2_w[tap], ggml_nbytes(ds_fc2w));
+            bind_w(ds_fc2b, deepstack->fc2_b[tap], static_cast<std::size_t>(merger->fc2_ne1) * sizeof(float));
+            ggml_tensor* merged_rows = ggml_reshape_2d(ctx, vision_block_input(ctx, cur), hidden * unit, rows / unit);
+            ggml_tensor* normed = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, merged_rows, eps), ds_lnw), ds_lnb);
+            ggml_tensor* fc1 = ggml_add(ctx, vision_linear(ctx, ds_fc1w, normed), ds_fc1b);
+            fc1 = merger->gelu_erf != 0 ? ggml_gelu_erf(ctx, fc1) : ggml_gelu(ctx, fc1);
+            tap_rows.push_back(ggml_add(ctx, vision_linear(ctx, ds_fc2w, fc1), ds_fc2b));
+        }
     }
+    if (static_cast<int>(tap_rows.size()) != taps)
+    { set_last_error("vision_encoder: a DeepStack tap block was not reached."); return 0; }
 
     // The merger reads the residual stream directly instead of a host round
     // trip through post-LN, a contiguous copy and two separately dispatched linears.
@@ -3753,11 +3900,13 @@ static int fused_qwen35_vision_encoder_f32_impl(
         bind_w(fc2_w, merger->fc2_w, ggml_nbytes(fc2_w));
         bind_w(fc2_b, merger->fc2_b, static_cast<std::size_t>(merger->fc2_ne1) * sizeof(float));
 
-        ggml_tensor* normed = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, ggml_cont(ctx, cur), eps), post_w), post_b);
+        ggml_tensor* normed = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, vision_block_input(ctx, cur), eps), post_w), post_b);
         ggml_tensor* merged = ggml_reshape_2d(ctx, normed, hidden * unit, rows / unit);
         ggml_tensor* fc1 = ggml_add(ctx, vision_linear(ctx, fc1_w, merged), fc1_b);
         fc1 = merger->gelu_erf != 0 ? ggml_gelu_erf(ctx, fc1) : ggml_gelu(ctx, fc1);
         cur = ggml_add(ctx, vision_linear(ctx, fc2_w, fc1), fc2_b);
+        for (ggml_tensor* t : tap_rows)
+            cur = ggml_concat(ctx, cur, t, 0);   // [main | tap 0 | ...] per merged row
         merged_binding = create_standard_binding(ctx, *merged_desc);
         if (!merged_binding.storage) { set_last_error("vision_encoder: merged output bind failed."); return 0; }
         ggml_set_output(merged_binding.storage);
@@ -3786,10 +3935,18 @@ static int fused_qwen35_vision_encoder_f32_impl(
         upload_binding(hidden_binding, hidden_desc.data, hidden_binding.raw_bytes);
     for (auto& u : upload_list)
         ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
-    ggml_backend_tensor_set(cos_t, cos_table, 0, cos_sin_elems * sizeof(float));
-    ggml_backend_tensor_set(sin_t, sin_table, 0, cos_sin_elems * sizeof(float));
+    if (pos_t != nullptr)
+        ggml_backend_tensor_set(pos_t, positions, 0, ggml_nbytes(pos_t));
+    else
+    {
+        ggml_backend_tensor_set(cos_t, cos_table, 0, cos_sin_elems * sizeof(float));
+        ggml_backend_tensor_set(sin_t, sin_table, 0, cos_sin_elems * sizeof(float));
+    }
 
-    ggml_status status = tsg::compute_graph(compute_backend, graph);
+    // TS_GGML_NODE_PROFILE times the tower's nodes too (each node synchronized, so totals are inflated).
+    ggml_status status = graph_node_profile_enabled()
+        ? graph_compute_profiled(compute_backend, graph, "qwen35-vision", nullptr)
+        : tsg::compute_graph(compute_backend, graph);
     if (status != GGML_STATUS_SUCCESS) { ggml_gallocr_free(galloc); set_last_error("vision_encoder: graph compute failed."); return 0; }
     if (merger != nullptr)
         finalize_compute(false, merged_binding.storage, merged_desc->data, merged_binding.raw_bytes);
@@ -4159,6 +4316,48 @@ TSG_EXPORT int TSGgml_Qwen35VisionEncoderMergedF32(
             up_ne0, up_ne1, static_cast<std::size_t>(up_bytes), up_b_dim,
             down_ne0, down_ne1, static_cast<std::size_t>(down_bytes), down_b_dim,
             gelu_erf != 0, merger, &merged, static_cast<ggml_type>(linear_weight_type));
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in fused vision encoder."); return 0; }
+}
+
+// Additive ABI: the merged encoder over `images` stacked same-sized images of num_patches rows each
+// (hidden is [images * num_patches, D], merged [images * num_patches / unit, ...]), with
+//  - deepstack (optional): Qwen3-VL's DeepStack mergers in the same graph, writing
+//    [merged, out * (1 + taps)] rows: the final merger's, then each tap's;
+//  - positions (optional, 4 int32 per patch: row, column, row, column, shared by every image):
+//    ggml's vision rope at rope_theta instead of the cos/sin tables (which may then be null).
+//    Stacking more than one image needs positions.
+TSG_EXPORT int TSGgml_Qwen35VisionEncoderMergedBatchF32(
+    TensorView2DDesc hidden, TensorView2DDesc merged, const TSGgmlVisionMergerArgs* merger,
+    const TSGgmlVisionDeepStackArgs* deepstack, int images, const std::int32_t* positions, float rope_theta,
+    int block_count, float eps, float attn_scale,
+    int num_patches, int num_heads, int head_dim, int half_dim,
+    const float* cos_table, const float* sin_table,
+    const float* const* ln1_w, const float* const* ln1_b,
+    const float* const* qkv_w, const float* const* qkv_b,
+    const float* const* out_w, const float* const* out_b,
+    const float* const* ln2_w, const float* const* ln2_b,
+    const float* const* up_w,  const float* const* up_b,
+    const float* const* down_w, const float* const* down_b,
+    int ln_dim,
+    int qkv_ne0, int qkv_ne1, std::int64_t qkv_bytes, int qkv_b_dim,
+    int out_ne0, int out_ne1, std::int64_t out_bytes, int out_b_dim,
+    int up_ne0, int up_ne1, std::int64_t up_bytes, int up_b_dim,
+    int down_ne0, int down_ne1, std::int64_t down_bytes, int down_b_dim, int gelu_erf, int linear_weight_type)
+{
+    if (merger == nullptr) { set_last_error("vision_encoder: merger arguments missing."); return 0; }
+    try {
+        return fused_qwen35_vision_encoder_f32_impl(hidden, block_count, eps, attn_scale,
+            num_patches, num_heads, head_dim, half_dim, cos_table, sin_table,
+            ln1_w, ln1_b, qkv_w, qkv_b, out_w, out_b, ln2_w, ln2_b, up_w, up_b, down_w, down_b,
+            ln_dim,
+            qkv_ne0, qkv_ne1, static_cast<std::size_t>(qkv_bytes), qkv_b_dim,
+            out_ne0, out_ne1, static_cast<std::size_t>(out_bytes), out_b_dim,
+            up_ne0, up_ne1, static_cast<std::size_t>(up_bytes), up_b_dim,
+            down_ne0, down_ne1, static_cast<std::size_t>(down_bytes), down_b_dim,
+            gelu_erf != 0, merger, &merged, static_cast<ggml_type>(linear_weight_type), deepstack,
+            positions, images, rope_theta);
     }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in fused vision encoder."); return 0; }

@@ -38,6 +38,7 @@ namespace TensorSharp.Models.Architecture
             // Text / multimodal language models.
             Qwen35Architecture.Descriptor,
             Qwen4ExpArchitecture.Descriptor,
+            Qwen3VLArchitecture.Descriptor,
             Gemma4Architecture.Descriptor,
             GptOssArchitecture.Descriptor,
             NemotronArchitecture.Descriptor,

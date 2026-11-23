@@ -744,10 +744,8 @@ namespace TensorSharp.Models
                     var (width, height) = Qwen35ImageProcessor.ReadImageDimensions(firstFrame);
                     var (resizedH, resizedW) = processor.SmartResizeVideo(
                         groups.Count * QwenVideoFrames.TemporalPatchSize, height, width);
-                    foreach (var group in groups)
+                    foreach (var cached in GetOrCreateQwenVLVideoEmbeddings(encoder, processor, message, groups, resizedH, resizedW))
                     {
-                        var cached = GetOrCreateQwenVLVideoEmbedding(encoder, processor,
-                            message.ImagePaths[group.First], message.ImagePaths[group.Second], resizedH, resizedW);
                         cachedEmbeddings.Add(cached);
                         spans.Add(new QwenVLVisionSpan(videoPadId, cached.TokenCount, cached.Extra0, cached.Extra1));
                     }
@@ -1117,51 +1115,80 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// The embedding of one temporal pair of video frames, cached under both frame
-        /// paths and the clip's resized size (the size depends on the whole clip, so the
-        /// same two frames in a longer clip are a different entry). Both frames are
-        /// resized to the clip size; a pair that repeats the clip's last frame encodes
-        /// that frame twice, as the Qwen-VL processor pads an odd clip.
+        /// The embeddings of a clip's temporal pairs of video frames, in pair order. Each is
+        /// cached under both frame paths and the clip's resized size (the size depends on the
+        /// whole clip, so the same two frames in a longer clip are a different entry). Both
+        /// frames are resized to the clip size; a pair that repeats the clip's last frame
+        /// encodes that frame twice, as the Qwen-VL processor pads an odd clip. The pairs
+        /// not cached yet are decoded in parallel and encoded together
+        /// (<see cref="Qwen35VisionEncoder.EncodeVideoPairs"/>), which stacks several per
+        /// tower graph where the backend can.
         /// </summary>
-        private CachedEmbedding GetOrCreateQwenVLVideoEmbedding(
+        private List<CachedEmbedding> GetOrCreateQwenVLVideoEmbeddings(
             Qwen35VisionEncoder encoder,
             Qwen35ImageProcessor processor,
-            string firstFramePath,
-            string secondFramePath,
+            ChatMessage message,
+            IReadOnlyList<QwenVideoFrames.Group> groups,
             int resizedHeight,
             int resizedWidth)
         {
-            string first = NormalizePath(firstFramePath);
-            string second = NormalizePath(secondFramePath);
-            string firstId = MediaContentId.OfFile(first) ?? "path:" + first;
-            string secondId = MediaContentId.OfFile(second) ?? "path:" + second;
-            string key = "vid2:" + firstId + ":" + secondId + ":" + resizedHeight + "x" + resizedWidth;
-            GetMediaVersion(first, out long firstSize, out long firstTicks);
-            GetMediaVersion(second, out long secondSize, out long secondTicks);
-            if (_videoFrameCache.TryGetValue(key, out var cached) &&
-                (cached.ContentId != null && !key.Contains("path:", StringComparison.Ordinal)
-                    || cached.MatchesPair(firstSize, firstTicks, secondSize, secondTicks)))
+            var result = new CachedEmbedding[groups.Count];
+            var misses = new List<(int Index, string Key, string First, string Second,
+                long FirstSize, long FirstTicks, long SecondSize, long SecondTicks)>();
+            for (int i = 0; i < groups.Count; i++)
             {
-                TouchAndPin(cached);
-                return cached;
+                string first = NormalizePath(message.ImagePaths[groups[i].First]);
+                string second = NormalizePath(message.ImagePaths[groups[i].Second]);
+                string firstId = MediaContentId.OfFile(first) ?? "path:" + first;
+                string secondId = MediaContentId.OfFile(second) ?? "path:" + second;
+                string key = "vid2:" + firstId + ":" + secondId + ":" + resizedHeight + "x" + resizedWidth;
+                GetMediaVersion(first, out long firstSize, out long firstTicks);
+                GetMediaVersion(second, out long secondSize, out long secondTicks);
+                if (_videoFrameCache.TryGetValue(key, out var cached) &&
+                    (cached.ContentId != null && !key.Contains("path:", StringComparison.Ordinal)
+                        || cached.MatchesPair(firstSize, firstTicks, secondSize, secondTicks)))
+                {
+                    TouchAndPin(cached);
+                    result[i] = cached;
+                    continue;
+                }
+                if (cached != null)
+                    RemoveCachedEmbedding(_videoFrameCache, key, cached);
+                misses.Add((i, key, first, second, firstSize, firstTicks, secondSize, secondTicks));
             }
-            if (cached != null)
-                RemoveCachedEmbedding(_videoFrameCache, key, cached);
+            if (misses.Count == 0)
+                return new List<CachedEmbedding>(result);
 
-            float[] firstPixels = processor.ProcessImage(first, resizedHeight, resizedWidth);
-            float[] secondPixels = string.Equals(first, second, StringComparison.Ordinal)
-                ? firstPixels
-                : processor.ProcessImage(second, resizedHeight, resizedWidth);
-            Tensor embeddings = encoder.Encode(firstPixels, secondPixels, resizedHeight, resizedWidth);
+            var paths = new List<string>();
+            var slots = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var miss in misses)
+                foreach (string path in new[] { miss.First, miss.Second })
+                    if (slots.TryAdd(path, paths.Count))
+                        paths.Add(path);
+            var pixels = new float[paths.Count][];
+            System.Threading.Tasks.Parallel.For(0, paths.Count,
+                k => pixels[k] = processor.ProcessImage(paths[k], resizedHeight, resizedWidth));
+
+            Tensor[] embeddings = encoder.EncodeVideoPairs(
+                misses.ConvertAll(m => pixels[slots[m.First]]), misses.ConvertAll(m => pixels[slots[m.Second]]),
+                resizedHeight, resizedWidth);
             int mergedH = resizedHeight / processor.PatchSize / processor.MergeSize;
             int mergedW = resizedWidth / processor.PatchSize / processor.MergeSize;
-            var fresh = new CachedEmbedding(key, firstSize, firstTicks, embeddings, (int)embeddings.Sizes[0],
-                mergedH, mergedW, secondSize, secondTicks) { ContentId = key };
-            if (!key.Contains("path:", StringComparison.Ordinal)
-                && TryTakeRacedEntry(_videoFrameCache, key, fresh, out CachedEmbedding raced))
-                return raced;
-            AddCachedEmbedding(_videoFrameCache, key, fresh);
-            return fresh;
+            for (int m = 0; m < misses.Count; m++)
+            {
+                var miss = misses[m];
+                var fresh = new CachedEmbedding(miss.Key, miss.FirstSize, miss.FirstTicks, embeddings[m],
+                    (int)embeddings[m].Sizes[0], mergedH, mergedW, miss.SecondSize, miss.SecondTicks) { ContentId = miss.Key };
+                if (!miss.Key.Contains("path:", StringComparison.Ordinal)
+                    && TryTakeRacedEntry(_videoFrameCache, miss.Key, fresh, out CachedEmbedding raced))
+                {
+                    result[miss.Index] = raced;
+                    continue;
+                }
+                AddCachedEmbedding(_videoFrameCache, miss.Key, fresh);
+                result[miss.Index] = fresh;
+            }
+            return new List<CachedEmbedding>(result);
         }
 
         /// <summary>

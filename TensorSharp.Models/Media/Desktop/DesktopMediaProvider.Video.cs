@@ -34,10 +34,19 @@ namespace TensorSharp.Models.Media.Desktop
             {
                 throw new PlatformNotSupportedException(
                     "Video input needs OpenCV's native library (OpenCvSharpExtern), which could not be loaded on " +
-                    $"{RuntimeInformation.RuntimeIdentifier}. OpenCvSharp ships no Windows on Arm build of it; " +
-                    "elsewhere, check that its runtime package for this platform is installed.", ex);
+                    $"{RuntimeInformation.RuntimeIdentifier}, or ffmpeg and ffprobe (on PATH, or TS_FFMPEG / TS_FFPROBE) to read " +
+                    "frames instead. OpenCvSharp ships no Windows on Arm build of it; elsewhere, check that its runtime package " +
+                    "for this platform is installed.", ex);
             }
         }
+
+        // Where OpenCV's native library does not load, video goes through ffmpeg: decided by the first
+        // video call that fails to load it, so a host with OpenCV never runs ffmpeg for frames.
+        private static readonly Lazy<FfmpegVideoDecoder> s_ffmpegVideo = new(FfmpegVideoDecoder.TryCreate);
+        private static volatile bool s_openCvVideoMissing;
+
+        /// <summary>The ffmpeg decoder once OpenCV's native library has failed to load, or null.</summary>
+        private static FfmpegVideoDecoder FfmpegFallback => s_openCvVideoMissing ? s_ffmpegVideo.Value : null;
 
         public VideoInfo Probe(string path)
         {
@@ -45,8 +54,20 @@ namespace TensorSharp.Models.Media.Desktop
                 throw new ArgumentNullException(nameof(path));
             if (!File.Exists(path))
                 throw new FileNotFoundException($"video not found: {path}", path);
+            if (FfmpegFallback is { } ffmpeg)
+                return ffmpeg.Probe(path);
 
-            using var capture = OpenVideoCapture(path);
+            VideoCapture opened;
+            try
+            {
+                opened = OpenVideoCapture(path);
+            }
+            catch (PlatformNotSupportedException) when (s_ffmpegVideo.Value is { } fallback)
+            {
+                s_openCvVideoMissing = true;
+                return fallback.Probe(path);
+            }
+            using var capture = opened;
             if (!capture.IsOpened())
                 throw new InvalidOperationException($"Failed to open video file: {path}");
 
@@ -91,8 +112,24 @@ namespace TensorSharp.Models.Media.Desktop
                 return;
             if (!File.Exists(path))
                 throw new FileNotFoundException($"video not found: {path}", path);
+            if (FfmpegFallback is { } ffmpeg)
+            {
+                ffmpeg.ReadFrames(path, frameIndices, onFrame);
+                return;
+            }
 
-            using var capture = OpenVideoCapture(path);
+            VideoCapture opened;
+            try
+            {
+                opened = OpenVideoCapture(path);
+            }
+            catch (PlatformNotSupportedException) when (s_ffmpegVideo.Value is { } fallback)
+            {
+                s_openCvVideoMissing = true;
+                fallback.ReadFrames(path, frameIndices, onFrame);
+                return;
+            }
+            using var capture = opened;
             if (!capture.IsOpened())
                 throw new InvalidOperationException($"Failed to open video file: {path}");
 

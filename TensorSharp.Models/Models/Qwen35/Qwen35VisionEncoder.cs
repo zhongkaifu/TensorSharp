@@ -47,6 +47,22 @@ namespace TensorSharp.Models
         private ModelBase _hostModel;
         public void SetHostModel(ModelBase model) => _hostModel = model;
 
+        /// <summary>
+        /// Encode one small blank frame (a frame pair on a video-capable tower) so the first real request does not pay the
+        /// tower's one-time device setup: on a CUDA server beside its language model, the first clip's encoder graphs took
+        /// about 10 s more than the next clip's, and an image encoded first left 0.6 s of that. GGML GPU backends only;
+        /// TS_QWEN_VISION_WARMUP=0 skips it.
+        /// </summary>
+        public void WarmUp()
+        {
+            if (!_useNativeAttention || Environment.GetEnvironmentVariable("TS_QWEN_VISION_WARMUP") == "0"
+                || _allocator is not GgmlAllocator ggml || ggml.Context.BackendType == GgmlBackendType.Cpu)
+                return;
+            int side = 4 * _patchSize * _spatialMergeSize;
+            var frame = new float[3 * side * side];
+            using Tensor warm = TemporalPatchSize == 2 ? Encode(frame, frame, side, side) : Encode(frame, side, side);
+        }
+
         private readonly int _imageSize;
         private readonly int _patchSize;
         private readonly int _hiddenSize;
@@ -64,6 +80,9 @@ namespace TensorSharp.Models
         {
             public required float[] CosTable { get; init; }
             public required float[] SinTable { get; init; }
+            /// <summary>The same rotation as ggml vision-rope positions: (row, column, row, column) blocks of one entry per
+            /// patch, in block order.</summary>
+            public required int[] Positions { get; init; }
         }
 
         public int ProjectionDim => _projectionDim;
@@ -78,6 +97,21 @@ namespace TensorSharp.Models
         /// frames through <see cref="Encode(float[], float[], int, int)"/>.
         /// </summary>
         public int TemporalPatchSize => _weights.ContainsKey("v.patch_embd.weight.1") ? 2 : 1;
+
+        /// <summary>The tower blocks a DeepStack merger also projects (Qwen3-VL's <c>v.deepstack.N</c>), ascending; empty
+        /// for a tower without them (Qwen 3.5).</summary>
+        private int[] _deepStackBlocks = Array.Empty<int>();
+
+        /// <summary>DeepStack mergers in the projector (0 for Qwen 3.5's tower, 3 for Qwen3-VL's).</summary>
+        public int DeepStackCount => _deepStackBlocks.Length;
+
+        /// <summary>
+        /// When set, <see cref="Encode(float[], int, int)"/> and the video-pair overload return
+        /// [tokens, ProjectionDim * (1 + DeepStackCount)]: each row the final merger's values, then each DeepStack
+        /// merger's in block order (the layout llama.cpp's qwen3vl_merger projector produces). A model whose layers take
+        /// the taps (Qwen3-VL) sets it; off, the encoder returns the final merger's rows only.
+        /// </summary>
+        public bool ConcatenateDeepStack { get; set; }
 
         public Qwen35VisionEncoder(string mmProjPath, IAllocator allocator, bool qwenImage21 = false,
             bool mergerGeluErf = false)
@@ -114,6 +148,10 @@ namespace TensorSharp.Models
 
             LoadWeights(gguf);
             CombineTemporalPatchWeights();
+            var deepStack = new List<int>();
+            for (int i = 0; i < _blockCount; i++)
+                if (_weights.ContainsKey($"v.deepstack.{i}.norm.weight")) deepStack.Add(i);
+            _deepStackBlocks = deepStack.ToArray();
         }
 
         private void LoadWeights(GgufFile gguf)
@@ -172,7 +210,54 @@ namespace TensorSharp.Models
         /// Output: Tensor of shape [numMergedTokens, projectionDim].
         /// </summary>
         public Tensor Encode(float[] pixelValues, int resizedH, int resizedW)
-            => EncodeCore(pixelValues, null, resizedH, resizedW);
+            => ConcatenateDeepStack && DeepStackCount > 0
+                ? EncodeConcatenated(pixelValues, null, resizedH, resizedW)
+                : EncodeCore(pixelValues, null, resizedH, resizedW);
+
+        /// <summary>The final merger's rows with every DeepStack merger's beside them (<see cref="ConcatenateDeepStack"/>).</summary>
+        private Tensor EncodeConcatenated(float[] pixelValues, float[] secondFrame, int resizedH, int resizedW)
+        {
+            var taps = new List<Tensor>();
+            Tensor main = null;
+            try
+            {
+                main = EncodeCore(pixelValues, secondFrame, resizedH, resizedW, taps, tapsInGraph: true);
+                if (taps.Count == 0 && main.Sizes[1] == (long)_projectionDim * (1 + DeepStackCount))
+                {
+                    // The merged graph ran the DeepStack mergers itself: its rows are already [main | tap 0 | ...].
+                    Tensor fused = main;
+                    main = null;
+                    return fused;
+                }
+                if (taps.Count != DeepStackCount)
+                    throw new InvalidOperationException($"The tower produced {taps.Count} DeepStack taps; its projector has {DeepStackCount}.");
+                long tokens = main.Sizes[0], width = main.Sizes[1];
+                var result = new Tensor(_allocator, DType.Float32, tokens, width * (1 + taps.Count));
+                try
+                {
+                    CopyColumns(result, 0, main);
+                    for (int i = 0; i < taps.Count; i++)
+                        CopyColumns(result, width * (1 + i), taps[i]);
+                }
+                catch
+                {
+                    result.Dispose();
+                    throw;
+                }
+                return result;
+            }
+            finally
+            {
+                main?.Dispose();
+                foreach (Tensor tap in taps) tap.Dispose();
+            }
+        }
+
+        private static void CopyColumns(Tensor destination, long column, Tensor source)
+        {
+            using Tensor columns = destination.Narrow(1, column, source.Sizes[1]);
+            Ops.Copy(columns, source);
+        }
 
         /// <summary>
         /// Encode one temporal patch of a video: two consecutive sampled frames, both
@@ -194,10 +279,118 @@ namespace TensorSharp.Models
                     "so it cannot merge a pair of video frames.");
             if (firstFrame.Length != secondFrame.Length)
                 throw new ArgumentException("Both frames of a temporal patch must have the same resized size.");
-            return EncodeCore(firstFrame, secondFrame, resizedH, resizedW);
+            return ConcatenateDeepStack && DeepStackCount > 0
+                ? EncodeConcatenated(firstFrame, secondFrame, resizedH, resizedW)
+                : EncodeCore(firstFrame, secondFrame, resizedH, resizedW);
         }
 
-        private unsafe Tensor EncodeCore(float[] pixelValues, float[] secondFrame, int resizedH, int resizedW, List<Tensor> deepStack = null)
+        // Patches the merged graph stacks per call when it encodes several video pairs (TS_QWEN_VISION_BATCH_PATCHES; 0 or
+        // anything below two pairs encodes one pair per graph). Stacking pays where pairs are small: 32 pairs of 448 patches
+        // took 1,061 ms one per graph and 902-953 ms at 4,096-24,576 patches per graph on CUDA, while pairs of 2,880 patches
+        // already fill the GPU (178 ms a pair either way). The default keeps the activations near half a gigabyte.
+        private static readonly int s_videoBatchPatches =
+            int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN_VISION_BATCH_PATCHES"), out int batchPatches) && batchPatches >= 0
+                ? batchPatches : 8192;
+
+        /// <summary>
+        /// Encode the temporal patches of one clip: pair <c>i</c> is (<paramref name="firstFrames"/>[i],
+        /// <paramref name="secondFrames"/>[i]), every frame channel-first [C, H, W] at the same resized size. Returns one
+        /// tensor per pair, each what <see cref="Encode(float[], float[], int, int)"/> returns for that pair. On the GGML
+        /// backends the merged graph stacks several pairs per call (the linears and norms see every row at once, attention
+        /// stays within a pair), which a clip of dozens of pairs is otherwise dominated by; elsewhere, or when the backend
+        /// declines, the pairs are encoded one at a time.
+        /// </summary>
+        public Tensor[] EncodeVideoPairs(IReadOnlyList<float[]> firstFrames, IReadOnlyList<float[]> secondFrames, int resizedH, int resizedW)
+        {
+            ArgumentNullException.ThrowIfNull(firstFrames);
+            ArgumentNullException.ThrowIfNull(secondFrames);
+            if (firstFrames.Count != secondFrames.Count)
+                throw new ArgumentException("Every temporal patch needs a first and a second frame.");
+            int count = firstFrames.Count;
+            var results = new Tensor[count];
+            try
+            {
+                int patches = checked((resizedH / _patchSize) * (resizedW / _patchSize));
+                int perCall = patches > 0 ? s_videoBatchPatches / patches : 0;
+                for (int i = 0; i < count;)
+                {
+                    int take = Math.Min(perCall, count - i);
+                    if (take > 1 && TemporalPatchSize == 2 && _useNativeAttention && !s_traceEnabled && !s_ropeTables
+                        && !_batchedEncoderFailed && TryEncodePairBatch(firstFrames, secondFrames, i, take, resizedH, resizedW, results))
+                    {
+                        i += take;
+                        continue;
+                    }
+                    results[i] = Encode(firstFrames[i], secondFrames[i], resizedH, resizedW);
+                    i++;
+                }
+                return results;
+            }
+            catch
+            {
+                foreach (Tensor t in results) t?.Dispose();
+                throw;
+            }
+        }
+
+        private bool TryEncodePairBatch(IReadOnlyList<float[]> firstFrames, IReadOnlyList<float[]> secondFrames,
+            int start, int count, int resizedH, int resizedW, Tensor[] results)
+        {
+            int factor = checked(_patchSize * _spatialMergeSize);
+            if (resizedH <= 0 || resizedW <= 0 || resizedH % factor != 0 || resizedW % factor != 0)
+                throw new ArgumentException($"Vision dimensions must be positive multiples of {factor}.");
+            long expectedPixels = checked(3L * resizedH * resizedW);
+            for (int k = start; k < start + count; k++)
+                if (firstFrames[k]?.LongLength != expectedPixels || secondFrames[k]?.LongLength != expectedPixels)
+                    throw new ArgumentException("Each frame must contain exactly 3 * height * width channel-first values.");
+
+            long encodeStart = Stopwatch.GetTimestamp();
+            int gridH = resizedH / _patchSize, gridW = resizedW / _patchSize;
+            int numPatches = gridH * gridW;
+            int headDim = _hiddenSize / _numHeads;
+            int halfDim = headDim / 2;
+            int unit = _spatialMergeSize * _spatialMergeSize;
+            RopeCache rope = GetOrCreateRopeCache(gridH, gridW, numPatches, halfDim);
+            bool withTaps = ConcatenateDeepStack && DeepStackCount > 0;
+
+            var stacked = new Tensor(_allocator, DType.Float32, (long)count * numPatches, _hiddenSize);
+            Tensor projected = null;
+            try
+            {
+                for (int k = 0; k < count; k++)
+                {
+                    using Tensor embedded = PatchEmbed(firstFrames[start + k], secondFrames[start + k], resizedH, resizedW, gridH, gridW);
+                    AddPositionEmbedding(embedded, gridH, gridW);
+                    using Tensor rows = stacked.Narrow(0, (long)k * numPatches, numPatches);
+                    Ops.Copy(rows, embedded);
+                }
+                long blocksStart = Stopwatch.GetTimestamp();
+                projected = TryWholeEncoderMerged(stacked, numPatches, headDim, halfDim, rope, withTaps, count);
+                if (projected == null)
+                    return false;
+                long tokens = numPatches / unit;
+                for (int k = 0; k < count; k++)
+                {
+                    using Tensor part = projected.Narrow(0, k * tokens, tokens);
+                    results[start + k] = Ops.NewContiguous(part);
+                }
+                double tickMs = 1000.0 / Stopwatch.Frequency;
+                Console.WriteLine($"  Vision encode: {(Stopwatch.GetTimestamp() - encodeStart) * tickMs:F0} ms total for {count} video pairs " +
+                    $"(patchEmbed {(blocksStart - encodeStart) * tickMs:F0} ms, blocks+merger " +
+                    $"{(Stopwatch.GetTimestamp() - blocksStart) * tickMs:F0} ms), {numPatches} patches -> {tokens} tokens each");
+                return true;
+            }
+            finally
+            {
+                stacked.Dispose();
+                projected?.Dispose();
+            }
+        }
+
+        /// <param name="tapsInGraph">With <paramref name="deepStack"/>: try the merged graph that also runs the DeepStack mergers
+        /// first; when it runs, the result is already [tokens, out * (1 + taps)] and <paramref name="deepStack"/> stays empty.</param>
+        private unsafe Tensor EncodeCore(float[] pixelValues, float[] secondFrame, int resizedH, int resizedW, List<Tensor> deepStack = null,
+            bool tapsInGraph = false)
         {
             ArgumentNullException.ThrowIfNull(pixelValues);
             int factor = checked(_patchSize * _spatialMergeSize);
@@ -240,10 +433,10 @@ namespace TensorSharp.Models
             // round-tripping dispatches per block. Falls back to the per-block
             // loop on any failure. CPU-allocator path keeps the per-block loop.
             bool wholeEncoderDone = false;
-            if (deepStack == null && _useNativeAttention && !s_traceEnabled)
+            if ((deepStack == null || tapsInGraph) && _useNativeAttention && !s_traceEnabled)
             {
                 Tensor mergedProjection = TryWholeEncoderMerged(blockOrdered, numPatches, headDim, halfDim,
-                    ropeCache.CosTable, ropeCache.SinTable);
+                    ropeCache, withTaps: deepStack != null);
                 if (mergedProjection != null)
                 {
                     blockOrdered.Dispose();
@@ -263,15 +456,19 @@ namespace TensorSharp.Models
             }
             if (!wholeEncoderDone)
             {
+                // Deepstack needs the residual at three tap boundaries, not a host
+                // round trip for every transformer block: the Qwen-Image tower on
+                // CUDA, and any tower whose taps are wanted on a GGML backend (the
+                // Qwen3-VL chat models), fuse each range through its tap and project
+                // before starting the next. The blocks keep their own GELU
+                // (TryWholeEncoderFused's geluErf: erf only on the Qwen-Image tower).
+                bool fuseRanges = UseFusedVision21 || (deepStack != null && _useNativeAttention);
                 for (int i = 0; i < _blockCount; i++)
                 {
-                    if (!s_traceEnabled)
+                    if (!s_traceEnabled && !fuseRanges)
                         Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
-                    // Deepstack needs the residual at three tap boundaries, not
-                    // a host round trip for every transformer block. Fuse each
-                    // range through its tap and project before starting the next.
                     bool rangeDone = false;
-                    if (UseFusedVision21 && !s_traceEnabled)
+                    if (fuseRanges && !s_traceEnabled)
                     {
                         int end = i;
                         while (end + 1 < _blockCount &&
@@ -755,10 +952,17 @@ namespace TensorSharp.Models
         /// The separate merger ran post-LN, a contiguous copy and two linears as host-
         /// dispatched ops (~55 ms of a ~245 ms 4032-patch encode on CUDA).
         /// </summary>
+        /// <param name="withTaps">Also run the DeepStack mergers in the same graph and return [merged, out * (1 + taps)] rows
+        /// (<see cref="ConcatenateDeepStack"/>); null when the native library cannot, so the caller fuses block ranges.</param>
+        /// <param name="images">Stacked same-sized images in <paramref name="hidden"/>, <paramref name="numPatches"/> rows
+        /// each (attention stays within an image); above 1, null when the backend cannot batch them, so the caller encodes
+        /// one at a time.</param>
         private Tensor TryWholeEncoderMerged(Tensor hidden, int numPatches, int headDim, int halfDim,
-            float[] cosTable, float[] sinTable)
+            RopeCache rope, bool withTaps = false, int images = 1)
         {
-            if (s_mergedEncoderDisabled || _mergedEncoderFailed || !TryCollectBlockWeights(0, _blockCount, out var w)
+            if (s_mergedEncoderDisabled || (withTaps ? _mergedTapsFailed : _mergedEncoderFailed)
+                || (images > 1 && (_batchedEncoderFailed || s_ropeTables))
+                || !TryCollectBlockWeights(0, _blockCount, out var w)
                 || !_weights.TryGetValue("v.post_ln.weight", out var postW) || !_weights.TryGetValue("v.post_ln.bias", out var postB)
                 || !_weights.TryGetValue("mm.0.weight", out var fc1W) || !_weights.TryGetValue("mm.0.bias", out var fc1B)
                 || !_weights.TryGetValue("mm.2.weight", out var fc2W) || !_weights.TryGetValue("mm.2.bias", out var fc2B))
@@ -766,6 +970,27 @@ namespace TensorSharp.Models
             int unit = _spatialMergeSize * _spatialMergeSize;
             if (numPatches % unit != 0)
                 return null;
+            GgmlBasicOps.VisionDeepStackTaps taps = null;
+            if (withTaps)
+            {
+                int n = _deepStackBlocks.Length;
+                var lnW = new Tensor[n]; var lnB = new Tensor[n]; var tapFc1W = new Tensor[n]; var tapFc1B = new Tensor[n];
+                var tapFc2W = new Tensor[n]; var tapFc2B = new Tensor[n];
+                for (int i = 0; i < n; i++)
+                {
+                    string p = $"v.deepstack.{_deepStackBlocks[i]}";
+                    if (!_weights.TryGetValue(p + ".norm.weight", out lnW[i]) || !_weights.TryGetValue(p + ".norm.bias", out lnB[i])
+                        || !_weights.TryGetValue(p + ".fc1.weight", out tapFc1W[i]) || !_weights.TryGetValue(p + ".fc1.bias", out tapFc1B[i])
+                        || !_weights.TryGetValue(p + ".fc2.weight", out tapFc2W[i]) || !_weights.TryGetValue(p + ".fc2.bias", out tapFc2B[i]))
+                        return null;
+                }
+                if (UseF16Linears)
+                {
+                    tapFc1W = Array.ConvertAll(tapFc1W, F16Linear);
+                    tapFc2W = Array.ConvertAll(tapFc2W, F16Linear);
+                }
+                taps = new GgmlBasicOps.VisionDeepStackTaps(_deepStackBlocks, lnW, lnB, tapFc1W, tapFc1B, tapFc2W, tapFc2B);
+            }
             if (UseF16Linears)
             {
                 w = w with
@@ -776,17 +1001,34 @@ namespace TensorSharp.Models
                 fc1W = F16Linear(fc1W);
                 fc2W = F16Linear(fc2W);
             }
-            var projected = new Tensor(_allocator, DType.Float32, numPatches / unit, (int)fc2W.Sizes[0]);
+            int width = (int)fc2W.Sizes[0] * (1 + (taps?.Blocks.Length ?? 0));
+            var projected = new Tensor(_allocator, DType.Float32, (long)images * numPatches / unit, width);
             bool ok = false;
             try
             {
                 ok = GgmlBasicOps.Qwen35VisionEncoderMerged(hidden, projected, _eps, 1f / MathF.Sqrt(headDim),
-                    numPatches, _numHeads, headDim, halfDim, cosTable, sinTable,
+                    numPatches, _numHeads, headDim, halfDim, rope.CosTable, rope.SinTable,
                     w.Ln1W, w.Ln1B, w.QkvW, w.QkvB, w.OutW, w.OutB, w.Ln2W, w.Ln2B, w.UpW, w.UpB, w.DownW, w.DownB,
                     UseFusedVision21, postW, postB, fc1W, fc1B, fc2W, fc2B, unit,
                     // ApplyVisionMergerGelu: erf when configured, or on the Qwen-Image tower.
-                    _mergerGeluErf || _qwenImage21);
-                if (!ok && !_mergedEncoderFailed)
+                    _mergerGeluErf || _qwenImage21, taps,
+                    images, s_ropeTables ? null : rope.Positions, _ropeTheta);
+                if (!ok && images > 1)
+                {
+                    // A batch the backend declines (its attention cannot keep the images apart, or the graph does not
+                    // fit) leaves the single-image path as it was.
+                    if (!_batchedEncoderFailed)
+                        Console.Error.WriteLine("[qwen35-vision] batched encoder graph declined (" +
+                            GgmlBasicOps.LastNativeError("no diagnostic") + "); encoding video pairs one at a time. Reported once.");
+                    _batchedEncoderFailed = true;
+                }
+                else if (!ok && withTaps && !_mergedTapsFailed)
+                {
+                    _mergedTapsFailed = true;
+                    Console.Error.WriteLine("[qwen35-vision] merged encoder graph with DeepStack declined (" +
+                        GgmlBasicOps.LastNativeError("no diagnostic") + "); fusing block ranges between the taps. Reported once.");
+                }
+                else if (!ok && !withTaps && !_mergedEncoderFailed)
                 {
                     _mergedEncoderFailed = true;
                     Console.Error.WriteLine("[qwen35-vision] merged encoder graph declined (" +
@@ -804,6 +1046,13 @@ namespace TensorSharp.Models
 
         private static readonly bool s_mergedEncoderDisabled =
             Environment.GetEnvironmentVariable("TS_QWEN_VISION_MERGED") == "0";
+
+        // The merged graph rotates Q and K with ggml's vision rope (one op each, straight from the QKV projection) and
+        // can stack video pairs; TS_QWEN_VISION_ROPE=tables keeps the cos/sin-table rotation and one pair per graph.
+        private static readonly bool s_ropeTables =
+            string.Equals(Environment.GetEnvironmentVariable("TS_QWEN_VISION_ROPE"), "tables", StringComparison.OrdinalIgnoreCase);
+
+        private bool _batchedEncoderFailed;
 
         // Opt-in F16 copies of the linear weights for the merged CUDA graph (tensor-core
         // GEMMs with F32 accumulation, half the resident weight memory; attention, norms
@@ -837,6 +1086,7 @@ namespace TensorSharp.Models
             return half;
         }
         private bool _mergedEncoderFailed;
+        private bool _mergedTapsFailed;
 
         private readonly record struct BlockWeights(
             Tensor[] Ln1W, Tensor[] Ln1B, Tensor[] QkvW, Tensor[] QkvB, Tensor[] OutW, Tensor[] OutB,
@@ -1627,7 +1877,14 @@ namespace TensorSharp.Models
                 }
             }
 
-            cache = new RopeCache { CosTable = cosTable, SinTable = sinTable };
+            int[] positions = new int[4 * numPatches];
+            for (int p = 0; p < numPatches; p++)
+            {
+                positions[p] = positions[2 * numPatches + p] = gridY[p];
+                positions[numPatches + p] = positions[3 * numPatches + p] = gridX[p];
+            }
+
+            cache = new RopeCache { CosTable = cosTable, SinTable = sinTable, Positions = positions };
             _ropeCache[key] = cache;
             return cache;
         }

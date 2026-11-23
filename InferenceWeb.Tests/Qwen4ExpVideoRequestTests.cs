@@ -11,7 +11,7 @@ using TensorSharp.Server.RequestParsers;
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Ordered video-frame input for Qwen 3.8 Flash Next (<c>qwen4exp</c>): the OpenAI
+/// Ordered video-frame input for the Qwen-VL families (Qwen 3.8 Flash Next <c>qwen4exp</c>, Qwen3-VL <c>qwen3vl</c>): the OpenAI
 /// <c>video_url</c> part is sampled into timed frames, the prompt renders them as the
 /// Qwen3-VL video layout (one <c>&lt;|video_pad|&gt;</c> block per temporal pair, each
 /// labelled with its time), and the injector's prompt layout
@@ -41,8 +41,10 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         if (Directory.Exists(_directory)) Directory.Delete(_directory, true);
     }
 
-    [Fact]
-    public void OpenAiVideo_IsAcceptedForQwen4ExpAndRendersTimedPairsOncePerClip()
+    [Theory]
+    [InlineData("qwen4exp")]
+    [InlineData("qwen3vlmoe")]
+    public void OpenAiVideo_IsAcceptedForQwenVLFamiliesAndRendersTimedPairsOncePerClip(string architecture)
     {
         var uploads = new UploadStoragePolicy(_directory);
         using var json = JsonDocument.Parse("""
@@ -52,7 +54,7 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
               {"type":"image_url","image_url":{"url":"data:image/png;base64,Ag=="}},
               {"type":"text","text":"Describe the numbered frames in time order."}]}]
             """);
-        var message = Assert.Single(ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: "qwen4exp"));
+        var message = Assert.Single(ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: architecture));
         Assert.True(message.IsVideo);
         Assert.Equal(new[] { 0, 2, 4 }, _decoder.Requested);
         Assert.Equal(5, message.ImagePaths!.Count);
@@ -69,7 +71,7 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
             + "<0.0 seconds>" + Start + VideoPad + End
             + "<1.0 seconds>" + Start + VideoPad + End
             + "<2.0 seconds>" + Start + VideoPad + End;
-        string content = ChatTemplate.InjectMultimodalTokens(new() { message }, "qwen4exp")[0].Content!;
+        string content = ChatTemplate.InjectMultimodalTokens(new() { message }, architecture)[0].Content!;
         Assert.StartsWith(Image + clip + Image + "Describe the numbered frames", content);
         Assert.Equal(3, Count(content, VideoPad));
         Assert.Equal(2, Count(content, QwenVideoFrames.ImagePad));
@@ -140,6 +142,7 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         Assert.Throws<JsonException>(() => ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: "qwen35"));
         Assert.Empty(_decoder.Requested);
         Assert.True(ChatProtocolRegistry.For("qwen4exp")!.CapsVideoFrames);
+        Assert.True(ChatProtocolRegistry.For("qwen3vlmoe")!.CapsVideoFrames);
         Assert.False(ChatProtocolRegistry.For("qwen35")!.CapsVideoFrames);
     }
 

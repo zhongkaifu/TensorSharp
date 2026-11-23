@@ -165,7 +165,7 @@ namespace TensorSharp.Runtime
             Register(new ChatProtocol
             {
                 Id = "qwen35",
-                Architectures = new[] { "qwen35", "qwen35moe", "qwen3next", "qwen3vl", "qwen3vlmoe" },
+                Architectures = new[] { "qwen35", "qwen35moe", "qwen3next" },
                 Render = r => ChatTemplate.RenderQwen35(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools),
                 // The GGUF template is used as shipped in BOTH thinking modes. It used
                 // to be replaced by the purpose-built renderer with thinking off,
@@ -235,6 +235,29 @@ namespace TensorSharp.Runtime
                 // full image's worth of tokens, so long clips are capped like Gemma 4
                 // and DeepSeek V4.1. The frames render as the Qwen3-VL video layout
                 // (see QwenVideoFrames) and the injector merges them in temporal pairs.
+                CapsVideoFrames = true,
+            });
+
+            // Qwen3-VL: ChatML, Hermes <tool_call> JSON and the Qwen-VL vision placeholders. Its templates
+            // differ from Qwen 3.5's in the reasoning block: an Instruct checkpoint's has none at all (the
+            // shipped template renders the generation prompt as a bare `<|im_start|>assistant\n`), and a
+            // Thinking checkpoint's opens `<think>\n` there and renders past turns without their
+            // reasoning. Qwen 3.5's protocol closes an empty `<think>` block on every thinking-off prompt,
+            // which an Instruct checkpoint never saw in training, so the family keeps its own entry.
+            Register(new ChatProtocol
+            {
+                Id = "qwen3vl",
+                Architectures = new[] { "qwen3vl", "qwen3vlmoe" },
+                Render = r => ChatTemplate.RenderChatMl(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
+                AppendMediaPlaceholders = AppendQwenVisionPads,
+                CreateOutputParser = () => new Qwen35OutputParser(),
+                AssistantGenerationSuffixForTemplate = (_, template) =>
+                    template != null && template.Contains("<think>", StringComparison.Ordinal) ? "<think>\n" : null,
+                // `<|im_start|>assistant\n` (and a Thinking checkpoint's `<think>\n`) as the template ends it.
+                KeepsGenerationPromptWhitespace = true,
+                // role=tool renders independently of the assistant tool_calls field.
+                ToolCallRawSplicing = ToolCallRawSplicing.Always,
+                // A `video_url` part is sampled into timed frames and rendered as the Qwen3-VL video layout, as for qwen4exp.
                 CapsVideoFrames = true,
             });
 
