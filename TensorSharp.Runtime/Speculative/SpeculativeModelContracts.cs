@@ -601,6 +601,10 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Width of the proposal block <see cref="TryDraftBatch"/> fills per sequence.</summary>
         int BatchDraftBlockWidth => 0;
 
+        /// <summary>Whether <see cref="TryDraftBatch"/> takes blocks narrower than <see cref="BatchDraftBlockWidth"/> (the
+        /// drafts the step's windows can verify) and drafts only that many.</summary>
+        bool BatchDraftTakesNarrowBlocks => false;
+
         /// <summary>Whether <see cref="TryDraftChainBatch"/> runs the per-token draft head chains
         /// (<see cref="IDraftHead.DraftChain"/>) of several sequences in one pass.</summary>
         bool SupportsBatchedDraftChain => false;

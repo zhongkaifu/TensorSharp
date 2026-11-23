@@ -73,8 +73,6 @@ namespace TensorSharp.Models
             ParseBaseConfig();
             if (tpDegree > 1 || layerSplitDegree > 1)
                 throw new NotSupportedException($"{arch}: tensor parallelism and layer split are not implemented yet (one device).");
-            if (!string.IsNullOrEmpty(draftModelPath))
-                throw new NotSupportedException($"{arch}: speculative decoding (DSpark) is not implemented yet.");
 
             _physicalLayers = Config.NumLayers;
             int layers = _physicalLayers;
@@ -151,6 +149,9 @@ namespace TensorSharp.Models
             try
             {
                 ValidateLayerWeights();
+                // The checkpoint's DSpark drafter (an inkling2_dspark GGUF), a block drafter of the family's own.
+                if (!string.IsNullOrEmpty(draftModelPath))
+                    FamilyDrafter = new DSpark(this, draftModelPath);
             }
             catch
             {
@@ -164,6 +165,73 @@ namespace TensorSharp.Models
         {
             BuildRelativeTables();
             BuildTauTable();
+            PackProjections();
+        }
+
+        /// <summary>Row offsets of a stored layer's packed attention projections (<see cref="PackProjections"/>).</summary>
+        private sealed class ProjectionRows
+        {
+            public int Q, Gate, Rel, Sink, K, KConv = -1, V, VConv = -1, Total;
+            /// <summary>Rows read with xq ([Q, K)), with xk ([K, V)) and with xv ([V, Total)).</summary>
+            public int KRows => V - K;
+            public int VRows => Total - V;
+        }
+
+        /// <summary>Stored layers whose projections are packed (null: none, or the layer kept its separate weights).</summary>
+        private ProjectionRows[] _projections;
+
+        private static readonly bool PackedProjectionsDisabled = Environment.GetEnvironmentVariable("TS_INKLING_FUSED_PROJECTIONS") == "0";
+
+        /// <summary>
+        /// Each stored layer's attention projections as one quantized weight, its output rows
+        /// [q | gate | rel | sink | k (| k_conv) | v (| v_conv)]: a decode step reads them in one product (or one a distinct
+        /// input) instead of six to eight, each of which paid its own activation quantize and launch tail. Only where every
+        /// source is quantized with one type, input width and no per-tensor scale; the sources are released.
+        /// </summary>
+        private void PackProjections()
+        {
+            if (PackedProjectionsDisabled) return;
+            int packed = 0;
+            for (int l = 0; l < _physicalLayers; l++)
+            {
+                string Name(string suffix) => $"blk.{l}.{suffix}";
+                var names = new List<string> { Name("attn_q.weight"), Name("attn_gate.weight"), Name("attn_rel.weight"), Name("attn_sink_proj.weight"), Name("attn_k.weight") };
+                bool conv = _quantWeights.ContainsKey(Name("attn_k_conv_proj.weight")) && _quantWeights.ContainsKey(Name("attn_v_conv_proj.weight"));
+                if (conv) names.Add(Name("attn_k_conv_proj.weight"));
+                names.Add(Name("attn_v.weight"));
+                if (conv) names.Add(Name("attn_v_conv_proj.weight"));
+                var weights = new QuantizedWeight[names.Count];
+                bool ok = true;
+                for (int i = 0; i < names.Count && ok; i++)
+                    ok = _quantWeights.TryGetValue(names[i], out weights[i]) && weights[i].GgmlType == weights[0].GgmlType
+                         && weights[i].Ne0 == weights[0].Ne0 && weights[i].Scale == 1.0f;
+                if (!ok || !TryCreateFusedQuantizedWeight(out QuantizedWeight fused, weights))
+                    continue;
+                var rows = new ProjectionRows();
+                int at = 0;
+                int Take(int i) { int start = at; at += (int)weights[i].Ne1; return start; }
+                rows.Q = Take(0);
+                rows.Gate = Take(1);
+                rows.Rel = Take(2);
+                rows.Sink = Take(3);
+                rows.K = Take(4);
+                int next = 5;
+                if (conv) rows.KConv = Take(next++);
+                rows.V = Take(next++);
+                if (conv) rows.VConv = Take(next++);
+                rows.Total = at;
+                _quantWeights[Name("attn_proj.weight")] = fused;
+                foreach (string n in names)
+                {
+                    _quantWeights[n].Dispose();
+                    _quantWeights.Remove(n);
+                }
+                _projections ??= new ProjectionRows[_physicalLayers];
+                _projections[l] = rows;
+                packed++;
+            }
+            if (packed > 0)
+                Console.WriteLine($"  Packed attention projections: {packed} layers");
         }
 
         private static string LayerBits(bool[] flags) => new(flags.Select(f => f ? '1' : '0').ToArray());
@@ -203,6 +271,25 @@ namespace TensorSharp.Models
 
         protected override RecurrentState CreateRecurrentState(RankScope scope, int layer)
             => new ShortConvState(scope.Allocator, ExecutorFor(scope.Allocator), _convChannels, _convTaps - 1);
+
+        /// <summary>Rows a prompt step takes a sequence (TS_INKLING_RING_STEP_ROWS, experiment): a sliding ring keeps its window
+        /// plus these rows.</summary>
+        protected override int RingStepRowsForPlacement
+            => int.TryParse(Environment.GetEnvironmentVariable("TS_INKLING_RING_STEP_ROWS"), out int rows) && rows >= 64
+                ? rows : base.RingStepRowsForPlacement;
+
+        /// <summary>Several sequences verify 4 rows each, up to 16 in all: the experts product reads a verify's distinct experts
+        /// once (Inkling 2 Mini, 128 experts, 8 a row), so 16 rows cost far less than twice 8. Four code conversations: 103.7
+        /// tok/s in all at 4 rows each against 97.4 at 2; two: 76.2 at 4 rows each against 67.5 at 8.</summary>
+        protected override int ExpertVerifyRowBudget => 16;
+
+        protected override int ExpertVerifySequenceRows => 4;
+
+        /// <summary>Verify windows pad their attention windows to 2,048 rows where the fused attention runs: it finds a row's keys
+        /// from the positions and its key splits past the written ones exit at once, so the wider bucket costs nothing, while
+        /// a 256-row bucket traced every verify width again every 256 positions (25-95 ms each; a 384-token reply at 24K
+        /// traced about 16 of them).</summary>
+        protected override int DecodeWindowRows(int executorRows) => FusedAttention ? Math.Max(executorRows, 2048) : executorRows;
 
         /// <summary>The full layers read separate Q, K and V inputs, and so does every layer of a later pass.</summary>
         protected override bool FusesQkv(int layer) => false;
@@ -253,6 +340,13 @@ namespace TensorSharp.Models
                     foreach (string c in Controllers)
                         foreach (string part in new[] { "down", "gain", "forget" }) required.Add($"loop_{c}_ctrl_{part}.weight");
                 }
+                if (_projections?[l] != null)
+                {
+                    // Packed into attn_proj.weight at load (PackProjections).
+                    required.RemoveAll(n => n is "attn_q.weight" or "attn_k.weight" or "attn_v.weight" or "attn_gate.weight"
+                        or "attn_sink_proj.weight" or "attn_rel.weight" or "attn_k_conv_proj.weight" or "attn_v_conv_proj.weight");
+                    required.Add("attn_proj.weight");
+                }
                 foreach (string suffix in required)
                 {
                     string name = $"blk.{l}.{suffix}";
@@ -301,6 +395,8 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            FamilyDrafter?.Dispose();
+            FamilyDrafter = null;
             if (_relTables != null)
                 foreach (Tensor t in _relTables) t?.Dispose();
             _relTables = null;

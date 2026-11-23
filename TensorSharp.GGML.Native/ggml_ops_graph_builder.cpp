@@ -342,6 +342,10 @@ namespace
         FUSED_INKLING_ROUTE = 35,     // GraphFusion.InklingRoute
         FUSED_INKLING_SITU = 36,      // GraphFusion.InklingSitu
         FUSED_INKLING_EXPERT_SUM = 37,// GraphFusion.InklingExpertSum
+        FUSED_INKLING_EXPERTS = 38,   // GraphFusion.InklingExperts
+        FUSED_INKLING_CONV_BATCH = 39,// GraphFusion.InklingConvBatch
+        FUSED_INKLING_DRAFT_PICK = 40,// GraphFusion.InklingDraftPick
+        FUSED_INKLING_REL_TABLE = 41, // GraphFusion.InklingRelTable
         SELECTED_ATTENTION = 100,     // a prompt chunk's flash attention under a selection's mask (no region: the op)
     };
 
@@ -505,6 +509,7 @@ namespace
         // Inkling 2's fused nodes (try_serve_inkling) and their descriptors (the nodes' userdata, so their addresses must
         // not move): a graph holding any runs on the TensorSharp fused-op backend that wraps ggml-cuda.
         std::deque<tsg_dsv4_fused_desc> inkling_descs;
+        std::deque<tsg_inkling_conv_batch> inkling_conv_batches;
         int inkling_nodes = 0;
         void* inkling_capture = nullptr;   // the whole run as one CUDA graph (tsg_inkling_compute)
 #endif
@@ -1379,12 +1384,13 @@ namespace
         static const unsigned mask = []() -> unsigned
         {
             const char* e = std::getenv("TS_INKLING_FUSED");
-            if (e == nullptr || *e == 0 || std::strcmp(e, "1") == 0 || std::strcmp(e, "all") == 0) return 0xFFu;
+            if (e == nullptr || *e == 0 || std::strcmp(e, "1") == 0 || std::strcmp(e, "all") == 0) return 0x7FFu;
             if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return 0u;
-            static const char* names[] = { "clip", "conv", "mix", "control", "route", "situ", "sum" };
+            static const char* names[] = { "clip", "conv", "mix", "control", "route", "situ", "sum", "experts", "convbatch", "pick",
+                                           "reltable" };
             const std::string list(e);
             unsigned m = 0;
-            for (int i = 0; i < 7; i++)
+            for (int i = 0; i < 11; i++)
                 if (list.find(names[i]) != std::string::npos) m |= 1u << i;
             return m;
         }();
@@ -1417,7 +1423,7 @@ namespace
     bool try_serve_inkling_stage(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp,
                            std::vector<ggml_tensor*>& results)
     {
-        if (kind < FUSED_INKLING_CLIP || kind > FUSED_INKLING_EXPERT_SUM) return false;
+        if (kind < FUSED_INKLING_CLIP || kind > FUSED_INKLING_REL_TABLE) return false;
         if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) return false;
         if ((inkling_fused_mask() & (1u << (kind - FUSED_INKLING_CLIP))) == 0) return false;
         if (inkling_backend() == nullptr) return false;
@@ -1434,7 +1440,10 @@ namespace
             if (ns < 1 || nip < 1 || nfp < 1) return false;
             ggml_tensor* x = in[0];
             ggml_tensor* w = ip[0] != 0 ? (ns > 1 ? in[1] : nullptr) : nullptr;
-            if (!f32_contiguous(x) || x->ne[3] != 1 || x->ne[0] > 4096) return false;
+            // x's heads contiguous within a row, its rows at any stride (a packed product's slice).
+            if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->nb[1] != x->ne[0] * sizeof(float) || x->nb[2] % sizeof(float) != 0
+                || x->ne[3] != 1 || x->ne[0] > 4096)
+                return false;
             if (ip[0] != 0 && (w == nullptr || !f32_contiguous(w) || w->ne[0] != x->ne[0] || ggml_nelements(w) != x->ne[0] * x->ne[1]))
                 return false;
             results = { inkling_node(g, TSG_INKLING_CLIP, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], 1, { x, w }, 0, 0, 0, 0, fp[0]) };
@@ -1444,15 +1453,23 @@ namespace
         {
             if (ns < 3 || nip < 1 || nfp < 1) return false;
             ggml_tensor *x = in[0], *win = in[1], *kern = in[2];
+            // ip[1] = 1: a verify window's convolution, whose last input is the history [taps - 1 + rows, channels] it writes.
+            const bool verify = nip > 1 && ip[1] == 1;
             ggml_tensor* dyn = ip[0] > 0 ? (ns > 3 ? in[3] : nullptr) : nullptr;
+            ggml_tensor* hist = verify ? in[ns - 1] : nullptr;
+            if (verify && ns != (ip[0] > 0 ? 5 : 4)) return false;
             const std::int64_t channels = x->ne[0], count = x->ne[1], taps = kern->ne[0];
-            if (!f32_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 || !f32_contiguous(kern) || kern->ne[1] != channels || taps < 2 || taps > 8)
+            if (verify && (hist->type != GGML_TYPE_F32 || !ggml_is_contiguous(hist) || hist->ne[0] != taps - 1 + count || hist->ne[1] != channels))
+                return false;
+            // x and the dynamic taps: their rows at any stride (a packed product's slices).
+            auto rows_strided = [](const ggml_tensor* t) { return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0; };
+            if (!rows_strided(x) || x->ne[2] != 1 || x->ne[3] != 1 || !f32_contiguous(kern) || kern->ne[1] != channels || taps < 2 || taps > 8)
                 return false;
             if (win->type != GGML_TYPE_F32 || !ggml_is_contiguous(win) || win->ne[0] != taps - 1 || win->ne[1] != channels) return false;
-            if (ip[0] > 0 && (dyn == nullptr || !f32_contiguous(dyn) || dyn->ne[0] != taps * ip[0] || dyn->ne[1] != count || channels % ip[0] != 0))
+            if (ip[0] > 0 && (dyn == nullptr || !rows_strided(dyn) || dyn->ne[0] != taps * ip[0] || dyn->ne[1] != count || channels % ip[0] != 0))
                 return false;
-            results = { inkling_node(g, TSG_INKLING_CONV, GGML_TYPE_F32, channels, count, 1, 1, { x, win, kern, dyn },
-                                     static_cast<int>(ip[0]), 0, 0, 0, fp[0]) };
+            results = { inkling_node(g, TSG_INKLING_CONV, GGML_TYPE_F32, channels, count, 1, 1, { x, win, kern, dyn, hist },
+                                     static_cast<int>(ip[0]), verify ? 1 : 0, 0, 0, fp[0]) };
             return true;
         }
         case FUSED_INKLING_MIX:
@@ -1481,8 +1498,10 @@ namespace
             if (x->ne[2] != 1 || m->ne[0] != h || m->ne[1] != rows || down->ne[0] != 2 * h || gain->ne[0] != rank || gain->ne[1] != h
                 || forget->ne[0] != rank || forget->ne[1] != h)
                 return false;
-            // The controller's rank values a row (g) live past the result, in the node's own tail.
-            const std::int64_t extra = (rank * rows + h - 1) / h;
+            // The controller's rank values a row (g) live past the result, in the node's own tail; a prompt chunk's (16 rows
+            // and more) the down product's partials, [ceil(h / 256)][rows][2 rank + 2].
+            const std::int64_t words = rows >= 16 ? (h + 255) / 256 * rows * (2 * rank + 2) + rank * rows : rank * rows;
+            const std::int64_t extra = (words + h - 1) / h;
             ggml_tensor* node = inkling_node(g, TSG_INKLING_CONTROL, GGML_TYPE_F32, h, rows + extra, 1, 1, { x, m, down, gain, forget },
                                              0, 0, 0, 0, fp[0]);
             results = { ggml_view_2d(g->ctx, node, h, rows, node->nb[1], 0) };
@@ -1504,9 +1523,18 @@ namespace
         }
         case FUSED_INKLING_SITU:
         {
-            if (ns != 1 || nfp < 2) return false;
+            if ((ns != 1 && ns != 2) || nfp < 2) return false;
             ggml_tensor* gu = in[0];
             if (!f32_contiguous(gu) || gu->ne[0] % 2 != 0) return false;
+            if (ns == 2)
+            {
+                // One outer scale a route vector (NVFP4 experts).
+                ggml_tensor* scale = in[1];
+                if (!f32_contiguous(scale) || ggml_nelements(scale) != gu->ne[1] * gu->ne[2] * gu->ne[3]) return false;
+                results = { inkling_node(g, TSG_INKLING_SITU, GGML_TYPE_F32, gu->ne[0] / 2, gu->ne[1], gu->ne[2], gu->ne[3], { gu, scale },
+                                         0, 0, 0, 0, fp[0], fp[1]) };
+                return true;
+            }
             results = { inkling_node(g, TSG_INKLING_SITU, GGML_TYPE_F32, gu->ne[0] / 2, gu->ne[1], gu->ne[2], gu->ne[3], { gu }, 0, 0, 0, 0,
                                      fp[0], fp[1]) };
             return true;
@@ -1519,6 +1547,100 @@ namespace
                 || weights->ne[2] != down->ne[2])
                 return false;
             results = { inkling_node(g, TSG_INKLING_EXPERT_SUM, GGML_TYPE_F32, down->ne[0], down->ne[2], 1, 1, { down, weights }) };
+            return true;
+        }
+        case FUSED_INKLING_REL_TABLE:
+        {
+            if (ns != 2) return false;
+            ggml_tensor *w = in[0], *r = in[1];
+            const std::int64_t rel = w->ne[0], width = w->ne[1];
+            // The kernel's relative width is compile-time (Inkling 2's 16).
+            if (!f32_contiguous(w) || w->ne[2] != 1 || rel != 16 || r->type != GGML_TYPE_F32
+                || r->nb[0] != sizeof(float)
+                || r->ne[0] != rel || r->ne[3] != 1)
+                return false;
+            results = { inkling_node(g, TSG_INKLING_REL_TABLE, GGML_TYPE_F16, width, r->ne[1], r->ne[2], 1, { w, r }) };
+            return true;
+        }
+        case FUSED_INKLING_DRAFT_PICK:
+        {
+            if (ns != 3 || nip < 1 || nfp < 1) return false;
+            ggml_tensor *base = in[0], *fold = in[1], *bias = in[2];
+            const std::int64_t padded = base->ne[0], lanes = base->ne[1], vocab = ip[0];
+            if (base->type != GGML_TYPE_F32 || base->nb[0] != sizeof(float) || base->ne[2] != 1 || !f32_contiguous(fold)
+                || fold->ne[0] != padded || fold->ne[1] != lanes || !f32_contiguous(bias) || ggml_nelements(bias) != padded
+                || vocab < 1 || vocab > padded || lanes < 1)
+                return false;
+            ggml_tensor* pick = inkling_node(g, TSG_INKLING_PICK, GGML_TYPE_F32, lanes, 3, 1, 1, { base, fold, bias },
+                                             static_cast<int>(vocab), 0, 0, 0, fp[0]);
+            ggml_tensor* ids = inkling_node(g, TSG_INKLING_PICK_I32, GGML_TYPE_I32, lanes, 1, 1, 1, { pick });
+            results = { ids, ggml_view_3d(g->ctx, pick, 1, 1, lanes, sizeof(float), sizeof(float), lanes * sizeof(float)),
+                        ggml_view_2d(g->ctx, pick, 1, lanes, sizeof(float), 2 * lanes * sizeof(float)) };
+            return true;
+        }
+        case FUSED_INKLING_CONV_BATCH:
+        {
+            if (nip < 5 || nfp < 1) return false;
+            const int heads = static_cast<int>(ip[0]), verify = static_cast<int>(ip[1]), n = static_cast<int>(ip[2]);
+            const int offset = static_cast<int>(ip[3]), hist = static_cast<int>(ip[4]);
+            if (n < 1 || n > TSG_INKLING_CONV_BATCH_MAX || nip != 5 + n) return false;
+            const int fixed = heads > 0 ? 3 : 2, per = verify ? 2 : 1;
+            if (ns != fixed + per * n) return false;
+            ggml_tensor *x = in[0], *kern = in[1], *dyn = heads > 0 ? in[2] : nullptr;
+            const std::int64_t channels = x->ne[0], rows = x->ne[1], taps = kern->ne[0];
+            if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[2] != 1 || !f32_contiguous(kern) || kern->ne[1] != channels
+                || taps - 1 != hist || taps > 8)
+                return false;
+            if (dyn != nullptr && (dyn->type != GGML_TYPE_F32 || dyn->nb[0] != sizeof(float) || dyn->ne[0] != taps * heads || dyn->ne[1] != rows))
+                return false;
+            g->inkling_conv_batches.emplace_back();
+            tsg_inkling_conv_batch& b = g->inkling_conv_batches.back();
+            b.n = n; b.offset = offset; b.hist = hist;
+            std::int64_t at = 0;
+            for (int s2 = 0; s2 < n; s2++)
+            {
+                b.count[s2] = static_cast<int>(ip[5 + s2]);
+                b.first[s2] = static_cast<int>(at);
+                at += b.count[s2];
+                ggml_tensor* w = in[fixed + per * s2];
+                ggml_tensor* h = verify ? in[fixed + per * s2 + 1] : nullptr;
+                if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != hist || w->ne[1] < offset + channels) return false;
+                if (h != nullptr && (h->type != GGML_TYPE_F32 || !ggml_is_contiguous(h)
+                                     || ggml_nelements(h) < (offset + channels) * (hist + b.count[s2])))
+                    return false;
+                b.window[s2] = w;
+                b.history[s2] = h;
+            }
+            if (at != rows) return false;
+            ggml_tensor* node = inkling_node(g, TSG_INKLING_CONV_BATCH, GGML_TYPE_F32, channels, rows, 1, 1, { x, kern, dyn },
+                                             heads, verify, 0, 0, fp[0]);
+            g->inkling_descs.back().object = &b;
+            results = { node };
+            return true;
+        }
+        case FUSED_INKLING_EXPERTS:
+        {
+            if (ns != 3) return false;
+            ggml_tensor *w = in[0], *x = in[1], *ids = in[2];
+            // TS_INKLING_EXPERTS_ROWS: the most rows the kernel takes (default 32, 0: never); TS_INKLING_EXPERTS_MIN: the
+            // fewest (default 2: one row's eight experts are each read once by ggml's kernel too).
+            static const int most = []() { const char* e = std::getenv("TS_INKLING_EXPERTS_ROWS"); return e != nullptr ? std::atoi(e) : 32; }();
+            static const int fewest = []() { const char* e = std::getenv("TS_INKLING_EXPERTS_MIN"); return e != nullptr ? std::atoi(e) : 2; }();
+            if (!tsg_inkling_experts_supported(w->type) || x->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+            const std::int64_t k = w->ne[0], m = w->ne[1], experts = w->ne[2], used = ids->ne[0], rows = ids->ne[1];
+            // A prompt chunk (more than 32 rows) on FP4 tensor cores where it can; else ggml's MMQ.
+            // TS_INKLING_EXPERTS_FP4_MIN: the fewest rows that take it (default 33; tests take it lower).
+            static const int fp4_min = []() { const char* e = std::getenv("TS_INKLING_EXPERTS_FP4_MIN"); return e != nullptr ? std::atoi(e) : 33; }();
+            const bool fp4 = rows >= fp4_min && tsg_inkling_experts_fp4(w->type, k, m);
+            if (rows < fewest || (!fp4 && (rows > most || rows > 32)) || k % 64 != 0 || experts > 1024 || used > 32 || w->ne[3] != 1) return false;
+            if (w->nb[1] != ggml_row_size(w->type, k) || w->nb[2] != w->nb[1] * m) return false;
+            if (x->ne[0] != k || x->ne[2] != rows || x->ne[3] != 1 || (x->ne[1] != 1 && x->ne[1] != used) || x->nb[0] != sizeof(float)) return false;
+            if (ids->nb[0] != sizeof(std::int32_t) || ids->ne[2] != 1) return false;
+            const std::int64_t bytes = fp4 ? tsg_inkling_experts_fp4_workspace_bytes(k, experts, used, rows, x->ne[1] * rows)
+                                           : tsg_inkling_experts_workspace_bytes(k, experts, used, rows, x->ne[1] * rows);
+            const std::int64_t extra = (bytes / static_cast<std::int64_t>(sizeof(float)) + m * used - 1) / (m * used);
+            ggml_tensor* node = inkling_node(g, TSG_INKLING_EXPERTS, GGML_TYPE_F32, m, used, rows + extra, 1, { w, x, ids }, fp4 ? 1 : 0);
+            results = { ggml_view_3d(g->ctx, node, m, used, rows, node->nb[1], node->nb[2], 0) };
             return true;
         }
         default:
@@ -1534,15 +1656,15 @@ namespace
         if (kind != FUSED_INKLING_ATTENTION) return false;
         if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) { why = "not a single-device ggml_cuda graph"; return false; }
         if (inkling_backend() == nullptr) { why = "no fused-op backend"; return false; }
-        if (ns != 5 || nip < 6 || nfp < 1)
+        if (ns != 6 || nip < 6 || nfp < 1)
         {
-            why = "inputs q, k, v, T, positions; ip ring, extent, band, first key, floor, row offset; fp scale";
+            why = "inputs q, k, v, T, positions, sink; ip ring, extent, band, first key, floor, row offset; fp scale";
             return false;
         }
-        ggml_tensor* in[5];
-        for (int i = 0; i < 5; i++)
+        ggml_tensor* in[6];
+        for (int i = 0; i < 6; i++)
             if ((in[i] = node_at(g, s[i])) == nullptr) { why = "a missing input"; return false; }
-        ggml_tensor *q = in[0], *k = in[1], *v = in[2], *table = in[3], *pos = in[4];
+        ggml_tensor *q = in[0], *k = in[1], *v = in[2], *table = in[3], *pos = in[4], *sink = in[5];
         const std::int64_t d = q->ne[0], count = q->ne[1], heads = q->ne[2], keys = k->ne[1], kvh = k->ne[2], dv = v->ne[0];
         if (q->type != GGML_TYPE_F32 || q->nb[0] != sizeof(float) || q->ne[3] != 1) { why = "q is not F32 rows"; return false; }
         if ((k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32) || v->type != k->type || k->nb[0] != ggml_type_size(k->type)
@@ -1557,10 +1679,17 @@ namespace
             why = "a shape the kernels do not take";
             return false;
         }
-        if (table->type != GGML_TYPE_F32 || !ggml_is_contiguous(table) || table->ne[0] != ip[1] + 1 || table->ne[1] != heads
-            || table->ne[2] != count)
+        // An F16 table (GraphFusion.InklingRelTable) only for prompt rows: the kernels of more than 16 rows read either.
+        if ((table->type != GGML_TYPE_F32 && !(table->type == GGML_TYPE_F16 && count > 16)) || !ggml_is_contiguous(table)
+            || table->ne[0] != ip[1] + 1 || table->ne[1] != heads || table->ne[2] != count)
         {
-            why = "the bias table is not contiguous F32 [extent + 1, heads, rows]";
+            why = "the bias table is not contiguous F32 (or, past 16 rows, F16) [extent + 1, heads, rows]";
+            return false;
+        }
+        if (sink->type != GGML_TYPE_F32 || sink->nb[0] != sizeof(float) || sink->ne[0] != heads || sink->ne[1] != count
+            || sink->nb[1] != (size_t)heads * sizeof(float))
+        {
+            why = "the sink logits are not F32 [heads, rows]";
             return false;
         }
         if (pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) || ip[5] < 0 || ip[5] + count > ggml_nelements(pos))
@@ -1581,8 +1710,8 @@ namespace
         // The split kernel's partials live past the result, in the node's own tail.
         const std::int64_t workspace = tsg_inkling_attention_workspace_floats(count, heads, kvh, keys, dv);
         const std::int64_t extra = (workspace + dv * heads - 1) / (dv * heads);
-        ggml_tensor* args[5] = { q, k, v, table, pos };
-        ggml_tensor* node = ggml_custom_4d(g->ctx, GGML_TYPE_F32, dv, heads, count + extra, 1, args, 5, tsg_dsv4_fused_cpu, 1, &desc);
+        ggml_tensor* args[6] = { q, k, v, table, pos, sink };
+        ggml_tensor* node = ggml_custom_4d(g->ctx, GGML_TYPE_F32, dv, heads, count + extra, 1, args, 6, tsg_dsv4_fused_cpu, 1, &desc);
         g->inkling_nodes++;
         results = { extra > 0 ? ggml_view_3d(g->ctx, node, dv, heads, count, node->nb[1], node->nb[2], 0) : node };
         return true;
@@ -3024,7 +3153,10 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
                 g_backend_compute_failed.store(true, std::memory_order_release);
         }
 #if defined(TSG_GGML_USE_CUDA)
-        else if (g->inkling_nodes > 0)
+        // TS_INKLING_CAPTURE_ALL=1 (experiment): every replayable graph of an Inkling model's step (its drafter's too) as one
+        // CUDA graph through the same path.
+        else if (g->inkling_nodes > 0 || (g->replayable && g->tp == nullptr && g_backend_type == BACKEND_TYPE_CUDA && inkling_backend() != nullptr
+                 && []() { static const bool on = std::getenv("TS_INKLING_CAPTURE_ALL") != nullptr && std::getenv("TS_INKLING_CAPTURE_ALL")[0] == '1'; return on; }()))
         {
             // Inkling 2's fused nodes: the fused-op backend runs the graph's ordinary nodes on ggml-cuda as graph views and
             // launches the fused ones between them, all on one stream.
@@ -3034,10 +3166,15 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             static const bool capture = []() { const char* e = std::getenv("TS_INKLING_CAPTURE"); return e == nullptr || std::strcmp(e, "0") != 0; }();
             if (graph_node_profile_enabled())
                 status = graph_compute_profiled(inkling_backend(), g->graph, g->replayable ? "graph builder decode" : "graph builder prefill");
-            else if (capture && g->replayable)
+            else if (tsg_inkling_event_profile_enabled() && !g->replayable)
+                status = tsg_inkling_event_profile(inkling_backend(), graph_backend(g), g->graph);
+            else if ((capture || tsg_inkling_event_profile_enabled()) && g->replayable)
             {
                 if (g->inkling_capture == nullptr) g->inkling_capture = tsg_inkling_capture_new();
-                status = tsg_inkling_compute(g->inkling_capture, inkling_backend(), graph_backend(g), g->graph, 2);
+                // TS_INKLING_CAPTURE_WARMUP: runs before the capture (default 0: a relaxed capture lets the first run size ggml-cuda's
+                // pools, and a verify window of a new width or cache bucket ran two slow uncaptured runs before it was captured).
+                static const int warmup = []() { const char* e = std::getenv("TS_INKLING_CAPTURE_WARMUP"); return e != nullptr ? std::atoi(e) : 0; }();
+                status = tsg_inkling_compute(g->inkling_capture, inkling_backend(), graph_backend(g), g->graph, warmup);
             }
             else
                 status = ggml_backend_graph_compute_async(inkling_backend(), g->graph);

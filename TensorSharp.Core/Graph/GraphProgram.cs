@@ -399,6 +399,22 @@ namespace TensorSharp.Graph
         /// <summary>Inkling 2's routed experts' weighted sum: sum_k down[:, k] * weights[k] for each row, the products rounded
         /// and added in expert order. Inputs: down [hidden, K, rows] (contiguous), weights [1, K, rows]. Result: [hidden, rows].</summary>
         InklingExpertSum = 37,
+        /// <summary>Inkling 2's routed experts' products for a few rows, as MulMatId: experts [K, M, E] (quantized), x
+        /// [K, 1 or used, rows] (F32), ids [used, rows] (I32) -> [M, used, rows]. Served where the kernel takes the weight
+        /// type and the rows (each expert the rows picked read once for all of its pairs); otherwise its MulMatId runs.</summary>
+        InklingExperts = 38,
+        /// <summary>Several sequences' short convolutions at once: x [channels, rows] (the step's rows), kernel [taps,
+        /// channels][, dynamic taps [taps * heads, rows]], then per sequence its window leaf [taps - 1, conv channels] (and,
+        /// in a verify, its history leaf). Ip: heads (0: none), verify (1), sequences, the channels' offset in the leaves,
+        /// taps - 1, each sequence's rows. Fp: scale. Result: [channels, rows].</summary>
+        InklingConvBatch = 39,
+        /// <summary>Inkling 2's DSpark pick: logits = base [padded, lanes] (any column stride) + fold [padded, lanes] + bias
+        /// [padded], their first Ip[0] (vocab) entries' argmax and the probability there of softmax(Fp[0] tanh(logits / Fp[0])).
+        /// Results: the pick [lanes] (I32), its probability [1, 1, lanes] and the pick as F32 [1, lanes].</summary>
+        InklingDraftPick = 40,
+        /// <summary>Inkling 2's relative-bias table in F16: W [rel, extent + 1] (F32) by r [rel, heads, rows] (F32, any row
+        /// strides) -> [extent + 1, heads, rows] (F16), each entry the dot of W's column and the head and row's r.</summary>
+        InklingRelTable = 41,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

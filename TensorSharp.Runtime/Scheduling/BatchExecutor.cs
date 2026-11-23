@@ -3824,6 +3824,14 @@ namespace TensorSharp.Runtime.Scheduling
                 if (lanes.Count >= 2)
                 {
                     int m = lanes.Count;
+                    // A drafter that takes narrower blocks drafts only what the windows can verify.
+                    int width = blockWidth;
+                    if (batched.BatchDraftTakesNarrowBlocks)
+                    {
+                        int need = 1;
+                        foreach (int cap in caps) need = Math.Max(need, cap);
+                        width = Math.Min(blockWidth, need);
+                    }
                     var laneIds = new string[m];
                     var laneAnchors = new int[m];
                     var lanePositions = new int[m];
@@ -3834,8 +3842,8 @@ namespace TensorSharp.Runtime.Scheduling
                         laneIds[j] = requestIds[lanes[j]];
                         laneAnchors[j] = anchors[lanes[j]];
                         lanePositions[j] = positions[lanes[j]];
-                        blockTokens[j] = new int[blockWidth];
-                        blockConf[j] = new float[blockWidth];
+                        blockTokens[j] = new int[width];
+                        blockConf[j] = new float[width];
                     }
                     long tDraft0 = Timestamp();
                     draftedTogether = batched.TryDraftBatch(laneIds, laneAnchors, carries.ToArray(), lanePositions,
