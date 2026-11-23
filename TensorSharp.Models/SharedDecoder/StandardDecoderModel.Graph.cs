@@ -1482,7 +1482,7 @@ namespace TensorSharp.Models
                     // last reader, so a step that emits differently (other outputs, another stage) must not share it.
                     string floored = attentionFloors == null ? $"{attentionFloor > 0}" : string.Concat(Array.ConvertAll(attentionFloors, f => f > 0 ? '1' : '0'));
                     kind = $"{rows}|{slots.Length}|{snapshots}|{floored}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}|{EmissionVariant(counts, starts)}" +
-                        RingWrapVariant(counts, starts);
+                        RingWrapVariant(counts, starts) + (FloatProductsForTests ? "|f32" : "");
                     // A decode step that could advance runs as the recorded program instead, so it is kept for the next
                     // step to advance (a streamed step keeps nothing: decode would re-emit every node of every step).
                     if (_streamedKinds.Contains(kind) && !advance)

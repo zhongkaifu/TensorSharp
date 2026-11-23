@@ -675,8 +675,7 @@ namespace TensorSharp.Models.Graph
             if (FloatProducts && weight.Ne2 <= 1)
             {
                 using var values = new Tensor(Allocator, DType.Float32, weight.Ne1, weight.Ne0);
-                NativeDequant.DequantizeToFloat32Native(weight.Format, weight.Data, (IntPtr)TensorComputePrimitives.GetFloatPointer(values),
-                    weight.Ne0 * weight.Ne1);
+                DequantizeValues(weight, (IntPtr)TensorComputePrimitives.GetFloatPointer(values));
                 DenseProduct(result, x, values);
                 return result;
             }
@@ -684,6 +683,31 @@ namespace TensorSharp.Models.Graph
                 TensorComputePrimitives.GetFloatPointer(x), (int)weight.Ne0, rows,
                 TensorComputePrimitives.GetFloatPointer(result), (int)weight.Ne1);
             return result;
+        }
+
+        /// <summary>Rows of a weight one parallel chunk of <see cref="DequantizeValues"/> takes at least.</summary>
+        private const long DequantizeChunkRows = 16;
+
+        /// <summary>
+        /// An exact product's weight values (<see cref="TensorGraphExecutor.FloatProducts"/>) as F32 rows, the rows in chunks on
+        /// the worker pool. A row's values are its blocks' dequantization whichever thread writes them, so they are the bits one
+        /// call over the whole weight writes. That call ran on one thread: about 90 s of every step of the Muse-Glimmer F32
+        /// reference on an M5 Pro (eng/validation/MuseGlimmerF32Reference, a dense 30B model's weights each step), with the 17
+        /// other pool threads busy 6% of it.
+        /// </summary>
+        internal static void DequantizeValues(IGraphWeight weight, IntPtr values)
+        {
+            long ne0 = weight.Ne0, rows = weight.Ne1, rowBytes = weight.Bytes / Math.Max(1, rows);
+            int format = weight.Format;
+            IntPtr data = weight.Data;
+            if (rowBytes * rows != weight.Bytes)
+            {
+                NativeDequant.DequantizeToFloat32Native(format, data, values, ne0 * rows);
+                return;
+            }
+            CpuParallel.ForRange(rows, DequantizeChunkRows, (from, to) =>
+                NativeDequant.DequantizeToFloat32Native(format, data + (nint)(from * rowBytes),
+                    values + (nint)(from * ne0 * sizeof(float)), (to - from) * ne0));
         }
     }
 }

@@ -144,9 +144,9 @@ namespace TensorSharp.Graph
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>
         protected abstract Tensor QuantizedMatMul(IGraphWeight weight, Tensor x);
 
-        /// <summary>While a compiled program runs: its block-format products keep their activations in F32
-        /// (<see cref="GraphProgram.FloatProducts"/>). An executor whose products would round them reads it in
-        /// <see cref="QuantizedMatMul"/>.</summary>
+        /// <summary>While a compiled program runs, or a stream of a program recorded with it: its block-format products keep
+        /// their activations in F32 (<see cref="GraphProgram.FloatProducts"/>). An executor whose products would round them
+        /// reads it in <see cref="QuantizedMatMul"/>.</summary>
         protected bool FloatProducts { get; private set; }
 
         /// <summary>The managed product of a weight's host blocks with host rows (x [rows, Ne0] -> [rows, Ne1]),
@@ -1306,18 +1306,29 @@ namespace TensorSharp.Graph
 
             private readonly TensorGraphExecutor _x;
             private readonly Session _session;
+            private readonly bool _floatProducts;
 
             public Stream(TensorGraphExecutor executor, GraphProgram template)
             {
                 _x = executor;
                 _session = new Session(executor, null, executor.LivenessOf(template));
+                // A stream runs a kind of step recorded before (its template): its products keep their activations in F32
+                // where the recorded program's did. Without it an F32 reference's second prompt chunk of a size took the
+                // managed kernels' quantized-activation products.
+                _floatProducts = template?.FloatProducts ?? false;
             }
 
             public void Entry(int node, in GraphNode entry) => _session.Entry(node, entry);
 
             public void InputData(int node, IntPtr data, long bytes, object handle) => _session.InputData(node, data, bytes, handle);
 
-            public bool Execute(Func<bool> body) => _x.OnBackendThread(body);
+            public bool Execute(Func<bool> body) => _x.OnBackendThread(() =>
+            {
+                bool before = _x.FloatProducts;
+                _x.FloatProducts = _floatProducts;
+                try { return body(); }
+                finally { _x.FloatProducts = before; }
+            });
 
             public float[][] Outputs { get; private set; }
 
