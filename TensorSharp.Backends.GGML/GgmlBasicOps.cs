@@ -1287,10 +1287,21 @@ namespace TensorSharp.GGML
             }
         }
 
+        /// <summary>Qwen3-VL's DeepStack mergers for <see cref="Qwen35VisionEncoderMerged"/>: the tap blocks (ascending) and
+        /// each tap's post-merge LayerNorm and fc1 / fc2, at the final merger's widths.</summary>
+        public sealed record VisionDeepStackTaps(int[] Blocks, Tensor[] LnW, Tensor[] LnB, Tensor[] Fc1W, Tensor[] Fc1B,
+            Tensor[] Fc2W, Tensor[] Fc2B);
+
         /// <summary>
         /// The whole Qwen3.5-family encoder plus its post-LN spatial merger as one
         /// graph: writes the projected [merged, out] rows into <paramref name="merged"/>.
         /// <paramref name="hidden"/> is the encoder input and is not written back.
+        /// With <paramref name="deepStack"/> the same graph also runs Qwen3-VL's DeepStack mergers after their blocks, and
+        /// <paramref name="merged"/> takes [merged, out * (1 + taps)] rows: the final merger's, then each tap's.
+        /// With <paramref name="ropePositions"/> (4 per patch: row, column, row, column) the rotary is ggml's vision rope
+        /// at <paramref name="ropeTheta"/> instead of the cos/sin tables, and <paramref name="images"/> &gt; 1 stacks that
+        /// many same-sized images of <paramref name="numPatches"/> rows each in <paramref name="hidden"/> (attention stays
+        /// within an image); false when the backend cannot batch them, so the caller encodes one at a time.
         /// </summary>
         public static unsafe bool Qwen35VisionEncoderMerged(
             Tensor hidden, Tensor merged, float eps, float attnScale,
@@ -1300,8 +1311,23 @@ namespace TensorSharp.GGML
             Tensor[] outW, Tensor[] outB, Tensor[] ln2W, Tensor[] ln2B,
             Tensor[] upW, Tensor[] upB, Tensor[] downW, Tensor[] downB, bool geluErf,
             Tensor postLnW, Tensor postLnB, Tensor fc1W, Tensor fc1B, Tensor fc2W, Tensor fc2B,
-            int mergeUnit, bool mergerGeluErf)
+            int mergeUnit, bool mergerGeluErf, VisionDeepStackTaps deepStack = null,
+            int images = 1, int[] ropePositions = null, float ropeTheta = 10000f)
         {
+            if (images < 1 || (images > 1 && ropePositions == null) || hidden.Sizes[0] != (long)images * numPatches)
+                return false;
+            if (deepStack != null)
+            {
+                int taps = deepStack.Blocks.Length;
+                if (taps < 1 || taps > GgmlNative.VisionDeepStackArgs.Max)
+                    return false;
+                foreach (Tensor[] set in new[] { deepStack.LnW, deepStack.LnB, deepStack.Fc1B, deepStack.Fc2B })
+                    if (set.Length != taps || Array.Exists(set, t => t == null || t.ElementType != DType.Float32 || !t.IsContiguous()))
+                        return false;
+                foreach (Tensor[] set in new[] { deepStack.Fc1W, deepStack.Fc2W })
+                    if (set.Length != taps || Array.Exists(set, t => t == null || t.ElementType != qkvW[0].ElementType || !t.IsContiguous()))
+                        return false;
+            }
             if (!HasNativeBufferStorage(hidden) || !HasNativeBufferStorage(merged))
                 return false;
             if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView)
@@ -1353,6 +1379,40 @@ namespace TensorSharp.GGML
             };
             fixed (float* cosPtr = cosTable, sinPtr = sinTable)
             {
+                if (deepStack != null || ropePositions != null)
+                {
+                    GgmlNative.VisionDeepStackArgs? taps = null;
+                    if (deepStack != null)
+                    {
+                        var ds = new GgmlNative.VisionDeepStackArgs
+                        {
+                            StructBytes = Marshal.SizeOf<GgmlNative.VisionDeepStackArgs>(),
+                            Count = deepStack.Blocks.Length,
+                        };
+                        for (int i = 0; i < deepStack.Blocks.Length; i++)
+                            ds.Set(i, deepStack.Blocks[i], GetBufferStart(deepStack.LnW[i]), GetBufferStart(deepStack.LnB[i]),
+                                GetBufferStart(deepStack.Fc1W[i]), GetBufferStart(deepStack.Fc1B[i]),
+                                GetBufferStart(deepStack.Fc2W[i]), GetBufferStart(deepStack.Fc2B[i]));
+                        taps = ds;
+                    }
+                    return GgmlNative.Qwen35VisionEncoderMergedBatch(hiddenView, mergedView, args, taps,
+                        images, ropePositions, ropeTheta,
+                        blockCount, eps, attnScale, numPatches, numHeads, headDim, halfDim,
+                        (IntPtr)cosPtr, (IntPtr)sinPtr,
+                        Ptrs(ln1W), Ptrs(ln1B), Ptrs(qkvW), Ptrs(qkvB),
+                        Ptrs(outW), Ptrs(outB), Ptrs(ln2W), Ptrs(ln2B),
+                        Ptrs(upW), Ptrs(upB), Ptrs(downW), Ptrs(downB),
+                        (int)ln1W[0].ElementCount(),
+                        (int)qkvW[0].Sizes[qkvW[0].DimensionCount - 1], (int)qkvW[0].Sizes[0],
+                        qkvW[0].ElementCount() * linearBytes, (int)qkvB[0].ElementCount(),
+                        (int)outW[0].Sizes[outW[0].DimensionCount - 1], (int)outW[0].Sizes[0],
+                        outW[0].ElementCount() * linearBytes, (int)outB[0].ElementCount(),
+                        (int)upW[0].Sizes[upW[0].DimensionCount - 1], (int)upW[0].Sizes[0],
+                        upW[0].ElementCount() * linearBytes, (int)upB[0].ElementCount(),
+                        (int)downW[0].Sizes[downW[0].DimensionCount - 1], (int)downW[0].Sizes[0],
+                        downW[0].ElementCount() * linearBytes, (int)downB[0].ElementCount(), geluErf,
+                        linear == DType.Float16 ? 1 : 0);
+                }
                 return GgmlNative.Qwen35VisionEncoderMerged(hiddenView, mergedView, args,
                     blockCount, eps, attnScale, numPatches, numHeads, headDim, halfDim,
                     (IntPtr)cosPtr, (IntPtr)sinPtr,

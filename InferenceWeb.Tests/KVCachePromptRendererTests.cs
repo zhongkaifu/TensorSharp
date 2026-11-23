@@ -814,8 +814,7 @@ public class KVCachePromptRendererTests
         Assert.Equal("<think>\n", KVCachePromptRenderer.GetAssistantGenerationSuffix("qwen35", true));
         Assert.Equal("<think>\n", KVCachePromptRenderer.GetAssistantGenerationSuffix("qwen35moe", true));
         Assert.Equal("<think>\n", KVCachePromptRenderer.GetAssistantGenerationSuffix("qwen3next", true));
-        Assert.Equal("<think>\n", KVCachePromptRenderer.GetAssistantGenerationSuffix("qwen3vl", true));
-        Assert.Equal("<think>\n", KVCachePromptRenderer.GetAssistantGenerationSuffix("qwen3vlmoe", true));
+        // Qwen3-VL (qwen3vl, qwen3vlmoe) frames reasoning by its template, not by the flag: Qwen3VLChatProtocolTests.
     }
 
     [Fact]

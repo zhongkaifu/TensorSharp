@@ -478,8 +478,13 @@ A SigLIP-style ViT with:
 - A multimodal projector (RMSNorm + Linear + GELU + Linear) to the LM hidden
   dim.
 
-On a GGML backend each block runs through two fused kernels
-(`FusedVisionAttention` and `FusedVisionMLP`); see § 8.
+On a GGML backend the whole tower, post-LN and merger run as one graph
+(`TSGgml_Qwen35VisionEncoderMergedBatchF32`): Q and K turn by ggml's vision rope straight from the QKV
+projection, bias adds broadcast, and the frame pairs of a video can share the graph. `TS_QWEN_VISION_ROPE=tables`
+keeps the cos/sin-table rotation (`TSGgml_Qwen35VisionEncoderMergedF32`). The per-block fused kernels
+(`FusedVisionAttention` and `FusedVisionMLP`) are the fallback; see § 8. On a CUDA GPU a 2,880-patch frame pair
+takes 166 ms through the graph (231 ms with the table rotation and materialized bias rows), and its output stays
+within 1.7e-3 relative L2 of the managed CPU tower.
 
 ## 5. Parameters and settings
 

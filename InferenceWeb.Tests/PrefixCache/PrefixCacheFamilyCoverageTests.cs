@@ -86,7 +86,7 @@ public sealed class PrefixCacheFamilyCoverageTests
         Assert.Equal(
             new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4Model", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
                     "Inkling2RuntimeModel", "Lfm3RuntimeModel", "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerRuntimeModel",
-                    "MuseSparkModel", "NemotronModel", "Qwen35RuntimeModel", "Qwen4ExpRuntimeModel", "RaonRuntimeModel" },
+                    "MuseSparkModel", "NemotronModel", "Qwen35RuntimeModel", "Qwen3VLModel", "Qwen4ExpRuntimeModel", "RaonRuntimeModel" },
             engineServed.Select(t => t.Name).ToArray());
     }
 
@@ -97,6 +97,7 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(Mistral3Model))]
     [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(Qwen35RuntimeModel))]
+    [InlineData(typeof(Qwen3VLModel))]
     [InlineData(typeof(Qwen4ExpRuntimeModel))]
     [InlineData(typeof(MuseGlimmerRuntimeModel))]
     public void HolderFamilies_UseTheHolderAdapter(Type family)

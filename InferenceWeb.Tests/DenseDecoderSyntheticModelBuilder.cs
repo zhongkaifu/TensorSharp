@@ -48,6 +48,11 @@ public sealed class DenseDecoderSyntheticModelBuilder
     public bool MoeSharedExpert { get; init; }
     public const int ExpertFfnLength = 32;
     public string RopeScalingType { get; init; }
+    /// <summary>Qwen-VL's interleaved M-RoPE: rotated pairs per (T, H, W, extra) axis
+    /// (<c>rope.dimension_sections</c>, summing to <see cref="KeyLength"/> / 2), or null for none.</summary>
+    public int[] RopeSections { get; init; }
+    /// <summary>Qwen3-VL's DeepStack layers (<c>n_deepstack_layers</c>); 0 writes no key.</summary>
+    public int DeepStackLayers { get; init; }
     public float RopeBase { get; init; } = 1_000_000f;
     public int LayerCount { get; init; } = NumBlocks;
     /// <summary>Key/value head dimension (default <see cref="HeadDim"/>; flash-attention kernels need 64 and up).</summary>
@@ -207,6 +212,10 @@ public sealed class DenseDecoderSyntheticModelBuilder
         }
         if (RopeScalingType != null)
             kv.Add(($"{a}.rope.scaling.type", Str(RopeScalingType)));
+        if (RopeSections != null)
+            kv.Add(($"{a}.rope.dimension_sections", I32Arr(RopeSections)));
+        if (DeepStackLayers > 0)
+            kv.Add(($"{a}.n_deepstack_layers", U32((uint)DeepStackLayers)));
 
         var tokens = new List<string>(VocabSize);
         foreach (int cp in ByteToUnicode()) tokens.Add(char.ConvertFromUtf32(cp));

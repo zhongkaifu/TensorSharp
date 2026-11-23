@@ -18,6 +18,7 @@
 | Qwen 3.8 Flash Next | [Qwen3.8-Flash-Next](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（GDN + 注意力混合 MoE，512 专家，分片 GGUF，+ mmproj） | ✅ / ✅（`video_url`） / — | ✅ | ✅ | [qwen38-flash-next](models/qwen38-flash-next_zh-cn.md) |
 | Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)（另有 12B、31B、26B-A4B MoE） | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4](models/gemma4_zh-cn.md) |
 | Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（另有 35B-A3B MoE、Qwen3.8-27B） | ✅ / — / — | ✅ | ✅ | [qwen35](models/qwen35_zh-cn.md) |
+| Qwen3-VL | [Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF)（MoE，激活 3B；也支持稠密 `qwen3vl` 检查点，需含 DeepStack 合并器的 mmproj） | ✅ / ✅（`video_url`） / — | ✅（Thinking 检查点） | ✅ | [qwen3vl](models/qwen3vl_zh-cn.md) |
 | Bonsai2 | 本地哈希钉住的 `Ternary-Bonsai-2-27B-PQ2_0.gguf` / `-PTQ1_0.gguf`（采用 PRISM 带符号 Hadamard 变换的稠密 Qwen 3.5 混合，+ mmproj）；仅支持单设备 GGML 后端，已在 Metal 上验证 | ✅ / — / — | ✅ | ✅ | [bonsai2](models/bonsai2_zh-cn.md) |
 | GPT OSS | [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF)（MoE） | — / — / — | ✅ | ✅ | [gptoss](models/gptoss_zh-cn.md) |
 | Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF)（另有 47B、Omni） | ✅（Omni） / — / — | ✅ | ✅ | [nemotron](models/nemotron_zh-cn.md) |
@@ -45,6 +46,7 @@
 | Qwen 3.8 Flash Next | `qwen4exp` | Qwen3.8-Flash-Next（混合 MoE，512 专家 / 激活 10 个，48 层中 36 层为 GatedDeltaNet 并与 QSA 索引的全注意力层交错，PLE n-gram 块，×4 超连接） | 图像、视频（`video_url`） | 支持 | 支持（Qwen XML / JSON 工具调用） | 支持（共享 MTP 头，独立 GGUF，经 `--draft-model` 加载；可在其可加载的所有后端上使用） | [qwen38-flash-next](models/qwen38-flash-next_zh-cn.md) |
 | Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-12B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 | 支持（独立草稿 GGUF） | [gemma4](models/gemma4_zh-cn.md) |
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5/3.6-35B-A3B（MoE）、Qwen3.8-27B（稠密混合） | 图像 | 支持 | 支持 | 支持：Qwen 3.6 与 Qwen 3.8 27B 内嵌 NextN（`--spec`）；Qwen 3.8 27B 另可经 `--draft-model` 加载 DFlash2 块级草稿（独立 GGUF） | [qwen35](models/qwen35_zh-cn.md) |
+| Qwen3-VL | `qwen3vl`, `qwen3vlmoe` | Qwen3-VL-30B-A3B（MoE，128 专家 / 激活 8）、稠密 Qwen3-VL（交错 M-RoPE，DeepStack 注入前三层） | 图像、视频（`video_url`） | Thinking 检查点 | 支持（Hermes JSON） | 无权重 n-gram（`--spec --spec-type ngram`） | [qwen3vl](models/qwen3vl_zh-cn.md) |
 | Bonsai2（Qwen 家族） | 带 `prism.hadamard.*` 元数据与 PQ2_0 / PTQ1_0 张量的 `qwen35` | Ternary-Bonsai-2-27B PQ2_0 / PTQ1_0（64 层稠密 Qwen 3.5 混合；加载时无损重打包为 GGML Q2_0；仅支持单设备 GGML 后端） | 图像（伴随 mmproj） | 支持 | 支持 | — | [bonsai2](models/bonsai2_zh-cn.md) |
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持（始终） | 支持 | — | [gptoss](models/gptoss_zh-cn.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe`, `nemotron_h_omni` | Nemotron-H-8B/47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni、Nemotron 3.5 Lightning 30B-A3B（23 Mamba-2 + 23 MoE + 6 注意力） | 图像（Omni）；音频仅在加载自行转换的 Parakeet 音频伴随 GGUF（`--mmproj` 或 `TS_NEMOTRON_AUDIO_MMPROJ`）时可用，否则拒绝 | 支持 | 支持 | 不支持（拒绝：verify 与 decode 内核不同，投机会改变输出） | [nemotron](models/nemotron_zh-cn.md) |

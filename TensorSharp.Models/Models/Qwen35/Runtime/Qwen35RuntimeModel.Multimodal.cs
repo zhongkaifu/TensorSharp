@@ -31,6 +31,7 @@ namespace TensorSharp.Models
             VisionEncoder?.Dispose();
             VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator);
             VisionEncoder.SetHostModel(this);
+            VisionEncoder.WarmUp();
         }
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition) => QueueMedia(embeddings, insertPosition);

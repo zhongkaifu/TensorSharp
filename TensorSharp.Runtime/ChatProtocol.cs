@@ -265,6 +265,13 @@ namespace TensorSharp.Runtime
         public Func<bool, string?>? AssistantGenerationSuffix { get; init; }
 
         /// <summary>
+        /// The generation prompt ends exactly as the GGUF template renders it: the renderer's trailing-whitespace trim is
+        /// skipped when a generation prompt is added. A ChatML template ends it with <c>&lt;|im_start|&gt;assistant\n</c>;
+        /// trimmed, the model writes the separator itself, and Qwen3-VL then opened its answers with ": " or a blank line.
+        /// </summary>
+        public bool KeepsGenerationPromptWhitespace { get; init; }
+
+        /// <summary>
         /// <see cref="AssistantGenerationSuffix"/> for a family whose architecture name
         /// carries more than one turn format, given the GGUF's embedded template (null when
         /// unknown). Takes precedence when set.

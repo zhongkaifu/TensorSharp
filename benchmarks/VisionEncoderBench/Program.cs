@@ -18,6 +18,7 @@
 //   TS_VBENCH_IMAGE   path to a test image (default imgs/banner_1.png)
 //   TS_VBENCH_ITERS   timed iterations (default 5)
 //   TS_VBENCH_WARMUP  warmup iterations (default 1)
+//   TS_VBENCH_QWEN3VL 1: the qwen35 tower as Qwen3-VL runs it (DeepStack taps, exact-GELU mergers)
 using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.Cpu;
@@ -145,12 +146,53 @@ switch (type)
     }
     case "qwen35":
     {
-        var enc = new Qwen35VisionEncoder(mmproj, allocator);
+        // TS_VBENCH_QWEN3VL=1: the tower as the Qwen3-VL chat models run it (exact-GELU mergers, the DeepStack taps
+        // concatenated to the output).
+        bool qwen3vl = Env("TS_VBENCH_QWEN3VL", "0") == "1";
+        var enc = new Qwen35VisionEncoder(mmproj, allocator, mergerGeluErf: qwen3vl);
+        if (qwen3vl)
+        {
+            enc.ConcatenateDeepStack = true;
+        }
         encoder = enc;
         var proc = new Qwen35ImageProcessor(enc.PatchSize, enc.SpatialMergeSize);
         var (pixels, resH, resW) = proc.ProcessImage(image);
         geom = $"{resW}x{resH}, patch={enc.PatchSize}, merge={enc.SpatialMergeSize}";
         encodeOnce = () => enc.Encode(pixels, resH, resW);
+        // TS_VBENCH_PAIRS=N: N video pairs through EncodeVideoPairs (pair k: the image rolled right by 32k and 32k + 16
+        // columns), returned as one [N * tokens, width] tensor. TS_QWEN_VISION_BATCH_PATCHES=0 encodes them one at a time.
+        int pairs = EnvInt("TS_VBENCH_PAIRS", 0);
+        if (pairs > 0)
+        {
+            float[] Roll(int columns)
+            {
+                var rolled = new float[pixels.Length];
+                for (int c = 0; c < 3; c++)
+                    for (int y = 0; y < resH; y++)
+                    {
+                        int row = (c * resH + y) * resW;
+                        for (int x = 0; x < resW; x++)
+                            rolled[row + (x + columns) % resW] = pixels[row + x];
+                    }
+                return rolled;
+            }
+            var firsts = Enumerable.Range(0, pairs).Select(k => Roll(32 * k)).ToList();
+            var seconds = Enumerable.Range(0, pairs).Select(k => Roll(32 * k + 16)).ToList();
+            geom += $", {pairs} video pairs";
+            encodeOnce = () =>
+            {
+                Tensor[] parts = enc.EncodeVideoPairs(firsts, seconds, resH, resW);
+                long tokens = parts[0].Sizes[0];
+                var all = new Tensor(allocator, DType.Float32, tokens * pairs, parts[0].Sizes[1]);
+                for (int k = 0; k < pairs; k++)
+                {
+                    using (Tensor rows = all.Narrow(0, k * tokens, tokens))
+                        Ops.Copy(rows, parts[k]);
+                    parts[k].Dispose();
+                }
+                return all;
+            };
+        }
         break;
     }
     default: // gemma4

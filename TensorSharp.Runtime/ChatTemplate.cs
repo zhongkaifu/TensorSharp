@@ -969,7 +969,7 @@ namespace TensorSharp.Runtime
                     // Gemma's generation boundary is part of its published template:
                     // preserve its newline and any channel prefix exactly. Adding an
                     // empty thought block can make E4B continue unmarked reasoning.
-                    if (architecture != "gemma4" || !addGenerationPrompt)
+                    if ((architecture != "gemma4" && protocol?.KeepsGenerationPromptWhitespace != true) || !addGenerationPrompt)
                         result = result.TrimEnd();
                     if (result.Length > 0)
                     {
@@ -1520,11 +1520,10 @@ namespace TensorSharp.Runtime
 
         private static bool IsQwen35Family(string? architecture)
         {
+            // Not Qwen3-VL (qwen3vl, qwen3vlmoe): its templates frame reasoning differently (see its ChatProtocol).
             return architecture == "qwen35" ||
                    architecture == "qwen35moe" ||
-                   architecture == "qwen3next" ||
-                   architecture == "qwen3vl" ||
-                   architecture == "qwen3vlmoe";
+                   architecture == "qwen3next";
         }
 
         /// <summary>
