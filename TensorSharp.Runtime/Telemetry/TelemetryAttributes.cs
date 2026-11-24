@@ -165,6 +165,22 @@ namespace TensorSharp.Runtime.Telemetry
 
         // Media -------------------------------------------------------------------------
         public const string MediaKind = "tensorsharp.media.kind";
+        /// <summary><c>prompt.media</c>: the request's still images, sampled video frames, video files
+        /// and audio clips, as its history carried them.</summary>
+        public const string MediaImages = "tensorsharp.media.images";
+        public const string MediaVideoFrames = "tensorsharp.media.video_frames";
+        public const string MediaVideos = "tensorsharp.media.videos";
+        public const string MediaAudio = "tensorsharp.media.audio";
+        /// <summary><c>prompt.media</c>: the media spans the prompt ended up with (an image, a frame pair,
+        /// an audio clip each) and the prompt tokens they took.</summary>
+        public const string MediaSpans = "tensorsharp.media.spans";
+        public const string MediaTokens = "tensorsharp.media.tokens";
+        /// <summary><c>prompt.media</c>: ms spent waiting for the media preparation lock (an engine step,
+        /// or another request's encode, held it).</summary>
+        public const string MediaLockWaitMs = "tensorsharp.media.lock_wait_ms";
+        /// <summary><c>prompt.media</c>: times the media were prepared, when more than once (the prompt
+        /// was over its budget and earlier media gave way; the encoder's cache serves the repeats).</summary>
+        public const string MediaPreparations = "tensorsharp.media.preparations";
         public const string VideoMode = "tensorsharp.video.mode";
         public const string VideoWidth = "tensorsharp.video.width";
         public const string VideoHeight = "tensorsharp.video.height";

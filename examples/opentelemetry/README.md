@@ -234,6 +234,7 @@ POST /v1/chat/completions              server span  (App Insights: requests)
    │                                   gen_ai.usage.input_tokens / output_tokens / cache_read.input_tokens,
    │                                   tensorsharp.ttft_ms, tensorsharp.protocol, tensorsharp.request_id, tensorsharp.outcome
    ├─ prompt.render                    chat template rendering
+   │  └─ prompt.media                  images, video frames and audio through the encoder
    ├─ inference.queue                  submitted until first scheduled
    ├─ inference.prefill                until the first token; tensorsharp.compute.prefill_ms
    └─ inference.decode                 the rest; tensorsharp.compute.decode_ms

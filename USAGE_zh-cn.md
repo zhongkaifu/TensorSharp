@@ -2473,6 +2473,7 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
    │                           tensorsharp.prompt.uncached_tokens、tensorsharp.prefill.tokens_per_second、
    │                           tensorsharp.decode.tokens_per_second
    ├─ prompt.render            套用聊天模板并分词，直到请求进入引擎
+   │  └─ prompt.media          图片、视频帧和音频经过编码器；tensorsharp.media.*
    ├─ inference.queue          等待调度器
    ├─ inference.prefill        直到生成第一个 token；tensorsharp.compute.prefill_ms
    └─ inference.decode         其余部分；tensorsharp.compute.decode_ms
@@ -2491,6 +2492,12 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
   便于按提示词长度或同时运行的请求数拆分。区间为空的速率不记录。
 - Ollama 的 `/api/generate` 为 `text_completion <model>`。嵌入请求（`/v1/embeddings`、`/api/embed`）为
   `embeddings <model>`，带 `tensorsharp.embedding.inputs`。
+- 带图片、视频或音频的提示词在 `prompt.render` 下有一个 `prompt.media`：等待媒体准备锁的时间
+  （`tensorsharp.media.lock_wait_ms`，锁被某个引擎步骤或另一个请求的编码占用）、编码器运行以及把输出放入提示词。
+  它记录历史中的媒体（`tensorsharp.media.images`、`.video_frames`、`.videos`、`.audio`）、提示词最终得到的
+  媒体（`tensorsharp.media.spans`，一张图片、一对帧或一段音频各算一个，以及 `tensorsharp.media.tokens`），
+  过长的提示词重新准备过媒体时还有 `tensorsharp.media.preparations`。只有聊天管线记录它，CLI 和
+  DiffusionGemma 不记录。
 - DiffusionGemma 的聊天 span 下有 `prompt.render` 和一个 `diffusion.denoise` span，每次预览对应一个
   `preview` 事件。Jev 请求（`POST /v1/systemone`）是一个 `chat <model>` span。
 - Skills 与代码执行回合每轮记录一个聊天 span（`tensorsharp.round`）；TensorSharp 执行的每次工具调用记录
