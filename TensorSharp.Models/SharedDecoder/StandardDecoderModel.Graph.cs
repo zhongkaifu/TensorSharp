@@ -1802,7 +1802,7 @@ namespace TensorSharp.Models
             if (outputs.Routes == null) return;
             foreach ((int output, int layer) in outputs.Routes)
                 if (TryGetLayerExperts(layer, out var gate, out _, out _))
-                    GgmlBasicOps.MoeRoutingCount(gate.Data, _numExperts, System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(graph.Outputs[output]));
+                    GgmlBasicOps.MoeRoutingCount(gate.Data, _numExperts, Array.ConvertAll(graph.Outputs[output], v => (int)v));
         }
 
         /// <summary>The head over the stream <paramref name="h"/> leaving the last layer: the captures past it, the final
@@ -2929,8 +2929,8 @@ namespace TensorSharp.Models
 
         /// <summary>For <see cref="DeviceRoutesForTests"/>: layer <paramref name="layer"/>'s routes <paramref name="selected"/>
         /// (I32 [K, rows]) and the scores they were picked by (<paramref name="scores"/> [experts, rows]) as outputs. The ids
-        /// leave as F32 values gathered from 0 .. experts - 1, which every executor reads back alike (an I32 output is its bits
-        /// on GGML, its values on the managed executor). Nothing when the seam is unset.</summary>
+        /// leave as F32 values gathered from 0 .. experts - 1, which every executor reads back alike (an I32 output reads back
+        /// as its values too: the GGML executor converts it after the download). Nothing when the seam is unset.</summary>
         protected void EmitDeviceRoutes(GraphStep step, int layer, int selected, int scores, int k, int experts)
         {
             if (DeviceRoutesForTests == null) return;
