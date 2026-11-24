@@ -2806,7 +2806,7 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
    ├─ inference.queue          waiting for the scheduler
    ├─ inference.prefill        until the first token; tensorsharp.compute.prefill_ms
    ├─ inference.decode         the rest; tensorsharp.compute.decode_ms
-   └─ inference.speculation    beside decode when it ran speculatively: tensorsharp.speculative.*
+   └─ inference.speculation    beside decode while speculation is on: tensorsharp.speculative.*
 ```
 
 - `<model>` is the model file name without its directory or extension. `tensorsharp.request_id` is
@@ -2831,7 +2831,14 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
   (`.phase.draft_ms`, `.verify_ms`, `.commit_ms`, `.snapshot_ms`, `.rollback_ms`, `.catch_up_ms`,
   `.plain_ms`); and the cost governor's measurements (`.governor.plain_ms_per_token`,
   `.spec_ms_per_token`, `.wins`, `.losses`). The engine's "Speculative decoding stats" log line is
-  written under this span, so it is in the request's trace.
+  written under this span, so it is in the request's trace. Its `tensorsharp.speculative.outcome`
+  is `ran`.
+- With speculation on, a request that decoded two tokens or more without speculating has an
+  `inference.speculation` span too, with `tensorsharp.speculative.outcome=declined` and why in
+  `tensorsharp.speculative.declined`: `unavailable` (the chosen algorithm cannot serve the model),
+  `no_draft_head`, `no_trunk`, `refused_by_model`, `unprofitable`, `multi_sequence`,
+  `paged_storage`, `pending_multimodal`, `fused_cache`, `adapter`, `prefix_reuse`,
+  `cannot_seed`, `too_few_tokens`, or `unknown` when no step recorded one.
 - Ollama's `/api/generate` is `text_completion <model>`. Embeddings (`/v1/embeddings`, `/api/embed`)
   are `embeddings <model>`, with `tensorsharp.embedding.inputs`.
 - DiffusionGemma's chat span has `prompt.render` and one `diffusion.denoise` span with a `preview`
@@ -2960,6 +2967,7 @@ semantic conventions, which are still in development and may change.
 | `tensorsharp.engine.forward.time` | counter, `s` | `tensorsharp.model.architecture` |
 | `tensorsharp.kv_cache.blocks.used`, `.total` | gauge, `{block}` | `tensorsharp.model.architecture` |
 | `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.speculative.speculator` |
+| `tensorsharp.speculative.requests` | counter, `{request}` | `tensorsharp.model.architecture`, `tensorsharp.speculative.outcome` (`ran`, `declined`), and `tensorsharp.speculative.speculator` (ran) or `tensorsharp.speculative.declined` (declined). Requests that finished while speculation was on |
 | `tensorsharp.model.load.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.outcome`, `error.type` |
 | `tensorsharp.tool.duration` | histogram, `s` | `gen_ai.tool.name`, `tensorsharp.outcome`, `error.type` |
 | `tensorsharp.image.generation.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.image.mode`, `tensorsharp.backend`, `tensorsharp.outcome`, `error.type` |

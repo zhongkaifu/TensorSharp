@@ -2476,7 +2476,7 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
    ├─ inference.queue          等待调度器
    ├─ inference.prefill        直到生成第一个 token；tensorsharp.compute.prefill_ms
    ├─ inference.decode         其余部分；tensorsharp.compute.decode_ms
-   └─ inference.speculation    解码走了投机解码时与 decode 并列：tensorsharp.speculative.*
+   └─ inference.speculation    投机解码开启时与 decode 并列：tensorsharp.speculative.*
 ```
 
 - `<model>` 是不含目录和扩展名的模型文件名。`tensorsharp.request_id` 就是服务端返回的
@@ -2496,7 +2496,12 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
   `.acceptance`）；验证、普通、回滚与暂停的步数（`.steps.*`）；各阶段总耗时（`.phase.draft_ms`、`.verify_ms`、
   `.commit_ms`、`.snapshot_ms`、`.rollback_ms`、`.catch_up_ms`、`.plain_ms`）；以及代价调控器的测量值
   （`.governor.plain_ms_per_token`、`.spec_ms_per_token`、`.wins`、`.losses`）。引擎的 "Speculative decoding
-  stats" 日志行就在这个 span 下写出，因此位于该请求的 trace 中。
+  stats" 日志行就在这个 span 下写出，因此位于该请求的 trace 中。其 `tensorsharp.speculative.outcome` 为 `ran`。
+- 投机解码开启时，解码了两个及以上 token 却没有走投机解码的请求也有一个 `inference.speculation` span，
+  `tensorsharp.speculative.outcome=declined`，原因记在 `tensorsharp.speculative.declined`：`unavailable`
+  （所选算法无法服务该模型）、`no_draft_head`、`no_trunk`、`refused_by_model`、`unprofitable`、
+  `multi_sequence`、`paged_storage`、`pending_multimodal`、`fused_cache`、`adapter`、`prefix_reuse`、
+  `cannot_seed`、`too_few_tokens`，没有任何步骤记下原因时为 `unknown`。
 - Ollama 的 `/api/generate` 为 `text_completion <model>`。嵌入请求（`/v1/embeddings`、`/api/embed`）为
   `embeddings <model>`，带 `tensorsharp.embedding.inputs`。
 - DiffusionGemma 的聊天 span 下有 `prompt.render` 和一个 `diffusion.denoise` span，每次预览对应一个
@@ -2613,6 +2618,7 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 | `tensorsharp.engine.forward.time` | counter，`s` | `tensorsharp.model.architecture` |
 | `tensorsharp.kv_cache.blocks.used`、`.total` | gauge，`{block}` | `tensorsharp.model.architecture` |
 | `tensorsharp.speculative.tokens.drafted`、`.accepted` | counter，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.speculator` |
+| `tensorsharp.speculative.requests` | counter，`{request}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.outcome`（`ran`、`declined`），以及 `tensorsharp.speculative.speculator`（ran）或 `tensorsharp.speculative.declined`（declined）；投机解码开启时结束的请求 |
 | `tensorsharp.model.load.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.outcome`、`error.type` |
 | `tensorsharp.tool.duration` | histogram，`s` | `gen_ai.tool.name`、`tensorsharp.outcome`、`error.type` |
 | `tensorsharp.image.generation.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.image.mode`、`tensorsharp.backend`、`tensorsharp.outcome`、`error.type` |

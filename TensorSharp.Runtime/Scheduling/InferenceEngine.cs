@@ -835,7 +835,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (_handles.TryRemove(seq.RequestId, out var handle))
                 {
-                    LogSpeculationStatsIfAny(seq);
+                    RecordSpeculationOutcome(seq);
                     handle.CompleteWithError(ex);
                     Interlocked.Increment(ref _totalCompleted);
                 }
@@ -1064,7 +1064,7 @@ namespace TensorSharp.Runtime.Scheduling
                         // stop-sequence hit in the adapter) never reach the
                         // ApplyResults finish paths, so surface speculative
                         // stats here too.
-                        LogSpeculationStatsIfAny(handle.Sequence);
+                        RecordSpeculationOutcome(handle.Sequence);
                         handle.CompleteAborted();
                     }
                     break;
@@ -1142,7 +1142,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (r.Error != null)
                 {
-                    LogSpeculationStatsIfAny(seq);
+                    RecordSpeculationOutcome(seq);
                     _scheduler.NotifyError(seq, r.Error, output);
                     handle?.CompleteWithError(r.Error);
                     _handles.TryRemove(seq.RequestId, out _);
@@ -1215,7 +1215,7 @@ namespace TensorSharp.Runtime.Scheduling
                         if (BatchExecutor.EndsSequence(_model.Tokenizer, seq, token))
                         {
                             TruncateUnpublishedTail(seq, emittedCount);
-                            LogSpeculationStatsIfAny(seq);
+                            RecordSpeculationOutcome(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, "eos", output);
                             handle?.CompleteFinished();
                             _handles.TryRemove(seq.RequestId, out _);
@@ -1253,7 +1253,7 @@ namespace TensorSharp.Runtime.Scheduling
                                     "{Emitted} of {Requested} requested tokens; finishing it as a length stop",
                                     seq.RequestId, _contextLimit, emittedCount, seq.MaxNewTokens);
                             TruncateUnpublishedTail(seq, emittedCount);
-                            LogSpeculationStatsIfAny(seq);
+                            RecordSpeculationOutcome(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "max_tokens", output);
                             handle?.CompleteFinished();
                             _handles.TryRemove(seq.RequestId, out _);
@@ -1288,7 +1288,7 @@ namespace TensorSharp.Runtime.Scheduling
                                 continue;
                             }
                             TruncateUnpublishedTail(seq, emittedCount);
-                            LogSpeculationStatsIfAny(seq);
+                            RecordSpeculationOutcome(seq);
                             _logger.LogWarning(
                                 "Request {EngineRequestId} stopped after {Emitted} tokens: {What} (period {Period})",
                                 seq.RequestId, emittedCount,
@@ -1389,12 +1389,20 @@ namespace TensorSharp.Runtime.Scheduling
         /// drafter's catch-up each took (<see cref="SpeculationStats"/> says what
         /// each phase holds), and which drafter it was. The same counters go on
         /// the request's <c>inference.speculation</c> span, which is current while
-        /// the line is written so the line is in the request's trace.</summary>
-        private void LogSpeculationStatsIfAny(SequenceState seq)
+        /// the line is written so the line is in the request's trace. A request
+        /// that decoded at least two tokens without speculating while speculation
+        /// was on gets a declined span instead, with why
+        /// (<see cref="SequenceState.SpeculationDeclined"/>). Both are counted in
+        /// <c>tensorsharp.speculative.requests</c>.</summary>
+        private void RecordSpeculationOutcome(SequenceState seq)
         {
             var st = seq.SpecStats;
             if (st == null || (st.VerifySteps + st.PlainSteps) == 0)
+            {
+                RecordSpeculationDeclined(seq);
                 return;
+            }
+            Telemetry.SpeculationTelemetry.CountRequest(_architectureTag.Value as string ?? "unknown", st.Speculator, declined: null);
             System.Diagnostics.Activity? span = null;
             try
             {
@@ -1416,6 +1424,28 @@ namespace TensorSharp.Runtime.Scheduling
                     st.PerVerifyStep(st.CatchUpMs),
                     st.PlainMsPerToken, st.SpecMsPerToken, st.GovernorWins, st.GovernorLosses, st.GovernorParkedSteps,
                     st.Speculator ?? "unknown", st.DraftWindow);
+            }
+        }
+
+        /// <summary>The declined half of <see cref="RecordSpeculationOutcome"/>: nothing unless
+        /// speculation is on and the request decoded two tokens or more, the least a draft can
+        /// pay off on (one that finished on its first token had nothing to speculate).</summary>
+        private void RecordSpeculationDeclined(SequenceState seq)
+        {
+            if (!_executor.Speculation.Enabled || seq.OutputTokens.Count < 2)
+                return;
+            string reason = seq.SpeculationDeclined ?? SpeculationDeclineReason.Unknown;
+            Telemetry.SpeculationTelemetry.CountRequest(_architectureTag.Value as string ?? "unknown", speculator: null, reason);
+            try
+            {
+                using var span = Telemetry.SpeculationTelemetry.StartDeclined(seq.TelemetryContext, seq.FirstTokenAt, reason);
+                _logger.LogDebug("Speculative decoding declined for {EngineRequestId}: {SpeculationDeclined}",
+                    seq.RequestId, reason);
+            }
+            catch (Exception ex)
+            {
+                // Telemetry must never fail the request it describes.
+                _logger.LogDebug(ex, "Recording the declined speculation of {EngineRequestId} failed.", seq.RequestId);
             }
         }
 

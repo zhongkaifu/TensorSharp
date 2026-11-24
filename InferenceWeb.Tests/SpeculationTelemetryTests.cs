@@ -67,6 +67,8 @@ public partial class SpeculativeExecutionTests
         Assert.True(span.Duration > TimeSpan.Zero);
 
         Assert.Equal(expected, span.GetTagItem(TelemetryAttributes.Speculator));
+        Assert.Equal(TelemetryAttributes.SpeculativeOutcomeRan, span.GetTagItem(TelemetryAttributes.SpeculativeOutcome));
+        Assert.Null(span.GetTagItem(TelemetryAttributes.SpeculativeDeclined));
         Assert.Equal(stats.DraftWindow, span.GetTagItem(SpeculationTelemetry.DraftWindow));
         Assert.Equal(stats.TokensDrafted, span.GetTagItem(SpeculationTelemetry.TokensDrafted));
         Assert.Equal(stats.TokensAccepted, span.GetTagItem(SpeculationTelemetry.TokensAccepted));
@@ -91,6 +93,79 @@ public partial class SpeculativeExecutionTests
         Assert.EndsWith($"| governor plain={stats.PlainMsPerToken:F1}ms/tok spec={stats.SpecMsPerToken:F1}ms/tok "
             + $"wins={stats.GovernorWins} losses={stats.GovernorLosses} parked={stats.GovernorParkedSteps} "
             + $"| speculator name={expected} window={stats.DraftWindow}", line);
+    }
+
+    [Fact]
+    public void ARequestThatCouldNotSpeculateHasADeclinedSpanWithItsReasonAndIsCounted()
+    {
+        var request = new ActivityContext(ActivityTraceId.CreateRandom(), ActivitySpanId.CreateRandom(), ActivityTraceFlags.Recorded);
+        var spans = new ConcurrentQueue<Activity>();
+        using var listener = ListenToInference(a => { if (a.TraceId == request.TraceId) spans.Enqueue(a); });
+        ActivitySource.AddActivityListener(listener);
+        var counted = new ConcurrentQueue<Dictionary<string, object>>();
+        using var meters = new MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == TensorSharpTelemetry.MeterName && instrument.Name == "tensorsharp.speculative.requests")
+                    l.EnableMeasurementEvents(instrument);
+            },
+        };
+        meters.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var d = new Dictionary<string, object>();
+            foreach (var tag in tags) d[tag.Key] = tag.Value;
+            counted.Enqueue(d);
+        });
+        meters.Start();
+        var log = new TracedLines();
+
+        // The fake carries a per-token head; a block drafter cannot serve it, so arming declines.
+        var seq = RunEngineRequest(new FakeSpeculativeModel(), promptLen: 5, maxNewTokens: 24, specEnabled: true,
+            speculator: SpeculatorRegistry.Block, logger: log, telemetryContext: request);
+        meters.Dispose();
+
+        Assert.Null(seq.SpecStats);
+        Assert.True(seq.OutputTokens.Count >= 2);
+        Assert.Equal(SpeculationDeclineReason.Unavailable, seq.SpeculationDeclined);
+        var span = Assert.Single(spans);
+        Assert.Equal(SpeculationTelemetry.SpanName, span.DisplayName);
+        Assert.Equal(request.SpanId, span.ParentSpanId);
+        Assert.Equal(seq.FirstTokenAt, span.StartTimeUtc);
+        Assert.Equal(TelemetryAttributes.SpeculativeOutcomeDeclined, span.GetTagItem(TelemetryAttributes.SpeculativeOutcome));
+        Assert.Equal(SpeculationDeclineReason.Unavailable, span.GetTagItem(TelemetryAttributes.SpeculativeDeclined));
+        Assert.Null(span.GetTagItem(SpeculationTelemetry.TokensDrafted));
+        Assert.DoesNotContain(log.Lines, l => l.Line.StartsWith("Speculative decoding stats for ", StringComparison.Ordinal));
+        Assert.Contains(counted, d => Equals(d.GetValueOrDefault(TelemetryAttributes.SpeculativeOutcome), TelemetryAttributes.SpeculativeOutcomeDeclined)
+            && Equals(d.GetValueOrDefault(TelemetryAttributes.SpeculativeDeclined), SpeculationDeclineReason.Unavailable));
+    }
+
+    [Fact]
+    public void ASpeculativeRequestIsCountedAsRanWithItsSpeculator()
+    {
+        var counted = new ConcurrentQueue<Dictionary<string, object>>();
+        using var meters = new MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == TensorSharpTelemetry.MeterName && instrument.Name == "tensorsharp.speculative.requests")
+                    l.EnableMeasurementEvents(instrument);
+            },
+        };
+        meters.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var d = new Dictionary<string, object>();
+            foreach (var tag in tags) d[tag.Key] = tag.Value;
+            counted.Enqueue(d);
+        });
+        meters.Start();
+
+        var seq = RunEngineRequest(new FakeSpeculativeModel(), promptLen: 5, maxNewTokens: 24, specEnabled: true);
+        meters.Dispose();
+
+        Assert.True(seq.SpecStats.VerifySteps > 0);
+        Assert.Contains(counted, d => Equals(d.GetValueOrDefault(TelemetryAttributes.SpeculativeOutcome), TelemetryAttributes.SpeculativeOutcomeRan)
+            && Equals(d.GetValueOrDefault(TelemetryAttributes.Speculator), SpeculatorRegistry.DraftHead));
     }
 
     [Fact]

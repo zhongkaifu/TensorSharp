@@ -353,7 +353,7 @@ POST /v1/chat/completions          ASP.NET Core server span (SERVER)     -> App 
    ├─ inference.queue              SubmittedAt -> FirstScheduledAt          ┐ built when the request
    ├─ inference.prefill            FirstScheduledAt -> FirstTokenAt         │ finishes, from the
    ├─ inference.decode             FirstTokenAt -> FinishedAt               ┘ scheduler's timestamps
-   └─ inference.speculation        FirstTokenAt -> the engine finishing it  (speculative requests; §5.2)
+   └─ inference.speculation        FirstTokenAt -> the engine finishing it  (speculation on; §5.2)
 ```
 
 - `<model>` is the model file name without directory or extension (`GenAiRequestTelemetry.ModelNameFromPath`).
@@ -403,7 +403,24 @@ and the counters can be queried without parsing it:
 
 It covers the same interval as `inference.decode`, which the host builds later, so the two are siblings. A failure
 to start it is logged at Debug and the line is written anyway. The line gains a last section,
-`| speculator name=<speculator> window=<n>`, after the ones the `eng/` scripts parse.
+`| speculator name=<speculator> window=<n>`, after the ones the `eng/` scripts parse. Such a span has
+`tensorsharp.speculative.outcome=ran`.
+
+With speculation on (`BatchExecutor.Speculation.Enabled`), a request that decoded at least two tokens without a
+verify or plain step gets the span as well, from `SpeculationTelemetry.StartDeclined`:
+`tensorsharp.speculative.outcome=declined` and `tensorsharp.speculative.declined`, the
+`SequenceState.SpeculationDeclined` code (`SpeculationDeclineReason`). The code is the latest a step left:
+
+- `BatchExecutor.NoteSpeculationDeclined`, after each plan, copies the `Code` of the planner's
+  `SpeculativePerSequence` rejection to every sequence the step schedules: `adapter`, `no_trunk`, `no_draft_head`,
+  `refused_by_model`, `unprofitable`, `multi_sequence`, `paged_storage`, `pending_multimodal`, `fused_cache`;
+- arming sets `too_few_tokens` (fewer than two tokens asked for), `unavailable` (`SpeculatorRegistry.Create`
+  declined), `prefix_reuse` (an algorithm that cannot resume after a reused prefix) or `cannot_seed`;
+- `unknown` when none did.
+
+A sequence that speculates on another path anyway has stats, and its code is not reported. The engine counts every
+such request in `tensorsharp.speculative.requests`, `ran` with its speculator or `declined` with the code, and logs
+the decline at Debug only: the operator's sentence is the executor's once-only warning.
 
 ### 5.3 Preemption
 
@@ -617,6 +634,7 @@ latency in one bucket.
 | `tensorsharp.engine.step.duration` | histogram, s (0.001 … 5.12) | per step that ran, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram, `{sequence}` (1 … 256) | `ScheduledWork.Count`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | the `SpeculationStats` increment sites (below), `tensorsharp.speculative.speculator` |
+| `tensorsharp.speculative.requests` | counter, `{request}` | `InferenceEngine.RecordSpeculationOutcome`, once a request that finished while speculation was on: `tensorsharp.speculative.outcome`, with `.speculator` (ran) or `.declined` (§5.2) |
 | `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` (16 … 65536) | per step with prompt work: the `IsPrefill` work items' `NumScheduledTokens`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.inter_token.duration` | histogram, s (0.005 … 30) | per output token after a sequence's first: the time since `SequenceState.LastTokenTimestamp`, a multi-token step's time split evenly, `tensorsharp.engine.step_kind` of the step that emitted it |
 | `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | the scheduler's "Radix prompt reuse" admission log site, `tensorsharp.prefix_cache.outcome` and `.source` |

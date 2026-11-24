@@ -304,7 +304,8 @@ public class ExecutionPlannerTests
         var plan = ExecutionPlanner.PlanStep(SpecLinearCaps(), ExecutionOptions.Default, SpecConfig, Seqs(2));
 
         Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
-        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativePerSequence);
+        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativePerSequence
+            && r.Code == TensorSharp.Runtime.Speculative.SpeculationDeclineReason.MultiSequence);
     }
 
     [Fact]
@@ -315,7 +316,8 @@ public class ExecutionPlannerTests
 
         // Forward would attend against an empty linear cache; must stay batched.
         Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
-        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativePerSequence);
+        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativePerSequence
+            && r.Code == TensorSharp.Runtime.Speculative.SpeculationDeclineReason.PagedStorage);
     }
 
     [Fact]
@@ -326,6 +328,8 @@ public class ExecutionPlannerTests
 
         Assert.True(plan.SpeculationUnprofitable);
         Assert.Equal(ExecutionPathKind.SingleSequenceFused, plan.Selected);
+        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativePerSequence
+            && r.Code == TensorSharp.Runtime.Speculative.SpeculationDeclineReason.Unprofitable);
     }
 
     [Fact]

@@ -325,6 +325,7 @@ namespace TensorSharp.Runtime.Scheduling
                     if (plan.SpeculationRefusal != null)
                         WarnSpeculationRefusedOnce(plan.SpeculationRefusal);
                     LogPlanTransition(plan);
+                    NoteSpeculationDeclined(plan, output);
 
                     for (int i = 0; i < plan.Candidates.Count; i++)
                     {
@@ -3006,6 +3007,7 @@ namespace TensorSharp.Runtime.Scheduling
                             "only on turns that prefill from position 0. Reported once.",
                             exec.Speculator.Describe(), prevComputed);
                     }
+                    seq.SpeculationDeclined = SpeculationDeclineReason.PrefixReuse;
                     exec.Dispose();
                     return null;
                 }
@@ -3020,6 +3022,7 @@ namespace TensorSharp.Runtime.Scheduling
                     // nothing, while the same turn on a holder drafted at 95%.
                     if (!exec.CanSeedCommitted)
                     {
+                        seq.SpeculationDeclined = SpeculationDeclineReason.CannotSeed;
                         exec.Dispose();
                         return null;
                     }
@@ -3056,6 +3059,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 if (!exec.CanSeedCommitted)
                 {
+                    seq.SpeculationDeclined = SpeculationDeclineReason.CannotSeed;
                     exec.Dispose();
                     _lateArmDeclinedFor = seq.RequestId;
                     return null;
@@ -3113,15 +3117,41 @@ namespace TensorSharp.Runtime.Scheduling
         /// least two tokens to decode, or every proposal would be wasted.</summary>
         private static bool CanSpeculate(SequenceState seq) => seq.MaxNewTokens >= 2;
 
+        /// <summary>A step the planner kept off the speculative path, while speculation is
+        /// on: each of its sequences notes why (<see cref="SequenceState.SpeculationDeclined"/>).
+        /// One that speculates on another path anyway has stats, and the note is not reported.</summary>
+        private void NoteSpeculationDeclined(ExecutionPlan plan, SchedulerOutput output)
+        {
+            if (!PlanConfig.Speculation.Enabled)
+                return;
+            string? code = null;
+            foreach (var rejection in plan.Rejections)
+            {
+                if (rejection.Path == ExecutionPathKind.SpeculativePerSequence && rejection.Code != null)
+                {
+                    code = rejection.Code;
+                    break;
+                }
+            }
+            if (code == null)
+                return;
+            foreach (var work in output.ScheduledWork)
+                work.Sequence.SpeculationDeclined = code;
+        }
+
         private SpeculativeExecution? TryArmSpeculation(
             ISpeculativeTarget spec, SequenceState seq, ISpecTrunk? trunk, string trunkLabel)
         {
             if (!CanSpeculate(seq))
+            {
+                seq.SpeculationDeclined = SpeculationDeclineReason.TooFewTokens;
                 return null;
+            }
             var speculator = SpeculatorRegistry.Create(
                 spec, Speculation, out string? declineReason);
             if (speculator == null)
             {
+                seq.SpeculationDeclined = SpeculationDeclineReason.Unavailable;
                 WarnSpeculationDeclinedOnce(declineReason);
                 return null;
             }
@@ -4233,6 +4263,7 @@ namespace TensorSharp.Runtime.Scheduling
             var speculator = SpeculatorRegistry.Create(spec, Speculation, out string? declineReason);
             if (speculator == null)
             {
+                seq.SpeculationDeclined = SpeculationDeclineReason.Unavailable;
                 WarnSpeculationDeclinedOnce(declineReason);
                 _fusedSpecDeclined.Add(seq.RequestId);
                 return false;
@@ -4241,6 +4272,7 @@ namespace TensorSharp.Runtime.Scheduling
                 { Timestamp = Timestamp };
             if (!exec.CanSeedCommitted)
             {
+                seq.SpeculationDeclined = SpeculationDeclineReason.CannotSeed;
                 exec.Dispose();
                 _fusedSpecDeclined.Add(seq.RequestId);
                 return false;

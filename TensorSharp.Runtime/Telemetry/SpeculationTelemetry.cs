@@ -15,11 +15,13 @@ using TensorSharp.Runtime.Speculative;
 namespace TensorSharp.Runtime.Telemetry
 {
     /// <summary>
-    /// <c>inference.speculation</c>: one span for a request that decoded speculatively, a child of the
-    /// request's own span, from its first token to the moment the engine finished it, carrying what
-    /// <see cref="SpeculationStats"/> counted. The engine opens it on its worker thread as the request
-    /// finishes and writes its "Speculative decoding stats" line while the span is current, so the line
-    /// lands in the request's trace rather than in none.
+    /// <c>inference.speculation</c>: one span for a request that finished while speculation was on, a
+    /// child of the request's own span, from its first token to the moment the engine finished it. One
+    /// that speculated (<c>tensorsharp.speculative.outcome</c> <c>ran</c>) carries what
+    /// <see cref="SpeculationStats"/> counted; one that did not (<c>declined</c>) carries why
+    /// (<c>tensorsharp.speculative.declined</c>, a <see cref="SpeculationDeclineReason"/>). The engine
+    /// opens it on its worker thread as the request finishes and writes its "Speculative decoding stats"
+    /// line while the span is current, so the line lands in the request's trace rather than in none.
     /// </summary>
     public static class SpeculationTelemetry
     {
@@ -62,17 +64,59 @@ namespace TensorSharp.Runtime.Telemetry
         public static Activity? Start(ActivityContext request, DateTime? decodeStartUtc, SpeculationStats stats)
         {
             ArgumentNullException.ThrowIfNull(stats);
-            if (request == default || !TensorSharpTelemetry.Inference.HasListeners())
-                return null;
-            var span = TensorSharpTelemetry.Inference.StartActivity(SpanName, ActivityKind.Internal, request,
-                startTime: decodeStartUtc is { } start ? TensorSharpTelemetry.ToUtcOffset(start) : default);
+            var span = StartSpan(request, decodeStartUtc);
             if (span is { IsAllDataRequested: true })
                 SetTags(span, stats);
             return span;
         }
 
+        /// <summary>
+        /// Start the span of a request that finished without speculating although speculation was on,
+        /// with <paramref name="reason"/> (a <see cref="SpeculationDeclineReason"/>). Null as for
+        /// <see cref="Start(ActivityContext, DateTime?, SpeculationStats)"/>.
+        /// </summary>
+        public static Activity? StartDeclined(ActivityContext request, DateTime? decodeStartUtc, string reason)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(reason);
+            var span = StartSpan(request, decodeStartUtc);
+            if (span is { IsAllDataRequested: true })
+            {
+                span.SetTag(TelemetryAttributes.SpeculativeOutcome, TelemetryAttributes.SpeculativeOutcomeDeclined);
+                span.SetTag(TelemetryAttributes.SpeculativeDeclined, reason);
+            }
+            return span;
+        }
+
+        /// <summary><c>tensorsharp.speculative.requests</c>: one request, by outcome, with its speculator
+        /// (ran) or reason (declined).</summary>
+        public static void CountRequest(string architecture, string? speculator, string? declined)
+        {
+            var counter = TensorSharpMetrics.SpeculativeRequests;
+            if (!counter.Enabled)
+                return;
+            var architectureTag = new System.Collections.Generic.KeyValuePair<string, object?>(
+                TelemetryAttributes.ModelArchitecture, string.IsNullOrEmpty(architecture) ? "unknown" : architecture);
+            if (declined != null)
+                counter.Add(1, architectureTag,
+                    new(TelemetryAttributes.SpeculativeOutcome, TelemetryAttributes.SpeculativeOutcomeDeclined),
+                    new(TelemetryAttributes.SpeculativeDeclined, declined));
+            else
+                counter.Add(1, architectureTag,
+                    new(TelemetryAttributes.SpeculativeOutcome, TelemetryAttributes.SpeculativeOutcomeRan),
+                    new(TelemetryAttributes.Speculator, speculator ?? "unknown"));
+        }
+
+        private static Activity? StartSpan(ActivityContext request, DateTime? decodeStartUtc)
+        {
+            if (request == default || !TensorSharpTelemetry.Inference.HasListeners())
+                return null;
+            return TensorSharpTelemetry.Inference.StartActivity(SpanName, ActivityKind.Internal, request,
+                startTime: decodeStartUtc is { } start ? TensorSharpTelemetry.ToUtcOffset(start) : default);
+        }
+
         private static void SetTags(Activity span, SpeculationStats stats)
         {
+            span.SetTag(TelemetryAttributes.SpeculativeOutcome, TelemetryAttributes.SpeculativeOutcomeRan);
             if (!string.IsNullOrEmpty(stats.Speculator)) span.SetTag(TelemetryAttributes.Speculator, stats.Speculator);
             if (stats.DraftWindow > 0) span.SetTag(DraftWindow, stats.DraftWindow);
             span.SetTag(TokensDrafted, stats.TokensDrafted);

@@ -376,6 +376,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// logs it when the request finishes.</summary>
         public SpeculationStats? SpecStats { get; internal set; }
 
+        /// <summary>Why the latest step that could have speculated for this request
+        /// did not (a <see cref="SpeculationDeclineReason"/>), while speculation is on.
+        /// Read when the request finishes: a request that never speculated reports it
+        /// on its <c>inference.speculation</c> span. Null when nothing declined.</summary>
+        public string? SpeculationDeclined { get; internal set; }
+
         // Successful cache-recovery forwards run outside the scheduled step's
         // timer, sometimes while preparing a batch that later declines. Keep
         // their phase times on the request so completion includes them once even
