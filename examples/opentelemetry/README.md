@@ -236,7 +236,8 @@ POST /v1/chat/completions              server span  (App Insights: requests)
    ├─ prompt.render                    chat template rendering
    ├─ inference.queue                  submitted until first scheduled
    ├─ inference.prefill                until the first token; tensorsharp.compute.prefill_ms
-   └─ inference.decode                 the rest; tensorsharp.compute.decode_ms
+   ├─ inference.decode                 the rest; tensorsharp.compute.decode_ms
+   └─ inference.speculation            when decode ran speculatively: drafter, drafted/accepted, phase times
 ```
 
 Ollama's `/api/generate` names the span `text_completion <model>`

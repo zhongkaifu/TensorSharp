@@ -142,6 +142,9 @@ namespace TensorSharp.Runtime.Speculative
         // deltas as Stats, here and not at completion: a preempted request that re-arms gets a
         // new execution, and work its earlier one did would otherwise go uncounted.
         private readonly KeyValuePair<string, object?> _architectureTag;
+        // And the algorithm drafting (tensorsharp.speculative.speculator), so a model served with
+        // MTP one day and a DFlash drafter the next reads as two series, not one.
+        private readonly KeyValuePair<string, object?> _speculatorTag;
 
         public SpeculativeExecution(ISpeculativeTarget model, ISpeculator speculator, ISpecTrunk? trunk = null,
             SpeculationCostGovernor? governor = null)
@@ -167,8 +170,12 @@ namespace TensorSharp.Runtime.Speculative
             _architectureTag = new(Telemetry.TelemetryAttributes.ModelArchitecture,
                 string.IsNullOrEmpty(architecture) ? "unknown" : architecture);
 
+            _speculatorTag = new(Telemetry.TelemetryAttributes.Speculator, speculator.Name);
+
             int k = Math.Min(speculator.MaxDraftTokens, Math.Max(0, model.SpecMaxDraftTokens));
             MaxDraftTokens = k;
+            Stats.Speculator = speculator.Name;
+            Stats.DraftWindow = k;
             if (speculator.NeedsHiddenState)
             {
                 _pendingH = new float[_hidden];
@@ -649,8 +656,8 @@ namespace TensorSharp.Runtime.Speculative
 
             Stats.TokensDrafted += k;
             Stats.TokensAccepted += m;
-            Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag);
-            Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(m, _architectureTag);
+            Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag, _speculatorTag);
+            Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(m, _architectureTag, _speculatorTag);
             RecordAcceptedLength(k, m);
 
             // Tell the trunk the accept count BEFORE deciding how to roll back: a
@@ -890,7 +897,7 @@ namespace TensorSharp.Runtime.Speculative
         {
             var histogram = Telemetry.TensorSharpMetrics.SpeculativeAcceptedLength;
             if (histogram.Enabled && drafted > 0)
-                histogram.Record(accepted, _architectureTag,
+                histogram.Record(accepted, _architectureTag, _speculatorTag,
                     new KeyValuePair<string, object?>(Telemetry.TelemetryAttributes.SpeculativeDrafted, drafted));
         }
 
@@ -918,8 +925,8 @@ namespace TensorSharp.Runtime.Speculative
                 Stats.VerifySteps++;
                 Stats.TokensDrafted += k;
                 Stats.TokensAccepted += accepted;
-                Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag);
-                Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(accepted, _architectureTag);
+                Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag, _speculatorTag);
+                Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(accepted, _architectureTag, _speculatorTag);
                 RecordAcceptedLength(k, accepted);
                 if (accepted < k)
                     Stats.RollbackSteps++;

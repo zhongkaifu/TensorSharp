@@ -1387,20 +1387,36 @@ namespace TensorSharp.Runtime.Scheduling
         /// a request that ran speculatively finishes: the phases' totals and, per
         /// verify step, what drafting, the verify forward, the commit and the
         /// drafter's catch-up each took (<see cref="SpeculationStats"/> says what
-        /// each phase holds).</summary>
+        /// each phase holds), and which drafter it was. The same counters go on
+        /// the request's <c>inference.speculation</c> span, which is current while
+        /// the line is written so the line is in the request's trace.</summary>
         private void LogSpeculationStatsIfAny(SequenceState seq)
         {
             var st = seq.SpecStats;
             if (st == null || (st.VerifySteps + st.PlainSteps) == 0)
                 return;
-            _logger.LogInformation(
-                "Speculative decoding stats for {EngineRequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} commit={CommitMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0} | perVerifyMs draft={DraftPerVerify:F1} verify={VerifyPerVerify:F1} commit={CommitPerVerify:F1} catchUp={CatchUpPerVerify:F1} | governor plain={GovPlain:F1}ms/tok spec={GovSpec:F1}ms/tok wins={GovWins} losses={GovLosses} parked={GovParked}",
-                seq.RequestId, st.TokensDrafted, st.TokensAccepted, st.AcceptanceRate,
-                st.VerifySteps, st.PlainSteps, st.RollbackSteps,
-                st.DraftMs, st.VerifyMs, st.CommitMs, st.SnapshotMs, st.RollbackMs, st.CatchUpMs, st.PlainMs,
-                st.PerVerifyStep(st.DraftMs), st.PerVerifyStep(st.VerifyMs), st.PerVerifyStep(st.CommitMs),
-                st.PerVerifyStep(st.CatchUpMs),
-                st.PlainMsPerToken, st.SpecMsPerToken, st.GovernorWins, st.GovernorLosses, st.GovernorParkedSteps);
+            System.Diagnostics.Activity? span = null;
+            try
+            {
+                span = Telemetry.SpeculationTelemetry.Start(seq.TelemetryContext, seq.FirstTokenAt, st);
+            }
+            catch (Exception ex)
+            {
+                // Telemetry must never fail the request it describes.
+                _logger.LogDebug(ex, "Starting the speculation span of {EngineRequestId} failed.", seq.RequestId);
+            }
+            using (span)
+            {
+                _logger.LogInformation(
+                    "Speculative decoding stats for {EngineRequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} commit={CommitMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0} | perVerifyMs draft={DraftPerVerify:F1} verify={VerifyPerVerify:F1} commit={CommitPerVerify:F1} catchUp={CatchUpPerVerify:F1} | governor plain={GovPlain:F1}ms/tok spec={GovSpec:F1}ms/tok wins={GovWins} losses={GovLosses} parked={GovParked} | speculator name={Speculator} window={DraftWindow}",
+                    seq.RequestId, st.TokensDrafted, st.TokensAccepted, st.AcceptanceRate,
+                    st.VerifySteps, st.PlainSteps, st.RollbackSteps,
+                    st.DraftMs, st.VerifyMs, st.CommitMs, st.SnapshotMs, st.RollbackMs, st.CatchUpMs, st.PlainMs,
+                    st.PerVerifyStep(st.DraftMs), st.PerVerifyStep(st.VerifyMs), st.PerVerifyStep(st.CommitMs),
+                    st.PerVerifyStep(st.CatchUpMs),
+                    st.PlainMsPerToken, st.SpecMsPerToken, st.GovernorWins, st.GovernorLosses, st.GovernorParkedSteps,
+                    st.Speculator ?? "unknown", st.DraftWindow);
+            }
         }
 
         internal static long ComputeBlockByteSize(IModelArchitecture model, int blockSize)

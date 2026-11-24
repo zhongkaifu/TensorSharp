@@ -391,6 +391,7 @@ namespace TensorSharp.Server
                 _lifecycle.LoadModel(modelPath, mmProjPath, backendStr);
                 telemetry.Loaded(_lifecycle.Architecture, _lifecycle.LoadedBackend,
                     _lifecycle.LoadedTensorParallelDegree, _lifecycle.LoadedLayerSplitDegree);
+                telemetry.DraftHead(_lifecycle.LoadedDraftHeadKind, _lifecycle.LoadedDraftHeadFile);
             }
             catch (Exception ex)
             {
