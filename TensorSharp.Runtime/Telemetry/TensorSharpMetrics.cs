@@ -123,6 +123,10 @@ namespace TensorSharp.Runtime.Telemetry
         public static readonly Counter<long> SpeculativeTokensAccepted = M.CreateCounter<long>(
             "tensorsharp.speculative.tokens.accepted", "{token}", "Proposed tokens the target model accepted.");
 
+        public static readonly Counter<long> SpeculativeRequests = M.CreateCounter<long>(
+            "tensorsharp.speculative.requests", "{request}",
+            "Requests that finished while speculation was on, by outcome (ran or declined), with the speculator that ran or why it was declined.");
+
         // Models ------------------------------------------------------------------------
 
         public static readonly Histogram<double> ModelLoadDuration = M.CreateHistogram(

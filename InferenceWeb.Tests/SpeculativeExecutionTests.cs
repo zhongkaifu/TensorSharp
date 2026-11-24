@@ -968,7 +968,7 @@ public partial class SpeculativeExecutionTests
     private static SequenceState RunEngineRequest(FakeSpeculativeModel model, int promptLen, int maxNewTokens,
         bool specEnabled, bool enablePrefixCaching = false, int soloPrefillChunk = 0, string speculator = null,
         Action beforeDispose = null, IRequestAdapter adapter = null, SamplingConfig sampling = null,
-        Microsoft.Extensions.Logging.ILogger logger = null)
+        Microsoft.Extensions.Logging.ILogger logger = null, System.Diagnostics.ActivityContext telemetryContext = default)
     {
         var cfg = new SchedulerConfig
         {
@@ -1001,6 +1001,7 @@ public partial class SpeculativeExecutionTests
         };
         var seq = new SequenceState("mtp-req", Enumerable.Range(1, promptLen).ToList(),
             maxNewTokens, BlockSize, sampling ?? greedy, adapter: adapter);
+        seq.TelemetryContext = telemetryContext;
         var handle = engine.SubmitRequest(seq);
         var completion = handle.Completion.GetAwaiter().GetResult();
         Assert.True(completion.PrefillElapsedTicks > 0, "The engine must time all prompt chunks even when speculation is armed.");

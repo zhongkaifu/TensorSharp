@@ -79,14 +79,16 @@ namespace TensorSharp.Runtime.Scheduling
                     // Neither the drafters nor the verify trunks apply a request adapter,
                     // so an adapter step decodes plainly (see BatchExecutor's arming gate).
                     rejections.Add(new ExecutionPathRejection(
-                        ExecutionPathKind.SpeculativePerSequence, "a LoRA adapter is active for this step"));
+                        ExecutionPathKind.SpeculativePerSequence, "a LoRA adapter is active for this step",
+                        SpeculationDeclineReason.Adapter));
                 }
                 else if (!caps.SupportsSpeculativeTrunk)
                 {
                     rejections.Add(new ExecutionPathRejection(
                         ExecutionPathKind.SpeculativePerSequence,
                         "requested (--spec) but this architecture has no speculative trunk "
-                        + "(it cannot verify a draft window in one pass)"));
+                        + "(it cannot verify a draft window in one pass)",
+                        SpeculationDeclineReason.NoTrunk));
                 }
                 else if (!caps.HasDraftHead
                          && SpeculatorRegistry.RequiresDraftHead(config.Speculation.SpeculatorName))
@@ -94,14 +96,16 @@ namespace TensorSharp.Runtime.Scheduling
                     rejections.Add(new ExecutionPathRejection(
                         ExecutionPathKind.SpeculativePerSequence,
                         $"requested (--spec) but the loaded weights have no draft head; "
-                        + $"--spec-type {SpeculatorRegistry.NGram} needs none"));
+                        + $"--spec-type {SpeculatorRegistry.NGram} needs none",
+                        SpeculationDeclineReason.NoDraftHead));
                 }
                 else if (caps.SpeculationRefusal != null)
                 {
                     speculationRefusal = caps.SpeculationRefusal;
                     rejections.Add(new ExecutionPathRejection(
                         ExecutionPathKind.SpeculativePerSequence,
-                        "refused by the model: " + caps.SpeculationRefusal));
+                        "refused by the model: " + caps.SpeculationRefusal,
+                        SpeculationDeclineReason.RefusedByModel));
                 }
                 else if (!caps.SpeculationProfitable)
                 {
@@ -110,24 +114,29 @@ namespace TensorSharp.Runtime.Scheduling
                     mtpUnprofitable = true;
                     rejections.Add(new ExecutionPathRejection(
                         ExecutionPathKind.SpeculativePerSequence,
-                        "speculation unprofitable on this backend; serving standard decode"));
+                        "speculation unprofitable on this backend; serving standard decode",
+                        SpeculationDeclineReason.Unprofitable));
                 }
                 else
                 {
                     // Linear-trunk speculation requires the per-sequence route.
                     if (!solo)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.SpeculativePerSequence, "multi-sequence step"));
+                            ExecutionPathKind.SpeculativePerSequence, "multi-sequence step",
+                            SpeculationDeclineReason.MultiSequence));
                     else if (features.SoloKvInPagedStorage)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.SpeculativePerSequence, "sequence K/V lives in paged storage; linear cache would be empty"));
+                            ExecutionPathKind.SpeculativePerSequence, "sequence K/V lives in paged storage; linear cache would be empty",
+                            SpeculationDeclineReason.PagedStorage));
                     else if (features.SoloHasPendingMultimodal && !features.SoloIsDecode
                              && !caps.SupportsSpeculativeMultimodalPrefill)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.SpeculativePerSequence, "pending multimodal embeddings need Forward's inject hook"));
+                            ExecutionPathKind.SpeculativePerSequence, "pending multimodal embeddings need Forward's inject hook",
+                            SpeculationDeclineReason.PendingMultimodal));
                     else if (fusedResident)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.SpeculativePerSequence, "sequence lives in a per-request fused cache (the fused path speculates on it itself when the trunk follows the bound holder)"));
+                            ExecutionPathKind.SpeculativePerSequence, "sequence lives in a per-request fused cache (the fused path speculates on it itself when the trunk follows the bound holder)",
+                            SpeculationDeclineReason.FusedCache));
                     else
                     {
                         candidates.Add(ExecutionPathKind.SpeculativePerSequence); // terminal

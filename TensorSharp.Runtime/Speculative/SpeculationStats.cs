@@ -11,9 +11,19 @@ namespace TensorSharp.Runtime.Speculative
 {
     /// <summary>Cumulative speculative-decoding counters for one execution
     /// (one request on the engine path; one Generate call on the standalone
-    /// path). The engine logs these when a request finishes.</summary>
+    /// path). The engine logs these when a request finishes, and puts them on the
+    /// request's <c>inference.speculation</c> span.</summary>
     public sealed class SpeculationStats
     {
+        /// <summary>The algorithm that drafted: its <see cref="ISpeculator.Name"/>
+        /// (<see cref="SpeculatorRegistry.DraftHead"/>, <see cref="SpeculatorRegistry.Block"/>,
+        /// <see cref="SpeculatorRegistry.NGram"/> or a registered one). Kept by <see cref="Reset"/>.</summary>
+        public string? Speculator { get; internal set; }
+
+        /// <summary>The most tokens one verify window drafts
+        /// (<see cref="SpeculativeExecution.MaxDraftTokens"/>). Kept by <see cref="Reset"/>.</summary>
+        public int DraftWindow { get; internal set; }
+
         public long TokensDrafted { get; internal set; }
         public long TokensAccepted { get; internal set; }
         public long VerifySteps { get; internal set; }

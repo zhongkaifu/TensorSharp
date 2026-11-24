@@ -2805,7 +2805,8 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
    ├─ prompt.render            chat template and tokenization, until the request reaches the engine
    ├─ inference.queue          waiting for the scheduler
    ├─ inference.prefill        until the first token; tensorsharp.compute.prefill_ms
-   └─ inference.decode         the rest; tensorsharp.compute.decode_ms
+   ├─ inference.decode         the rest; tensorsharp.compute.decode_ms
+   └─ inference.speculation    beside decode while speculation is on: tensorsharp.speculative.*
 ```
 
 - `<model>` is the model file name without its directory or extension. `tensorsharp.request_id` is
@@ -2822,6 +2823,22 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
   admission to its first token, and `tensorsharp.decode.tokens_per_second` is the tokens after the
   first over the time after it: the speeds this request saw, so a query can split them by prompt
   size or by how many requests ran beside it. A rate whose interval is empty is left out.
+- A request that decoded speculatively (MTP/NextN, a DFlash drafter, n-gram) also has
+  `inference.speculation`, over the same time as `inference.decode`. It carries the drafter
+  (`tensorsharp.speculative.speculator`: `draft-head`, `block` or `ngram`) and its window
+  (`.draft_window`); the drafted and accepted tokens (`.tokens.drafted`, `.tokens.accepted`,
+  `.acceptance`); the verify, plain, rollback and parked steps (`.steps.*`); each phase's total
+  (`.phase.draft_ms`, `.verify_ms`, `.commit_ms`, `.snapshot_ms`, `.rollback_ms`, `.catch_up_ms`,
+  `.plain_ms`); and the cost governor's measurements (`.governor.plain_ms_per_token`,
+  `.spec_ms_per_token`, `.wins`, `.losses`). The engine's "Speculative decoding stats" log line is
+  written under this span, so it is in the request's trace. Its `tensorsharp.speculative.outcome`
+  is `ran`.
+- With speculation on, a request that decoded two tokens or more without speculating has an
+  `inference.speculation` span too, with `tensorsharp.speculative.outcome=declined` and why in
+  `tensorsharp.speculative.declined`: `unavailable` (the chosen algorithm cannot serve the model),
+  `no_draft_head`, `no_trunk`, `refused_by_model`, `unprofitable`, `multi_sequence`,
+  `paged_storage`, `pending_multimodal`, `fused_cache`, `adapter`, `prefix_reuse`,
+  `cannot_seed`, `too_few_tokens`, or `unknown` when no step recorded one.
 - Ollama's `/api/generate` is `text_completion <model>`. Embeddings (`/v1/embeddings`, `/api/embed`)
   are `embeddings <model>`, with `tensorsharp.embedding.inputs`.
 - DiffusionGemma's chat span has `prompt.render` and one `diffusion.denoise` span with a `preview`
@@ -2832,7 +2849,9 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
   runs a command (`tensorsharp.codeexec.shell`, `.sandbox`, `.exit_code`, `.timed_out`, `.output_bytes`).
 - Loading a model is `model.load` (`tensorsharp.model.file`, `gen_ai.request.model`,
   `tensorsharp.backend`, `tensorsharp.model.architecture`, the tensor-parallel and layer-split
-  degrees when above 1, and the outcome), the startup load included; unloading is `model.unload`.
+  degrees when above 1, the drafter when the model has one (`tensorsharp.model.draft_head`:
+  `per_token` or `block`, and `tensorsharp.model.draft_file` for one attached from its own GGUF),
+  and the outcome), the startup load included; unloading is `model.unload`.
 - TensorSharp's own model calls carry `tensorsharp.internal=true` and `tensorsharp.origin`:
   `prefix-cache-warmup` for the startup warm-up, `warmup` for the CLI's `--warmup-runs` passes,
   `knowledge-rerank` and `knowledge-media-extract` for the knowledge library. Leave them out of
@@ -2933,7 +2952,7 @@ semantic conventions, which are still in development and may change.
 | `tensorsharp.engine.lane.steps` | counter, `{step}` | `tensorsharp.model.architecture`, `tensorsharp.engine.lane.finish` (`ready`, `waited`) |
 | `tensorsharp.engine.lane.rows` | counter, `{row}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.lane.time` | counter, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.lane.state` (`issue`, `wait`, `idle`) |
-| `tensorsharp.speculative.accepted_length` | histogram, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.speculative.drafted`. Drafted tokens one verify window kept |
+| `tensorsharp.speculative.accepted_length` | histogram, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.speculative.speculator`, `tensorsharp.speculative.drafted`. Drafted tokens one verify window kept |
 | `tensorsharp.slots` | gauge, `{slot}` | `tensorsharp.model.architecture`, `tensorsharp.slot.state` (`running`, `retained`) |
 | `tensorsharp.slots.memory` / `.capacity` | gauge, `By` / `{token}` | `tensorsharp.model.architecture` |
 | `tensorsharp.slots.grows`, `.grow_failures` | counter | `tensorsharp.model.architecture` |
@@ -2947,7 +2966,8 @@ semantic conventions, which are still in development and may change.
 | `tensorsharp.engine.steps` | counter, `{step}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.forward.time` | counter, `s` | `tensorsharp.model.architecture` |
 | `tensorsharp.kv_cache.blocks.used`, `.total` | gauge, `{block}` | `tensorsharp.model.architecture` |
-| `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.speculative.speculator` |
+| `tensorsharp.speculative.requests` | counter, `{request}` | `tensorsharp.model.architecture`, `tensorsharp.speculative.outcome` (`ran`, `declined`), and `tensorsharp.speculative.speculator` (ran) or `tensorsharp.speculative.declined` (declined). Requests that finished while speculation was on |
 | `tensorsharp.model.load.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.outcome`, `error.type` |
 | `tensorsharp.tool.duration` | histogram, `s` | `gen_ai.tool.name`, `tensorsharp.outcome`, `error.type` |
 | `tensorsharp.image.generation.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.image.mode`, `tensorsharp.backend`, `tensorsharp.outcome`, `error.type` |

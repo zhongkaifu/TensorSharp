@@ -480,6 +480,8 @@ namespace TensorSharp.Server
         private const string StartupLoad = "tensorsharp.model.startup_load";
         private const string LoadSkipped = "tensorsharp.model.load.skipped";
         private const string LayerSplitDegree = "tensorsharp.layer_split.degree";
+        private const string DraftHeadKindTag = "tensorsharp.model.draft_head";
+        private const string DraftFile = "tensorsharp.model.draft_file";
 
         private readonly Activity? _activity;
         private readonly long _startTimestamp = Stopwatch.GetTimestamp();
@@ -549,6 +551,20 @@ namespace TensorSharp.Server
                 _activity.SetTag(TelemetryAttributes.TensorParallelDegree, tensorParallelDegree);
             if (layerSplitDegree > 1)
                 _activity.SetTag(LayerSplitDegree, layerSplitDegree);
+        }
+
+        /// <summary>
+        /// The drafter the loaded model speculates with: <c>per_token</c> (an MTP/NextN head) or
+        /// <c>block</c> (a DFlash block drafter), and the file it was attached from, if it has
+        /// its own (a name, never the path). Nothing for a model without one.
+        /// </summary>
+        public void DraftHead(TensorSharp.Runtime.Speculative.DraftHeadKind kind, string? attachedFile)
+        {
+            if (_activity is not { IsAllDataRequested: true } || kind == TensorSharp.Runtime.Speculative.DraftHeadKind.None)
+                return;
+            _activity.SetTag(DraftHeadKindTag, kind == TensorSharp.Runtime.Speculative.DraftHeadKind.Block ? "block" : "per_token");
+            if (FileName(attachedFile) is { } file)
+                _activity.SetTag(DraftFile, file);
         }
 
         /// <summary>
