@@ -116,7 +116,7 @@ phase and per stage, and a span **event** per finished denoising step (§8).
 
 | Source or meter | Declared in | Spans or instruments |
 |---|---|---|
-| `TensorSharp.Inference` | Runtime | `chat <model>`, `text_completion <model>`, `embeddings <model>`, `prompt.render`, `inference.queue`, `inference.prefill`, `inference.decode`, `inference.speculation`, `diffusion.denoise`, `inference.step` |
+| `TensorSharp.Inference` | Runtime | `chat <model>`, `text_completion <model>`, `embeddings <model>`, `prompt.render`, `prompt.media`, `inference.queue`, `inference.prefill`, `inference.decode`, `inference.speculation`, `diffusion.denoise`, `inference.step` |
 | `TensorSharp.Models` | Runtime | `model.load`, `model.unload` |
 | `TensorSharp.Media` | Runtime | `generate_video <model>` and its children, `generate_image <model>` |
 | `TensorSharp.Agent` | Runtime | `execute_tool <name>`, `codeexec.run` |
@@ -350,6 +350,7 @@ POST /v1/chat/completions          ASP.NET Core server span (SERVER)     -> App 
 │                                  tensorsharp.request_id, tensorsharp.protocol, gen_ai.response.id
 └─ chat <model>                    one per generation (TensorSharp.Inference)
    ├─ prompt.render                engine lookup -> SequenceState constructor (SubmittedAt)
+   │  └─ prompt.media              media preparation lock wait, encode and placement (§5.2)
    ├─ inference.queue              SubmittedAt -> FirstScheduledAt          ┐ built when the request
    ├─ inference.prefill            FirstScheduledAt -> FirstTokenAt         │ finishes, from the
    ├─ inference.decode             FirstTokenAt -> FinishedAt               ┘ scheduler's timestamps
@@ -374,6 +375,15 @@ The engine runs on its own worker thread, so its phases are not spans that threa
 - `SubmittedAt` is stamped by the `SequenceState` constructor, after all template rendering, tokenizing, compaction
   and media encoding, so `prompt.render` runs from just after the engine lookup to `SubmittedAt`. If preparation
   throws, `prompt.render` ends at the throw.
+- A prompt with media has `prompt.media` under `prompt.render`, built with it from a
+  `ChatGenerationPipeline.MediaPreparationRecord`: from just before `GpuLockWaiters.Enter` on
+  `ModelBase.MediaPreparationLock` (the wait to hold it is `tensorsharp.media.lock_wait_ms`) to after
+  `GetPreparedMediaSpans`, so it covers `ProcessPromptTokens` (the encoders) and any re-preparation
+  `CompactMediaHistoryForContext` asks for (`tensorsharp.media.preparations` when above 1). It carries the
+  history's media (`tensorsharp.media.images`, `.video_frames`: a video message's timed frames, `.videos`,
+  `.audio`) and the prompt's (`tensorsharp.media.spans`, `.tokens`). A preparation that threw ends with
+  `prompt.render`, without spans or tokens. Only the chat pipeline's main path records it; the CLI and the
+  DiffusionGemma path prepare media without it.
 - The engine records when it finished a request: `InferenceCompletion.FinishedAt`, stamped in `CompleteFinished` and
   `CompleteAborted`. Decode ends there, not when the request thread has drained the token channel, which waits on the
   client. (The chat pipeline falls back to the time it read the completion when `FinishedAt` is absent. The CLI ends

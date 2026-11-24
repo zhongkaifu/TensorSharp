@@ -2806,6 +2806,7 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
    │                           tensorsharp.prompt.uncached_tokens, tensorsharp.prefill.tokens_per_second,
    │                           tensorsharp.decode.tokens_per_second
    ├─ prompt.render            chat template and tokenization, until the request reaches the engine
+   │  └─ prompt.media          images, video frames and audio through the encoder; tensorsharp.media.*
    ├─ inference.queue          waiting for the scheduler
    ├─ inference.prefill        until the first token; tensorsharp.compute.prefill_ms
    ├─ inference.decode         the rest; tensorsharp.compute.decode_ms
@@ -2844,6 +2845,13 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
   `cannot_seed`, `too_few_tokens`, or `unknown` when no step recorded one.
 - Ollama's `/api/generate` is `text_completion <model>`. Embeddings (`/v1/embeddings`, `/api/embed`)
   are `embeddings <model>`, with `tensorsharp.embedding.inputs`.
+- A prompt with images, video or audio has `prompt.media` under `prompt.render`: the wait for the
+  media preparation lock (`tensorsharp.media.lock_wait_ms`, an engine step or another request's
+  encode holding it), the encoder and the placement of its output. It carries what the history
+  held (`tensorsharp.media.images`, `.video_frames`, `.videos`, `.audio`), what the prompt got
+  (`tensorsharp.media.spans`, one for an image, a frame pair or a clip, and `tensorsharp.media.tokens`),
+  and `tensorsharp.media.preparations` when an over-long prompt had its media prepared again.
+  Only the chat pipeline records it, not the CLI or DiffusionGemma.
 - DiffusionGemma's chat span has `prompt.render` and one `diffusion.denoise` span with a `preview`
   event per preview. A Jev request (`POST /v1/systemone`) is a `chat <model>` span.
 - Skills and code-execution turns record one chat span per round (`tensorsharp.round`), one
