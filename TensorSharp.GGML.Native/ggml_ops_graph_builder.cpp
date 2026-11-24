@@ -151,6 +151,8 @@ namespace
         ggml_tensor* tensor;
         void* data;
         std::size_t bytes;
+        // An I32 node (a top-k's ids): downloaded as is, then written over as F32 values (int_outputs_to_float).
+        bool ints = false;
     };
 
     // A greedy head (OP_TOP_K with ip[1] = 1: GraphCapabilities.GreedyIdOutputs): each row's largest logit, a tie to the
@@ -900,6 +902,25 @@ namespace
                 best = i;
             }
         return best;
+    }
+
+    // After a run (the device synchronized, the outputs downloaded): each I32 output to its F32 values, in place. The host
+    // reads every output as F32 values (GraphProgram.Output); an I32 node's raw bytes there read as denormals, which is
+    // how a draft chain's top-k ids (StandardDecoderModel.DraftChain) all came back as token 0. Exact below 2^24.
+    void int_outputs_to_float(TsgGraph* g)
+    {
+        for (const Output& o : g->outputs)
+        {
+            if (!o.ints || o.data == nullptr) continue;
+            auto* values = static_cast<float*>(o.data);
+            const std::size_t n = o.bytes / sizeof(std::int32_t);
+            for (std::size_t i = 0; i < n; i++)
+            {
+                std::int32_t id;
+                std::memcpy(&id, values + i, sizeof id);
+                values[i] = static_cast<float>(id);
+            }
+        }
     }
 
     // After a run (the device synchronized, the candidates downloaded): each greedy head's rows to their ids.
@@ -2884,7 +2905,9 @@ TSG_EXPORT int TSGgml_GraphOutput(void* handle, int node, void* data, std::int64
         }
         if (data != nullptr && static_cast<std::size_t>(bytes) < ggml_nbytes(t))
             throw std::runtime_error("graph builder: output buffer is smaller than its node");
-        g->outputs.push_back({ t, data, data != nullptr ? ggml_nbytes(t) : 0 });
+        if (t->type == GGML_TYPE_I32 && !ggml_is_contiguous(t))
+            throw std::runtime_error("graph builder: an I32 output is read back as F32 values, so it must be contiguous");
+        g->outputs.push_back({ t, data, data != nullptr ? ggml_nbytes(t) : 0, t->type == GGML_TYPE_I32 });
         return 1;
     }
     catch (const std::exception& ex)
@@ -3229,6 +3252,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             return 1;
         }
         sync_backend(graph_backend(g));
+        int_outputs_to_float(g);
         resolve_greedy_heads(g, false);
         clear_last_error();
         return 1;
@@ -3295,6 +3319,7 @@ TSG_EXPORT int TSGgml_GraphRunRanked(void* const* handles, int nranks, const int
         for (int r = 0; r < nranks; r++)
         {
             auto* g = static_cast<TsgGraph*>(handles[r]);
+            int_outputs_to_float(g);
             if (g->greedy.empty()) continue;
             ScopedRank scope(g->rank);
             resolve_greedy_heads(g, true);
