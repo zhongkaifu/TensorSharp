@@ -88,6 +88,30 @@ public sealed class GenAiRequestTelemetryTests : IDisposable
     private static string NewModel() => "test-model-" + Guid.NewGuid().ToString("N")[..8];
 
     [Fact]
+    public void FloatSamplingValuesGoOnTheSpanAsTheyWereWritten()
+    {
+        string model = NewModel();
+        using (var telemetry = GenAiRequestTelemetry.Start(TelemetryAttributes.OperationChat, model, "ggml_cuda"))
+            telemetry.SetSampling(512, 0.7f, 0.8f, 20, 1);
+
+        var chat = Assert.Single(_stopped, a => a.DisplayName == $"chat {model}");
+        // Widened, 0.7f is 0.699999988079071 and 0.8f 0.800000011920929.
+        Assert.Equal(0.7, chat.GetTagItem(TelemetryAttributes.GenAiRequestTemperature));
+        Assert.Equal(0.8, chat.GetTagItem(TelemetryAttributes.GenAiRequestTopP));
+        Assert.Equal(20, chat.GetTagItem(TelemetryAttributes.GenAiRequestTopK));
+        Assert.Equal(1L, chat.GetTagItem(TelemetryAttributes.GenAiRequestSeed));
+    }
+
+    [Theory]
+    [InlineData(0.7f, 0.7)]
+    [InlineData(1f, 1.0)]
+    [InlineData(0f, 0.0)]
+    [InlineData(0.95f, 0.95)]
+    [InlineData(0.123456789f, 0.12345679)]
+    public void AsWrittenIsTheFloatsShortestDecimal(float value, double expected) =>
+        Assert.Equal(expected, GenAiRequestTelemetry.AsWritten(value));
+
+    [Fact]
     public void ACompletedChatHasItsSpanPhasesUsageAndMetrics()
     {
         string model = NewModel();

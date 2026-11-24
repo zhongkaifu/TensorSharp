@@ -252,7 +252,11 @@ namespace TensorSharp.Server
                     ContentChars = m.Content?.Length ?? 0,
                     ContentOmitted = contentOmitted ? true : (bool?)null,
                     ContentTruncated = contentTruncated ? true : (bool?)null,
-                    Images = ToPathList(m.ImagePaths),
+                    // A video's sampled frames are counted, not listed: dozens of temporary
+                    // paths a turn told nothing the video file below does not.
+                    Images = ToPathList(StillImages(m)),
+                    VideoFrames = CountVideoFrames(m) is > 0 and int frames ? frames : (int?)null,
+                    Videos = ToPathList(m.VideoFilePaths),
                     Audios = ToPathList(m.AudioPaths),
                     TextFiles = ToPathList(m.TextFilePaths),
                     IsVideo = m.IsVideo ? true : (bool?)null,
@@ -265,7 +269,9 @@ namespace TensorSharp.Server
         }
 
         /// <summary>
-        /// Serialize the upload manifest for a single message as a single-line JSON array.
+        /// Serialize the upload manifest for a single message as a single-line JSON array: each
+        /// image, video file, audio clip and text file, and a video's sampled frames as one
+        /// <c>video_frames</c> entry per folder they were written to, with their count.
         /// </summary>
         public static string SerializeUploadsForLog(ChatMessage message)
         {
@@ -274,14 +280,68 @@ namespace TensorSharp.Server
 
             var entries = new List<UploadLogEntry>();
 
-            string imageType = message.IsVideo ? "video_frame" : "image";
-            AppendUploadEntries(entries, message.ImagePaths, imageType);
+            AppendUploadEntries(entries, StillImages(message), "image");
+            AppendUploadEntries(entries, message.VideoFilePaths, "video");
+            AppendVideoFrameEntries(entries, message);
             AppendUploadEntries(entries, message.AudioPaths, "audio");
             AppendUploadEntries(entries, message.TextFilePaths, "text");
 
             return entries.Count == 0
                 ? "[]"
                 : JsonSerializer.Serialize(entries, FullInputJsonOptions);
+        }
+
+        /// <summary>Whether <paramref name="message"/>'s image <paramref name="index"/> is a sampled
+        /// video frame: a video message's images are, unless its
+        /// <see cref="ChatMessage.ImageTimestamps"/> leave that one untimed (a still image beside them).</summary>
+        private static bool IsVideoFrame(ChatMessage message, int index) =>
+            message.IsVideo && (message.ImageTimestamps == null
+                || (index < message.ImageTimestamps.Count && message.ImageTimestamps[index] != null));
+
+        /// <summary>The message's images that are not sampled video frames.</summary>
+        private static List<string> StillImages(ChatMessage message)
+        {
+            if (message.ImagePaths == null || !message.IsVideo)
+                return message.ImagePaths;
+            var stills = new List<string>();
+            for (int i = 0; i < message.ImagePaths.Count; i++)
+                if (!IsVideoFrame(message, i))
+                    stills.Add(message.ImagePaths[i]);
+            return stills;
+        }
+
+        private static int CountVideoFrames(ChatMessage message)
+        {
+            if (message.ImagePaths == null || !message.IsVideo)
+                return 0;
+            int frames = 0;
+            for (int i = 0; i < message.ImagePaths.Count; i++)
+                if (!string.IsNullOrEmpty(message.ImagePaths[i]) && IsVideoFrame(message, i))
+                    frames++;
+            return frames;
+        }
+
+        /// <summary>One <c>video_frames</c> entry per folder the frames are in, in order of first
+        /// appearance: the folder as its path, and how many frames it holds.</summary>
+        private static void AppendVideoFrameEntries(List<UploadLogEntry> sink, ChatMessage message)
+        {
+            if (message.ImagePaths == null || !message.IsVideo)
+                return;
+            var folders = new List<(string Folder, int Count)>();
+            for (int i = 0; i < message.ImagePaths.Count; i++)
+            {
+                string path = message.ImagePaths[i];
+                if (string.IsNullOrEmpty(path) || !IsVideoFrame(message, i))
+                    continue;
+                string folder = Path.GetDirectoryName(path) ?? string.Empty;
+                int at = folders.FindIndex(f => string.Equals(f.Folder, folder, StringComparison.Ordinal));
+                if (at < 0)
+                    folders.Add((folder, 1));
+                else
+                    folders[at] = (folder, folders[at].Count + 1);
+            }
+            foreach (var (folder, count) in folders)
+                sink.Add(new UploadLogEntry { Path = folder, MediaType = "video_frames", Count = count });
         }
 
         private static void AppendUploadEntries(List<UploadLogEntry> sink, List<string> paths, string mediaType)
@@ -379,6 +439,8 @@ namespace TensorSharp.Server
             public bool? ContentOmitted { get; init; }
             public bool? ContentTruncated { get; init; }
             public List<string> Images { get; init; }
+            public int? VideoFrames { get; init; }
+            public List<string> Videos { get; init; }
             public List<string> Audios { get; init; }
             public List<string> TextFiles { get; init; }
             public bool? IsVideo { get; init; }
@@ -391,6 +453,7 @@ namespace TensorSharp.Server
             public string Path { get; init; }
             public string Name { get; init; }
             public string MediaType { get; init; }
+            public int? Count { get; init; }
         }
     }
 
