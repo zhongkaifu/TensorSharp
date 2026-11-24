@@ -157,6 +157,17 @@ namespace TensorSharp.Runtime
             Math.Round(seconds, 1, MidpointRounding.ToEven).ToString("F1", CultureInfo.InvariantCulture);
 
         /// <summary>
+        /// One sampled frame's source time in the frame-times line: to the millisecond, without trailing zeros
+        /// (<c>0</c>, <c>0.5</c>, <c>0.471</c>). A sampled time is the frame's index over the probed rate, and a
+        /// probed rate is often a long fraction (a camera clip's <c>avg_frame_rate</c> of 266000/15669), whose
+        /// round-trip digits (<c>0.47124812030075186</c>) cost a frame about fourteen more digit tokens than a
+        /// millisecond needs and say nothing it does not. The pairing and the per-pair labels still read the
+        /// exact times.
+        /// </summary>
+        public static string FormatFrameTime(double seconds) =>
+            Math.Round(seconds, 3, MidpointRounding.ToEven).ToString("0.###", CultureInfo.InvariantCulture);
+
+        /// <summary>
         /// Append the message's vision placeholders in prompt order: one
         /// <c>&lt;|vision_start|&gt;&lt;|image_pad|&gt;&lt;|vision_end|&gt;</c> per still
         /// image, and per clip the timestamped per-pair blocks described on this class.
@@ -192,7 +203,7 @@ namespace TensorSharp.Runtime
                 void AppendFrameTime(int index)
                 {
                     if (!firstFrame) text.Append(", ");
-                    text.Append(message.ImageTimestamps![index]!.Value.ToString("R", CultureInfo.InvariantCulture));
+                    text.Append(FormatFrameTime(message.ImageTimestamps![index]!.Value));
                     firstFrame = false;
                 }
             }

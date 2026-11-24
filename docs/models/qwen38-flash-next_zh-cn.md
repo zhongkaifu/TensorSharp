@@ -172,7 +172,8 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
   不再多包一对分隔符——为每对一个 `<t seconds><|vision_start|><|video_pad|>…<|vision_end|>` 块，
   `t` 是该对的平均源时间（保留一位小数）。由于帧对的标签丢失了两帧各自的时间（且 `max_frames`
   上限可能选中不相邻的帧），这些块之前会有一行文本
-  `Sampled video frame times in chronological order: 0, 1, 2 seconds.`，列出全部采样源时间；逐对的
+  `Sampled video frame times in chronological order: 0, 1, 2 seconds.`，列出全部采样源时间，精确到毫秒（`0.471`，
+  而不是按探测帧率算出的 `0.47124812030075186`）；逐对的
   视觉 token 布局不变。一条消息里的两个 `video_url` part 渲染成两段片段。同一条消息里的静态图保留
   各自的 `<|image_pad|>` span，按附件顺序排列。
 - **编码缓存。** 帧对的 embedding 以两帧路径加片段尺寸为键缓存，任一帧文件的大小或时间戳变化

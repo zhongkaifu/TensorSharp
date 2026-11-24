@@ -261,7 +261,8 @@ Qwen-VL video layout takes over from there:
   pair's label loses its two frames' individual times (and a `max_frames` cap
   can select non-adjacent frames), the blocks are preceded by one text line,
   `Sampled video frame times in chronological order: 0, 1, 2 seconds.`, listing
-  every sampled source time; the per-pair vision-token layout is unchanged.
+  every sampled source time to the millisecond (`0.471`, not the probed rate's
+  `0.47124812030075186`); the per-pair vision-token layout is unchanged.
   Two `video_url` parts in one message render as two clips. Still images in the
   same message keep their `<|image_pad|>` spans, in attachment order.
 - **Encoding cache.** A pair's embedding is cached under both frame paths and

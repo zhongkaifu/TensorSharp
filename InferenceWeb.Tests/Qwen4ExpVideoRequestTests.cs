@@ -234,6 +234,30 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
     }
 
     [Fact]
+    public void FrameTimesLineListsEachTimeToTheMillisecond()
+    {
+        // A camera clip's probed rate (avg_frame_rate 266000/15669, 16.98 fps) sampled every eighth frame at
+        // 2 fps, as MediaHelper times them: index / rate, whose round-trip digits run to seventeen places.
+        const double rate = 266000.0 / 15669.0;
+        var times = new List<double?> { 0, 8 / rate, 16 / rate, 24 / rate, 1234.56789 };
+        var message = new ChatMessage
+        {
+            Role = "user", IsVideo = true,
+            ImagePaths = times.Select((_, i) => $"f{i}.png").ToList(),
+            ImageTimestamps = times,
+        };
+        var sb = new StringBuilder();
+        QwenVideoFrames.AppendPlaceholders(message, sb);
+        Assert.StartsWith("Sampled video frame times in chronological order: 0, 0.471, 0.942, 1.414, 1234.568 seconds.\n",
+            sb.ToString());
+        // The pairs and their labels still come from the exact times: 0 and 0.471 s pair, labelled 0.2.
+        Assert.Contains("<0.2 seconds>" + Start + VideoPad + End, sb.ToString());
+        Assert.Equal(new QwenVideoFrames.Group(0, 1, 4 / rate), QwenVideoFrames.Layout(message)[0].Groups![0]);
+        Assert.Equal("0.5", QwenVideoFrames.FormatFrameTime(0.5));
+        Assert.Equal("2", QwenVideoFrames.FormatFrameTime(2.0004));
+    }
+
+    [Fact]
     public void Layout_RejectsNegativeOrNonFiniteFrameTimes()
     {
         var message = new ChatMessage
