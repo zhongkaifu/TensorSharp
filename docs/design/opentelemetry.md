@@ -116,7 +116,7 @@ phase and per stage, and a span **event** per finished denoising step (§8).
 
 | Source or meter | Declared in | Spans or instruments |
 |---|---|---|
-| `TensorSharp.Inference` | Runtime | `chat <model>`, `text_completion <model>`, `embeddings <model>`, `prompt.render`, `prompt.media`, `inference.queue`, `inference.prefill`, `inference.decode`, `diffusion.denoise`, `inference.step` |
+| `TensorSharp.Inference` | Runtime | `chat <model>`, `text_completion <model>`, `embeddings <model>`, `prompt.render`, `prompt.media`, `inference.queue`, `inference.prefill`, `inference.decode`, `inference.speculation`, `diffusion.denoise`, `inference.step` |
 | `TensorSharp.Models` | Runtime | `model.load`, `model.unload` |
 | `TensorSharp.Media` | Runtime | `generate_video <model>` and its children, `generate_image <model>` |
 | `TensorSharp.Agent` | Runtime | `execute_tool <name>`, `codeexec.run` |
@@ -353,7 +353,8 @@ POST /v1/chat/completions          ASP.NET Core server span (SERVER)     -> App 
    │  └─ prompt.media              media preparation lock wait, encode and placement (§5.2)
    ├─ inference.queue              SubmittedAt -> FirstScheduledAt          ┐ built when the request
    ├─ inference.prefill            FirstScheduledAt -> FirstTokenAt         │ finishes, from the
-   └─ inference.decode             FirstTokenAt -> FinishedAt               ┘ scheduler's timestamps
+   ├─ inference.decode             FirstTokenAt -> FinishedAt               ┘ scheduler's timestamps
+   └─ inference.speculation        FirstTokenAt -> the engine finishing it  (speculation on; §5.2)
 ```
 
 - `<model>` is the model file name without directory or extension (`GenAiRequestTelemetry.ModelNameFromPath`).
@@ -394,6 +395,42 @@ The engine runs on its own worker thread, so its phases are not spans that threa
 - Wall time and compute time differ under continuous batching. Span durations are wall time;
   `PrefillElapsedTicks` / `DecodeElapsedTicks` go on the phase spans as `tensorsharp.compute.prefill_ms` /
   `tensorsharp.compute.decode_ms`.
+
+One engine span is the exception: `inference.speculation`, for a request that decoded speculatively
+(`SequenceState.SpecStats` with a verify or plain step). `InferenceEngine.LogSpeculationStatsIfAny`, which runs on
+the worker as the request finishes, starts it with `SpeculationTelemetry.Start` under
+`SequenceState.TelemetryContext` (none when that is default, so it is never a root), from `FirstTokenAt`, and writes
+the "Speculative decoding stats" line while it is current, so that line has the request's trace id (it had none, §7.1)
+and the counters can be queried without parsing it:
+
+- `tensorsharp.speculative.speculator` (`ISpeculator.Name`: `draft-head`, `block`, `ngram`) and `.draft_window`
+  (`SpeculativeExecution.MaxDraftTokens`), which `SpeculationStats.Speculator` and `.DraftWindow` keep;
+- `.tokens.drafted`, `.tokens.accepted`, `.acceptance` (0 to 1); `.steps.verify`, `.steps.plain`, `.steps.rollback`,
+  `.steps.parked` (the governor's parked steps during the request);
+- each phase's total in ms, as `SpeculationStats` defines the phases: `.phase.draft_ms`, `.verify_ms`, `.commit_ms`,
+  `.snapshot_ms`, `.rollback_ms`, `.catch_up_ms`, `.plain_ms` (per verify step is a phase over `.steps.verify`);
+- the cost governor's `.governor.plain_ms_per_token`, `.spec_ms_per_token`, `.wins`, `.losses`.
+
+It covers the same interval as `inference.decode`, which the host builds later, so the two are siblings. A failure
+to start it is logged at Debug and the line is written anyway. The line gains a last section,
+`| speculator name=<speculator> window=<n>`, after the ones the `eng/` scripts parse. Such a span has
+`tensorsharp.speculative.outcome=ran`.
+
+With speculation on (`BatchExecutor.Speculation.Enabled`), a request that decoded at least two tokens without a
+verify or plain step gets the span as well, from `SpeculationTelemetry.StartDeclined`:
+`tensorsharp.speculative.outcome=declined` and `tensorsharp.speculative.declined`, the
+`SequenceState.SpeculationDeclined` code (`SpeculationDeclineReason`). The code is the latest a step left:
+
+- `BatchExecutor.NoteSpeculationDeclined`, after each plan, copies the `Code` of the planner's
+  `SpeculativePerSequence` rejection to every sequence the step schedules: `adapter`, `no_trunk`, `no_draft_head`,
+  `refused_by_model`, `unprofitable`, `multi_sequence`, `paged_storage`, `pending_multimodal`, `fused_cache`;
+- arming sets `too_few_tokens` (fewer than two tokens asked for), `unavailable` (`SpeculatorRegistry.Create`
+  declined), `prefix_reuse` (an algorithm that cannot resume after a reused prefix) or `cannot_seed`;
+- `unknown` when none did.
+
+A sequence that speculates on another path anyway has stats, and its code is not reported. The engine counts every
+such request in `tensorsharp.speculative.requests`, `ran` with its speculator or `declined` with the code, and logs
+the decline at Debug only: the operator's sentence is the executor's once-only warning.
 
 ### 5.3 Preemption
 
@@ -458,7 +495,7 @@ GenAI semantic conventions, development status:
 | `gen_ai.request.model` | the model file name |
 | `gen_ai.request.max_tokens` | the `maxTokens` argument (`SamplingConfig.MaxTokens` is not read on this path) |
 | `tensorsharp.request.effective_max_tokens` | when fitting the prompt to the context lowered the budget |
-| `gen_ai.request.temperature`, `top_p`, `top_k`, `seed` | the effective `SamplingConfig` |
+| `gen_ai.request.temperature`, `top_p`, `top_k`, `seed` | the effective `SamplingConfig`; its floats as written (`GenAiRequestTelemetry.AsWritten`: 0.7, not the widened 0.699999988079071) |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | prompt tokens; generated tokens |
 | `gen_ai.usage.cache_read.input_tokens`, `tensorsharp.prefix_cache.reused_tokens` | prefix-cache reuse, when non-zero |
 | `gen_ai.response.finish_reasons` | the finish reason; absent after an engine error or an abandoned stream. When the CLI stops a generation itself because a stop sequence matched or a tool call ended the turn, it is `stop_sequence`, as on the server. |
@@ -514,7 +551,7 @@ The generation code in Chat cannot see the `HttpContext`, and Chat cannot refere
 | Span | Where | Notes |
 |---|---|---|
 | `embeddings <model>` | `EmbeddingAdapter.EmbedAsync` (`/v1/embeddings`, `/api/embed`) | One per request, around both the dispatcher path and `EmbedMediaAsync`. Not in `EmbeddingRequestDispatcher`, which batches several requests into one encoder call. `tensorsharp.embedding.inputs`; usage records the prompt tokens (and `output_tokens=0`). Refusals: `model_not_found` (404), `request_too_large` (413), `invalid_request`, `invalid_json`, `invalid_input`. |
-| `model.load` | `ModelService.LoadModelCore`, which both `LoadModel` (Web UI, `HostedModelGuard` reloads) and `LoadStartupModel` call; also `GgufKnowledgeEmbeddingProvider` | `tensorsharp.model.file` (file name, never a path), `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.model.mmproj_file`, `tensorsharp.model.startup_load`; after the load the architecture, the backend that actually loaded, `tensorsharp.tp.degree` and `tensorsharp.layer_split.degree` when above 1. The distributed no-op is `tensorsharp.model.load.skipped` and records no duration. A refusal (`ModelLoadRefusal.IsRefusal`) is `refused`, cancellation `cancelled`, anything else `failed`; refused and failed both set Error status, because the requested model is not loaded. The span is current during the load, so the loader's log lines are in its trace. |
+| `model.load` | `ModelService.LoadModelCore`, which both `LoadModel` (Web UI, `HostedModelGuard` reloads) and `LoadStartupModel` call; also `GgufKnowledgeEmbeddingProvider` | `tensorsharp.model.file` (file name, never a path), `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.model.mmproj_file`, `tensorsharp.model.startup_load`; after the load the architecture, the backend that actually loaded, `tensorsharp.tp.degree` and `tensorsharp.layer_split.degree` when above 1, and for a model that drafts `tensorsharp.model.draft_head` (`per_token`, `block`: `IDraftHead.DraftHeadKind`) with `tensorsharp.model.draft_file` when the drafter came from its own GGUF (`ModelLifecycleService.LoadedDraftHeadFile`, a file name). The distributed no-op is `tensorsharp.model.load.skipped` and records no duration. A refusal (`ModelLoadRefusal.IsRefusal`) is `refused`, cancellation `cancelled`, anything else `failed`; refused and failed both set Error status, because the requested model is not loaded. The span is current during the load, so the loader's log lines are in its trace. |
 | `model.unload` | `ModelService.UnloadModelCore`, when a model was loaded | No metric. |
 | `diffusion.denoise` | `DiffusionChatStreamCoreAsync` | One per request, from `scheduler.Submit` to its result, with a `preview` span event per preview (`tensorsharp.diffusion.block`, `.step`, `.total_steps`) and `tensorsharp.diffusion.previews`. The scheduler batches requests, so there is no span per denoising step. |
 | `chat <model>` for Jev | `ModelService.JevAsync` → `TraceJevAsync` | `POST /v1/systemone` drives DiffusionGemma through `JevInference.Run` and bypasses the pipeline. The span starts before the execution gate, so queueing counts. Usage comes from a callback with the same totals as the response. Refusals: `invalid_request`, `model_not_found`, `model_unavailable`, `queue_full`. |
@@ -606,12 +643,13 @@ latency in one bucket.
 | `tensorsharp.kv_cache.blocks.used`, `.total` | observable gauge, `{block}` | `PoolStats`: used = total − free (blocks the prefix cache can evict count as free) |
 | `tensorsharp.engine.step.duration` | histogram, s (0.001 … 5.12) | per step that ran, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram, `{sequence}` (1 … 256) | `ScheduledWork.Count`, `tensorsharp.engine.step_kind` |
-| `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | the `SpeculationStats` increment sites (below) |
+| `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | the `SpeculationStats` increment sites (below), `tensorsharp.speculative.speculator` |
+| `tensorsharp.speculative.requests` | counter, `{request}` | `InferenceEngine.RecordSpeculationOutcome`, once a request that finished while speculation was on: `tensorsharp.speculative.outcome`, with `.speculator` (ran) or `.declined` (§5.2) |
 | `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` (16 … 65536) | per step with prompt work: the `IsPrefill` work items' `NumScheduledTokens`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.inter_token.duration` | histogram, s (0.005 … 30) | per output token after a sequence's first: the time since `SequenceState.LastTokenTimestamp`, a multi-token step's time split evenly, `tensorsharp.engine.step_kind` of the step that emitted it |
 | `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | the scheduler's "Radix prompt reuse" admission log site, `tensorsharp.prefix_cache.outcome` and `.source` |
 | `tensorsharp.engine.step.phase.duration` | histogram, s (0.0001 … 1.024) | `BatchExecutor`'s batched decode paths (pipelined groups and one batched step): the host's `finish`, `sample` and `issue` parts; the unified step (the shared decoder runtime): its decoders' draws (`sample`, `.rows` = decoders) and its forward (`issue`, `.rows` = every row it ran, prompt chunks included); `tensorsharp.engine.step.phase`, `.rows` |
-| `tensorsharp.speculative.accepted_length` | histogram, `{token}` (0 … 8) | the same sites as the drafted and accepted counters, one value a verify window, `tensorsharp.speculative.drafted` |
+| `tensorsharp.speculative.accepted_length` | histogram, `{token}` (0 … 8) | the same sites as the drafted and accepted counters, one value a verify window, `tensorsharp.speculative.speculator`, `tensorsharp.speculative.drafted` |
 | `tensorsharp.slots*`, `tensorsharp.cuda_graph.*`, `tensorsharp.engine.forward.issue_time`, `.wait_time`, `tensorsharp.engine.lane.steps`, `.rows`, `.time` | observable gauges and counters | `IServingTelemetrySource.ReadServingTelemetry()` of a registered engine's model (no model implements it since the Qwen 3.8 Flash Next direct-CUDA engine was removed) |
 
 All carry `tensorsharp.model.architecture`.
@@ -763,7 +801,8 @@ An OpenTelemetry logger provider is added beside the console and file loggers.
 - Trace and span ids come from `Activity.Current` where the line is written: usually the server span. `model.load` is
   current during a load; the video helper makes the phase span current for its own line (§8.9); the Studio job span is
   current while a job runs. Lines written on the engine worker, the diffusion worker or the MLX worker carry none, and
-  no `tensorsharp.request_id` either: those workers clear `TelemetryContext` (§5.4).
+  no `tensorsharp.request_id` either: those workers clear `TelemetryContext` (§5.4). The exception is the engine's
+  "Speculative decoding stats" line, written under the request's `inference.speculation` span (§5.2).
 - Over OTLP the `EventId` name is exported as the record's event name; its numeric id only with
   `OTEL_DOTNET_EXPERIMENTAL_OTLP_EMIT_EVENT_LOG_ATTRIBUTES=true`. Azure Monitor gets `EventId` and `EventName`.
 - The video request lines, which all used `UploadReceived`, have their own ids: `VideoGenerateStarted` (1640),

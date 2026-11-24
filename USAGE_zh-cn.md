@@ -2329,7 +2329,9 @@ Information 级别日志。只需对日志文件做一次 grep，即可获得紧
 此完成日志可以同时看到推理过程与最终用户可见结果。输入正文会刻意限制长度：
 无损上传的文档不会再被完整复制到日志中，从而避免额外内存/IO 峰值和意外泄露
 文档内容。上传清单与 `contentChars` 仍保留可用的审计元数据；如需逐字节重放，
-请另行捕获请求。设置 `TENSORSHARP_LOG_LEVEL=Warning` 可关闭逐轮信息日志。
+请另行捕获请求。视频的采样帧只计数、不逐个列出：上传清单列出视频文件（`"mediaType":"video"`），
+帧所在的每个文件夹各一条 `"mediaType":"video_frames"` 记录并带 `count`，`fullInput` 中该消息带
+`videoFrames` 和 `videos`。设置 `TENSORSHARP_LOG_LEVEL=Warning` 可关闭逐轮信息日志。
 
 `fullInput` 字段示例（为便于阅读做了缩进，实际日志为单行）：
 
@@ -2476,7 +2478,8 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
    │  └─ prompt.media          图片、视频帧和音频经过编码器；tensorsharp.media.*
    ├─ inference.queue          等待调度器
    ├─ inference.prefill        直到生成第一个 token；tensorsharp.compute.prefill_ms
-   └─ inference.decode         其余部分；tensorsharp.compute.decode_ms
+   ├─ inference.decode         其余部分；tensorsharp.compute.decode_ms
+   └─ inference.speculation    投机解码开启时与 decode 并列：tensorsharp.speculative.*
 ```
 
 - `<model>` 是不含目录和扩展名的模型文件名。`tensorsharp.request_id` 就是服务端返回的
@@ -2490,6 +2493,18 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
   `tensorsharp.prefill.tokens_per_second` 是它除以从请求首次被调度到第一个 token 的时间，
   `tensorsharp.decode.tokens_per_second` 是第一个 token 之后的 token 数除以之后的时间：即本请求实际得到的速度，
   便于按提示词长度或同时运行的请求数拆分。区间为空的速率不记录。
+- 走了投机解码（MTP/NextN、DFlash 草稿模型、n-gram）的请求还有一个 `inference.speculation`，时间范围与
+  `inference.decode` 相同。它记录草稿器（`tensorsharp.speculative.speculator`：`draft-head`、`block` 或
+  `ngram`）及其窗口（`.draft_window`）；起草与接受的 token（`.tokens.drafted`、`.tokens.accepted`、
+  `.acceptance`）；验证、普通、回滚与暂停的步数（`.steps.*`）；各阶段总耗时（`.phase.draft_ms`、`.verify_ms`、
+  `.commit_ms`、`.snapshot_ms`、`.rollback_ms`、`.catch_up_ms`、`.plain_ms`）；以及代价调控器的测量值
+  （`.governor.plain_ms_per_token`、`.spec_ms_per_token`、`.wins`、`.losses`）。引擎的 "Speculative decoding
+  stats" 日志行就在这个 span 下写出，因此位于该请求的 trace 中。其 `tensorsharp.speculative.outcome` 为 `ran`。
+- 投机解码开启时，解码了两个及以上 token 却没有走投机解码的请求也有一个 `inference.speculation` span，
+  `tensorsharp.speculative.outcome=declined`，原因记在 `tensorsharp.speculative.declined`：`unavailable`
+  （所选算法无法服务该模型）、`no_draft_head`、`no_trunk`、`refused_by_model`、`unprofitable`、
+  `multi_sequence`、`paged_storage`、`pending_multimodal`、`fused_cache`、`adapter`、`prefix_reuse`、
+  `cannot_seed`、`too_few_tokens`，没有任何步骤记下原因时为 `unknown`。
 - Ollama 的 `/api/generate` 为 `text_completion <model>`。嵌入请求（`/v1/embeddings`、`/api/embed`）为
   `embeddings <model>`，带 `tensorsharp.embedding.inputs`。
 - 带图片、视频或音频的提示词在 `prompt.render` 下有一个 `prompt.media`：等待媒体准备锁的时间
@@ -2505,7 +2520,9 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
   工具运行命令时其下还有一个 `codeexec.run` span（`tensorsharp.codeexec.shell`、`.sandbox`、
   `.exit_code`、`.timed_out`、`.output_bytes`）。
 - 模型加载为 `model.load`（`tensorsharp.model.file`、`gen_ai.request.model`、`tensorsharp.backend`、
-  `tensorsharp.model.architecture`、大于 1 时的张量并行与按层切分度数，以及结果），启动时的加载也包括在内；
+  `tensorsharp.model.architecture`、大于 1 时的张量并行与按层切分度数、模型带草稿头时的草稿器
+  （`tensorsharp.model.draft_head`：`per_token` 或 `block`；从单独 GGUF 挂载的还有 `tensorsharp.model.draft_file`），
+  以及结果），启动时的加载也包括在内；
   卸载为 `model.unload`。
 - TensorSharp 自己发起的模型调用带有 `tensorsharp.internal=true` 和 `tensorsharp.origin`：启动预热为
   `prefix-cache-warmup`，CLI 的 `--warmup-runs` 预热轮为 `warmup`，知识库为 `knowledge-rerank` 和
@@ -2595,7 +2612,7 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 | `tensorsharp.engine.lane.steps` | counter，`{step}` | `tensorsharp.model.architecture`、`tensorsharp.engine.lane.finish`（`ready`：主机回来取 logits 时 GPU 已完成，瓶颈在主机；`waited`：瓶颈在 GPU）；只有同时保持两个解码组在途的模型（`IPipelinedBatchedDecode`）才记录，自直连引擎移除后没有这样的模型 |
 | `tensorsharp.engine.lane.rows` | counter，`{row}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.lane.time` | counter，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.lane.state`（`issue`、`wait`、`idle`）；各解码通道上主机下发、等待以及通道空闲的时间之和 |
-| `tensorsharp.speculative.accepted_length` | histogram，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.drafted`；一个验证窗口保留的草稿 token 数 |
+| `tensorsharp.speculative.accepted_length` | histogram，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.speculator`、`tensorsharp.speculative.drafted`；一个验证窗口保留的草稿 token 数 |
 | `tensorsharp.slots` | gauge，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.state`（`running`、`retained`）；`tensorsharp.slots*`、`tensorsharp.cuda_graph.*` 与 `forward.issue_time` / `.wait_time` 来自自带序列 slot 并上报它们的模型（`IServingTelemetrySource`），唯一的这类模型是已移除的 Qwen3.8-Flash-Next 直连 CUDA 引擎，目前没有模型上报 |
 | `tensorsharp.slots.memory` / `.capacity` | gauge，`By` / `{token}` | `tensorsharp.model.architecture` |
 | `tensorsharp.slots.grows`、`.grow_failures` | counter | `tensorsharp.model.architecture` |
@@ -2609,7 +2626,8 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 | `tensorsharp.engine.steps` | counter，`{step}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.forward.time` | counter，`s` | `tensorsharp.model.architecture` |
 | `tensorsharp.kv_cache.blocks.used`、`.total` | gauge，`{block}` | `tensorsharp.model.architecture` |
-| `tensorsharp.speculative.tokens.drafted`、`.accepted` | counter，`{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.speculative.tokens.drafted`、`.accepted` | counter，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.speculator` |
+| `tensorsharp.speculative.requests` | counter，`{request}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.outcome`（`ran`、`declined`），以及 `tensorsharp.speculative.speculator`（ran）或 `tensorsharp.speculative.declined`（declined）；投机解码开启时结束的请求 |
 | `tensorsharp.model.load.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.outcome`、`error.type` |
 | `tensorsharp.tool.duration` | histogram，`s` | `gen_ai.tool.name`、`tensorsharp.outcome`、`error.type` |
 | `tensorsharp.image.generation.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.image.mode`、`tensorsharp.backend`、`tensorsharp.outcome`、`error.type` |

@@ -131,6 +131,19 @@ namespace TensorSharp.Server
         /// </summary>
         public bool DraftHeadRefusedByModel { get; private set; }
 
+        /// <summary>
+        /// The file name of the drafter attached from its own GGUF (TS_SPEC_DRAFT_MODEL: a DFlash
+        /// block drafter, Gemma 4's assistant head), or null when none was. A checkpoint that
+        /// carries its own head (MTP/NextN) needs none; <see cref="LoadedDraftHeadKind"/> covers both.
+        /// </summary>
+        public string LoadedDraftHeadFile { get; private set; }
+
+        /// <summary>How the loaded model drafts, with its own head or an attached one:
+        /// <see cref="TensorSharp.Runtime.Speculative.DraftHeadKind.None"/> when it carries no drafter.</summary>
+        public TensorSharp.Runtime.Speculative.DraftHeadKind LoadedDraftHeadKind =>
+            (Volatile.Read(ref _model) as TensorSharp.Runtime.Speculative.IDraftHead)?.DraftHeadKind
+            ?? TensorSharp.Runtime.Speculative.DraftHeadKind.None;
+
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
         public string LoadedMmProjName => _loadedMmProjPath != null ? Path.GetFileName(_loadedMmProjPath) : null;
@@ -329,6 +342,7 @@ namespace TensorSharp.Server
             _loadedMmProjPath = null;
             DraftHeadActivationError = null;
             DraftHeadRefusedByModel = false;
+            LoadedDraftHeadFile = null;
             LoadedTensorParallelDegree = 1;
             LoadedLayerSplitDegree = 1;
             if (outgoing != null)
@@ -433,6 +447,7 @@ namespace TensorSharp.Server
                 }
                 else if (SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath() is { } attachedDraft)
                 {
+                    LoadedDraftHeadFile = Path.GetFileName(attachedDraft);
                     _logger.LogInformation("Loaded draft head {Draft} (HasDraftHead=True)",
                         Path.GetFileName(attachedDraft));
                 }
@@ -502,6 +517,7 @@ namespace TensorSharp.Server
                 _loadedMmProjPath = null;
                 DraftHeadActivationError = null;
                 DraftHeadRefusedByModel = false;
+                LoadedDraftHeadFile = null;
                 LoadedTensorParallelDegree = 1;
                 LoadedLayerSplitDegree = 1;
                 throw;

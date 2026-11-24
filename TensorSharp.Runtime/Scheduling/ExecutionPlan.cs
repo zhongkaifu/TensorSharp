@@ -99,8 +99,9 @@ namespace TensorSharp.Runtime.Scheduling
 
     /// <summary>A path that was considered but not selected, with the reason —
     /// makes "why did the engine not take the fast path?" a logged fact
-    /// instead of archaeology.</summary>
-    public sealed record ExecutionPathRejection(ExecutionPathKind Path, string Reason)
+    /// instead of archaeology. <paramref name="Code"/> is a stable short form for
+    /// telemetry (for the speculative path, a <see cref="SpeculationDeclineReason"/>).</summary>
+    public sealed record ExecutionPathRejection(ExecutionPathKind Path, string Reason, string? Code = null)
     {
         public override string ToString() => $"{Path}: {Reason}";
     }

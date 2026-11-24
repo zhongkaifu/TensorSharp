@@ -144,6 +144,17 @@ namespace TensorSharp.Runtime.Telemetry
         public const string LaneState = "tensorsharp.engine.lane.state";
         /// <summary>Tokens a speculator drafted for one verify window.</summary>
         public const string SpeculativeDrafted = "tensorsharp.speculative.drafted";
+        /// <summary>The speculation algorithm that drafted (<c>draft-head</c> for a per-token head such as
+        /// MTP/NextN, <c>block</c> for a block drafter such as DFlash, <c>ngram</c>), on the speculation
+        /// metrics and on the <c>inference.speculation</c> span.</summary>
+        public const string Speculator = "tensorsharp.speculative.speculator";
+        /// <summary>Whether a request that finished while speculation was on speculated: <c>ran</c> or
+        /// <c>declined</c>, on <c>tensorsharp.speculative.requests</c> and <c>inference.speculation</c>.</summary>
+        public const string SpeculativeOutcome = "tensorsharp.speculative.outcome";
+        /// <summary>Why a request did not speculate (a <c>SpeculationDeclineReason</c>), with outcome <c>declined</c>.</summary>
+        public const string SpeculativeDeclined = "tensorsharp.speculative.declined";
+        public const string SpeculativeOutcomeRan = "ran";
+        public const string SpeculativeOutcomeDeclined = "declined";
         /// <summary>A step's rows, bucketed: <c>1</c>, <c>2-4</c>, <c>5-8</c>, <c>9-16</c>, <c>17+</c>.</summary>
         public const string RowsBucket = "tensorsharp.engine.rows";
         /// <summary>Request span: output tokens a second after the first token.</summary>
