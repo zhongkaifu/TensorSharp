@@ -5,8 +5,12 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda/common.cuh"
+#include <cublasLt.h>
+#include <algorithm>
 #include <atomic>
 #include <climits>
+#include <mutex>
+#include <unordered_map>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -865,4 +869,188 @@ bool tsg_vision_mma_supported(ggml_backend_t backend) {
     int major = 0;
     return cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, context->device) == cudaSuccess
         && major >= 8;
+}
+
+namespace {
+__global__ void narrow_rows_f16(const char * x, size_t row_bytes, int64_t k_dim, int64_t count, __half * out) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += int64_t(blockDim.x) * gridDim.x) {
+        const int64_t t = i / k_dim, k = i - t * k_dim;
+        out[i] = __float2half_rn(reinterpret_cast<const float *>(x + t * row_bytes)[k]);
+    }
+}
+
+__device__ __forceinline__ float linear_gelu_tanh(float v) {
+    return 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+}
+
+// The fallback's epilogues, for a GPU whose cuBLASLt has no kernel with the bias / GELU epilogue.
+__global__ void linear_epilogue_f32(float * y, const float * bias, const float * residual, int64_t n_dim, int64_t count) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += int64_t(blockDim.x) * gridDim.x) {
+        float v = y[i];
+        if (bias != nullptr) v += bias[i % n_dim];
+        if (residual != nullptr) v += residual[i];
+        y[i] = v;
+    }
+}
+
+__global__ void linear_epilogue_gelu_f16(__half * y, const __half * bias, int64_t n_dim, int64_t count) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += int64_t(blockDim.x) * gridDim.x) {
+        float v = __half2float(y[i]);
+        if (bias != nullptr) v += __half2float(bias[i % n_dim]);
+        y[i] = __float2half_rn(linear_gelu_tanh(v));
+    }
+}
+
+int linear_blocks(int64_t count) { return int(std::min<int64_t>((count + 255) / 256, 65535)); }
+
+// One cuBLAS / cuBLASLt handle pair and a 32 MiB workspace per device (with only cuBLAS's default workspace the
+// fastest kernels are left out), and one cuBLASLt plan per shape. ggml-cuda's own handles sit past members of its context
+// that this translation unit cannot address (see tsg_msa_cuda_compute), so the linear keeps its own.
+constexpr size_t kLinearF16Workspace = size_t(32) << 20;
+
+struct LinearPlanKey {
+    int device; int64_t k, n, t, ldx; int flags;
+    bool operator==(const LinearPlanKey & o) const {
+        return device == o.device && k == o.k && n == o.n && t == o.t && ldx == o.ldx && flags == o.flags;
+    }
+};
+struct LinearPlanHash {
+    size_t operator()(const LinearPlanKey & key) const {
+        size_t h = std::hash<int64_t>()(key.k);
+        const int64_t rest[] = {key.n, key.t, key.ldx, int64_t(key.flags), int64_t(key.device)};
+        for (int64_t v : rest) h = h * 1000003u ^ std::hash<int64_t>()(v);
+        return h;
+    }
+};
+struct LinearPlan {
+    bool lt = false;   // false: the plain-cuBLAS fallback
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+};
+struct LinearState {
+    std::mutex mu;
+    cublasHandle_t blas[GGML_CUDA_MAX_DEVICES] = {};
+    cublasLtHandle_t lt[GGML_CUDA_MAX_DEVICES] = {};
+    void * workspace[GGML_CUDA_MAX_DEVICES] = {};
+    std::unordered_map<LinearPlanKey, LinearPlan, LinearPlanHash> plans;
+};
+LinearState & linear_state() { static LinearState s; return s; }
+
+enum : int { kLinearBias = 1, kLinearResidual = 2, kLinearGelu = 4 };
+
+// Caller holds the state's lock.
+LinearPlan & linear_plan(LinearState & s, const LinearPlanKey & key) {
+    auto found = s.plans.find(key);
+    if (found != s.plans.end()) return found->second;
+    LinearPlan plan;
+    const bool gelu = (key.flags & kLinearGelu) != 0, bias = (key.flags & kLinearBias) != 0;
+    const cudaDataType_t out_type = gelu ? CUDA_R_16F : CUDA_R_32F;
+    bool ok = cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS;
+    const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+    const cublasLtEpilogue_t epilogue = gelu ? (bias ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_GELU)
+                                             : bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
+    // A GELU epilogue writing F16 takes an F16 bias; the F32 results take the F32 bias as it is.
+    const cudaDataType_t bias_type = gelu ? CUDA_R_16F : CUDA_R_32F;
+    ok = ok && cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)) == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)) == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)) == CUBLAS_STATUS_SUCCESS
+            && (!bias || cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type,
+                                                        sizeof(bias_type)) == CUBLAS_STATUS_SUCCESS)
+            && cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_16F, key.k, key.n, key.k) == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_16F, key.k, key.t, key.ldx) == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatrixLayoutCreate(&plan.c, out_type, key.n, key.t, key.n) == CUBLAS_STATUS_SUCCESS;
+    cublasLtMatmulPreference_t preference = nullptr;
+    ok = ok && cublasLtMatmulPreferenceCreate(&preference) == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                    &kLinearF16Workspace, sizeof(kLinearF16Workspace)) == CUBLAS_STATUS_SUCCESS;
+    cublasLtMatmulHeuristicResult_t result{};
+    int found_algos = 0;
+    ok = ok && cublasLtMatmulAlgoGetHeuristic(s.lt[key.device], plan.op, plan.a, plan.b, plan.c, plan.c, preference, 1,
+                                              &result, &found_algos) == CUBLAS_STATUS_SUCCESS && found_algos > 0;
+    if (preference != nullptr) cublasLtMatmulPreferenceDestroy(preference);
+    plan.lt = ok;
+    if (ok) plan.algo = result.algo;
+    return s.plans.emplace(key, plan).first->second;
+}
+} // namespace
+
+void tsg_linear_f16_cuda_compute(ggml_tensor * dst, ggml_backend_t backend) {
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    const int device = context->device;
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    CUDA_CHECK(cudaSetDevice(device));
+    const cudaStream_t stream = context->stream(device, 0);
+    ggml_custom_op_params params;
+    std::memcpy(&params, dst->op_params, sizeof(params));
+    const auto & d = *static_cast<const tsg_dsv4_fused_desc *>(params.userdata);
+    const bool has_bias = d.i0 != 0, has_residual = d.i1 != 0, gelu = d.i2 != 0;
+    const ggml_tensor * w = dst->src[0], * x = dst->src[1];
+    int arg = 2;
+    const ggml_tensor * bias = has_bias ? dst->src[arg++] : nullptr;
+    const ggml_tensor * residual = has_residual ? dst->src[arg++] : nullptr;
+    const int64_t k_dim = w->ne[0], n_dim = w->ne[1], tokens = x->ne[1];
+    const bool x_f32 = x->type == GGML_TYPE_F32;
+    const auto sizes = tsg_linear_f16_sizes(k_dim, n_dim, tokens, x_f32, gelu);
+    GGML_ASSERT(ggml_nbytes(dst) >= sizes.out_bytes + sizes.x16_bytes + sizes.bias16_bytes &&
+                "tsg_linear_f16: node was not built by it");
+    char * scratch = static_cast<char *>(dst->data) + sizes.out_bytes;
+
+    // Operands: x as F16 rows (narrowed into the node's scratch when it is F32), and with gelu the bias as F16.
+    const void * xh = x->data;
+    int64_t ldx = int64_t(x->nb[1] / sizeof(__half));
+    if (x_f32) {
+        auto * narrowed = reinterpret_cast<__half *>(scratch);
+        const int64_t count = tokens * k_dim;
+        narrow_rows_f16<<<linear_blocks(count), 256, 0, stream>>>(static_cast<const char *>(x->data), x->nb[1], k_dim,
+                                                                  count, narrowed);
+        CUDA_CHECK(cudaGetLastError());
+        xh = narrowed;
+        ldx = k_dim;
+        scratch += sizes.x16_bytes;
+    }
+    const void * bias_ptr = bias != nullptr ? bias->data : nullptr;
+    if (gelu && bias != nullptr) {
+        auto * bias16 = reinterpret_cast<__half *>(scratch);
+        narrow_rows_f16<<<linear_blocks(n_dim), 256, 0, stream>>>(static_cast<const char *>(bias->data), 0, n_dim, n_dim,
+                                                                  bias16);
+        CUDA_CHECK(cudaGetLastError());
+        bias_ptr = bias16;
+    }
+
+    LinearState & s = linear_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (s.blas[device] == nullptr) {
+        CUBLAS_CHECK(cublasCreate(&s.blas[device]));
+        CUBLAS_CHECK(cublasLtCreate(&s.lt[device]));
+        CUDA_CHECK(cudaMalloc(&s.workspace[device], kLinearF16Workspace));
+    }
+    const int flags = (has_bias ? kLinearBias : 0) | (has_residual ? kLinearResidual : 0) | (gelu ? kLinearGelu : 0);
+    LinearPlan & plan = linear_plan(s, {device, k_dim, n_dim, tokens, ldx, flags});
+    const float one = 1.0f, zero = 0.0f;
+    const float beta = has_residual ? 1.0f : 0.0f;
+    const void * c = has_residual ? residual->data : dst->data;
+    if (plan.lt) {
+        if (has_bias)
+            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr)));
+        CUBLAS_CHECK(cublasLtMatmul(s.lt[device], plan.op, &one, w->data, plan.a, xh, plan.b, &beta, c, plan.c, dst->data,
+                                    plan.c, &plan.algo, s.workspace[device], kLinearF16Workspace, stream));
+        return;
+    }
+    // Plain cuBLAS (F32 or, with gelu, F16 results) and the epilogue as its own kernel.
+    CUBLAS_CHECK(cublasSetStream(s.blas[device], stream));
+    // cublasSetStream resets the workspace to cuBLAS's default pool, so the workspace is set after it.
+    CUBLAS_CHECK(cublasSetWorkspace(s.blas[device], s.workspace[device], kLinearF16Workspace));
+    CUBLAS_CHECK(cublasGemmEx(s.blas[device], CUBLAS_OP_T, CUBLAS_OP_N, int(n_dim), int(tokens), int(k_dim), &one,
+        w->data, CUDA_R_16F, int(k_dim), xh, CUDA_R_16F, int(ldx), &zero,
+        dst->data, gelu ? CUDA_R_16F : CUDA_R_32F, int(n_dim), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    const int64_t count = n_dim * tokens;
+    if (gelu)
+        linear_epilogue_gelu_f16<<<linear_blocks(count), 256, 0, stream>>>(static_cast<__half *>(dst->data),
+            static_cast<const __half *>(bias_ptr), n_dim, count);
+    else if (has_bias || has_residual)
+        linear_epilogue_f32<<<linear_blocks(count), 256, 0, stream>>>(static_cast<float *>(dst->data),
+            static_cast<const float *>(bias_ptr), has_residual ? static_cast<const float *>(residual->data) : nullptr,
+            n_dim, count);
+    CUDA_CHECK(cudaGetLastError());
 }

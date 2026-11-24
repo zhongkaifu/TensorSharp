@@ -78,6 +78,10 @@ enum tsg_dsv4_fused_kind : int32_t
     // TSG_ATTN_VISION_F32 on tensor cores: F16 Q/K/V operands, F32 scores,
     // softmax and output. Same inputs and output layout.
     TSG_ATTN_VISION_MMA         = 28,
+    // A vision-tower linear on tensor cores (tsg_linear_f16): src F16 w [K, N], F32 x [K, T] -> dst F32 1-D, the
+    // [N, T] product followed by the F16 copy of x it multiplies. CUDA runs desc.cuda_compute (cuBLAS, F32
+    // accumulation); the CPU backend runs the node's own F32 reference.
+    TSG_VISION_LINEAR_F16       = 29,
 };
 
 #define TSG_DSV4_FUSED_MAGIC 0x5453445356344655ull  // "TSDSV4FU"

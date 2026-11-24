@@ -125,14 +125,16 @@ sampling (temperature 0.7, top_p 0.8, top_k 20):
 
 | | TensorSharp | vLLM |
 |---|---|---|
-| First token, a clip not seen before | 8.7-11.0 s | 4.2-4.7 s |
-| First token, another question about the same clip (TensorSharp reuses the tower output, vLLM the decoded frames) | 5.2-6.4 s | 3.0-3.4 s |
-| Decode after a 12K-token video prompt | 60-67 tok/s | 78 tok/s |
+| First token, a clip not seen before | 7.9-8.0 s (10.1 s for the first clip after start-up) | 4.2-4.7 s |
+| First token, another question about the same clip (TensorSharp reuses the sampled frames and the tower output, vLLM the decoded frames) | 4.3-4.7 s | 3.0-3.4 s |
+| Decode after a 12K-token video prompt | 64-66 tok/s | 78 tok/s |
 | Decode after a short text prompt | 98 tok/s | — |
 
-A new clip's 12.5K-token prompt spends about 1.2 s in frame extraction, 0.3 s decoding the frames, 3.3 s in the tower
-(34 pairs of 1,400 patches) and 5 s in prefill. On 15 short questions about the clips, checked against answers written
-from the frames beforehand, TensorSharp answered 11 right, 1 partly and 3 wrong, vLLM 10, 3 and 2.
+A new clip's 12.5K-token prompt spends about 1.2 s in frame extraction, 0.3 s decoding the frames, 2.2 s in the tower
+(34 pairs of 1,400 patches; 3.3 s with F32 linears) and 4-5 s in prefill. The prefill is ggml's: llama.cpp b12030 takes
+2.9 s for an 11.3K-token text prompt on the same GGUF where TensorSharp takes 3.5 s, and vLLM's AWQ kernels are faster
+still. On 15 short questions about the clips, checked against answers written from the frames beforehand, TensorSharp
+answered 11 right, 2 partly and 2 wrong, vLLM 10, 3 and 2.
 
 `top_k` 0 (no limit) samples over the whole 151,936-token vocabulary on the host and drops decode to about 42 tok/s;
 vLLM's default is the checkpoint's `top_k` 20.

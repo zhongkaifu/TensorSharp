@@ -326,6 +326,40 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         return count;
     }
 
+    [Fact]
+    public void TheSameClipAgainReusesItsSampledFramesUntilTheyAreGone()
+    {
+        var uploads = new UploadStoragePolicy(_directory);
+        static JsonDocument Request(int fps) => JsonDocument.Parse(
+            "[{\"role\":\"user\",\"content\":[{\"type\":\"video_url\",\"video_url\":{\"url\":\"data:video/mp4;base64,AQIDBA==\"," +
+            $"\"fps\":{fps},\"max_frames\":3}}}},{{\"type\":\"text\",\"text\":\"What happens?\"}}]}}]");
+        ChatMessage Parse(int fps)
+        {
+            using var json = Request(fps);
+            return Assert.Single(ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: "qwen3vlmoe"));
+        }
+
+        ChatMessage first = Parse(1);
+        Assert.Equal(new[] { 0, 2, 4 }, _decoder.Requested);
+        ChatMessage again = Parse(1);
+        // A follow-up turn resends the clip: its frames come back without another decode.
+        Assert.Equal(new[] { 0, 2, 4 }, _decoder.Requested);
+        Assert.Equal(first.ImagePaths, again.ImagePaths);
+        Assert.Equal(first.ImageTimestamps, again.ImageTimestamps);
+        Assert.Equal(first.VideoFilePaths, again.VideoFilePaths);
+        Assert.True(again.IsVideo);
+
+        // Other sampling is another clip.
+        Parse(2);
+        Assert.Equal(6, _decoder.Requested.Count);
+
+        // Frames a cleanup removed are sampled again.
+        File.Delete(first.ImagePaths![0]);
+        ChatMessage resampled = Parse(1);
+        Assert.Equal(9, _decoder.Requested.Count);
+        Assert.All(resampled.ImagePaths!, path => Assert.True(File.Exists(path)));
+    }
+
     private sealed class FakeDecoder : IVideoDecoder
     {
         public List<int> Requested = new();
