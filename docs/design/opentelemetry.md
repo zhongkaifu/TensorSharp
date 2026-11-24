@@ -448,7 +448,7 @@ GenAI semantic conventions, development status:
 | `gen_ai.request.model` | the model file name |
 | `gen_ai.request.max_tokens` | the `maxTokens` argument (`SamplingConfig.MaxTokens` is not read on this path) |
 | `tensorsharp.request.effective_max_tokens` | when fitting the prompt to the context lowered the budget |
-| `gen_ai.request.temperature`, `top_p`, `top_k`, `seed` | the effective `SamplingConfig` |
+| `gen_ai.request.temperature`, `top_p`, `top_k`, `seed` | the effective `SamplingConfig`; its floats as written (`GenAiRequestTelemetry.AsWritten`: 0.7, not the widened 0.699999988079071) |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | prompt tokens; generated tokens |
 | `gen_ai.usage.cache_read.input_tokens`, `tensorsharp.prefix_cache.reused_tokens` | prefix-cache reuse, when non-zero |
 | `gen_ai.response.finish_reasons` | the finish reason; absent after an engine error or an abandoned stream. When the CLI stops a generation itself because a stop sequence matched or a tool call ended the turn, it is `stop_sequence`, as on the server. |

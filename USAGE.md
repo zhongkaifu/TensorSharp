@@ -2646,7 +2646,10 @@ both reasoning and the user-visible result. Input bodies are deliberately bounde
 losslessly uploaded documents are not duplicated into logs, avoiding large memory/I/O
 spikes and accidental document disclosure. The upload manifest and `contentChars`
 retain useful audit metadata; capture requests separately when byte-for-byte replay is
-required. Set `TENSORSHARP_LOG_LEVEL=Warning` to suppress per-turn Information logs.
+required. A video's sampled frames are counted rather than listed: the manifest names the
+video file (`"mediaType":"video"`) and gives one `"mediaType":"video_frames"` entry per folder
+the frames were written to, with their `count`, and `fullInput` gives `videoFrames` and
+`videos` for the message. Set `TENSORSHARP_LOG_LEVEL=Warning` to suppress per-turn Information logs.
 
 Sample `fullInput` payload (formatted for readability; it is emitted as a
 single line in the actual log):

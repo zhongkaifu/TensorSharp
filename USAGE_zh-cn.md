@@ -2329,7 +2329,9 @@ Information 级别日志。只需对日志文件做一次 grep，即可获得紧
 此完成日志可以同时看到推理过程与最终用户可见结果。输入正文会刻意限制长度：
 无损上传的文档不会再被完整复制到日志中，从而避免额外内存/IO 峰值和意外泄露
 文档内容。上传清单与 `contentChars` 仍保留可用的审计元数据；如需逐字节重放，
-请另行捕获请求。设置 `TENSORSHARP_LOG_LEVEL=Warning` 可关闭逐轮信息日志。
+请另行捕获请求。视频的采样帧只计数、不逐个列出：上传清单列出视频文件（`"mediaType":"video"`），
+帧所在的每个文件夹各一条 `"mediaType":"video_frames"` 记录并带 `count`，`fullInput` 中该消息带
+`videoFrames` 和 `videos`。设置 `TENSORSHARP_LOG_LEVEL=Warning` 可关闭逐轮信息日志。
 
 `fullInput` 字段示例（为便于阅读做了缩进，实际日志为单行）：
 

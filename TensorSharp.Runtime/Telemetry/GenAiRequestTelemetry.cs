@@ -11,6 +11,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Threading;
 
 namespace TensorSharp.Runtime.Telemetry
@@ -114,6 +115,27 @@ namespace TensorSharp.Runtime.Telemetry
         {
             if (_activity is { IsAllDataRequested: true })
                 _activity.SetTag(key, value);
+        }
+
+        /// <summary>
+        /// The sampling the request asked for, as a <c>SamplingConfig</c> holds it (floats). Each value
+        /// goes on the span as the decimal it was written as, 0.7 rather than 0.699999988079071 (the
+        /// float nearest 0.7, widened to double). Nulls are left off.
+        /// </summary>
+        public void SetSampling(int? maxTokens, float? temperature, float? topP, int? topK, long? seed = null) =>
+            SetSampling(maxTokens, AsWritten(temperature), AsWritten(topP), topK, seed);
+
+        /// <summary>
+        /// A float as the shortest decimal that reads back as it (what <c>float.ToString</c> prints), as
+        /// a double. Widening the float itself keeps its binary value, whose decimal expansion is longer.
+        /// </summary>
+        public static double? AsWritten(float? value)
+        {
+            if (value is not { } v)
+                return null;
+            if (!float.IsFinite(v))
+                return v;
+            return double.Parse(v.ToString("R", CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
         }
 
         /// <summary>The sampling the request asked for. Nulls are left off.</summary>

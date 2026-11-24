@@ -70,24 +70,78 @@ public class ModelServiceUploadLoggingTests
     }
 
     [Fact]
-    public void SerializeUploadsForLog_VideoFrames_TaggedAsVideoFrame()
+    public void SerializeUploadsForLog_VideoFrames_AreOneEntryPerFolderBesideTheVideoFile()
     {
         var msg = new ChatMessage
         {
             Role = "user",
             Content = "Describe video",
             IsVideo = true,
-            ImagePaths = new List<string> { "/uploads/frame01.png", "/uploads/frame02.png" },
+            ImagePaths = new List<string> { "/tmp/clip/frame01.png", "/tmp/clip/frame02.png", "/uploads/still.png", "/tmp/clip/frame03.png" },
+            // The third is a still image beside the clip's timed frames.
+            ImageTimestamps = new List<double?> { 0.0, 0.5, null, 1.0 },
+            VideoFilePaths = new List<string> { "/uploads/clip.mp4" },
         };
 
         string json = ModelService.SerializeUploadsForLog(msg);
         using var doc = JsonDocument.Parse(json);
         var entries = doc.RootElement.EnumerateArray().ToList();
 
+        Assert.Equal(3, entries.Count);
+        Assert.Equal(("image", "/uploads/still.png", "still.png"),
+            (entries[0].GetProperty("mediaType").GetString(), entries[0].GetProperty("path").GetString(), entries[0].GetProperty("name").GetString()));
+        Assert.Equal(("video", "/uploads/clip.mp4", "clip.mp4"),
+            (entries[1].GetProperty("mediaType").GetString(), entries[1].GetProperty("path").GetString(), entries[1].GetProperty("name").GetString()));
+        Assert.Equal("video_frames", entries[2].GetProperty("mediaType").GetString());
+        Assert.Equal(System.IO.Path.GetDirectoryName("/tmp/clip/frame01.png"), entries[2].GetProperty("path").GetString());
+        Assert.Equal(3, entries[2].GetProperty("count").GetInt32());
+        Assert.False(entries[2].TryGetProperty("name", out _));
+        Assert.DoesNotContain("frame01.png", json);
+    }
+
+    [Fact]
+    public void SerializeUploadsForLog_FramesWithoutTimesAreVideoFramesToo()
+    {
+        var msg = new ChatMessage
+        {
+            Role = "user",
+            IsVideo = true,
+            ImagePaths = new List<string> { "/tmp/a/f1.png", "/tmp/a/f2.png", "/tmp/b/f3.png" },
+        };
+
+        using var doc = JsonDocument.Parse(ModelService.SerializeUploadsForLog(msg));
+        var entries = doc.RootElement.EnumerateArray().ToList();
+
         Assert.Equal(2, entries.Count);
-        Assert.All(entries, e => Assert.Equal("video_frame", e.GetProperty("mediaType").GetString()));
-        Assert.Equal("frame01.png", entries[0].GetProperty("name").GetString());
-        Assert.Equal("frame02.png", entries[1].GetProperty("name").GetString());
+        Assert.All(entries, e => Assert.Equal("video_frames", e.GetProperty("mediaType").GetString()));
+        Assert.Equal(new[] { 2, 1 }, entries.Select(e => e.GetProperty("count").GetInt32()));
+    }
+
+    [Fact]
+    public void SerializeMessagesForLog_CountsAVideosFramesAndNamesTheVideoFile()
+    {
+        var history = new List<ChatMessage>
+        {
+            new ChatMessage
+            {
+                Role = "user",
+                Content = "What happens?",
+                IsVideo = true,
+                ImagePaths = new List<string> { "/tmp/clip/frame01.png", "/tmp/clip/frame02.png", "/uploads/still.png" },
+                ImageTimestamps = new List<double?> { 0.0, 0.5, null },
+                VideoFilePaths = new List<string> { "/uploads/clip.mp4" },
+            },
+        };
+
+        string json = ModelService.SerializeMessagesForLog(history);
+        using var doc = JsonDocument.Parse(json);
+        var entry = doc.RootElement.EnumerateArray().Single();
+
+        Assert.Equal(new[] { "/uploads/still.png" }, entry.GetProperty("images").EnumerateArray().Select(e => e.GetString()));
+        Assert.Equal(2, entry.GetProperty("videoFrames").GetInt32());
+        Assert.Equal(new[] { "/uploads/clip.mp4" }, entry.GetProperty("videos").EnumerateArray().Select(e => e.GetString()));
+        Assert.True(entry.GetProperty("isVideo").GetBoolean());
+        Assert.DoesNotContain("frame01.png", json);
     }
 
     [Fact]
@@ -165,6 +219,8 @@ public class ModelServiceUploadLoggingTests
         var entry = doc.RootElement.EnumerateArray().Single();
 
         Assert.False(entry.TryGetProperty("images", out _));
+        Assert.False(entry.TryGetProperty("videoFrames", out _));
+        Assert.False(entry.TryGetProperty("videos", out _));
         Assert.False(entry.TryGetProperty("audios", out _));
         Assert.False(entry.TryGetProperty("textFiles", out _));
         Assert.False(entry.TryGetProperty("isVideo", out _));
