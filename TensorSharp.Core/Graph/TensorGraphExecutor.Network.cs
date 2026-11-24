@@ -8,6 +8,7 @@
 // Ops' signatures do not annotate; nullable analysis is off for this file.
 #nullable disable
 using System;
+using System.Collections.Generic;
 
 namespace TensorSharp.Graph
 {
@@ -83,6 +84,42 @@ namespace TensorSharp.Graph
             Ops.Sub(r, r, poly);
             Ops.Mul(r, r, 0.5f);
             return r;
+        }
+
+        /// <summary>ggml_pad: <paramref name="x"/> with Ip[i] zeros after its extent along ne[i] (keys padded to their mask).</summary>
+        private Tensor PadNode(Tensor x, GraphNode n, RunState run)
+        {
+            int dims = x.DimensionCount;
+            long Ip(int i) => n.Ip != null && n.Ip.Length > i ? n.Ip[i] : 0;
+            for (int i = dims; i < 4; i++)
+                if (Ip(i) != 0) throw new NotSupportedException($"padding ne[{i}] of a {dims}-dimensional tensor");
+            var sizes = new long[dims];
+            bool any = false;
+            for (int d = 0; d < dims; d++)
+            {
+                long pad = Ip(dims - 1 - d);
+                if (pad < 0) throw new NotSupportedException("negative padding");
+                any |= pad > 0;
+                sizes[d] = x.Sizes[d] + pad;
+            }
+            var result = new Tensor(Allocator, x.ElementType, sizes);
+            Ops.Fill(result, 0f);
+            if (!any)
+            {
+                Ops.Copy(result, x);
+                return result;
+            }
+            Tensor inner = result;
+            var narrowed = new List<Tensor>();
+            for (int d = 0; d < dims; d++)
+                if (sizes[d] != x.Sizes[d])
+                {
+                    inner = inner.Narrow(d, 0, x.Sizes[d]);
+                    narrowed.Add(inner);
+                }
+            Ops.Copy(inner, x);
+            foreach (Tensor t in narrowed) t.Dispose();
+            return result;
         }
 
         private Tensor DepthwiseConv2dNode(Tensor x, Tensor kernel, GraphNode n, RunState run)

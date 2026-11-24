@@ -57,7 +57,7 @@ namespace TensorSharp.Models.Architecture
 
             // Generative media.
             DiffusionGemmaArchitecture.Descriptor,
-            QwenImage.QwenImageArchitecture.Descriptor,
+            QwenImage21.QwenImage21Architecture.Descriptor,
             WanVideo.WanVideoArchitecture.Descriptor,
 
             // Audio.

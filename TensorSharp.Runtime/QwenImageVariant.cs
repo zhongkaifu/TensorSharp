@@ -44,7 +44,7 @@ namespace TensorSharp.Runtime
     {
         public const string Flag = "--qwen-image-variant";
 
-        /// <summary>Read by <c>QwenImageModel</c> at load: <c>base</c> or <c>turbo</c>.</summary>
+        /// <summary>Read by <c>QwenImage21DiffusionModel</c> at load: <c>base</c> or <c>turbo</c>.</summary>
         public const string EnvironmentVariable = "TS_QWEN_IMAGE_VARIANT";
 
         /// <summary>The accepted values, in the spelling the usage pages show.</summary>

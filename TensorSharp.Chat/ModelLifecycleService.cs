@@ -459,7 +459,7 @@ namespace TensorSharp.Server
                     TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable)));
                 // So does the checkpoint declaration (--qwen-image-variant), which the CLI refuses
                 // for another model outright.
-                if (_model is not TensorSharp.Models.QwenImage.QwenImageModel &&
+                if (_model is not TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel &&
                     Environment.GetEnvironmentVariable(TensorSharp.Runtime.QwenImageVariantFlag.EnvironmentVariable) is { } variant &&
                     !string.IsNullOrWhiteSpace(variant))
                 {

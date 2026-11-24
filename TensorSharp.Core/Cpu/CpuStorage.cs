@@ -20,12 +20,13 @@ namespace TensorSharp.Cpu
         public CpuStorage(IAllocator allocator, DType ElementType, long elementCount)
             : base(allocator, ElementType, elementCount)
         {
-            buffer = Marshal.AllocHGlobal(new IntPtr(ByteLength));
+            buffer = allocator is RecyclingCpuAllocator recycler ? recycler.Rent(ByteLength) : Marshal.AllocHGlobal(new IntPtr(ByteLength));
         }
 
         protected override void Destroy()
         {
-            Marshal.FreeHGlobal(buffer);
+            if (Allocator is RecyclingCpuAllocator recycler) recycler.Return(buffer, ByteLength);
+            else Marshal.FreeHGlobal(buffer);
             buffer = IntPtr.Zero;
         }
 

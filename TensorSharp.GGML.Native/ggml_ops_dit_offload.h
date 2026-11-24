@@ -123,9 +123,20 @@ bool h3_lora_kcat_takes(const ggml_tensor* w, const ggml_tensor* x);
 std::unordered_set<const ggml_tensor*> h3_deferrable(ggml_cgraph* graph);
 #endif
 
+// The wide routes a program's family measured (GraphProgram.WideTokenRoutes); a program without them takes MiniMax-H3's:
+// Q4_K and BF16 products of at least h3_cublas_min_rows() rows on cuBLAS BF16, cuDNN for contiguous queries.
+struct DitWideRoutes
+{
+    std::int64_t min_rows = 0;      // products take cuBLAS BF16 from this many rows (0: h3_cublas_min_rows())
+    bool q6k = false;               // Q6_K weights take it as well as Q4_K (tsg_cuda_q6k_gemm_bf16)
+    bool strided_attention = false; // cuDNN also takes a query that is a strided view (cudnn_sdpa_node_wants)
+    bool float_weights_on_ggml = false;   // BF16 weights keep ggml's products
+};
+
 // Runs `graph` with the DiT offload: cuDNN attention wherever it takes a node, the fused nodes, and with
-// `wide_token_products` the cuBLAS/int8 weight products (and TS_H3_CUDA_F32_PRODUCTS' F32 ones); when nothing is
-// offloaded, the graph as it is (profiled under TS_GGML_NODE_PROFILE). Fails a run that left an int8 product
-// unscaled and never read. Synchronous.
-ggml_status dit_offload_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* tag, bool wide_token_products);
+// `wide_token_products` the cuBLAS/int8 weight products (and TS_H3_CUDA_F32_PRODUCTS' F32 ones) on `routes` (null:
+// MiniMax-H3's); when nothing is offloaded, the graph as it is (profiled under TS_GGML_NODE_PROFILE). Fails a run that
+// left an int8 product unscaled and never read. Synchronous.
+ggml_status dit_offload_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* tag, bool wide_token_products,
+                                const DitWideRoutes* routes = nullptr);
 } // namespace tsg

@@ -100,6 +100,8 @@ namespace TensorSharp.Graph
             GraphOp.PadReflect1d,
             // Non-decoder networks (TensorGraphExecutor.Network.cs).
             GraphOp.Norm, GraphOp.GeluErf, GraphOp.DepthwiseConv2d,
+            // Qwen-Image-2.1's text conditioner (ggml_gelu's tanh form) and its keys padded to their masks.
+            GraphOp.Gelu, GraphOp.Pad,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -148,6 +150,10 @@ namespace TensorSharp.Graph
         /// their activations in F32 (<see cref="GraphProgram.FloatProducts"/>). An executor whose products would round them
         /// reads it in <see cref="QuantizedMatMul"/>.</summary>
         protected bool FloatProducts { get; private set; }
+
+        /// <summary>While a compiled program runs: its products have thousands of rows (<see cref="GraphProgram.WideTokenProducts"/>,
+        /// a diffusion denoiser's step over a whole image), whatever rows its first product has (a timestep's two).</summary>
+        protected bool WideTokenProducts { get; private set; }
 
         /// <summary>The managed product of a weight's host blocks with host rows (x [rows, Ne0] -> [rows, Ne1]),
         /// registered by the assembly that holds the managed kernels. A backend without a kernel for a weight's
@@ -1252,8 +1258,9 @@ namespace TensorSharp.Graph
                 return _x.OnBackendThread(() =>
                 {
                     var session = new Session(_x, _dead, _x.LivenessOf(_program));
-                    bool floatProducts = _x.FloatProducts;
+                    bool floatProducts = _x.FloatProducts, wideTokenProducts = _x.WideTokenProducts;
                     _x.FloatProducts = _program.FloatProducts;
+                    _x.WideTokenProducts = _program.WideTokenProducts;
                     try
                     {
                         int node = 0;
@@ -1283,6 +1290,7 @@ namespace TensorSharp.Graph
                     finally
                     {
                         _x.FloatProducts = floatProducts;
+                        _x.WideTokenProducts = wideTokenProducts;
                         session.Dispose();
                     }
                 });
@@ -1742,6 +1750,9 @@ namespace TensorSharp.Graph
                 case GraphOp.RmsNorm: return V(RowNorm(T(0), Fp(0, 1e-6f), run));
                 case GraphOp.Norm: return V(LayerNormRows(T(0), Fp(0, 1e-6f), run));
                 case GraphOp.GeluErf: return V(GeluErf(In(T(0), run)));
+                // ggml_gelu: 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))), the backend's GELU kernel.
+                case GraphOp.Gelu: return V(Ops.GELU(null, In(T(0), run)));
+                case GraphOp.Pad: return V(PadNode(T(0), n, run));
                 case GraphOp.DepthwiseConv2d: return V(DepthwiseConv2dNode(T(0), T(1), n, run));
                 case GraphOp.L2Norm:
                 {

@@ -904,7 +904,7 @@ public static class ServerOptionsBuilder
     /// Translate the Qwen-Image-2.1 companion flags
     /// (<c>--qwen-image-vae</c> / <c>--qwen-image-vl</c> /
     /// <c>--qwen-image-mmproj</c>) into the env vars that
-    /// <c>QwenImageModel</c> reads (<c>TS_QWEN_IMAGE_VAE</c> /
+    /// <c>QwenImage21DiffusionModel</c> reads (<c>TS_QWEN_IMAGE_VAE</c> /
     /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>), the checkpoint
     /// declaration (<c>--qwen-image-variant</c>, <c>TS_QWEN_IMAGE_VARIANT</c>) and the LoRA plug-ins
     /// (<c>--lora</c> / <c>--lora-scale</c> / <c>--lora-config</c>, published as

@@ -227,7 +227,7 @@ try
     // read by SchedulerConfig.FromEnvironment when the engine is constructed.
     specFlagsApplied = ServerOptionsBuilder.ApplySpeculativeCliFlags(args);
     // Translate --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj into the
-    // TS_QWEN_IMAGE_* env vars QwenImageModel reads to locate the Qwen-Image-2.1 VAE,
+    // TS_QWEN_IMAGE_* env vars QwenImage21DiffusionModel reads to locate the Qwen-Image-2.1 VAE,
     // Qwen3-VL-8B text encoder and mmproj, --qwen-image-variant into TS_QWEN_IMAGE_VARIANT,
     // and --lora / --lora-scale / --lora-config into TS_LORAS, after the LoRA preflight has
     // checked them against the startup model and --video-steps. Must run before the startup
@@ -797,7 +797,7 @@ if (!hostingOptions.EmbeddingsEnabled)
 // leaving an operator to wonder why --width 1000 produced 2048x2048 images. Only a
 // Qwen-Image server: for a video model these warnings would describe a size nothing uses.
 if (!hostingOptions.EmbeddingsEnabled
-    && app.Services.GetRequiredService<ModelService>().Model is TensorSharp.Models.QwenImage.QwenImageModel)
+    && app.Services.GetRequiredService<ModelService>().Model is TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel)
 {
     foreach (string sizeWarning in ServerOptionsBuilder.DescribeQwenImageSizeDefaultWarnings(args))
         startupLogger.LogWarning(LogEventIds.HostConfiguration, "{QwenImageSizeDefault}", sizeWarning);

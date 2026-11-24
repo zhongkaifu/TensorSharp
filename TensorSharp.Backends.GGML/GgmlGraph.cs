@@ -106,6 +106,16 @@ namespace TensorSharp.GGML
                 throw new InvalidOperationException("ggml graph WideTokenProducts failed: " + GgmlBasicOps.LastNativeError());
         }
 
+        /// <summary>The wide routes of a wide-token program (<see cref="TensorSharp.Graph.GraphProgram.WideTokenRoutes"/>), marking
+        /// it wide as well. Before the first node.</summary>
+        public void MarkWideTokenRoutes(TensorSharp.Graph.GraphWideTokenRoutes routes)
+        {
+            ArgumentNullException.ThrowIfNull(routes);
+            int flags = (routes.Q6K ? 1 : 0) | (routes.StridedAttention ? 2 : 0) | (routes.FloatWeightsOnGgml ? 4 : 0);
+            if (GgmlNative.TSGgml_GraphWideTokenRoutes(Handle, routes.MinRows, flags) == 0)
+                throw new InvalidOperationException("ggml graph WideTokenRoutes failed: " + GgmlBasicOps.LastNativeError());
+        }
+
         /// <summary>The program's NVFP4 products quantize their activation rows to 8 bits
         /// (<see cref="TensorSharp.Graph.GraphProgram.Q8Nvfp4Activations"/>): every such product asks ggml for q8 activations.
         /// Before the first node.</summary>
@@ -389,6 +399,10 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_GraphWideTokenProducts(IntPtr graph, int on);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial int TSGgml_GraphWideTokenRoutes(IntPtr graph, long minRows, int flags);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

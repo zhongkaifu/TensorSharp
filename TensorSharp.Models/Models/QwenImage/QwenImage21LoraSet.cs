@@ -793,6 +793,68 @@ internal sealed class QwenImage21LoraSet : IDisposable
     /// <summary>The native adapter descriptor for tensor-parallel rank <paramref name="rank"/>.</summary>
     internal IntPtr AdapterFor(int rank) => _adapters[rank];
 
+    private static long s_generations;
+
+    /// <summary>A number no other set has had: a plan compiled with this set's factors is never taken for another's, even
+    /// where the other set's buffers reuse these addresses.</summary>
+    internal long Generation { get; } = Interlocked.Increment(ref s_generations);
+
+    /// <summary>The update of a projection outside the blocks (img_in, txt_in.in_layer, txt_in.out_layer,
+    /// time_text_embed.timestep_embedder.linear_1 / linear_2, modulation.1, norm_out.linear, proj_out) for tensor-parallel
+    /// rank <paramref name="rank"/>; default when it has none.</summary>
+    internal unsafe QwenImage21Lora Global(string module, int rank = 0)
+    {
+        var a = (QwenImage21Adapter*)_adapters[rank];
+        return module switch
+        {
+            "img_in" => a->ImageIn,
+            "txt_in.in_layer" => a->TextIn,
+            "txt_in.out_layer" => a->TextOut,
+            "time_text_embed.timestep_embedder.linear_1" => a->TimeIn,
+            "time_text_embed.timestep_embedder.linear_2" => a->TimeOut,
+            "modulation.1" => a->Modulation,
+            "norm_out.linear" => a->NormOut,
+            "proj_out" => a->ProjOut,
+            _ => throw new ArgumentOutOfRangeException(nameof(module)),
+        };
+    }
+
+    /// <summary>Block <paramref name="layer"/>'s updates for tensor-parallel rank <paramref name="rank"/>.</summary>
+    internal unsafe QwenImage21BlockLora Block(int layer, int rank = 0)
+    {
+        var a = (QwenImage21Adapter*)_adapters[rank];
+        if (layer < 0 || layer >= a->NumLayers) throw new ArgumentOutOfRangeException(nameof(layer));
+        return ((QwenImage21BlockLora*)a->Blocks)[layer];
+    }
+
+    /// <summary>Every address a graph binds as a leaf of this set (each factor, row scale and norm replacement, on every
+    /// rank): the keys of their device copies.</summary>
+    internal unsafe IEnumerable<IntPtr> FactorPointers()
+    {
+        var result = new HashSet<IntPtr>();
+        void Add(in QwenImage21Lora l)
+        {
+            foreach (IntPtr p in new[] { l.Down, l.Up, l.RowScale })
+                if (p != IntPtr.Zero) result.Add(p);
+        }
+        foreach (IntPtr handle in _adapters)
+        {
+            var a = (QwenImage21Adapter*)handle;
+            Add(a->ImageIn); Add(a->TextIn); Add(a->TextOut); Add(a->TimeIn); Add(a->TimeOut);
+            Add(a->Modulation); Add(a->NormOut); Add(a->ProjOut);
+            var blocks = (QwenImage21BlockLora*)a->Blocks;
+            for (int b = 0; b < a->NumLayers; b++)
+            {
+                Add(blocks[b].Q); Add(blocks[b].K); Add(blocks[b].V); Add(blocks[b].Out);
+                Add(blocks[b].Gate); Add(blocks[b].Up); Add(blocks[b].Down);
+            }
+        }
+        foreach (IntPtr p in NormQ) if (p != IntPtr.Zero) result.Add(p);
+        foreach (IntPtr p in NormK) if (p != IntPtr.Zero) result.Add(p);
+        if (TextNorm != IntPtr.Zero) result.Add(TextNorm);
+        return result;
+    }
+
     /// <summary>Select the per-step output head (a PDD bundle); a no-op without heads.</summary>
     internal unsafe void SelectOutputHead(int step)
     {

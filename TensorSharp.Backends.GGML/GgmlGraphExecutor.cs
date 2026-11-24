@@ -127,7 +127,8 @@ namespace TensorSharp.GGML
             int served = 0, lowered = 0;
             try
             {
-                if (program.WideTokenProducts) g.MarkWideTokenProducts();
+                if (program.WideTokenRoutes != null) g.MarkWideTokenRoutes(program.WideTokenRoutes);
+                else if (program.WideTokenProducts) g.MarkWideTokenProducts();
                 if (program.Q8Nvfp4Activations) g.MarkQ8Nvfp4Activations();
                 foreach (GraphNode n in program.Entries)
                 {

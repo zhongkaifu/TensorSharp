@@ -10,13 +10,13 @@ namespace TensorSharp.Models.QwenImage
     internal sealed class QwenImage21Vae : IDisposable, IGgmlHostMemoryOwner
     {
         private VaeWeights _weights;
-        public QwenImage21Vae(QwenImageModel model)
+        public QwenImage21Vae(IFloatTensorStore source, BackendType backend)
         {
-            QwenImage21CompanionValidation.ValidateVae(model.VaeWeightSource);
-            _weights = VaeWeights.Load(model.VaeWeightSource);
+            QwenImage21CompanionValidation.ValidateVae(source);
+            _weights = VaeWeights.Load(source);
             // Vulkan convolutions run on the device too: the native F32 convolution
             // rescales inputs past the F16 range that Vulkan's matrix units accept.
-            bool ggml = model.Backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlMetal
+            bool ggml = backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlMetal
                 or BackendType.GgmlVulkan;
             VaeReferenceMath.UseGpuConv = ggml && Environment.GetEnvironmentVariable("TS_QWEN_VAE_GPU") != "0";
             // The whole-VAE graph, by default on CUDA and Metal. On an M5 Pro at 2048x2048 it
@@ -28,12 +28,12 @@ namespace TensorSharp.Models.QwenImage
             // operands and only the per-convolution path rescales for that (the fused graph
             // turns the decoder's >65504 activations into NaN there).
             string fused = Environment.GetEnvironmentVariable("TS_QWEN21_VAE_FUSED");
-            if (fused == "1" && model.Backend == BackendType.GgmlVulkan)
+            if (fused == "1" && backend == BackendType.GgmlVulkan)
                 Console.WriteLine("  [vae21] TS_QWEN21_VAE_FUSED=1 ignored on Vulkan: the whole-VAE graph overflows F16 " +
                     "cooperative-matrix operands there; decoding per convolution instead.");
-            VaeReferenceMath.UseFusedGraph21 = model.Backend != BackendType.GgmlVulkan &&
-                (fused == "1" || (fused != "0" && model.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal));
-            if (ggml) GgmlBasicOps.EnsureBackendAvailable(model.Backend switch
+            VaeReferenceMath.UseFusedGraph21 = backend != BackendType.GgmlVulkan &&
+                (fused == "1" || (fused != "0" && backend is BackendType.GgmlCuda or BackendType.GgmlMetal));
+            if (ggml) GgmlBasicOps.EnsureBackendAvailable(backend switch
             {
                 BackendType.GgmlCuda => GgmlBackendType.Cuda,
                 BackendType.GgmlMetal => GgmlBackendType.Metal,

@@ -41,6 +41,11 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <summary>The request's noise stream at <paramref name="seed"/> (the CPU torch generator, Philox, ...).</summary>
         INoiseSource Noise(long seed);
 
+        /// <summary>The noise stream <paramref name="request"/> draws from, made after its refusals: <see cref="Noise(long)"/>
+        /// at its seed, unless the family's stream also depends on what else the request holds (Qwen-Image-2.1's edits
+        /// draw on a stream keyed to their reference pictures as the caller passed them).</summary>
+        INoiseSource Noise(DiffusionRequest request) => Noise(request.Seed);
+
         /// <summary>Where <paramref name="request"/> samples and the size it returns (text to image:
         /// <see cref="DiffusionCanvas.TextToImage"/>; an edit: the family's reference rules). A masked edit returns its
         /// source canvas (<paramref name="mask"/>, null when unmasked) and samples its selection
@@ -91,6 +96,11 @@ namespace TensorSharp.Models.SharedDiffusion
 
         /// <summary>Drop the activations and compute buffers (cached plans); the weights stay resident.</summary>
         void ReleaseWorkspace();
+
+        /// <summary>The component releases its device memory (weights and workspace) after every phase it runs, whatever the
+        /// residency plan would keep: a family whose components took turns on the device before it moved to the runtime
+        /// (Qwen-Image-2.1's), and whose working memory is not calibrated on every device yet.</summary>
+        bool ReleaseAfterPhase => false;
     }
 
     /// <summary>Text (and, for references, the vision tower) to hidden rows with modality tags.</summary>
@@ -107,6 +117,10 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <summary>The step's prediction. <see cref="DenoiseStepInputs.Latent"/> is the sampler's state, read only;
         /// the output's arrays may be the denoiser's own buffers, valid until its next step.</summary>
         StepOutput Step(DenoiseStepInputs inputs, AdapterSet adapters, CancellationToken cancellationToken);
+
+        /// <summary>A request's denoising ended (finished, failed or cancelled): drop what the denoiser kept for that request
+        /// alone (Qwen-Image-2.1's prefix keys and values), before the decode needs the room. Weights and cached plans stay.</summary>
+        void FinishRequest() { }
     }
 
     /// <summary>The VAE: tiled encode to a posterior, tiled and blended decode, and a cheap preview.</summary>
@@ -132,6 +146,15 @@ namespace TensorSharp.Models.SharedDiffusion
 
         /// <summary>The VAE's copy of reference <paramref name="index"/>.</summary>
         RgbImage ForVae(RgbImage image, int index);
+
+        /// <summary>The vision tower's copy of reference <paramref name="index"/> for a request that samples on
+        /// <paramref name="canvas"/> (a family whose references follow the output's size: Qwen-Image-2.1's are conditioned at
+        /// about 1 MP, or the output's area if smaller); the default is <see cref="ForVision(RgbImage, int)"/>.</summary>
+        PresentedImage ForVision(RgbImage image, int index, DiffusionCanvas canvas) => ForVision(image, index);
+
+        /// <summary>The VAE's copy of reference <paramref name="index"/> for a request that samples on <paramref name="canvas"/>;
+        /// the default is <see cref="ForVae(RgbImage, int)"/>.</summary>
+        RgbImage ForVae(RgbImage image, int index, DiffusionCanvas canvas) => ForVae(image, index);
 
         /// <summary>The reference's token rows from its posterior, drawing the posterior sample from
         /// <paramref name="noise"/> (before the target noise).</summary>

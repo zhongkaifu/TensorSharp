@@ -19,7 +19,7 @@ namespace TensorSharp.Models.QwenImage
         private readonly QwenImageModel _model;
         private QwenImage21Vae _vae;
         private QwenImage21DiT _dit;
-        private QwenImage21Vae Vae => _vae ??= new QwenImage21Vae(_model);
+        private QwenImage21Vae Vae => _vae ??= new QwenImage21Vae(_model.VaeWeightSource, _model.Backend);
         private QwenImage21DiT Dit => _dit ??= new QwenImage21DiT(_model.DitGgufPath, _model.Backend, _model.DitTensorParallelGroup, _model.Loras);
 
         public QwenImage21Pipeline(QwenImageModel model) => _model = model;
