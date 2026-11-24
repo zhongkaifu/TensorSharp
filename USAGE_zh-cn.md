@@ -2671,7 +2671,7 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 - 控制台和日志文件保持不变：每个路径、id 和 scope 都原样保留。
 
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` 会导出以上全部内容：不脱敏的日志、真实的请求路径和响应 id、
-聊天 span 上的 `gen_ai.input.messages` 和 `gen_ai.output.messages`（由角色与内容组成的 JSON，最多 64K 字符，
+聊天 span 上的 `gen_ai.input.messages` 和 `gen_ai.output.messages`（按 OpenTelemetry GenAI 约定由角色与 parts 组成的 JSON，最多 64K 字符，
 保留最新的消息）、视频 span 上的 `tensorsharp.video.prompt`、图像 span 上的 `tensorsharp.image.prompt`、
 工具 span 上的 `tensorsharp.tool.arguments` 和 `tensorsharp.tool.result`，以及 `codeexec.run` 上的
 `tensorsharp.codeexec.command`。Studio 的 span 无论如何都不带提示词。只有当数据去往的每个地方（collector 及其后端、Application Insights 资源及其保留策略、

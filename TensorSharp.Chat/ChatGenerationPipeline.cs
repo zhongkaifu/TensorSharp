@@ -1489,12 +1489,17 @@ namespace TensorSharp.Server
             requestTelemetry.SetOutputMessages(() => CapturedMessagesJson(null, text));
 
         /// <summary>
-        /// <c>[{"role":…,"content":…}]</c> for <c>gen_ai.input.messages</c> (<paramref name="messages"/>)
-        /// or <c>gen_ai.output.messages</c> (<paramref name="assistantText"/>), with at most
-        /// <see cref="MaxCapturedContentChars"/> characters of text: past that, a history keeps
-        /// its newest messages and the end of the oldest one kept, an answer its beginning.
-        /// Null when it cannot be built (text with a broken surrogate pair, say): telemetry
-        /// never fails a request.
+        /// <c>gen_ai.input.messages</c> (<paramref name="messages"/>) or <c>gen_ai.output.messages</c>
+        /// (<paramref name="assistantText"/>) in the shape of the OpenTelemetry GenAI conventions'
+        /// message schemas (<c>gen-ai-input-messages.json</c>, <c>gen-ai-output-messages.json</c>):
+        /// <c>[{"role":…,"parts":[{"type":"text","content":…}]}]</c>. An assistant message's tool
+        /// calls are <c>tool_call</c> parts, and a <c>tool</c> message is one
+        /// <c>tool_call_response</c> part. Viewers that read the conventions (the Application
+        /// Insights agent view, for one) show nothing for a message without <c>parts</c>.
+        /// At most <see cref="MaxCapturedContentChars"/> characters of message text: past that, a
+        /// history keeps its newest messages and the end of the oldest one kept, an answer its
+        /// beginning. Null when it cannot be built (text with a broken surrogate pair, say):
+        /// telemetry never fails a request.
         /// </summary>
         internal static string? CapturedMessagesJson(IReadOnlyList<ChatMessage>? messages, string? assistantText)
         {
@@ -1519,14 +1524,14 @@ namespace TensorSharp.Server
                             // A negative budget left: the oldest message kept fits only in part.
                             if (i == first && budget < 0)
                                 content = "…" + TailOf(content, content.Length + budget);
-                            WriteCapturedMessage(writer, message.Role, content);
+                            WriteCapturedMessage(writer, message.Role, content, message.ToolCalls, message.ToolCallId);
                         }
                     }
                     if (assistantText != null)
                     {
                         WriteCapturedMessage(writer, "assistant", assistantText.Length > MaxCapturedContentChars
                             ? HeadOf(assistantText, MaxCapturedContentChars) + "…"
-                            : assistantText);
+                            : assistantText, null, null);
                     }
                     writer.WriteEndArray();
                 }
@@ -1538,12 +1543,65 @@ namespace TensorSharp.Server
             }
         }
 
-        private static void WriteCapturedMessage(Utf8JsonWriter writer, string role, string content)
+        private static void WriteCapturedMessage(Utf8JsonWriter writer, string role, string content,
+            IReadOnlyList<ToolCall>? toolCalls, string? toolCallId)
         {
             writer.WriteStartObject();
             writer.WriteString("role", role ?? string.Empty);
-            writer.WriteString("content", content);
+            writer.WriteStartArray("parts");
+            if (string.Equals(role, "tool", StringComparison.OrdinalIgnoreCase))
+            {
+                writer.WriteStartObject();
+                writer.WriteString("type", "tool_call_response");
+                if (!string.IsNullOrEmpty(toolCallId))
+                    writer.WriteString("id", toolCallId);
+                writer.WriteString("response", content);
+                writer.WriteEndObject();
+            }
+            else
+            {
+                // An assistant turn that only called tools has no text; any other message keeps
+                // its (possibly empty) text part, so it still shows as a message.
+                if (content.Length > 0 || toolCalls is not { Count: > 0 })
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("type", "text");
+                    writer.WriteString("content", content);
+                    writer.WriteEndObject();
+                }
+                if (toolCalls != null)
+                {
+                    foreach (ToolCall call in toolCalls)
+                    {
+                        if (call is null)
+                            continue;
+                        writer.WriteStartObject();
+                        writer.WriteString("type", "tool_call");
+                        if (!string.IsNullOrEmpty(call.Id))
+                            writer.WriteString("id", call.Id);
+                        writer.WriteString("name", call.Name ?? string.Empty);
+                        writer.WritePropertyName("arguments");
+                        writer.WriteRawValue(CapturedToolArguments(call));
+                        writer.WriteEndObject();
+                    }
+                }
+            }
+            writer.WriteEndArray();
             writer.WriteEndObject();
+        }
+
+        // A tool call's arguments as the JSON object the model produced; arguments that do not
+        // serialize (an unexpected value type) become {} rather than lose the whole attribute.
+        private static string CapturedToolArguments(ToolCall call)
+        {
+            try
+            {
+                return JsonSerializer.Serialize(call.Arguments ?? new Dictionary<string, object?>());
+            }
+            catch (Exception)
+            {
+                return "{}";
+            }
         }
 
         // Cut text without splitting a surrogate pair, which the JSON writer refuses.

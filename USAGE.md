@@ -3059,8 +3059,8 @@ With content capture off, which is the default:
 - The console and the log file are unchanged: they keep every path, id and scope.
 
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` exports all of it: unredacted logs, the
-real request paths and response ids, `gen_ai.input.messages` and `gen_ai.output.messages` on chat spans (role and content
-pairs as JSON, at most 64K characters, keeping the newest messages), `tensorsharp.video.prompt` on
+real request paths and response ids, `gen_ai.input.messages` and `gen_ai.output.messages` on chat spans (each message's role and parts
+as JSON in the OpenTelemetry GenAI message shape, at most 64K characters, keeping the newest messages), `tensorsharp.video.prompt` on
 clips, `tensorsharp.image.prompt` on pictures, `tensorsharp.tool.arguments` and `tensorsharp.tool.result`
 on tool spans, and `tensorsharp.codeexec.command` on `codeexec.run`. Studio spans carry no prompt either way.
 Turn it on only when every place the data goes (the collector and its backends, the Application

@@ -924,8 +924,12 @@ With it on:
 
 - the redaction processor is left out, so log content is exported;
 - the chat span gets `gen_ai.input.messages` (the history the prompt was rendered from, after compaction) and
-  `gen_ai.output.messages`, as JSON strings `[{"role":…,"content":…}]` (the JSON-string form the v1.41.0 conventions
-  allow on spans), cut to 64K characters per attribute: a history keeps its newest messages, an answer its beginning.
+  `gen_ai.output.messages`, as JSON strings (the JSON-string form the v1.41.0 conventions allow on spans) in the shape
+  of the conventions' message schemas, `[{"role":…,"parts":[{"type":"text","content":…}]}]`: an assistant message's
+  tool calls are `tool_call` parts (`id`, `name`, `arguments`) and a `tool` message is a `tool_call_response` part
+  (`id`, `response`). GenAI viewers read the text from `parts`; the Application Insights agent view, for one, shows
+  an empty Input + Output tab for the flat `{"role":…,"content":…}` form TensorSharp wrote before. Each is cut to
+  64K characters per attribute: a history keeps its newest messages, an answer its beginning.
   The JSON is built only when the span is recorded, and a failure returns nothing rather than throw. The 64K counts
   message text, before the JSON adds quotes and escapes. The Azure Monitor exporter lets these two attributes through
   up to 262,144 characters (exporter 1.10.0's `GenAi_Properties_MaxValueLength`, not the 8,192 of other attributes),
