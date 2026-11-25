@@ -180,6 +180,7 @@ foreach (var (engine, outputs) in results)
 // End to end through a model's public API (TS_QWEN_IMAGE_* companions and TS_QWEN_IMAGE_VARIANT from the environment):
 //   --e2e [--model runtime] --backend B --prompt P --out x.png [--image a.png ...] [--mask m.png] [--width W --height H]
 //   [--seed S] [--steps N] [--cfg C] [--negative N] [--keep-source-size] [--previews K] [--lora path[:scale]]
+//   [--mask-crop] [--mask-crop-padding P]
 public static class EndToEnd
 {
     static string Arg(string[] a, string name, string fallback)
@@ -209,6 +210,8 @@ public static class EndToEnd
         };
         if (Arg(args, "--negative", null) is string negative) p.NegativePrompt = negative;
         if (Arg(args, "--mask", null) is string mask) p.Mask = TensorSharp.Models.QwenImage.ImageIO.Load(mask, preserveAlpha: true);
+        if (args.Contains("--mask-crop")) p.MaskCrop = true;
+        if (Arg(args, "--mask-crop-padding", null) is string padding) p.MaskCropPadding = int.Parse(padding, CultureInfo.InvariantCulture);
         var previews = new List<(int, int)>();
         p.OnStep = (step, total, preview) => { if (preview != null) previews.Add((step, preview.Width)); };
         var loras = new List<LoraSpec>();
