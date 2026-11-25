@@ -59,7 +59,7 @@ MODEL_NAMES = {
 
 
 def qwen21_sigmas(steps, image_tokens):
-    """Match QwenImage21Sampling.Sigmas, including its F32 output rounding.
+    """Match DiffusionSchedules.DynamicShift (Qwen-Image-2.1's recipe), including its F32 output rounding.
 
     sd.cpp's default Flux schedule uses different anchors and no terminal stretch.
     Explicit --sigmas makes the reference use the same denoising workload.
