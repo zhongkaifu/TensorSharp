@@ -1,23 +1,24 @@
 name: Qwen-Image-2.1 Metal validation
 
-# Qwen-Image-2.1's diffusion-runtime migration on a GitHub-hosted Apple Silicon runner (ggml-metal on its
-# paravirtualized GPU): at the migration commit f981cb6, where the retired native graph still exists, the runtime's
+# Qwen-Image-2.1's diffusion-runtime migration on an Apple Silicon Mac with ggml-metal: at the migration commit f981cb6, where the retired native graph still exists, the runtime's
 # programs against it live and its velocities frozen for the Metal lane; at the head, the runtime's programs against
-# every frozen lane and the shared diffusion and graph suites, pinned to Metal. Skipped tests (no usable Metal device)
-# are counted and reported, never taken as passes. Runs only on this branch's pushes and by hand.
+# every frozen lane and the shared diffusion and graph suites, pinned to Metal. A run that aborts, prints no summary or
+# skips the Qwen-Image tests fails. GitHub's hosted macOS runners cannot do it: their GPU is the Apple Paravirtual device
+# (MTLGPUFamilyApple5, no simdgroup reduction), on which upstream ggml-metal aborts encoding RMS_NORM (run 45517155047);
+# run it by hand on a self-hosted Apple Silicon runner (the `runner` input).
 on:
-  push:
-    branches: [claude/cool-gauss-sadgh3]
-    paths:
-      - ".github/workflows/qwen-image-metal-validation.yml"
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "runs-on label of an Apple Silicon Mac runner"
+        default: "self-hosted"
 
 permissions:
   contents: read
 
 jobs:
   metal:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +33,9 @@ jobs:
         run: |
           system_profiler SPDisplaysDataType | sed -n '1,25p'
           sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          if system_profiler SPDisplaysDataType | grep -q "Paravirtual"; then
+            echo "::error::This runner's GPU is the Apple Paravirtual device; ggml-metal needs a real Apple Silicon GPU."; exit 1
+          fi
 
       - name: Migration commit (runtime and retired graph) on Metal
         env:
@@ -58,7 +62,10 @@ jobs:
             --filter "(FullyQualifiedName~QwenImage|FullyQualifiedName~MiniMaxH3|FullyQualifiedName~Diffusion|FullyQualifiedName~Graph)&Requires!=Cuda&Requires!=Mlx&Requires!=Models" \
             --logger "console;verbosity=normal" 2>&1 | tee "$RUNNER_TEMP/head.log" | grep -E "^\s+Failed |Passed!|Failed!|QwenImage21DenoiserTests" || true
           echo "Qwen-Image denoiser tests skipped on Metal: $(grep -cE '^\s+Skipped InferenceWeb.Tests.QwenImage21DenoiserTests' "$RUNNER_TEMP/head.log")"
-          grep -qE "^Failed!" "$RUNNER_TEMP/head.log" "$RUNNER_TEMP/migration.log" && exit 1 || true
+          for log in "$RUNNER_TEMP/migration.log" "$RUNNER_TEMP/head.log"; do
+            if grep -qE "Test Run Aborted|^Failed!" "$log" || ! grep -qE "^Passed!" "$log"; then echo "::error::$log: aborted, failed or no summary"; exit 1; fi
+          done
+          if grep -qE "^\s+Skipped InferenceWeb.Tests.QwenImage21DenoiserTests" "$RUNNER_TEMP/head.log"; then echo "::error::Qwen-Image denoiser tests skipped"; exit 1; fi
 
       - uses: actions/upload-artifact@v4
         if: always()

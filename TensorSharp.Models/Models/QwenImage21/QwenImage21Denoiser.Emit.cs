@@ -481,12 +481,57 @@ namespace TensorSharp.Models.QwenImage21
                     kPad = b.Op(GraphOp.Cont, kPad);
                     vPad = b.Op(GraphOp.Cont, vPad);
                 }
-                ReadOnlySpan<int> srcs = mask >= 0 ? stackalloc[] { qs, kPad, vPad, mask } : stackalloc[] { qs, kPad, vPad };
-                int fa = b.Op(GraphOp.FlashAttnExt, srcs, stackalloc long[] { PrecisionF32 }, stackalloc[] { scale, 0f, 0f });
-                int @out = b.Op(GraphOp.Reshape, stackalloc[] { fa }, stackalloc long[] { width, nq });
+                // The retired graph built this flash attention and kept it only where the backend runs it (ggml-cuda takes
+                // head sizes 40 to 256 and 576, for one): elsewhere its explicit attention over the F32 views.
+                int kvFormat = sharedHalf || (_style == Style.Metal && kType == GraphFormat.F32) ? GraphFormat.F16 : kType;
+                int @out;
+                if (FlashSupported(hd, nq, nk + pad, heads, kvFormat, mask >= 0 ? MaskKeys(g) : 0, mask >= 0 ? MaskQueries(g) : 0))
+                {
+                    ReadOnlySpan<int> srcs = mask >= 0 ? stackalloc[] { qs, kPad, vPad, mask } : stackalloc[] { qs, kPad, vPad };
+                    int fa = b.Op(GraphOp.FlashAttnExt, srcs, stackalloc long[] { PrecisionF32 }, stackalloc[] { scale, 0f, 0f });
+                    @out = b.Op(GraphOp.Reshape, stackalloc[] { fa }, stackalloc long[] { width, nq });
+                }
+                else @out = ExplicitAttention(b, qs, ks, vs, g.IsImage ? -1 : mask, MaskKeys(g), nq, nk, scale, width);
                 joined = joined < 0 ? @out : b.Op(GraphOp.Concat, stackalloc[] { joined, @out }, stackalloc long[] { 1 });
             }
             return joined;
+        }
+
+        /// <summary>The retired graph's attention where the backend has no flash attention for the segment (its Builder.attention
+        /// fallback): scores at F32 accumulation over the segment's F32 keys, a text run's causal mask cut from its F16 mask,
+        /// softmax, and the values' product.</summary>
+        private static int ExplicitAttention(GraphProgramBuilder b, int qs, int ks, int vs, int mask, long maskKeys, long nq, long nk,
+            float scale, long width)
+        {
+            int scores = b.Op(GraphOp.MulMat, stackalloc[] { ks, qs }, stackalloc long[] { PrecisionF32 });
+            int probs;
+            if (mask >= 0)
+            {
+                long nb1 = maskKeys * 2;
+                int causal = b.Op(GraphOp.View, stackalloc[] { mask }, stackalloc long[] { 2, nk, nq, 1, 1, nb1, nb1 * nq, nb1 * nq, 0 });
+                causal = b.Op(GraphOp.Cast, stackalloc[] { b.Op(GraphOp.Cont, causal) }, stackalloc long[] { GraphFormat.F32 });
+                probs = b.Op(GraphOp.SoftMaxExt, stackalloc[] { scores, causal }, ReadOnlySpan<long>.Empty, stackalloc[] { scale, 0f });
+            }
+            else probs = b.Op(GraphOp.SoftMaxExt, stackalloc[] { scores }, ReadOnlySpan<long>.Empty, stackalloc[] { scale, 0f });
+            int vt = b.Op(GraphOp.Cont, b.Op(GraphOp.Permute, stackalloc[] { vs }, stackalloc long[] { 1, 0, 2, 3 }));
+            int av = b.Op(GraphOp.MulMat, vt, probs);
+            int permuted = b.Op(GraphOp.Cont, b.Op(GraphOp.Permute, stackalloc[] { av }, stackalloc long[] { 0, 2, 1, 3 }));
+            return b.Op(GraphOp.Reshape, stackalloc[] { permuted }, stackalloc long[] { width, nq });
+        }
+
+        // Whether the GGML backend runs a segment's flash attention (ggml's supports_op on the node), by its operands' shapes.
+        private readonly Dictionary<(long, long, long, long, int, long, long), bool> _flashSupport = new();
+
+        private bool FlashSupported(long hd, long nq, long nk, long heads, int format, long maskCols, long maskRows)
+        {
+            if (_executor is not GgmlGraphExecutor ggml) return true;
+            var key = (hd, nq, nk, heads, format, maskCols, maskRows);
+            lock (_flashSupport)
+            {
+                if (!_flashSupport.TryGetValue(key, out bool supported))
+                    _flashSupport[key] = supported = ggml.SupportsFlashAttention(hd, nq, nk, heads, format, maskCols, maskRows, (int)PrecisionF32);
+                return supported;
+            }
         }
 
         /// <summary>A tensor executor's object for a weight leaf: an F32 vector as a tensor, a projection or factor as itself.</summary>

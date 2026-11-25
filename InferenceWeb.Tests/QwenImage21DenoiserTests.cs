@@ -171,7 +171,10 @@ public sealed class QwenImage21DenoiserTests : IDisposable
                 err += (expected[i] - actual[i]) * (double)(expected[i] - actual[i]);
                 norm += expected[i] * (double)expected[i];
             }
-            Assert.True(Math.Sqrt(err / norm) < 1e-4, $"step {step}: relative L2 {Math.Sqrt(err / norm):E2}");
+            // ggml-cpu attends F32 keys and values as the managed executor does; the GPU backends attend F16 copies (8e-4 on
+            // an RTX 4000 Ada).
+            double bound = TestGates.PinnedGgmlBackend == BackendType.GgmlCpu ? 1e-4 : 2e-3;
+            Assert.True(Math.Sqrt(err / norm) < bound, $"step {step}: relative L2 {Math.Sqrt(err / norm):E2}, bound {bound:E0}");
         }
         ggml.FinishRequest();
         managed.FinishRequest();

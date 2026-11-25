@@ -406,6 +406,11 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial int TSGgml_FlashAttnSupported(long headDim, long qRows, long kvRows, long heads, int kvType,
+            long maskCols, long maskRows, int prec);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_GraphQ8Nvfp4Activations(IntPtr graph, int on);
 
         [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]

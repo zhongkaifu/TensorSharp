@@ -26,6 +26,15 @@ namespace TensorSharp.GGML
         internal static void Register()
             => GraphExecutors.Register(typeof(GgmlAllocator), allocator => For(((GgmlAllocator)allocator).Context.BackendType));
 
+        /// <summary>Whether this backend runs a flash attention of queries [<paramref name="headDim"/>, <paramref name="qRows"/>,
+        /// <paramref name="heads"/>] F32 over keys and values [<paramref name="headDim"/>, <paramref name="kvRows"/>, heads] of
+        /// <paramref name="kvFormat"/> (a <see cref="GraphFormat"/>), with an F16 mask [<paramref name="maskCols"/>,
+        /// <paramref name="maskRows"/>] (maskCols 0: none) at accumulation <paramref name="precision"/>: ggml's own
+        /// supports_op on such a node, for an emitter that picks its attention form the way a native builder does.</summary>
+        public bool SupportsFlashAttention(long headDim, long qRows, long kvRows, long heads, int kvFormat, long maskCols, long maskRows,
+            int precision)
+            => GgmlNative.TSGgml_FlashAttnSupported(headDim, qRows, kvRows, heads, kvFormat, maskCols, maskRows, precision) != 0;
+
         public static GgmlGraphExecutor For(GgmlBackendType backend)
         {
             lock (s_executors)

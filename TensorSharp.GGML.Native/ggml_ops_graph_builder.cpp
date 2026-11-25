@@ -2973,6 +2973,30 @@ TSG_EXPORT int TSGgml_GraphWideTokenRoutes(void* handle, std::int64_t min_rows, 
     return 1;
 }
 
+// Whether the active rank's backend runs ggml_flash_attn_ext on these operands (ggml_backend_supports_op): queries
+// [head_dim, q_rows, heads] F32, keys and values [head_dim, kv_rows, heads] of `kv_type`, an F16 mask [mask_cols,
+// mask_rows] (mask_cols 0: none) and accumulation `prec`. A program emitter that reproduces a native builder's choice
+// between flash and explicit attention asks before it emits (Qwen-Image-2.1's denoiser, as its retired graph did).
+// 1 = supported, 0 = not, -1 = no backend.
+TSG_EXPORT int TSGgml_FlashAttnSupported(std::int64_t head_dim, std::int64_t q_rows, std::int64_t kv_rows, std::int64_t heads,
+                                         int kv_type, std::int64_t mask_cols, std::int64_t mask_rows, int prec)
+{
+    if (!ensure_backend() || g_backend == nullptr) return -1;
+    if (head_dim <= 0 || q_rows <= 0 || kv_rows <= 0 || heads <= 0 || kv_type < 0 || kv_type >= GGML_TYPE_COUNT) return 0;
+    ggml_init_params params{ ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context* ctx = ggml_init(params);
+    if (ctx == nullptr) return 0;
+    ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, q_rows, heads);
+    ggml_tensor* k = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_type), head_dim, kv_rows, heads);
+    ggml_tensor* v = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_type), head_dim, kv_rows, heads);
+    ggml_tensor* mask = mask_cols > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_cols, mask_rows) : nullptr;
+    ggml_tensor* fa = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f, 0.0f, 0.0f);
+    ggml_prec_set_acc(fa, static_cast<ggml_prec>(prec));
+    const int supported = ggml_backend_supports_op(g_backend, fa) ? 1 : 0;
+    ggml_free(ctx);
+    return supported;
+}
+
 // The program's NVFP4 products quantize their activations to 8 bits (GraphProgram.Q8Nvfp4Activations), set before its first
 // node: build() asks ggml for GGML_PREC_Q8 activations on every product of an NVFP4 matrix.
 TSG_EXPORT int TSGgml_GraphQ8Nvfp4Activations(void* handle, int on)

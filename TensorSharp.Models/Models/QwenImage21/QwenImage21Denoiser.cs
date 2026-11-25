@@ -475,7 +475,10 @@ namespace TensorSharp.Models.QwenImage21
             {
                 using var recorded = new QwenImage21Emitter(_executor, record: true);
                 Emit(recorded, s, -1);
-                using IGraphPlan once = recorded.Compile(replayable: false);
+                // With its own allocator, freed when it is disposed: a one-shot GGML graph takes the backend's shared scratch,
+                // which outlives it, and the cached steps' plan would then hold its compute memory beside that scratch (as the
+                // retired graph never did: it freed its extract graph before the cached one ran).
+                using IGraphPlan once = recorded.Compile(replayable: true);
                 Compiles++;
                 if (!trace.Run(once))
                     throw new InvalidOperationException("Qwen-Image-2.1 denoiser step failed: " + once.LastError);
@@ -540,7 +543,8 @@ namespace TensorSharp.Models.QwenImage21
                         {
                             recorded[r] = new QwenImage21Emitter(_executor, record: true);
                             Emit(recorded[r], s, r);
-                            plans[r] = executor.CompileForRank(recorded[r].ToProgram(retain), r);
+                            // An extract step's plans too own their allocators, freed with them after the run (see Run).
+                            plans[r] = executor.CompileForRank(recorded[r].ToProgram(replayable: true), r);
                         }
                     }
                     catch
