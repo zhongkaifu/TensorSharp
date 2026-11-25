@@ -518,8 +518,14 @@ whole requests through the public API (text to image, an edit, a masked edit, CF
 LoRA) gave byte-identical PNGs; on a two-rank loopback group the sharded predictions (full, extract, cached) equal the
 retired TP forward's byte for byte. The managed executor is within 1e-4 relative L2 of the retired pure-C# transformer on
 the fixtures. Those outputs are frozen (`InferenceWeb.Tests/Fixtures/QwenImage21/LegacyGoldens`) and the runtime is held to
-them on every lane. Not yet validated on Metal, CUDA or Vulkan hardware, and multi-GPU TP only through loopback numerics:
-the commit before the deletion (f981cb6) keeps the live A/B tests and probes for a machine that has them.
+them on every lane. On ggml_cuda (RTX 4000 Ada, CUDA 13.2) the programs give the retired graph's bytes on the same nine
+fixture cases. Two changes were needed for that: the emitter asks the backend whether it runs a segment's flash attention,
+as the retired graph did (`TSGgml_FlashAttnSupported`), and falls back to the retired explicit attention where it does not;
+ggml-cuda has no kernel for the fixtures' head size 32. The extract step's plan also owns and frees its compute memory. Whole
+requests gave byte-identical PNGs in the retired pipeline's time or less: text to image at 1024² and 2048², an edit, a
+masked edit, keep source size, CFG with previews, and a LoRA. Peak VRAM was the retired pipeline's, except an edit
+(+293 MiB) and the LoRA (+68 MiB). Not yet validated on Metal or Vulkan hardware, and multi-GPU TP only through loopback
+numerics: the commit before the deletion (f981cb6) keeps the live A/B tests and probes for a machine that has them.
 
 The legacy path's tuning switches went with it (`TS_QWEN21_FLASH`, `_PAD_MASK`, `_CUDNN_ATTENTION`, `_CUBLAS_MATMUL`,
 `_CUBLAS_MIN_ROWS`, `_GRAPH_REUSE`, `_GRAPH_TRACE`, `_PREFIX_CACHE`, `_PREFIX_CACHE_TYPE`, `_PREFIX_CACHE_MAX_MIB`, the seven

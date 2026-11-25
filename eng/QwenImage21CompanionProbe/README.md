@@ -154,9 +154,14 @@ at two denoising steps. Each step is predicted three ways: by the whole-sequence
 graph (a denoiser whose prefix cache is always declined), through the prefix KV
 cache (step 1 extracts the prefix, step 2 reads it), and with the blocks sharded
 over a loopback tensor-parallel group of ranks on this one device (`GgmlCpu` or
-`GgmlMetal`), with and without the cache. It fails when a cached prediction is not
-bit-identical to the whole-sequence one, or when a sharded prediction exceeds 1%
-relative L2. The comparisons against 8-bit cache storage (`q8_0`, `q8_0_v`) were
+`GgmlMetal`), with and without the cache. It fails when the extract step is not
+bit-identical to the whole-sequence one, when the cached step is not (on `GgmlCpu`)
+or exceeds 1% relative L2 (on a GPU backend), or when a sharded prediction exceeds
+1%. A GPU backend picks its kernels, and how they split a product, by the rows the
+product computes, and a cached step computes only the target's. On `GgmlCuda` (RTX
+4000 Ada) at 1024 x 1024 with a 512 x 512 reference, the runtime's extract step was
+bit-identical and its cached step 0.25% from the whole sequence. The retired engine's
+two modes were 0.23% to 0.46% apart there at 512 x 512. The comparisons against 8-bit cache storage (`q8_0`, `q8_0_v`) were
 removed with that storage. Conditioning and latents are seeded noise, so it checks
 kernels on the real quantized weights, not image quality or multi-GPU speed.
 

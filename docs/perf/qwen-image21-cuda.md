@@ -14,9 +14,12 @@
 > `ggml_ops_graph_builder.cpp`, served by the DiT offload in `ggml_ops_dit_offload.cpp`):
 > Q4_K and Q6_K products of 256 rows or more on cuBLAS BF16, unmasked attention on
 > cuDNN, BF16 weights on ggml's own products. The runtime keeps two compiled plans a
-> device across steps. It has not yet been run on CUDA hardware, so none of the
-> measurements below has been repeated with it. The VAE, vision-encoder and
-> conditioning-encoder sections still describe the current code.
+> device across steps. On an RTX 4000 Ada (CUDA 13.2, sm_89, ggml `d9fe7bff`) its
+> whole requests gave the retired pipeline's PNGs byte for byte, in the retired
+> pipeline's time or less
+> ([Implementation and validation](../models/qwenimage21.md#implementation-and-validation)).
+> The A40 measurements below have not been repeated with it. The VAE,
+> vision-encoder and conditioning-encoder sections still describe the current code.
 
 The retired implementation kept a complete Qwen-Image-2.1 velocity-prediction
 graph alive across denoising steps. This removed repeated graph construction,

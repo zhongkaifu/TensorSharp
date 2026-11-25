@@ -337,10 +337,14 @@ if (args.Length >= 4 && args[0] == "dit-parity")
             fullA = Predict(full, stepA, 0.95f, 0, "full step 1");
             fullB = Predict(full, stepB, 0.60f, 1, "full step 2");
         }
+        // On ggml-cpu a cached step is the whole sequence's bytes. A GPU backend picks its kernels, and their work splits, by
+        // the rows a product computes, and a cached step computes fewer: the retired engine's two modes were 2.3e-3 to 4.6e-3
+        // apart on ggml-cuda (RTX 4000 Ada, 512 x 512), so the cached step is held to 1% there.
+        double cachedTolerance = device == BackendType.GgmlCpu ? 0 : 0.01;
         using (var dit = new QwenImage21Denoiser(new QwenImage21Weights(args[1]), device, null, null) { FreeMemory = () => -1 })
         {
             Compare("cache extract (step 1)", fullA, Predict(dit, stepA, 0.95f, 0, "cache step 1"), 0);
-            Compare("cache cached (step 2)", fullB, Predict(dit, stepB, 0.60f, 1, "cache step 2"), 0);
+            Compare("cache cached (step 2)", fullB, Predict(dit, stepB, 0.60f, 1, "cache step 2"), cachedTolerance);
             dit.FinishRequest();
         }
         GgmlBasicOps.ReleaseReuseComputeBuffers();

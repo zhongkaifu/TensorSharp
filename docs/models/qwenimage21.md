@@ -747,8 +747,9 @@ graph executor runs them with resident quantized weights on the GGML backends, a
 managed tensor executor runs them over the same file-mapped weights on `cpu`. There is
 no weight-streaming mode on either. Start with smaller dimensions if available memory
 is insufficient. CUDA and Vulkan were exercised on NVIDIA A40s with the retired native
-graph; the runtime has not yet been run on Metal, CUDA or Vulkan hardware. The
-measurements below record where each was taken.
+graph; the runtime was validated on CUDA on an RTX 4000 Ada
+([Implementation and validation](#implementation-and-validation)) and has not been run
+on Metal or Vulkan hardware. The measurements below record where each was taken.
 
 ## Pure C# CPU backend (`--backend cpu`)
 
@@ -1228,10 +1229,14 @@ so cached steps no longer equalled uncached ones.
 **CUDA graphs.** Upstream ggml-cuda captures a graph as a CUDA graph once two
 consecutive executions leave it unchanged, then replays it. The runtime keeps each
 device's compiled plans across steps (two, for the two CFG branches), as the
-retired native graph kept its retained graphs; whether ggml-cuda captures and
-replays the runtime's plans the same way has not been checked, because no CUDA
-machine was available for the migration. The rest of this paragraph and the
-measurements below describe the retired graph. Its cached step graph was retained
+retired native graph kept its retained graphs. On an RTX 4000 Ada, ggml-cuda
+captures and replays both alike. Counted with an interposer on the CUDA runtime
+([`eng/validation/CudaGraphCount`](../../eng/validation/CudaGraphCount/README.md)),
+both captured the same 197 graphs once and replayed all of them every step from the
+third on: 394 launches over 4 steps and 1,182 over 8, at 256² and at 1024² with a
+reference. Warm steps took 1.43 s at 1024² either way, and turning graphs off
+(`GGML_CUDA_DISABLE_GRAPHS=1`) cost both under 1%. The rest of this paragraph and
+the measurements below describe the retired graph. Its cached step graph was retained
 across steps (`TS_QWEN21_GRAPH_REUSE=1`, since removed) with fixed input and cache
 buffers, so from a request's third step onward each denoising step was one graph
 replay. This is the effect of vLLM-Omni's CUDA-graph decode, without separate
@@ -1409,10 +1414,40 @@ PNGs were byte-identical to the retired pipeline's for a 512×512 text-to-image,
 256×256, and a voxel-style LoRA at 512×512; the real-weight `dit-parity`
 predictions (whole sequence, cache extract and cached, two-rank loopback tensor
 parallelism whole, extract and cached) were byte-identical to the retired
-implementation's. **The runtime has not been validated on Metal, CUDA or Vulkan
-hardware**: no such machine was available, so its parity with the retired graph on
-GPUs is not established. The GPU measurements on this page were made with the
-retired native graph.
+implementation's.
+
+On `ggml_cuda` (RTX 4000 Ada 20 GB, CUDA 13.2, sm_89; same weights and ggml), every
+whole request gave the retired pipeline's PNG byte for byte. Times are a whole
+request in a fresh process, and peak VRAM was sampled every 200 ms:
+
+| Request | Retired | Runtime | Peak VRAM, retired → runtime |
+|---|---|---|---|
+| Text to image, 1024² | 26.35 s | 19.72 s | 5596 → 5596 MiB |
+| Text to image, 2048² | 69.51 s | 68.77 s | 16150 → 16150 MiB |
+| Edit, 1024² | 28.20 s | 28.10 s | 8570 → 8863 MiB |
+| Masked edit, 1024² | 27.84 s | 28.18 s | not measured |
+| Keep source size | 28.30 s | 28.19 s | not measured |
+| CFG 2.5, negative prompt, previews, 512² | 11.89 s | 11.41 s | 6310 → 6312 MiB |
+| Voxel LoRA, 1024² | 24.02 s | 21.24 s | 5652 → 5720 MiB |
+
+The masked edit and keep-source-size requests were timed before the extract step's
+plan freed its own compute memory, and were not measured again. Warm denoising steps
+take the retired graph's time: 1.44 s at 1024² with a reference, 6.90 s at 2048². An
+edit's cached steps hold about 290 MiB more than the retired graph's.
+
+The frozen goldens' `ggml_cuda` lane holds the runtime to the retired graph's bytes on
+the nine synthetic cases. Pinned to CUDA, the Qwen-Image, MiniMax-H3, diffusion, graph
+and LoRA suites passed: 2,735 tests, none failed. The 89 skipped were other backends'
+pinned tests and an AVX-512 kernel test, none of them Qwen-Image-2.1's denoiser tests.
+On CUDA, a request whose prefix cache is declined is 2e-3-close to a cached one
+(ggml-cpu: float rounding). The retired engine's own two modes differed in the same way
+there: 2.3e-3 to 4.6e-3 at 512².
+
+**The runtime has not been validated on Metal or Vulkan hardware**: no such machine
+was available. GitHub's hosted macOS runners expose a paravirtual GPU that ggml-metal
+cannot drive, so the runtime's parity with the retired graph is not established
+there. The other GPU measurements on this page were made with the retired native
+graph.
 
 ## Current Unsloth Q8_0 validation
 
