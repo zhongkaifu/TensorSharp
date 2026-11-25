@@ -253,8 +253,9 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   ggml-metal cannot pad the start of a dimension, and the encoder's one front pad had
   refused the whole graph, so Metal edits encoded their reference image per convolution.
   The fused encode is about twice as fast (3.6 to 1.9 s for a 1248x832 reference on an
-  M5 Pro) and moves an edit's pixels slightly (63 dB PSNR on that edit);
-  `TS_QWEN21_VAE_FUSED=0` keeps the per-convolution path. Text-to-image is unchanged.
+  M5 Pro) and moves an edit's pixels slightly (63 dB PSNR on that edit). The
+  `TS_QWEN21_VAE_FUSED=0` switch back to the per-convolution path was removed later.
+  Text-to-image is unchanged.
 
 - **Qwen-Image: only Qwen-Image-2.1 loads.** Earlier Qwen-Image and Qwen-Image-Edit
   checkpoints such as Qwen-Image-Edit-2511 are refused at load (exit code 2).
@@ -454,7 +455,21 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   - the per-family drafter paths `TS_DSV4_DSPARK`, `TS_QWEN35_DFLASH`,
     `TS_MUSE_GLIMMER_DFLASH` and `TS_NEMOTRON_DFLASH`: `--draft-model` (or
     `TS_SPEC_DRAFT_MODEL`) names every drafter, and the server no longer copies it into
-    them.
+    them;
+  - the switches between the paths of Qwen-Image-2.1's companions and their diagnostics:
+    `TS_QWEN_VAE_GPU`, `TS_QWEN_VAE_FUSED`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VAE_ATTN`,
+    `TS_QWEN_VAE_CONV_TILE_BYTES`, `TS_QWEN_VAE_FUSED_IM2COL_BUDGET`,
+    `TS_QWEN21_VAE_TRACE`, `TS_QWEN_VAE_PROFILE`, `TS_QWEN_VAE_POOL_TRACE`,
+    `TS_QWEN_TE_FUSED`, `TS_QWEN_TE_CPU_MATMUL`, `TS_QWEN21_TE_PRESCALE`,
+    `TS_QWEN_TE_TRACE_DIR`, `TS_QWEN_TE_TRACE_LAYER`, `TS_QWEN_TE_PROFILE` and
+    `TS_QWEN21_VISION_FUSED`. The VAE runs its whole-VAE graph on `ggml_cuda` and
+    `ggml_metal`, per convolution on `ggml_cpu` and `ggml_vulkan`, and in managed code on
+    `cpu`, with fixed im2col limits (1 GiB per device convolution before it is split into
+    bands, 2 GiB of scratch in the whole-VAE graph); the Qwen3-VL-8B text encoder runs its
+    fused trunk graph on every GGML backend and, on `cpu`, projects through the 8-bit
+    integer GEMM (the packed F32 GEMM and the older activation pre-scaling are gone); its
+    vision encoder takes the fused path on `ggml_cuda` and the per-block path elsewhere.
+    The run's `[diffusion]` line still reports each phase's seconds.
 - **Rebuild the native library with the managed code.** The managed code no longer
   probes for exports an older `GgmlOps` lacked, and several native entry points were
   merged: `TSGgml_Dsv4LoadModel` now takes the DSpark drafter path and the routed-MoE

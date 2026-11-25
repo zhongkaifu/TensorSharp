@@ -2345,7 +2345,14 @@ choose their kernels per backend. The switches of the transformers it replaced (
 whole graph and the pure-C# one: `TS_QWEN21_FLASH`, `_PAD_MASK`, `_CUDNN_ATTENTION`,
 `_CUBLAS_MATMUL`, `_CUBLAS_MIN_ROWS`, `_GRAPH_REUSE`, `_GRAPH_TRACE`, the `TS_QWEN21_CPU_*`
 switches and `TS_QWEN21_MEMORY`) were removed; setting one stops the CLI and the server at
-startup with `<NAME> was removed: <advice> Unset it.` The
+startup with `<NAME> was removed: <advice> Unset it.` The switches that chose between the
+paths of its VAE, text encoder and vision encoder, and those that traced or profiled them,
+were removed the same way (`TS_QWEN_VAE_GPU`, `TS_QWEN_VAE_FUSED`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VAE_ATTN`,
+`TS_QWEN_VAE_CONV_TILE_BYTES`, `TS_QWEN_VAE_FUSED_IM2COL_BUDGET`, `TS_QWEN21_VAE_TRACE`,
+`TS_QWEN_VAE_PROFILE`, `TS_QWEN_VAE_POOL_TRACE`, `TS_QWEN_TE_FUSED`,
+`TS_QWEN_TE_CPU_MATMUL`, `TS_QWEN21_TE_PRESCALE`, `TS_QWEN_TE_TRACE_DIR`,
+`TS_QWEN_TE_TRACE_LAYER`, `TS_QWEN_TE_PROFILE`, `TS_QWEN21_VISION_FUSED`); each companion
+takes the path that was its default. The
 [environment variable matrix](docs/env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs)
 gives each one's advice.
 
@@ -2441,7 +2448,7 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 | Packed F32 SGEMM behind `Ops.Addmm` and the Direct networks | ON (AVX-512 8x32, AVX2 6x16 or portable kernel) | `TS_CPU_SGEMM_KERNEL`, `TS_CPU_SGEMM_KC` / `_MC` / `_NC`, `TS_CPU_SGEMM_DOT_MAXN` for tuning | — |
 | AVX-512 kernels | ON when the CPU has AVX-512 F/BW/DQ and the runtime accelerates `Vector512` (the older per-row Q4_0 / Q8_0 dots: when it has AVX-512 F/BW) | `TS_CPU_DISABLE_AVX512=1` runs the AVX2 form of every hand-written kernel; `DOTNET_EnableAVX512=0` (not `DOTNET_EnableAVX512F`) makes the whole runtime AVX2-only | — |
 | DiffusionGemma on `cpu` | prompt-KV caching, batched MoE, fused Q/K/V and gate/up projections | `DIFFUSION_NO_PKV=1` turns the prompt-KV cache off; `DIFFUSION_CPU_ATTN_FAST=1`, `DIFFUSION_CPU_MOE_CHUNK` | — |
-| Qwen-Image-2.1 on `cpu` | the DiT's graph programs on the managed tensor executor; the text encoder with 8-bit activations on the multi-row integer GEMM; packed-GEMM VAE and vision tower; a request with no size renders at 1024×1024 (1 MP) — `ggml_cpu` and the GPU backends keep 2048×2048 | `TS_QWEN_TE_CPU_MATMUL=f32` keeps the text encoder's F32 activations against dequantized weight tiles (slower, numerically steadier); `TS_CPU_GEMM_THREADS` sizes the VAE's own pool (every logical CPU, at most 64); `TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` skips the up-front refusal of a size that cannot fit in memory; `TS_QWEN_VAE_PROFILE=1`, `TS_QWEN_TE_PROFILE=1` print stage timings (the DiT's `TS_QWEN21_CPU_*` switches were removed with the pure-C# transformer) | — |
+| Qwen-Image-2.1 on `cpu` | the DiT's graph programs on the managed tensor executor; the text encoder with 8-bit activations on the multi-row integer GEMM; packed-GEMM VAE and vision tower; a request with no size renders at 1024×1024 (1 MP) — `ggml_cpu` and the GPU backends keep 2048×2048 | `TS_CPU_GEMM_THREADS` sizes the VAE's own pool (every logical CPU, at most 64); `TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` skips the up-front refusal of a size that cannot fit in memory (the DiT's `TS_QWEN21_CPU_*` switches were removed with the pure-C# transformer; the text encoder's `TS_QWEN_TE_CPU_MATMUL` and the `TS_QWEN_VAE_PROFILE` / `TS_QWEN_TE_PROFILE` timings were removed as well) | — |
 | DeepSeek V4.1 Flash's whole-model executor | pure C# (`DeepSeek4CpuExecutor`) — a whole-model executor here rather than the generic per-op path | `TS_DSV4_THREADS=N` sets its compute width (every processor by default), not `TS_CPU_THREADS` | — |
 | Quantized weights on the direct video networks (Wan, MiniMax-H3) | kept in their GGUF storage type and multiplied there (expanding them to F32 at load took 4x the weight memory; on Wan at 256x160x5f, one step, the in-place path measured 80.9 s against 121.4 s) | — | — |
 

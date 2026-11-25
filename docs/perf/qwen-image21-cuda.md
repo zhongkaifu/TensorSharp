@@ -193,16 +193,19 @@ claim persistent CUDA graph replay. Allocation or unsupported-op failures fall
 back to the existing per-convolution path. Non-finite fused outputs also trigger
 that fallback, and non-finite final RGBA is rejected before pixel conversion.
 
-Set `TS_QWEN21_VAE_FUSED=0` for the per-convolution baseline. The existing global
-`TS_QWEN_VAE_FUSED=0` and `TS_QWEN_VAE_GPU=0` controls continue to disable this
-path. `TS_QWEN21_VAE_TRACE=1` reports fused execution or per-convolution tensor
-statistics and stops at the first non-finite intermediate. Qwen-Image-2.1 uses
-cuDNN automatically when its runtime is available. `TS_VAE_CUDNN_CONV=0`
-disables it; `1` explicitly enables it. Other VAEs retain their existing opt-in
-behavior.
+On CUDA and Metal the VAE always takes the whole-VAE graph, falling back only as
+described above. The switches that selected the per-convolution path instead
+(`TS_QWEN21_VAE_FUSED=0`, `TS_QWEN_VAE_FUSED=0`, `TS_QWEN_VAE_GPU=0`) were removed,
+as was `TS_QWEN21_VAE_TRACE`, which reported fused execution or per-convolution
+tensor statistics. The per-convolution path still runs on `ggml_cpu` and
+`ggml_vulkan`, so a per-convolution baseline now comes from another backend (the
+companion probe's `vae` on `Cpu`) and includes that backend's rounding.
+Qwen-Image-2.1 uses cuDNN automatically when its runtime is available.
+`TS_VAE_CUDNN_CONV=0` disables it; `1` explicitly enables it. Other VAEs retain
+their existing opt-in behavior.
 Qwen-Image-2.1 requests cuDNN FMA math to prevent implicit F16/TF32 conversion.
-Without cuDNN, the interpreter chooses ggml im2col/GEMM or direct convolution based
-on the existing `TS_QWEN_VAE_FUSED_IM2COL_BUDGET` scratch limit.
+Without cuDNN, the interpreter lowers a convolution to ggml im2col/GEMM up to a
+fixed 2 GiB of scratch, and to a direct convolution above that.
 
 Whole-VAE graphs may need substantial activation scratch at large resolutions.
 Paired real-weight encode/decode validation is required in addition to the native
@@ -229,11 +232,13 @@ every block. The MLPs use upstream `ggml_gelu_erf`, as required by Qwen3-VL;
 the main and deepstack projectors also use the native erf activation. Older
 Qwen3.5 callers retain their existing ABI and tanh-GELU behavior.
 
-`TS_QWEN21_VISION_FUSED=0` restores the previous per-block vision path and its
-managed erf approximation. The new kernel evaluates erf directly, so the
-comparison is numerical rather than bitwise. Use the companion probe's `vision`
-command to compare the main embedding and all three deepstack embeddings with
-identical image preprocessing. CPU and Metal retain their previous execution.
+CPU and Metal retain their previous execution: the per-block vision path with its
+managed erf approximation. The `TS_QWEN21_VISION_FUSED=0` switch that selected that
+path on CUDA was removed. The fused kernel evaluates erf directly, so the two paths
+agree numerically rather than bitwise. To compare them, run the companion probe's
+`vision` command on `Cuda` and on another backend, which applies identical image
+preprocessing, and compare the main embedding and all three deepstack embeddings;
+the difference then also includes the other backend's rounding.
 
 That per-block path's linear layers pass each weight to the native matrix multiply
 as a transposed view of its stored rows, the layout `ggml_mul_mat` consumes, on every
@@ -250,18 +255,17 @@ trunk divided every quantized projection input by 1024 and restored the scale
 after multiplication. That transformation can underflow CUDA's F16 activation
 quantization scales for small normalized inputs. Layers with Q/K head norms
 identify the Qwen3-VL path.
-`TS_QWEN21_TE_PRESCALE=1` restores the former scaling for numerical comparisons.
-Use `TS_QWEN_TE_FUSED=0` as the per-operation reference, and compare on the same
-backend before interpreting cross-backend quantization differences.
-For a selected-layer comparison, set `TS_QWEN_TE_TRACE_DIR` to an ignored
-validation directory and `TS_QWEN_TE_TRACE_LAYER` to the zero-based layer index.
-Both paths write corresponding planar F32 intermediate tensors. Native tracing
-retains those outputs, which can inhibit fusion; compare traced and untraced
-final outputs before treating the trace as representative. The per-operation
-head normalization uses a host double-precision sum while the CUDA graph uses
-device reductions, so subsequent quantization can amplify initially small
-rounding differences. Raw conditioning agreement alone does not validate image
-quality.
+The switch back to the former scaling (`TS_QWEN21_TE_PRESCALE=1`), the switch to
+the per-operation path on a GGML backend (`TS_QWEN_TE_FUSED=0`) and the per-layer
+trace (`TS_QWEN_TE_TRACE_DIR`, `TS_QWEN_TE_TRACE_LAYER`) were removed. Every GGML
+backend runs the fused trunk, falling back to the per-operation path only when
+the graph cannot be built, and the `cpu` backend runs the per-operation path. A
+per-operation reference therefore comes from another backend (the companion
+probe's `text` on `Cpu` against `GgmlCuda`), and the difference includes each
+backend's quantization. The per-operation head normalization uses a host
+double-precision sum while the CUDA graph uses device reductions, so subsequent
+quantization can amplify initially small rounding differences. Raw conditioning
+agreement alone does not validate image quality.
 
 Measured conditioning errors and their limitations are recorded in the ignored
 validation report `docs/validation/qwen-image21-cuda/REPORT.md` (local validation

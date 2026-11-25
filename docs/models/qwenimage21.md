@@ -792,8 +792,7 @@ What runs where:
   reads (F32 here), under the same rule as on a device: at most half of the free
   physical memory.
 - **Text encoder**: the projections run the managed multi-row integer GEMM (8-bit
-  activations, as ggml-cpu quantizes them; `TS_QWEN_TE_CPU_MATMUL=f32` selects a packed F32 GEMM on
-  dequantized Q4_K / Q6_K tiles), with a managed causal grouped-query attention.
+  activations, as ggml-cpu quantizes them), with a managed causal grouped-query attention.
 - **Vision encoder** (editing): packed-GEMM linear layers and a managed multi-head
   attention. Each linear weight's F32 copy is released once it is packed, so the
   tower holds one copy of its weights: encoding a 512×512 reference peaked at
@@ -835,8 +834,9 @@ With the retired transformer's F32 route (its removed `TS_QWEN21_CPU_MATMUL=f32`
 F32 activations against dequantized weight tiles) the same 256×256 run took 20.4 s
 at 42.0 dB / 0.984, and the 512×512 one 169.6 s (steps of 30.7–31.6 s) at
 31.4 dB / 0.96. The text encoder alone takes 0.76–0.88 s for the 37-token default
-prompt with the integer projections, against 1.8–1.9 s with
-`TS_QWEN_TE_CPU_MATMUL=f32` and about 1.4 s on `ggml_cpu`. Two larger runs were
+prompt with the integer projections, against 1.8–1.9 s with the packed F32 GEMM
+on dequantized Q4_K / Q6_K tiles (`TS_QWEN_TE_CPU_MATMUL=f32`, since removed) and
+about 1.4 s on `ggml_cpu`. Two larger runs were
 measured with the F32 transformer, before the integer route became the default: a
 1024×1024 Pruna 5-step generation took 756 s on `cpu` against 1101 s on
 `ggml_cpu`, and a 512×512 edit 224 s against 353 s.
@@ -876,8 +876,6 @@ image took 12–13 s through the vision encoder, and a 256×256 one 0.72 s again
   512×512, with attention growing faster than that; that is why the automatic size
   on this backend is 1024×1024. Use a step-distillation LoRA and a small size for
   anything interactive.
-- The GGML-only switches (`TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no
-  effect on `cpu`.
 
 ## LoRA plug-ins
 
@@ -1053,13 +1051,12 @@ NVIDIA RTX 4000 Ada, 20 GB, driver 580, `ggml_cuda`:
 - **Loading.** The factors are read, scaled and packed in parallel at startup. This
   takes 0.1–0.8 s on the M5 Pro and 0.2–1.3 s on the CUDA machine; the output is
   bit-identical to a serial load.
-- **VAE decoding.** The whole-VAE graph is now the default on Metal as well as CUDA.
+- **VAE decoding.** The whole-VAE graph now runs on Metal as well as CUDA.
   It decodes 1024×1024 in 5.0 s on the M5 Pro, where the per-convolution path took
   13.0 s and sd.cpp takes 7.1 s. At 2048×2048 it takes 24.9 s instead of 85.3 s, with
   a 45 GB peak memory footprint instead of 64 GB. It never runs on Vulkan, where
-  F16 cooperative-matrix operands overflow in the decoder; setting
-  `TS_QWEN21_VAE_FUSED=1` there prints a warning and decodes per convolution.
-  `TS_QWEN21_VAE_FUSED=0` selects the per-convolution path on any backend.
+  F16 cooperative-matrix operands overflow in the decoder; Vulkan and `ggml_cpu`
+  decode per convolution on the device.
 - **Why the CUDA images differ more.** On the CUDA machine, sd.cpp keeps the
   transformer on the GPU and runs out of memory for a whole-image decode, then
   retries with 256×256 tiles (11.5–13.2 s). Its wall times include that retry.
@@ -1375,8 +1372,10 @@ transformer (`QwenImage21ManagedDiT` with its CPU kernels). Their switches went 
 them; the [environment variable matrix](../env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs)
 lists them, and setting one makes the CLI and the server refuse to start with
 `<NAME> was removed: <advice> Unset it.` The CLI and server flags, the companion
-variables, `TS_QWEN_IMAGE_VARIANT`, `TS_QWEN21_EDIT_NOISE`, `TS_QWEN21_VAE_FUSED`
-and `TS_QWEN_TE_FUSED` are unchanged.
+variables, `TS_QWEN_IMAGE_VARIANT` and `TS_QWEN21_EDIT_NOISE` are unchanged. The
+companions' own path switches, which the migration kept (`TS_QWEN21_VAE_FUSED`,
+`TS_QWEN_TE_FUSED` and the rest), were removed later and are refused the same way;
+the matrix lists them too.
 
 What checks the runtime in place of the retired engines' tests and tools (the
 native whole-graph CTests, the NumPy oracle `eng/tests/qwen-image21-dit.py` and
@@ -1611,7 +1610,8 @@ The 2.1 VAE also routes spatial attention through native matrix operations,
 tiling queries while every query still attends to every key. Each score tile is
 bounded to 16 MiB, supporting the VAE's 768/1152-channel attention heads without
 requiring a flash-attention kernel for those widths. The managed implementation
-remains the fallback; `TS_QWEN21_VAE_ATTN=0` selects it for comparison.
+remains the fallback when the device call fails; the `TS_QWEN21_VAE_ATTN=0` switch
+that selected it for comparison was removed.
 
 Large VAE CPU normalization passes now visit contiguous spatial tiles, and SiLU
 uses parallel ranges. Twelve scalar-oracle tests pass with bit-exact outputs,

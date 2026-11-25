@@ -2062,7 +2062,12 @@ Qwen-Image-2.1 的 Transformer 在共享的扩散运行时上以计算图程序�
 Transformer（原生整图与纯 C# 实现）的开关——`TS_QWEN21_FLASH`、`_PAD_MASK`、`_CUDNN_ATTENTION`、
 `_CUBLAS_MATMUL`、`_CUBLAS_MIN_ROWS`、`_GRAPH_REUSE`、`_GRAPH_TRACE`、各个 `TS_QWEN21_CPU_*` 开关以及
 `TS_QWEN21_MEMORY`——均已移除；设置任何一个，CLI 与服务端都会在启动时报错退出，并提示
-`<NAME> was removed: <advice> Unset it.`。各自的替代说明见
+`<NAME> was removed: <advice> Unset it.`。为它的 VAE、文本编码器与视觉编码器选择执行路径的开关及其跟踪与计时
+开关（`TS_QWEN_VAE_GPU`、`TS_QWEN_VAE_FUSED`、`TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VAE_ATTN`、
+`TS_QWEN_VAE_CONV_TILE_BYTES`、`TS_QWEN_VAE_FUSED_IM2COL_BUDGET`、`TS_QWEN21_VAE_TRACE`、`TS_QWEN_VAE_PROFILE`、
+`TS_QWEN_VAE_POOL_TRACE`、`TS_QWEN_TE_FUSED`、`TS_QWEN_TE_CPU_MATMUL`、`TS_QWEN21_TE_PRESCALE`、
+`TS_QWEN_TE_TRACE_DIR`、`TS_QWEN_TE_TRACE_LAYER`、`TS_QWEN_TE_PROFILE`、`TS_QWEN21_VISION_FUSED`）同样已移除，
+各组件都走原来的默认路径。各自的替代说明见
 [环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md#矩阵外的-qwen-image-21-开关)。
 
 #### 张量并行与分布式推理
@@ -2143,7 +2148,7 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 | `Ops.Addmm` 与 Direct 网络背后的 packed F32 SGEMM | 启用（AVX-512 8x32、AVX2 6x16 或可移植内核） | `TS_CPU_SGEMM_KERNEL`、`TS_CPU_SGEMM_KC` / `_MC` / `_NC`、`TS_CPU_SGEMM_DOT_MAXN` 用于调优 | — |
 | AVX-512 内核 | CPU 支持 AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速时启用（旧的逐行 Q4_0 / Q8_0 点积：CPU 支持 AVX-512 F/BW 时启用） | `TS_CPU_DISABLE_AVX512=1` 让所有手写内核以 AVX2 形式运行；`DOTNET_EnableAVX512=0`（不是 `DOTNET_EnableAVX512F`）让整个运行时只用到 AVX2 | — |
 | `cpu` 上的 DiffusionGemma | prompt-KV 缓存、批量 MoE、融合的 Q/K/V 与 gate/up 投影 | `DIFFUSION_NO_PKV=1` 关闭 prompt-KV 缓存；`DIFFUSION_CPU_ATTN_FAST=1`、`DIFFUSION_CPU_MOE_CHUNK` | — |
-| `cpu` 上的 Qwen-Image-2.1 | DiT 的计算图程序在托管张量执行器上运行；文本编码器使用 8 位激活、在多行整数 GEMM 上计算；VAE 与视觉塔走 packed GEMM；未指定尺寸的请求输出 1024×1024（1 百万像素）——`ggml_cpu` 与 GPU 后端保持 2048×2048 | `TS_QWEN_TE_CPU_MATMUL=f32` 让文本编码器保留 F32 激活乘以反量化权重分块（更慢，数值更稳定）；`TS_CPU_GEMM_THREADS` 设置 VAE 专用池的宽度（每个逻辑 CPU 一个线程，最多 64）；`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` 跳过对内存放不下的尺寸的预先拒绝；`TS_QWEN_VAE_PROFILE=1`、`TS_QWEN_TE_PROFILE=1` 打印各阶段耗时（DiT 的 `TS_QWEN21_CPU_*` 开关已随纯 C# Transformer 一并移除） | — |
+| `cpu` 上的 Qwen-Image-2.1 | DiT 的计算图程序在托管张量执行器上运行；文本编码器使用 8 位激活、在多行整数 GEMM 上计算；VAE 与视觉塔走 packed GEMM；未指定尺寸的请求输出 1024×1024（1 百万像素）——`ggml_cpu` 与 GPU 后端保持 2048×2048 | `TS_CPU_GEMM_THREADS` 设置 VAE 专用池的宽度（每个逻辑 CPU 一个线程，最多 64）；`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` 跳过对内存放不下的尺寸的预先拒绝（DiT 的 `TS_QWEN21_CPU_*` 开关已随纯 C# Transformer 一并移除；文本编码器的 `TS_QWEN_TE_CPU_MATMUL` 以及 `TS_QWEN_VAE_PROFILE` / `TS_QWEN_TE_PROFILE` 计时同样已移除） | — |
 | DeepSeek V4.1 Flash 的整模型执行器 | 纯 C#（`DeepSeek4CpuExecutor`）——在这个后端上走整模型执行器，而不是通用逐算子路径 | 它的计算宽度由 `TS_DSV4_THREADS=N` 决定（默认取全部处理器），而不是 `TS_CPU_THREADS` | — |
 | direct 视频网络（Wan、MiniMax-H3）上的量化权重 | 保持 GGUF 存储类型，直接参与乘法（加载时展开成 F32 需要 4 倍权重内存；Wan 在 256x160x5f、单步下，就地路径实测 80.9 秒，展开路径 121.4 秒） | — | — |
 

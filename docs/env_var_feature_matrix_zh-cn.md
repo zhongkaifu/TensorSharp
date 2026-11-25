@@ -252,20 +252,35 @@ Transformer）的开关随之移除。设置其中任何一个，服务端或 CL
 - `TS_QWEN21_MEMORY`：运行会记录每个阶段的秒数与驻留计划（`[diffusion]` 日志行）；按阶段的进程内存报告没有
   替代。
 
+为 Qwen-Image-2.1 的伴随组件（VAE、Qwen3-VL-8B 文本编码器及其视觉编码器）选择执行路径、或对它们做跟踪与计时的
+开关也已移除。每个组件保留原来的默认路径；设置其中任何一个，服务端或 CLI 同样会在启动时报错退出：
+
+- `TS_QWEN_VAE_GPU`、`TS_QWEN_VAE_FUSED`、`TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VAE_ATTN`：VAE 在 `ggml_cuda` 与
+  `ggml_metal` 上运行整 VAE 计算图，在 `ggml_cpu` 与 `ggml_vulkan` 上在设备上逐卷积运行（Vulkan 从不使用整图），
+  在 `cpu` 上以托管代码（packed GEMM）运行。在 GGML 后端上，它的注意力总是走设备内核；只有设备调用失败时才
+  改用托管实现。
+- `TS_QWEN_VAE_CONV_TILE_BYTES`：设备卷积的 im2col 估计超过固定的 1 GiB 时，按水平条带拆分。
+- `TS_QWEN_VAE_FUSED_IM2COL_BUDGET`：整 VAE 计算图在临时缓冲不超过固定的 2 GiB 时把卷积展开为 im2col，超过时
+  改用直接卷积。
+- `TS_QWEN_TE_FUSED`：文本编码器在所有 GGML 后端上把整个主干作为一张计算图运行（只有这张图无法构建时才逐算子
+  运行），在 `cpu` 上逐算子运行。
+- `TS_QWEN_TE_CPU_MATMUL`：在 `cpu` 上，文本编码器的投影把激活量化到 8 位，并在多行整数 GEMM 上计算（i7-11800H
+  上 37 token 的默认提示用时 0.76-0.88 s，`f32` 选择的 packed F32 GEMM 为 1.8-1.9 s，`ggml_cpu` 约 1.4 s）；
+  F32 GEMM 已移除。
+- `TS_QWEN21_TE_PRESCALE`：文本编码器的融合主干直接相乘，不再预先缩放激活；旧的缩放方式已移除。
+- `TS_QWEN21_VISION_FUSED`：Qwen-Image 模式下的视觉编码器在 `ggml_cuda` 上走融合路径，在其他所有后端上走逐块
+  （主机端 erf）路径。
+- `TS_QWEN21_VAE_TRACE`、`TS_QWEN_VAE_PROFILE`、`TS_QWEN_VAE_POOL_TRACE`、`TS_QWEN_TE_TRACE_DIR`、
+  `TS_QWEN_TE_TRACE_LAYER`、`TS_QWEN_TE_PROFILE`：没有替代；运行的 `[diffusion]` 日志行仍报告每个阶段的秒数。
+
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
 | `TS_QWEN21_EDIT_NOISE` | Qwen-Image-2.1 编辑 | `references`（或不设置）：编辑的初始噪声取自由参考图（8 位像素的 SHA-256）决定的 Philox 流，因此在相同种子与尺寸下也不会从画出源图的那份噪声重新开始。`seed`：编辑改用该种子的文生图噪声（与 stable-diffusion.cpp 相同），用于噪声对齐的对比，每次这样的编辑都会打印一行。其他取值会使请求失败。文生图噪声在两种设置下相同 | `references` | 未注册 | 否 |
-| `TS_QWEN21_VAE_FUSED` | Qwen-Image-2.1 VAE | 整 VAE 计算图，CUDA 与 Metal 上默认使用。`0` 选择逐卷积路径；`1` 在其他 GGML 后端上强制使用，但 Vulkan 除外，那里会被忽略并给出警告 | CUDA / Metal 上启用 | 未注册 | 否 |
-| `TS_QWEN21_VISION_FUSED` | `ggml_cuda` 上的 Qwen-Image-2.1 视觉编码器 | `0` 恢复此前的逐块视觉路径，用于 A/B | 启用 | 未注册 | 否 |
-| `TS_QWEN_VAE_PROFILE` | `cpu` 上的 Qwen-Image-2.1 VAE | `1` 打印一次编码或解码中各类算子（conv、norm、add、attention、resample、权重打包）的耗时 | 关闭 | 未注册 | 否 |
 | `TS_QWEN_IMAGE_CPU_MEMORY_CHECK` | `cpu` 上的 Qwen-Image-2.1 | 在开始任何工作之前，估计峰值（VAE 解码：每个输出像素 2304 字节再加约 1.8 GiB；去噪：每个 token 128 KiB 再加 2.5 GiB 与映射的 Transformer）超过机器内存的尺寸会被拒绝，并给出能放下的最大方形尺寸；只超过当前空闲内存的尺寸会得到一条警告。`0` 跳过拒绝 | 启用 | 未注册 | 否 |
 | `TS_CPU_GEMM_THREADS` | `cpu` 上的 Qwen-Image-2.1 VAE | 托管 VAE 专用线程池的宽度。默认每个逻辑 CPU 一个线程：卷积受 FMA 限制，每核两个 SMT 线程能让唯一的 512 位 FMA 端口更忙（512x512 解码 7.9 -> 7.0 s）。文本编码器与视觉塔仍在共享池上，那里多出的自旋线程得不偿失。`TS_CPU_POOL=0` 时 VAE 改用宽度上限为此值的 `Parallel.For`，不再使用专用池 | 逻辑 CPU 数，最多 64（限制在 1-512） | 未注册 | 否 |
-| `TS_CPU_GEMM_KC` / `TS_CPU_GEMM_NT` | `cpu` 上的 Qwen-Image packed GEMM（VAE、文本编码器、视觉塔） | packed GEMM 的 K 分块与 N 分块，仅用于调优；结果与它们无关 | `256` / `256`（限制在 16-4096 / 32-2048） | 未注册 | 否 |
-| `TS_QWEN_TE_CPU_MATMUL` | `cpu` 上的 Qwen-Image-2.1 文本编码器（Qwen3-VL-8B） | 不设置时，投影像 ggml-cpu 那样把激活量化到 8 位，并在多行整数 GEMM 上计算：37 token 的默认提示用时 0.76-0.88 s，packed F32 GEMM 为 1.8-1.9 s（ggml_cpu 约 1.4 s）。`f32` 改用反量化权重分块上的 packed F32 GEMM（激活为精确的 F32：每个投影与双精度参照相差约 1e-6，8 位路径约 4e-3）。 | 整数（Q8）激活 | 未注册 | 否 |
-| `TS_QWEN_TE_PROFILE` | 同上 | `1` 每次前向打印逐算子路径的耗时拆分（linear / attention / norm） | 关闭 | 未注册 | 否 |
+| `TS_CPU_GEMM_KC` / `TS_CPU_GEMM_NT` | `cpu` 上的 Qwen-Image packed GEMM（VAE、视觉塔） | packed GEMM 的 K 分块与 N 分块，仅用于调优；结果与它们无关 | `256` / `256`（限制在 16-4096 / 32-2048） | 未注册 | 否 |
 
 在 `cpu` 上，前缀 KV 缓存是位于主机内存中的托管缓存，它最多可占一半的"空闲内存"指未被使用的物理内存。
-只对 GGML 有效的开关（`TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VISION_FUSED`）在那里不起作用。
 
 ## 矩阵外的 MiniMax-H3-Image 开关
 

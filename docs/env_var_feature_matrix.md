@@ -282,21 +282,43 @@ transformer) were removed with them. Setting one stops the server or CLI at star
 - `TS_QWEN21_MEMORY`: the run logs each phase's seconds and the residency plan
   (`[diffusion]` lines); the per-phase process memory report has no replacement.
 
+The switches that chose between the paths of Qwen-Image-2.1's companions (the VAE, the
+Qwen3-VL-8B text encoder and its vision encoder), or traced and profiled them, were removed
+as well. Each companion keeps the path that was its default, and setting one of these stops
+the server or CLI at startup in the same way:
+
+- `TS_QWEN_VAE_GPU`, `TS_QWEN_VAE_FUSED`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VAE_ATTN`: the
+  VAE runs its whole-VAE graph on `ggml_cuda` and `ggml_metal`, per convolution on the device
+  on `ggml_cpu` and `ggml_vulkan` (Vulkan never ran the whole graph), and in managed code
+  (packed GEMM) on `cpu`. On the GGML backends its attention always runs the device kernel;
+  the managed one is used only if the device call fails.
+- `TS_QWEN_VAE_CONV_TILE_BYTES`: a device convolution is split into horizontal bands once
+  its im2col estimate passes a fixed 1 GiB.
+- `TS_QWEN_VAE_FUSED_IM2COL_BUDGET`: the whole-VAE graph lowers a convolution to im2col up
+  to a fixed 2 GiB of scratch, and to a direct convolution above that.
+- `TS_QWEN_TE_FUSED`: the text encoder runs its whole trunk as one graph on every GGML
+  backend (per operation only when that graph cannot be built), and per operation on `cpu`.
+- `TS_QWEN_TE_CPU_MATMUL`: on `cpu` the text encoder's projections quantize their
+  activations to 8 bits and run the multi-row integer GEMM (0.76-0.88 s for the 37-token
+  default prompt on an i7-11800H, against 1.8-1.9 s for the packed F32 GEMM that `f32`
+  selected, and about 1.4 s on `ggml_cpu`); the F32 GEMM was removed.
+- `TS_QWEN21_TE_PRESCALE`: the text encoder's fused trunk multiplies without pre-scaling its
+  activations; the older scaling was removed.
+- `TS_QWEN21_VISION_FUSED`: the vision encoder in Qwen-Image mode takes its fused path on
+  `ggml_cuda` and the per-block (host-erf) path on every other backend.
+- `TS_QWEN21_VAE_TRACE`, `TS_QWEN_VAE_PROFILE`, `TS_QWEN_VAE_POOL_TRACE`,
+  `TS_QWEN_TE_TRACE_DIR`, `TS_QWEN_TE_TRACE_LAYER`, `TS_QWEN_TE_PROFILE`: no replacement;
+  the run's `[diffusion]` line still reports each phase's seconds.
+
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `TS_QWEN21_EDIT_NOISE` | Qwen-Image-2.1 edits | `references` (or unset): an edit's initial noise is drawn on a Philox stream keyed to its reference images (8-bit pixels, SHA-256), so it never restarts from the noise that drew its source at the same seed and size. `seed`: edits draw the seed's text-to-image noise, as stable-diffusion.cpp does, for matched-noise comparisons; each such edit prints a line. Any other value fails the request. Text-to-image noise is the same either way | `references` | not registered | no |
-| `TS_QWEN21_VAE_FUSED` | Qwen-Image-2.1 VAE | Whole-VAE graph, the default on CUDA and Metal. `0` selects the per-convolution path; `1` forces the graph on another GGML backend except Vulkan, where it is ignored with a warning | ON on CUDA / Metal | not registered | no |
-| `TS_QWEN21_VISION_FUSED` | Qwen-Image-2.1 vision encoder on `ggml_cuda` | `0` restores the previous per-block vision path for A/B runs | ON | not registered | no |
-| `TS_QWEN_VAE_PROFILE` | Qwen-Image-2.1 VAE on `cpu` | `1` prints the time per op class (conv, norm, add, attention, resample, weight packing) of one encode or decode | OFF | not registered | no |
 | `TS_QWEN_IMAGE_CPU_MEMORY_CHECK` | Qwen-Image-2.1 on `cpu` | Before any work, a size whose estimated peak (the VAE decode: 2304 bytes per output pixel plus about 1.8 GiB; the denoise: 128 KiB per token plus 2.5 GiB and the mapped transformer) exceeds the machine's memory is refused with the largest square size that fits; one that only exceeds the memory free right now gets a warning. `0` skips the refusal | ON | not registered | no |
 | `TS_CPU_GEMM_THREADS` | Qwen-Image-2.1 VAE on `cpu` | Width of the dedicated pool the managed VAE runs on. One thread per logical CPU by default: the convolutions are FMA-bound, and two SMT threads per core keep the single 512-bit FMA port busier (512x512 decode 7.9 -> 7.0 s). The text encoder and vision tower stay on the shared pool, where the extra spinning workers cost more than they give. Under `TS_CPU_POOL=0` the VAE runs `Parallel.For` capped at this width instead of its own pool | logical CPUs, at most 64 (clamped 1-512) | not registered | no |
-| `TS_CPU_GEMM_KC` / `TS_CPU_GEMM_NT` | Qwen-Image packed GEMM on `cpu` (VAE, text encoder, vision) | K chunk and N tile of the packed GEMM, for tuning; the result does not depend on them | `256` / `256` (clamped 16-4096 / 32-2048) | not registered | no |
-| `TS_QWEN_TE_CPU_MATMUL` | Qwen-Image-2.1 text encoder (Qwen3-VL-8B) on `cpu` | Unset, the projections quantize their activations to 8 bits as ggml-cpu does and run the multi-row integer GEMM: 0.76-0.88 s for the 37-token default prompt against 1.8-1.9 s for the packed F32 GEMM (ggml_cpu about 1.4 s). `f32` selects the packed F32 GEMM on dequantized weight tiles (exact F32 activations: about 1e-6 relative to a double-precision reference per projection, against about 4e-3 for the 8-bit route). | integer (Q8) activations | not registered | no |
-| `TS_QWEN_TE_PROFILE` | same | `1` prints a per-forward split of the per-op path (linear / attention / norms) | OFF | not registered | no |
+| `TS_CPU_GEMM_KC` / `TS_CPU_GEMM_NT` | Qwen-Image packed GEMM on `cpu` (VAE, vision) | K chunk and N tile of the packed GEMM, for tuning; the result does not depend on them | `256` / `256` (clamped 16-4096 / 32-2048) | not registered | no |
 
 On `cpu`, the prefix KV cache is a managed cache in host memory, and the free memory it
-may take half of is the physical memory not in use. The GGML-only switches
-(`TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no effect there.
+may take half of is the physical memory not in use.
 
 ## Out-of-Matrix MiniMax-H3-Image Knobs
 

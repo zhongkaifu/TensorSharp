@@ -632,8 +632,8 @@ TENSORSHARP_MODELS="$PWD/models" dotnet run --project TensorSharp.Cli -c Release
   已随之移除。
 - **前缀 KV 缓存**：位于主机内存的托管缓存，保存注意力实际读取的值（这里为 F32），规则与设备上相同：
   最多使用空闲物理内存的一半。
-- **文本编码器**：投影在托管的多行整数 GEMM 上计算（8 位激活，与 ggml-cpu 的量化方式相同；`TS_QWEN_TE_CPU_MATMUL=f32` 改用反量化
-  Q4_K / Q6_K 分块上的 packed F32 GEMM），注意力是托管的因果分组查询注意力。
+- **文本编码器**：投影在托管的多行整数 GEMM 上计算（8 位激活，与 ggml-cpu 的量化方式相同），注意力是托管的
+  因果分组查询注意力。
 - **视觉编码器**（编辑）：packed GEMM 线性层与托管多头注意力。每个线性层权重打包之后即释放其 F32 副本，
   因此视觉塔只保留一份权重：在分阶段基准中编码一张 512×512 参考图的提交内存峰值为 3.2 GB，保留两份时为
   5.4 GB，输出逐比特相同。
@@ -666,8 +666,8 @@ i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows。DiT 为 `qwen_image
 
 使用已退役 Transformer 的 F32 路径（已移除的 `TS_QWEN21_CPU_MATMUL=f32`：F32 激活乘以反量化的权重分块）时，同样的 256×256 运行用时
 20.4 s，PSNR / SSIM 为 42.0 dB / 0.984；512×512 用时 169.6 s（每步 30.7–31.6 s），为 31.4 dB / 0.96。
-单看文本编码器，37 token 的默认提示在整数投影下用时 0.76–0.88 s，`TS_QWEN_TE_CPU_MATMUL=f32` 下为
-1.8–1.9 s，`ggml_cpu` 约 1.4 s。另有两次更大的运行是在整数路径成为默认值之前、用 F32 Transformer 测的：
+单看文本编码器，37 token 的默认提示在整数投影下用时 0.76–0.88 s，在反量化 Q4_K / Q6_K 分块上的 packed F32 GEMM
+（`TS_QWEN_TE_CPU_MATMUL=f32`，已移除）下为 1.8–1.9 s，`ggml_cpu` 约 1.4 s。另有两次更大的运行是在整数路径成为默认值之前、用 F32 Transformer 测的：
 1024×1024、Pruna 5 步生成在 `cpu` 上用时 756 s，`ggml_cpu` 为 1101 s；512×512 编辑为 224 s 对 353 s。
 
 两个后端产生的像素并不相同，而且两者都不是参照答案：已退役的托管 Transformer 像 ggml-cpu 那样量化激活，
@@ -692,7 +692,6 @@ fixture 上（有无参考图、经过前缀缓存）与该 Transformer 冻结�
 - **速度。** 在上面这台 8 核笔记本上，已退役的 Transformer 在 512×512 时每步 17.6–21.7 s；2K 方图的图像 token 是 512×512 的 16 倍，
   注意力的增长还要更快，这也是这个后端的自动尺寸为 1024×1024 的原因。需要交互速度时，请使用步数蒸馏
   LoRA 并选小尺寸。
-- 只对 GGML 有效的开关（`TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VISION_FUSED`）在 `cpu` 上不起作用。
 
 ## LoRA 插件
 
@@ -832,11 +831,10 @@ NVIDIA RTX 4000 Ada，20 GB，驱动 580，`ggml_cuda`：
   （`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f16`）反而使每步慢 5%，因此 F32 乘积并不是瓶颈。
 - **加载。** 启动时并行读取、缩放并打包因子：M5 Pro 上 0.1–0.8 s，CUDA 机器上 0.2–1.3 s；
   结果与串行加载逐位一致。
-- **VAE 解码。** 整个 VAE 的融合计算图现在在 Metal 与 CUDA 上都是默认路径。它在 M5 Pro 上用
+- **VAE 解码。** 整个 VAE 的融合计算图现在在 Metal 与 CUDA 上都会运行。它在 M5 Pro 上用
   5.0 s 解码 1024×1024（逐卷积路径需要 13.0 s，sd.cpp 需要 7.1 s）。2048×2048 时用 24.9 s
   代替 85.3 s，内存峰值占用为 45 GB 而非 64 GB。它从不在 Vulkan 上运行，因为解码器中的 F16
-  协作矩阵操作数会溢出；在 Vulkan 上设置 `TS_QWEN21_VAE_FUSED=1` 会打印警告并改为逐卷积解码。
-  `TS_QWEN21_VAE_FUSED=0` 在任何后端上选择逐卷积路径。
+  协作矩阵操作数会溢出；Vulkan 与 `ggml_cpu` 在设备上逐卷积解码。
 - **为什么 CUDA 上图像差异更大。** 在这台 CUDA 机器上，sd.cpp 把 Transformer 留在 GPU 上，整图
   解码时显存不足，于是改用 256×256 分块重试（11.5–13.2 s），它的总耗时包含这次重试。
   TensorSharp 先释放 Transformer 的权重，再用 4.0–4.1 s 完成解码。两个引擎在 CUDA 上还都以 TF32
@@ -994,7 +992,8 @@ Qwen-Image-2.1 与 Qwen-Image-2.1-Turbo 是共享扩散运行时（`TensorSharp.
 纯 C# Transformer（`QwenImage21ManagedDiT` 及其 CPU 内核）。它们的开关也随之移除，
 [环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的-qwen-image-21-开关)列出了这些开关；设置任何一个，
 CLI 与服务端都会拒绝启动，并报告 `<NAME> was removed: <advice> Unset it.`。CLI 与服务端参数、伴随文件
-变量、`TS_QWEN_IMAGE_VARIANT`、`TS_QWEN21_EDIT_NOISE`、`TS_QWEN21_VAE_FUSED` 与 `TS_QWEN_TE_FUSED` 保持不变。
+变量、`TS_QWEN_IMAGE_VARIANT` 与 `TS_QWEN21_EDIT_NOISE` 保持不变。迁移时保留下来的伴随组件路径开关
+（`TS_QWEN21_VAE_FUSED`、`TS_QWEN_TE_FUSED` 等）后来也已移除，同样会被拒绝；环境变量矩阵也列出了它们。
 
 取代已退役引擎测试与工具（原生整图 CTest、NumPy 参考实现 `eng/tests/qwen-image21-dit.py` 以及
 `benchmarks/QwenImageDiTBench`，均已移除）的验证：
