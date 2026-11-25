@@ -1,9 +1,11 @@
 # Qwen-Image-2.1
 
-Qwen-Image-2.1 uses the `QwenImageModel` image pipeline for text-to-image generation
-and image editing. It requires a Qwen3-VL-8B text encoder and the dedicated 2.1
-VAE. Native RGBA input and PNG output preserve transparency; the Qwen3-VL
-conditioning branch composites the reference over white while the VAE keeps alpha.
+Qwen-Image-2.1 generates and edits images on TensorSharp's shared diffusion runtime
+(`QwenImage21DiffusionModel`, the runtime MiniMax-H3-Image also uses; see
+[Implementation and validation](#implementation-and-validation)). It requires a
+Qwen3-VL-8B text encoder and the dedicated 2.1 VAE. Native RGBA input and PNG
+output preserve transparency; the Qwen3-VL conditioning branch composites the
+reference over white while the VAE keeps alpha.
 Earlier Qwen-Image / Qwen-Image-Edit checkpoints (such as Qwen-Image-Edit-2511) are
 no longer supported and are refused at load (exit code 2). The `--qwen-image-lora`
 option was replaced by `--lora` ([LoRA plug-ins](#lora-plug-ins)), and
@@ -145,8 +147,8 @@ same request gives the same picture.
 An edit's noise also depends on its reference images. TensorSharp hashes the
 pictures as they were passed (SHA-256 over their 8-bit RGB values in order, plus
 alpha when any pixel is not opaque) and draws the noise on a separate Philox
-stream chosen by that hash; the pipeline's `Qwen-Image-2.1: …` log line shows it
-as `(edit noise stream <id>)`. Without this, editing a picture at the seed and size it
+stream chosen by that hash; the run logs it as `[qwen21] edit noise stream <id>`.
+Without this, editing a picture at the seed and size it
 was drawn with starts from the very noise that became that picture, and
 Qwen-Image-2.1 can then retrace the picture instead of following the instruction.
 Every host's defaults lead there: the seed is 0 unless a request names one, and an
@@ -411,7 +413,7 @@ identify only their architecture (`qwen_image`), so the file does not distinguis
 - `--qwen-image-variant turbo` (or `base`) on the CLI and the server, or
   `"qwen-image-variant": "turbo"` in a config file; the Turbo config sets it. The hosts
   hand it to the model as `TS_QWEN_IMAGE_VARIANT`, which an in-process caller can set
-  before constructing `QwenImageModel` (its `Variant` property reports the result). An
+  before constructing `QwenImage21DiffusionModel` (its `Variant` property reports the result). An
   unknown flag value is a configuration error at startup (exit code 1), and an unknown
   `TS_QWEN_IMAGE_VARIANT` refuses the load (exit code 2).
 - TensorAgent's Turbo catalog entries declare it themselves.
@@ -442,11 +444,14 @@ followed by a final 0:
 
 Its scheduler has shift 1.0 and no dynamic shifting, so the values are used as they are
 at every resolution: that is how diffusers loads them, and what the AtomicChat card passes
-to stable-diffusion.cpp as `--sigmas`. The run logs it before denoising:
+to stable-diffusion.cpp as `--sigmas`. The run names the schedule before denoising,
+and each step's line gives its two sigmas:
 
 ```text
-Qwen-Image-2.1 Turbo: 1024x1024, 8 steps, CFG 1, seed 42, 0 reference(s)
-  [qwen21] Turbo schedule (model_index.json sample_sigmas): 8 steps on fixed sigmas [1, 0.97845, 0.95418, 0.92663, 0.89508, 0.84515, 0.70453, 0.41457, 0]
+Qwen-Image-2.1-Turbo: 1024x1024, 8 steps, its own fixed sigmas, cfg 1, seed 42, 0 reference(s)
+  [diffusion] qwen_image step 1/8 sigma 1 -> 0.97845 <seconds>s
+  ...
+  [diffusion] qwen_image step 8/8 sigma 0.41457 -> 0 <seconds>s
 ```
 
 - The default is 8 steps at CFG 1. An explicit `--diffusion-steps 8` (`steps: 8` in a
@@ -647,8 +652,13 @@ it back on the original canvas. `--mask-crop-padding` sets that context in sourc
 pixels (0–16384, default 64). Cropping is optional; small regions can use a smaller
 internal `--width`/`--height` to reduce inference work. These set the nominal
 full-canvas sampling resolution; crop mode scales it to the selected crop's share
-of the canvas and rounds up to the 32-pixel grid. The saved image still has the
-source dimensions. The quality and speed tradeoff depends on the selection,
+of the canvas and rounds up to the 32-pixel grid. A masked edit never samples its
+selection (the whole picture or the crop) above its own resolution: the saved image
+has the source dimensions, so sampling more pixels would only enlarge the latent
+mask, the denoise and the decode. A 512x512 picture's masked edit therefore samples
+512x512 instead of the automatic 2048x2048 area; a larger size or area than the
+picture does not raise it, and a picture larger than the area is still sampled
+below its own resolution. The quality and speed tradeoff depends on the selection,
 context, internal resolution and sampling steps.
 
 Multipart API:
@@ -736,18 +746,23 @@ Run each tool with `--help` (the C# benchmark documents its arguments in
 or `artifacts/`. Browser touch emulation does not establish native phone behavior;
 CPU mask microbenchmarks do not measure full model inference or GPU speedups.
 
-On the GGML backends the 2.1 diffusion transformer runs a complete GGML graph with
-resident quantized weights; on `cpu` it runs a managed forward over the same
-file-mapped weights. There is no weight-streaming mode on either. Start with smaller
-dimensions if available memory is insufficient. CUDA and Vulkan were exercised on
-NVIDIA A40s; the measurements below record where.
+On every backend the 2.1 diffusion transformer runs as the diffusion runtime's graph
+programs ([Implementation and validation](#implementation-and-validation)): the GGML
+graph executor runs them with resident quantized weights on the GGML backends, and the
+managed tensor executor runs them over the same file-mapped weights on `cpu`. There is
+no weight-streaming mode on either. Start with smaller dimensions if available memory
+is insufficient. CUDA and Vulkan were exercised on NVIDIA A40s with the retired native
+graph; the runtime was validated on CUDA on an RTX 4000 Ada
+([Implementation and validation](#implementation-and-validation)) and has not been run
+on Metal or Vulkan hardware. The measurements below record where each was taken.
 
 ## Pure C# CPU backend (`--backend cpu`)
 
-`--backend cpu` runs the whole pipeline in managed C#: the diffusion transformer,
-the Qwen3-VL text encoder, the vision encoder used for editing, the VAE, LoRA
-plug-ins and the prefix KV cache. No GGML graph is built and the pipeline makes no
-call into the native GgmlOps library; the CLI also skips its GGML teardown at exit on
+`--backend cpu` runs the whole pipeline in managed C#: the diffusion transformer
+(the runtime's graph programs on the managed tensor executor), the Qwen3-VL text
+encoder, the vision encoder used for editing, the VAE, LoRA plug-ins and the prefix
+KV cache. No GGML graph is built and the pipeline makes no call into the native
+GgmlOps library; the CLI also skips its GGML teardown at exit on
 this backend unless something else in the process loaded the library. Weights are
 read from the memory-mapped GGUF and safetensors files in their stored types.
 Previously the model refused `cpu` and needed a GGML backend. Outside the model
@@ -772,20 +787,17 @@ chose. `ggml_cpu` keeps the native 2048×2048 default.
 
 What runs where:
 
-- **Transformer** (`QwenImage21ManagedDiT`): the operations of the native graph,
-  in the same order and from the same weight descriptors. The quantized
-  projections quantize their activations to Q8_K / Q8_0, as ggml-cpu does, and run
-  the managed multi-row integer GEMM; attention is a tiled flash attention; LoRA
-  factors (stacked shrinks, DoRA row scales) are applied unmerged as on the GGML
-  backends. `TS_QWEN21_CPU_MATMUL=f32`, the default before, multiplies F32
-  activations by dequantized weight tiles instead: slower, but numerically steadier.
-- **Prefix KV cache**: a managed cache in host memory with the same types
-  (`auto`/`f32` store what attention reads, so cached steps reproduce uncached
-  ones bit for bit; `f16`, `q8_0`, `q8_0_v`) and the same rule: at most half of the
-  free physical memory, and `TS_QWEN21_PREFIX_CACHE_MAX_MIB`.
-- **Text encoder**: the projections run the same multi-row integer GEMM (8-bit
-  activations; `TS_QWEN_TE_CPU_MATMUL=f32` selects a packed F32 GEMM on
-  dequantized Q4_K / Q6_K tiles), with a managed causal grouped-query attention.
+- **Transformer** (`QwenImage21Denoiser`): the same graph programs the GGML
+  backends run, executed by the managed tensor executor over the file-mapped
+  weights; LoRA factors (stacked shrinks, DoRA row scales) are applied unmerged as
+  on the GGML backends. It replaced the pure-C# transformer (`QwenImage21ManagedDiT`
+  and its CPU kernels), whose tuning switches (`TS_QWEN21_CPU_*`) were removed with
+  it.
+- **Prefix KV cache**: a managed cache in host memory that stores what attention
+  reads (F32 here), under the same rule as on a device: at most half of the free
+  physical memory.
+- **Text encoder**: the projections run the managed multi-row integer GEMM (8-bit
+  activations, as ggml-cpu quantizes them), with a managed causal grouped-query attention.
 - **Vision encoder** (editing): packed-GEMM linear layers and a managed multi-head
   attention. Each linear weight's F32 copy is released once it is packed, so the
   tower holds one copy of its weights: encoding a 512×512 reference peaked at
@@ -799,16 +811,18 @@ What runs where:
 All of these have AVX-512 and AVX2 kernels, chosen by one instruction-set decision
 for the whole backend (`TS_CPU_DISABLE_AVX512=1` selects the AVX2 ones), and a
 portable fallback; the environment variable matrix lists
-[every switch](../env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs),
-including the `0` / `scalar` settings that restore each previous stage.
+[the switches that remain](../env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs)
+and the ones that were removed.
 
-### Measured on an 8-core laptop
+### Measured on an 8-core laptop (retired pure-C# transformer)
 
+These figures were measured with the pure-C# transformer the runtime replaced
+(`QwenImage21ManagedDiT`, since removed) and the native whole-graph forward on
+`ggml_cpu`; the migration's measurements did not cover the `cpu` backend.
 i7-11800H (8 cores / 16 threads, AVX-512), 32 GB, Windows. DiT
 `qwen_image_2.1_Q4_K_M.gguf`, text encoder `Qwen3VL-8B-Instruct-Q4_K_M.gguf`,
-VAE BF16; text-to-image, CFG 1, seed 42, with the default integer (Q8) projections.
-`ggml_cpu` runs native code these changes did not touch. PSNR / SSIM compare the
-`cpu` image with the `ggml_cpu` one.
+VAE BF16; text-to-image, CFG 1, seed 42, with that transformer's default integer
+(Q8) projections. PSNR / SSIM compare the `cpu` image with the `ggml_cpu` one.
 
 | Run | Stage | `cpu` | `ggml_cpu` |
 |---|---|---:|---:|
@@ -821,28 +835,32 @@ VAE BF16; text-to-image, CFG 1, seed 42, with the default integer (Q8) projectio
 | | total | **118 s** | 295.7 s |
 | | PSNR / SSIM | 32.9 dB / 0.972 | reference |
 
-With `TS_QWEN21_CPU_MATMUL=f32` (F32 activations against dequantized weight
-tiles, the default before) the same 256×256 run took 20.4 s at 42.0 dB / 0.984,
-and the 512×512 one 169.6 s (steps of 30.7–31.6 s) at 31.4 dB / 0.96. The text
-encoder alone takes 0.76–0.88 s for the 37-token default prompt with the integer
-projections, against 1.8–1.9 s with `TS_QWEN_TE_CPU_MATMUL=f32` and about 1.4 s on
-`ggml_cpu`. Two larger runs were measured with the F32 transformer, before the
-integer route became the default: a 1024×1024 Pruna 5-step generation took 756 s
-on `cpu` against 1101 s on `ggml_cpu`, and a 512×512 edit 224 s against 353 s.
+With the retired transformer's F32 route (its removed `TS_QWEN21_CPU_MATMUL=f32`:
+F32 activations against dequantized weight tiles) the same 256×256 run took 20.4 s
+at 42.0 dB / 0.984, and the 512×512 one 169.6 s (steps of 30.7–31.6 s) at
+31.4 dB / 0.96. The text encoder alone takes 0.76–0.88 s for the 37-token default
+prompt with the integer projections, against 1.8–1.9 s with the packed F32 GEMM
+on dequantized Q4_K / Q6_K tiles (`TS_QWEN_TE_CPU_MATMUL=f32`, since removed) and
+about 1.4 s on `ggml_cpu`. Two larger runs were
+measured with the F32 transformer, before the integer route became the default: a
+1024×1024 Pruna 5-step generation took 756 s on `cpu` against 1101 s on
+`ggml_cpu`, and a 512×512 edit 224 s against 353 s.
 
-The two backends do not produce the same pixels, and neither is the reference:
-the managed transformer quantizes the activations as ggml-cpu does but sums in
-another order and keeps F32 where ggml-cpu uses its F16 GELU table and
-BF16-rounded inputs (`TS_QWEN21_CPU_GELU_FP16` / `TS_QWEN21_CPU_ROUND_ACTIVATIONS`
-reproduce those), and each re-quantization can flip a rounding. On single
-forwards (`benchmarks/QwenImageDiTBench`, 256×256) the managed velocity has cosine
-0.99993 to ggml-cpu at sigma 1 and 0.99938 at sigma 0.02 (0.99994 and 0.9978 with
-the F32 route), while a 1e-4 relative change of the timestep alone moves
-ggml-cpu's own velocity by 4.7e-2 (cosine 0.9989). Editing on `cpu` is also covered by
-unit tests of the managed transformer (edit layouts, several references) and by
-stage benchmarks (`benchmarks/QwenImageStagesBench`). In the stage benchmark a
-1024×1024 reference image took 12–13 s through the vision encoder, and a 256×256
-one 0.72 s against 5.0 s on `ggml_cpu`.
+The two backends did not produce the same pixels, and neither was the reference:
+the retired transformer quantized the activations as ggml-cpu does but summed in
+another order and kept F32 where ggml-cpu uses its F16 GELU table and
+BF16-rounded inputs, and each re-quantization can flip a rounding. On single
+forwards (256×256, measured with the since-removed `benchmarks/QwenImageDiTBench`)
+its velocity had cosine 0.99993 to ggml-cpu at sigma 1 and 0.99938 at sigma 0.02
+(0.99994 and 0.9978 with the F32 route), while a 1e-4 relative change of the
+timestep alone moves ggml-cpu's own velocity by 4.7e-2 (cosine 0.9989). The
+runtime's managed executor is held to that transformer's frozen velocities within
+1e-4 relative L2 on synthetic fixtures, with and without references, through the
+prefix cache ([Implementation and validation](#implementation-and-validation)).
+Editing on `cpu` is also covered by stage benchmarks
+(`benchmarks/QwenImageStagesBench`). In the stage benchmark a 1024×1024 reference
+image took 12–13 s through the vision encoder, and a 256×256 one 0.72 s against
+5.0 s on `ggml_cpu`.
 
 ### Limitations on `cpu`
 
@@ -852,19 +870,17 @@ one 0.72 s against 5.0 s on `ggml_cpu`.
 - **Memory.** The DiT and text-encoder weights are file-mapped (4.2 GB for the
   Q4_K_M DiT, 5.0 GB for the Q4_K_M text encoder), but activations, the prefix
   cache and the VAE feature maps are ordinary process memory. The VAE releases
-  each feature map after its last read: a 1024×1024 Pruna 5-step generation
-  peaked at 3.7 GiB of commit (8.0 GiB of working set), and a 2048×2048 VAE encode
-  plus decode at 10.5 GiB of commit. Before any work, a size whose estimated peak
+  each feature map after its last read: with the retired transformer, a 1024×1024
+  Pruna 5-step generation peaked at 3.7 GiB of commit (8.0 GiB of working set), and
+  a 2048×2048 VAE encode plus decode at 10.5 GiB of commit. Before any work, a size whose estimated peak
   exceeds the machine's memory is refused with the largest square size that fits
   (`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` overrides), and one that exceeds the memory
   free right now gets a warning.
-- **Speed.** At 512×512 one step takes 17.6–21.7 s on the 8-core laptop above,
-  and a 2K square has 16 times the image tokens of 512×512, with attention growing
-  faster than that; that is why the automatic size on this backend is 1024×1024.
-  Use a step-distillation LoRA and a small size for anything interactive.
-- The GGML-only switches (`TS_QWEN21_GRAPH_REUSE`, `TS_QWEN21_FLASH`,
-  `TS_QWEN21_PAD_MASK`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no
-  effect on `cpu`.
+- **Speed.** At 512×512 one step took 17.6–21.7 s with the retired transformer on
+  the 8-core laptop above, and a 2K square has 16 times the image tokens of
+  512×512, with attention growing faster than that; that is why the automatic size
+  on this backend is 1024×1024. Use a step-distillation LoRA and a small size for
+  anything interactive.
 
 ## LoRA plug-ins
 
@@ -911,8 +927,8 @@ bundle, which has one output head per trained step, runs only its trained count.
 Two plug-ins that both carry a recipe cannot be stacked, and on
 [Qwen-Image-2.1-Turbo](#lora-plug-ins-on-turbo), whose checkpoint has a schedule of its
 own, a plug-in that carries one is refused. Style and editing
-plug-ins carry no recipe and keep the checkpoint's own schedule. The run logs the
-resolved recipe and its sigmas before denoising.
+plug-ins carry no recipe and keep the checkpoint's own schedule. The run's first
+line names the resolved recipe, and each step's line gives its sigmas.
 
 ### Supported formats
 
@@ -983,8 +999,9 @@ factors, ...)`), then one line per file with its update count, ranks and scales.
 
 **Prefix KV cache.** The cache stays on. The first step runs the whole sequence
 through the adapted transformer, so the stored text and reference keys and values
-include the LoRA. Retained graphs and stored prefixes are keyed on the adapter's
-factor buffers, so one built with other factors, or none, is never reused.
+include the LoRA. Retained plans and stored prefixes belong to the LoRA set they
+were built with: binding another set, or none, drops them, so they are never reused
+with other factors.
 
 **Tensor parallelism.** Under `--tp N`, a column-parallel projection (Q, K, V, gate,
 up) gives each GPU the rows of `B` (and of any DoRA row scale) for its own output
@@ -995,7 +1012,8 @@ projections keep the full factors.
 
 ### LoRA performance
 
-TensorSharp against stable-diffusion.cpp `19bbbca` on 2026-09-25. Both builds used
+TensorSharp, with the retired native graph, against stable-diffusion.cpp `19bbbca` on
+2026-09-25. Both builds used
 unchanged ggml `353b63b`. Every run was a 1024×1024 text-to-image with the teapot
 prompt, seed 42, CFG 1 and Euler, each engine in a fresh process with a cooldown
 between runs. Both engines received the same F32 sigma vector. Each configuration
@@ -1038,13 +1056,12 @@ NVIDIA RTX 4000 Ada, 20 GB, driver 580, `ggml_cuda`:
 - **Loading.** The factors are read, scaled and packed in parallel at startup. This
   takes 0.1–0.8 s on the M5 Pro and 0.2–1.3 s on the CUDA machine; the output is
   bit-identical to a serial load.
-- **VAE decoding.** The whole-VAE graph is now the default on Metal as well as CUDA.
+- **VAE decoding.** The whole-VAE graph now runs on Metal as well as CUDA.
   It decodes 1024×1024 in 5.0 s on the M5 Pro, where the per-convolution path took
   13.0 s and sd.cpp takes 7.1 s. At 2048×2048 it takes 24.9 s instead of 85.3 s, with
   a 45 GB peak memory footprint instead of 64 GB. It never runs on Vulkan, where
-  F16 cooperative-matrix operands overflow in the decoder; setting
-  `TS_QWEN21_VAE_FUSED=1` there prints a warning and decodes per convolution.
-  `TS_QWEN21_VAE_FUSED=0` selects the per-convolution path on any backend.
+  F16 cooperative-matrix operands overflow in the decoder; Vulkan and `ggml_cpu`
+  decode per convolution on the device.
 - **Why the CUDA images differ more.** On the CUDA machine, sd.cpp keeps the
   transformer on the GPU and runs out of memory for a whole-image decode, then
   retries with 256×256 tiles (11.5–13.2 s). Its wall times include that retry.
@@ -1063,7 +1080,7 @@ because it ignores the alpha stored in `lora_adapter_metadata`.
 The server loads its `--lora` set at startup and applies it to every generation and
 edit request; its HTTP requests cannot choose plug-ins. A request's `steps`
 and `cfg` still override a plug-in's recipe. In process,
-`QwenImageModel.SetLoras(IReadOnlyList<LoraSpec>)` replaces the set for later
+`QwenImage21DiffusionModel.SetLoras(IReadOnlyList<LoraSpec>)` replaces the set for later
 requests (an empty list removes it). The new set is validated against the
 transformer immediately, and a failure leaves the previous set in place.
 
@@ -1106,45 +1123,45 @@ first step runs the whole sequence and stores each block's post-RoPE keys and
 values for the prefix on the device. Every later step runs only the target
 image's tokens and attends over the stored prefix followed by the target. A CFG
 run keeps one cache per branch. The caches are released when denoising ends,
-before VAE decoding. Each step's log line ends with `prefix=extract` or
-`prefix=cached` (`prefix=declined` when the cache did not fit; see below).
+before VAE decoding. The first step logs `[qwen21] prefix KV cache: <N> tokens,
+<size> MiB F16/F16; later steps compute only the target image` (F32/F32 where
+attention reads F32); a cache that does not fit prints `[qwen21] prefix KV cache
+declined: …` on stderr instead (see below).
 
-The cache is on by default; `TS_QWEN21_PREFIX_CACHE=0` turns it off. By default
-it stores exactly what the attention kernel reads: F16 for Metal and CUDA flash
-attention, F32 otherwise. Cached steps therefore reproduce the uncached
-computation. On Metal, one seed gives a byte-identical PNG with the cache on, with
-it off, and from the build before the cache existed. This was checked for
-generation, one- and two-reference editing, and CFG 4 with two caches. The
-diffusers `use_kv_cache` documentation notes that its PyTorch implementation does
-not reproduce images bit for bit across the two settings; TensorSharp's graphs do.
+The cache is always on. It stores exactly what attention reads: F16 on Metal and
+CUDA, F32 elsewhere (`ggml_cpu`, `ggml_vulkan` and the pure-C# `cpu` backend).
+Cached steps therefore reproduce the uncached computation: on real Q4_K_M weights
+on `ggml_cpu`, the cache's extract and cached predictions are bit-identical to the
+whole-sequence graph's (`dit-parity`, [Implementation and
+validation](#implementation-and-validation)). With the retired native graph, one
+seed gave a byte-identical PNG on Metal with the cache on, with it off, and from the
+build before the cache existed; that was checked for generation, one- and
+two-reference editing, and CFG 4 with two caches. The diffusers `use_kv_cache`
+documentation notes that its PyTorch implementation does not reproduce images bit
+for bit across the two settings; TensorSharp's graphs do.
 
 The cost is memory: 512 KiB per prefix token per CFG branch in F16 (32 blocks, K
-and V, 4096 values of 2 bytes). A prompt is tens to a few hundred tokens, and
-each reference at about 1 megapixel adds 4,096 tokens, about 2 GiB. A cache may
-use at most half of the memory the device reports free, and
-`TS_QWEN21_PREFIX_CACHE_MAX_MIB` caps it further. A cache that does not fit is
-declined with a warning on stderr, and that request recomputes the prefix every
-step, as before.
+and V, 4096 values of 2 bytes), twice that in F32. A prompt is tens to a few
+hundred tokens, and each reference at about 1 megapixel adds 4,096 tokens, about
+2 GiB in F16. A cache may use at most half of the memory the device reports free
+(on `cpu`, half of the machine's free physical memory). A cache that does not fit
+is declined with that warning, and that request recomputes the prefix every step.
 
-`TS_QWEN21_PREFIX_CACHE_TYPE` selects the storage type:
-
-| Value | K / V storage | Bytes per prefix token and branch | Output |
-|---|---|---:|---|
-| `auto` (default) | What attention reads (F16 on Metal/CUDA flash, F32 otherwise) | 512 KiB (F16) | Identical to uncached |
-| `f16`, `f32` | As named | 512 KiB / 1 MiB | Identical where attention reads that type |
-| `q8_0` | Q8_0 / Q8_0 | 272 KiB | Rounds the stored prefix |
-| `q8_0_v` | Attention type / Q8_0 | 392 KiB | Rounds the stored prefix values |
-
-The 8-bit settings correspond to vLLM-Omni's `fp8` and `fp8_v` prefix caches.
-They use ggml Q8_0 blocks, which have one scale per 32 values, instead of FP8
-E4M3 with one scale per token and head. The stored prefix is converted back to
-the attention type every step, so the target's own keys and values stay exact.
-Their measured effect on output quality is below.
+The switches of the retired implementation are gone, and setting one stops the CLI
+and the server at startup: `TS_QWEN21_PREFIX_CACHE` (which turned the cache off),
+`TS_QWEN21_PREFIX_CACHE_MAX_MIB` (a further cap, with no replacement) and
+`TS_QWEN21_PREFIX_CACHE_TYPE`, whose 8-bit storage types `q8_0` (272 KiB per prefix
+token and branch) and `q8_0_v` (392 KiB) were removed. Those corresponded to
+vLLM-Omni's `fp8` and `fp8_v` prefix caches, with ggml Q8_0 blocks (one scale per
+32 values) instead of FP8 E4M3 with one scale per token and head; their measured
+effect is kept below as history.
 
 ### Measured effect
 
-Each row compares the build before the cache with this build, in fresh processes
-with the Q4_K_M files, seed 42 and CFG 1 unless stated. Step time is the mean of
+These measurements were made with the retired native graph; the runtime has not
+been timed on Metal, CUDA or Vulkan. Each row compares the build before the cache
+with the build that added it, in fresh processes with the Q4_K_M files, seed 42
+and CFG 1 unless stated. Step time is the mean of
 steps 2 onward, because step 1 stores the prefix and costs the same as an uncached
 step. "Identical" means the output PNGs have the same SHA-256. Wall time is the
 whole process, including model load, encoders and VAE. References are about
@@ -1177,8 +1194,8 @@ NVIDIA A40, 46 GB, `ggml_cuda` on one GPU:
 
 NVIDIA A40, `ggml_vulkan` on one GPU. The build before this change decoded on
 the CPU under Vulkan (see "Vulkan VAE" below), so its wall times are not
-comparable. The cache comparison therefore uses this build with
-`TS_QWEN21_PREFIX_CACHE=0` as the uncached side:
+comparable. The cache comparison therefore used that build with its (since
+removed) `TS_QWEN21_PREFIX_CACHE=0` as the uncached side:
 
 | Workload | Uncached step | Cached step | Per step | Output |
 |---|---:|---:|---:|---|
@@ -1196,7 +1213,7 @@ peaked at 16.3 GB. The cache helps in proportion to the prefix's share of the
 sequence: generation, whose prefix is only the prompt, gains 1–3%; editing gains
 the most at 1024², and less at 2048² where the target is four times larger.
 
-8-bit storage, same 1024² single-reference edit:
+The removed 8-bit storage, same 1024² single-reference edit:
 
 | Storage | Prefix cache size | Metal step | Metal PSNR | CUDA step | CUDA PSNR |
 |---|---:|---:|---:|---:|---:|
@@ -1205,21 +1222,29 @@ the most at 1024², and less at 2048² where the target is four times larger.
 | `q8_0_v` | 1,582 MiB | 10.90 s | 60.5 dB | 1.414 s | 52.8 dB |
 
 PSNR compares the output PNG with the default setting's (RGBA, 0–255). The 8-bit
-types save memory but are 5–13% slower per step, because the stored prefix is
-dequantized every step; CUDA dequantizes Q8_0 through F32. Use them only when a
-cache would otherwise be declined.
+types saved memory but were 5–13% slower per step, because the stored prefix was
+dequantized every step (on CUDA through F32), and they rounded the stored prefix,
+so cached steps no longer equalled uncached ones.
 
 ## CUDA graphs and tensor parallelism
 
 **CUDA graphs.** Upstream ggml-cuda captures a graph as a CUDA graph once two
-consecutive executions leave it unchanged, then replays it. The cached step graph
-is retained across steps (`TS_QWEN21_GRAPH_REUSE=1`, the default) with fixed
-input and cache buffers. From a request's third step onward, each denoising step
-is therefore one graph replay. This is the effect of vLLM-Omni's CUDA-graph
-decode, without separate capture code. As in vLLM-Omni, the first step, which
-stores the prefix, runs uncaptured. Under tensor parallelism, each rank's
-segments between reductions are captured separately; vLLM-Omni disables graphs
-under TP.
+consecutive executions leave it unchanged, then replays it. The runtime keeps each
+device's compiled plans across steps (two, for the two CFG branches), as the
+retired native graph kept its retained graphs. On an RTX 4000 Ada, ggml-cuda
+captures and replays both alike. Counted with an interposer on the CUDA runtime
+([`eng/validation/CudaGraphCount`](../../eng/validation/CudaGraphCount/README.md)),
+both captured the same 197 graphs once and replayed all of them every step from the
+third on: 394 launches over 4 steps and 1,182 over 8, at 256² and at 1024² with a
+reference. Warm steps took 1.43 s at 1024² either way, and turning graphs off
+(`GGML_CUDA_DISABLE_GRAPHS=1`) cost both under 1%. The rest of this paragraph and
+the measurements below describe the retired graph. Its cached step graph was retained
+across steps (`TS_QWEN21_GRAPH_REUSE=1`, since removed) with fixed input and cache
+buffers, so from a request's third step onward each denoising step was one graph
+replay. This is the effect of vLLM-Omni's CUDA-graph decode, without separate
+capture code. As in vLLM-Omni, the first step, which stores the prefix, ran
+uncaptured. Under tensor parallelism, each rank's segments between reductions were
+captured separately; vLLM-Omni disables graphs under TP.
 
 On an A40, counting CUDA runtime calls confirmed this: a 10-step request made 1
 capture and 8 graph launches (20 steps: 18 launches), and a two-GPU request made
@@ -1250,9 +1275,10 @@ GPUs, following vLLM-Omni's layout for 2.1:
 - The text encoder, vision encoder and VAE stay on the first GPU. Multi-node
   groups are refused.
 
-Measured on two NVIDIA A40s in different CPU sockets (46 GB each). Peer access is
-not functional between them, so NCCL used its shared-memory transport. The prefix
-cache was on unless stated; step times exclude step 1:
+Measured with the retired native graph on two NVIDIA A40s in different CPU sockets
+(46 GB each); the runtime's sharded programs have not been run on two GPUs. Peer
+access is not functional between them, so NCCL used its shared-memory transport.
+The prefix cache was on unless stated; step times exclude step 1:
 
 | Workload | 1 GPU step | 2 GPUs step | Speedup | Wall time | PSNR vs 1 GPU |
 |---|---:|---:|---:|---|---:|
@@ -1277,14 +1303,18 @@ column quantifies this. Forcing an exact F32 all-reduce
 (`GGML_CUDA_AR_BF16_THRESHOLD=0`) produced byte-identical PNGs to the default,
 so reduced-precision reduction is not the cause.
 
-The sharded graphs were also checked against the unsharded graph on single-GPU
-machines, with a loopback group of backend instances on one device reducing
-through host memory. Across 146 synthetic sharded forwards, the maximum
-normalized error was 9.4e-5 on Metal and 1.7e-7 on CPU. With the real Q4_K_M
-weights on Metal, relative L2 error was 0.07–0.10% of one prediction, with and
-without the prefix cache. The native test runs the same 146 forwards on a real
-two-GPU group for CUDA (4.5e-5, NCCL) and Vulkan (9.3e-5, host reduction).
-vLLM-Omni lists TP for 2.1 as unverified and publishes no 2.1 scaling numbers.
+The sharded transformer is also checked against the unsharded one on a single
+device, with a loopback group of backend instances on one device reducing through
+host memory. On the runtime, `QwenImage21TensorParallelShardTests` checks the
+shards, and `dit-parity` on the real Q4_K_M weights found the two-rank loopback
+predictions (whole sequence, cache extract and cached) on `ggml_cpu` byte-identical
+to the retired implementation's. The retired graph's removed native test ran 146
+synthetic sharded forwards: the maximum normalized error was 9.4e-5 on Metal and
+1.7e-7 on CPU, and 4.5e-5 (CUDA, NCCL) and 9.3e-5 (Vulkan, host reduction) on a
+real two-GPU group. With the real Q4_K_M weights on Metal, the retired graph's
+sharded predictions were within 0.07–0.10% relative L2 of the unsharded ones, with
+and without the prefix cache. vLLM-Omni lists
+TP for 2.1 as unverified and publishes no 2.1 scaling numbers.
 
 **Vulkan VAE.** ggml-vulkan multiplies F32 matrices through F16
 cooperative-matrix operands on GPUs that have them, and the VAE feeds some
@@ -1306,13 +1336,135 @@ backends ignore activation-precision hints, so there is no FP8 GEMM to select.
 The 8-bit weight configuration is the Q8_0 GGUF. On NVIDIA Turing and newer,
 ggml-cuda's quantized matrix kernels also quantize the activations to 8 bits, so
 this runs as int8 W8A8 on tensor cores. The part of vLLM-Omni's FP8 work that
-applies here is 8-bit prefix storage, described above.
+applied here was 8-bit prefix storage, which was removed with the retired native
+graph (see [Prefix KV cache](#prefix-kv-cache)).
+
+## Implementation and validation
+
+Qwen-Image-2.1 and Qwen-Image-2.1-Turbo are a family of the shared diffusion
+runtime (`TensorSharp.Models/SharedDiffusion`), the same runtime MiniMax-H3-Image
+uses; the runtime's design is in [diffusion-runtime.md](../design/diffusion-runtime.md).
+The family's code is in `TensorSharp.Models/Models/QwenImage21/`:
+
+- `QwenImage21DiffusionModel` is the model the hosts load for the `qwen_image`
+  architecture; it replaced `QwenImageModel`. `QwenImage21Family` gives the runtime
+  the geometry, the sampling recipes (the base scheduler, Turbo's sigmas, a
+  plug-in's recipe) and the noise.
+- `QwenImage21Denoiser` (with `QwenImage21Denoiser.Emit.cs`) emits the transformer
+  as `GraphProgram`s: the GGML graph executor runs them on `ggml_cpu`,
+  `ggml_metal`, `ggml_cuda` and `ggml_vulkan`, and the managed tensor executor runs
+  them on the pure-C# `cpu` backend. It holds the prefix KV cache (extract, then
+  cached; the whole sequence when a cache is declined), applies LoRA plug-ins
+  unmerged, shards the blocks under `--tp`, and keeps its compiled plans across
+  steps. The programs choose their kernels per backend. On `ggml_cuda` each program
+  asks, through `GraphWideTokenRoutes` (native `TSGgml_GraphWideTokenRoutes`), for
+  the retired graph's routing: Q4_K and Q6_K products of 256 rows or more on
+  cuBLAS, unmasked attention on cuDNN.
+- `QwenImage21Canvas` resolves the geometry: explicit sizes, the default size from
+  `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`, the automatic area (2048×2048, or
+  1024×1024 on `cpu`), keep-source-size and reference sizing. `QwenImage21Noise`
+  draws the Philox noise and the edit streams (the shared Philox draw is
+  `SharedDiffusion/PhiloxNoise.cs`), `QwenImage21Layout` packs the sequence,
+  `QwenImage21Weights` maps the transformer's weights, and `QwenImage21Components`
+  wraps the conditioner (the Qwen3-VL-8B text encoder and vision encoder) and the VAE
+  as runtime components. The encoders, the VAE and its fused graph, the LoRA loader
+  and Turbo's schedule behave as before.
+
+The retired engines were deleted: the `QwenImageModel` → `QwenImage21Pipeline` →
+`QwenImage21DiT` path, its native whole-graph forward (`ggml_ops_qwen_image21.cpp`,
+`TSGgml_QwenImage21Forward` / `TSGgml_QwenImage21ForwardTp`) and its pure-C#
+transformer (`QwenImage21ManagedDiT` with its CPU kernels). Their switches went with
+them; the [environment variable matrix](../env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs)
+lists them, and setting one makes the CLI and the server refuse to start with
+`<NAME> was removed: <advice> Unset it.` The CLI and server flags, the companion
+variables, `TS_QWEN_IMAGE_VARIANT` and `TS_QWEN21_EDIT_NOISE` are unchanged. The
+companions' own path switches, which the migration kept (`TS_QWEN21_VAE_FUSED`,
+`TS_QWEN_TE_FUSED` and the rest), were removed later and are refused the same way;
+the matrix lists them too.
+
+What checks the runtime in place of the retired engines' tests and tools (the
+native whole-graph CTests, the NumPy oracle `eng/tests/qwen-image21-dit.py` and
+`benchmarks/QwenImageDiTBench`, all removed):
+
+- `InferenceWeb.Tests/QwenImage21DenoiserTests.cs` runs the programs on a small
+  synthetic transformer on the backend `TS_TEST_GGML_BACKEND` pins (`ggml_cpu` by
+  default; Metal, CUDA or Vulkan when pinned), against the retired native graph's
+  velocities frozen before it was deleted
+  (`InferenceWeb.Tests/Fixtures/QwenImage21/LegacyGoldens`, read by
+  `QwenImage21Goldens.cs`): byte for byte on the lane that froze them (x64
+  `ggml_cpu`), within 2e-3 relative L2 elsewhere. The managed executor (`cpu`) is
+  held to the retired pure-C# transformer's frozen velocities within 1e-4. The
+  cases run through the prefix cache (extract, then cached) and with LoRA plug-ins
+  on fused and on separate gate/up projections. The same file tests the prefix
+  cache's keying, eviction and decline, and `QwenImage21TensorParallelShardTests`
+  tests the tensor-parallel shards.
+- [`eng/QwenImage21CompanionProbe`](../../eng/QwenImage21CompanionProbe/README.md)
+  `dit-parity` loads the real transformer and compares the whole-sequence graph
+  with the prefix cache's extract and cached graphs (bit-identical on `ggml_cpu`),
+  then the transformer sharded over a two-rank loopback group on one device
+  (`ggml_cpu` or `ggml_metal`). It writes every prediction next to its JSON report
+  (`<report>.d/*.f32`) for byte comparisons between builds. Its `dit` mode times
+  predictions with the runtime's denoiser.
+- [`eng/validation/QwenImage21DenoiserAB`](../../eng/validation/QwenImage21DenoiserAB/README.md)
+  times and compares denoiser steps on real weights (`--engines runtime,runtime2`;
+  `--out` / `--against` compare velocities across backends or builds) and whole
+  requests end to end (`--e2e`). The migration commit `f981cb6` also had `legacy`
+  engines; check it out to compare against the retired ones.
+
+Measured for the migration on a Linux x64 4-core Xeon, `ggml_cpu`,
+Qwen-Image-2.1-Turbo Q4_K_M, unchanged upstream ggml `d9fe7bff`: the end-to-end
+PNGs were byte-identical to the retired pipeline's for a 512×512 text-to-image, a
+512×512 edit, a 512×512 masked edit, CFG 2.5 with a negative prompt and previews at
+256×256, and a voxel-style LoRA at 512×512; the real-weight `dit-parity`
+predictions (whole sequence, cache extract and cached, two-rank loopback tensor
+parallelism whole, extract and cached) were byte-identical to the retired
+implementation's.
+
+On `ggml_cuda` (RTX 4000 Ada 20 GB, CUDA 13.2, sm_89; same weights and ggml), every
+whole request gave the retired pipeline's PNG byte for byte. Times are a whole
+request in a fresh process, and peak VRAM was sampled every 200 ms:
+
+| Request | Retired | Runtime | Peak VRAM, retired → runtime |
+|---|---|---|---|
+| Text to image, 1024² | 26.35 s | 19.72 s | 5596 → 5596 MiB |
+| Text to image, 2048² | 69.51 s | 68.77 s | 16150 → 16150 MiB |
+| Edit, 1024² | 28.20 s | 28.10 s | 8570 → 8863 MiB |
+| Masked edit, 1024² | 27.84 s | 28.18 s | not measured |
+| Keep source size | 28.30 s | 28.19 s | not measured |
+| CFG 2.5, negative prompt, previews, 512² | 11.89 s | 11.41 s | 6310 → 6312 MiB |
+| Voxel LoRA, 1024² | 24.02 s | 21.24 s | 5652 → 5720 MiB |
+| Edit with two references, 1024² | 32.18 s | 32.28 s | 11564 → 11510 MiB |
+| Edit with three references (2048² canvas) | 96.63 s | 97.81 s | 17576 → 17728 MiB |
+| Two references, CFG 2.5, negative prompt, 512² | 20.16 s | 19.65 s | 7374 → 7562 MiB |
+| Two references, keep source size | 32.87 s | 32.69 s | 11558 → 11510 MiB |
+
+The masked edit and keep-source-size requests were timed before the extract step's
+plan freed its own compute memory, and were not measured again. The multi-reference
+rows were measured at the branch head. A two-reference edit at 512² on `ggml_cpu`
+(4-core Xeon) was byte-identical too: 318 s retired, 311 s runtime. Warm denoising steps
+take the retired graph's time: 1.44 s at 1024² with a reference, 6.90 s at 2048². An
+edit's cached steps hold about 290 MiB more than the retired graph's.
+
+The frozen goldens' `ggml_cuda` lane holds the runtime to the retired graph's bytes on
+the nine synthetic cases. Pinned to CUDA, the Qwen-Image, MiniMax-H3, diffusion, graph
+and LoRA suites passed: 2,735 tests, none failed. The 89 skipped were other backends'
+pinned tests and an AVX-512 kernel test, none of them Qwen-Image-2.1's denoiser tests.
+On CUDA, a request whose prefix cache is declined is 2e-3-close to a cached one
+(ggml-cpu: float rounding). The retired engine's own two modes differed in the same way
+there: 2.3e-3 to 4.6e-3 at 512².
+
+**The runtime has not been validated on Metal or Vulkan hardware**: no such machine
+was available. GitHub's hosted macOS runners expose a paravirtual GPU that ggml-metal
+cannot drive, so the runtime's parity with the retired graph is not established
+there. The other GPU measurements on this page were made with the retired native
+graph.
 
 ## Current Unsloth Q8_0 validation
 
 The metadata-free Unsloth Q8_0 diffusion model and the three companion files in
 the direct launch command above passed generation and editing on Apple M5 Pro,
-48 GiB unified memory, macOS 27.0. Both engines used Metal, Euler, CFG 1, seed 42,
+48 GiB unified memory, macOS 27.0, with the retired native graph (the runtime has
+not been rerun on Metal). Both engines used Metal, Euler, CFG 1, seed 42,
 matching F32 sigma vectors and Philox noise, in serial fresh processes.
 
 | Workload | TensorSharp wall time | stable-diffusion.cpp wall time |
@@ -1394,12 +1546,13 @@ operator coverage is detailed below.
 
 ## Native optimization validation
 
-CUDA and Metal retain up to two complete DiT graphs for the positive/negative
-CFG layouts. `TS_QWEN21_GRAPH_REUSE=1` is the default on both backends; `0`
-rebuilds the graph for each prediction. Reuse retains graph metadata and scratch
-allocations while refreshing all dynamic inputs. Weight invalidation, cache
-clearing and scratch release retire the graphs. `TS_QWEN21_GRAPH_TRACE=1` logs
-builds and replay counts. Scratch is released before final VAE decoding.
+The transformer's denoiser keeps up to two compiled plans a device, for the
+positive and negative CFG layouts, as the retired native graph retained two DiT
+graphs on CUDA and Metal (its `TS_QWEN21_GRAPH_REUSE` and `TS_QWEN21_GRAPH_TRACE`
+were removed with it). The transformer's device copies and scratch are released
+before the final VAE decode. The DiT measurements and checks in this section
+belong to the retired native graph; the runtime's checks are in
+[Implementation and validation](#implementation-and-validation).
 
 The Metal VAE uses F32 MPS convolutions, with direct F32 ggml convolution for
 unsupported vendor shapes. This preserves activations above the FP16 range:
@@ -1408,8 +1561,9 @@ when accumulation is F32. `TS_VAE_MPS_CONV=0` selects the direct convolution
 baseline. TensorSharp releases its MPS graphs and staging buffers on explicit
 scratch release and backend shutdown. Upstream ggml sources remain unchanged.
 
-Metal reuse passed **159 native forwards** against the CPU explicit-attention
-reference and **16 independent NumPy cases / 80 forwards**, including multiple
+The retired graph's Metal reuse passed **159 native forwards** in its removed native
+test against the CPU explicit-attention reference and **16 independent NumPy cases /
+80 forwards** in the removed NumPy oracle, including multiple
 reference images and flash-attention tile boundaries. The maximum normalized
 native error was 0.00054533; the maximum NumPy absolute error was 0.00140832,
 within the existing 0.002 tile-boundary tolerance. These are synthetic numerical
@@ -1417,9 +1571,10 @@ checks, not downloaded-model quality or performance measurements. The unchanged
 ggml revision for these checks was `179b60f27b1019d42da01ac532cabdb8f73ba8b7`;
 evidence is in ignored `docs/validation/qwen21-native-metal-report.md`.
 
-CPU, Metal and CUDA image attention now uses each segment's exact key/value
-length without a dense padding mask; on CUDA, `TS_QWEN21_PAD_MASK=1` restores the
-padded mask as a comparison diagnostic (see
+The runtime's programs keep the retired graph's attention forms. CPU, Metal, CUDA
+and the managed executor attend each image segment's exact key/value length
+without a dense padding mask (the retired graph's padded-mask diagnostic,
+`TS_QWEN21_PAD_MASK`, was removed; see
 [`docs/perf/qwen-image21-cuda.md`](../perf/qwen-image21-cuda.md)). Causal text
 masks are retained. Metal casts the strided key/value tensors directly to F16, and
 supported backends use upstream fused SwiGLU to avoid intermediate feed-forward
@@ -1429,8 +1584,9 @@ masks.
 The earlier attention optimization measurements below used unchanged ggml at
 `456172ec733a135778adcd32d00e576a58232e45`.
 
-The independent NumPy transformer oracle passed **16 cases on CPU and 16 on
-Metal**, each with five forwards. It covers generation, editing, multiple
+The independent NumPy transformer oracle (`eng/tests/qwen-image21-dit.py`, removed
+with the native graph it checked) passed **16 cases on CPU and 16 on Metal**, each
+with five forwards. It covers generation, editing, multiple
 references, fused/separate MLP weights, flash/explicit attention, changed latent
 inputs, shape shrink/restore, and attention tile boundaries. Maximum absolute
 error was 0.000005282 on CPU and 0.001409 on Metal. The larger boundary fixture
@@ -1448,23 +1604,19 @@ These timings exclude the full model, conditioning, scheduler and VAE and do not
 establish full-resolution generation speed or visual quality. CUDA and Vulkan
 were unavailable and are not counted as passing validation.
 
-Run the oracle and optional synthetic benchmark with:
-
-```bash
-python3 eng/tests/qwen-image21-dit.py --backend cpu
-python3 eng/tests/qwen-image21-dit.py --backend metal
-python3 eng/tests/qwen-image21-dit.py --backend metal --benchmark-target-tokens 16384
-```
-
-The benchmark mode reports timings separately and does not count as an oracle
-test. Logs, the before/after measurements and dependency metadata are under
-ignored `docs/validation/qwen-image-2.1/performance-native-20260920/`.
+Those numbers came from the oracle's benchmark mode, which reported timings
+separately and did not count as an oracle test. Logs, the before/after
+measurements and dependency metadata are under ignored
+`docs/validation/qwen-image-2.1/performance-native-20260920/`. The oracle and its
+benchmark mode were removed with the native graph; the runtime's programs are
+checked as described in [Implementation and validation](#implementation-and-validation).
 
 The 2.1 VAE also routes spatial attention through native matrix operations,
 tiling queries while every query still attends to every key. Each score tile is
 bounded to 16 MiB, supporting the VAE's 768/1152-channel attention heads without
 requiring a flash-attention kernel for those widths. The managed implementation
-remains the fallback; `TS_QWEN21_VAE_ATTN=0` selects it for comparison.
+remains the fallback when the device call fails; the `TS_QWEN21_VAE_ATTN=0` switch
+that selected it for comparison was removed.
 
 Large VAE CPU normalization passes now visit contiguous spatial tiles, and SiLU
 uses parallel ranges. Twelve scalar-oracle tests pass with bit-exact outputs,
@@ -1517,9 +1669,9 @@ is absent. The tests above do not replace the image-generation benchmarks.
 
 The independent NumPy/native transformer oracle passed **12 cases on CPU and
 12 on Metal**, covering text-only, one-reference and multiple-reference layouts,
-fused/unfused MLP projections, and flash-attention on/off. This checks small
-synthetic graphs, not full-model CPU inference. See
-[`eng/tests/qwen-image21-dit.py`](../../eng/tests/qwen-image21-dit.py).
+fused/unfused MLP projections, and flash-attention on/off. This checked small
+synthetic graphs, not full-model CPU inference. The oracle
+(`eng/tests/qwen-image21-dit.py`) was removed with the native graph.
 
 Matched generation and editing runs on an Apple M5 Pro with 48 GiB unified
 memory used the configuration's Q4_K_M diffusion/text weights, 512×512 pixels,

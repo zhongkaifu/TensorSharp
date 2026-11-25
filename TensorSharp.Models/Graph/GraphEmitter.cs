@@ -300,6 +300,9 @@ namespace TensorSharp.Models.Graph
         /// whole image (<see cref="GraphProgramBuilder.MarkWideTokenProducts"/>). Call it before the first entry.</summary>
         public void MarkWideTokenProducts() => _b.MarkWideTokenProducts();
 
+        /// <summary>A wide program with its family's routes (<see cref="GraphProgram.WideTokenRoutes"/>).</summary>
+        public void MarkWideTokenProducts(GraphWideTokenRoutes routes) => _b.MarkWideTokenProducts(routes);
+
         /// <summary>The program's NVFP4 products quantize their activation rows to 8 bits
         /// (<see cref="GraphProgramBuilder.MarkQ8Nvfp4Activations"/>). Call it before the first entry.</summary>
         public void MarkQ8Nvfp4Activations() => _b.MarkQ8Nvfp4Activations();

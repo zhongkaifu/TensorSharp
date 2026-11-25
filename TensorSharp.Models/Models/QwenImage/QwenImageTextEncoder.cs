@@ -42,8 +42,6 @@ namespace TensorSharp.Models.QwenImage
     {
         private readonly int _numHeads, _numKVHeads, _headDim, _numLayers;
         private readonly float _ropeBase, _eps;
-        private static readonly string TraceDirectory = Environment.GetEnvironmentVariable("TS_QWEN_TE_TRACE_DIR");
-        private static readonly int TraceLayer = int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN_TE_TRACE_LAYER"), out int layer) ? layer : 0;
         internal IAllocator ConditionerAllocator => _allocator;
 
         public int HiddenSize => Config.HiddenSize;
@@ -82,7 +80,6 @@ namespace TensorSharp.Models.QwenImage
         /// </summary>
         public unsafe float[] EncodeHidden(int[] tokens, ImageCond[] imgs)
         {
-            if (!string.IsNullOrEmpty(TraceDirectory)) System.IO.Directory.CreateDirectory(TraceDirectory);
             int seq = tokens.Length;
             if (imgs != null && imgs.Length == 0) imgs = null;
             _mropePos = BuildPositions(tokens.Length, imgs);
@@ -93,8 +90,6 @@ namespace TensorSharp.Models.QwenImage
             if (TryFusedEncode(tokens, imgs, out float[] fusedOut))
                 return fusedOut;
 
-            long profileStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            _profileLinear = _profileAttention = _profileNorm = 0;
             Tensor hidden = Embedding(tokens);             // [seq, hidden]
             if (imgs != null)
             {
@@ -111,28 +106,20 @@ namespace TensorSharp.Models.QwenImage
             for (int layer = 0; layer < _numLayers; layer++)
             {
                 string p = $"blk.{layer}";
-                TraceTensor(layer, "input", hidden);
-                long normStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 Tensor normedAttn = RMSNormOp(hidden, $"{p}.attn_norm.weight");
-                _profileNorm += System.Diagnostics.Stopwatch.GetTimestamp() - normStart;
                 using (Tensor normed = normedAttn)
                 using (Tensor attnOut = Attention(normed, p, seq, layer))
                 {
-                    TraceTensor(layer, "attn_out", attnOut);
                     Tensor res = Ops.Add(hidden, hidden, attnOut);
                     if (!ReferenceEquals(res, hidden)) { hidden.Dispose(); hidden = res; }
                 }
-                TraceTensor(layer, "attn_residual", hidden);
-                normStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 Tensor normedFfn = RMSNormOp(hidden, $"{p}.ffn_norm.weight");
-                _profileNorm += System.Diagnostics.Stopwatch.GetTimestamp() - normStart;
                 using (Tensor normed2 = normedFfn)
                 using (Tensor ffnOut = SwiGluFfn(normed2, p, layer))
                 {
                     Tensor res = Ops.Add(hidden, hidden, ffnOut);
                     if (!ReferenceEquals(res, hidden)) { hidden.Dispose(); hidden = res; }
                 }
-                TraceTensor(layer, "output", hidden);
                 if (imgs != null)
                 {
                     float* hp = GetFloatPtr(hidden);
@@ -149,14 +136,6 @@ namespace TensorSharp.Models.QwenImage
             }
             var output = TensorToHostFloat(hidden, (long)seq * Config.HiddenSize);
             hidden.Dispose();
-            if (ProfileOn)
-            {
-                double ms(long ticks) => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                double total = ms(System.Diagnostics.Stopwatch.GetTimestamp() - profileStart);
-                Console.WriteLine($"  [te-profile] {seq} tokens: total {total:F0} ms, linear {ms(_profileLinear):F0} ms, " +
-                    $"attention {ms(_profileAttention):F0} ms, rms norms {ms(_profileNorm):F0} ms, " +
-                    $"other {total - ms(_profileLinear) - ms(_profileAttention) - ms(_profileNorm):F0} ms");
-            }
             return output; // Qwen-Image-2.1 uses the last block before output_norm.
         }
 
@@ -288,32 +267,25 @@ namespace TensorSharp.Models.QwenImage
 
         private Tensor Attention(Tensor input, string prefix, int seq, int layer)
         {
-            TraceTensor(layer, "norm1", input);
             int qDim = _numHeads * _headDim, kvDim = _numKVHeads * _headDim;
             float scale = 1.0f / MathF.Sqrt(_headDim);
 
             Tensor q = LinearWithBias(input, $"{prefix}.attn_q.weight", $"{prefix}.attn_q.bias");
             Tensor k = LinearWithBias(input, $"{prefix}.attn_k.weight", $"{prefix}.attn_k.bias");
             Tensor v = LinearWithBias(input, $"{prefix}.attn_v.weight", $"{prefix}.attn_v.bias");
-            TraceTensor(layer, "q", q); TraceTensor(layer, "k", k); TraceTensor(layer, "v", v);
 
             NormalizeHeads(q, $"{prefix}.attn_q_norm.weight", _numHeads, seq);
             NormalizeHeads(k, $"{prefix}.attn_k_norm.weight", _numKVHeads, seq);
-            TraceTensor(layer, "qnorm", q); TraceTensor(layer, "knorm", k);
             ApplyMRoPE(q, _numHeads, seq);
             ApplyMRoPE(k, _numKVHeads, seq);
-            TraceTensor(layer, "qrope", q); TraceTensor(layer, "krope", k);
 
             if (UseManagedAttention)
             {
                 // Pure-C# backend: causal GQA straight from the [seq, heads*dim] projections.
                 // No head-first copies, no group-expanded K/V and no seq x seq score tensors.
                 var merged = new Tensor(_allocator, DType.Float32, seq, qDim);
-                long attentionStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 CausalGqaAttention(q, k, v, merged, seq, scale);
-                _profileAttention += System.Diagnostics.Stopwatch.GetTimestamp() - attentionStart;
                 q.Dispose(); k.Dispose(); v.Dispose();
-                TraceTensor(layer, "merged", merged);
                 using (merged)
                     return Linear(merged, $"{prefix}.attn_output.weight");
             }
@@ -329,7 +301,6 @@ namespace TensorSharp.Models.QwenImage
             using Tensor kT = kExp.Transpose(1, 2);
             var scores = new Tensor(_allocator, DType.Float32, _numHeads, seq, seq);
             Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
-            TraceTensor(layer, "scores", scores);
             qHeads.Dispose();
 
             if (IsGgmlBackend)
@@ -343,7 +314,6 @@ namespace TensorSharp.Models.QwenImage
                 Ops.AddCausalMask(scores, seq, 0, float.NegativeInfinity);
                 Ops.Softmax(scores, scores);
             }
-            TraceTensor(layer, "probs", scores);
 
             var attnOut = new Tensor(_allocator, DType.Float32, _numHeads, seq, _headDim);
             Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExp);
@@ -351,23 +321,17 @@ namespace TensorSharp.Models.QwenImage
 
             using Tensor flat = ReshapeFromHeads(attnOut, _numHeads, seq, _headDim);
             attnOut.Dispose();
-            TraceTensor(layer, "merged", flat);
             return LinearForward(flat, $"{prefix}.attn_output.weight");
         }
 
         private Tensor SwiGluFfn(Tensor input, string prefix, int layer)
         {
-            TraceTensor(layer, "norm2", input);
             Tensor gate = Linear(input, $"{prefix}.ffn_gate.weight");
-            TraceTensor(layer, "gate", gate);
             using (Tensor up = Linear(input, $"{prefix}.ffn_up.weight"))
             {
-                TraceTensor(layer, "up", up);
                 SiluMulInPlace(gate, up);
             }
-            TraceTensor(layer, "activated", gate);
             Tensor down = Linear(gate, $"{prefix}.ffn_down.weight");
-            TraceTensor(layer, "down", down);
             gate.Dispose();
             return down;
         }
@@ -563,53 +527,25 @@ namespace TensorSharp.Models.QwenImage
             return result;
         }
 
-        // Pure-C# backend projections. By default they go through LinearForward to the
-        // multi-row integer GEMM in ManagedQuantizedOps (activations quantized to 8 bits, as
-        // ggml-cpu does): 0.76-0.88 s for the 37-token default prompt on an i7-11800H, against
-        // 1.8-1.9 s for the packed F32 GEMM and ~1.4 s on ggml_cpu. TS_QWEN_TE_CPU_MATMUL=f32
-        // selects the packed F32 GEMM instead, reading the quantized weight through
-        // QuantRowsPanelSource (each tile dequantized once per forward, with exact F32
-        // activations: 1e-6 relative to a double-precision reference per projection, against
-        // ~4e-3 for the 8-bit route).
-        private static readonly bool F32MatmulOn = string.Equals(
-            Environment.GetEnvironmentVariable("TS_QWEN_TE_CPU_MATMUL")?.Trim(), "f32", StringComparison.OrdinalIgnoreCase);
+        // Pure-C# backend projections go through LinearForward to the multi-row integer GEMM in
+        // ManagedQuantizedOps (activations quantized to 8 bits, as ggml-cpu does): 0.76-0.88 s
+        // for the 37-token default prompt on an i7-11800H, against ~1.4 s on ggml_cpu.
 
         // Parity reference for the harness (QwenImageStagesBench text --f64-linear), never set in
-        // production: every projection the packed GEMM would run is instead summed in double over
-        // the exactly dequantized weights, so a whole forward can be compared with one whose
-        // matmuls carry neither F32 accumulation nor 8-bit activation rounding.
+        // production: every projection whose weight type QuantRowsPanelSource reads is instead
+        // summed in double over the exactly dequantized weights, so a whole forward can be compared
+        // with one whose matmuls carry neither F32 accumulation nor 8-bit activation rounding.
         internal static bool ReferenceF64Linear;
 
-        // TS_QWEN_TE_PROFILE=1: per-forward split of the per-op path (linear / attention / norms).
-        private static readonly bool ProfileOn = Environment.GetEnvironmentVariable("TS_QWEN_TE_PROFILE") == "1";
-        private long _profileLinear, _profileAttention, _profileNorm;
-
-        private Tensor Linear(Tensor input, string weightName)
+        private unsafe Tensor Linear(Tensor input, string weightName)
         {
-            long start = System.Diagnostics.Stopwatch.GetTimestamp();
-            Tensor result = LinearCore(input, weightName);
-            _profileLinear += System.Diagnostics.Stopwatch.GetTimestamp() - start;
-            return result;
-        }
-
-        private unsafe Tensor LinearCore(Tensor input, string weightName)
-        {
-            if (_backend != BackendType.Cpu || !(F32MatmulOn || ReferenceF64Linear) || !input.IsContiguous() ||
+            if (_backend != BackendType.Cpu || !ReferenceF64Linear || !input.IsContiguous() ||
                 !_quantWeights.TryGetValue(weightName, out var qw) || !qw.HasHostData ||
                 !QuantRowsPanelSource.Supports(qw.GgmlType, qw.Ne0) || input.Sizes[1] != qw.Ne0)
                 return LinearForward(input, weightName);
             int seq = (int)input.Sizes[0], inDim = (int)qw.Ne0, outDim = (int)qw.Ne1;
             var result = new Tensor(_allocator, DType.Float32, seq, outDim);
-            if (ReferenceF64Linear)
-            {
-                ReferenceLinearF64(GetFloatPtr(input), seq, inDim, qw, GetFloatPtr(result), outDim);
-                return result;
-            }
-            var packedInput = CpuPackedGemm.PackA(GetFloatPtr(input), seq, inDim, inDim, 1, CpuPackedGemm.Isa);
-            CpuPackedGemm.Gemm(packedInput, new QuantRowsPanelSource(qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1),
-                outDim, GetFloatPtr(result), outDim);
-            if (qw.Scale != 1.0f)
-                Ops.Mul(result, result, qw.Scale);
+            ReferenceLinearF64(GetFloatPtr(input), seq, inDim, qw, GetFloatPtr(result), outDim);
             return result;
         }
 
@@ -649,9 +585,9 @@ namespace TensorSharp.Models.QwenImage
             return acc;
         }
 
-        // gate = silu(gate) * up. Chunked (one delegate per 16K values, not per value) and, with
-        // the packed GEMM on the pure-C# backend, vectorized: the vectorized exp is within an ulp
-        // or two of MathF.Exp. Other backends keep the scalar formula.
+        // gate = silu(gate) * up. Chunked (one delegate per 16K values, not per value) and, on the
+        // pure-C# backend, vectorized: the vectorized exp is within an ulp or two of MathF.Exp.
+        // Other backends keep the scalar formula.
         private unsafe void SiluMulInPlace(Tensor gate, Tensor up)
         {
             int n = (int)gate.ElementCount();
@@ -686,17 +622,6 @@ namespace TensorSharp.Models.QwenImage
             return dst;
         }
 
-        // Diagnostic-only snapshots. The native path writes matching planar
-        // layouts; retaining intermediate outputs there can inhibit fusion.
-        private void TraceTensor(int layer, string stage, Tensor tensor)
-        {
-            if (string.IsNullOrEmpty(TraceDirectory) || layer != TraceLayer) return;
-            float[] values = TensorToHostFloat(tensor, tensor.ElementCount());
-            byte[] bytes = new byte[values.Length * sizeof(float)];
-            Buffer.BlockCopy(values, 0, bytes, 0, bytes.Length);
-            System.IO.File.WriteAllBytes(System.IO.Path.Combine(TraceDirectory, $"unfused.L{layer:D2}.{stage}.f32"), bytes);
-        }
-
         protected override float[] ForwardCore(int[] tokens) =>
             throw new NotSupportedException("Use EncodeHidden().");
         protected override void ResetKVCacheCore() { }
@@ -705,9 +630,7 @@ namespace TensorSharp.Models.QwenImage
         // The per-op loop above pays ~10 device<->host round-trips per layer (M-RoPE, head
         // norms, SiLU as host loops) x 36 layers. The fused path assembles the embeddings and
         // rotate-half M-RoPE tables on the host, then runs the whole causal GQA trunk as one
-        // device graph (weights resident by GGUF mmap ptr). TS_QWEN_TE_FUSED=0 disables.
-        private static readonly bool FusedTrunkOn =
-            Environment.GetEnvironmentVariable("TS_QWEN_TE_FUSED") != "0";
+        // device graph (weights resident by GGUF mmap ptr).
         private QwenTeLayerW[] _fusedLayers;
         private readonly System.Collections.Generic.List<IntPtr> _fusedAllocs = new();
         private bool _fusedFailed;
@@ -715,7 +638,7 @@ namespace TensorSharp.Models.QwenImage
         private unsafe bool TryFusedEncode(int[] tokens, ImageCond[] imgs, out float[] result)
         {
             result = null;
-            if (!FusedTrunkOn || !IsGgmlBackend || _fusedFailed) return false;
+            if (!IsGgmlBackend || _fusedFailed) return false;
             if (_fusedLayers == null && !BuildFusedLayers()) { _fusedFailed = true; return false; }
 
             int seq = tokens.Length, H = Config.HiddenSize, hd = _headDim, half = hd / 2;

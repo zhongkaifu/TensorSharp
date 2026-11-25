@@ -54,9 +54,31 @@ public sealed class SharedDiffusionEditMaskTests
     {
         var source = Image(100, 50, _ => .5f);
         EditMask mask = EditMask.Create(new EditMaskOptions { Mask = Image(100, 50, i => i == 0 ? 1f : 0f) }, source);
-        Assert.Equal((2048, 1024), mask.SamplingDimensions(2048, 1024));
-        Assert.Equal((2048, 1024), mask.SamplingDimensions(2040, 1000, multiple: 64));
+        // Never above the source's own 100 x 50 (the composite returns it), snapped upward to the grid.
+        Assert.Equal((128, 64), mask.SamplingDimensions(2048, 1024));
+        Assert.Equal((128, 64), mask.SamplingDimensions(2040, 1000, multiple: 64));
         Assert.Equal((32, 32), mask.SamplingDimensions(10, 10));
+    }
+
+    /// <summary>A masked edit's selection samples at the full canvas's density only while that is below the source's own
+    /// resolution: a large picture at the request's area is sampled below its pixels, a small one at them, never above.</summary>
+    [Fact]
+    public void SamplingNeverExceedsTheSelectionsOwnResolution()
+    {
+        var source = Image(1000, 500, _ => .5f);
+        var selection = Image(1000, 500, i => i % 1000 is >= 400 and < 600 && i / 1000 is >= 200 and < 300 ? 1f : 0f);
+        EditMask whole = EditMask.Create(new EditMaskOptions { Mask = selection }, source);
+        EditMask crop = EditMask.Create(new EditMaskOptions { Mask = selection, MaskCrop = true, MaskCropPadding = 0 }, source);
+        Assert.Equal((200, 100), (crop.Width, crop.Height));
+        // A 4000 x 2000 canvas (4x the source) would have sampled the whole picture at 4000 x 2000 and the crop at 800 x 400.
+        Assert.Equal((1024, 512), whole.SamplingDimensions(4000, 2000));
+        Assert.Equal((224, 128), crop.SamplingDimensions(4000, 2000));
+        // A canvas below the source still lowers the density: half the picture's resolution.
+        Assert.Equal((512, 256), whole.SamplingDimensions(500, 250));
+        Assert.Equal((128, 64), crop.SamplingDimensions(500, 250));
+        // The latent mask then has one cell a 16 x 16 block of the source's own pixels (or fewer).
+        var (w, h) = whole.SamplingDimensions(4000, 2000);
+        Assert.Equal(64 * 32, whole.LatentWeights(w / 16, h / 16).Length);
     }
 
     [Fact]

@@ -1304,7 +1304,6 @@ namespace tsg
         if (data == nullptr)
             return false;
 
-        qwen_image21_invalidate_weight(data);
         // ggml-cpu's repacked copy (graphs bound to it keep theirs; the next graph repacks the new bytes).
         cpu_repack_forget(data);
 
@@ -3420,8 +3419,6 @@ extern "C" void TSGgml_GptOssResetDecodeCache();
 extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
 extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
 extern "C" void TSGgml_DFlashResetCaches();
-extern "C" void TSGgml_QwenImage21ResetForwardCache();
-extern "C" void TSGgml_QwenImage21ReleasePrefixCaches();
 extern "C" void TSGgml_WanResetForwardCache();
 extern "C" void TSGgml_NemotronMamba2PrefillClear();
 extern "C" void TSGgml_NemotronMamba2DecodeClear(std::uint64_t model_key);
@@ -3434,10 +3431,6 @@ extern "C" void TSGgml_NemotronMamba2DecodeClear(std::uint64_t model_key);
 TSG_EXPORT void TSGgml_ResetSharedGraphCaches()
 {
     host_read_barrier();
-    TSGgml_QwenImage21ResetForwardCache();
-    // Stored Qwen-Image-2.1 prefix K/V are device memory too; a request that
-    // still wants them stores them again on its next step.
-    TSGgml_QwenImage21ReleasePrefixCaches();
     // The slot-stable arena pools bind resident weight buffers this wipe is
     // about to free; their captured graphs must not survive it.
     TSGgml_GptOssResetBatchedDecodeCache();
@@ -3553,9 +3546,6 @@ static std::recursive_mutex g_teardown_mutex;
 TSG_EXPORT void TSGgml_Shutdown()
 {
     std::lock_guard<std::recursive_mutex> teardown(g_teardown_mutex);
-    TSGgml_QwenImage21ResetForwardCache();
-    // Prefix K/V buffers belong to the backends about to be freed.
-    TSGgml_QwenImage21ReleasePrefixCaches();
     // Tear the TP communicator down first: it holds NCCL communicators and
     // pinned staging buffers that reference every rank's backend.
     tp_comm_free();
@@ -3758,7 +3748,6 @@ TSG_EXPORT void TSGgml_ReleaseReuseComputeBuffers()
     // it gets round to it - long after the free returned. The barrier is two
     // atomic loads and no write when nothing was deferred.
     host_read_barrier();
-    TSGgml_QwenImage21ResetForwardCache();
     free_reuse_compute_buffer();
     free_reuse_gallocr();
     // MiniMax-H3's CUDA attention and projection scratch (~3 GB at 20k tokens) is
@@ -4143,7 +4132,6 @@ TSG_EXPORT int TSGgml_ReleaseHostRanges(const void* const* bases, const std::uin
         tsg_graphtp::on_drop_ranges(ranges);
         tsg::moe_hot_tier_drop_ranges(ranges);
         for (const auto& span : ranges.spans) tsg::host_expert_io_on_drop(reinterpret_cast<const void*>(span.first));
-        tsg::qwen_image21_invalidate_ranges(ranges);
         tsg::host_pin_release_ranges(ranges.spans);
         clear_last_error();
         return dropped;

@@ -29,7 +29,7 @@ public sealed class ServingContractConformanceTests
     {
         "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
-        "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3",
+        "diffusion-gemma", "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
         // families they generate media rather than decode steps, so the decoder runtime does not apply.
         "whisper", "kokoro", "ace-step-1.5",
@@ -226,10 +226,11 @@ public sealed class ServingContractConformanceTests
     /// <summary>
     /// The families on the shared diffusion runtime (TensorSharp.Models.SharedDiffusion). Each is proven by its own suites
     /// against the implementation it replaced (MiniMax-H3-Image: MiniMaxH3ImageDenoiserTests, MiniMaxH3ImageVaeCodecTests
-    /// and MiniMaxH3ImageSwitchTests against the legacy model's denoiser and decoder). A family moved there leaves
+    /// and MiniMaxH3ImageSwitchTests against the legacy model's denoiser and decoder; Qwen-Image-2.1: QwenImage21DenoiserTests
+    /// against the retired transformer's frozen outputs, QwenImage21Goldens). A family moved there leaves
     /// <see cref="LegacyBespokeFamilies"/> and joins this list.
     /// </summary>
-    internal static readonly HashSet<string> DiffusionRuntimeFamilies = new(StringComparer.Ordinal) { "minimax-h3-image" };
+    internal static readonly HashSet<string> DiffusionRuntimeFamilies = new(StringComparer.Ordinal) { "minimax-h3-image", "qwen_image" };
 
     [Fact]
     public void TheDiffusionRuntimeFamiliesAreExactlyTheKnownOnes()

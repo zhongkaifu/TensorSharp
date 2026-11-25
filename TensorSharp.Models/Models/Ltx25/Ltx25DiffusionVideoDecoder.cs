@@ -10,6 +10,7 @@ using TensorSharp.Cuda;
 using TensorSharp.MLX;
 using TensorSharp.Models.Direct;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.Ltx25;
@@ -132,7 +133,7 @@ public sealed class Ltx25DiffusionVideoDecoder : IDisposable
         int pixels = geometry.CanvasHeight * geometry.CanvasWidth;
         int frameSize = checked(height * SpatialScale * width * SpatialScale * 3);
         var result = new float[checked((long)geometry.ContentFrames * frameSize)];
-        Run(latents, frames, height, width, frame => QwenImage21Sampling.Noise(checked(3 * pixels), seed, NoiseStream, (uint)frame),
+        Run(latents, frames, height, width, frame => PhiloxNoise.Draw(checked(3 * pixels), seed, NoiseStream, (uint)frame),
             (frame, rgb) =>
             {
                 // Planar [3, H, W] in [-1, 1] -> interleaved RGB in [0, 1].

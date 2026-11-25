@@ -139,12 +139,13 @@ Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
   <p>Qwen-Image-2.1 可以把<strong>提示词</strong>变成图像，也可以把<strong>提示词 + 一张或多张参考图</strong>变成编辑后的图像。所加载的 <code>qwen_image</code> GGUF 是扩散 Transformer；模型还会在 DiT 文件同目录解析伴随文件（或通过 <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> 环境变量指定）：专用 2.1 VAE、Qwen3-VL-8B 文本编码器，以及编辑时必需的 <code>mmproj</code> 视觉编码器。与 DiffusionGemma 一样，它<em>不是</em>自回归文本模型——自回归入口会抛异常，图像由 <code>GenerateImage()</code> 与 <code>EditImage()</code> 产生。</p>
   <pre data-lang="csharp"><code>using TensorSharp.Models;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 
 // 加载 Qwen-Image-2.1 DiT GGUF（架构 = qwen_image）。2.1 VAE 与 Qwen3-VL-8B
 // 文本编码器 + mmproj 从同一目录解析（或用 TS_QWEN_IMAGE_* 环境变量）。
 // 任意 GGML 后端都可以，BackendType.Cpu（纯 C#）也可以。
-using var model = (QwenImageModel)ModelBase.Create("qwen_image_2.1_Q4_K_M.gguf", BackendType.GgmlMetal);
+using var model = (QwenImage21DiffusionModel)ModelBase.Create("qwen_image_2.1_Q4_K_M.gguf", BackendType.GgmlMetal);
 
 var p = new QwenImageParams
 {
@@ -334,7 +335,7 @@ foreach (SkillToolInvocation call in reply.SkillInvocations)
       <tr><td><code>ModelConfig</code></td><td>架构元数据：<code>VocabSize</code>、上下文长度等。</td></tr>
       <tr><td><code>IBatchedPagedModel</code></td><td>可选的批量/分页前向（<code>ForwardBatch</code>），多数架构为连续批处理而实现。</td></tr>
       <tr><td><code>DiffusionGemmaModel</code> + <code>DiffusionGemmaSampler</code></td><td>文本扩散模型及其 EntropyBound 去噪采样器（<code>Generate(promptTokens, DiffusionEbParams, …)</code>），通过 <code>LoadVisionEncoder</code> 接收图像输入，通过 <code>ReadStructured</code> 做一步式 Jev 读取。<code>Forward()</code> 不受支持。</td></tr>
-      <tr><td><code>QwenImageModel</code> + <code>QwenImageParams</code></td><td>Qwen-Image-2.1 图像生成与编辑器。<code>GenerateImage(prompt, QwenImageParams)</code> 与 <code>EditImage(prompt, RgbImage 或 IReadOnlyList&lt;RgbImage&gt;, QwenImageParams)</code> 返回 <code>RgbImage</code>；<code>ImageIO</code> 负责 PNG 加载/保存。</td></tr>
+      <tr><td><code>QwenImage21DiffusionModel</code> + <code>QwenImageParams</code></td><td>Qwen-Image-2.1 图像生成与编辑器。<code>GenerateImage(prompt, QwenImageParams)</code> 与 <code>EditImage(prompt, RgbImage 或 IReadOnlyList&lt;RgbImage&gt;, QwenImageParams)</code> 返回 <code>RgbImage</code>；<code>ImageIO</code> 负责 PNG 加载/保存。</td></tr>
       <tr><td><code>SkillsChatClient</code> + <code>SkillsChatClientOptions</code></td><td>面向兼容 OpenAI 的端点使用 <a href="#skills">Agent Skills</a>。<code>CompleteAsync(SkillsChatRequest)</code> 返回 <code>SkillsChatResponse</code>；<code>SkillDelivery</code> 决定披露循环由服务端还是本进程运行（位于 <code>TensorSharp.AgentHost.Skills</code>）。</td></tr>
       <tr><td><code>MultiAgentOptions</code> + <code>MultiAgentSession</code></td><td>子智能体上限，以及 <code>spawn_agent</code> / <code>wait_agent</code> / <code>send_input</code> / <code>close_agent</code> / <code>list_agents</code> 背后那棵请求级智能体树（位于 <code>TensorSharp.AgentHost.Agents</code>）。由 <code>SkillAgentLoop</code>、<code>SkillsChatClient</code> 与服务端聊天路径使用。</td></tr>
       <tr><td><code>SkillRegistry</code> + <code>SkillRegistryOptions</code></td><td>宿主已知的技能集合：在配置的根目录中扫描 <code>SKILL.md</code>、从文件夹或 <code>.zip</code> 安装，以及查找。它是唯一接触技能存储的组件，因此边界约束集中在一处生效。</td></tr>

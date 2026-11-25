@@ -17,6 +17,7 @@ using TensorAgent.Core.Hosting;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 using TensorSharp.Server;
 using TensorSharp.Server.Hosting;
@@ -221,7 +222,7 @@ public sealed class ImageTurnsRealModelTests : IDisposable
     public async Task AFollowUpChangesThePictureTheModelReadItAs()
     {
         string dit = DitPath(Environment.GetEnvironmentVariable(DitVariable)!)!;
-        using var model = new QwenImageModel(dit, BackendType.GgmlMetal);
+        using var model = new QwenImage21DiffusionModel(dit, BackendType.GgmlMetal);
         var models = new ModelService();
         WebUiChatService chat = ChatWith(models, model);
         try
@@ -295,7 +296,7 @@ public sealed class ImageTurnsRealModelTests : IDisposable
     private async Task AskAsync(Case[] cases, Func<Case, Reading, bool?> judge)
     {
         string dit = DitPath(Environment.GetEnvironmentVariable(DitVariable)!)!;
-        using var model = new QwenImageModel(dit, BackendType.GgmlMetal);
+        using var model = new QwenImage21DiffusionModel(dit, BackendType.GgmlMetal);
         var models = new ModelService();
         WebUiChatService chat = ChatWith(models, model);
         try
@@ -357,7 +358,7 @@ public sealed class ImageTurnsRealModelTests : IDisposable
     }
 
     /// <summary>A chat service with <paramref name="model"/> loaded, as a host's would be after a load.</summary>
-    private WebUiChatService ChatWith(ModelService models, QwenImageModel model)
+    private WebUiChatService ChatWith(ModelService models, QwenImage21DiffusionModel model)
     {
         var options = new ServerHostingOptions(
             startupModelPath: null, startupMmProjPath: null, defaultBackend: "ggml_metal",
@@ -373,7 +374,7 @@ public sealed class ImageTurnsRealModelTests : IDisposable
             codeRunner: null, workspaces: null, codeArtifacts: null, NullLoggerFactory.Instance);
     }
 
-    private static void SetLoadedModel(ModelService models, QwenImageModel? model) =>
+    private static void SetLoadedModel(ModelService models, QwenImage21DiffusionModel? model) =>
         models.LifecycleService.GetType().GetField("_model", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(models.LifecycleService, model);
 }

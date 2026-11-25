@@ -190,8 +190,9 @@ diffusers implements it (main d5df05ed), which conditions on every picture twice
   area (the server's 2048x2048 default), or on the CLI its VAE copy's size. An edit below
   2048x2048 samples on a larger canvas of the same aspect (diffusers'
   `min_generation_area`) and is resized back with Lanczos; a speed plug-in's own floor
-  replaces it (pDMD's is 1024 pixels: its edits, masked ones included, sample at the asked
-  size, as its diffusers pipeline does). Text to image keeps its own size (no floor).
+  replaces it (pDMD's is 1024 pixels: its edits sample at the asked size, as its diffusers
+  pipeline does). Text to image keeps its own size (no floor); a masked edit's selection
+  has its own rule (below).
 - **Refusals.** `cfg` above 1, a negative prompt, more than 16 references, a side under
   32 pixels, and, before anything runs, an edit whose references make its text encoding
   or its denoising step need more than the device's free memory (the message names the
@@ -226,11 +227,35 @@ Qwen-Image path uses, and the flags and fields are the same:
   server takes `maskPath` (an upload), `maskMode`, `maskInvert`, `maskFeather`, `maskCrop`
   and `maskCropPadding`, or a `mask` file on the multipart `/api/image-edit`; the OpenAI
   `/v1/images/edits` takes a `mask` part, read [OpenAI's way](../../TensorSharp.Server.Host/API_EXAMPLES.md#openai-image-routes-v1imagesgenerations-v1imagesedits).
-- **Size.** The result is always `<Picture 1>`'s own canvas, whatever it samples at. The
-  whole picture samples where the same edit without a mask would (the rules above); a
-  crop samples its box at that canvas's density; either way the 2048x2048 floor (a speed
-  plug-in's own instead, when one is loaded) applies to what is sampled, at its own aspect,
-  and the decode is resized back with Lanczos.
+- **Size.** The result is always `<Picture 1>`'s own canvas. The whole picture (or a
+  crop's box) samples at the density of the canvas the same edit without a mask would use
+  (the rules above), but never above its own resolution, and the edit's floor does not raise
+  it: a whole picture's latent mask, denoise and decode are at most the size of the pixels
+  they are composited into, snapped upward to the 32-pixel grid. A picture larger than that
+  canvas still samples below its own resolution, and the decode is resized back with
+  Lanczos. (Before, the 2048x2048 floor applied here too: a 512x512 picture's masked edit
+  sampled 2048x2048, 16 times its pixels.)
+- **A crop's floor.** A crop smaller than `<Picture 1>` samples at least 2048x2048 pixels
+  (the edit's own floor) at its own aspect, held to 4 times the whole picture's pixels; a
+  speed plug-in's floor does not change it. A crop above 4 MP samples at its own size, and a crop whose
+  padding reaches every edge is the whole picture, at its own size. The 448x512 crop of a
+  1024x1024 picture samples 1920x2176, as before masked edits were capped. Smaller floors
+  were tried first on the A40 (Q4_K_M, a red vase in that crop, seeds 7, 11 and 23):
+
+  | crop sampled at | total | a step | peak | the vases |
+  |---|---|---|---|---|
+  | its own size, 448x512 | 16.9-17.5 s | 1.71 s | 32.5 GB | plain; one seed drew stray white shapes |
+  | 1 MP, 960x1088 | 19.9-20.4 s | 2.1 s | 32.8 GB | clean, but plain |
+  | 4 MP, 1920x2176 (the floor) | 33.5-34.6 s | 3.9 s | 33.8 GB | relief or painted surfaces for two seeds |
+
+  At 4 MP the three PNGs are byte-identical to the ones from before the cap. The peak is
+  mostly the 32B text encoder's. A small picture's crop is held to 4 times the picture. A
+  crop of a 512x512 picture (a green bottle in place of a vase, seeds 7, 11 and 23) samples
+  736x1440, 1 MP, in 28.3-28.9 s (3.1 s a step, 34.1 GB). At 4 MP, 16 times the picture,
+  it took 42.9-43.4 s (5.1 s a step, 35.1 GB). At 4 MP two seeds kept most of the vase, and
+  the third drew an illustrated bottle and redrew the cat's edge as a drawing. At 1 MP two
+  seeds drew a clean bottle in the picture's light, and the third (seed 7) kept the vase
+  beside a thin bottle.
 - **The latent.** The mask goes to the latent grid by the largest weight in each 16x16
   cell, so a thin stroke stays editable. `<Picture 1>` (or its crop) at the sampling canvas
   is encoded to its posterior mean, normalized as the references are (its reference copy is
@@ -245,8 +270,8 @@ Qwen-Image path uses, and the flags and fields are the same:
   model; a full one is an unmasked edit on the source's canvas.
 - **With pDMD.** Masks and the pDMD plug-in compose: its two steps reset the kept cells
   after each step like the six do, and the composite is the same, so the kept pixels are
-  still the source's own bytes; the selection samples at the plug-in's floor (the asked
-  size). Checked on the M5 Pro (Q8_0, the mug replaced by a
+  still the source's own bytes; the selection samples as above (at most its own
+  resolution, a crop at least the crop floor). Checked on the M5 Pro before that cap, at the plug-in's floor (Q8_0, the mug replaced by a
   glass teapot, a box mask): 2,960,883 kept pixels, none differing; 34.9 s a step against
   the six-step masked edit's 33.6 s, the edit in 99 s.
 

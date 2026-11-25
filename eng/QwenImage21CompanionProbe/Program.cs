@@ -6,6 +6,8 @@ using System.Text.Json;
 using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 
 static void WriteFloats(string path, float[] values)
@@ -18,7 +20,7 @@ static void WriteFloats(string path, float[] values)
 }
 
 // Isolate the actual vision tower, including all three DeepStack projectors.
-// Its inputs match QwenImage21Pipeline/Conditioner, including alpha compositing.
+// Its inputs match QwenImage21References/Conditioner, including alpha compositing.
 if (args.Length >= 4 && args[0] == "vision")
 {
     if (args.Length > 8) throw new ArgumentException("Too many vision arguments.");
@@ -49,7 +51,7 @@ if (args.Length >= 4 && args[0] == "vision")
         image = new RgbImage(requestedWidth, requestedHeight, rgb, alpha);
     }
     int sourceWidth = image.Width, sourceHeight = image.Height;
-    var (width, height) = QwenImage21Pipeline.ResolveReferenceDimensions(image, requestedWidth, requestedHeight);
+    var (width, height) = QwenImage21Canvas.ReferenceDimensions(image, requestedWidth, requestedHeight);
     image = ImageIO.Resize(image, width, height);
     float[] pixels = image.ToPlanarChw();
     int hw = checked(width * height);
@@ -122,7 +124,7 @@ if (args.Length >= 4 && args[0] == "vision")
             requestedWidth, requestedHeight, width, height, tokenCount, channels = 4096, deepStackCount = 3,
             inputSha256, preprocessingSeconds, loadSeconds, iterations, seconds = timings,
             timingScope = "EncodeWithDeepStack plus readback/finite checks; excludes model loading and output-file writes",
-            backend = device.ToString(), fusedRequested = Environment.GetEnvironmentVariable("TS_QWEN21_VISION_FUSED") != "0",
+            backend = device.ToString(),
             outputs = files, binaries = new {
                 native = Stamp(Path.Combine(AppContext.BaseDirectory, nativeName)),
                 models = Stamp(typeof(Qwen35VisionEncoder).Assembly.Location),
@@ -151,17 +153,15 @@ if (args.Length >= 4 && (args[0] == "vae" || args[0] == "vae-encode"))
     if (width <= 0 || height <= 0 || width % 32 != 0 || height % 32 != 0)
         throw new ArgumentException("Positive dimensions divisible by 32 required.");
     GgmlBasicOps.EnsureBackendAvailable(backendName);
-    // Mirror QwenImage21Vae: fused by default on CUDA and Metal, never on Vulkan.
-    string fused = Environment.GetEnvironmentVariable("TS_QWEN21_VAE_FUSED");
-    VaeReferenceMath.UseFusedGraph21 = backendName != GgmlBackendType.Vulkan &&
-        (fused == "1" || backendName is GgmlBackendType.Cuda or GgmlBackendType.Metal);
+    // Mirror QwenImage21Vae: the whole-VAE graph on CUDA and Metal, per convolution elsewhere.
+    VaeReferenceMath.UseFusedGraph21 = backendName is GgmlBackendType.Cuda or GgmlBackendType.Metal;
     using var file = new SafetensorsFile(args[1]);
     // As the model opens it: the published file uses diffusers names (decoder.conv_in, ...).
     var source = new QwenImage21VaeTensorStore(file);
     QwenImage21CompanionValidation.ValidateVae(source);
     var weights = VaeWeights.Load(source);
     var latent = new VaeLatent(64, height / 16, width / 16,
-        QwenImage21Sampling.Noise(checked(width / 16 * (height / 16) * 64), 42));
+        PhiloxNoise.Draw(checked(width / 16 * (height / 16) * 64), 42));
     if (latent.Data.Any(x => !float.IsFinite(x))) throw new InvalidDataException("Non-finite input noise.");
     var pixels = new float[checked(width * height * 3)];
     var alpha = new float[checked(width * height)];
@@ -227,28 +227,31 @@ if (args.Length >= 5 && args[0] == "dit")
     Buffer.BlockCopy(conditioningBytes, 0, conditioning, 0, conditioningBytes.Length);
     if (conditioning.Any(x => !float.IsFinite(x))) throw new InvalidDataException("Non-finite conditioning.");
     int textTokens = conditioning.Length / 4096;
-    float[] latents = QwenImage21Pipeline.ToTokens(QwenImage21Sampling.Noise(width / 16 * (height / 16) * 64, 42), height / 16, width / 16);
+    var family = new QwenImage21Family(device, QwenImageVariant.Base);
+    float[] latents = family.ToRows(new LatentTensor(new LatentShape(64, 1, height / 16, width / 16),
+        PhiloxNoise.Draw(width / 16 * (height / 16) * 64, 42)));
     var timings = new List<double>();
     float[] velocity = null;
     try
     {
-        using var dit = new QwenImage21DiT(args[1], device);
+        using var dit = new QwenImage21Denoiser(args[1], device);
+        var text = new ConditioningSet(conditioning, textTokens, 4096);
+        var layout = QwenImage21Layout.Build(textTokens, null, new[] { (height / 16, width / 16) }, 128);
         for (int i = 0; i < iterations; ++i)
         {
             var watch = Stopwatch.StartNew();
-            // Same latent at a changing timestep tests refresh of device input
-            // storage; this is a prediction benchmark, not an image sampler.
-            velocity = dit.Predict(latents, height / 16, width / 16, conditioning, textTokens, 1f - i / (float)iterations);
+            // Same latent at a changing timestep: the first step extracts the text prefix, the later ones read it; this is a
+            // prediction benchmark, not an image sampler.
+            velocity = (float[])dit.Predict(latents, text, Array.Empty<LatentRef>(), layout, 1f - i / (float)iterations, i, false, null).Clone();
             timings.Add(watch.Elapsed.TotalSeconds);
-            Console.WriteLine(JsonSerializer.Serialize(new { iteration = i, seconds = timings[^1] }));
+            Console.WriteLine(JsonSerializer.Serialize(new { iteration = i, seconds = timings[^1], mode = dit.LastMode.ToString() }));
         }
+        dit.FinishRequest();
         string destination = Path.GetFullPath(args[2]);
         Directory.CreateDirectory(Path.GetDirectoryName(destination));
         WriteFloats(destination, velocity);
         Console.WriteLine(JsonSerializer.Serialize(new { scenario = "real-weight-dit", width, height, textTokens,
-            iterations, seconds = timings, backend = device.ToString(), output = destination,
-            graphReuse = Environment.GetEnvironmentVariable("TS_QWEN21_GRAPH_REUSE") != "0",
-            paddedMask = Environment.GetEnvironmentVariable("TS_QWEN21_PAD_MASK") == "1" }));
+            iterations, seconds = timings, backend = device.ToString(), output = destination }));
     }
     finally
     {
@@ -289,14 +292,20 @@ if (args.Length >= 4 && args[0] == "dit-parity")
     for (int i = before; i < before + slots; i++) imageSlots[i] = 1;
     float[] text = Gaussian(textTokens * 4096, 1f);
     float[][] references = { Gaussian(rh * rw * 64, 1f) };
-    int[] referenceHeights = { rh }, referenceWidths = { rw };
     float[] stepA = Gaussian(h * w * 64, 1f), stepB = Gaussian(h * w * 64, 1f);
     var report = new List<object>();
-    float[] Predict(QwenImage21DiT dit, float[] latents, float t, QwenImage21DiT.PrefixCache cache, string label)
+    var failures = new List<string>();
+    var conditioning = new ConditioningSet(text, textTokens, 4096, imageSlots);
+    LatentRef[] latentRefs = { new LatentRef(0, new LatentShape(64, 1, rh, rw), references[0]) };
+    var layout = QwenImage21Layout.Build(textTokens, imageSlots, new[] { (rh, rw), (h, w) }, 128);
+    float[] Predict(QwenImage21Denoiser dit, float[] latents, float t, int step, string label)
     {
         var watch = Stopwatch.StartNew();
-        float[] result = dit.Predict(latents, h, w, text, textTokens, t, imageSlots, references, referenceHeights, referenceWidths, cache);
-        Console.WriteLine(JsonSerializer.Serialize(new { label, seconds = watch.Elapsed.TotalSeconds, path = cache?.LastPath.ToString() ?? "Full" }));
+        float[] result = (float[])dit.Predict(latents, conditioning, latentRefs, layout, t, step, false, null).Clone();
+        string dumps = Path.GetFullPath(args[2]) + ".d";
+        Directory.CreateDirectory(dumps);   // parity-dumps: each prediction's velocity, for comparing two builds byte for byte
+        WriteFloats(Path.Combine(dumps, label.Replace(' ', '-') + ".f32"), result);
+        Console.WriteLine(JsonSerializer.Serialize(new { label, seconds = watch.Elapsed.TotalSeconds, path = dit.LastMode.ToString() }));
         return result;
     }
     void Compare(string label, float[] expected, float[] actual, double tolerance)
@@ -315,24 +324,26 @@ if (args.Length >= 4 && args[0] == "dit-parity")
         bool passed = relativeL2 <= tolerance;
         report.Add(new { label, identical, maxError, normalizedMax = maxError / Math.Max(scale, 1e-12), relativeL2, tolerance, passed });
         Console.WriteLine(JsonSerializer.Serialize(report[^1]));
-        if (!passed) throw new InvalidDataException($"{label}: relative L2 {relativeL2} exceeds {tolerance}.");
+        if (!passed) failures.Add($"{label}: relative L2 {relativeL2} exceeds {tolerance}.");
     }
     try
     {
+        // The whole-sequence graph: a cache that cannot fit (no free memory) is declined, so every step recomputes the prefix.
         float[] fullA, fullB;
-        using (var dit = new QwenImage21DiT(args[1], device))
+        using (var full = new QwenImage21Denoiser(new QwenImage21Weights(args[1]), device, null, null) { FreeMemory = () => 0 })
         {
-            fullA = Predict(dit, stepA, 0.95f, null, "full step 1");
-            fullB = Predict(dit, stepB, 0.60f, null, "full step 2");
-            using var cache = QwenImage21DiT.CreatePrefixCache(text, imageSlots, references, "1", "auto");
-            Compare("cache extract (step 1)", fullA, Predict(dit, stepA, 0.95f, cache, "cache step 1"), 0);
-            Compare("cache cached (step 2)", fullB, Predict(dit, stepB, 0.60f, cache, "cache step 2"), 0);
-            foreach (string type in new[] { "q8_0", "q8_0_v" })
-            {
-                using var quantized = QwenImage21DiT.CreatePrefixCache(text, imageSlots, references, "1", type);
-                Predict(dit, stepA, 0.95f, quantized, $"{type} step 1");
-                Compare($"{type} cached (step 2)", fullB, Predict(dit, stepB, 0.60f, quantized, $"{type} step 2"), 0.02);
-            }
+            fullA = Predict(full, stepA, 0.95f, 0, "full step 1");
+            fullB = Predict(full, stepB, 0.60f, 1, "full step 2");
+        }
+        // On ggml-cpu a cached step is the whole sequence's bytes. A GPU backend picks its kernels, and their work splits, by
+        // the rows a product computes, and a cached step computes fewer: the retired engine's two modes were 2.3e-3 to 4.6e-3
+        // apart on ggml-cuda (RTX 4000 Ada, 512 x 512), so the cached step is held to 1% there.
+        double cachedTolerance = device == BackendType.GgmlCpu ? 0 : 0.01;
+        using (var dit = new QwenImage21Denoiser(new QwenImage21Weights(args[1]), device, null, null) { FreeMemory = () => -1 })
+        {
+            Compare("cache extract (step 1)", fullA, Predict(dit, stepA, 0.95f, 0, "cache step 1"), 0);
+            Compare("cache cached (step 2)", fullB, Predict(dit, stepB, 0.60f, 1, "cache step 2"), cachedTolerance);
+            dit.FinishRequest();
         }
         GgmlBasicOps.ReleaseReuseComputeBuffers();
         GgmlBasicOps.ClearHostBufferCache();
@@ -340,19 +351,20 @@ if (args.Length >= 4 && args[0] == "dit-parity")
         {
             GgmlBasicOps.TensorParallelInitLoopback(device == BackendType.GgmlCpu ? GgmlBackendType.Cpu : GgmlBackendType.Metal, ranks);
             using var group = new LoopbackGroup(ranks);
-            using var sharded = new QwenImage21DiT(args[1], device, group);
-            // Reordered partial sums round differently on GPU matmuls; a missing or
-            // doubled reduction is off by O(1).
-            Compare($"tp{ranks} full (step 1)", fullA, Predict(sharded, stepA, 0.95f, null, $"tp{ranks} full step 1"), 0.01);
-            using var cache = QwenImage21DiT.CreatePrefixCache(text, imageSlots, references, "1", "auto");
-            Compare($"tp{ranks} cache extract (step 1)", fullA, Predict(sharded, stepA, 0.95f, cache, $"tp{ranks} cache step 1"), 0.01);
-            Compare($"tp{ranks} cache cached (step 2)", fullB, Predict(sharded, stepB, 0.60f, cache, $"tp{ranks} cache step 2"), 0.01);
+            // Reordered partial sums round differently on GPU matmuls; a missing or doubled reduction is off by O(1).
+            using (var shardedFull = new QwenImage21Denoiser(new QwenImage21Weights(args[1]), device, null, null, group) { FreeMemory = () => 0 })
+                Compare($"tp{ranks} full (step 1)", fullA, Predict(shardedFull, stepA, 0.95f, 0, $"tp{ranks} full step 1"), 0.01);
+            using var sharded = new QwenImage21Denoiser(new QwenImage21Weights(args[1]), device, null, null, group) { FreeMemory = () => -1 };
+            Compare($"tp{ranks} cache extract (step 1)", fullA, Predict(sharded, stepA, 0.95f, 0, $"tp{ranks} cache step 1"), 0.01);
+            Compare($"tp{ranks} cache cached (step 2)", fullB, Predict(sharded, stepB, 0.60f, 1, $"tp{ranks} cache step 2"), 0.01);
+            sharded.FinishRequest();
         }
         string destination = Path.GetFullPath(args[2]);
         Directory.CreateDirectory(Path.GetDirectoryName(destination));
         File.WriteAllText(destination, JsonSerializer.Serialize(new { scenario = "real-weight-dit-parity", width, height, reference,
             textTokens, prefixTokens = textTokens - slots + rh * rw, ranks, backend = device.ToString(), results = report },
             new JsonSerializerOptions { WriteIndented = true }));
+        if (failures.Count > 0) throw new InvalidDataException(string.Join(" ", failures));
     }
     finally
     {
@@ -363,7 +375,7 @@ if (args.Length >= 4 && args[0] == "dit-parity")
     return 0;
 }
 
-// Run twice, setting TS_QWEN_TE_FUSED=0/1 before process startup, then compare.
+// Compare two runs' F32 outputs (another backend's, or another build's).
 // No model/device scenario is considered passing unless this tool executes it.
 if (args.Length == 3 && args[0] == "compare")
 {
@@ -424,7 +436,7 @@ using (var encoder = new QwenImageTextEncoder(args[1], backend))
     Buffer.BlockCopy(hidden, 0, bytes, 0, bytes.Length);
     File.WriteAllBytes(output, bytes);
     Console.WriteLine(JsonSerializer.Serialize(new { tokens = tokens.Length, hidden = encoder.HiddenSize,
-        seconds, backend = backend.ToString(), fusedRequested = Environment.GetEnvironmentVariable("TS_QWEN_TE_FUSED") != "0", output }));
+        seconds, backend = backend.ToString(), output }));
 }
 GgmlBasicOps.ReleaseReuseComputeBuffers();
 GgmlBasicOps.ClearHostBufferCache();

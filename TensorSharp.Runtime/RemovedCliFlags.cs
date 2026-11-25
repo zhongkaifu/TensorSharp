@@ -118,6 +118,59 @@ namespace TensorSharp.Runtime
             ("TS_WAN_VAE", "every video model reads TS_VIDEO_VAE (--video-vae)."),
             ("TS_WAN_TE", "every video model reads TS_VIDEO_TEXT_ENCODER (--video-text-encoder)."),
             ("TS_WAN_DIT2", "every video model reads TS_VIDEO_DIT2 (--video-dit2)."),
+            // Qwen-Image-2.1's retired transformers (the native whole graph and the pure-C# one): it runs on the diffusion
+            // runtime's graph programs, which pick their kernels per backend.
+            ("TS_QWEN21_FLASH", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_PAD_MASK", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_CUDNN_ATTENTION", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_CUBLAS_MATMUL", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_CUBLAS_MIN_ROWS", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_GRAPH_REUSE", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_GRAPH_TRACE", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_PREFIX_CACHE",
+                "Qwen-Image-2.1 always caches its text and reference prefix's keys and values after the first step; a cache "
+                + "larger than half the device's free memory is declined on its own and the request recomputes the prefix."),
+            ("TS_QWEN21_PREFIX_CACHE_TYPE",
+                "Qwen-Image-2.1's prefix cache stores what its attention reads (F16 on Metal and CUDA, F32 elsewhere), so cached "
+                + "steps equal uncached ones; the 8-bit storage was removed."),
+            ("TS_QWEN21_PREFIX_CACHE_MAX_MIB",
+                "a Qwen-Image-2.1 prefix cache larger than half the device's free memory is declined on its own; the cap has "
+                + "no replacement."),
+            ("TS_QWEN21_CPU_MATMUL", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_GATHER_V", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_DEPTH", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_MLP_ROWS", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_ROUND_ACTIVATIONS", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_GELU_FP16", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_PROFILE", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_MEMORY",
+                "Qwen-Image-2.1's run logs each phase's seconds and the residency plan ([diffusion] lines); the per-phase "
+                + "process memory report has no replacement."),
+            // Qwen-Image-2.1's companions (VAE, Qwen3-VL text encoder, its vision mode) keep their default paths only.
+            ("TS_QWEN_VAE_GPU", Qwen21VaePathRemoved),
+            ("TS_QWEN_VAE_FUSED", Qwen21VaePathRemoved),
+            ("TS_QWEN21_VAE_FUSED", Qwen21VaePathRemoved),
+            ("TS_QWEN21_VAE_ATTN", Qwen21VaePathRemoved),
+            ("TS_QWEN_VAE_CONV_TILE_BYTES",
+                "Qwen-Image-2.1's VAE splits a device convolution into bands once its im2col passes 1 GiB; the budget is fixed."),
+            ("TS_QWEN_VAE_FUSED_IM2COL_BUDGET",
+                "Qwen-Image-2.1's whole-VAE graph lowers a convolution to im2col up to 2 GiB of scratch; the budget is fixed."),
+            ("TS_QWEN21_VAE_TRACE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_VAE_PROFILE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_VAE_POOL_TRACE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_TE_FUSED",
+                "Qwen-Image-2.1's text encoder runs its whole trunk as one graph on every GGML backend, and per operation on "
+                + "the cpu backend; the switch between them was removed."),
+            ("TS_QWEN_TE_CPU_MATMUL",
+                "Qwen-Image-2.1's text encoder on the cpu backend projects through the 8-bit integer GEMM; the F32 GEMM was removed."),
+            ("TS_QWEN21_TE_PRESCALE",
+                "Qwen-Image-2.1's text encoder trunk multiplies without pre-scaling its activations; the older scaling was removed."),
+            ("TS_QWEN_TE_TRACE_DIR", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_TE_TRACE_LAYER", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_TE_PROFILE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN21_VISION_FUSED",
+                "Qwen-Image-2.1's vision encoder runs its fused path on ggml_cuda and the per-block one elsewhere; the switch "
+                + "between them was removed."),
             ("TS_H3_IMAGE_VAE_BATCH",
                 "MiniMax-H3-Image's VAE decoder sizes its own programs (a row of tiles, at most 64); the native decoder whose "
                 + "tiles a call it capped was removed with the legacy model."),
@@ -594,6 +647,18 @@ namespace TensorSharp.Runtime
         private const string CpuPreviousKernelsRemoved =
             "the pure-C# cpu backend always runs its current kernels; the switch back to the previous ones was removed.";
 
+        private const string Qwen21KernelSwitchRemoved =
+            "Qwen-Image-2.1's transformer runs as the diffusion runtime's graph programs, which choose their kernels per backend "
+            + "(on CUDA cuBLAS from 256 rows and cuDNN attention, as the removed native graph did) and keep their compiled plans.";
+        private const string Qwen21VaePathRemoved =
+            "Qwen-Image-2.1's VAE runs its whole-VAE graph on ggml_cuda and ggml_metal, per convolution on the other GGML backends "
+            + "and in managed code on the cpu backend; the switches between those paths were removed.";
+        private const string Qwen21CompanionDiagnosticRemoved =
+            "Qwen-Image-2.1's VAE and text encoder no longer trace or profile themselves; the run's [diffusion] line keeps "
+            + "each phase's seconds.";
+        private const string Qwen21CpuSwitchRemoved =
+            "Qwen-Image-2.1 on the cpu backend runs the transformer's graph programs on the managed tensor executor; the "
+            + "pure-C# transformer these tuned was removed.";
         private const string DiffusionCpuLegacyRemoved =
             "DiffusionGemma on the cpu backend always runs its batched CPU stages "
             + "(DIFFUSION_NO_PKV=1 still turns the prompt-KV cache off).";

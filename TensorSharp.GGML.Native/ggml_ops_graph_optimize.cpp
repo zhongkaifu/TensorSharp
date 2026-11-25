@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -23,12 +24,32 @@ namespace {
     }
 
     void insert_dependencies(ggml_context * ctx, ggml_cgraph * graph, const Dependencies & dependencies);
+
+    // Upstream ggml added add_scratch to the optimize parameters (between add_alloc_dep and user_data): a backend may ask
+    // the scheduler's allocator for shared scratch. TensorSharp allocates its graphs itself and keeps no such reservations,
+    // so a backend that asks is refused by name rather than handed a null pointer. No backend asks yet.
+    ggml_tensor * refuse_scratch(void *, size_t nbytes, ggml_tensor *, ggml_tensor *) {
+        throw std::runtime_error("Backend optimizer requested " + std::to_string(nbytes) +
+                                 " bytes of scheduler scratch, which TensorSharp's graph allocation does not provide");
+    }
+
+    // Set add_scratch where the ggml revision has it; older revisions have no such field.
+    template <typename Params>
+    auto set_scratch(Params & params, int) -> decltype(params.add_scratch = refuse_scratch, void()) {
+        params.add_scratch = refuse_scratch;
+    }
+    template <typename Params>
+    void set_scratch(Params &, long) {}
 }
 
 void tsg_optimize_graph_with_alloc_dependencies(ggml_backend_t backend, ggml_context * ctx, ggml_cgraph * graph) {
     if (!backend || !graph || !backend->iface.graph_optimize) return;
     Dependencies dependencies;
-    ggml_backend_graph_optimize_params params = { add_dependency, &dependencies };
+    // By field, not position: the struct's layout differs between ggml revisions.
+    ggml_backend_graph_optimize_params params{};
+    params.add_alloc_dep = add_dependency;
+    params.user_data = &dependencies;
+    set_scratch(params, 0);
     backend->iface.graph_optimize(backend, graph, &params);
     insert_dependencies(ctx, graph, dependencies);
 }

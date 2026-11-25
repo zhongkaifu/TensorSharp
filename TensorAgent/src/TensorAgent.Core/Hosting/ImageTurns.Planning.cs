@@ -12,6 +12,7 @@ using System.Text;
 using System.Text.Json;
 using TensorSharp.Chat;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 
 namespace TensorAgent.Core.Hosting;
 
@@ -68,7 +69,7 @@ public static partial class ImageTurns
 
     /// <summary>
     /// The longest question the image model is asked, in tokens of the whole prompt it scores
-    /// (<see cref="QwenImageModel.ChooseAnswerPrompt"/>: the chat template, the instruction,
+    /// (<see cref="QwenImage21DiffusionModel.ChooseAnswerPrompt"/>: the chat template, the instruction,
     /// the conversation, and the lettered options and reply format the model adds). Its text
     /// trunk holds F32 attention scores and probabilities of [tokens, tokens, 32 heads], so its
     /// scratch grows with the square of the question: 256 MB at 1,024 tokens, 1 GB at 2,048,
@@ -76,7 +77,7 @@ public static partial class ImageTurns
     /// chat is fitted under it by dropping its oldest messages first (see <see cref="Question"/>);
     /// a question the estimate still lets through over it gets no answer, not a failure.
     /// </summary>
-    internal const int QuestionTokenLimit = QwenImageModel.MaxQuestionTokens;
+    internal const int QuestionTokenLimit = QwenImage21DiffusionModel.MaxQuestionTokens;
 
     /// <summary>
     /// How a turn reads the conversation: the folder its pictures are kept in, because a
@@ -99,7 +100,7 @@ public static partial class ImageTurns
     /// One question for the image model: the instruction, the conversation and what is asked
     /// about it, and the options' texts in option order. The options are not lettered here and
     /// the question does not say how to answer: the image model letters them, in every
-    /// rotation, and adds that line itself (<see cref="QwenImageModel.ChooseAnswer"/>).
+    /// rotation, and adds that line itself (<see cref="QwenImage21DiffusionModel.ChooseAnswer"/>).
     /// </summary>
     public sealed record PlanQuestion(string System, string User, IReadOnlyList<string> Options);
 
@@ -192,7 +193,7 @@ public static partial class ImageTurns
         /// Change <paramref name="picture"/> as <paramref name="prompt"/> says, in the user's own
         /// words: an edit model takes the instruction as it is given. At the service's seed, as
         /// an attached photo is: the engine keys an edit's noise to its pictures
-        /// (QwenImage21Sampling.ReferenceStream, with the evidence), so a change of a picture the
+        /// (QwenImage21Noise.ReferenceStream, with the evidence), so a change of a picture the
         /// model made never starts from the noise that picture was drawn from, whether it comes
         /// from this rule or from Edit on the picture, which attaches it.
         /// </summary>
@@ -588,7 +589,7 @@ public static partial class ImageTurns
 
         // Measured on the whole prompt the image model scores, its option lines and reply
         // format included, not on this side's part of it.
-        bool Fits(string user) => EstimateTokens(QwenImageModel.ChooseAnswerPrompt(PlannerInstruction, user, optionTexts)) <= QuestionTokenLimit;
+        bool Fits(string user) => EstimateTokens(QwenImage21DiffusionModel.ChooseAnswerPrompt(PlannerInstruction, user, optionTexts)) <= QuestionTokenLimit;
 
         string question = Render(newest.Length);
         while (!Fits(question) && lines.FindIndex(l => l.Droppable) is var oldest and >= 0)

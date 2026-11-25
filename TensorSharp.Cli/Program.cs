@@ -1008,8 +1008,8 @@ namespace TensorSharp.Cli
             }
 
             // Qwen-Image-2.1: let the operator override the companion files that
-            // QwenImageModel otherwise resolves from a same-directory scan. These
-            // are translated into the env vars QwenImageModel reads (the existing
+            // QwenImage21DiffusionModel otherwise resolves from a same-directory scan. These
+            // are translated into the env vars QwenImage21DiffusionModel reads (the existing
             // override mechanism) and validated here so a typo fails fast instead
             // of silently falling back to the directory scan.
             ApplyQwenImageCompanionOverride("--qwen-image-vae", "TS_QWEN_IMAGE_VAE", qwenImageVaePath);
@@ -1027,7 +1027,7 @@ namespace TensorSharp.Cli
             ApplyVideoCompanionOverride("--video-diffusion-vae", videoDiffusionVaePath, "TS_VIDEO_DIFFUSION_VAE");
 
             // --qwen-image-variant declares which Qwen-Image-2.1 checkpoint the GGUF holds
-            // (Turbo samples its own 8-step schedule); QwenImageModel reads it at load.
+            // (Turbo samples its own 8-step schedule); QwenImage21DiffusionModel reads it at load.
             if (qwenImageVariant is { } variant)
             {
                 Environment.SetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable, QwenImageVariantFlag.Name(variant));
@@ -2527,7 +2527,7 @@ namespace TensorSharp.Cli
                 if (!File.Exists(path))
                     throw new ArgumentException($"Input image not found: {path}");
             }
-            Console.WriteLine(imageModel is TensorSharp.Models.QwenImage.QwenImageModel
+            Console.WriteLine(imageModel is TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel
                 ? "=== Qwen-Image-2.1 ===" : $"=== {imageModel.ImageModelFamily} ===");
             for (int i = 0; i < imagePaths.Count; i++)
                 Console.WriteLine($"  input{(imagePaths.Count > 1 ? $" {i + 1}" : "  ")}: {imagePaths[i]}");
@@ -4234,7 +4234,7 @@ namespace TensorSharp.Cli
 
         /// <summary>
         /// Translate a Qwen-Image-2.1 companion-file CLI flag into the env var
-        /// QwenImageModel reads (its existing override mechanism). Validates the
+        /// QwenImage21DiffusionModel reads (its existing override mechanism). Validates the
         /// path exists so a typo fails fast at startup rather than silently
         /// falling back to the same-directory scan and surfacing as a confusing
         /// "companion not found" later.

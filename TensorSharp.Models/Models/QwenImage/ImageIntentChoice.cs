@@ -11,7 +11,7 @@ namespace TensorSharp.Models.QwenImage
 {
     /// <summary>
     /// The option the image model's own Qwen3-VL-8B picked for a multiple-choice question
-    /// (<see cref="QwenImageModel.ChooseAnswer"/>).
+    /// (<c>QwenImage21DiffusionModel.ChooseAnswer</c>).
     /// </summary>
     /// <param name="Index">The chosen option, as an index into the options in the order given.</param>
     /// <param name="Probability">Its probability among the options, averaged over the option

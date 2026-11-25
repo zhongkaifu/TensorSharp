@@ -191,8 +191,8 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         Assert.Equal(((2048, 2048), (1024, 1024)), (styled.Sampling, styled.Output));
         DiffusionCanvas t2i = family.ResolveCanvas(new DiffusionRequest { Width = 1024, Height = 1024, Adapters = With(1024) }, null);
         Assert.Equal(((1024, 1024), (1024, 1024)), (t2i.Sampling, t2i.Output));
-        // A masked edit's selection samples at the contract's floor too (S6's masks with S7's pDMD): a 1024 x 1024 picture
-        // whole, and a 384 x 384 crop of a 2048 x 2048 one at its density, no longer raised to 4 MP.
+        // A masked edit's selection takes neither floor: a 1024 x 1024 picture whole samples at its own size, and a
+        // 384 x 384 crop of a 2048 x 2048 one at the masked crop floor (the family's 4 MP), whatever the contract says.
         RgbImage square = Picture(1024, 1024), big = Picture(2048, 2048);
         var whole = new EditMaskOptions { Mask = RectangleMask(1024, 1024, 10, 10, 200, 200) };
         DiffusionCanvas masked = family.ResolveCanvas(new DiffusionRequest
@@ -205,7 +205,7 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         {
             References = new[] { new DiffusionReference(big) }, Mask = cropped, Adapters = With(1024),
         }, EditMask.Create(cropped, big));
-        Assert.Equal(new DiffusionCanvas((384, 384), (2048, 2048)), crop);
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (2048, 2048)), crop);
     }
 
     // ---- layout
@@ -498,16 +498,17 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
     /// The latent side of a masked edit: the kept cells (a 16x16 cell of weight 0 everywhere; max-pooled, so a cell with any
     /// selected pixel is edited) end exactly on the source's posterior mean, normalized as the references' rows are (F16, then
     /// the VAE's latents_mean/std); the selected cells are the sampler's (here the initial noise, the stub predicting zero
-    /// velocity). The source is encoded once more at the sampling canvas when its reference copy is another size.
+    /// velocity). The selection samples at the source's own 768 x 768, so the latent mask has one cell a 16 x 16 block of
+    /// source pixels; the source is encoded once more at that size, since its reference copy is another (a 1024 short edge).
     /// </summary>
     [Fact]
     public void TheKeptLatentCellsEndOnTheSourcesNormalizedMean()
     {
-        const int W = 1024, H = 1024;
+        const int W = 768, H = 768, Cells = W / 16;
         RgbImage source = Picture(W, H, 9);
         RgbImage mask = RectangleMask(W, H, 256, 256, 513, 512, ramp: 0);  // x 512 is one pixel into the next cell column
         var inner = new MiniMaxH3ImageFamily(Grid);
-        var canvas = new LatentShape(24, 1, 128, 128);              // the 4 MP floor: 2048x2048
+        var canvas = new LatentShape(24, 1, Cells, Cells);          // the source's own 768x768, not the 4 MP floor
         var mean = new float[canvas.Count];
         for (int i = 0; i < mean.Length; i++) mean[i] = MathF.Sin(i * 0.37f) * 3f;
         var referencePosterior = new LatentPosterior(new LatentShape(24, 1, 64, 64), new float[24 * 64 * 64], new float[24 * 64 * 64]);
@@ -518,8 +519,8 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         {
             Prompt = "x", References = new[] { new DiffusionReference(source) }, Mask = new EditMaskOptions { Mask = mask }, Seed = 3,
         });
-        Assert.Equal(((2048, 2048), (1024, 1024)), (result.Recipe.Canvas.Sampling, result.Recipe.Canvas.Output));
-        Assert.Equal(new[] { (1024, 1024), (2048, 2048) }, family.Encoded);
+        Assert.Equal(((W, H), (W, H)), (result.Recipe.Canvas.Sampling, result.Recipe.Canvas.Output));
+        Assert.Equal(new[] { (1024, 1024), (W, H) }, family.Encoded);
 
         float[] expected = inner.References.SourceLatent(new LatentPosterior(canvas, mean, new float[mean.Length])).Data;
         // The pipeline draws the reference's posterior sample first, then the target noise.
@@ -529,14 +530,14 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         LatentTensor decoded = family.Decoded;
         Assert.Equal(canvas, decoded.Shape);
         int keptCells = 0, editedCells = 0;
-        for (int y = 0; y < 128; y++)
-            for (int x = 0; x < 128; x++)
+        for (int y = 0; y < Cells; y++)
+            for (int x = 0; x < Cells; x++)
             {
-                // The 8x8 source pixels of the 1024x1024 mask a latent cell of the 2048 canvas covers; any selected one edits it.
-                bool edited = x * 8 + 8 > 256 && x * 8 < 513 && y * 8 + 8 > 256 && y * 8 < 512;
+                // The 16x16 source pixels a latent cell covers; any selected one edits it.
+                bool edited = x * 16 + 16 > 256 && x * 16 < 513 && y * 16 + 16 > 256 && y * 16 < 512;
                 for (int c = 0; c < 24; c++)
                 {
-                    long at = ((long)c * 128 + y) * 128 + x;
+                    long at = ((long)c * Cells + y) * Cells + x;
                     if (edited) Assert.Equal(noise[at], decoded.Data[at]);
                     else Assert.Equal(expected[at], decoded.Data[at]);
                 }
@@ -547,10 +548,13 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// A masked edit's canvas (MiniMaxH3ImageFamily.ResolveCanvas): it returns the source's own size whatever it samples;
-    /// the whole picture samples as an unmasked edit's canvas would, the selection's crop at that canvas's density, both
-    /// with the 4 MP floor at their own aspect; a crop asked for explicitly over 20 MP is refused, a mask with no picture
-    /// to edit too.
+    /// A masked edit's canvas (MiniMaxH3ImageFamily.ResolveCanvas): it returns the source's own size whatever it samples, and
+    /// samples the selection (the whole picture or its crop) at the unmasked edit's canvas density but never above the
+    /// selection's own resolution, without the edit's floor: a whole picture's latent mask and denoise are never larger than
+    /// the picture they are composited into. A crop smaller than its picture samples at least MaskedCropFloor (2048 x 2048
+    /// pixels) at its own aspect, held to 4 times the picture's pixels. A smaller canvas (an explicit size or area) still
+    /// lowers the density down to that floor; a mask with no picture to edit is refused. (The 20 MP ceiling now needs a
+    /// picture above 20 MP, too large for this test.)
     /// </summary>
     [Fact]
     public void AMaskedEditSamplesItsSelectionAndReturnsItsSource()
@@ -565,21 +569,48 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         EditMaskOptions Whole(RgbImage p) => new() { Mask = RectangleMask(p.Width, p.Height, 10, 10, 200, 200) };
         EditMaskOptions Cropped(RgbImage p) => new() { Mask = RectangleMask(p.Width, p.Height, 512, 512, 744, 768), MaskCrop = true, MaskCropPadding = 64 };
 
-        Assert.Equal(new DiffusionCanvas((2048, 2048), (1024, 1024)), Canvas(square, Whole(square)));
-        Assert.Equal(new DiffusionCanvas((2368, 1760), (1000, 750)), Canvas(photo, Whole(photo), keep: true));
-        Assert.Equal(new DiffusionCanvas((2048, 2048), (1024, 1024)), Canvas(square, Whole(square), 2048, 2048));
-        // The crop is 384 x 384 source pixels (the rectangle and its gray ramp, 64 of context each side), 384 x 384 at the
-        // whole picture's 2048 x 2048 density, then the floor at its square aspect.
+        // The whole picture at its own size (an unmasked edit would sample the square at 2048 x 2048, the 4 MP floor, and the
+        // 1000 x 750 photo at 2368 x 1760); the photo's sides snap upward to the 32-pixel grid.
+        Assert.Equal(new DiffusionCanvas((1024, 1024), (1024, 1024)), Canvas(square, Whole(square)));
+        Assert.Equal(new DiffusionCanvas((1024, 768), (1000, 750)), Canvas(photo, Whole(photo)));
+        Assert.Equal(new DiffusionCanvas((1024, 768), (1000, 750)), Canvas(photo, Whole(photo), keep: true));
+        // An explicit size above the picture does not raise it; one below lowers the density.
+        Assert.Equal(new DiffusionCanvas((1024, 1024), (1024, 1024)), Canvas(square, Whole(square), 2048, 2048));
+        Assert.Equal(new DiffusionCanvas((512, 512), (1024, 1024)), Canvas(square, Whole(square), 512, 512));
+        // The crop is 384 x 384 source pixels (the rectangle and its gray ramp, 64 of context each side). Its own size is
+        // below the masked crop floor, so it samples 2048 x 2048, whatever the canvas (as before the cap: the picture's
+        // density, then the 4 MP floor; with the cap alone it sampled 384 x 384).
+        Assert.Equal(MiniMaxH3ImageFamily.MinGenerationArea, MiniMaxH3ImageFamily.MaskedCropFloor);
+        Assert.Equal(4, MiniMaxH3ImageFamily.MaskedCropPictureMultiple);
         EditMask crop = EditMask.Create(Cropped(big), big);
         Assert.Equal((384, 384), (crop.Width, crop.Height));
         Assert.Equal(new DiffusionCanvas((2048, 2048), (2048, 2048)), Canvas(big, Cropped(big)));
-        // A wide crop of a 1000 x 750 photo samples at the floor at its own aspect.
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (2048, 2048)), Canvas(big, Cropped(big), 4096 * 7, 4096 * 7));
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (2048, 2048)), Canvas(big, Cropped(big), 1024, 1024));
+        // A 1452 x 1428 crop (2.07 MP) rises to 4 MP at its aspect, from its own size or from the 736 x 736 that half the
+        // density would give it.
+        var large = new EditMaskOptions { Mask = RectangleMask(2048, 2048, 200, 200, 1500, 1500), MaskCrop = true, MaskCropPadding = 64 };
+        Assert.Equal((1452, 1428), (EditMask.Create(large, big).Width, EditMask.Create(large, big).Height));
+        Assert.Equal(new DiffusionCanvas((2080, 2016), (2048, 2048)), Canvas(big, large));
+        Assert.Equal(new DiffusionCanvas((2080, 2016), (2048, 2048)), Canvas(big, large, 1024, 1024));
+        // A 2652 x 1828 crop (4.85 MP) of a 3000 x 2000 picture is above the floor: it samples at its own size on the grid.
+        RgbImage wider = Picture(3000, 2000);
+        var above = new EditMaskOptions { Mask = RectangleMask(3000, 2000, 200, 200, 2700, 1900), MaskCrop = true, MaskCropPadding = 64 };
+        Assert.Equal((2652, 1828), (EditMask.Create(above, wider).Width, EditMask.Create(above, wider).Height));
+        Assert.Equal(new DiffusionCanvas((2656, 1824), (3000, 2000)), Canvas(wider, above));
+        // A wide 800 x 120 crop of a 1000 x 750 photo rises at its 20:3 aspect to 3 MP, four times the photo's pixels.
         EditMask wide = EditMask.Create(new EditMaskOptions { Mask = RectangleMask(1000, 750, 100, 300, 900, 420, ramp: 0), MaskCrop = true, MaskCropPadding = 0 }, photo);
+        Assert.Equal((800, 120), (wide.Width, wide.Height));
         DiffusionCanvas wideCanvas = family.ResolveCanvas(new DiffusionRequest { References = new[] { new DiffusionReference(photo) }, KeepSourceSize = true }, wide);
-        Assert.Equal((1000, 750), wideCanvas.Output);
-        Assert.Equal(MiniMaxH3ImageFamily.EditCanvas(800, 128), wideCanvas.Sampling);
-        // An explicit size is the whole picture's: its crop at 28672 x 28672 would sample 5376 x 5376.
-        Assert.Contains("at most 21.0 MP", Assert.Throws<ArgumentException>(() => Canvas(big, Cropped(big), 4096 * 7, 4096 * 7)).Message);
+        Assert.Equal(new DiffusionCanvas((4480, 672), (1000, 750)), wideCanvas);
+        // A 512 x 512 picture: its 252 x 228 crop rises to 1 MP (four times the picture), and a crop whose padding reaches
+        // every edge is the whole picture, at its own size.
+        RgbImage small = Picture(512, 512);
+        var smallCrop = new EditMaskOptions { Mask = RectangleMask(512, 512, 200, 200, 300, 300), MaskCrop = true, MaskCropPadding = 64 };
+        Assert.Equal((252, 228), (EditMask.Create(smallCrop, small).Width, EditMask.Create(smallCrop, small).Height));
+        Assert.Equal(new DiffusionCanvas((1088, 960), (512, 512)), Canvas(small, smallCrop));
+        Assert.Equal(new DiffusionCanvas((512, 512), (512, 512)), Canvas(small, smallCrop with { MaskCropPadding = 16384 }));
+        Assert.Equal(new DiffusionCanvas((512, 512), (512, 512)), Canvas(small, Whole(small)));
         Assert.Contains("requires a first reference image", Assert.Throws<ArgumentException>(() => family.ResolveCanvas(
             new DiffusionRequest(), EditMask.Create(Whole(square), square))).Message);
     }

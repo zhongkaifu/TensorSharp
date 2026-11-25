@@ -61,7 +61,9 @@ namespace TensorSharp.Models.Graph
         {
             if (_stepWidthSet) return;
             _stepWidthSet = true;
-            CpuWorkerPool.SelectWidthForStep(rows);
+            // A program of whole-image products (a diffusion denoiser's step) is never decode-sized, though its first product
+            // may be (the timestep embedding's rows).
+            CpuWorkerPool.SelectWidthForStep(WideTokenProducts ? long.MaxValue : rows);
         }
 
         protected override void DenseProduct(Tensor result, Tensor rows, Tensor weight)
@@ -161,7 +163,38 @@ namespace TensorSharp.Models.Graph
             return result;
         }
 
-        protected override bool Fuses(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm;
+        /// <summary><see cref="GraphFusion.PairRotary"/> in one pass over the rows: the region's products and sums, each
+        /// rounded as its ops round them.</summary>
+        private unsafe bool PairRotary(Tensor x, Tensor cos, Tensor sin, Tensor[] results)
+        {
+            if (x.DimensionCount != 3 || !x.IsContiguous() || !cos.IsContiguous() || !sin.IsContiguous()) return false;
+            long rows = x.Sizes[0], heads = x.Sizes[1], d = x.Sizes[2], half = d / 2;
+            if (d % 2 != 0 || cos.ElementCount() != rows * half || sin.ElementCount() != rows * half) return false;
+            var result = new Tensor(Allocator, DType.Float32, rows, heads, d);
+            long xa = (long)TensorComputePrimitives.GetFloatPointer(x), ra = (long)TensorComputePrimitives.GetFloatPointer(result);
+            long ca = (long)TensorComputePrimitives.GetFloatPointer(cos), sa = (long)TensorComputePrimitives.GetFloatPointer(sin);
+            void Row(long r)
+            {
+                float* c = (float*)ca + r * half, s = (float*)sa + r * half;
+                for (long h = 0; h < heads; h++)
+                {
+                    float* xi = (float*)xa + (r * heads + h) * d, o = (float*)ra + (r * heads + h) * d;
+                    for (long j = 0; j < half; j++)
+                    {
+                        float even = xi[2 * j], odd = xi[2 * j + 1];
+                        float ec = even * c[j], os = odd * s[j], oc = odd * c[j], es = even * s[j];
+                        o[j] = ec - os;
+                        o[half + j] = oc + es;
+                    }
+                }
+            }
+            if (rows >= ParallelRegionRows) System.Threading.Tasks.Parallel.For(0L, rows, Row);
+            else for (long r = 0; r < rows; r++) Row(r);
+            results[0] = result;
+            return true;
+        }
+
+        protected override bool Fuses(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.PairRotary;
 
         /// <summary>Tokens of a fused region below which it runs on the calling thread.</summary>
         private const int ParallelRegionRows = 8;
@@ -177,6 +210,8 @@ namespace TensorSharp.Models.Graph
             float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
             switch (kind)
             {
+                case GraphFusion.PairRotary:
+                    return PairRotary(inputs[0], inputs[1], inputs[2], results);
                 case GraphFusion.DeltaNetPrep:
                     return DeltaNetPrep(inputs, (int)ip[0], (int)ip[1], (int)ip[2], (int)ip[3], eps, results);
                 case GraphFusion.GatedRmsNorm:

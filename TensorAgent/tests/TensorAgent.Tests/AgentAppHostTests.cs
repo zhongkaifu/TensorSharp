@@ -647,7 +647,7 @@ public sealed class AgentAppHostTests : IDisposable
         var modelField = lifecycle.GetType().GetField("_model",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         modelField.SetValue(lifecycle,
-            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage.QwenImageModel)));
+            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel)));
         try
         {
             File.WriteAllBytes(Path.Combine(host.Options.UploadDirectory, "dog.png"), new byte[] { 1 });

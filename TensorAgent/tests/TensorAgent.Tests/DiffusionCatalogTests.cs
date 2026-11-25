@@ -61,7 +61,7 @@ public sealed class ProcessEnvironmentCollection
 /// </para>
 /// <para>
 /// The scans are stated here rather than called, because they are private to
-/// <c>QwenImageModel</c>. <see cref="TheScansThisFileMirrorsAreStillTheOnesTheModelPerforms"/>
+/// <c>QwenImage21DiffusionModel</c>. <see cref="TheScansThisFileMirrorsAreStillTheOnesTheModelPerforms"/>
 /// is what keeps the two from drifting apart.
 /// </para>
 /// </summary>
@@ -95,7 +95,7 @@ public sealed class DiffusionCatalogTests
     private static string NameOf(CatalogModel model, CatalogFileRole role) =>
         model.Files.Single(f => f.Role == role).FileName;
 
-    /// <summary>The VAE scan in <c>QwenImageModel</c>'s constructor: a safetensors file
+    /// <summary>The VAE scan in <c>QwenImage21DiffusionModel</c>'s constructor: a safetensors file
     /// naming the 2.1 VAE.</summary>
     private static bool VaeScanFinds(string fileName)
     {
@@ -132,7 +132,7 @@ public sealed class DiffusionCatalogTests
             Assert.True(model.Files.Any(f => f.Role == role), $"{model.Id} has no {role}");
         }
 
-        // The VAE and the text encoder are not optional: QwenImageModel's constructor
+        // The VAE and the text encoder are not optional: QwenImage21DiffusionModel's constructor
         // throws FileNotFoundException without them, so an entry that marks either one
         // optional is an entry that can finish downloading and then refuse to load.
         Assert.False(model.Files.Single(f => f.Role == CatalogFileRole.Vae).Optional);
@@ -242,7 +242,7 @@ public sealed class DiffusionCatalogTests
         // to catch the rename this file exists to prevent, and the alternative — making
         // the resolvers public on a shared assembly so a phone test can call them — is
         // a worse trade.
-        string model = ReadSource("TensorSharp.Models/Models/QwenImage/QwenImageModel.cs");
+        string model = ReadSource("TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs");
         foreach (string literal in new[]
                  {
                      "\"TS_QWEN_IMAGE_VAE\"", "\"TS_QWEN_IMAGE_TE\"", "\"TS_QWEN_IMAGE_MMPROJ\"",

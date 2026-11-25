@@ -3,8 +3,9 @@
 Status: stages S1-S8 and S10 implemented. MiniMax-H3-Image (text to image, editing with up to 16 references, masked
 edits, multi-turn, LoRA plug-ins) runs only on the diffusion runtime; the legacy model was deleted in S10, after its
 outputs were frozen as golden fixtures (see "S10, as built" under section 1.6). S9 (tensor parallelism) and S11 (the
-conditioner on the shared decoder runtime) are design. Corrections made while implementing are marked "(S5)", "(S6)" and
-so on below. Written 2026-11-19 on `feature/h3-image-unified` (cut from `origin/main` ec702639) at ggml `cd6d2b75`; since
+conditioner on the shared decoder runtime) are design. Qwen-Image-2.1 (and Turbo) has since moved onto the runtime too,
+and its legacy pipeline was deleted the same way ([section 3.10](#310-qwen-image-21-on-the-runtime-as-built)).
+Corrections made while implementing are marked "(S5)", "(S6)" and so on below. Written 2026-11-19 on `feature/h3-image-unified` (cut from `origin/main` ec702639) at ggml `cd6d2b75`; since
 the merge of `origin/main` 19bfb073 (S10) the series builds against main's and CI's pin, ggml `d9fe7bff`, unchanged
 (AGENTS.md). Every statement about upstream is from the sources listed in
 [Appendix A](#appendix-a-upstream-sources-read), at the revisions given there.
@@ -408,8 +409,8 @@ H100: about 58 GB, so no regression). Otherwise it releases a phase's components
 phase through `IGraphExecutor.Invalidate` on their weight leaves. For example, on an A40 the
 bf16 DiT (40.2 GB) cannot sit beside the Q4_K_M text encoder (18.2 GB). The weights stay
 mapped on the host, so a re-upload is a device copy, not a disk read. `MiniMaxH3DiT.ReleaseDeviceResidency`
-and `QwenImage21Pipeline` (which disposes its conditioner before the DiT) are the two
-precedents that this generalizes. The planner logs its decision once per load and per geometry
+and the retired `QwenImage21Pipeline` (which disposed its conditioner before the DiT) are the two
+precedents that this generalizes; Qwen-Image-2.1's components now declare it (`IResidentComponent.ReleaseAfterPhase`, §3.10). The planner logs its decision once per load and per geometry
 class, and the decision is visible in telemetry.
 
 ### 3.5 Scheduling and batching
@@ -432,9 +433,9 @@ class, and the decision is visible in telemetry.
 
 ### 3.6 Multi-GPU: tensor parallelism
 
-The precedent is Qwen-Image-2.1's DiT TP (`QwenImage21DiT(..., ITensorParallelGroup tpGroup)`:
+The precedent was Qwen-Image-2.1's DiT TP (the retired `QwenImage21DiT(..., ITensorParallelGroup tpGroup)`:
 whole heads and MLP columns per rank, two all-reduces a block, the native
-`QwenImage21ForwardTp`). On the runtime, a denoiser that declares `Shardable` is emitted per
+`QwenImage21ForwardTp`), which now runs as ranked programs (`QwenImage21Denoiser`, §3.10). On the runtime, a denoiser that declares `Shardable` is emitted per
 rank, as `EmitRankedStep` does for decoders. Each rank takes 56/T heads of the qkv projection
 (qkv is stacked `[q; k; v]` in the Comfy-Org file, so a rank takes rows of each third) and
 14336/T FFN columns. The adaLN projection, the token refiner, the final layer and the PDD head
@@ -484,9 +485,51 @@ flow models) at a reduced size through `IVaeCodec.Preview`, with masked previews
 | Family | Needs from the runtime | Fits by |
 |---|---|---|
 | MiniMax-H3 video (`MiniMaxH3Pipeline`) | two streams (video, audio) with different shifts and a velocity scale (`ShiftSlope`); keyframes and Ref2VA references; audio VAE; video preview | `StepOutput` with several named outputs; a recipe with per-stream sigmas; `IVaeCodec` per modality; the same layout and segment machinery (H3-Image's layout is a subset) |
-| Qwen-Image-2.1 (`QwenImage21Pipeline`) | CFG (two branches); a prefix K/V cache (text and reference rows are modulated at t = 0 and do not attend to the target, so their K/V are fixed across steps); Philox noise; DiT TP; PDD LoRA heads (Fun-Acc: per-step heads replacing `proj_out`) | `DiffusionGuidance.Cfg`, batched as two sequences; `DenoiserCaps.PrefixCacheable` (State leaves for the cached K/V); `INoiseSource`; §3.6; the "heads by step" policy (§5.4), the same idea as H3's PDD |
+| Qwen-Image-2.1 (migrated: §3.10) | CFG (two branches); a prefix K/V cache (text and reference rows are modulated at t = 0 and do not attend to the target, so their K/V are fixed across steps); Philox noise; DiT TP; PDD LoRA heads (Fun-Acc: per-step heads replacing `proj_out`) | `DiffusionGuidance.Cfg`, batched as two sequences; `DenoiserCaps.PrefixCacheable` (State leaves for the cached K/V); `INoiseSource`; §3.6; the "heads by step" policy (§5.4), the same idea as H3's PDD |
 | Wan 2.x (`WanVideoModel`) | T5 conditioner; UniPC multistep (sampler state); CFG; causal 3-D VAE in temporal chunks; A14B's two experts switched by sigma | stateful `ISampler`; a recipe with `DenoiserStage[]` selected by sigma range |
 | LTX 2.5 (`Ltx25Pipeline`) | Gemma prompt encoder plus connector; audio and video; two stages (base, then latent upsampler, then refine with a distilled LoRA); IC-LoRA references | `SamplingRecipe.Stages` with a latent transform between stages; per-stage adapter sets |
+
+### 3.10 Qwen-Image-2.1 on the runtime (as built)
+
+Qwen-Image-2.1 and its Turbo checkpoint run only on the diffusion runtime (`TensorSharp.Models/Models/QwenImage21`); the
+bespoke `QwenImageModel` → `QwenImage21Pipeline` → `QwenImage21DiT` path, its native whole-graph forward
+(`ggml_ops_qwen_image21.cpp`, `TSGgml_QwenImage21Forward[Tp]`) and its pure-C# transformer (`QwenImage21ManagedDiT` and its
+CPU kernels) were deleted once their outputs were frozen.
+
+| Piece | On the runtime |
+|---|---|
+| Model and host wiring | `QwenImage21DiffusionModel` behind the `qwen_image` descriptor (`ServingContract.SharedDiffusionRuntime`, TP on the multi-GPU GGML backends); the CLI, server, Web UI and TensorAgent load it; `IImageGenerationModel`, `ILoraPluginHost` and the multiple-choice scorer keep their contracts |
+| Family | `QwenImage21Family`: 64 channels at 1/16, Philox noise with the edit stream keyed to the caller's pictures (`QwenImage21Noise`, `TS_QWEN21_EDIT_NOISE`), the canvas rules (`QwenImage21Canvas`: explicit size, the server's default size, 2048² or 1024² on cpu, kept source size, mask canvas), one resize a reference shared by the vision tower and the VAE, and the recipes: the base checkpoint's dynamic shift (`DiffusionSchedule.DynamicShift`, mu from the target's tokens), Turbo's eight published sigmas (`DiffusionSchedule.NodeSets`, any other count refused), a LoRA recipe's node sets |
+| Denoiser | `QwenImage21Denoiser`: the transformer emitted as `GraphProgram`s node for node as the native graph built it (`QwenImage21Denoiser.Emit.cs`), on the GGML graph executor (cpu, metal, cuda, vulkan) and the managed tensor executor (cpu); the prefix K/V cache as state leaves (an extract program at the first step, a cached one after; two caches for a CFG pair; declined above half the device's free memory); unmerged LoRA from `QwenImage21LoraSet`'s descriptors (stacked shrinks, DoRA row scales, per-step output heads, norm replacements); TP as ranked programs (`CompileForRank`, `RunRanked` with exact F32 sums) over Megatron shards (`ShardBlocks`) |
+| Conditioner, VAE | the existing Qwen3-VL-8B encoder and VAE wrapped as components that release their device memory after each phase (`ReleaseAfterPhase`), as the pipeline did |
+
+Runtime pieces added for it, all family-neutral: `SamplingRecipe` dynamic-shift and node-set schedules with token-dependent
+sigmas (`SigmasFor(steps, tokens)`), per-request noise (`IDiffusionFamily.Noise(request)`), `IDenoiser.FinishRequest`,
+canvas-aware reference policies, `IResidentComponent.ReleaseAfterPhase`, `SharedDiffusion/PhiloxNoise` (also LTX-2.5's and
+MiniMax-H3's draws), `GraphFusion.PairRotary` (served by the managed executor), `GraphOp.Gelu` and `GraphOp.Pad` on the
+tensor executors, a recycling CPU allocator for the managed executor's step buffers, and per-program wide-token routes
+(`GraphWideTokenRoutes` → `TSGgml_GraphWideTokenRoutes`): the CUDA offload's choices that were the native graph's (Q4_K and
+Q6_K products on cuBLAS from 256 rows, strided-Q cuDNN attention, BF16 products on float weights) are a program's
+declaration, not a family check in native code. ggml stays unpatched.
+
+Evidence (Linux x64, 4-core Xeon, ggml `d9fe7bff` unchanged): on ggml_cpu the programs give the retired native forward's
+bytes on synthetic fixtures (with and without LoRA, through extract and cached steps) and on the real Q4_K_M transformer;
+whole requests through the public API (text to image, an edit, a masked edit, CFG with a negative prompt and previews, a
+LoRA) gave byte-identical PNGs; on a two-rank loopback group the sharded predictions (full, extract, cached) equal the
+retired TP forward's byte for byte. The managed executor is within 1e-4 relative L2 of the retired pure-C# transformer on
+the fixtures. Those outputs are frozen (`InferenceWeb.Tests/Fixtures/QwenImage21/LegacyGoldens`) and the runtime is held to
+them on every lane. On ggml_cuda (RTX 4000 Ada, CUDA 13.2) the programs give the retired graph's bytes on the same nine
+fixture cases. Two changes were needed for that: the emitter asks the backend whether it runs a segment's flash attention,
+as the retired graph did (`TSGgml_FlashAttnSupported`), and falls back to the retired explicit attention where it does not;
+ggml-cuda has no kernel for the fixtures' head size 32. The extract step's plan also owns and frees its compute memory. Whole
+requests gave byte-identical PNGs in the retired pipeline's time or less: text to image at 1024² and 2048², an edit, a
+masked edit, keep source size, CFG with previews, and a LoRA. Peak VRAM was the retired pipeline's, except an edit
+(+293 MiB) and the LoRA (+68 MiB). Not yet validated on Metal or Vulkan hardware, and multi-GPU TP only through loopback
+numerics: the commit before the deletion (f981cb6) keeps the live A/B tests and probes for a machine that has them.
+
+The legacy path's tuning switches went with it (`TS_QWEN21_FLASH`, `_PAD_MASK`, `_CUDNN_ATTENTION`, `_CUBLAS_MATMUL`,
+`_CUBLAS_MIN_ROWS`, `_GRAPH_REUSE`, `_GRAPH_TRACE`, `_PREFIX_CACHE`, `_PREFIX_CACHE_TYPE`, `_PREFIX_CACHE_MAX_MIB`, the seven
+`_CPU_*` and `_MEMORY`); `RemovedCliFlags` refuses each at startup with what to do instead.
 
 ---
 
@@ -654,8 +697,13 @@ The method:
    `SharedDiffusion/EditMask`. Grayscale white edits and black keeps, or alpha transparent
    edits; `maskInvert`; inward feather (0-1024 px); optional `maskCrop` with padding. The mask
    must match `<Picture 1>`'s exact size, and `<Picture 1>` is the picture being edited.
-2. **Canvas:** the source's aspect (or the crop's) at the request's area, with the floor of
-   §4.4. The output is always the source canvas.
+2. **Canvas:** the source's aspect (or the crop's) at the request's area, but never above the
+   selection's own resolution and without the edit's floor (`EditMask.SamplingDimensions`): the
+   output is always the source canvas, so sampling more pixels than it holds only enlarges the
+   latent mask, the denoise and the decode. A family may keep a floor of its own for a crop
+   smaller than its picture: MiniMax-H3-Image samples one at least at its 4 MP edit floor, at
+   the crop's aspect and held to 4 times the picture's pixels, since at its own size or at
+   1 MP a small crop came out plain.
 3. **Source latent:** the posterior **mean** of `<Picture 1>` at the sampling canvas. It is the
    VAE copy already encoded for the reference when that copy has the same size; otherwise it is
    a separate tiled encode. The mean keeps the blend independent of the RNG stream. ComfyUI's
@@ -678,8 +726,11 @@ modulated at `t = 1 - m*sigma`, as ComfyUI's H3 video does). It is off by defaul
 it is an experiment for stage S6 to measure.
 
 (S6, as built: the canvas is the unmasked edit's for the whole picture, the crop sampled at
-that canvas's density, then the 4 MP floor and the 20 MP ceiling applied to what is sampled at
-its own aspect; the output is the source canvas. The source latent is the posterior mean
+that canvas's density but never above its own resolution, a crop smaller than its picture raised
+to at least 4 MP (`MaskedCropFloor`, at most `MaskedCropPictureMultiple` = 4 times the picture's
+pixels), then the 20 MP ceiling applied to what is sampled at its own aspect; the output is the source canvas. The 4 MP floor applied to every masked edit until they
+were capped at their own resolution. The cap alone left a 448x512 crop plain, with stray shapes
+for one seed in three, and a 1 MP floor left it clean but plain, hence the crop floor. The source latent is the posterior mean
 through the references' own F16 rounding and latent normalization
 (`IReferencePolicy.SourceLatent`; the S2 pipeline had used the raw mean, which is not the
 space MiniMax-H3-Image's DiT works in), encoded once more at the sampling canvas when the

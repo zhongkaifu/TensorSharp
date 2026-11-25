@@ -447,7 +447,7 @@ public sealed class MediaRoutesTests : IDisposable
         var modelField = _models.LifecycleService.GetType().GetField("_model",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         modelField.SetValue(_models.LifecycleService,
-            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage.QwenImageModel)));
+            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel)));
         try
         {
             File.WriteAllBytes(Path.Combine(_uploads, "dog.png"), new byte[] { 1 });
@@ -493,7 +493,7 @@ public sealed class MediaRoutesTests : IDisposable
         var modelField = _models.LifecycleService.GetType().GetField("_model",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         modelField.SetValue(_models.LifecycleService,
-            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage.QwenImageModel)));
+            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel)));
         try
         {
             const string reason = "The selected edit plug-in is missing.";

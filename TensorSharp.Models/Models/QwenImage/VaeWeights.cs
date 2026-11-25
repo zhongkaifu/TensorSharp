@@ -65,7 +65,6 @@ namespace TensorSharp.Models.QwenImage
         {
             CpuGemmIsa isa = CpuPackedGemm.Isa;
             if (_packed.TryGetValue(name, out var packed) && packed.Isa == isa) return packed;
-            long t0 = VaeCpuProfile.Start();
             float[] raw = _cache.TryGetValue(name, out var cached) ? cached : _src.ReadFloat32(name);
             int k = ic * khw;
             float[] slice = kd == 1 ? raw : VaeReferenceMath.LastTemporalSlice(raw, oc, ic, kd, khw, 1);
@@ -75,7 +74,6 @@ namespace TensorSharp.Models.QwenImage
             _packed[name] = packed;
             _cache.Remove(name);
             _slices.Remove(name);
-            VaeCpuProfile.Stop(VaeCpuProfile.Weights, t0);
             return packed;
         }
 

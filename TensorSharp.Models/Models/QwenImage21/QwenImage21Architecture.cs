@@ -7,45 +7,37 @@
 using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime;
 
-namespace TensorSharp.Models.QwenImage
+namespace TensorSharp.Models.QwenImage21
 {
-    /// <summary>Qwen-Image-2.1 architecture plug-in (any other Qwen-Image transformer is refused by <see cref="QwenImageModel"/>).</summary>
-    internal static class QwenImageArchitecture
+    /// <summary>Qwen-Image-2.1 architecture plug-in, built on the shared diffusion runtime (any other Qwen-Image transformer is
+    /// refused by <see cref="QwenImage21DiffusionModel"/>).</summary>
+    internal static class QwenImage21Architecture
     {
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
-            Id = "qwen_image",
+            Id = QwenImage21Family.ArchitectureId,
             DisplayName = "Qwen-Image",
             Aliases = new[] { "qwen_image", "qwen-image" },
-            // --tp shards the diffusion transformer (heads and MLP columns per GPU);
-            // the text encoder and VAE stay on the first GPU.
-            Factory = c => new QwenImageModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
-            Serving = new ServingContract
-            {
-                Implementation = ServingImplementation.Bespoke,
-                Backends = new[] { BackendType.Cpu, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.GgmlVulkan },
-                Autoregressive = false,
-                HasRoutedExperts = false,
-                ContinuousBatching = MechanismSupport.NotApplicable("generates media, not decode steps; requests are serialized by its pipeline"),
-                TensorParallel = MechanismSupport.On(ServingBackends.GgmlMultiDevice),
-                LayerSplit = MechanismSupport.None("qwen-image has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
-                HybridParallel = MechanismSupport.None("qwen-image has no multi-GPU placement to combine."),
-                ExpertOffload = MechanismSupport.NotApplicable("no routed experts"),
-            },
+            // --tp shards the diffusion transformer (heads and MLP columns per GPU); the text encoder and VAE stay on the
+            // first GPU.
+            Factory = c => new QwenImage21DiffusionModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            Serving = ServingContract.SharedDiffusionRuntime(
+                new[] { BackendType.Cpu, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.GgmlVulkan },
+                tensorParallelBackends: ServingBackends.GgmlMultiDevice,
+                tensorParallelGap: "qwen-image shards its transformer over the GPUs of ggml_cuda and ggml_vulkan only.",
+                layerSplitGap: "qwen-image has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
             SupportsDistributedTensorParallel = false,
             DetectFromTensors = LooksLikeVersion21,
             LoraPluginType = LoraCliFlags.QwenImagePluginType,
         };
 
         /// <summary>
-        /// Community Qwen-Image-2.1 GGUFs can contain no metadata at all. Identify
-        /// their single-stream transformer from its input, conditioning and block
-        /// layout, without opening tensor data or relying on the file name.
+        /// Community Qwen-Image-2.1 GGUFs can contain no metadata at all. Identify their single-stream transformer from its input,
+        /// conditioning and block layout, without opening tensor data or relying on the file name.
         /// </summary>
         private static bool LooksLikeVersion21(GgufFile file)
         {
-            // These are the two namespaces accepted by QwenImage21DiT. Use the
-            // same precedence as its loader rather than mixing tensor namespaces.
+            // The two namespaces QwenImage21Weights accepts, with its precedence.
             string prefix = file.Tensors.ContainsKey("img_in.weight") ? "" : "model.diffusion_model.";
             bool Has(string name, params ulong[] shape)
             {
@@ -56,9 +48,8 @@ namespace TensorSharp.Models.QwenImage
                 return true;
             }
 
-            // A text norm alone is insufficient: nearby diffusion architectures
-            // share common projection names. Check Qwen-Image-2.1's dimensions
-            // and gated image MLP as well. The loader validates remaining blocks.
+            // A text norm alone is insufficient: nearby diffusion architectures share common projection names. Check
+            // Qwen-Image-2.1's dimensions and gated image MLP as well. The loader validates remaining blocks.
             return Has("img_in.weight", 64, 4096)
                 && Has("txt_in.text_norm.weight", 4096)
                 && Has("txt_in.in_layer.weight", 4096, 4096)

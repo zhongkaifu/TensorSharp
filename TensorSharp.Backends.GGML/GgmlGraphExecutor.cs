@@ -26,6 +26,15 @@ namespace TensorSharp.GGML
         internal static void Register()
             => GraphExecutors.Register(typeof(GgmlAllocator), allocator => For(((GgmlAllocator)allocator).Context.BackendType));
 
+        /// <summary>Whether this backend runs a flash attention of queries [<paramref name="headDim"/>, <paramref name="qRows"/>,
+        /// <paramref name="heads"/>] F32 over keys and values [<paramref name="headDim"/>, <paramref name="kvRows"/>, heads] of
+        /// <paramref name="kvFormat"/> (a <see cref="GraphFormat"/>), with an F16 mask [<paramref name="maskCols"/>,
+        /// <paramref name="maskRows"/>] (maskCols 0: none) at accumulation <paramref name="precision"/>: ggml's own
+        /// supports_op on such a node, for an emitter that picks its attention form the way a native builder does.</summary>
+        public bool SupportsFlashAttention(long headDim, long qRows, long kvRows, long heads, int kvFormat, long maskCols, long maskRows,
+            int precision)
+            => GgmlNative.TSGgml_FlashAttnSupported(headDim, qRows, kvRows, heads, kvFormat, maskCols, maskRows, precision) != 0;
+
         public static GgmlGraphExecutor For(GgmlBackendType backend)
         {
             lock (s_executors)
@@ -127,7 +136,8 @@ namespace TensorSharp.GGML
             int served = 0, lowered = 0;
             try
             {
-                if (program.WideTokenProducts) g.MarkWideTokenProducts();
+                if (program.WideTokenRoutes != null) g.MarkWideTokenRoutes(program.WideTokenRoutes);
+                else if (program.WideTokenProducts) g.MarkWideTokenProducts();
                 if (program.Q8Nvfp4Activations) g.MarkQ8Nvfp4Activations();
                 foreach (GraphNode n in program.Entries)
                 {
@@ -174,6 +184,13 @@ namespace TensorSharp.GGML
         /// per-op tensor-parallel path the runtime ran on Vulkan before crossed for every op (see <see cref="RanksSumOnHost"/>).</summary>
         public bool RunsRanks(int ranks)
             => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
+
+        /// <summary>Whether <paramref name="ranks"/> ranks of a loopback group run here (TSGgml_TensorParallelInitLoopback on
+        /// ggml-cpu or ggml-metal: backend instances on the one device, sums through host memory). A caller that opts in
+        /// checks a sharded program's numerics on one device; it says nothing about multi-device speed, and the decoder
+        /// runtime does not opt in (its loopback fixtures keep the per-op tensor-parallel path).</summary>
+        public bool RunsLoopbackRanks(int ranks)
+            => Backend is GgmlBackendType.Cpu or GgmlBackendType.Metal && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
 
         /// <summary>ggml-vulkan's collective (ggml-vulkan-comm) moves every partial through host memory: each device writes its
         /// share to an imported host buffer and its peers read it from there, a host thread or SYNC_FD semaphores ordering the

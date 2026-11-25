@@ -187,8 +187,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 
 - **Metal 上的 Qwen-Image-2.1 编辑改用融合 VAE 图编码照片。** 上游 ggml-metal 不能在维度开头填充，
   编码器里唯一的前置填充让整张图被拒绝，因此 Metal 上的编辑一直逐个卷积地编码参考图片。融合编码约快一倍
-  （M5 Pro 上 1248x832 的参考图从 3.6 秒降到 1.9 秒），并会轻微改变编辑结果的像素（该次编辑的 PSNR 为 63 dB）；
-  `TS_QWEN21_VAE_FUSED=0` 保留逐卷积路径。文生图不受影响。
+  （M5 Pro 上 1248x832 的参考图从 3.6 秒降到 1.9 秒），并会轻微改变编辑结果的像素（该次编辑的 PSNR 为 63 dB）。
+  退回逐卷积路径的 `TS_QWEN21_VAE_FUSED=0` 开关后来已移除。文生图不受影响。
 
 - **Qwen-Image：只加载 Qwen-Image-2.1。** 更早的 Qwen-Image 与 Qwen-Image-Edit 检查点（例如
   Qwen-Image-Edit-2511）会在加载时被拒绝（退出码 2）。`--qwen-image-lora` 与 `--offload-cpu` 现在是
@@ -315,7 +315,16 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   - `TS_JSON_GRAMMAR` 与 `TS_JSON_FORCE_OPEN`：`json_object` / `json_schema` 始终在 JSON 语法约束下解码，语法无法表达的
     schema 仍退回到首 token 约束；
   - 按家族区分的草稿器路径 `TS_DSV4_DSPARK`、`TS_QWEN35_DFLASH`、`TS_MUSE_GLIMMER_DFLASH` 与 `TS_NEMOTRON_DFLASH`：
-    所有草稿器都由 `--draft-model`（或 `TS_SPEC_DRAFT_MODEL`）指定，服务端也不再把它复制到这些变量里。
+    所有草稿器都由 `--draft-model`（或 `TS_SPEC_DRAFT_MODEL`）指定，服务端也不再把它复制到这些变量里；
+  - 为 Qwen-Image-2.1 伴随组件选择执行路径的开关及其诊断开关：`TS_QWEN_VAE_GPU`、`TS_QWEN_VAE_FUSED`、
+    `TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VAE_ATTN`、`TS_QWEN_VAE_CONV_TILE_BYTES`、`TS_QWEN_VAE_FUSED_IM2COL_BUDGET`、
+    `TS_QWEN21_VAE_TRACE`、`TS_QWEN_VAE_PROFILE`、`TS_QWEN_VAE_POOL_TRACE`、`TS_QWEN_TE_FUSED`、
+    `TS_QWEN_TE_CPU_MATMUL`、`TS_QWEN21_TE_PRESCALE`、`TS_QWEN_TE_TRACE_DIR`、`TS_QWEN_TE_TRACE_LAYER`、
+    `TS_QWEN_TE_PROFILE` 与 `TS_QWEN21_VISION_FUSED`。VAE 在 `ggml_cuda` 与 `ggml_metal` 上运行整 VAE 计算图，
+    在 `ggml_cpu` 与 `ggml_vulkan` 上逐卷积运行，在 `cpu` 上以托管代码运行，im2col 上限固定（设备卷积超过 1 GiB
+    时按条带拆分，整 VAE 计算图的临时缓冲为 2 GiB）；Qwen3-VL-8B 文本编码器在所有 GGML 后端上运行融合主干
+    计算图，在 `cpu` 上通过 8 位整数 GEMM 计算投影（packed F32 GEMM 与旧的激活预缩放均已删除）；它的视觉编码器
+    在 `ggml_cuda` 上走融合路径，在其他后端上走逐块路径。运行的 `[diffusion]` 日志行仍报告每个阶段的秒数。
 - **原生库须与托管代码一起重新构建。** 托管代码不再探测旧版 `GgmlOps` 缺少的导出，若干原生入口也已合并：
   `TSGgml_Dsv4LoadModel` 现在直接接收 DSpark 草稿器路径与 routed-MoE 张量并行度（`Dsv4LoadModelDspark` /
   `Dsv4LoadModelParallel` 两个变体已删除），`TSGgml_Qwen4ExpTokenSpan` 取代了它的 `Ex` / `Qsa` 变体。`TSGgml_Dsv4Reset` 已删除（`TSGgml_Dsv4ResetChecked` 会报告槽位拒绝的重置），owner-0 的

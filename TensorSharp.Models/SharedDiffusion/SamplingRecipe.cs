@@ -25,6 +25,23 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <summary>An endpoint-inclusive linspace u_i = 1 - i/N through the flow shift
         /// sigma = s*u / (1 + (s-1)*u), then a terminal 0 (diffusers' flow-matching set_timesteps), per stream.</summary>
         LinspaceShift,
+
+        /// <summary>
+        /// Exponential dynamic shifting by the image's token count, then terminal stretching (diffusers'
+        /// FlowMatchEulerDiscreteScheduler with use_dynamic_shifting and shift_terminal, as Qwen/Qwen-Image-2.1's
+        /// scheduler_config.json sets it): mu is linear in the tokens through (256, 0.5) and (8192, 0.9), each linspace point
+        /// t of 1 .. 1/N becomes e^mu / (e^mu + 1/t - 1), the shifted list is stretched so that its last point is 0.02, and a
+        /// terminal 0 follows. One step has no interval to stretch: [1, 0].
+        /// </summary>
+        DynamicShift,
+
+        /// <summary>
+        /// Sigma nodes per step count (<see cref="SamplingRecipe.NodeSets"/>: a distilled checkpoint's or a step-distillation
+        /// adapter's trained schedules), each optionally through the exponential dynamic shift of
+        /// <see cref="DynamicShift"/> (<see cref="SamplingRecipe.ShiftNodes"/>, no terminal stretch), then a terminal 0. Only the
+        /// listed step counts run.
+        /// </summary>
+        NodeSets,
     }
 
     /// <summary>How a model with per-interval output heads (MiniMax-H3-Image's PDD heads) picks a step's heads.</summary>
@@ -76,31 +93,75 @@ namespace TensorSharp.Models.SharedDiffusion
 
         public HeadPolicy Heads { get; init; } = HeadPolicy.None;
 
+        /// <summary><see cref="DiffusionSchedule.NodeSets"/>: the sigma nodes (decreasing, in (0, 1], no terminal 0) of each
+        /// step count the recipe runs.</summary>
+        public IReadOnlyDictionary<int, float[]> NodeSets { get; init; }
+
+        /// <summary><see cref="DiffusionSchedule.NodeSets"/>: the nodes go through the token count's exponential dynamic
+        /// shift.</summary>
+        public bool ShiftNodes { get; init; }
+
+        /// <summary>The denoiser reads its timestep as a bf16 pipeline computes it (sigma * 1000 rounded to bf16, then / 1000
+        /// in bf16): an adapter trained in bf16 whose distilled sigmas sit between bf16 values.</summary>
+        public bool TimestepBf16 { get; init; }
+
+        /// <summary>What a refusal of a step count names as the recipe's owner ("Qwen-Image-2.1-Turbo, which was distilled
+        /// for one published 8-step schedule,"); null names the recipe itself.</summary>
+        public string Owner { get; init; }
+
         public DiffusionSamplerKind Sampler { get; init; } = DiffusionSamplerKind.EulerFlow;
 
         /// <summary>Guidance a request that names none takes (1: a single branch).</summary>
         public float Cfg { get; init; } = 1f;
 
-        /// <summary>Whether the recipe fixes its step count (an explicit sigma list has exactly one).</summary>
-        public bool FixedSteps => Schedule == DiffusionSchedule.Explicit;
+        /// <summary>Whether the recipe fixes its step count (an explicit sigma list has exactly one, node sets their own).</summary>
+        public bool FixedSteps => Schedule is DiffusionSchedule.Explicit or DiffusionSchedule.NodeSets;
+
+        /// <summary>Whether the sigmas depend on the image's token count (<see cref="SigmasFor(int, long)"/>).</summary>
+        public bool DependsOnTokens => Schedule == DiffusionSchedule.DynamicShift || (Schedule == DiffusionSchedule.NodeSets && ShiftNodes);
 
         /// <summary>The step count a request asking for <paramref name="requested"/> (0: the default) runs; an explicit
-        /// list refuses any other count than its own.</summary>
+        /// list refuses any other count than its own, node sets any count they do not list.</summary>
         public int ResolveSteps(int requested)
         {
             if (requested < 0) throw new ArgumentOutOfRangeException(nameof(requested), "Steps must be nonnegative (zero selects the default).");
             if (requested == 0) return Steps;
+            if (Schedule == DiffusionSchedule.NodeSets)
+            {
+                if (NodeSets == null || !NodeSets.ContainsKey(requested))
+                    throw new ArgumentException(
+                        $"{Owner ?? "This sampling recipe"} defines schedules for {string.Join(", ", (NodeSets?.Keys ?? Array.Empty<int>()).OrderBy(k => k))} " +
+                        $"step(s), not {requested}. Use one of those step counts, or omit --diffusion-steps / \"steps\" to use its default ({Steps}).");
+                return requested;
+            }
             if (FixedSteps && requested != Steps)
                 throw new ArgumentException($"This sampling recipe denoises exactly {Steps} steps on its own sigmas; {requested} steps contradicts it.");
             return requested;
         }
 
-        /// <summary>The sigmas a run of <paramref name="steps"/> steps denoises on: steps + 1 values ending in 0.</summary>
+        /// <summary>The sigmas a run of <paramref name="steps"/> steps denoises on: steps + 1 values ending in 0. A schedule
+        /// that depends on the image's token count (<see cref="DependsOnTokens"/>) needs <see cref="SigmasFor(int, long)"/>.</summary>
         public float[] SigmasFor(int steps)
         {
+            if (DependsOnTokens)
+                throw new InvalidOperationException($"The {Schedule} schedule depends on the image's token count; pass it.");
+            return SigmasFor(steps, 0);
+        }
+
+        /// <summary>The sigmas a run of <paramref name="steps"/> steps over an image of <paramref name="imageTokens"/> denoiser
+        /// tokens denoises on (the token count is read only by a schedule that <see cref="DependsOnTokens"/>).</summary>
+        public float[] SigmasFor(int steps, long imageTokens)
+        {
             if (steps < 1) throw new ArgumentOutOfRangeException(nameof(steps));
+            if (DependsOnTokens && imageTokens <= 0) throw new ArgumentOutOfRangeException(nameof(imageTokens));
             switch (Schedule)
             {
+                case DiffusionSchedule.DynamicShift:
+                    return DiffusionSchedules.DynamicShift(steps, imageTokens);
+                case DiffusionSchedule.NodeSets:
+                    if (NodeSets == null || !NodeSets.TryGetValue(steps, out float[] nodes))
+                        throw new ArgumentException($"{Owner ?? "This sampling recipe"} defines no schedule for {steps} step(s).");
+                    return DiffusionSchedules.Nodes(nodes, ShiftNodes ? imageTokens : 0);
                 case DiffusionSchedule.Explicit:
                     if (Sigmas == null || steps != Sigmas.Length - 1)
                         throw new ArgumentException($"This sampling recipe's explicit sigmas take {(Sigmas?.Length ?? 1) - 1} steps, not {steps}.");
@@ -170,6 +231,12 @@ namespace TensorSharp.Models.SharedDiffusion
                     if (StreamShifts != null && StreamShifts.Values.Any(s => !float.IsFinite(s) || s <= 0))
                         throw new ArgumentException("A stream's flow shift must be finite and positive.");
                     break;
+                case DiffusionSchedule.NodeSets:
+                    if (NodeSets == null || NodeSets.Count == 0) throw new ArgumentException("A node-set recipe lists at least one schedule.");
+                    if (!NodeSets.ContainsKey(Steps)) throw new ArgumentException($"A node-set recipe's default of {Steps} steps has no schedule.");
+                    foreach (var (count, nodes) in NodeSets)
+                        DiffusionSchedules.CheckNodes(nodes, count);
+                    break;
             }
             if (Heads != HeadPolicy.None && (Grid == null || Grid.Length < 2))
                 throw new ArgumentException($"Head policy {Heads} picks heads on the model's grid, which the recipe does not give.");
@@ -183,10 +250,13 @@ namespace TensorSharp.Models.SharedDiffusion
                 DiffusionSchedule.Explicit => "explicit sigmas",
                 DiffusionSchedule.ComfySimpleOverGrid => $"comfy-simple over a {Grid?.Length ?? 0}-point grid",
                 DiffusionSchedule.LinspaceShift => $"linspace, shift {Shift.ToString("0.###", CultureInfo.InvariantCulture)}",
+                DiffusionSchedule.DynamicShift => "dynamic exponential shift",
+                DiffusionSchedule.NodeSets => ShiftNodes ? "its own sigmas, dynamically shifted" : "its own fixed sigmas",
                 _ => Schedule.ToString(),
             };
             string heads = Heads switch { HeadPolicy.GridInterval => ", grid-interval heads", HeadPolicy.ByStep => ", by-step heads", _ => "" };
-            return $"{steps} steps, {schedule}{heads}, cfg {Cfg.ToString("0.###", CultureInfo.InvariantCulture)}";
+            return $"{steps} steps, {schedule}{heads}, cfg {Cfg.ToString("0.###", CultureInfo.InvariantCulture)}" +
+                   (TimestepBf16 ? ", bf16 timesteps" : "");
         }
     }
 
@@ -244,6 +314,59 @@ namespace TensorSharp.Models.SharedDiffusion
                 sigmas[i] = (float)TimeSnrShift(shift, 1.0 - (double)i / steps);
             sigmas[steps] = 0f;
             return sigmas;
+        }
+
+        /// <summary><see cref="DiffusionSchedule.DynamicShift"/>'s sigmas, in double as the reference computes them and rounded
+        /// once to float32: steps + 1 values ending in 0.</summary>
+        public static float[] DynamicShift(int steps, long imageTokens)
+        {
+            if (steps <= 0 || imageTokens <= 0) throw new ArgumentOutOfRangeException(steps <= 0 ? nameof(steps) : nameof(imageTokens));
+            // The anchors are interpolated and extrapolated (16,384 tokens at 2048 x 2048 lies past 8192).
+            if (steps == 1) return new[] { 1f, 0f };
+            double exp = Math.Exp(DynamicShiftMu(imageTokens));
+            double lastShifted = exp / (exp + steps - 1);
+            double terminalScale = (1 - lastShifted) / (1 - 0.02);
+            var result = new float[steps + 1];
+            for (int i = 0; i < steps; i++)
+            {
+                // linspace(1, 1 / steps, steps).
+                double t = (double)(steps - i) / steps;
+                double shifted = exp / (exp + (1 / t - 1));
+                result[i] = (float)(1 - (1 - shifted) / terminalScale);
+            }
+            result[steps - 1] = 0.02f;
+            return result;
+        }
+
+        /// <summary>The dynamic shift's mu at <paramref name="imageTokens"/>: linear through (256, 0.5) and (8192, 0.9).</summary>
+        public static double DynamicShiftMu(long imageTokens) => 0.5 + (imageTokens - 256) * (0.9 - 0.5) / (8192 - 256);
+
+        /// <summary><see cref="DiffusionSchedule.NodeSets"/>' sigmas: the nodes, through the exponential dynamic shift at
+        /// <paramref name="shiftTokens"/> tokens when it is positive, then a terminal 0.</summary>
+        public static float[] Nodes(float[] nodes, long shiftTokens)
+        {
+            ArgumentNullException.ThrowIfNull(nodes);
+            var result = new float[nodes.Length + 1];
+            double exp = shiftTokens > 0 ? Math.Exp(DynamicShiftMu(shiftTokens)) : 0;
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                double t = nodes[i];
+                result[i] = shiftTokens > 0 ? (float)(exp / (exp + (1 / t - 1))) : (float)t;
+            }
+            result[nodes.Length] = 0f;
+            return result;
+        }
+
+        internal static void CheckNodes(float[] nodes, int steps)
+        {
+            if (nodes == null || nodes.Length != steps)
+                throw new ArgumentException($"A node set of {steps} step(s) lists {steps} sigma nodes.");
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                if (!float.IsFinite(nodes[i]) || nodes[i] <= 0f || nodes[i] > 1f)
+                    throw new ArgumentException("Sigma nodes lie in (0, 1].");
+                if (i > 0 && !(nodes[i] < nodes[i - 1])) throw new ArgumentException("Sigma nodes must strictly decrease.");
+            }
         }
 
         /// <summary>The flow-matching SNR shift: sigma' = a*t / (1 + (a-1)*t).</summary>

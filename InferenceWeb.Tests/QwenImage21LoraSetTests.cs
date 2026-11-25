@@ -6,13 +6,14 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using TensorSharp.GGML;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 
 namespace InferenceWeb.Tests;
 
 /// <summary>
 /// End-to-end tests of <see cref="QwenImage21LoraSet.Load"/> on synthetic files: a tiny
 /// transformer GGUF (8-wide projections, the real module names) and hand-written LoRA
-/// safetensors. The packed native factors are read back from the
+/// safetensors. The packed native factors are read back through the set's
 /// <see cref="QwenImage21Adapter"/> descriptors and the reconstructed update
 /// (up · down) is compared with the intended strength * alpha / rank * B · A.
 /// </summary>
@@ -22,7 +23,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
     private const int D = 8;          // hidden width of the synthetic transformer
     private const int Ff = 12;        // MLP width (gate and up halves)
     private const int ModOut = 32;    // modulation.1 output
-    private const int HeadDim = QwenImage21DiT.HeadDim;
+    private const int HeadDim = QwenImage21Weights.ReleaseHeadDim;
     private const int F16 = 1, F32 = 0;
 
     private readonly string _dir;
@@ -221,11 +222,9 @@ public sealed class QwenImage21LoraSetTests : IDisposable
 
     // ---- reading the packed native factors back ----------------------------------------------
 
-    private static QwenImage21Adapter AdapterOf(QwenImage21LoraSet set, int rank = 0) =>
-        Marshal.PtrToStructure<QwenImage21Adapter>(set.AdapterFor(rank));
+    private static QwenImage21Adapter AdapterOf(QwenImage21LoraSet set, int rank = 0) => set.Adapter(rank);
 
-    private static QwenImage21BlockLora BlockOf(QwenImage21LoraSet set, int block, int rank = 0) =>
-        Marshal.PtrToStructure<QwenImage21BlockLora>(AdapterOf(set, rank).Blocks + block * Marshal.SizeOf<QwenImage21BlockLora>());
+    private static QwenImage21BlockLora BlockOf(QwenImage21LoraSet set, int block, int rank = 0) => set.Block(block, rank);
 
     private static float[] ReadValues(IntPtr p, long count, int type)
     {
@@ -340,10 +339,9 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         var adapter = AdapterOf(set);
         var block = BlockOf(set, 0);
 
-        Assert.Equal(Marshal.SizeOf<QwenImage21Adapter>(), adapter.StructBytes);
-        Assert.Equal(QwenImage21DiT.Layers, adapter.NumLayers);
+        Assert.Equal(QwenImage21Weights.ReleaseLayers, adapter.Blocks.Length);
         Assert.True(set.SplitGateUp[0]);
-        Assert.Equal(new bool[QwenImage21DiT.Layers - 1], set.SplitGateUp.Skip(1));
+        Assert.Equal(new bool[QwenImage21Weights.ReleaseLayers - 1], set.SplitGateUp.Skip(1));
 
         // q, k, v: one contiguous down allocation (the graph's stacked shrink).
         foreach (var l in new[] { block.Q, block.K, block.V })
@@ -370,18 +368,40 @@ public sealed class QwenImage21LoraSetTests : IDisposable
 
         AssertEmpty(block.Out);
         AssertEmpty(block.Down);
-        for (int b = 1; b < QwenImage21DiT.Layers; b++)
+        for (int b = 1; b < QwenImage21Weights.ReleaseLayers; b++)
         {
             var other = BlockOf(set, b);
             foreach (var l in new[] { other.Q, other.K, other.V, other.Out, other.Gate, other.Up, other.Down }) AssertEmpty(l);
         }
         foreach (var g in new[] { adapter.ImageIn, adapter.TextIn, adapter.TextOut, adapter.TimeIn, adapter.TimeOut, adapter.Modulation, adapter.NormOut, adapter.ProjOut })
             AssertEmpty(g);
-        Assert.Equal(IntPtr.Zero, adapter.OutputHead);
         Assert.Null(set.Recipe);
         Assert.Empty(set.OutputHeads);
         Assert.True(set.FactorBytes > 0);
         Assert.Contains("diffusers.safetensors: 5 low-rank update(s), rank 2/4", set.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>The GGML backends keep a device copy of each factor keyed by its host address. The set drops them before it
+    /// frees the factors, whichever of it and the transformer is disposed first: otherwise the next set, whose factors the
+    /// allocator may place at the same addresses, computes with the stale copies (as QwenImage21DenoiserTests' CUDA lane did).</summary>
+    [Fact]
+    public void Disposing_a_set_drops_its_device_copies_on_every_rank_first()
+    {
+        using var dit = Transformer(fused: true);
+        var file = new LoraFile();
+        file.Factors("transformer.transformer_blocks.0.attn.to_q.lora_A.weight", "transformer.transformer_blocks.0.attn.to_q.lora_B.weight", 4, D, D, 1);
+        file.Factors("transformer.transformer_blocks.0.img_mlp.out.lora_A.weight", "transformer.transformer_blocks.0.img_mlp.out.lora_B.weight", 2, Ff, D, 2);
+        string path = Save(file, "dispose.safetensors");
+
+        var set = Load(dit, 2, BackendType.GgmlCpu, new LoraSpec(path));
+        IntPtr[] pointers = set.FactorPointers().ToArray();
+        Assert.NotEmpty(pointers);
+        var seen = new List<IntPtr>();
+        set.InvalidateHookForTest = seen.Add;
+        set.Dispose();
+        Assert.Equal(pointers.OrderBy(p => (long)p), seen.OrderBy(p => (long)p));
+        set.Dispose();
+        Assert.Equal(pointers.Length, seen.Count);
     }
 
     [Fact]
@@ -871,7 +891,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
     // ---- VideoX-Fun PDD bundles ----------------------------------------------------------------
 
     private const string PddFormat = "qwenimage21_extracted_prefused_v1";
-    private const int Channels = QwenImage21DiT.Channels, Dim = QwenImage21DiT.HiddenSize, TextDim = QwenImage21DiT.TextDim;
+    private const int Channels = QwenImage21Weights.ReleaseChannels, Dim = QwenImage21Weights.ReleaseDim, TextDim = QwenImage21Weights.ReleaseTextDim;
 
     private (string Path, float[] Heads, float[] NormQ, float[] TextNorm, (float[] A, float[] B) Q) PddBundle(
         string folder, int steps = 2, bool withHeads = true, bool withConfig = true, string fullParameters = null)
@@ -925,16 +945,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         Assert.Equal(1f, recipe.Cfg);
         Assert.Equal(new[] { 1f, 0.5f, 0f }, recipe.Sigmas(2, 4096));
 
-        // Step heads are selected per call on every rank's descriptor.
-        for (int r = 0; r < 2; r++)
-        {
-            Assert.Equal(set.OutputHeads[0], AdapterOf(set, r).OutputHead);
-            Assert.Equal(F32, AdapterOf(set, r).OutputHeadType);
-        }
-        set.SelectOutputHead(1);
-        for (int r = 0; r < 2; r++) Assert.Equal(set.OutputHeads[1], AdapterOf(set, r).OutputHead);
-        Assert.Throws<ArgumentOutOfRangeException>(() => set.SelectOutputHead(2));
-        Assert.Throws<ArgumentOutOfRangeException>(() => set.SelectOutputHead(-1));
+        // (The denoiser projects each step through its own head: QwenImage21DenoiserTests.A_per_step_head_bundle_….)
         Assert.Contains("2 per-step output heads", set.Summary, StringComparison.Ordinal);
         Assert.Contains("3 replaced parameter(s)", set.Summary, StringComparison.Ordinal);
     }
@@ -1189,7 +1200,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
     [Fact]
     public void Turbo_TheModelHandsItsScheduleToTheLoad()
     {
-        // Through QwenImageModel.SetLoras, which every host's --lora reaches: the model must
+        // Through QwenImage21DiffusionModel.SetLoras, which every host's --lora reaches: the model must
         // pass its own recipe, and how it was identified, to the load.
         using var dit = Transformer();
         var (path, _) = ToQ();
@@ -1198,7 +1209,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
 
         foreach (var (declared, how) in new[] { (true, "declared"), (false, "assumed from its file name; declare --qwen-image-variant base if it is not") })
         {
-            QwenImageModel turbo = QwenImage21TurboTests.ModelOf(QwenImageVariant.Turbo, declared, dit, BackendType.GgmlCpu);
+            QwenImage21DiffusionModel turbo = QwenImage21TurboTests.ModelOf(QwenImageVariant.Turbo, declared, dit, BackendType.GgmlCpu);
             var ex = Assert.Throws<ArgumentException>(() => turbo.SetLoras(speed));
             Assert.Contains($"this transformer is Qwen-Image-2.1-Turbo ({how}), which is step-distilled already", ex.Message, StringComparison.Ordinal);
             Assert.Null(turbo.Loras);
@@ -1206,7 +1217,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         }
 
         // The base checkpoint takes the same plug-in and samples on its recipe.
-        QwenImageModel baseModel = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base, true, dit, BackendType.GgmlCpu);
+        QwenImage21DiffusionModel baseModel = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base, true, dit, BackendType.GgmlCpu);
         baseModel.SetLoras(speed);
         try
         {
@@ -1283,12 +1294,12 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         using var dit = Transformer();
         var (path, _) = ToQ();
         var set = Load(dit, new LoraSpec(path));
-        Assert.NotEqual(IntPtr.Zero, set.AdapterFor(0));
+        Assert.NotNull(set.Adapter(0));
 
         set.Dispose();
         set.Dispose();   // idempotent
 
-        Assert.Throws<IndexOutOfRangeException>(() => set.AdapterFor(0));
+        Assert.Throws<IndexOutOfRangeException>(() => set.Adapter(0));
     }
 
     // ---- regressions from the adversarial review --------------------------------------------
@@ -1423,7 +1434,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         using var set = QwenImage21LoraSet.Load(new[] { new LoraSpec(weights, null, configPath) }, gguf, prefix, BackendType.GgmlMetal, 1);
 
         Assert.Contains(expected, set.Summary, StringComparison.Ordinal);
-        Assert.NotEqual(IntPtr.Zero, set.AdapterFor(0));
+        Assert.NotNull(set.Adapter(0));
         Assert.True(set.FactorBytes > 0);
         if (config != null)
         {

@@ -72,6 +72,18 @@ namespace TensorSharp.Graph
     }
 
     /// <summary>
+    /// Which wide routes a <see cref="GraphProgram.WideTokenProducts"/> program takes on ggml_cuda (the DiT offload,
+    /// ggml_ops_dit_offload.cpp), as the family that emits it measured them. Without one a program takes MiniMax-H3's: Q4_K and
+    /// BF16 weights' products of at least TS_H3_CUBLAS_MIN_ROWS (1024) rows on cuBLAS BF16 and cuDNN for attentions whose
+    /// queries are contiguous.
+    /// </summary>
+    /// <param name="MinRows">A product takes the cuBLAS BF16 route from this many rows.</param>
+    /// <param name="Q6K">Q6_K weights take it as well as Q4_K.</param>
+    /// <param name="StridedAttention">cuDNN's attention also takes queries that are a strided view (a permutation of [D, H, S]).</param>
+    /// <param name="FloatWeightsOnGgml">BF16 weights keep ggml's own products.</param>
+    public sealed record GraphWideTokenRoutes(long MinRows, bool Q6K, bool StridedAttention, bool FloatWeightsOnGgml);
+
+    /// <summary>
     /// A tensor-parallel group's sum for executors whose ranks' programs are traced in lockstep on one thread: each
     /// rank's <see cref="GraphOp.AllReduce"/> hands its partial in, and the last rank's arrival sums them in place (the
     /// group's collective), before the trace emits any rank's next node.
@@ -415,6 +427,12 @@ namespace TensorSharp.Graph
         /// <summary>Inkling 2's relative-bias table in F16: W [rel, extent + 1] (F32) by r [rel, heads, rows] (F32, any row
         /// strides) -> [extent + 1, heads, rows] (F16), each entry the dot of W's column and the head and row's r.</summary>
         InklingRelTable = 41,
+        /// <summary>A rotary embedding of interleaved pairs from tables, its results half-split (Qwen-Image-2.1's): x [D, heads,
+        /// rows] (F32, contiguous), cos and sin [D/2, rows]. Result [D, heads, rows]: per head, out[j] = x[2j] cos[j] - x[2j+1]
+        /// sin[j] and out[D/2 + j] = x[2j+1] cos[j] + x[2j] sin[j], each product rounded before the sum (the region's ops:
+        /// stride-2 views of the pairs, the tables broadcast over the heads, and a concatenation of the two halves). Rotating
+        /// q and k by the same permutation leaves their products unchanged.</summary>
+        PairRotary = 42,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
@@ -492,6 +510,10 @@ namespace TensorSharp.Graph
         /// product kernels honour on Blackwell instead of their native NVFP4 activations; on every other route the
         /// activations are 8-bit already.</summary>
         public bool Q8Nvfp4Activations { get; }
+
+        /// <summary>The routes a <see cref="WideTokenProducts"/> program's products and attentions take on ggml_cuda, where the
+        /// family that emits it says (null: MiniMax-H3's, the routes the offload was tuned on).</summary>
+        public GraphWideTokenRoutes? WideTokenRoutes { get; init; }
     }
 
     /// <summary>
@@ -521,6 +543,20 @@ namespace TensorSharp.Graph
             _wideTokenProducts = true;
             Mix(9);
         }
+
+        /// <summary><see cref="MarkWideTokenProducts"/> with the routes a family's products and attentions take
+        /// (<see cref="GraphProgram.WideTokenRoutes"/>), part of the signature.</summary>
+        public void MarkWideTokenProducts(GraphWideTokenRoutes routes)
+        {
+            ArgumentNullException.ThrowIfNull(routes);
+            MarkWideTokenProducts();
+            if (_routes != null) throw new InvalidOperationException("A program's wide routes are marked once.");
+            _routes = routes;
+            Mix(routes.MinRows);
+            Mix((routes.Q6K ? 1 : 0) | (routes.StridedAttention ? 2 : 0) | (routes.FloatWeightsOnGgml ? 4 : 0));
+        }
+
+        private GraphWideTokenRoutes? _routes;
 
         /// <summary>Whether <see cref="MarkWideTokenProducts"/> was called.</summary>
         public bool WideTokenProducts => _wideTokenProducts;
@@ -678,7 +714,10 @@ namespace TensorSharp.Graph
         {
             if (_entries == null) throw new InvalidOperationException("A hash-only trace has no program.");
             return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature,
-                floatProducts: _floatProducts, wideTokenProducts: _wideTokenProducts, q8Nvfp4Activations: _q8Nvfp4Activations);
+                floatProducts: _floatProducts, wideTokenProducts: _wideTokenProducts, q8Nvfp4Activations: _q8Nvfp4Activations)
+            {
+                WideTokenRoutes = _routes,
+            };
         }
     }
 }

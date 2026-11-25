@@ -139,12 +139,13 @@ Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
   <p>Qwen-Image-2.1 turns a <strong>prompt</strong> into an image, or a <strong>prompt + one or more reference images</strong> into an edited image. The loaded <code>qwen_image</code> GGUF is the diffusion transformer; the model also resolves its companions next to the DiT file (or via the <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> environment variables): the dedicated 2.1 VAE, the Qwen3-VL-8B text encoder, and its <code>mmproj</code> vision encoder, which editing requires. Like DiffusionGemma it is <em>not</em> an autoregressive text model — the autoregressive entry points throw, and images come from <code>GenerateImage()</code> and <code>EditImage()</code>.</p>
   <pre data-lang="csharp"><code>using TensorSharp.Models;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 
 // Load the Qwen-Image-2.1 DiT GGUF (architecture = qwen_image). The 2.1 VAE and the
 // Qwen3-VL-8B text encoder + mmproj are resolved from the same directory (or the
 // TS_QWEN_IMAGE_* env vars). Any GGML backend works, and so does BackendType.Cpu (pure C#).
-using var model = (QwenImageModel)ModelBase.Create("qwen_image_2.1_Q4_K_M.gguf", BackendType.GgmlMetal);
+using var model = (QwenImage21DiffusionModel)ModelBase.Create("qwen_image_2.1_Q4_K_M.gguf", BackendType.GgmlMetal);
 
 var p = new QwenImageParams
 {
@@ -334,7 +335,7 @@ foreach (SkillToolInvocation call in reply.SkillInvocations)
       <tr><td><code>ModelConfig</code></td><td>Architecture metadata: <code>VocabSize</code>, context length, and more.</td></tr>
       <tr><td><code>IBatchedPagedModel</code></td><td>Optional batched/paged forward (<code>ForwardBatch</code>) implemented by most architectures for continuous batching.</td></tr>
       <tr><td><code>DiffusionGemmaModel</code> + <code>DiffusionGemmaSampler</code></td><td>Text-diffusion model and its EntropyBound denoising sampler (<code>Generate(promptTokens, DiffusionEbParams, …)</code>), with image input through <code>LoadVisionEncoder</code> and one-step Jev reads through <code>ReadStructured</code>. <code>Forward()</code> is unsupported.</td></tr>
-      <tr><td><code>QwenImageModel</code> + <code>QwenImageParams</code></td><td>Qwen-Image-2.1 image generator and editor. <code>GenerateImage(prompt, QwenImageParams)</code> and <code>EditImage(prompt, RgbImage or IReadOnlyList&lt;RgbImage&gt;, QwenImageParams)</code> return an <code>RgbImage</code>; <code>ImageIO</code> loads/saves PNG.</td></tr>
+      <tr><td><code>QwenImage21DiffusionModel</code> + <code>QwenImageParams</code></td><td>Qwen-Image-2.1 image generator and editor. <code>GenerateImage(prompt, QwenImageParams)</code> and <code>EditImage(prompt, RgbImage or IReadOnlyList&lt;RgbImage&gt;, QwenImageParams)</code> return an <code>RgbImage</code>; <code>ImageIO</code> loads/saves PNG.</td></tr>
       <tr><td><code>SkillsChatClient</code> + <code>SkillsChatClientOptions</code></td><td><a href="#skills">Agent Skills</a> against an OpenAI-compatible endpoint. <code>CompleteAsync(SkillsChatRequest)</code> returns a <code>SkillsChatResponse</code>; <code>SkillDelivery</code> chooses whether the server or this process runs the disclosure loop (in <code>TensorSharp.AgentHost.Skills</code>).</td></tr>
       <tr><td><code>MultiAgentOptions</code> + <code>MultiAgentSession</code></td><td>Sub-agent limits and the request-scoped agent tree behind <code>spawn_agent</code> / <code>wait_agent</code> / <code>send_input</code> / <code>close_agent</code> / <code>list_agents</code> (in <code>TensorSharp.AgentHost.Agents</code>). Used by <code>SkillAgentLoop</code>, <code>SkillsChatClient</code> and the server's chat paths.</td></tr>
       <tr><td><code>SkillRegistry</code> + <code>SkillRegistryOptions</code></td><td>The set of skills a host knows about: scanning configured roots for <code>SKILL.md</code>, installing from a folder or a <code>.zip</code>, and lookup. The only component that touches skill storage, so containment is enforced in one place.</td></tr>

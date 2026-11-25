@@ -1,19 +1,22 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using TensorSharp.Models;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 using static InferenceWeb.Tests.QwenImage21SamplingTests;
 
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// The noise a request starts from, through the pipeline's own seam
-/// (<see cref="QwenImage21Pipeline.Request"/>) and through <c>Run</c> itself, stopped where it
-/// has drawn the latent it samples from (<see cref="QwenImage21Pipeline.LatentsDrawn"/>): which
-/// pictures an edit's noise follows and the size it is drawn for. The geometry reads the server
-/// default size (TS_QWEN_IMAGE_WIDTH/HEIGHT), so these run with the other classes that set it,
-/// one at a time.
+/// The noise a request starts from, through the family's seam (<see cref="QwenImage21Family.Noise(DiffusionRequest)"/> and
+/// its canvas) and through the model's <c>Run</c> itself, over the diffusion runtime with stand-in components, stopped at
+/// the first denoiser step (the latent it samples from): which pictures an edit's noise follows and the size it is drawn
+/// for. The geometry reads the server default size (TS_QWEN_IMAGE_WIDTH/HEIGHT), so these run with the other classes that
+/// set it, one at a time.
 /// </summary>
 [Collection(QwenImageDefaultSizeCollection.Name)]
 public sealed class QwenImage21InitialNoiseTests : IDisposable
@@ -24,13 +27,13 @@ public sealed class QwenImage21InitialNoiseTests : IDisposable
     {
         _env.Set("TS_QWEN_IMAGE_WIDTH", null);
         _env.Set("TS_QWEN_IMAGE_HEIGHT", null);
-        _env.Set(QwenImage21Sampling.EditNoiseVariable, null);
+        _env.Set(QwenImage21Noise.EditNoiseVariable, null);
     }
 
     public void Dispose() => _env.Dispose();
 
     private static float[] Expected(long seed, ulong stream, int latentHeight, int latentWidth) =>
-        QwenImage21Pipeline.ToTokens(QwenImage21Sampling.Noise(latentHeight * latentWidth * 64, seed, stream), latentHeight, latentWidth);
+        InitialLatents(seed, stream, latentHeight, latentWidth);
 
     /// <summary>A selection: white over the square [left, left + size) on both axes.</summary>
     private static RgbImage Square(int width, int height, int left, int size)
@@ -42,170 +45,194 @@ public sealed class QwenImage21InitialNoiseTests : IDisposable
         return new RgbImage(width, height, pixels);
     }
 
+    private static DiffusionRequest Request(RgbImage[] pictures, long seed, int width = 0, int height = 0, long area = 0,
+        bool keepSourceSize = false) => new()
+    {
+        Prompt = "p",
+        References = pictures.Select(p => new DiffusionReference(p)).ToArray(),
+        Seed = seed,
+        Width = width,
+        Height = height,
+        TargetArea = area,
+        KeepSourceSize = keepSourceSize,
+    };
+
+    /// <summary>The family's first draw for <paramref name="request"/> at its sampling size, as token rows.</summary>
+    private static (float[] Latents, ulong Stream, (int Width, int Height) Sampling) Draw(DiffusionRequest request, bool followReferences = true)
+    {
+        var family = new QwenImage21Family(BackendType.GgmlMetal, QwenImageVariant.Base) { FollowReferences = followReferences };
+        RgbImage first = request.References.Count > 0 ? request.References[0].Image : null;
+        var canvas = family.ResolveCanvas(request, request.Mask == null ? null : EditMask.Create(request.Mask, first));
+        var (width, height) = canvas.Sampling;
+        INoiseSource noise = family.Noise(request);
+        float[] latents = ToTokens(noise.Next(width / 16 * (height / 16) * 64), height / 16, width / 16);
+        return (latents, family.LastStream, canvas.Sampling);
+    }
+
     [Fact]
     public void TextToImageStartsFromTheSeedsNoiseBitForBit()
     {
-        var request = new QwenImage21Pipeline.Request(Array.Empty<RgbImage>(), new QwenImageParams { Seed = 3, Width = 96, Height = 64 }, null, followReferences: true);
+        var (latents, stream, sampling) = Draw(Request(Array.Empty<RgbImage>(), 3, 96, 64));
 
-        Assert.Equal(0UL, request.NoiseStream);
-        Assert.Equal((4, 6), (request.LatentHeight, request.LatentWidth));
-        Assert.True(SameBits(QwenImage21Pipeline.ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6), request.InitialLatents()));
+        Assert.Equal(0UL, stream);
+        Assert.Equal((96, 64), sampling);
+        Assert.True(SameBits(ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6), latents));
     }
 
     [Fact]
     public void AnEditStartsFromItsReferencesStreamAndInSeedModeFromTheSeedsNoise()
     {
         var source = Decoded(96, 64, 7);
-        var p = new QwenImageParams { Seed = 3, Width = 96, Height = 64 };
-        float[] textToImage = QwenImage21Pipeline.ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6);
+        float[] textToImage = ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6);
 
-        var edit = new QwenImage21Pipeline.Request(new[] { source }, p, null, followReferences: true);
-        Assert.Equal(QwenImage21Sampling.ReferenceStream(new[] { source }), edit.NoiseStream);
-        Assert.NotEqual(0UL, edit.NoiseStream);
-        Assert.True(SameBits(Expected(3, edit.NoiseStream, 4, 6), edit.InitialLatents()));
-        Assert.False(SameBits(textToImage, edit.InitialLatents()));
+        var (edit, stream, _) = Draw(Request(new[] { source }, 3, 96, 64));
+        Assert.Equal(QwenImage21Noise.ReferenceStream(new[] { source }), stream);
+        Assert.NotEqual(0UL, stream);
+        Assert.True(SameBits(Expected(3, stream, 4, 6), edit));
+        Assert.False(SameBits(textToImage, edit));
 
-        var seedMode = new QwenImage21Pipeline.Request(new[] { source }, p, null, followReferences: false);
-        Assert.Equal(0UL, seedMode.NoiseStream);
-        Assert.True(SameBits(textToImage, seedMode.InitialLatents()));
+        var (seedMode, seedStream, _) = Draw(Request(new[] { source }, 3, 96, 64), followReferences: false);
+        Assert.Equal(0UL, seedStream);
+        Assert.True(SameBits(textToImage, seedMode));
     }
 
     /// <summary>
-    /// A masked edit with a crop hands the encoders the selection's crop in place of the first
-    /// picture. The noise still follows the picture the caller passed, so every selection on one
-    /// picture, and the unmasked edit of it, start from that picture's stream; the crop is
-    /// another picture with another stream. A later reference stays as the caller gave it.
-    /// </summary>
-    [Fact]
-    public void AMaskedEditFollowsTheCallersPictureNotTheSelectionsCrop()
-    {
-        var source = Decoded(128, 96, 4);
-        var other = Decoded(32, 32, 5);
-        var caller = new[] { source, other };
-        var p = new QwenImageParams { Seed = 0, Mask = Square(128, 96, 16, 32), MaskCrop = true, MaskCropPadding = 8 };
-
-        var masked = new QwenImage21Pipeline.Request(caller, p, null, followReferences: true);
-
-        Assert.Same(caller, masked.CallerInputs);
-        Assert.NotSame(source, masked.Inputs[0]);
-        Assert.Same(masked.Mask.Reference, masked.Inputs[0]);
-        Assert.Same(other, masked.Inputs[1]);
-        Assert.Same(source, caller[0]);
-        Assert.Equal(QwenImage21Sampling.ReferenceStream(caller), masked.NoiseStream);
-        Assert.NotEqual(QwenImage21Sampling.ReferenceStream(masked.Inputs), masked.NoiseStream);
-
-        var unmasked = new QwenImage21Pipeline.Request(caller, new QwenImageParams { Seed = 0 }, null, followReferences: true);
-        Assert.Equal(unmasked.NoiseStream, masked.NoiseStream);
-        var elsewhere = new QwenImage21Pipeline.Request(caller,
-            new QwenImageParams { Seed = 0, Mask = Square(128, 96, 48, 40), MaskCrop = true, MaskCropPadding = 8 }, null, followReferences: true);
-        Assert.Equal(masked.NoiseStream, elsewhere.NoiseStream);
-
-        var (width, height) = masked.Geometry.Sampling;
-        Assert.True(SameBits(Expected(0, masked.NoiseStream, height / 16, width / 16), masked.InitialLatents()));
-    }
-
-    /// <summary>
-    /// An edit that keeps its source size samples at <see cref="QwenImage21Pipeline.KeptSourceSampling"/>
-    /// and resizes back afterwards; the noise is drawn for the sampled size. A 640 x 480 photo
-    /// edited at TensorAgent's area samples at 1184 x 896 and comes back at 640 x 480.
+    /// An edit that keeps its source size samples at <see cref="QwenImage21Canvas.KeptSourceSampling"/> and resizes back
+    /// afterwards; the noise is drawn for the sampled size. A 640 x 480 photo edited at TensorAgent's area samples at
+    /// 1184 x 896 and comes back at 640 x 480.
     /// </summary>
     [Fact]
     public void AnEditThatKeepsItsSourceSizeDrawsNoiseForTheSizeItSamplesAt()
     {
         var photo = Decoded(640, 480, 9);
-        var p = new QwenImageParams { Seed = 5, TargetArea = 1024L * 1024, KeepSourceSize = true };
+        var request = Request(new[] { photo }, 5, area: 1024L * 1024, keepSourceSize: true);
 
-        var request = new QwenImage21Pipeline.Request(new[] { photo }, p, null, followReferences: true);
-
-        var geometry = QwenImage21Pipeline.ResolveGeometry(p, photo, null);
-        Assert.Equal(geometry, request.Geometry);
-        Assert.Equal(((1184, 896), (640, 480)), request.Geometry);
-        Assert.Equal((896 / 16, 1184 / 16), (request.LatentHeight, request.LatentWidth));
-        float[] latents = request.InitialLatents();
+        DiffusionCanvas canvas = QwenImage21Canvas.Resolve(request, photo, null);
+        Assert.Equal((1184, 896), canvas.Sampling);
+        Assert.Equal((640, 480), canvas.Output);
+        var (latents, stream, sampling) = Draw(request);
+        Assert.Equal((1184, 896), sampling);
         Assert.Equal(1184 / 16 * (896 / 16) * 64, latents.Length);
-        Assert.True(SameBits(Expected(5, QwenImage21Sampling.ReferenceStream(new[] { photo }), 896 / 16, 1184 / 16), latents));
+        Assert.True(SameBits(Expected(5, QwenImage21Noise.ReferenceStream(new[] { photo }), 896 / 16, 1184 / 16), latents));
     }
 
     /// <summary>
-    /// The case that retraced: a picture edited at the seed and size it was drawn at. Kept at its
-    /// own size (TensorAgent and the Web UI send keepSourceSize with every edit), a 1024 x 1024
-    /// picture samples at 1024 x 1024, exactly where its text-to-image draw did, and the edit's
-    /// noise is still not that draw.
+    /// The case that retraced: a picture edited at the seed and size it was drawn at. Kept at its own size (TensorAgent and
+    /// the Web UI send keepSourceSize with every edit), a 1024 x 1024 picture samples at 1024 x 1024, exactly where its
+    /// text-to-image draw did, and the edit's noise is still not that draw.
     /// </summary>
     [Fact]
     public void AnEditOfAPictureAtItsOwnSeedAndSizeDoesNotStartFromItsNoise()
     {
         var picture = Decoded(1024, 1024, 11);
-        var drawn = new QwenImage21Pipeline.Request(Array.Empty<RgbImage>(), new QwenImageParams { Seed = 0, Width = 1024, Height = 1024 }, null, followReferences: true);
-        var edit = new QwenImage21Pipeline.Request(new[] { picture }, new QwenImageParams { Seed = 0, TargetArea = 1024L * 1024, KeepSourceSize = true }, null, followReferences: true);
+        var (from, _, drawnAt) = Draw(Request(Array.Empty<RgbImage>(), 0, 1024, 1024));
+        var (to, _, editedAt) = Draw(Request(new[] { picture }, 0, area: 1024L * 1024, keepSourceSize: true));
 
-        Assert.Equal(drawn.Geometry.Sampling, edit.Geometry.Sampling);
-        float[] from = drawn.InitialLatents(), to = edit.InitialLatents();
+        Assert.Equal(drawnAt, editedAt);
         Assert.Equal(from.Length, to.Length);
         Assert.False(SameBits(from, to));
         Assert.InRange(Math.Abs(Correlation(from, to)), 0, 0.02);
     }
 
     // =====================================================================================
-    // through Run: the latent the pipeline samples from, not only the one Request offers
+    // through Run: the latent the runtime samples from, not only the one the family offers
     // =====================================================================================
 
     private sealed class StopAtTheLatents : Exception { }
 
-    /// <summary>
-    /// Runs <paramref name="run"/> on a Qwen-Image-2.1 model with no weights, stopped where
-    /// <c>Run</c> has drawn the latent it samples from, and returns that latent. The model has a
-    /// vision projector path, so an edit gets past its refusal, and a GPU backend, so the cpu
-    /// backend's memory check does not depend on this machine; nothing native is called.
-    /// </summary>
-    private static float[] LatentsRunSamplesFrom(Action<QwenImageModel> run)
+    /// <summary>Stand-ins for the encoders: a text row and, for each picture, one vision slot a 32-pixel cell (as
+    /// Qwen3-VL-8B gives them), and the posterior mean of zeros; the denoiser keeps the first step's latent and stops.</summary>
+    private sealed class Stand : IConditioner, IVaeCodec, IDenoiser
     {
-        QwenImageModel model = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base, backend: BackendType.GgmlMetal);
-        (typeof(QwenImageModel).GetField("_mmprojPath", BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new MissingFieldException(nameof(QwenImageModel), "_mmprojPath")).SetValue(model, "mmproj-not-loaded.gguf");
-        float[]? drawn = null;
-        QwenImage21Pipeline.LatentsDrawn.Value = latents =>
+        public float[] Latents;
+        public long WeightBytes => 0;
+        public long WorkingBytes(DiffusionWorkload workload) => 0;
+        public void ReleaseWorkspace() { }
+        public void ReleaseDevice() { }
+        public void Dispose() { }
+        public DenoiserCaps Caps { get; } = new();
+
+        public ConditioningSet Encode(string prompt, IReadOnlyList<PresentedImage> pictures, CancellationToken ct)
         {
-            drawn = latents;
+            var tags = new List<int> { 0 };
+            for (int i = 0; i < pictures.Count; i++)
+            {
+                tags.AddRange(Enumerable.Repeat(i + 1, pictures[i].Image.Width / 32 * (pictures[i].Image.Height / 32)));
+                tags.Add(0);
+            }
+            return new ConditioningSet(new float[tags.Count * 4096], tags.Count, 4096, pictures.Count > 0 ? tags.ToArray() : null);
+        }
+
+        public LatentPosterior Encode(RgbImage image, CancellationToken ct) =>
+            new(new LatentShape(64, 1, image.Height / 16, image.Width / 16), new float[image.Height / 16 * (image.Width / 16) * 64], null);
+
+        public RgbImage Decode(LatentTensor latent, CancellationToken ct) => throw new InvalidOperationException();
+        public RgbImage Preview(LatentTensor latent, int maxSide) => throw new InvalidOperationException();
+
+        public StepOutput Step(DenoiseStepInputs inputs, AdapterSet adapters, CancellationToken ct)
+        {
+            Latents = (float[])inputs.Latent.Clone();
             throw new StopAtTheLatents();
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="run"/> on a Qwen-Image-2.1 model no constructor ran for: its runtime pipeline over the real
+    /// family with <see cref="Stand"/> components and no device budget, stopped at the first denoiser step, and returns
+    /// that step's latent and the stream the family drew it from. The model has a vision projector path, so an edit gets
+    /// past its refusal, and a GPU backend, so the cpu backend's memory check does not depend on this machine; nothing
+    /// native is called.
+    /// </summary>
+    private static (float[] Latents, ulong Stream) LatentsRunSamplesFrom(Action<QwenImage21DiffusionModel> run)
+    {
+        QwenImage21DiffusionModel model = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base, backend: BackendType.GgmlMetal);
+        var stand = new Stand();
+        var family = new QwenImage21Family(BackendType.GgmlMetal, QwenImageVariant.Base)
+        {
+            ConditionerFactory = _ => stand,
+            DenoiserFactory = _ => stand,
+            VaeFactory = _ => stand,
         };
-        try
-        {
-            Assert.Throws<StopAtTheLatents>(() => run(model));
-        }
-        finally
-        {
-            QwenImage21Pipeline.LatentsDrawn.Value = null;
-        }
-        return drawn ?? throw new InvalidOperationException("Run did not draw its latent.");
+        static void Set(object target, string field, object value) =>
+            (typeof(QwenImage21DiffusionModel).GetField(field, BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new MissingFieldException(nameof(QwenImage21DiffusionModel), field)).SetValue(target, value);
+        Set(model, "_mmprojPath", "mmproj-not-loaded.gguf");
+        Set(model, "_family", family);
+        Set(model, "_pipeline", new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlMetal },
+            new ResidencyPlanner(() => null, _ => { }), _ => { }));
+        Assert.Throws<StopAtTheLatents>(() => run(model));
+        return (stand.Latents ?? throw new InvalidOperationException("Run did not reach its first step."), family.LastStream);
     }
 
     [Fact]
     public void RunSamplesTextToImageFromTheSeedsNoise()
     {
-        float[] latents = LatentsRunSamplesFrom(model =>
+        var (latents, stream) = LatentsRunSamplesFrom(model =>
             model.GenerateImage("a red teapot", new QwenImageParams { Seed = 3, Width = 96, Height = 64 }));
 
-        Assert.True(SameBits(QwenImage21Pipeline.ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6), latents));
+        Assert.Equal(0UL, stream);
+        Assert.True(SameBits(ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6), latents));
     }
 
     /// <summary>
-    /// The retrace's fix as the pipeline applies it: an edit samples from its references' stream,
-    /// and only <c>TS_QWEN21_EDIT_NOISE=seed</c> brings back the seed's text-to-image noise.
+    /// The retrace's fix as the runtime applies it: an edit samples from its references' stream, and only
+    /// <c>TS_QWEN21_EDIT_NOISE=seed</c> brings back the seed's text-to-image noise.
     /// </summary>
     [Fact]
     public void RunSamplesAnEditFromItsReferencesStreamAndInSeedModeFromTheSeedsNoise()
     {
         var source = Decoded(96, 64, 7);
         var p = new QwenImageParams { Seed = 3, Width = 96, Height = 64 };
-        float[] textToImage = QwenImage21Pipeline.ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6);
+        float[] textToImage = ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6);
 
-        float[] edit = LatentsRunSamplesFrom(model => model.EditImage("make it blue", source, p));
-        Assert.True(SameBits(Expected(3, QwenImage21Sampling.ReferenceStream(new[] { source }), 4, 6), edit));
+        var (edit, stream) = LatentsRunSamplesFrom(model => model.EditImage("make it blue", source, p));
+        Assert.Equal(QwenImage21Noise.ReferenceStream(new[] { source }), stream);
+        Assert.True(SameBits(Expected(3, stream, 4, 6), edit));
         Assert.False(SameBits(textToImage, edit));
 
-        _env.Set(QwenImage21Sampling.EditNoiseVariable, "seed");
-        float[] seedMode = LatentsRunSamplesFrom(model => model.EditImage("make it blue", source, p));
+        _env.Set(QwenImage21Noise.EditNoiseVariable, "seed");
+        var (seedMode, seedStream) = LatentsRunSamplesFrom(model => model.EditImage("make it blue", source, p));
+        Assert.Equal(0UL, seedStream);
         Assert.True(SameBits(textToImage, seedMode));
     }
 
@@ -213,22 +240,41 @@ public sealed class QwenImage21InitialNoiseTests : IDisposable
     public void RunSamplesAKeptSourceSizeEditAtTheSizeItSamplesAt()
     {
         var photo = Decoded(640, 480, 9);
-        float[] latents = LatentsRunSamplesFrom(model => model.EditImage("make it blue", photo,
+        var (latents, _) = LatentsRunSamplesFrom(model => model.EditImage("make it blue", photo,
             new QwenImageParams { Seed = 5, TargetArea = 1024L * 1024, KeepSourceSize = true }));
 
-        Assert.True(SameBits(Expected(5, QwenImage21Sampling.ReferenceStream(new[] { photo }), 896 / 16, 1184 / 16), latents));
+        Assert.True(SameBits(Expected(5, QwenImage21Noise.ReferenceStream(new[] { photo }), 896 / 16, 1184 / 16), latents));
     }
 
+    /// <summary>
+    /// A masked edit with a crop hands the encoders the selection's crop in place of the first picture. The noise still
+    /// follows the pictures the caller passed, so every selection on one picture, and the unmasked edit of it, start from
+    /// that picture's stream; the crop is another picture with another stream.
+    /// </summary>
     [Fact]
     public void RunSamplesAMaskedEditFromTheCallersPictures()
     {
         var source = Decoded(128, 96, 4);
         var other = Decoded(32, 32, 5);
         var p = new QwenImageParams { Seed = 0, Mask = Square(128, 96, 16, 32), MaskCrop = true, MaskCropPadding = 8 };
-        var (width, height) = new QwenImage21Pipeline.Request(new[] { source, other }, p, BackendType.GgmlMetal, followReferences: true).Geometry.Sampling;
+        ulong callers = QwenImage21Noise.ReferenceStream(new[] { source, other });
 
-        float[] latents = LatentsRunSamplesFrom(model => model.EditImage("make it blue", new[] { source, other }, p));
+        var (latents, stream) = LatentsRunSamplesFrom(model => model.EditImage("make it blue", new[] { source, other }, p));
+        Assert.Equal(callers, stream);
 
-        Assert.True(SameBits(Expected(0, QwenImage21Sampling.ReferenceStream(new[] { source, other }), height / 16, width / 16), latents));
+        // The crop the encoders see is another picture, with another stream; the latent is the crop's sampling canvas.
+        var request = new DiffusionRequest { References = new[] { new DiffusionReference(source), new DiffusionReference(other) },
+            Mask = QwenImageEditMask.Options(p) };
+        var mask = EditMask.Create(request.Mask, source);
+        Assert.NotSame(source, mask.Reference);
+        Assert.NotEqual(QwenImage21Noise.ReferenceStream(new[] { mask.Reference, other }), stream);
+        var (width, height) = new QwenImage21Family(BackendType.GgmlMetal, QwenImageVariant.Base).ResolveCanvas(request, mask).Sampling;
+        Assert.True(SameBits(Expected(0, callers, height / 16, width / 16), latents));
+
+        var (_, unmasked) = LatentsRunSamplesFrom(model => model.EditImage("make it blue", new[] { source, other }, new QwenImageParams { Seed = 0 }));
+        Assert.Equal(callers, unmasked);
+        var (_, elsewhere) = LatentsRunSamplesFrom(model => model.EditImage("make it blue", new[] { source, other },
+            new QwenImageParams { Seed = 0, Mask = Square(128, 96, 48, 40), MaskCrop = true, MaskCropPadding = 8 }));
+        Assert.Equal(callers, elsewhere);
     }
 }

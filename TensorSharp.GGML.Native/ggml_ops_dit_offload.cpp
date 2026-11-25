@@ -123,6 +123,8 @@ extern "C" bool tsg_cuda_bf16_gemm(const void* w_bf16, int64_t K, int64_t N, con
                                    int x_swiglu, int64_t T, float* dst, int64_t dst_ld);
 extern "C" bool tsg_cuda_q4k_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const float* x,
                                        int64_t x_row_stride, int64_t T, float* dst, int64_t dst_ld);
+extern "C" bool tsg_cuda_q6k_gemm_bf16(const void* w_q6k, int64_t K, int64_t N, const float* x,
+                                       int64_t x_row_stride, int64_t T, float* dst, int64_t dst_ld);
 extern "C" bool tsg_cuda_q4k_gemm_supported(void);
 
 bool h3_cublas_matmul_enabled()
@@ -147,15 +149,16 @@ int64_t h3_cublas_min_rows()
 
 namespace
 {
-bool h3_q4k_matmul_wants(const ggml_tensor* node)
+// A Q4_K (or, with q6k, a Q6_K) weight's wide product on cuBLAS BF16, from min_rows rows (0: h3_cublas_min_rows()).
+bool h3_q4k_matmul_wants(const ggml_tensor* node, std::int64_t min_rows = 0, bool q6k = false)
 {
     if (node->op != GGML_OP_MUL_MAT) return false;
     const ggml_tensor* w = node->src[0];
     const ggml_tensor* x = node->src[1];
-    if (w == nullptr || x == nullptr || w->type != GGML_TYPE_Q4_K) return false;
+    if (w == nullptr || x == nullptr || (w->type != GGML_TYPE_Q4_K && !(q6k && w->type == GGML_TYPE_Q6_K))) return false;
     if (x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
     if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1) return false;
-    if (w->ne[0] % 256 != 0 || x->ne[0] != w->ne[0] || x->ne[1] < h3_cublas_min_rows()) return false;
+    if (w->ne[0] % 256 != 0 || x->ne[0] != w->ne[0] || x->ne[1] < (min_rows > 0 ? min_rows : h3_cublas_min_rows())) return false;
     if (!ggml_is_contiguous(w) || !ggml_is_contiguous(node)) return false;
     if (x->nb[0] != sizeof(float) || x->nb[1] % sizeof(float) != 0) return false;
     return true;
@@ -218,9 +221,10 @@ bool h3_q4k_matmul_run(ggml_tensor* node)
 {
     const ggml_tensor* w = node->src[0];
     const ggml_tensor* x = node->src[1];
-    return tsg_cuda_q4k_gemm_bf16(w->data, w->ne[0], w->ne[1], static_cast<const float*>(x->data),
-                                  static_cast<int64_t>(x->nb[1] / sizeof(float)), x->ne[1],
-                                  static_cast<float*>(node->data), node->ne[0]);
+    const auto gemm = w->type == GGML_TYPE_Q6_K ? tsg_cuda_q6k_gemm_bf16 : tsg_cuda_q4k_gemm_bf16;
+    return gemm(w->data, w->ne[0], w->ne[1], static_cast<const float*>(x->data),
+                static_cast<int64_t>(x->nb[1] / sizeof(float)), x->ne[1],
+                static_cast<float*>(node->data), node->ne[0]);
 }
 } // namespace
 #endif
@@ -550,6 +554,7 @@ struct H3Offload
     bool f32 = false;                  // TS_H3_CUDA_F32_PRODUCTS: weight products on the pedantic handle
     ggml_backend_t backend = nullptr;
     std::unordered_set<const ggml_tensor*> deferrable;     // h3_deferrable of the graph
+    DitWideRoutes routes;              // the program family's wide routes (min_rows 0: MiniMax-H3's)
 };
 
 // ---------------------------------------------------------------------------
@@ -639,11 +644,11 @@ bool h3_offload_wants(const ggml_tensor* node, void* ctx)
 {
     const auto* o = static_cast<const H3Offload*>(ctx);
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_HAVE_CUDNN)
-    if (o->attention && h3_sdpa_wants(node, nullptr)) return true;
+    if (o->attention && sdpa_wants(node, o->routes.strided_attention)) return true;
 #endif
 #if defined(TSG_GGML_USE_CUDA)
-    if (o->matmul && h3_q4k_matmul_wants(node)) return true;
-    if (o->matmul && !o->f32 && h3_bf16_matmul_wants(node)) return true;
+    if (o->matmul && h3_q4k_matmul_wants(node, o->routes.min_rows, o->routes.q6k)) return true;
+    if (o->matmul && !o->f32 && !o->routes.float_weights_on_ggml && h3_bf16_matmul_wants(node)) return true;
     if (o->fused && h3_fused_params(node).kind != H3_FUSED_NONE) return true;
     if (o->f32 && h3_f32_product_wants(node)) return true;
 #endif
@@ -661,7 +666,7 @@ bool h3_offload_run(ggml_tensor* node, void* ctx)
     if (node->op == GGML_OP_MUL_MAT && !ggml_is_quantized(node->src[0]->type))
     {
         const auto* o = static_cast<const H3Offload*>(ctx);
-        if (o->matmul && !o->f32 && h3_bf16_matmul_wants(node)) return h3_bf16_matmul_run(node);
+        if (o->matmul && !o->f32 && !o->routes.float_weights_on_ggml && h3_bf16_matmul_wants(node)) return h3_bf16_matmul_run(node);
         return h3_f32_product_run(node, o->backend);
     }
     if (node->op == GGML_OP_MUL_MAT) return h3_q4k_matmul_run(node);
@@ -685,9 +690,11 @@ bool h3_cudnn_attention_enabled()
 #endif
 }
 
-ggml_status dit_offload_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* tag, bool wide_token_products)
+ggml_status dit_offload_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* tag, bool wide_token_products,
+                                const DitWideRoutes* routes)
 {
     H3Offload which;
+    if (routes != nullptr) which.routes = *routes;
     which.attention = h3_cudnn_attention_enabled();
 #if defined(TSG_GGML_USE_CUDA)
     which.matmul = h3_cublas_matmul_enabled() && wide_token_products;

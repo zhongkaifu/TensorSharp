@@ -2,8 +2,9 @@
 
 [← 返回模型索引](README_zh-cn.md) | [English](qwenimage21.md)
 
-Qwen-Image-2.1 通过 `QwenImageModel` 图像流水线完成文生图与图像编辑。它需要
-Qwen3-VL-8B 文本编码器和专用的 2.1 VAE。原生 RGBA 输入与 PNG 输出会保留透明度；
+Qwen-Image-2.1 在 TensorSharp 共享的扩散运行时上完成文生图与图像编辑
+（`QwenImage21DiffusionModel`，MiniMax-H3-Image 使用的也是这个运行时；见
+[实现与验证](#实现与验证)）。它需要 Qwen3-VL-8B 文本编码器和专用的 2.1 VAE。原生 RGBA 输入与 PNG 输出会保留透明度；
 Qwen3-VL 条件分支把参考图合成到白色背景上，而 VAE 保留 alpha 通道。更早的
 Qwen-Image / Qwen-Image-Edit 检查点（例如 Qwen-Image-Edit-2511）已不再受支持，
 加载时会被拒绝（退出码 2）。`--qwen-image-lora` 选项已由 `--lora` 取代（见
@@ -125,7 +126,7 @@ CFG 1 带来的提速直接来自已发布的 2.1 检查点。步数蒸馏 LoRA 
 
 编辑的噪声还取决于参考图。TensorSharp 对传入的图片计算哈希（按顺序对 8 位 RGB 值，
 以及存在不透明度不为满的像素时的 alpha，计算 SHA-256），并用这个哈希选出一条单独的
-Philox 流来生成噪声；流水线的 `Qwen-Image-2.1: …` 日志行以 `(edit noise stream <id>)` 显示它。否则，
+Philox 流来生成噪声；运行日志以 `[qwen21] edit noise stream <id>` 显示它。否则，
 用画出某张图的种子和尺寸去编辑它时，会从恰好生成这张图的那份噪声开始，
 Qwen-Image-2.1 可能照原样重描这张图而不执行指令。各个主机的默认值正会走到这一步：
 请求不指定时种子为 0，编辑又按源图尺寸采样——自动尺寸在相同面积下沿用源图宽高比，而
@@ -339,7 +340,7 @@ Turbo 的张量名与形状与基础检查点相同，Unsloth GGUF 仅标注架�
 
 - CLI 与服务端用 `--qwen-image-variant turbo`（或 `base`），配置文件用
   `"qwen-image-variant": "turbo"`；Turbo 配置文件已经写好。宿主通过 `TS_QWEN_IMAGE_VARIANT`
-  交给模型，进程内调用方也可以在构造 `QwenImageModel` 之前设置它（其 `Variant` 属性报告结果）。
+  交给模型，进程内调用方也可以在构造 `QwenImage21DiffusionModel` 之前设置它（其 `Variant` 属性报告结果）。
   未知的参数值在启动时是配置错误（退出码 1），未知的 `TS_QWEN_IMAGE_VARIANT` 会拒绝加载（退出码 2）。
 - TensorAgent 的 Turbo 目录条目自行声明。
 
@@ -364,11 +365,14 @@ Turbo 使用其
 ```
 
 它的调度器 shift 为 1.0 且不做动态偏移，因此在任何分辨率下都原样使用这些值：diffusers 就是这样
-加载的，AtomicChat 模型卡也把这组值作为 `--sigmas` 交给 stable-diffusion.cpp。运行时会在去噪前记录：
+加载的，AtomicChat 模型卡也把这组值作为 `--sigmas` 交给 stable-diffusion.cpp。运行时会在去噪前写出
+所用的调度，每一步的日志行给出该步的两个 sigma：
 
 ```text
-Qwen-Image-2.1 Turbo: 1024x1024, 8 steps, CFG 1, seed 42, 0 reference(s)
-  [qwen21] Turbo schedule (model_index.json sample_sigmas): 8 steps on fixed sigmas [1, 0.97845, 0.95418, 0.92663, 0.89508, 0.84515, 0.70453, 0.41457, 0]
+Qwen-Image-2.1-Turbo: 1024x1024, 8 steps, its own fixed sigmas, cfg 1, seed 42, 0 reference(s)
+  [diffusion] qwen_image step 1/8 sigma 1 -> 0.97845 <seconds>s
+  ...
+  [diffusion] qwen_image step 8/8 sigma 0.41457 -> 0 <seconds>s
 ```
 
 - 默认 8 步、CFG 1。显式的 `--diffusion-steps 8`（请求中的 `steps: 8`）可以接受，其他步数会被拒绝，
@@ -521,7 +525,10 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 `--mask-invert` 反转选区。`--mask-crop` 只处理选区及周围上下文，再把它放回原始画布；
 `--mask-crop-padding` 设置上下文的原图像素范围（0–16384，默认 64）。裁切是可选的，小选区可以
 使用较小的内部 `--width` / `--height` 来减少推理工作。这两个参数设置名义上的整幅采样分辨率；
-裁切模式会按裁切区域占原图的比例缩放，并向上取整到 32 像素网格。保存的图像仍使用原图尺寸。
+裁切模式会按裁切区域占原图的比例缩放，并向上取整到 32 像素网格。遮罩编辑对选区（整张图或裁切区域）的采样
+绝不超过其自身分辨率：保存的图像使用原图尺寸，多采样的像素只会让潜变量遮罩、去噪与解码变大。因此 512x512 图片的遮罩编辑
+以 512x512 采样，而不是自动的 2048x2048 面积；请求比图片更大的尺寸或面积也不会提高它，比该面积更大的图片仍以低于
+其自身分辨率的尺寸采样。保存的图像仍使用原图尺寸。
 质量与速度的取舍取决于选区、上下文、内部尺寸和采样步数。
 
 Multipart API：
@@ -593,14 +600,16 @@ HEIC/HEIF 上传保留小缩略图，以及用于涂抹和重新打开选区的�
 `docs/validation/` 或 `artifacts/` 中。浏览器触摸模拟不能证明原生手机上的行为；CPU 遮罩微基准
 不测量完整模型推理或 GPU 提速。
 
-GGML 后端上的 2.1 扩散 Transformer 运行完整 GGML 图并常驻量化权重；`cpu` 则对同样的文件映射
-权重执行托管前向。两者都没有权重流式模式。可用内存不足时先减小尺寸。CUDA 与 Vulkan 曾在
-NVIDIA A40 上运行；下文记录各项测量的具体范围。
+在所有后端上，2.1 扩散 Transformer 都以扩散运行时的计算图程序运行（见[实现与验证](#实现与验证)）：
+GGML 后端由 GGML 图执行器以常驻量化权重运行这些程序，`cpu` 则由托管张量执行器在同样的文件映射
+权重上运行。两者都没有权重流式模式。可用内存不足时先减小尺寸。CUDA 与 Vulkan 曾用已退役的原生
+计算图在 NVIDIA A40 上运行；运行时已在 RTX 4000 Ada 上的 CUDA 中验证（见[实现与验证](#实现与验证)），
+尚未在 Metal 或 Vulkan 硬件上运行过。下文记录各项测量的具体范围。
 
 ## 纯 C# CPU 后端（`--backend cpu`）
 
-`--backend cpu` 用托管 C# 运行整条流水线：扩散 Transformer、Qwen3-VL 文本编码器、编辑用的视觉编码器、
-VAE、LoRA 插件与前缀 KV 缓存。不构建任何 GGML 计算图，流水线也不调用原生 GgmlOps 库；在这个后端上，
+`--backend cpu` 用托管 C# 运行整条流水线：扩散 Transformer（运行时的计算图程序，在托管张量执行器上运行）、
+Qwen3-VL 文本编码器、编辑用的视觉编码器、VAE、LoRA 插件与前缀 KV 缓存。不构建任何 GGML 计算图，流水线也不调用原生 GgmlOps 库；在这个后端上，
 除非进程里有其他代码加载过该库，CLI 退出时也会跳过 GGML 的清理。权重按存储类型直接从内存映射的
 GGUF 与 safetensors 文件读取。此前该模型拒绝 `cpu`，必须使用 GGML 后端。模型计算之外仍有两处原生部分，
 与之前相同：桌面平台上图像文件的读写经由 Magick.NET；服务端启动时会探测 GGML 与 CUDA 后端。
@@ -620,15 +629,14 @@ TENSORSHARP_MODELS="$PWD/models" dotnet run --project TensorSharp.Cli -c Release
 
 各部分的实现：
 
-- **Transformer**（`QwenImage21ManagedDiT`）：按原生计算图的算子、以相同顺序、从相同的权重描述符计算。
-  量化投影像 ggml-cpu 那样把激活量化成 Q8_K / Q8_0，并在托管的多行整数 GEMM 上计算；注意力是分块的
-  flash attention；LoRA 因子（堆叠的 shrink、DoRA 行缩放）与 GGML 后端一样以不合并的方式应用。
-  `TS_QWEN21_CPU_MATMUL=f32`（之前的默认值）改用 F32 激活乘以反量化的权重分块：更慢，但数值更稳定。
-- **前缀 KV 缓存**：位于主机内存的托管缓存，类型相同（`auto`/`f32` 保存注意力实际读取的值，因此
-  使用缓存的步骤与不使用缓存时逐比特一致；另有 `f16`、`q8_0`、`q8_0_v`），规则也相同：最多使用
-  空闲物理内存的一半，并受 `TS_QWEN21_PREFIX_CACHE_MAX_MIB` 限制。
-- **文本编码器**：投影同样在多行整数 GEMM 上计算（8 位激活；`TS_QWEN_TE_CPU_MATMUL=f32` 改用反量化
-  Q4_K / Q6_K 分块上的 packed F32 GEMM），注意力是托管的因果分组查询注意力。
+- **Transformer**（`QwenImage21Denoiser`）：与 GGML 后端运行的是同一批计算图程序，由托管张量执行器在
+  文件映射的权重上执行；LoRA 因子（堆叠的 shrink、DoRA 行缩放）与 GGML 后端一样以不合并的方式应用。
+  它取代了纯 C# Transformer（`QwenImage21ManagedDiT` 及其 CPU 内核），后者的调优开关（`TS_QWEN21_CPU_*`）
+  已随之移除。
+- **前缀 KV 缓存**：位于主机内存的托管缓存，保存注意力实际读取的值（这里为 F32），规则与设备上相同：
+  最多使用空闲物理内存的一半。
+- **文本编码器**：投影在托管的多行整数 GEMM 上计算（8 位激活，与 ggml-cpu 的量化方式相同），注意力是托管的
+  因果分组查询注意力。
 - **视觉编码器**（编辑）：packed GEMM 线性层与托管多头注意力。每个线性层权重打包之后即释放其 F32 副本，
   因此视觉塔只保留一份权重：在分阶段基准中编码一张 512×512 参考图的提交内存峰值为 3.2 GB，保留两份时为
   5.4 GB，输出逐比特相同。
@@ -638,14 +646,15 @@ TENSORSHARP_MODELS="$PWD/models" dotnet run --project TensorSharp.Cli -c Release
 
 它们都有 AVX-512 与 AVX2 内核，由整个后端统一的指令集判定选择（`TS_CPU_DISABLE_AVX512=1` 选择 AVX2），
 以及可移植回退；环境变量矩阵
-列出了[全部开关](../env_var_feature_matrix_zh-cn.md#矩阵外的-qwen-image-21-开关)，包括恢复各个旧阶段的
-`0` / `scalar` 设置。
+列出了[仍保留的开关](../env_var_feature_matrix_zh-cn.md#矩阵外的-qwen-image-21-开关)以及已移除的开关。
 
-### 在 8 核笔记本上的实测
+### 在 8 核笔记本上的实测（已退役的纯 C# Transformer）
 
+这些数据是用运行时所取代的纯 C# Transformer（`QwenImage21ManagedDiT`，已移除）以及 `ggml_cpu` 上的原生
+整图前向测得的；本次迁移的测量没有覆盖 `cpu` 后端。
 i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows。DiT 为 `qwen_image_2.1_Q4_K_M.gguf`，文本编码器为
-`Qwen3VL-8B-Instruct-Q4_K_M.gguf`，VAE 为 BF16；文生图、CFG 1、种子 42，使用默认的整数（Q8）投影。
-`ggml_cpu` 走原生代码，这些改动没有触及它。PSNR / SSIM 把 `cpu` 的图像与 `ggml_cpu` 的图像对比。
+`Qwen3VL-8B-Instruct-Q4_K_M.gguf`，VAE 为 BF16；文生图、CFG 1、种子 42，使用该 Transformer 默认的整数（Q8）
+投影。PSNR / SSIM 把 `cpu` 的图像与 `ggml_cpu` 的图像对比。
 
 | 运行 | 阶段 | `cpu` | `ggml_cpu` |
 |---|---|---:|---:|
@@ -658,19 +667,19 @@ i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows。DiT 为 `qwen_image
 | | 总计 | **118 s** | 295.7 s |
 | | PSNR / SSIM | 32.9 dB / 0.972 | 参照 |
 
-使用 `TS_QWEN21_CPU_MATMUL=f32`（F32 激活乘以反量化的权重分块，之前的默认值）时，同样的 256×256 运行用时
+使用已退役 Transformer 的 F32 路径（已移除的 `TS_QWEN21_CPU_MATMUL=f32`：F32 激活乘以反量化的权重分块）时，同样的 256×256 运行用时
 20.4 s，PSNR / SSIM 为 42.0 dB / 0.984；512×512 用时 169.6 s（每步 30.7–31.6 s），为 31.4 dB / 0.96。
-单看文本编码器，37 token 的默认提示在整数投影下用时 0.76–0.88 s，`TS_QWEN_TE_CPU_MATMUL=f32` 下为
-1.8–1.9 s，`ggml_cpu` 约 1.4 s。另有两次更大的运行是在整数路径成为默认值之前、用 F32 Transformer 测的：
+单看文本编码器，37 token 的默认提示在整数投影下用时 0.76–0.88 s，在反量化 Q4_K / Q6_K 分块上的 packed F32 GEMM
+（`TS_QWEN_TE_CPU_MATMUL=f32`，已移除）下为 1.8–1.9 s，`ggml_cpu` 约 1.4 s。另有两次更大的运行是在整数路径成为默认值之前、用 F32 Transformer 测的：
 1024×1024、Pruna 5 步生成在 `cpu` 上用时 756 s，`ggml_cpu` 为 1101 s；512×512 编辑为 224 s 对 353 s。
 
-两个后端产生的像素并不相同，而且两者都不是参照答案：托管 Transformer 像 ggml-cpu 那样量化激活，但求和
-顺序不同，并且在 ggml-cpu 使用 F16 GELU 表与 BF16 舍入输入的地方保持 F32（`TS_QWEN21_CPU_GELU_FP16` /
-`TS_QWEN21_CPU_ROUND_ACTIVATIONS` 可复现这两点），每次重新量化都可能翻转一次舍入。在单次前向上
-（`benchmarks/QwenImageDiTBench`，256×256），托管结果的速度场与 ggml-cpu 的余弦相似度在 sigma 1 时为
-0.99993，在 sigma 0.02 时为 0.99938（F32 路径为 0.99994 与 0.9978）；而仅仅把时间步相对改变 1e-4，
-ggml-cpu 自己的速度场就会变化 4.7e-2（余弦 0.9989）。`cpu` 上的编辑还由托管 Transformer 的单元测试
-（编辑布局、多张参考图）与分阶段基准（`benchmarks/QwenImageStagesBench`）覆盖。在分阶段基准中，一张
+两个后端产生的像素并不相同，而且两者都不是参照答案：已退役的托管 Transformer 像 ggml-cpu 那样量化激活，
+但求和顺序不同，并且在 ggml-cpu 使用 F16 GELU 表与 BF16 舍入输入的地方保持 F32，每次重新量化都可能翻转
+一次舍入。在单次前向上（256×256，用已移除的 `benchmarks/QwenImageDiTBench` 测得），它的速度场与 ggml-cpu
+的余弦相似度在 sigma 1 时为 0.99993，在 sigma 0.02 时为 0.99938（F32 路径为 0.99994 与 0.9978）；而仅仅把
+时间步相对改变 1e-4，ggml-cpu 自己的速度场就会变化 4.7e-2（余弦 0.9989）。运行时的托管执行器在合成
+fixture 上（有无参考图、经过前缀缓存）与该 Transformer 冻结的速度场相比，相对 L2 误差在 1e-4 以内
+（见[实现与验证](#实现与验证)）。`cpu` 上的编辑还由分阶段基准（`benchmarks/QwenImageStagesBench`）覆盖。在分阶段基准中，一张
 1024×1024 参考图经过视觉编码器用时 12–13 s，256×256 的参考图用时 0.72 s，`ggml_cpu` 为 5.0 s。
 
 ### `cpu` 上的限制
@@ -678,15 +687,14 @@ ggml-cpu 自己的速度场就会变化 4.7e-2（余弦 0.9989）。`cpu` 上的
 - **张量并行仅限 GPU。** `--backend cpu` 配合 `--tp N` 会在加载时被拒绝（退出码 2），提示信息会指向
   `ggml_cuda` / `ggml_vulkan`；托管流水线在单个进程内运行。
 - **内存。** DiT 与文本编码器的权重是文件映射的（Q4_K_M DiT 4.2 GB，Q4_K_M 文本编码器 5.0 GB），但激活、
-  前缀缓存与 VAE 特征图都是普通进程内存。VAE 在每张特征图最后一次被读取后即释放它：1024×1024、Pruna 5 步
-  生成的提交内存峰值为 3.7 GiB（工作集 8.0 GiB），2048×2048 的 VAE 编码加解码为 10.5 GiB。在开始任何工作
+  前缀缓存与 VAE 特征图都是普通进程内存。VAE 在每张特征图最后一次被读取后即释放它：使用已退役的
+  Transformer 时，1024×1024、Pruna 5 步生成的提交内存峰值为 3.7 GiB（工作集 8.0 GiB），2048×2048 的
+  VAE 编码加解码为 10.5 GiB。在开始任何工作
   之前，估计峰值超过机器内存的尺寸会被拒绝，并给出能放下的最大方形尺寸（`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0`
   可跳过）；只超过当前空闲内存的尺寸会得到一条警告。
-- **速度。** 在上面这台 8 核笔记本上，512×512 每步 17.6–21.7 s；2K 方图的图像 token 是 512×512 的 16 倍，
+- **速度。** 在上面这台 8 核笔记本上，已退役的 Transformer 在 512×512 时每步 17.6–21.7 s；2K 方图的图像 token 是 512×512 的 16 倍，
   注意力的增长还要更快，这也是这个后端的自动尺寸为 1024×1024 的原因。需要交互速度时，请使用步数蒸馏
   LoRA 并选小尺寸。
-- 只对 GGML 有效的开关（`TS_QWEN21_GRAPH_REUSE`、`TS_QWEN21_FLASH`、`TS_QWEN21_PAD_MASK`、
-  `TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VISION_FUSED`）在 `cpu` 上不起作用。
 
 ## LoRA 插件
 
@@ -724,8 +732,8 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 `--cfg`，服务端是请求中的 `steps` / `cfg`（`0` 或省略表示使用配方）。配方没有调度的步数会被
 拒绝，报错会列出支持的步数；PDD 包每个训练步有一个输出头，只能按训练时的步数运行。两个都带
 配方的插件不能叠加；[Qwen-Image-2.1-Turbo](#turbo-上的-lora-插件) 的检查点有自己的调度，
-带配方的插件在它上面会被拒绝。风格与编辑插件不带配方，沿用检查点自己的调度。运行会在去噪前记录解析出的
-配方及其 sigma。
+带配方的插件在它上面会被拒绝。风格与编辑插件不带配方，沿用检查点自己的调度。运行的第一行写出解析出的
+配方，每一步的日志行给出该步的 sigma。
 
 ### 支持的格式
 
@@ -782,8 +790,8 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 unmerged (... MiB of factors, ...)`），再为每个文件输出一行，列出更新数、rank 与缩放。
 
 **前缀 KV 缓存。** 缓存保持开启。第一步让整个序列经过已适配的 Transformer，因此保存的文本与
-参考图 K/V 已包含 LoRA 的作用。保留的计算图与保存的前缀以适配器的因子缓冲区为键，因此用
-其他因子（或不带因子）构建的图与前缀永远不会被复用。
+参考图 K/V 已包含 LoRA 的作用。保留的执行计划与保存的前缀属于构建它们时的 LoRA 插件组：绑定
+另一组插件（或不带插件）时它们会被丢弃，因此永远不会与其他因子一起复用。
 
 **张量并行。** 在 `--tp N` 下，列并行投影（Q、K、V、gate、up）让每张 GPU 取得与自己输出
 切片对应的 `B` 行（以及任何 DoRA 行缩放）。行并行投影（`to_out`、`img_mlp.out`）让每张 GPU
@@ -792,7 +800,7 @@ all-reduce 把各部分相加即为完整更新。复制的投影保留完整因
 
 ### LoRA 性能
 
-2026-09-25 与 stable-diffusion.cpp `19bbbca` 对比，两者均使用未修改的 ggml `353b63b`。每次运行都是
+2026-09-25 用已退役的原生计算图与 stable-diffusion.cpp `19bbbca` 对比，两者均使用未修改的 ggml `353b63b`。每次运行都是
 1024×1024 文生图（茶壶提示词、种子 42、CFG 1、Euler），每个引擎在全新进程中运行，两次运行之间有冷却。
 两个引擎使用相同的 F32 sigma 向量。每个配置运行两次，两个引擎轮流先跑，表中为中位数。每步秒数为
 稳态步（不含第一步）。PSNR 比较两个引擎的输出图像。没有步数蒸馏 LoRA 时，6 或 8 步本来就会得到
@@ -826,11 +834,10 @@ NVIDIA RTX 4000 Ada，20 GB，驱动 580，`ggml_cuda`：
   （`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f16`）反而使每步慢 5%，因此 F32 乘积并不是瓶颈。
 - **加载。** 启动时并行读取、缩放并打包因子：M5 Pro 上 0.1–0.8 s，CUDA 机器上 0.2–1.3 s；
   结果与串行加载逐位一致。
-- **VAE 解码。** 整个 VAE 的融合计算图现在在 Metal 与 CUDA 上都是默认路径。它在 M5 Pro 上用
+- **VAE 解码。** 整个 VAE 的融合计算图现在在 Metal 与 CUDA 上都会运行。它在 M5 Pro 上用
   5.0 s 解码 1024×1024（逐卷积路径需要 13.0 s，sd.cpp 需要 7.1 s）。2048×2048 时用 24.9 s
   代替 85.3 s，内存峰值占用为 45 GB 而非 64 GB。它从不在 Vulkan 上运行，因为解码器中的 F16
-  协作矩阵操作数会溢出；在 Vulkan 上设置 `TS_QWEN21_VAE_FUSED=1` 会打印警告并改为逐卷积解码。
-  `TS_QWEN21_VAE_FUSED=0` 在任何后端上选择逐卷积路径。
+  协作矩阵操作数会溢出；Vulkan 与 `ggml_cpu` 在设备上逐卷积解码。
 - **为什么 CUDA 上图像差异更大。** 在这台 CUDA 机器上，sd.cpp 把 Transformer 留在 GPU 上，整图
   解码时显存不足，于是改用 256×256 分块重试（11.5–13.2 s），它的总耗时包含这次重试。
   TensorSharp 先释放 Transformer 的权重，再用 4.0–4.1 s 完成解码。两个引擎在 CUDA 上还都以 TF32
@@ -845,7 +852,7 @@ sd.cpp 忽略 `lora_adapter_metadata` 中的 alpha，因此给它的 Pruna 倍�
 
 服务端在启动时加载 `--lora` 插件组，并把它应用到每个生成与编辑请求；其 HTTP 请求不能选择
 插件。请求中的 `steps` 与 `cfg` 仍会覆盖插件的配方。在进程内，
-`QwenImageModel.SetLoras(IReadOnlyList<LoraSpec>)` 为之后的请求替换插件组（空列表表示
+`QwenImage21DiffusionModel.SetLoras(IReadOnlyList<LoraSpec>)` 为之后的请求替换插件组（空列表表示
 移除）。新插件组会立即针对 Transformer 校验，失败时保留原来的插件组。
 
 按图片选择插件的宿主把插件组传给 `WebUiChatService` 的 `ImageGenerateStreamAsync`、
@@ -871,15 +878,16 @@ sd.cpp 忽略 `lora_adapter_metadata` 中的 alpha，因此给它的 Pruna 倍�
 
 ## 加速与内存
 
-在 GGML 后端上，2.1 扩散 Transformer 以常驻的量化权重运行完整的 GGML 图；在 `cpu` 上，它对同样的
-文件映射权重运行托管前向（见[纯 C# CPU 后端](#纯-c-cpu-后端--backend-cpu)）。两者都没有权重流式加载
-模式。可用内存不足时，请先使用较小的尺寸。CUDA 与 Vulkan 已在 NVIDIA A40 上验证，
-各项测量见[英文版模型卡](qwenimage21.md#prefix-kv-cache)。
+在所有后端上，2.1 扩散 Transformer 都以扩散运行时的计算图程序运行：GGML 后端以常驻的量化权重运行，
+`cpu` 则在同样的文件映射权重上由托管张量执行器运行（见[纯 C# CPU 后端](#纯-c-cpu-后端--backend-cpu)）。
+两者都没有权重流式加载模式。可用内存不足时，请先使用较小的尺寸。CUDA 与 Vulkan 曾用已退役的原生计算图
+在 NVIDIA A40 上验证，各项测量见[英文版模型卡](qwenimage21.md#prefix-kv-cache)；运行时已在 RTX 4000 Ada
+上的 CUDA 中验证，尚未在 Metal 或 Vulkan 硬件上验证。
 
-在 CPU、Metal 与 CUDA 上，图像段注意力按每段精确的 K/V 长度计算，不再构建稠密的填充
-掩码（CUDA 上 `TS_QWEN21_PAD_MASK=1` 可恢复填充掩码作对比诊断，见
-[`docs/perf/qwen-image21-cuda.md`](../perf/qwen-image21-cuda.md)）；文本的因果掩码保持
-不变，`ggml_vulkan` 仍构建填充的图像掩码。
+计算图程序沿用已退役计算图的注意力形式：在 CPU、Metal、CUDA 以及托管执行器上，图像段注意力按每段
+精确的 K/V 长度计算，不构建稠密的填充掩码；文本的因果掩码保持不变，`ggml_vulkan` 仍构建填充的图像
+掩码。已退役计算图用来恢复填充掩码的诊断开关 `TS_QWEN21_PAD_MASK` 已移除（见
+[`docs/perf/qwen-image21-cuda.md`](../perf/qwen-image21-cuda.md)）。
 
 ### 前缀 KV 缓存
 
@@ -889,39 +897,48 @@ Qwen-Image-2.1 用 `t = 0` 那一行调制文本与参考图 token，并且其�
 [前缀 KV 缓存](https://github.com/QwenLM/Qwen-Image-2.1#prefix-kv-cache)：
 第一步运行整个序列，把每个块前缀部分经过 RoPE 之后的 K 和 V 存到设备上；之后
 每一步只计算目标图像的 token，并对"已存前缀 + 目标"做注意力。CFG 运行为每个
-分支各保留一份缓存。去噪结束、VAE 解码之前释放缓存。每一步的日志行以
-`prefix=extract` 或 `prefix=cached` 结尾（缓存放不下时为 `prefix=declined`，见下文）。
+分支各保留一份缓存。去噪结束、VAE 解码之前释放缓存。第一步会记录
+`[qwen21] prefix KV cache: <N> tokens, <size> MiB F16/F16; later steps compute only the target image`
+（注意力读取 F32 时为 F32/F32）；放不下的缓存则在 stderr 上打印 `[qwen21] prefix KV cache declined: …`
+（见下文）。
 
-缓存默认开启；`TS_QWEN21_PREFIX_CACHE=0` 关闭它。默认情况下它存的正是注意力内核
-读取的类型（Metal 与 CUDA flash attention 为 F16，其他为 F32），所以缓存步复现
-不用缓存时的计算：在 Metal 上，同一个种子在开启缓存、关闭缓存以及加入缓存之前的
-构建中得到逐字节相同的 PNG。已对生成、单参考图与双参考图编辑、以及带两份缓存的
+缓存始终开启。它存的正是注意力读取的类型：Metal 与 CUDA 上为 F16，其他后端（`ggml_cpu`、
+`ggml_vulkan` 与纯 C# 的 `cpu`）为 F32，所以缓存步复现不用缓存时的计算：在 `ggml_cpu` 上用真实
+Q4_K_M 权重，缓存的 extract 与 cached 预测与整序列计算图逐比特相同（`dit-parity`，见
+[实现与验证](#实现与验证)）。使用已退役的原生计算图时，在 Metal 上同一个种子在开启缓存、关闭缓存
+以及加入缓存之前的构建中得到逐字节相同的 PNG；已对生成、单参考图与双参考图编辑、以及带两份缓存的
 CFG 4 做过验证。diffusers 的 `use_kv_cache` 文档指出其 PyTorch 实现在两种设置下
 不能逐位复现图像；TensorSharp 的计算图可以。
 
 代价是内存：F16 下每个前缀 token、每个 CFG 分支 512 KiB（32 个块、K 与 V、
-4096 个 2 字节的值）。提示词只有几十到几百个 token；每张约 1 百万像素的参考图
-增加 4,096 个 token，约 2 GiB。一份缓存最多使用设备报告的空闲内存的一半，
-`TS_QWEN21_PREFIX_CACHE_MAX_MIB` 可以进一步限制。放不下的缓存会被拒绝并在
-stderr 上给出警告，该请求像以前一样每一步都重算前缀。
+4096 个 2 字节的值），F32 下翻倍。提示词只有几十到几百个 token；每张约 1 百万像素的参考图
+增加 4,096 个 token，F16 下约 2 GiB。一份缓存最多使用设备报告的空闲内存的一半（`cpu` 上为
+机器空闲物理内存的一半）。放不下的缓存会被拒绝并给出上述警告，该请求每一步都重算前缀。
 
-`TS_QWEN21_PREFIX_CACHE_TYPE` 选择存储类型：`auto`（默认，与不用缓存完全一致）、
-`f16`、`f32`、`q8_0`（K 与 V 均为 Q8_0，每个 token 约 272 KiB）和 `q8_0_v`
-（仅 V 为 Q8_0，约 392 KiB）。两种 8 位设置对应 vLLM-Omni 的 `fp8` 与 `fp8_v`
-前缀缓存，但使用每 32 个值一个缩放的 ggml Q8_0 块，而不是每个 token 与头一个
-缩放的 FP8 E4M3；每一步都会把前缀转换回注意力类型，因此目标自身的 K/V 保持精确。
-它们对输出质量的实测影响见[英文版模型卡](qwenimage21.md#prefix-kv-cache)。
+已退役实现的开关都已移除，设置任何一个都会让 CLI 与服务端在启动时拒绝运行：`TS_QWEN21_PREFIX_CACHE`
+（曾用于关闭缓存）、`TS_QWEN21_PREFIX_CACHE_MAX_MIB`（额外的上限，没有替代）以及
+`TS_QWEN21_PREFIX_CACHE_TYPE`，其 8 位存储类型 `q8_0`（K 与 V 均为 Q8_0，每个 token 约 272 KiB）和
+`q8_0_v`（仅 V 为 Q8_0，约 392 KiB）已被移除。它们曾对应 vLLM-Omni 的 `fp8` 与 `fp8_v` 前缀缓存，但使用
+每 32 个值一个缩放的 ggml Q8_0 块，而不是每个 token 与头一个缩放的 FP8 E4M3；其实测影响作为历史记录
+保留在[英文版模型卡](qwenimage21.md#prefix-kv-cache)中。
 
-实测（默认存储，输出 PNG 与不用缓存时逐字节相同）：在 Apple M5 Pro（`ggml_metal`）上，
-1024² 单参考图编辑每步从 17.97 秒降至 9.65–10.38 秒，双参考图从 33.32 秒降至 11.46 秒；
-在 NVIDIA A40（`ggml_cuda`）上分别从 2.547 秒降至 1.328 秒、从 4.106 秒降至 1.538 秒。
-文生图的前缀只有提示词，只快 1–3%；2048² 时目标 token 占主导，编辑只快 13–17%。
+实测（用已退役的原生计算图测得，默认存储，输出 PNG 与不用缓存时逐字节相同）：在 Apple M5 Pro
+（`ggml_metal`）上，1024² 单参考图编辑每步从 17.97 秒降至 9.65–10.38 秒，双参考图从 33.32 秒降至
+11.46 秒；在 NVIDIA A40（`ggml_cuda`）上分别从 2.547 秒降至 1.328 秒、从 4.106 秒降至 1.538 秒。
+文生图的前缀只有提示词，只快 1–3%；2048² 时目标 token 占主导，编辑只快 13–17%。运行时尚未在 Metal
+或 CUDA 上计时。
 
 ### CUDA Graph 与张量并行
 
-上游 ggml-cuda 在同一张图连续两次执行不变后把它捕获为 CUDA Graph 并重放。缓存步
-的计算图在各步之间保留（`TS_QWEN21_GRAPH_REUSE=1`，默认），输入与缓存缓冲区
-固定，因此从一次请求的第三步起，每个去噪步都是一次图重放——这就是 vLLM-Omni
+上游 ggml-cuda 在同一张图连续两次执行不变后把它捕获为 CUDA Graph 并重放。运行时在各步之间为每个
+设备保留编译好的执行计划（两个，对应两个 CFG 分支），与已退役原生计算图保留其计算图的方式相同。
+在 RTX 4000 Ada 上，ggml-cuda 以同样方式捕获并重放两者。用 CUDA 运行时拦截库
+（[`eng/validation/CudaGraphCount`](../../eng/validation/CudaGraphCount/README.md)，英文）计数：两者都只捕获
+同样的 197 张图一次，从第三步起每步重放全部 197 张图：4 步共 394 次启动，8 步共 1,182 次，256² 与带参考图的
+1024² 都是如此。1024² 的热身后每步都是 1.43 s，关闭 CUDA Graph（`GGML_CUDA_DISABLE_GRAPHS=1`）对两者的
+影响都不到 1%。
+以下描述的是已退役的计算图：缓存步的计算图在各步之间保留（`TS_QWEN21_GRAPH_REUSE=1`，已移除），
+输入与缓存缓冲区固定，因此从一次请求的第三步起，每个去噪步都是一次图重放——这就是 vLLM-Omni
 CUDA Graph 解码的效果，无需另写捕获代码。与 vLLM-Omni 一样，存储前缀的第一步
 不被捕获。在 A40 上统计 CUDA 运行时调用确认了这一点：10 步请求只捕获 1 次、
 重放 8 次，双卡请求捕获 130 次（每卡 65 段）、重放 1,040 次；开启与关闭 CUDA Graph
@@ -933,11 +950,13 @@ Megatron 方式切分到 N 张 GPU：每张卡持有 32/N 个完整注意力头�
 列，其余投影与所有归一化权重复制；每个块的两个行并行乘积在 GPU 之间求和
 （ggml-cuda 有集合通信时在设备上完成，否则经由主机内存）。每张卡缓存自己那些头
 的前缀。N 必须整除 32 个注意力头——单机上受 ggml 16 设备上限约束，即 2、4、8 或 16——而且切分每个权重时都不能拆开它的量化块，加载时会按权重类型逐一检查。实测只覆盖 2 卡。文本编码器、
-视觉编码器与 VAE 留在第一张卡上；不支持多节点组。在两张 A40（NCCL 经共享内存传输）上，1024² 文生图每步
-从 1.107 秒降至 0.823 秒（1.34×），1024² 编辑从 1.326 秒降至 0.934 秒（1.42×），2048²
+视觉编码器与 VAE 留在第一张卡上；不支持多节点组。用已退役的原生计算图在两张 A40（NCCL 经共享内存传输）上
+实测，1024² 文生图每步从 1.107 秒降至 0.823 秒（1.34×），1024² 编辑从 1.326 秒降至 0.934 秒（1.42×），2048²
 文生图与编辑分别为 1.54× 与 1.57×。`ggml_vulkan` 经主机内存归约，双卡反而慢 14%。
 TP 改变了部分和的相加顺序，输出与单卡不逐位相同；这种舍入差异会沿去噪轨迹累积，
-构图与质量相同但细节可能不同（与单卡相比 PSNR 34–52 dB）。
+构图与质量相同但细节可能不同（与单卡相比 PSNR 34–52 dB）。运行时的切分程序尚未在两张 GPU 上运行；
+`QwenImage21TensorParallelShardTests` 检查切分结果，`dit-parity` 在 `ggml_cpu` 上用真实 Q4_K_M 权重
+运行的两 rank 回环组预测（整序列、缓存 extract 与 cached）与已退役实现逐字节相同。
 
 Vulkan VAE：ggml-vulkan 通过 F16 协作矩阵运算 F32 矩阵，而 VAE 的部分激活超过
 65,504，因此此前在 `ggml_vulkan` 下 VAE 卷积一直回退到 CPU（512×512 解码超过 8 分钟）。
@@ -946,12 +965,100 @@ Vulkan VAE：ggml-vulkan 通过 F16 协作矩阵运算 F32 矩阵，而 VAE 的�
 参考相比相对 L2 误差为 0.14%。
 
 FP8 权重：TensorSharp 加载块量化的 GGUF 权重；ggml 没有 FP8 E4M3 张量类型，8 位
-权重配置就是 Q8_0 GGUF。vLLM-Omni 的 FP8 工作中适用于这里的是 8 位前缀存储，
-见上文。
+权重配置就是 Q8_0 GGUF。vLLM-Omni 的 FP8 工作中曾适用于这里的是 8 位前缀存储，
+它已随已退役的原生计算图一起移除（见上文）。
+
+## 实现与验证
+
+Qwen-Image-2.1 与 Qwen-Image-2.1-Turbo 是共享扩散运行时（`TensorSharp.Models/SharedDiffusion`）的一个
+模型族，MiniMax-H3-Image 使用的也是这个运行时；运行时的设计见
+[diffusion-runtime.md](../design/diffusion-runtime.md)（英文）。该模型族的代码位于
+`TensorSharp.Models/Models/QwenImage21/`：
+
+- `QwenImage21DiffusionModel` 是宿主为 `qwen_image` 架构加载的模型，取代了 `QwenImageModel`。
+  `QwenImage21Family` 向运行时提供几何、采样配方（基础调度器、Turbo 的 sigma、插件的配方）与噪声。
+- `QwenImage21Denoiser`（及 `QwenImage21Denoiser.Emit.cs`）把 Transformer 生成为 `GraphProgram`：GGML 图执行器
+  在 `ggml_cpu`、`ggml_metal`、`ggml_cuda` 与 `ggml_vulkan` 上运行它们，托管张量执行器在纯 C# 的 `cpu` 后端
+  上运行它们。它持有前缀 KV 缓存（先 extract 再 cached；缓存被拒绝时运行整序列），以不合并的方式应用
+  LoRA 插件，在 `--tp` 下切分各块，并在各步之间保留编译好的执行计划。程序按后端选择内核：在
+  `ggml_cuda` 上，每个程序都请求已退役计算图的路由（`GraphWideTokenRoutes`，原生侧为
+  `TSGgml_GraphWideTokenRoutes`）：256 行及以上的 Q4_K 与 Q6_K 乘积走 cuBLAS，无掩码注意力走 cuDNN。
+- `QwenImage21Canvas` 解析几何：显式尺寸、`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT` 给出的默认尺寸、
+  自动面积（2048×2048，`cpu` 上为 1024×1024）、保留源图尺寸以及参考图尺寸。`QwenImage21Noise` 生成
+  Philox 噪声与编辑噪声流（共享的 Philox 采样位于 `SharedDiffusion/PhiloxNoise.cs`），`QwenImage21Layout`
+  打包序列，`QwenImage21Weights` 映射 Transformer 权重，`QwenImage21Components` 把条件编码器（Qwen3-VL-8B
+  文本编码器与视觉编码器）和 VAE 包装为运行时组件。编码器、VAE 及其融合计算图、LoRA 加载器与 Turbo 的
+  调度行为不变。
+
+已退役的引擎均已删除：`QwenImageModel` → `QwenImage21Pipeline` → `QwenImage21DiT` 这条路径、它的原生整图
+前向（`ggml_ops_qwen_image21.cpp`，`TSGgml_QwenImage21Forward` / `TSGgml_QwenImage21ForwardTp`）以及它的
+纯 C# Transformer（`QwenImage21ManagedDiT` 及其 CPU 内核）。它们的开关也随之移除，
+[环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的-qwen-image-21-开关)列出了这些开关；设置任何一个，
+CLI 与服务端都会拒绝启动，并报告 `<NAME> was removed: <advice> Unset it.`。CLI 与服务端参数、伴随文件
+变量、`TS_QWEN_IMAGE_VARIANT` 与 `TS_QWEN21_EDIT_NOISE` 保持不变。迁移时保留下来的伴随组件路径开关
+（`TS_QWEN21_VAE_FUSED`、`TS_QWEN_TE_FUSED` 等）后来也已移除，同样会被拒绝；环境变量矩阵也列出了它们。
+
+取代已退役引擎测试与工具（原生整图 CTest、NumPy 参考实现 `eng/tests/qwen-image21-dit.py` 以及
+`benchmarks/QwenImageDiTBench`，均已移除）的验证：
+
+- `InferenceWeb.Tests/QwenImage21DenoiserTests.cs` 在 `TS_TEST_GGML_BACKEND` 固定的后端上（默认 `ggml_cpu`；
+  固定后也可为 Metal、CUDA 或 Vulkan），用一个小型合成 Transformer 运行这些程序，并与已退役原生计算图在删除前
+  冻结的速度场对比（`InferenceWeb.Tests/Fixtures/QwenImage21/LegacyGoldens`，由 `QwenImage21Goldens.cs` 读取）：
+  在冻结它们的通道（x64 `ggml_cpu`）上逐字节一致，其他通道相对 L2 误差在 2e-3 以内。托管执行器（`cpu`）
+  与已退役纯 C# Transformer 冻结的速度场相比在 1e-4 以内。这些用例经过前缀缓存（先 extract 再 cached），
+  并带 LoRA 插件（融合与分开的 gate/up 投影）。同一文件还测试前缀缓存的键、淘汰与拒绝，
+  `QwenImage21TensorParallelShardTests` 测试张量并行切分。
+- [`eng/QwenImage21CompanionProbe`](../../eng/QwenImage21CompanionProbe/README.md) 的 `dit-parity` 加载真实
+  Transformer，先把整序列计算图与前缀缓存的 extract / cached 计算图对比（在 `ggml_cpu` 上逐比特相同），
+  再在一台设备上（`ggml_cpu` 或 `ggml_metal`）把 Transformer 切分到两 rank 的回环组上对比。它把每次预测写到
+  JSON 报告旁（`<report>.d/*.f32`），便于在不同构建之间逐字节比较。它的 `dit` 模式用运行时的去噪器为预测计时。
+- [`eng/validation/QwenImage21DenoiserAB`](../../eng/validation/QwenImage21DenoiserAB/README.md)（英文）在真实
+  权重上为去噪步计时并对比（`--engines runtime,runtime2`；`--out` / `--against` 跨后端或构建对比速度场），
+  也可端到端运行整个请求（`--e2e`）。迁移提交 `f981cb6` 还带有 `legacy` 引擎；需要与已退役引擎对比时请检出
+  该提交。
+
+为本次迁移所做的测量（Linux x64、4 核 Xeon、`ggml_cpu`、Qwen-Image-2.1-Turbo Q4_K_M、未修改的上游 ggml
+`d9fe7bff`）：512×512 文生图、512×512 编辑、512×512 遮罩编辑、带负向提示词的 CFG 2.5 及 256×256 预览，
+以及 512×512 的体素风格 LoRA，端到端输出的 PNG 都与已退役流水线逐字节相同；真实权重上的 `dit-parity`
+预测（整序列、缓存 extract 与 cached、两 rank 回环张量并行的整序列、extract 与 cached）都与已退役实现逐字节
+相同。
+
+在 `ggml_cuda`（RTX 4000 Ada 20 GB、CUDA 13.2、sm_89，同样的权重与 ggml）上，每个完整请求输出的 PNG 都与
+已退役流水线逐字节相同。时间为全新进程中整个请求的耗时，显存峰值每 200 ms 采样一次：
+
+| 请求 | 已退役 | 运行时 | 显存峰值（已退役 → 运行时） |
+|---|---|---|---|
+| 文生图 1024² | 26.35 s | 19.72 s | 5596 → 5596 MiB |
+| 文生图 2048² | 69.51 s | 68.77 s | 16150 → 16150 MiB |
+| 编辑 1024² | 28.20 s | 28.10 s | 8570 → 8863 MiB |
+| 遮罩编辑 1024² | 27.84 s | 28.18 s | 未测量 |
+| 保持原图尺寸 | 28.30 s | 28.19 s | 未测量 |
+| CFG 2.5、负向提示词、预览，512² | 11.89 s | 11.41 s | 6310 → 6312 MiB |
+| 体素 LoRA 1024² | 24.02 s | 21.24 s | 5652 → 5720 MiB |
+| 两张参考图编辑 1024² | 32.18 s | 32.28 s | 11564 → 11510 MiB |
+| 三张参考图编辑（2048² 画布） | 96.63 s | 97.81 s | 17576 → 17728 MiB |
+| 两张参考图、CFG 2.5、负向提示词，512² | 20.16 s | 19.65 s | 7374 → 7562 MiB |
+| 两张参考图、保持原图尺寸 | 32.87 s | 32.69 s | 11558 → 11510 MiB |
+
+遮罩编辑与保持原图尺寸是在 extract 步的执行计划自行释放计算内存之前计时的，之后未重测。多参考图的几行
+是在分支最新版本上测量的。在 `ggml_cpu`（4 核 Xeon）上，512² 的两张参考图编辑同样逐字节相同：已退役流水线
+318 s，运行时 311 s。热身后的去噪步
+与已退役计算图耗时相同：带一张参考图的 1024² 为 1.44 s，2048² 为 6.90 s。编辑请求的缓存步比已退役计算图
+多占约 290 MiB 显存。
+
+冻结金标准的 `ggml_cuda` 通道在九个合成用例上要求运行时与已退役计算图逐字节相同。固定到 CUDA 运行
+Qwen-Image、MiniMax-H3、扩散、计算图与 LoRA 测试套件：2,735 个测试通过，无失败。跳过的 89 个是其他后端
+的固定测试和一个 AVX-512 内核测试，不含 Qwen-Image-2.1 的去噪器测试。在 CUDA 上，前缀缓存被拒绝的请求
+与使用缓存的请求相差在 2e-3 以内（ggml-cpu 上只差浮点舍入）。已退役引擎自身的两种模式在该平台上
+同样有差异：512² 时为 2.3e-3 到 4.6e-3。
+
+**运行时尚未在 Metal 或 Vulkan 硬件上验证**：没有可用的此类机器。GitHub 托管的 macOS 运行器只提供
+ggml-metal 无法驱动的半虚拟化 GPU，因此运行时在这些平台上与已退役计算图的一致性尚未确立。本页其他 GPU
+测量都是用已退役的原生计算图完成的。
 
 ## 验证记录
 
 Unsloth Q8_0 验证、完整模型性能测量、原生优化验证、与 stable-diffusion.cpp 的
-历史对比以及复现命令，请参阅[英文版模型卡](qwenimage21.md)。其中的编辑对比是在编辑噪声
-改为由参考图决定之前完成的；要与 stable-diffusion.cpp 的编辑噪声对齐，现在需要
+历史对比以及复现命令，请参阅[英文版模型卡](qwenimage21.md)；这些都是用已退役的原生计算图完成的。其中的编辑
+对比是在编辑噪声改为由参考图决定之前完成的；要与 stable-diffusion.cpp 的编辑噪声对齐，现在需要
 `TS_QWEN21_EDIT_NOISE=seed`（基准脚本的 `--edit-noise seed`，两个引擎都运行时的默认值）。

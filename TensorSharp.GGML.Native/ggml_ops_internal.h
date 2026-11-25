@@ -1947,9 +1947,6 @@ namespace tsg
         }
         bool still_bound() const { return held && epoch == cached_buffer_epoch(); }
     };
-    // Retire Qwen-Image-2.1 graphs before an immutable weight is changed/freed.
-    void qwen_image21_invalidate_weight(const void* data);
-
     // The host memory one owner releases (TSGgml_ReleaseHostRanges): a model's GGUF mappings, its memory pool's blocks,
     // buffers it allocated. Spans [begin, end), sorted and merged, so contains() is a binary search.
     struct HostRanges
@@ -1980,7 +1977,6 @@ namespace tsg
         }
     };
     // Per-module halves of TSGgml_ReleaseHostRanges: drop what each keeps keyed inside the ranges.
-    void qwen_image21_invalidate_ranges(const HostRanges& ranges);
     void moe_hot_tier_drop_ranges(const HostRanges& ranges);
 
     // allow_unified_weight: when true the prefers_device_local_cache gate is

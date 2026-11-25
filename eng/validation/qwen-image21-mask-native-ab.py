@@ -122,8 +122,15 @@ def run_one(args, runtime, native_hash, command_template, label, source, mask, e
     if result["loaded_native_sha256"] != native_hash:
         raise ValueError(f"{label}: loaded native hash changed")
     log_text = log_path.read_text(encoding="utf-8")
-    result["denoise_seconds"] = int(re.search(r"\[qwen21-timing\] denoise: (\d+)ms", log_text).group(1)) / 1000
-    result["phase_milliseconds"] = {name: int(value) for name, value in re.findall(r"\[qwen21-timing\] ([^:\r\n]+): (\d+)ms", log_text)}
+    legacy = re.search(r"\[qwen21-timing\] denoise: (\d+)ms", log_text)
+    if legacy:   # a build before the diffusion runtime
+        result["denoise_seconds"] = int(legacy.group(1)) / 1000
+        result["phase_milliseconds"] = {name: int(value) for name, value in re.findall(r"\[qwen21-timing\] ([^:\r\n]+): (\d+)ms", log_text)}
+    else:        # "[diffusion] qwen_image WxH, ...: text 1.2s, vision 0.0s, VAE encode 0.3s, denoise 9.8s (...), decode 3.4s, total 14.5s"
+        summary = re.search(r"\[diffusion\] qwen_image \d+x\d+,[^:\r\n]*:([^\r\n]*)", log_text).group(1)
+        phases = {name: float(value) for name, value in re.findall(r"(text|vision|VAE encode|denoise|decode|total) ([0-9.]+)s", summary)}
+        result["denoise_seconds"] = phases["denoise"]
+        result["phase_milliseconds"] = {name: round(seconds * 1000) for name, seconds in phases.items()}
     result["output_sha256"] = digest(image)
     if result["output_sha256"] != expected_output:
         raise ValueError(f"{label}: output differs from the recorded baseline for this mode")

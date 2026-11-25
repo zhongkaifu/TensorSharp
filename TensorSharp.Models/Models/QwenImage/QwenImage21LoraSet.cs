@@ -11,13 +11,14 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.GGML;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.QwenImage;
 
 /// <summary>
 /// The LoRA plug-ins of one Qwen-Image-2.1 transformer, loaded, validated and packed for
-/// the native graph's unmerged update path (<see cref="QwenImage21Adapter"/>).
+/// the denoiser's unmerged update path (<see cref="QwenImage21Adapter"/>, read by the graph emitter).
 /// </summary>
 /// <remarks>
 /// <para><b>Why unmerged.</b> A step-distillation LoRA moves the weights by about 0.1-0.5%,
@@ -37,25 +38,27 @@ namespace TensorSharp.Models.QwenImage;
 internal sealed class QwenImage21LoraSet : IDisposable
 {
     private const int GgmlF32 = 0, GgmlF16 = 1;
-    private const int Channels = QwenImage21DiT.Channels, Dim = QwenImage21DiT.HiddenSize;
+    private const int Channels = QwenImage21Weights.ReleaseChannels, Dim = QwenImage21Weights.ReleaseDim;
     private const string PddFormatPrefix = "qwenimage21_extracted_prefused";
 
     private readonly LoraFactorBuffers _buffers = new();
-    private IntPtr[] _adapters = Array.Empty<IntPtr>();
+    private QwenImage21Adapter[] _adapters = Array.Empty<QwenImage21Adapter>();
     // The pure-C# cpu backend dequantizes checkpoint weights (DoRA row norms, diff bases) with
     // the managed kernels: it must not reach the native library whatever the process-global
     // NativeDequant route says.
     private bool _managedDequant;
+    private BackendType _backend;
+    private bool _disposed;
     private QwenImage21LoraRecipe _checkpointRecipe;
     private string _checkpointNote;
 
     /// <summary>The sampling recipe of the plug-in that carries one, or null.</summary>
     internal QwenImage21LoraRecipe Recipe { get; private set; }
     /// <summary>Blocks whose fused gate_up weight must be described as its two halves.</summary>
-    internal bool[] SplitGateUp { get; } = new bool[QwenImage21DiT.Layers];
+    internal bool[] SplitGateUp { get; } = new bool[QwenImage21Weights.ReleaseLayers];
     /// <summary>Replacement F32 gains (a PDD bundle), zero where the checkpoint's own is kept.</summary>
-    internal IntPtr[] NormQ { get; } = new IntPtr[QwenImage21DiT.Layers];
-    internal IntPtr[] NormK { get; } = new IntPtr[QwenImage21DiT.Layers];
+    internal IntPtr[] NormQ { get; } = new IntPtr[QwenImage21Weights.ReleaseLayers];
+    internal IntPtr[] NormK { get; } = new IntPtr[QwenImage21Weights.ReleaseLayers];
     internal IntPtr TextNorm { get; private set; }
     /// <summary>Per-step output heads (F32 [dim, channels]) replacing proj_out, or empty.</summary>
     internal IntPtr[] OutputHeads { get; private set; } = Array.Empty<IntPtr>();
@@ -105,6 +108,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
         var set = new QwenImage21LoraSet
         {
             _managedDequant = backend == BackendType.Cpu,
+            _backend = backend,
             _checkpointRecipe = checkpointRecipe,
             _checkpointNote = checkpointNote,
         };
@@ -531,7 +535,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
             OutputHeads = result;
             return 1;
         }
-        long length = local switch { "txt_in.text_norm" => QwenImage21DiT.TextDim, "attn.norm_q" or "attn.norm_k" => QwenImage21DiT.HeadDim, _ => -1 };
+        long length = local switch { "txt_in.text_norm" => QwenImage21Weights.ReleaseTextDim, "attn.norm_q" or "attn.norm_k" => QwenImage21Weights.ReleaseHeadDim, _ => -1 };
         if (length < 0 || !(shape.Length == 1 && shape[0] == length))
             throw new InvalidDataException($"LoRA '{file}': {name} has shape [{string.Join(",", shape)}], which does not replace {module}.");
         IntPtr current = local == "txt_in.text_norm" ? TextNorm : local == "attn.norm_q" ? NormQ[block] : NormK[block];
@@ -606,7 +610,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
         foreach (var module in QwenImage21LoraKeys.GlobalModules)
             if (_slots.TryGetValue(module, out var slot) && !slot.Empty)
                 groups.Add((() => new[] { (module, slot) }, false));
-        for (int b = 0; b < QwenImage21DiT.Layers; b++)
+        for (int b = 0; b < QwenImage21Weights.ReleaseLayers; b++)
         {
             Slot Get(string n) => _slots.TryGetValue($"{b}.{n}", out var s) && !s.Empty ? s : null;
             var qkv = new[] { "q", "k", "v" }.Select(n => ($"{b}.{n}", Get(n))).Where(p => p.Item2 != null).ToArray();
@@ -722,15 +726,15 @@ internal sealed class QwenImage21LoraSet : IDisposable
         }
     }
 
-    // ---- native descriptors ---------------------------------------------------------------
+    // ---- descriptors -----------------------------------------------------------------------
 
-    private unsafe void BuildAdapters()
+    private void BuildAdapters()
     {
-        _adapters = new IntPtr[_ranks];
+        _adapters = new QwenImage21Adapter[_ranks];
         for (int r = 0; r < _ranks; r++)
         {
-            var blocks = (QwenImage21BlockLora*)Allocate(sizeof(QwenImage21BlockLora) * QwenImage21DiT.Layers);
-            for (int b = 0; b < QwenImage21DiT.Layers; b++)
+            var blocks = new QwenImage21BlockLora[QwenImage21Weights.ReleaseLayers];
+            for (int b = 0; b < QwenImage21Weights.ReleaseLayers; b++)
             {
                 blocks[b] = new QwenImage21BlockLora
                 {
@@ -740,20 +744,14 @@ internal sealed class QwenImage21LoraSet : IDisposable
                     Down = Row($"{b}.down", r),
                 };
             }
-            var adapter = (QwenImage21Adapter*)Allocate(sizeof(QwenImage21Adapter));
-            *adapter = new QwenImage21Adapter
+            _adapters[r] = new QwenImage21Adapter
             {
-                StructBytes = sizeof(QwenImage21Adapter),
-                NumLayers = QwenImage21DiT.Layers,
                 ImageIn = Global("img_in"), TextIn = Global("txt_in.in_layer"), TextOut = Global("txt_in.out_layer"),
                 TimeIn = Global("time_text_embed.timestep_embedder.linear_1"),
                 TimeOut = Global("time_text_embed.timestep_embedder.linear_2"),
                 Modulation = Global("modulation.1"), NormOut = Global("norm_out.linear"), ProjOut = Global("proj_out"),
-                Blocks = (IntPtr)blocks,
-                OutputHead = OutputHeads.Length > 0 ? OutputHeads[0] : IntPtr.Zero,
-                OutputHeadType = GgmlF32,
+                Blocks = blocks,
             };
-            _adapters[r] = (IntPtr)adapter;
         }
     }
 
@@ -790,25 +788,89 @@ internal sealed class QwenImage21LoraSet : IDisposable
         return l with { Down = down, In = local };
     }
 
-    /// <summary>The native adapter descriptor for tensor-parallel rank <paramref name="rank"/>.</summary>
-    internal IntPtr AdapterFor(int rank) => _adapters[rank];
+    /// <summary>The descriptor for tensor-parallel rank <paramref name="rank"/>.</summary>
+    internal QwenImage21Adapter Adapter(int rank) => _adapters[rank];
 
-    /// <summary>Select the per-step output head (a PDD bundle); a no-op without heads.</summary>
-    internal unsafe void SelectOutputHead(int step)
+    private static long s_generations;
+
+    /// <summary>A number no other set has had: a plan compiled with this set's factors is never taken for another's, even
+    /// where the other set's buffers reuse these addresses.</summary>
+    internal long Generation { get; } = Interlocked.Increment(ref s_generations);
+
+    /// <summary>The update of a projection outside the blocks (img_in, txt_in.in_layer, txt_in.out_layer,
+    /// time_text_embed.timestep_embedder.linear_1 / linear_2, modulation.1, norm_out.linear, proj_out) for tensor-parallel
+    /// rank <paramref name="rank"/>; default when it has none.</summary>
+    internal QwenImage21Lora Global(string module, int rank = 0)
     {
-        if (OutputHeads.Length == 0) return;
-        if (step < 0 || step >= OutputHeads.Length)
-            throw new ArgumentOutOfRangeException(nameof(step), $"The LoRA bundle has {OutputHeads.Length} step heads; step {step + 1} has none.");
-        foreach (var adapter in _adapters) ((QwenImage21Adapter*)adapter)->OutputHead = OutputHeads[step];
+        QwenImage21Adapter a = _adapters[rank];
+        return module switch
+        {
+            "img_in" => a.ImageIn,
+            "txt_in.in_layer" => a.TextIn,
+            "txt_in.out_layer" => a.TextOut,
+            "time_text_embed.timestep_embedder.linear_1" => a.TimeIn,
+            "time_text_embed.timestep_embedder.linear_2" => a.TimeOut,
+            "modulation.1" => a.Modulation,
+            "norm_out.linear" => a.NormOut,
+            "proj_out" => a.ProjOut,
+            _ => throw new ArgumentOutOfRangeException(nameof(module)),
+        };
+    }
+
+    /// <summary>Block <paramref name="layer"/>'s updates for tensor-parallel rank <paramref name="rank"/>.</summary>
+    internal QwenImage21BlockLora Block(int layer, int rank = 0)
+    {
+        QwenImage21BlockLora[] blocks = _adapters[rank].Blocks;
+        if (layer < 0 || layer >= blocks.Length) throw new ArgumentOutOfRangeException(nameof(layer));
+        return blocks[layer];
+    }
+
+    /// <summary>Every address a graph binds as a leaf of this set (each factor, row scale and norm replacement, on every
+    /// rank): the keys of their device copies.</summary>
+    internal IEnumerable<IntPtr> FactorPointers()
+    {
+        var result = new HashSet<IntPtr>();
+        void Add(in QwenImage21Lora l)
+        {
+            foreach (IntPtr p in new[] { l.Down, l.Up, l.RowScale })
+                if (p != IntPtr.Zero) result.Add(p);
+        }
+        foreach (QwenImage21Adapter a in _adapters)
+        {
+            Add(a.ImageIn); Add(a.TextIn); Add(a.TextOut); Add(a.TimeIn); Add(a.TimeOut);
+            Add(a.Modulation); Add(a.NormOut); Add(a.ProjOut);
+            foreach (QwenImage21BlockLora block in a.Blocks)
+            {
+                Add(block.Q); Add(block.K); Add(block.V); Add(block.Out);
+                Add(block.Gate); Add(block.Up); Add(block.Down);
+            }
+        }
+        foreach (IntPtr p in NormQ) if (p != IntPtr.Zero) result.Add(p);
+        foreach (IntPtr p in NormK) if (p != IntPtr.Zero) result.Add(p);
+        if (TextNorm != IntPtr.Zero) result.Add(TextNorm);
+        return result;
     }
 
     /// <summary>The factors' memory (every allocation of the set: factors, per-rank copies, gains, heads), as ranges: the
-    /// transformer that binds them releases it with its own (QwenImage21DiT.AddOwnedHostMemory).</summary>
+    /// transformer that binds them releases it with its own (QwenImage21Denoiser.BindLora).</summary>
     internal void CollectHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges) => _buffers.AddRanges(ranges);
+
+    /// <summary>Test hook: receives each address the set drops instead of the GGML backends.</summary>
+    internal Action<IntPtr> InvalidateHookForTest { get; set; }
 
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+        // Before the free, whatever order the owner disposes it and the transformer in: a GGML backend must never keep a
+        // device copy keyed by a host address the allocator may hand to the next set's factors.
+        Action<IntPtr> hook = InvalidateHookForTest;
+        foreach (IntPtr p in FactorPointers())
+        {
+            if (hook != null) hook(p);
+            else if (_backend != BackendType.Cpu) GgmlBasicOps.InvalidateHostBuffer(p);
+        }
         _buffers.Dispose();
-        _adapters = Array.Empty<IntPtr>();
+        _adapters = Array.Empty<QwenImage21Adapter>();
     }
 }

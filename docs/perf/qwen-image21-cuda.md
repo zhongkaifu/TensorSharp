@@ -1,23 +1,45 @@
 # Qwen-Image-2.1 CUDA execution
 
-TensorSharp keeps a complete Qwen-Image-2.1 velocity-prediction graph alive across
-denoising steps. This removes repeated graph construction, allocation planning,
-weight binding, and mask generation, and supplies stable tensor and device
-addresses to unchanged upstream ggml's CUDA graph implementation.
+> **Historical for the transformer.** The diffusion-transformer sections below
+> ("Graph and input lifetimes", "Attention and managed preparation", "Projections on
+> cuBLAS and attention on cuDNN" and the transformer part of "Validation") describe the
+> retired native whole-graph forward (`ggml_ops_qwen_image21.cpp`,
+> `TSGgml_QwenImage21Forward[Tp]`), its managed wrapper (`QwenImage21DiT`) and its
+> switches. They were removed when Qwen-Image-2.1 moved onto the shared diffusion
+> runtime, where the transformer runs as graph programs
+> ([Implementation and validation](../models/qwenimage21.md#implementation-and-validation)).
+> Their measurements are kept as history. On `ggml_cuda` the runtime reproduces the
+> retired graph's routing per program: each program asks for it with
+> `GraphWideTokenRoutes` (native `TSGgml_GraphWideTokenRoutes` in
+> `ggml_ops_graph_builder.cpp`, served by the DiT offload in `ggml_ops_dit_offload.cpp`):
+> Q4_K and Q6_K products of 256 rows or more on cuBLAS BF16, unmasked attention on
+> cuDNN, BF16 weights on ggml's own products. The runtime keeps two compiled plans a
+> device across steps. On an RTX 4000 Ada (CUDA 13.2, sm_89, ggml `d9fe7bff`) its
+> whole requests gave the retired pipeline's PNGs byte for byte, in the retired
+> pipeline's time or less
+> ([Implementation and validation](../models/qwenimage21.md#implementation-and-validation)).
+> The A40 measurements below have not been repeated with it. The VAE,
+> vision-encoder and conditioning-encoder sections still describe the current code.
 
-The same graph-lifetime optimization is enabled by default on Metal. Metal
-retains ggml metadata and scratch allocations; CUDA capture and executable
+The retired implementation kept a complete Qwen-Image-2.1 velocity-prediction
+graph alive across denoising steps. This removed repeated graph construction,
+allocation planning, weight binding, and mask generation, and supplied stable
+tensor and device addresses to unchanged upstream ggml's CUDA graph
+implementation.
+
+The same graph-lifetime optimization was enabled by default on Metal. Metal
+retained ggml metadata and scratch allocations; CUDA capture and executable
 replay discussed below are specific to CUDA.
 
-The implementation is in
-[`ggml_ops_qwen_image21.cpp`](../../TensorSharp.GGML.Native/ggml_ops_qwen_image21.cpp).
-It changes execution and storage, without skipping denoising steps, transformer
-layers, or attention tokens. Floating-point differences between attention kernels
-still require numerical and image validation.
+The implementation was in `ggml_ops_qwen_image21.cpp` (removed). It changed
+execution and storage, without skipping denoising steps, transformer layers, or
+attention tokens. Floating-point differences between attention kernels still
+require numerical and image validation.
 
 ## Graph and input lifetimes
 
-Each CUDA or Metal device has at most two retained graphs, allowing positive and negative
+This section describes the retired native graph. Each CUDA or Metal device had at
+most two retained graphs, allowing positive and negative
 CFG layouts to coexist. Each graph owns its ggml context and a dedicated gallocr
 allocation. The key includes every weight pointer, type, shape and byte count;
 normalization epsilon; token and head dimensions; all segment boundaries and
@@ -30,7 +52,8 @@ tensor-parallel rank count, and each applied LoRA's factor buffers (its scales
 are folded into them), so a graph built for another adapter, or for none, is
 never reused. With the default
 [prefix KV cache](../models/qwenimage21.md#prefix-kv-cache)
-(`TS_QWEN21_PREFIX_CACHE=0` disables it), a request's first step runs the whole
+(the retired `TS_QWEN21_PREFIX_CACHE=0` disabled it; the runtime's cache is always
+on), a request's first step runs the whole
 sequence and stores the text and reference-image prefix in a graph that is built
 for that step and freed afterwards; it is never retained. Later steps run only
 the target tokens against that stored prefix in the retained cached-step graph.
@@ -67,6 +90,11 @@ profiler when making capture-specific claims.
 
 ## Attention and managed preparation
 
+The runtime's programs keep this section's attention forms (exact image-segment
+key lengths without a padding mask, causal text masks, one F16 K/V copy shared by
+the segment views on CUDA); the managed preparation it describes belonged to the
+retired `QwenImage21DiT`.
+
 Image segments are bidirectional within their existing causal-prefix boundary.
 CUDA flash attention can consume their exact KV lengths without padding, so these
 segments no longer allocate or upload a quadratic all-valid/padding mask. Text
@@ -79,21 +107,24 @@ Attention retains F32 accumulation. Unsupported flash shapes still use the expli
 attention path with the original F32 Q/K/V. No quantization or approximate
 attention method is added.
 
-[`QwenImage21DiT.cs`](../../TensorSharp.Models/Models/QwenImage/QwenImage21DiT.cs)
-retains at most two segment/RoPE layouts keyed by text length, image slots and
-reference/target geometry. Keys copy caller arrays, so later array mutation cannot
-return stale layouts. Text-to-image prediction pins the existing latent-token
-array directly; editing still assembles reference and target tokens together.
+The retired `QwenImage21DiT.cs` retained at most two segment/RoPE layouts keyed by
+text length, image slots and reference/target geometry. Keys copied caller arrays,
+so later array mutation could not return stale layouts. Text-to-image prediction
+pinned the existing latent-token array directly; editing assembled reference and
+target tokens together.
 
 | Control | Default | Purpose |
 | --- | --- | --- |
-| `TS_QWEN21_GRAPH_REUSE` | `1` on CUDA and Metal | `0` rebuilds the native graph for each prediction. CPU and Vulkan retain transient execution. |
-| `TS_QWEN21_PAD_MASK` | `0` | `1` restores the prior CUDA padded-mask/F32-KV preparation for attention comparisons. |
-| `TS_QWEN21_FLASH` | `1` | `0` uses explicit attention as a numerical reference. |
-| `TS_QWEN21_GRAPH_TRACE` | `0` | `1` logs graph builds, scratch size and execution counts; it is not CUDA capture instrumentation. |
-| `TS_QWEN21_PREFIX_CACHE` | on | `0` recomputes the text/reference prefix on every step instead of storing its keys and values. |
+| `TS_QWEN21_GRAPH_REUSE` | removed (was `1` on CUDA and Metal) | `0` rebuilt the native graph for each prediction. CPU and Vulkan retained transient execution. The runtime keeps its compiled plans. |
+| `TS_QWEN21_PAD_MASK` | removed (was `0`) | `1` restored the prior CUDA padded-mask/F32-KV preparation for attention comparisons. |
+| `TS_QWEN21_FLASH` | removed (was `1`) | `0` used explicit attention as a numerical reference. |
+| `TS_QWEN21_GRAPH_TRACE` | removed (was `0`) | `1` logged graph builds, scratch size and execution counts; it was not CUDA capture instrumentation. |
+| `TS_QWEN21_PREFIX_CACHE` | removed (was on) | `0` recomputed the text/reference prefix on every step. The runtime's cache is always on. |
 | `TS_GGML_LOG_DEBUG` | `0` | `1` exposes upstream debug messages, including CUDA graph warmup and reset decisions. |
-| `GGML_CUDA_DISABLE_GRAPHS` | unset | Upstream presence-based switch to disable CUDA graphs independently of TensorSharp graph reuse. |
+| `GGML_CUDA_DISABLE_GRAPHS` | unset | Upstream presence-based switch to disable CUDA graphs independently of TensorSharp's retained graphs or plans. |
+
+Setting one of the removed `TS_QWEN21_*` controls now stops the CLI and the server
+at startup with `<NAME> was removed: <advice> Unset it.`
 
 Use fresh processes for upstream environment controls, which ggml may read only
 once. Keep prompts, model quantization, resolution, steps, CFG, seed, sampler and
@@ -111,12 +142,20 @@ be the permuted view the graph already has. The graph and its allocation stay gg
 library declines runs on ggml as before. Text segments keep their causal masks and
 ggml's kernel.
 
-Measured on an A100 80 GB (Linux, sm_80 build), `qwen_image_2.1_Q4_K_M.gguf`,
-1344x768, 25 steps, warm server, the same prompt and seed:
+The retired graph turned these routes on with `TS_QWEN21_CUBLAS_MATMUL`,
+`TS_QWEN21_CUBLAS_MIN_ROWS` (256 rows) and `TS_QWEN21_CUDNN_ATTENTION`, all removed.
+The runtime's programs ask for the same routes themselves: `GraphWideTokenRoutes` with
+256 rows, Q6_K included, strided queries on cuDNN and BF16 weights on ggml's products,
+run through `dit_offload_compute` (`ggml_ops_dit_offload.cpp`). `--diffusion-products`
+still selects int8 products there.
+
+Measured with the retired graph on an A100 80 GB (Linux, sm_80 build),
+`qwen_image_2.1_Q4_K_M.gguf`, 1344x768, 25 steps, warm server, the same prompt and
+seed:
 
 | Build | Cached denoising step | Denoise | Whole picture |
 |---|---:|---:|---:|
-| MMQ and ggml flash attention (`TS_QWEN21_CUBLAS_MATMUL=0`, `TS_QWEN21_CUDNN_ATTENTION=0`) | 0.99 s | 28.4 s | 31.0 s |
+| MMQ and ggml flash attention (the removed `TS_QWEN21_CUBLAS_MATMUL=0`, `TS_QWEN21_CUDNN_ATTENTION=0`) | 0.99 s | 28.4 s | 31.0 s |
 | + Q4_K projections on cuBLAS BF16 | 0.62 s | 17.1 s | 19.1 s |
 | + Q6_K projections on cuBLAS BF16 | 0.58 s | 16.2 s | 18.1 s |
 | + attention on cuDNN SDPA (the default) | 0.47 s | 14.0 s | 15.9 s |
@@ -154,16 +193,19 @@ claim persistent CUDA graph replay. Allocation or unsupported-op failures fall
 back to the existing per-convolution path. Non-finite fused outputs also trigger
 that fallback, and non-finite final RGBA is rejected before pixel conversion.
 
-Set `TS_QWEN21_VAE_FUSED=0` for the per-convolution baseline. The existing global
-`TS_QWEN_VAE_FUSED=0` and `TS_QWEN_VAE_GPU=0` controls continue to disable this
-path. `TS_QWEN21_VAE_TRACE=1` reports fused execution or per-convolution tensor
-statistics and stops at the first non-finite intermediate. Qwen-Image-2.1 uses
-cuDNN automatically when its runtime is available. `TS_VAE_CUDNN_CONV=0`
-disables it; `1` explicitly enables it. Other VAEs retain their existing opt-in
-behavior.
+On CUDA and Metal the VAE always takes the whole-VAE graph, falling back only as
+described above. The switches that selected the per-convolution path instead
+(`TS_QWEN21_VAE_FUSED=0`, `TS_QWEN_VAE_FUSED=0`, `TS_QWEN_VAE_GPU=0`) were removed,
+as was `TS_QWEN21_VAE_TRACE`, which reported fused execution or per-convolution
+tensor statistics. The per-convolution path still runs on `ggml_cpu` and
+`ggml_vulkan`, so a per-convolution baseline now comes from another backend (the
+companion probe's `vae` on `Cpu`) and includes that backend's rounding.
+Qwen-Image-2.1 uses cuDNN automatically when its runtime is available.
+`TS_VAE_CUDNN_CONV=0` disables it; `1` explicitly enables it. Other VAEs retain
+their existing opt-in behavior.
 Qwen-Image-2.1 requests cuDNN FMA math to prevent implicit F16/TF32 conversion.
-Without cuDNN, the interpreter chooses ggml im2col/GEMM or direct convolution based
-on the existing `TS_QWEN_VAE_FUSED_IM2COL_BUDGET` scratch limit.
+Without cuDNN, the interpreter lowers a convolution to ggml im2col/GEMM up to a
+fixed 2 GiB of scratch, and to a direct convolution above that.
 
 Whole-VAE graphs may need substantial activation scratch at large resolutions.
 Paired real-weight encode/decode validation is required in addition to the native
@@ -190,11 +232,13 @@ every block. The MLPs use upstream `ggml_gelu_erf`, as required by Qwen3-VL;
 the main and deepstack projectors also use the native erf activation. Older
 Qwen3.5 callers retain their existing ABI and tanh-GELU behavior.
 
-`TS_QWEN21_VISION_FUSED=0` restores the previous per-block vision path and its
-managed erf approximation. The new kernel evaluates erf directly, so the
-comparison is numerical rather than bitwise. Use the companion probe's `vision`
-command to compare the main embedding and all three deepstack embeddings with
-identical image preprocessing. CPU and Metal retain their previous execution.
+CPU and Metal retain their previous execution: the per-block vision path with its
+managed erf approximation. The `TS_QWEN21_VISION_FUSED=0` switch that selected that
+path on CUDA was removed. The fused kernel evaluates erf directly, so the two paths
+agree numerically rather than bitwise. To compare them, run the companion probe's
+`vision` command on `Cuda` and on another backend, which applies identical image
+preprocessing, and compare the main embedding and all three deepstack embeddings;
+the difference then also includes the other backend's rounding.
 
 That per-block path's linear layers pass each weight to the native matrix multiply
 as a transposed view of its stored rows, the layout `ggml_mul_mat` consumes, on every
@@ -211,18 +255,17 @@ trunk divided every quantized projection input by 1024 and restored the scale
 after multiplication. That transformation can underflow CUDA's F16 activation
 quantization scales for small normalized inputs. Layers with Q/K head norms
 identify the Qwen3-VL path.
-`TS_QWEN21_TE_PRESCALE=1` restores the former scaling for numerical comparisons.
-Use `TS_QWEN_TE_FUSED=0` as the per-operation reference, and compare on the same
-backend before interpreting cross-backend quantization differences.
-For a selected-layer comparison, set `TS_QWEN_TE_TRACE_DIR` to an ignored
-validation directory and `TS_QWEN_TE_TRACE_LAYER` to the zero-based layer index.
-Both paths write corresponding planar F32 intermediate tensors. Native tracing
-retains those outputs, which can inhibit fusion; compare traced and untraced
-final outputs before treating the trace as representative. The per-operation
-head normalization uses a host double-precision sum while the CUDA graph uses
-device reductions, so subsequent quantization can amplify initially small
-rounding differences. Raw conditioning agreement alone does not validate image
-quality.
+The switch back to the former scaling (`TS_QWEN21_TE_PRESCALE=1`), the switch to
+the per-operation path on a GGML backend (`TS_QWEN_TE_FUSED=0`) and the per-layer
+trace (`TS_QWEN_TE_TRACE_DIR`, `TS_QWEN_TE_TRACE_LAYER`) were removed. Every GGML
+backend runs the fused trunk, falling back to the per-operation path only when
+the graph cannot be built, and the `cpu` backend runs the per-operation path. A
+per-operation reference therefore comes from another backend (the companion
+probe's `text` on `Cpu` against `GgmlCuda`), and the difference includes each
+backend's quantization. The per-operation head normalization uses a host
+double-precision sum while the CUDA graph uses device reductions, so subsequent
+quantization can amplify initially small rounding differences. Raw conditioning
+agreement alone does not validate image quality.
 
 Measured conditioning errors and their limitations are recorded in the ignored
 validation report `docs/validation/qwen-image21-cuda/REPORT.md` (local validation
@@ -248,25 +291,30 @@ Record working-tree state alongside commit IDs for reproducible comparisons.
 Configure the native build with
 `-DTENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON`
 and `-DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON`, then build
-`GgmlOpsQwenImage21Test` and `GgmlOpsQwenImage21VaeShortcutTest`.
+`GgmlOpsQwenImage21VaeShortcutTest`.
 Given the configured build directory in `$nativeBuild`:
 
 ```powershell
-ctest --test-dir $nativeBuild -C Release -R qwen-image21-whole-graph --output-on-failure
 ctest --test-dir $nativeBuild -C Release -R qwen-image21-vae-shortcuts --output-on-failure
+$env:TS_TEST_GGML_BACKEND = 'cuda'
 dotnet test InferenceWeb.Tests --filter QwenImage21
 ```
 
-The CTest fixture generates an explicit-attention CPU reference in a separate
-process before checking CUDA or Metal. On macOS, keep Metal enabled and configure
-`-DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON`; do not enable CUDA.
-The test exercises whole-graph dynamic inputs, changed
-shapes/segments/weight descriptors, fused and separate MLP layouts, zero-prefix
-input reachability, cache invalidation and recovery. These synthetic weights test
-execution correctness; they cannot establish full-model image quality.
-Metal runs 159 forwards and excludes the forced device-copy-budget scenario:
-its host weight mappings do not use that budget. The independent NumPy operator
-oracle is `python3 eng/tests/qwen-image21-dit.py --backend metal`.
+The transformer has no native test of its own any more. The retired graph's
+`GgmlOpsQwenImage21Test` (CTests `qwen-image21-whole-graph-{cpu,metal,vulkan,cuda}`)
+and the NumPy operator oracle `eng/tests/qwen-image21-dit.py` were removed with it.
+`InferenceWeb.Tests/QwenImage21DenoiserTests.cs` checks the runtime's programs on the
+backend `TS_TEST_GGML_BACKEND` pins (`ggml_cpu` by default; `cuda` above) against the
+retired native graph's velocities frozen before it was deleted
+(`InferenceWeb.Tests/Fixtures/QwenImage21/LegacyGoldens`): byte for byte on the lane
+that froze them (x64 `ggml_cpu`), within 2e-3 relative L2 on another lane such as a
+CUDA GPU, through the prefix cache and with LoRA plug-ins. Those synthetic weights test
+execution correctness; they cannot establish full-model image quality. The CUDA lane
+has not been run yet. On real weights, `eng/validation/QwenImage21DenoiserAB` compares
+a CUDA run's velocities with another backend's (`--out` on one, `--against` on the
+other) and times whole requests with `--e2e`; `eng/QwenImage21CompanionProbe`
+`dit-parity` (cache and loopback tensor-parallel parity) runs on `ggml_cpu` and
+`ggml_metal`.
 
 The end-to-end runner accepts exact model paths and writes generated evidence to
 ignored `docs/validation/` by default:

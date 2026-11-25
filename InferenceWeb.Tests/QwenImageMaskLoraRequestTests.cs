@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 using TensorSharp.Server.Hosting;
 
@@ -21,7 +22,7 @@ public sealed class QwenImageMaskLoraRequestTests : IDisposable
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), "ts-mask-lora-" + Guid.NewGuid().ToString("N"));
     private readonly ModelService _models = new();
-    private readonly QwenImageModel _model;
+    private readonly QwenImage21DiffusionModel _model;
     private readonly WebUiChatService _chat;
     private readonly byte[] _source;
     private readonly byte[] _mask;
@@ -32,7 +33,7 @@ public sealed class QwenImageMaskLoraRequestTests : IDisposable
         Directory.CreateDirectory(_directory);
         // The pipeline must return before touching model weights. An absent mask or lost
         // alpha/inversion option would enter inference and fail on this uninitialized model.
-        _model = (QwenImageModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImageModel));
+        _model = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base);
         SetLoraMetadata(Array.Empty<LoraSpec>());
         typeof(ModelLifecycleService).GetField("_model", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(_models.LifecycleService, _model);
@@ -60,7 +61,7 @@ public sealed class QwenImageMaskLoraRequestTests : IDisposable
     }
 
     private void SetLoraMetadata(IReadOnlyList<LoraSpec> specs) =>
-        typeof(QwenImageModel).GetProperty(nameof(QwenImageModel.LoraSpecs))!.SetValue(_model, specs);
+        typeof(QwenImage21DiffusionModel).GetProperty(nameof(QwenImage21DiffusionModel.LoraSpecs))!.SetValue(_model, specs);
 
     private void AssertOriginal(object response)
     {

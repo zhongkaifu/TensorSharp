@@ -13,6 +13,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Server.Hosting;
 
 namespace InferenceWeb.Tests;
@@ -40,9 +41,9 @@ public sealed class ImageModelChooserServiceTests : IDisposable
     }
 
     // No constructor ran: ChooseAnswer checks its arguments first and must fail on anything past them.
-    private QwenImageModel LoadUninitializedImageModel()
+    private QwenImage21DiffusionModel LoadUninitializedImageModel()
     {
-        var model = (QwenImageModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImageModel));
+        var model = (QwenImage21DiffusionModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImage21DiffusionModel));
         SetLoadedModel(model);
         return model;
     }
@@ -110,7 +111,7 @@ public sealed class ImageModelChooserServiceTests : IDisposable
     [Fact]
     public async Task ARetiringModel_IsNotAsked()
     {
-        QwenImageModel model = LoadUninitializedImageModel();
+        QwenImage21DiffusionModel model = LoadUninitializedImageModel();
         model.BeginRetirement();
 
         Assert.Null(await _chat.ChooseWithImageModelAsync("s", "u", Answers, CancellationToken.None));
@@ -127,7 +128,7 @@ public sealed class ImageModelChooserServiceTests : IDisposable
     [Fact]
     public async Task AModelUnloadedWhileTheQuestionWaits_IsNotAsked()
     {
-        QwenImageModel model = LoadUninitializedImageModel();
+        QwenImage21DiffusionModel model = LoadUninitializedImageModel();
         Task<ImageIntentChoice?> question;
         Monitor.Enter(ImageLock);
         try

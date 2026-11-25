@@ -96,10 +96,7 @@ namespace TensorSharp.Models.QwenImage
                     Weights = (IntPtr)wPtr, NumWeights = _weights.Length,
                     StructBytes = Marshal.SizeOf<QwenVaeArgs>(),
                 };
-                bool ok = GgmlBasicOps.TryQwenVaeRun(in a);
-                if (Environment.GetEnvironmentVariable("TS_QWEN21_VAE_TRACE") == "1")
-                    Console.WriteLine($"  [vae21] fused {inC}x{inH}x{inW}: ops={ops.Length} success={ok}");
-                return ok;
+                return GgmlBasicOps.TryQwenVaeRun(in a);
             }
         }
 

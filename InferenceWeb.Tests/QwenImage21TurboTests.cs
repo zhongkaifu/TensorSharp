@@ -7,6 +7,8 @@ using TensorSharp.Cli;
 using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.Host.Hosting;
@@ -57,31 +59,31 @@ public sealed class QwenImage21TurboTests : IDisposable
     [Fact]
     public void TurboDefaultsToItsOwnScheduleAndTheBaseCheckpointToFortyShiftedSteps()
     {
-        var (steps, cfg, sigmas) = QwenImage21Pipeline.ResolveSampling(new QwenImageParams(), QwenImage21Turbo.Recipe, 4096);
+        var (steps, cfg, sigmas) = QwenImage21TestGeometry.ResolveSampling(new QwenImageParams(), QwenImage21Turbo.Recipe, 4096);
         Assert.Equal(8, steps);
         Assert.Equal(1f, cfg);
         Assert.Equal(Published, sigmas);
 
-        (steps, cfg, sigmas) = QwenImage21Pipeline.ResolveSampling(new QwenImageParams(), null, 4096);
+        (steps, cfg, sigmas) = QwenImage21TestGeometry.ResolveSampling(new QwenImageParams(), null, 4096);
         Assert.Equal(40, steps);
         Assert.Equal(1f, cfg);
-        Assert.Equal(QwenImage21Sampling.Sigmas(40, 4096), sigmas);
+        Assert.Equal(DiffusionSchedules.DynamicShift(40, 4096), sigmas);
         // The base schedule is shifted by resolution; Turbo's is not.
-        Assert.NotEqual(QwenImage21Sampling.Sigmas(8, 4096), Published);
+        Assert.NotEqual(DiffusionSchedules.DynamicShift(8, 4096), Published);
     }
 
     [Fact]
     public void ExplicitSettingsWinWhereTheScheduleAllowsThem()
     {
         // The one count Turbo has, named explicitly, and an explicit CFG (a second, negative pass).
-        var (steps, cfg, sigmas) = QwenImage21Pipeline.ResolveSampling(
+        var (steps, cfg, sigmas) = QwenImage21TestGeometry.ResolveSampling(
             new QwenImageParams { Steps = 8, CfgScale = 2.5f }, QwenImage21Turbo.Recipe, 16384);
         Assert.Equal(8, steps);
         Assert.Equal(2.5f, cfg);
         Assert.Equal(Published, sigmas);
 
         // The base checkpoint takes any count.
-        (steps, _, sigmas) = QwenImage21Pipeline.ResolveSampling(new QwenImageParams { Steps = 12 }, null, 4096);
+        (steps, _, sigmas) = QwenImage21TestGeometry.ResolveSampling(new QwenImageParams { Steps = 12 }, null, 4096);
         Assert.Equal(12, steps);
         Assert.Equal(13, sigmas.Length);
     }
@@ -92,7 +94,7 @@ public sealed class QwenImage21TurboTests : IDisposable
     [InlineData(40)]
     public void AnotherStepCountIsRefusedRatherThanResampled(int requested)
     {
-        var ex = Assert.Throws<ArgumentException>(() => QwenImage21Pipeline.ResolveSampling(
+        var ex = Assert.Throws<ArgumentException>(() => QwenImage21TestGeometry.ResolveSampling(
             new QwenImageParams { Steps = requested }, QwenImage21Turbo.Recipe, 4096));
         Assert.StartsWith("Qwen-Image-2.1-Turbo, which was distilled for one published 8-step schedule", ex.Message, StringComparison.Ordinal);
         Assert.Contains($"defines schedules for 8 step(s), not {requested}", ex.Message, StringComparison.Ordinal);
@@ -176,7 +178,7 @@ public sealed class QwenImage21TurboTests : IDisposable
         bool preferManaged = NativeDequant.PreferManaged;
         try
         {
-            var error = Assert.Throws<ModelLoadRefusedException>(() => new QwenImageModel(fixture.Path, backend));
+            var error = Assert.Throws<ModelLoadRefusedException>(() => new QwenImage21DiffusionModel(fixture.Path, backend));
             Assert.Equal("TS_QWEN_IMAGE_VARIANT expects one of base, turbo (which Qwen-Image-2.1 checkpoint the GGUF holds), not 'lightning'.",
                 error.Message);
             Assert.True(ModelLoadRefusal.TryDescribe(error, out _));
@@ -191,33 +193,41 @@ public sealed class QwenImage21TurboTests : IDisposable
     // ---- the model's wiring -----------------------------------------------------------------
 
     /// <summary>
-    /// A <see cref="QwenImageModel"/> no constructor ran for, holding <paramref name="variant"/>
+    /// A <see cref="QwenImage21DiffusionModel"/> no constructor ran for, holding <paramref name="variant"/>
     /// the way a load resolves it (<paramref name="declared"/> or assumed from the file name), on
     /// <paramref name="backend"/>, with <paramref name="dit"/> as its transformer when given. The
     /// sampling and LoRA wiring read nothing else before their checks.
     /// </summary>
-    internal static QwenImageModel ModelOf(QwenImageVariant variant, bool declared = true,
+    internal static QwenImage21DiffusionModel ModelOf(QwenImageVariant variant, bool declared = true,
         GgufFile? dit = null, BackendType backend = BackendType.Cpu)
     {
-        var model = (QwenImageModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImageModel));
+        var model = (QwenImage21DiffusionModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImage21DiffusionModel));
         static void Set(Type owner, object target, string field, object? value) =>
             (owner.GetField(field, BindingFlags.Instance | BindingFlags.NonPublic)
                 ?? throw new MissingFieldException(owner.Name, field)).SetValue(target, value);
-        Set(typeof(QwenImageModel), model, $"<{nameof(QwenImageModel.Variant)}>k__BackingField", variant);
-        Set(typeof(QwenImageModel), model, "_variantDeclared", declared);
+        Set(typeof(QwenImage21DiffusionModel), model, $"<{nameof(QwenImage21DiffusionModel.Variant)}>k__BackingField", variant);
+        Set(typeof(QwenImage21DiffusionModel), model, "_variantDeclared", declared);
         Set(typeof(ModelBase), model, "_backend", backend);
         if (dit != null) Set(typeof(ModelBase), model, "_gguf", dit);
+        // What the constructor's field initializers and family would have set, so SetLoras and Run reach their own checks.
+        Set(typeof(QwenImage21DiffusionModel), model, "_generationLock", new object());
+        Set(typeof(QwenImage21DiffusionModel), model, "_adapters", AdapterSet.Empty);
+        var family = new QwenImage21Family(backend, variant);
+        Set(typeof(QwenImage21DiffusionModel), model, "_family", family);
+        // The runtime pipeline over a family without components and no device budget: a run fails at its first component.
+        Set(typeof(QwenImage21DiffusionModel), model, "_pipeline", new DiffusionPipeline(family, new DiffusionLoad { Backend = backend },
+            new ResidencyPlanner(() => null, _ => { }), _ => { }));
         return model;
     }
 
     [Fact]
     public void TheModelSamplesWithItsCheckpointsRecipe()
     {
-        QwenImageModel turbo = ModelOf(QwenImageVariant.Turbo);
+        QwenImage21DiffusionModel turbo = ModelOf(QwenImageVariant.Turbo);
         Assert.Same(QwenImage21Turbo.Recipe, turbo.CheckpointRecipe);
         Assert.Same(QwenImage21Turbo.Recipe, turbo.SamplingRecipe);
 
-        QwenImageModel baseModel = ModelOf(QwenImageVariant.Base);
+        QwenImage21DiffusionModel baseModel = ModelOf(QwenImageVariant.Base);
         Assert.Null(baseModel.CheckpointRecipe);
         Assert.Null(baseModel.SamplingRecipe);
     }
@@ -228,7 +238,7 @@ public sealed class QwenImage21TurboTests : IDisposable
         // Through the pipeline the model runs, not ResolveSampling alone: a run on Turbo must
         // sample with Turbo's recipe. The model has no encoder, transformer or VAE, so the
         // schedule is the first thing it can fail on.
-        QwenImageModel turbo = ModelOf(QwenImageVariant.Turbo);
+        QwenImage21DiffusionModel turbo = ModelOf(QwenImageVariant.Turbo);
         var ex = Assert.Throws<ArgumentException>(() =>
             turbo.GenerateImage("a red fox", new QwenImageParams { Steps = 12, Width = 512, Height = 512 }));
         Assert.StartsWith("Qwen-Image-2.1-Turbo, which was distilled for one published 8-step schedule", ex.Message, StringComparison.Ordinal);

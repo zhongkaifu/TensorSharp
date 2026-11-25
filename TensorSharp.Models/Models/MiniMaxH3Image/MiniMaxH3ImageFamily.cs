@@ -55,6 +55,16 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>The largest area an edit may ask for: the model's 4-20 MP range (4096 x 5120).</summary>
         public const long MaxEditArea = 4096L * 5120;
 
+        /// <summary>The least a masked crop smaller than its picture samples: the edit's own 2048 x 2048 pixels
+        /// (<see cref="MinGenerationArea"/>) at the crop's aspect, held to <see cref="MaskedCropPictureMultiple"/> times the
+        /// whole picture's pixels. At its own size a 448 x 512 crop came out plain, and at 1 MP it lost the surface detail
+        /// 4 MP draws (docs/models/minimax-h3-image.md, Masked edits). A speed plug-in's floor does not change this one.</summary>
+        public const long MaskedCropFloor = MinGenerationArea;
+
+        /// <summary>How many times its whole picture's pixels a crop's floor may sample: a 1024 x 1024 picture's crop gets
+        /// the full <see cref="MaskedCropFloor"/>, a 512 x 512 picture's 1 MP rather than 16 times the picture.</summary>
+        public const int MaskedCropPictureMultiple = 4;
+
         /// <summary>The family of the denoiser in <paramref name="path"/>: its grid from the safetensors metadata, or the
         /// release grid for a file without it (the legacy model's rule).</summary>
         public static MiniMaxH3ImageFamily ForDenoiser(string path)
@@ -152,10 +162,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// without one its VAE copy's size (a 1024-2048 short edge). Below <see cref="MinGenerationArea"/> (or a speed adapter's
         /// own floor, <see cref="SamplingContract.MinGenerationArea"/>) the picture samples on diffusers' larger canvas
         /// (get_image_canvas_size) and is resized back.
-        /// <para>A masked edit (section 4.5) returns its source canvas: the same rules give the whole picture's canvas, the
-        /// selection's crop (or the whole picture) samples at that canvas's density (<see cref="EditMask.SamplingDimensions"/>),
-        /// and the floor (the family's or the speed adapter's) and the 20 MP ceiling then apply to what it samples, at the
-        /// crop's aspect.</para>
+        /// <para>A masked edit (section 4.5) returns its source canvas: the same rules give the whole picture's canvas, and the
+        /// selection's crop (or the whole picture) samples at that canvas's density but never above its own resolution
+        /// (<see cref="EditMask.SamplingDimensions"/>), so neither the edit's floor nor the latent mask raises it past the
+        /// picture it is composited into. A crop smaller than its picture is the exception: it samples at least
+        /// <see cref="MaskedCropFloor"/> at its own aspect, or <see cref="MaskedCropPictureMultiple"/> times the picture's
+        /// pixels when that is less. The 20 MP ceiling still applies to what it samples, at the crop's aspect.</para>
         /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
@@ -192,13 +204,18 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 width = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vw, multiple));
                 height = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vh, multiple));
             }
-            // A speed adapter's contract may lower the floor (pDMD's 1024 px: an edit samples at the asked size, as the
-            // adapter's diffusers pipeline does); otherwise the family's 4 MP floor. Masked or not.
-            long floor = request.Adapters?.Contract is { MinGenerationArea: > 0 } contract ? contract.MinGenerationArea : MinGenerationArea;
             if (mask != null)
             {
-                var (cw, ch) = mask.SamplingDimensions(width, height, multiple);
-                var selection = EditCanvas(cw, ch, multiple, floor);
+                var selection = mask.SamplingDimensions(width, height, multiple);
+                long cropFloor = Math.Min(MaskedCropFloor, MaskedCropPictureMultiple * (long)mask.Source.Width * mask.Source.Height);
+                if ((mask.Width < mask.Source.Width || mask.Height < mask.Source.Height) &&
+                    (long)selection.Width * selection.Height < cropFloor)
+                {
+                    // The floor's area at the crop's aspect, also for a crop that only a smaller canvas took below it.
+                    double scale = Math.Sqrt(cropFloor / ((double)mask.Width * mask.Height));
+                    selection = (Math.Max(selection.Width, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Width * scale, multiple))),
+                                 Math.Max(selection.Height, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Height * scale, multiple))));
+                }
                 if ((long)selection.Width * selection.Height > MaxEditArea)
                 {
                     if (request.Width > 0)
@@ -210,6 +227,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 }
                 return new DiffusionCanvas(selection, (mask.Source.Width, mask.Source.Height));
             }
+            // A speed adapter's contract may lower the floor (pDMD's 1024 px: an edit samples at the asked size, as the
+            // adapter's diffusers pipeline does); otherwise the family's 4 MP floor. A masked selection takes neither (above;
+            // a crop takes the masked crop floor instead).
+            long floor = request.Adapters?.Contract is { MinGenerationArea: > 0 } contract ? contract.MinGenerationArea : MinGenerationArea;
             var sampling = EditCanvas(width, height, multiple, floor);
             if ((long)sampling.Width * sampling.Height > MaxEditArea)
             {

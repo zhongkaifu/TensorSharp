@@ -10,30 +10,24 @@ namespace TensorSharp.Models.QwenImage
     internal sealed class QwenImage21Vae : IDisposable, IGgmlHostMemoryOwner
     {
         private VaeWeights _weights;
-        public QwenImage21Vae(QwenImageModel model)
+        public QwenImage21Vae(IFloatTensorStore source, BackendType backend)
         {
-            QwenImage21CompanionValidation.ValidateVae(model.VaeWeightSource);
-            _weights = VaeWeights.Load(model.VaeWeightSource);
+            QwenImage21CompanionValidation.ValidateVae(source);
+            _weights = VaeWeights.Load(source);
             // Vulkan convolutions run on the device too: the native F32 convolution
             // rescales inputs past the F16 range that Vulkan's matrix units accept.
-            bool ggml = model.Backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlMetal
+            bool ggml = backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlMetal
                 or BackendType.GgmlVulkan;
-            VaeReferenceMath.UseGpuConv = ggml && Environment.GetEnvironmentVariable("TS_QWEN_VAE_GPU") != "0";
-            // The whole-VAE graph, by default on CUDA and Metal. On an M5 Pro at 2048x2048 it
-            // decodes in 25 s instead of 85 s with a 45 GB instead of 64 GB peak footprint,
-            // at 97-100 dB PSNR to the per-op path (1024x1024: 5 s instead of 13-15 s, where
-            // stable-diffusion.cpp takes 7 s). TS_QWEN21_VAE_FUSED=1 forces it on another GGML
-            // backend, =0 turns it off.
-            // Never on Vulkan: NVIDIA Vulkan multiplies through F16 cooperative-matrix
-            // operands and only the per-convolution path rescales for that (the fused graph
-            // turns the decoder's >65504 activations into NaN there).
-            string fused = Environment.GetEnvironmentVariable("TS_QWEN21_VAE_FUSED");
-            if (fused == "1" && model.Backend == BackendType.GgmlVulkan)
-                Console.WriteLine("  [vae21] TS_QWEN21_VAE_FUSED=1 ignored on Vulkan: the whole-VAE graph overflows F16 " +
-                    "cooperative-matrix operands there; decoding per convolution instead.");
-            VaeReferenceMath.UseFusedGraph21 = model.Backend != BackendType.GgmlVulkan &&
-                (fused == "1" || (fused != "0" && model.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal));
-            if (ggml) GgmlBasicOps.EnsureBackendAvailable(model.Backend switch
+            VaeReferenceMath.UseGpuConv = ggml;
+            // The whole-VAE graph on CUDA and Metal. On an M5 Pro at 2048x2048 it decodes in
+            // 25 s instead of 85 s with a 45 GB instead of 64 GB peak footprint, at 97-100 dB
+            // PSNR to the per-op path (1024x1024: 5 s instead of 13-15 s, where
+            // stable-diffusion.cpp takes 7 s). Per convolution on ggml-cpu, and on Vulkan:
+            // NVIDIA Vulkan multiplies through F16 cooperative-matrix operands and only the
+            // per-convolution path rescales for that (the fused graph turns the decoder's
+            // >65504 activations into NaN there).
+            VaeReferenceMath.UseFusedGraph21 = backend is BackendType.GgmlCuda or BackendType.GgmlMetal;
+            if (ggml) GgmlBasicOps.EnsureBackendAvailable(backend switch
             {
                 BackendType.GgmlCuda => GgmlBackendType.Cuda,
                 BackendType.GgmlMetal => GgmlBackendType.Metal,
@@ -53,24 +47,10 @@ namespace TensorSharp.Models.QwenImage
     internal static partial class VaeReferenceMath
     {
         internal static bool UseFusedGraph21;
-        private static readonly bool TraceVae21 = Environment.GetEnvironmentVariable("TS_QWEN21_VAE_TRACE") == "1";
-
-        private static void Trace21(string name, float[] values)
-        {
-            if (!TraceVae21) return;
-            int nonFinite = 0;
-            float max = 0;
-            foreach (float value in values)
-                if (!float.IsFinite(value)) nonFinite++;
-                else max = Math.Max(max, Math.Abs(value));
-            Console.WriteLine($"  [vae21] {name}: count={values.Length} nonfinite={nonFinite} maxabs={max:G9}");
-            if (nonFinite != 0) throw new InvalidOperationException($"Qwen-Image-2.1 VAE first non-finite tensor: {name}.");
-        }
 
         private static QwenImageVaeGraph FusedGraph21(VaeWeights weights)
         {
-            if (!UseGpuConv || !UseFusedGraph || !UseFusedGraph21 || weights.FusedGraphBuildFailed ||
-                Environment.GetEnvironmentVariable("TS_QWEN21_VAE_FUSED") == "0") return null;
+            if (!UseGpuConv || !UseFusedGraph21 || weights.FusedGraphBuildFailed) return null;
             if (weights.FusedGraph == null)
             {
                 weights.FusedGraph = QwenImageVaeGraph.TryBuild(weights);
@@ -92,35 +72,21 @@ namespace TensorSharp.Models.QwenImage
             int kh = (int)shape[^2], kw = (int)shape[^1];
             int kd = shape.Length == 5 ? (int)shape[2] : 1;
             float[] bias = w.Get(prefix + ".bias");
-            Trace21(prefix + ".input", x.D);
-            Feature result;
             if (FastCpu)
-            {
-                if (TraceVae21) Trace21(prefix + ".weight", w.KernelSlice(prefix + ".weight", oc, ic, kd, kh, kw));
-                Trace21(prefix + ".bias", bias);
-                result = Conv2dCpu(x, w.PackedKernel(prefix + ".weight", oc, ic, kd, kh * kw), bias, oc, kh, kw,
+                return Conv2dCpu(x, w.PackedKernel(prefix + ".weight", oc, ic, kd, kh * kw), bias, oc, kh, kw,
                     1, 1, pad, pad, pad, pad, upsample2x);
-            }
-            else
-            {
-                float[] weight = w.KernelSlice(prefix + ".weight", oc, ic, kd, kh, kw);
-                Trace21(prefix + ".weight", weight);
-                Trace21(prefix + ".bias", bias);
-                result = Conv2d(upsample2x ? NearestUpsample2x(x) : x, weight, oc, ic, kh, kw, bias, 1, 1, pad, pad, pad, pad);
-            }
-            Trace21(prefix + ".output", result.D);
-            return result;
+            float[] weight = w.KernelSlice(prefix + ".weight", oc, ic, kd, kh, kw);
+            return Conv2d(upsample2x ? NearestUpsample2x(x) : x, weight, oc, ic, kh, kw, bias, 1, 1, pad, pad, pad, pad);
         }
 
         // Norm then SiLU: one fused pass on the managed fast path (vectorized exp), the exact
-        // scalar SiLU elsewhere and whenever tracing needs the pre-activation tensor. With
-        // inPlace (x is dead afterwards) the fast path overwrites x instead of allocating a map;
-        // the result is either x or a new map, and the caller releases accordingly.
-        private static Feature NormSilu21(VaeWeights w, string gammaName, string traceName, Feature x, bool inPlace = false)
+        // scalar SiLU elsewhere. With inPlace (x is dead afterwards) the fast path overwrites x
+        // instead of allocating a map; the result is either x or a new map, and the caller
+        // releases accordingly.
+        private static Feature NormSilu21(VaeWeights w, string gammaName, Feature x, bool inPlace = false)
         {
-            if (FastCpu && !TraceVae21) return RmsNormChannelFast(x, w.Get(gammaName), silu: true, inPlace);
+            if (FastCpu) return RmsNormChannelFast(x, w.Get(gammaName), silu: true, inPlace);
             var t = RmsNormChannel(x, w.Get(gammaName));
-            Trace21(traceName, t.D);
             SiluInPlace(t.D);
             return t;
         }
@@ -135,17 +101,16 @@ namespace TensorSharp.Models.QwenImage
             var residual = hasShortcut ? Conv21(w, prefix + ".shortcut", x, 0) : x;
             // With a shortcut conv, x has no reader after the first norm: normalize it in place.
             bool inputDead = ownsInput && hasShortcut;
-            var t = NormSilu21(w, prefix + ".residual.0.gamma", prefix + ".residual.0.output", x, inPlace: inputDead);
+            var t = NormSilu21(w, prefix + ".residual.0.gamma", x, inPlace: inputDead);
             var u = Conv21(w, prefix + ".residual.2", t, 1);
             if (!ReferenceEquals(t, x)) VaeFeaturePool.Release(t);
             if (inputDead) VaeFeaturePool.Release(x);
-            var v = NormSilu21(w, prefix + ".residual.3.gamma", prefix + ".residual.3.output", u, inPlace: true);
+            var v = NormSilu21(w, prefix + ".residual.3.gamma", u, inPlace: true);
             var result = Conv21(w, prefix + ".residual.6", v, 1);
             VaeFeaturePool.Release(v);
             if (!ReferenceEquals(v, u)) VaeFeaturePool.Release(u);
             AddInPlace(result, residual);
             if (hasShortcut || ownsInput) VaeFeaturePool.Release(residual);
-            Trace21(prefix + ".output", result.D);
             return result;
         }
 
@@ -153,7 +118,6 @@ namespace TensorSharp.Models.QwenImage
         {
             x = Residual21(w, prefix + ".0", x, ownsInput: true);
             x = AttentionBlock(w, prefix + ".1", x);
-            Trace21(prefix + ".1.output", x.D);
             return Residual21(w, prefix + ".2", x, ownsInput: true);
         }
 
@@ -163,7 +127,6 @@ namespace TensorSharp.Models.QwenImage
         internal static Feature AverageDown21(Feature x, int outChannels, int timeFactor, int spatialFactor)
         {
             int group = x.C * timeFactor * spatialFactor * spatialFactor / outChannels;
-            long t0 = VaeCpuProfile.Start();
             var y = new Feature(outChannels, x.H / spatialFactor, x.W / spatialFactor);
             int sf2 = spatialFactor * spatialFactor;
             // Output channels are independent and each keeps its sequential group order, so the
@@ -186,7 +149,6 @@ namespace TensorSharp.Models.QwenImage
                     }
                 }
             }, CpuPool);
-            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
             return y;
         }
 
@@ -194,7 +156,6 @@ namespace TensorSharp.Models.QwenImage
         // the first chunk retains only the final temporal sample.
         internal static Feature DuplicateUp21(Feature x, int outChannels, int timeFactor, int spatialFactor)
         {
-            long t0 = VaeCpuProfile.Start();
             int repeats = outChannels * timeFactor * spatialFactor * spatialFactor / x.C;
             var y = Feature.Uninitialized(outChannels, x.H * spatialFactor, x.W * spatialFactor);
             CpuPackedGemm.ForEach(outChannels * y.H, (long)y.D.Length >= 1 << 16, row =>
@@ -210,7 +171,6 @@ namespace TensorSharp.Models.QwenImage
                     for (int u = 0; u < x.W; u++) y.D[dst + u * spatialFactor + j] = x.D[src + u];
                 }
             }, CpuPool);
-            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
             return y;
         }
 
@@ -226,7 +186,6 @@ namespace TensorSharp.Models.QwenImage
             if (a.H != x.H * spatialFactor || a.W != x.W * spatialFactor ||
                 (long)outChannels * timeFactor * spatialFactor * spatialFactor % x.C != 0)
                 throw new ArgumentException($"cannot add the {spatialFactor}x duplicate of [{x.C}, {x.H}, {x.W}] to [{a.C}, {a.H}, {a.W}]");
-            long t0 = VaeCpuProfile.Start();
             int repeats = outChannels * timeFactor * spatialFactor * spatialFactor / x.C;
             // DuplicateUp21's index math: output column v = u*s + j reads input column u of the
             // channel selected by (oc, h % s, j), row h / s.
@@ -241,7 +200,6 @@ namespace TensorSharp.Models.QwenImage
                     for (int u = 0; u < x.W; u++) a.D[dst + u * spatialFactor + j] += x.D[src + u];
                 }
             }, CpuPool);
-            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
             return a;
         }
 
@@ -256,7 +214,6 @@ namespace TensorSharp.Models.QwenImage
                 for (int c = 0; c < 3; c++) x.D[c * hw + i] = image.Pixels[i * 3 + c] * 2f - 1f;
                 x.D[3 * hw + i] = image.Alpha == null ? 1f : image.Alpha[i] * 2f - 1f;
             }
-            Trace21("encoder.input", x.D);
             var fused = FusedGraph21(w);
             using var pool = VaeFeaturePool.Enter(FastCpu);
             if (fused != null && fused.TryEncode(x.D, x.H, x.W, out var moments, out int lh, out int lw))
@@ -277,13 +234,11 @@ namespace TensorSharp.Models.QwenImage
                     VaeFeaturePool.Release(shortcut);
                 }
                 x = Mid21(w, "encoder.middle", x);
-                var normalized = NormSilu21(w, "encoder.head.0.gamma", "encoder.head.0.output", x, inPlace: true);
+                var normalized = NormSilu21(w, "encoder.head.0.gamma", x, inPlace: true);
                 if (!ReferenceEquals(normalized, x)) VaeFeaturePool.Release(x);
                 x = Consume(Conv21(w, "encoder.head.2", normalized, 1), normalized);
                 x = Consume(Conv21(w, "conv1", x, 0), x);
             }
-            VaeCpuProfile.Report($"encode {image.Width}x{image.Height}");
-            if (pool != null && VaeCpuProfile.Enabled) Console.WriteLine("  [vae21-profile] encode " + pool.Describe());
             int pixels = x.H * x.W;
             var latent = new float[64 * pixels];
             for (int c = 0; c < 64; c++)
@@ -308,7 +263,6 @@ namespace TensorSharp.Models.QwenImage
             var x = new Feature(64, latent.Height, latent.Width);
             for (int c = 0; c < 64; c++)
                 for (int i = 0; i < pixels; i++) x.D[c * pixels + i] = latent.Data[c * pixels + i] * Qwen21Std[c] + Qwen21Mean[c];
-            Trace21("decoder.input", x.D);
             var fused = FusedGraph21(w);
             using var pool = VaeFeaturePool.Enter(FastCpu);
             if (fused != null && fused.TryDecode(x.D, x.H, x.W, out var rgba, out int oh, out int ow))
@@ -335,12 +289,10 @@ namespace TensorSharp.Models.QwenImage
                         VaeFeaturePool.Release(stageInput);
                     }
                 }
-                var normalized = NormSilu21(w, "decoder.head.0.gamma", "decoder.head.0.output", x, inPlace: true);
+                var normalized = NormSilu21(w, "decoder.head.0.gamma", x, inPlace: true);
                 if (!ReferenceEquals(normalized, x)) VaeFeaturePool.Release(x);
                 x = Consume(Conv21(w, "decoder.head.2", normalized, 1), normalized);
             }
-            VaeCpuProfile.Report($"decode {latent.Width * 16}x{latent.Height * 16}");
-            if (pool != null && VaeCpuProfile.Enabled) Console.WriteLine("  [vae21-profile] decode " + pool.Describe());
             if (Array.Exists(x.D, v => !float.IsFinite(v)))
                 throw new InvalidOperationException("Qwen-Image-2.1 VAE produced non-finite RGBA values.");
             pixels = x.H * x.W;

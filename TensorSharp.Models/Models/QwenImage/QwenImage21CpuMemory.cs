@@ -106,7 +106,7 @@ namespace TensorSharp.Models.QwenImage
         }
 
         /// <summary>Physical memory not in use right now, from a fresh GC memory-load sample (see
-        /// QwenImage21ManagedDiT's free-memory rule for why the gen-0 collection), or 0 if unknown.</summary>
+        /// QwenImage21Denoiser's free-memory rule for why the gen-0 collection), or 0 if unknown.</summary>
         internal static long FreeMemoryBytes()
         {
             try

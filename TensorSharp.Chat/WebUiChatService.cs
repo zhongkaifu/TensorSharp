@@ -1433,13 +1433,13 @@ namespace TensorSharp.Chat
         /// <summary>
         /// Ask the loaded image model's own Qwen3-VL-8B which of <paramref name="options"/> fits
         /// the question in <paramref name="system"/> and <paramref name="user"/>
-        /// (<see cref="TensorSharp.Models.QwenImage.QwenImageModel.ChooseAnswer"/>): a host that plans
+        /// (<see cref="TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel.ChooseAnswer"/>): a host that plans
         /// an image turn from the whole conversation asks it what the newest message wants done.
         /// The options are their texts; the model letters them and asks for a letter itself.
         ///
         /// <para>Null when the loaded model is not Qwen-Image-2.1, when it is being unloaded,
         /// or when it cannot score the question (no GGML backend, an encoder-only text-encoder
-        /// GGUF, a question over <see cref="TensorSharp.Models.QwenImage.QwenImageModel.MaxQuestionTokens"/>);
+        /// GGUF, a question over <see cref="TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel.MaxQuestionTokens"/>);
         /// the caller decides without it. Cancellation and engine failures propagate.</para>
         ///
         /// <para>It is a media job, counted BEFORE the model is read: a host's model switch asks
@@ -1460,7 +1460,7 @@ namespace TensorSharp.Chat
             Interlocked.Increment(ref _mediaJobs);
             try
             {
-                if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel model)
+                if (_svc.Model is not TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel model)
                     return null;
                 retired = !model.TryEnterUse();
                 if (retired)
@@ -1515,7 +1515,7 @@ namespace TensorSharp.Chat
             return choice;
         }
 
-        // Every loadable QwenImageModel is a Qwen-Image-2.1 model: earlier Qwen-Image
+        // Every loadable QwenImage21DiffusionModel is a Qwen-Image-2.1 model: earlier Qwen-Image
         // checkpoints are refused at load, so the model type is the whole check.
         private const string NotAnImageModelError = "The loaded model is not a Qwen-Image-2.1 model.";
         private const string NotAGenerationModelError =
@@ -2042,7 +2042,7 @@ namespace TensorSharp.Chat
         /// (<c>--lora</c>). The set is swapped in under the same lock as the run, so a picture
         /// that waited behind another is made with the set it was asked with, and an unchanged
         /// set costs nothing. Pass absolute paths: specs are compared as the model records them
-        /// (<see cref="TensorSharp.Models.QwenImage.QwenImageModel.LoraSpecs"/>). A set that
+        /// (<see cref="TensorSharp.Models.QwenImage21.QwenImage21DiffusionModel.LoraSpecs"/>). A set that
         /// cannot be applied ends the stream with the reason, and the previous set stays.
         /// </summary>
         public IAsyncEnumerable<object> ImageEditStreamAsync(JsonElement body, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken) =>

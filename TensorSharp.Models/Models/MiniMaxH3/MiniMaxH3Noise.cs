@@ -1,7 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
-using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.SharedDiffusion;
 
 namespace TensorSharp.Models.MiniMaxH3;
 
@@ -20,7 +20,7 @@ internal static class MiniMaxH3Noise
         int extraChannels = checked((audioLength + volume - 1) / volume);
         // The reference draws once over the complete padded packed tensor. Keep
         // that counter geometry rather than drawing separate video/audio streams.
-        float[] packed = QwenImage21Sampling.Noise(checked(volume * (MiniMaxH3Geometry.VideoLatentChannels + extraChannels)), seed);
+        float[] packed = PhiloxNoise.Draw(checked(volume * (MiniMaxH3Geometry.VideoLatentChannels + extraChannels)), seed);
         float[] thwc = ToThwc(packed, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth);
         float[] video = MiniMaxH3DiT.PatchifyVideo(thwc, shape.LatentFrames, shape.LatentHeight,
             shape.LatentWidth, MiniMaxH3Geometry.VideoLatentChannels);
@@ -40,7 +40,7 @@ internal static class MiniMaxH3Noise
         int length = checked(frames * height * width * MiniMaxH3Geometry.VideoLatentChannels);
         if (latent.Length != length) throw new ArgumentException("H3 visual conditioning must have THWC latent geometry.", nameof(latent));
         // Every reference is reseeded, independently of the initial packed draw.
-        float[] noise = ToThwc(QwenImage21Sampling.Noise(length, seed), frames, height, width);
+        float[] noise = ToThwc(PhiloxNoise.Draw(length, seed), frames, height, width);
         const float timestep = MiniMaxH3Scheduler.VisualConditionTimestep;
         for (int i = 0; i < length; ++i)
             latent[i] = latent[i] * timestep + noise[i] * (1 - timestep);

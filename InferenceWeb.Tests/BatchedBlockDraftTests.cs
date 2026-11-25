@@ -19,8 +19,11 @@ namespace InferenceWeb.Tests;
 /// every draft and every commit. A request's drafts beside copies of itself are its drafts beside other requests (nothing of
 /// another lane reaches its rows): the same bits on every executor, the two runs' programs having the same shapes.
 /// <para>Against a lone draft a product's rounding follows its row count (the lanes' 4 x b rows against a lone block's b).
-/// ggml's CPU gives a row its bits whatever the rows beside it: the blocks and rings are the lone drafts' bits. The managed
-/// CPU rounds the two within ~1e-6: every id agrees, confidences and ring rows within 1e-5. A GPU's products round them apart
+/// ggml's CPU does not give a row its bits whatever the rows beside it: upstream ggml-cpu runs an F32 product of several rows
+/// through llamafile's tinyBLAS (2 or more rows on x86, 4 or more on ARM NEON; llamafile/sgemm.cpp) and a narrower one through
+/// ggml_vec_dot, whose sums run in another order, so a lane's rows beside three others round apart from its lone draft's
+/// (measured on the x64 and ARM CI runners and a 4-core Xeon: ring rows ~1e-7 apart, confidences ~1e-8). It and the managed
+/// CPU (within ~1e-6) are held to the same bound: every id agrees, confidences and ring rows within 1e-5. A GPU's products round them apart
 /// by up to ~1e-3 (ggml-metal's products of more than 8 rows take its half-precision tiles; MLX's ring rows are 3e-4 apart):
 /// ring rows within 1e-3, confidences within 1e-3 (ggml_cuda, whose F32 products of more rows than its matrix-vector kernel
 /// takes run on the TF32 tensor cores: 5e-3, ring rows 2e-3), and a block may part from its lone draft only at a slot the
@@ -181,7 +184,8 @@ public sealed class BatchedBlockDraftTests : IDisposable
         var (target, draft) = Fixtures(variant);
         if (family == "qwen4exp") target = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e.gguf"), indexerTopK: 16, qsa: true);
         var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block, MaxDraftTokens = 3, MinDraftProb = 0 };
-        // The managed CPU and ggml's CPU give a decode-size row its bits whatever the rows beside it; ggml's GPU kernels and
+        // The managed CPU and ggml's CPU round a decode-size row within ~1e-7 of its lone bits, far inside this checkpoint's
+        // ties, so every token agrees; ggml's GPU kernels and
         // direct CUDA's products round by their row count, where a synthetic checkpoint's near-tied logits pick either token.
         double nearTie = backend is BackendType.Cpu or BackendType.GgmlCpu ? 0 : 1e-2;
         await SpeculativeRuntimeChecks.AssertBatchedBlockDraftsDraftAsEachRequest(() => Create(family, target, draft, backend),
@@ -198,8 +202,11 @@ public sealed class BatchedBlockDraftTests : IDisposable
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         var (target, draft) = Fixtures(variant);
         using StandardDecoderModel together = Create("qwen35", target, draft, backend), alone = Create("qwen35", target, draft, backend);
-        // ggml's CPU gives a row its bits whatever the rows beside it: there the blocks and rings are the lone drafts' bits.
-        bool bitwise = backend == BackendType.GgmlCpu, cpu = backend is BackendType.Cpu or BackendType.GgmlCpu;
+        // No executor gives a lane its lone draft's bits: ggml's CPU sums a product of several rows (llamafile's tinyBLAS) in
+        // another order than a narrower one (ggml_vec_dot), and the managed CPU's and the GPUs' products round by row count too.
+        // Bit-identity holds against copies of the lane, whose programs have the same shapes (ALaneDraftsTheSameBesideCopiesOfItself).
+        const bool bitwise = false;
+        bool cpu = backend is BackendType.Cpu or BackendType.GgmlCpu;
         double tolerance = cpu ? CpuTolerance : backend == BackendType.GgmlCuda ? Tf32Tolerance : GpuTolerance;
         double ringTolerance = backend == BackendType.GgmlCuda ? Tf32RingTolerance : tolerance;
         string label = $"{backend} {variant}";

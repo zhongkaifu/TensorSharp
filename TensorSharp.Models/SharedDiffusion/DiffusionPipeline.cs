@@ -129,7 +129,7 @@ namespace TensorSharp.Models.SharedDiffusion
             ResidencyPlan plan = PlanResidency(job);
             if (plan.Refused)
                 throw new RequestRefusedException(Refusal(job, plan));
-            INoiseSource noise = _family.Noise(request.Seed);
+            INoiseSource noise = _family.Noise(request);
             var clock = Stopwatch.StartNew();
 
             // ---- Condition: text, and the references' vision copies.
@@ -191,6 +191,34 @@ namespace TensorSharp.Models.SharedDiffusion
             if (sourceRows != null) EditMask.Reinject(x, sourceRows, eps, maskWeights, maskValues, job.Sigmas[0]);
             int interval = request.PreviewCount > 0 ? Math.Max(1, (job.Steps + request.PreviewCount) / (request.PreviewCount + 1)) : 0;
             var stepSeconds = new double[job.Steps];
+            try
+            {
+                Denoise(request, job, denoiser, sampler, x, eps, positive, negative, references, sourceRows, maskWeights, maskValues,
+                    interval, stepSeconds, ct, betweenSteps);
+            }
+            finally
+            {
+                // The request's per-request state (a prefix cache's keys and values) goes before the decode needs the room.
+                denoiser.FinishRequest();
+            }
+            LeavePhase(DiffusionComponent.Denoiser, job.Demand(DiffusionPhase.Denoise));
+            double denoiseSeconds = clock.Elapsed.TotalSeconds;
+            ct.ThrowIfCancellationRequested();
+
+            // ---- Decode.
+            clock.Restart();
+            EnterPhase(request, DiffusionPhase.Decode, DiffusionComponent.Vae, plan);
+            RgbImage image = Vae.Decode(_family.FromRows(x, job.Target), ct);
+            LeavePhase(DiffusionComponent.Vae, job.Demand(DiffusionPhase.Decode));
+            double decodeSeconds = clock.Elapsed.TotalSeconds;
+            return Finish(request, job, total, image, positive, references, plan, conditionSeconds, vision, encodeSeconds, denoiseSeconds,
+                stepSeconds, decodeSeconds, clock);
+        }
+
+        private void Denoise(DiffusionRequest request, Prepared job, IDenoiser denoiser, IDiffusionSampler sampler, float[] x, float[] eps,
+            ConditioningSet positive, ConditioningSet negative, LatentRef[] references, float[] sourceRows, float[] maskWeights,
+            int maskValues, int interval, double[] stepSeconds, CancellationToken ct, Action betweenSteps)
+        {
             for (int i = 0; i < job.Steps; i++)
             {
                 if (i > 0) betweenSteps?.Invoke();
@@ -218,17 +246,12 @@ namespace TensorSharp.Models.SharedDiffusion
                     preview = Preview(x, velocity, next, sourceRows, eps, maskWeights, maskValues, job);
                 Report(request, new DiffusionProgress(DiffusionPhase.Denoise, i + 1, job.Steps, preview));
             }
-            LeavePhase(DiffusionComponent.Denoiser, job.Demand(DiffusionPhase.Denoise));
-            double denoiseSeconds = clock.Elapsed.TotalSeconds;
-            ct.ThrowIfCancellationRequested();
+        }
 
-            // ---- Decode.
-            clock.Restart();
-            EnterPhase(request, DiffusionPhase.Decode, DiffusionComponent.Vae, plan);
-            RgbImage image = Vae.Decode(_family.FromRows(x, job.Target), ct);
-            LeavePhase(DiffusionComponent.Vae, job.Demand(DiffusionPhase.Decode));
-            double decodeSeconds = clock.Elapsed.TotalSeconds;
-
+        private DiffusionResult Finish(DiffusionRequest request, Prepared job, Stopwatch total, RgbImage image, ConditioningSet positive,
+            LatentRef[] references, ResidencyPlan plan, double conditionSeconds, double vision, double encodeSeconds, double denoiseSeconds,
+            double[] stepSeconds, double decodeSeconds, Stopwatch clock)
+        {
             // ---- Composite: the requested size, a masked edit's source canvas.
             clock.Restart();
             Report(request, new DiffusionProgress(DiffusionPhase.Composite));
@@ -350,31 +373,33 @@ namespace TensorSharp.Models.SharedDiffusion
                 if (cfg > 1f) throw new ArgumentException($"{name} is guidance-distilled: cfg must be 1 (or left unset).");
                 if (!string.IsNullOrWhiteSpace(r.NegativePrompt)) throw new ArgumentException($"{name} takes no negative prompt.");
             }
-            float[] sigmas = recipe.SigmasFor(steps);
-
             RgbImage first = references.Count > 0 ? references[0].Image : null;
             EditMask mask = r.Mask == null ? null : EditMask.Create(r.Mask, first);
             var job = new Prepared
             {
-                Recipe = recipe, Steps = steps, Sigmas = sigmas, Cfg = cfg,
+                Recipe = recipe, Steps = steps, Cfg = cfg,
                 Guided = _family.Guidance == DiffusionGuidance.Cfg && cfg > 1f,
                 Adapters = adapters, Mask = mask,
                 Inputs = references.Select(x => x.Image).ToArray(),
             };
             // The canvas is resolved (and a bad size refused) before an empty selection returns its source unchanged.
             job.Canvas = _family.ResolveCanvas(r, mask);
+            job.Target = geometry.LatentOf(job.Canvas.Sampling.Width, job.Canvas.Sampling.Height);
+            long Rows(LatentShape s) => (long)(s.Height / geometry.Patch) * (s.Width / geometry.Patch);
+            job.TargetRows = Rows(job.Target);
+            // A schedule shifted by the image's size (Qwen-Image-2.1's) reads the target's denoiser tokens.
+            job.Sigmas = recipe.SigmasFor(steps, job.TargetRows);
             if (mask?.IsEmpty == true) return job;
             // A selection's canvas (or crop) is the first picture the encoders see; the others keep their own.
             if (mask != null) job.Inputs[0] = mask.Reference;
-            job.Target = geometry.LatentOf(job.Canvas.Sampling.Width, job.Canvas.Sampling.Height);
             // Both copies of every reference are made (and a bad one refused) before any component runs: the vision copy
             // the conditioner reads, and the VAE copy the encoder reads.
             job.VaeCopies = new RgbImage[job.Inputs.Length];
             job.Pictures = new PresentedImage[job.Inputs.Length];
             for (int i = 0; i < job.Inputs.Length; i++)
             {
-                job.Pictures[i] = _family.References.ForVision(job.Inputs[i], i);
-                job.VaeCopies[i] = _family.References.ForVae(job.Inputs[i], i);
+                job.Pictures[i] = _family.References.ForVision(job.Inputs[i], i, job.Canvas);
+                job.VaeCopies[i] = _family.References.ForVae(job.Inputs[i], i, job.Canvas);
             }
             job.EncodesReferences = job.Inputs.Length > 0 || mask is { IsFull: false };
 
@@ -386,8 +411,6 @@ namespace TensorSharp.Models.SharedDiffusion
                 job.Demands.Add(new(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.EncodeReferences)));
             job.Demands.Add(new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser.WorkingBytes(workload, DiffusionPhase.Denoise)));
             job.Demands.Add(new(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.Decode)));
-            long Rows(LatentShape s) => (long)(s.Height / geometry.Patch) * (s.Width / geometry.Patch);
-            job.TargetRows = Rows(job.Target);
             job.ReferenceRows = workload.References.Sum(Rows);
             _log($"{name}: {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height}" +
                  (job.Canvas.Output != job.Canvas.Sampling ? $" (returned at {job.Canvas.Output.Width}x{job.Canvas.Output.Height})" : "") +
@@ -492,6 +515,13 @@ namespace TensorSharp.Models.SharedDiffusion
         {
             _workspaces[component] = Math.Max(_workspaces.GetValueOrDefault(component), workingBytes);
             _running = null;
+            if (Created(component) is { ReleaseAfterPhase: true } released)
+            {
+                released.ReleaseWorkspace();
+                released.ReleaseDevice();
+                _workspaces.Remove(component);
+                _resident.Remove(component);
+            }
         }
 
         private void ReleaseWorkspaces()

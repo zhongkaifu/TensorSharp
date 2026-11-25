@@ -11,7 +11,8 @@
 //   * TSGgml_QwenVaeAttention - tiled spatial VAE attention
 //   * TSGgml_QwenVaeRun       - the whole VAE encode/decode as one graph
 //   * TSGgml_QwenTeTrunk      - the Qwen3-VL-8B text-encoder trunk as one graph
-// The Qwen-Image-2.1 transformer itself lives in ggml_ops_qwen_image21.cpp.
+// The Qwen-Image-2.1 transformer runs as the diffusion runtime's graph programs
+// (TensorSharp.Models/Models/QwenImage21/QwenImage21Denoiser.Emit.cs).
 // ============================================================================
 #include "ggml_ops_internal.h"
 #include "ggml-alloc.h"
@@ -368,11 +369,7 @@ TSG_EXPORT int TSGgml_QwenVaeRun(const TSGgmlQwenVaeDesc* d)
                     // its transient F32 im2col fits a budget — the gallocr reuses that scratch
                     // across the graph, so the peak is ONE conv's im2col, not the sum. Above
                     // the budget fall back to ggml_conv_2d_direct (no materialization).
-                    static const long long kIm2colBudget = []() {
-                        const char* e = std::getenv("TS_QWEN_VAE_FUSED_IM2COL_BUDGET");
-                        long long v = e ? std::atoll(e) : 0;
-                        return v > 0 ? v : 2LL * 1024 * 1024 * 1024;
-                    }();
+                    constexpr long long kIm2colBudget = 2LL * 1024 * 1024 * 1024;
                     const long long oh = (x->ne[1] + 2LL * p1 - op.kh) / op.sh + 1;
                     const long long ow = (x->ne[0] + 2LL * p0 - op.kw) / op.sw + 1;
                     const long long im2col = static_cast<long long>(op.ic) * op.kh * op.kw * oh * ow * 4;
@@ -559,24 +556,6 @@ struct TSGImgAttnW
 };
 static_assert(sizeof(void*) != 8 || sizeof(TSGImgAttnW) == 48, "TSGImgAttnW must match managed QImgAttnW");
 
-namespace {
-
-// Quantized matmul with overflow-safe activation pre-scaling. ggml quantizes the
-// activation to q8_1, whose per-block FP16 sum overflows for large activations.
-// Scaling the activation by 1/K before the matmul (and the result by K) keeps that
-// FP16 sum in range; q8_1 is scale-invariant in precision (the per-block scale
-// adapts), so this is exact. `prescale = false` skips both passes. The trunk below
-// uses it only for the TS_QWEN21_TE_PRESCALE=1 diagnostic.
-constexpr float QI_MM_SCALE = 1024.0f;
-ggml_tensor* qi_mm(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, bool prescale = true)
-{
-    if (!prescale) return ggml_mul_mat(ctx, w, x);
-    ggml_tensor* xs = ggml_scale(ctx, x, 1.0f / QI_MM_SCALE);
-    return ggml_scale(ctx, ggml_mul_mat(ctx, w, xs), QI_MM_SCALE);
-}
-
-} // namespace
-
 // ============================================================================
 // Fused transformer trunk for the Qwen-Image-2.1 text encoder (TSGgml_QwenTeTrunk):
 // the Qwen3-VL-8B LLM (36 layers, GQA, causal, per-head Q/K RMS norms) ran per-op
@@ -648,16 +627,6 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
             if (d->layers[l].q_norm == nullptr || d->layers[l].k_norm == nullptr)
             { set_last_error("QwenTeTrunk: every layer needs its Q/K head norms."); return 0; }
         const float eps = d->eps, scale = 1.0f / std::sqrt(static_cast<float>(hd));
-        const char* trace_dir = std::getenv("TS_QWEN_TE_TRACE_DIR");
-        const char* trace_layer_env = std::getenv("TS_QWEN_TE_TRACE_LAYER");
-        const int trace_layer = trace_layer_env ? std::atoi(trace_layer_env) : 0;
-        struct TraceTensor { ggml_tensor* tensor; std::string name; float scale; };
-        std::vector<TraceTensor> traces;
-        auto trace = [&](int layer, const char* name, ggml_tensor* tensor, float multiplier = 1.f) {
-            if (!trace_dir || !trace_dir[0] || layer != trace_layer) return;
-            ggml_set_output(tensor); // preserve it after its last graph consumer
-            traces.push_back({tensor, name, multiplier});
-        };
 
         PooledContextHandle context;
         if (!context.init(32 * 1024 * 1024)) { set_last_error("QwenTeTrunk: ctx alloc failed."); return 0; }
@@ -713,18 +682,13 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
         }
 
         ggml_tensor* h = x;
-        const char* prescale_env = std::getenv("TS_QWEN21_TE_PRESCALE");
-        const bool restore_qwen21_prescale = prescale_env && prescale_env[0] == '1';
         for (int l = 0; l < nl; l++)
         {
             const TSGTeLayerW& lw = d->layers[l];
-            trace(l, "input", h);
-            // Match the per-op projection math: dividing small normalized
-            // activations by 1024 can underflow CUDA's F16 q8_1 scales.
-            // TS_QWEN21_TE_PRESCALE=1 restores the guard for diagnosis.
-            const bool prescale = restore_qwen21_prescale;
+            // The per-op projection math: no activation pre-scaling (dividing small
+            // normalized activations by 1024 can underflow CUDA's F16 q8_1 scales).
             auto mm = [&](ggml_tensor* w, ggml_tensor* xx, ggml_tensor* bias) {
-                auto o = prescale && ggml_is_quantized(w->type) ? qi_mm(ctx, w, xx) : ggml_mul_mat(ctx, w, xx);
+                ggml_tensor* o = ggml_mul_mat(ctx, w, xx);
                 return bias ? ggml_add(ctx, o, bias) : o;
             };
             ggml_tensor *qw, *qb, *kw, *kb, *vw, *vb, *ow, *ob, *gw, *gb, *uw, *ub, *dw, *db;
@@ -737,11 +701,9 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
 
             // --- attention ---
             ggml_tensor* n1 = ggml_mul(ctx, ggml_rms_norm(ctx, h, eps), ln1);
-            trace(l, "norm1", n1);
             ggml_tensor* q = ggml_reshape_3d(ctx, mm(qw, n1, qb), hd, heads, seq);
             ggml_tensor* k = ggml_reshape_3d(ctx, mm(kw, n1, kb), hd, kvh, seq);
             ggml_tensor* v = ggml_reshape_3d(ctx, mm(vw, n1, vb), hd, kvh, seq);
-            trace(l, "q", q); trace(l, "k", k); trace(l, "v", v);
             {
                 ggml_tensor* qn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
                 ggml_tensor* kn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
@@ -750,39 +712,27 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
                 q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), qn);
                 k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), kn);
             }
-            trace(l, "qnorm", q); trace(l, "knorm", k);
             q = qte_rope_half(ctx, q, cosf, sinf, hd, heads, seq);
             k = qte_rope_half(ctx, k, cosf, sinf, hd, kvh, seq);
-            trace(l, "qrope", q); trace(l, "krope", k);
 
             ggml_tensor* qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));   // [hd, seq, heads]
             ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));   // [hd, seq, kvh]
             ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);                          // [kv, q, heads] (GQA broadcast)
-            trace(l, "scores", kq, scale);
             ggml_tensor* probs = ggml_soft_max_ext(ctx, kq, causalMask, scale, 0.0f);
-            trace(l, "probs", probs);
             ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));   // [kv, hd, kvh]
             ggml_tensor* kqv = ggml_mul_mat(ctx, vt, probs);                      // [hd, q, heads]
             ggml_tensor* merged = ggml_reshape_2d(ctx,
                 ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), hidden, seq); // [hidden, seq]
-            trace(l, "merged", merged);
             auto attn_out = mm(ow, merged, ob);
-            trace(l, "attn_out", attn_out);
             h = ggml_add(ctx, h, attn_out);
-            trace(l, "attn_residual", h);
 
             // --- SwiGLU MLP ---
             ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, h, eps), ln2);
-            trace(l, "norm2", n2);
             ggml_tensor* g = mm(gw, n2, gb);
             ggml_tensor* u = mm(uw, n2, ub);
-            trace(l, "gate", g); trace(l, "up", u);
             ggml_tensor* ff = ggml_mul(ctx, ggml_silu(ctx, g), u);
-            trace(l, "activated", ff);
             auto down = mm(dw, ff, db);
-            trace(l, "down", down);
             h = ggml_add(ctx, h, down);
-            trace(l, "output", h);
             if (d->deepstack && l < d->deepstack_count)
             {
                 ggml_tensor* extra = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
@@ -828,19 +778,6 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
         { set_last_error("QwenTeTrunk: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, static_cast<std::size_t>(hidden) * seq * sizeof(float));
-        for (const auto& item : traces) {
-            std::vector<float> values(static_cast<size_t>(ggml_nelements(item.tensor)));
-            ggml_backend_tensor_get(item.tensor, values.data(), 0, values.size() * sizeof(float));
-            if (item.scale != 1.f) for (float& value : values) value *= item.scale;
-            char file_name[128];
-            std::snprintf(file_name, sizeof(file_name), "/fused.L%02d.%s.f32", trace_layer, item.name.c_str());
-            std::string path = std::string(trace_dir) + file_name;
-            FILE* file = std::fopen(path.c_str(), "wb");
-            if (!file) throw std::runtime_error("QwenTeTrunk: cannot create trace file " + path);
-            const size_t written = std::fwrite(values.data(), sizeof(float), values.size(), file);
-            std::fclose(file);
-            if (written != values.size()) throw std::runtime_error("QwenTeTrunk: incomplete trace file " + path);
-        }
         clear_last_error();
         return 1;
     }

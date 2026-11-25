@@ -4,6 +4,7 @@ using System.Text;
 using TensorSharp.Models;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 
 namespace InferenceWeb.Tests;
@@ -95,7 +96,7 @@ public sealed class QwenImageArchitectureTests
     {
         // A Qwen-Image-Edit-2511-layout DiT (60 double-stream blocks, Qwen2.5-VL 3584-wide
         // text input, no txt_in.text_norm) tagged general.architecture=qwen_image. The tag
-        // routes it to QwenImageModel, which must refuse it by name before anything else:
+        // routes it to QwenImage21DiffusionModel, which must refuse it by name before anything else:
         // not with "requires a GGML backend" and not with a missing-companion error.
         BackendType backend = requested ?? TestGates.PinnedGgmlBackend;
         using var fixture = new TensorHeader(LegacyEditTensors(), "qwen-image-edit-2511-Q4_K_M.gguf",
@@ -105,7 +106,7 @@ public sealed class QwenImageArchitectureTests
         bool preferManaged = NativeDequant.PreferManaged;
         try
         {
-            var error = Assert.Throws<ModelLoadRefusedException>(() => new QwenImageModel(fixture.Path, backend));
+            var error = Assert.Throws<ModelLoadRefusedException>(() => new QwenImage21DiffusionModel(fixture.Path, backend));
             Assert.Contains("'qwen-image-edit-2511-Q4_K_M.gguf' is not a Qwen-Image-2.1 diffusion transformer", error.Message);
             Assert.Contains("docs/models/qwenimage21.md", error.Message);
             Assert.True(ModelLoadRefusal.TryDescribe(error, out string reason));

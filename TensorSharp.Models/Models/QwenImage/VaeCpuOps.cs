@@ -21,7 +21,6 @@
 // vectorized exp (within an ulp or two of MathF.Exp) only on this path; the GGML per-conv
 // path keeps the exact scalar SiLU.
 using System;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 
@@ -78,14 +77,12 @@ namespace TensorSharp.Models.QwenImage
             if (x.D.LongLength < (long)x.C * x.H * x.W)
                 throw new ArgumentException($"feature holds {x.D.LongLength} values, expected {x.C} x {x.H} x {x.W}.", nameof(x));
             int Ho = (H + padT + padB - KH) / strideH + 1, Wo = (W + padL + padR - KW) / strideW + 1;
-            long t0 = VaeCpuProfile.Start();
             var outp = Feature.Uninitialized(OC, Ho, Wo);
             fixed (float* xp = x.D, op = outp.D, bp = bias)
             {
                 var source = new Im2colPanelSource(xp, x.H, x.W, KH, KW, strideH, strideW, padT, padL, Ho, Wo, upsample2x);
                 CpuPackedGemm.Gemm(weight, source, Ho * Wo, op, (long)Ho * Wo, biasM: bp, pool: CpuPool);
             }
-            VaeCpuProfile.Stop(VaeCpuProfile.Conv, t0, 2.0 * OC * weight.K * Ho * Wo);
             return outp;
         }
 
@@ -118,7 +115,6 @@ namespace TensorSharp.Models.QwenImage
         /// </summary>
         internal static Feature RmsNormChannelFast(Feature x, float[] gamma, bool silu, bool inPlace = false)
         {
-            long t0 = VaeCpuProfile.Start();
             int C = x.C, hw = x.H * x.W;
             var outp = inPlace ? x : Feature.Uninitialized(C, x.H, x.W);
             float scale = MathF.Sqrt(C);
@@ -178,7 +174,6 @@ namespace TensorSharp.Models.QwenImage
                     }
                 }, CpuPool);
             }
-            VaeCpuProfile.Stop(VaeCpuProfile.Norm, t0);
             return outp;
         }
 
@@ -208,7 +203,6 @@ namespace TensorSharp.Models.QwenImage
         private static Feature AddInPlace(Feature a, Feature b)
         {
             if (a.D.Length != b.D.Length) throw new ArgumentException("feature sizes differ");
-            long t0 = VaeCpuProfile.Start();
             const int chunk = 64 * 1024;
             int chunks = (a.D.Length + chunk - 1) / chunk;
             fixed (float* ap0 = a.D, bp0 = b.D)
@@ -223,7 +217,6 @@ namespace TensorSharp.Models.QwenImage
                     for (; j < count; j++) ap[j] += bp[j];
                 }, CpuPool);
             }
-            VaeCpuProfile.Stop(VaeCpuProfile.Add, t0);
             return a;
         }
 
@@ -255,7 +248,6 @@ namespace TensorSharp.Models.QwenImage
         /// </summary>
         internal static Feature AttentionCpu(float[] qkv, int C, int H, int W)
         {
-            long t0 = VaeCpuProfile.Start();
             int hw = H * W;
             if (qkv.LongLength < 3L * C * hw)
                 throw new ArgumentException($"qkv holds {qkv.LongLength} values, expected 3 x {C} x {hw}.", nameof(qkv));
@@ -283,7 +275,6 @@ namespace TensorSharp.Models.QwenImage
                     CpuPackedGemm.Gemm(v, new StridedPanelSource(sp, 1, hw, rows), rows, op + i0, hw, pool: CpuPool);
                 }
             }
-            VaeCpuProfile.Stop(VaeCpuProfile.Attention, t0, 4.0 * C * hw * hw);
             return outp;
         }
 
@@ -319,44 +310,6 @@ namespace TensorSharp.Models.QwenImage
             for (; j + 8 <= n; j += 8) Vector256.Store(Vector256.Load(s + j) * inv, s + j);
             float invSum = 1f / sum;
             for (; j < n; j++) s[j] *= invSum;
-        }
-    }
-
-    /// <summary>TS_QWEN_VAE_PROFILE=1: time per op class of one managed encode/decode, printed
-    /// when it finishes (the drivers are single-threaded, so plain counters suffice).</summary>
-    internal static class VaeCpuProfile
-    {
-        internal static readonly bool Enabled = Environment.GetEnvironmentVariable("TS_QWEN_VAE_PROFILE") == "1";
-        internal const int Conv = 0, Norm = 1, Add = 2, Attention = 3, Resample = 4, Weights = 5;
-        private static readonly string[] Names = { "conv", "norm(+silu)", "add", "attention", "resample", "weights(load+pack)" };
-        private static readonly long[] Ticks = new long[Names.Length];
-        private static readonly long[] Calls = new long[Names.Length];
-        private static readonly double[] Flops = new double[Names.Length];
-
-        internal static long Start() => Enabled ? Stopwatch.GetTimestamp() : 0;
-
-        internal static void Stop(int slot, long start, double flops = 0)
-        {
-            if (!Enabled) return;
-            Ticks[slot] += Stopwatch.GetTimestamp() - start;
-            Calls[slot]++;
-            Flops[slot] += flops;
-        }
-
-        internal static void Report(string what)
-        {
-            if (!Enabled) return;
-            var line = new System.Text.StringBuilder($"  [vae21-profile] {what}:");
-            for (int i = 0; i < Names.Length; i++)
-            {
-                if (Calls[i] == 0) continue;
-                double ms = Ticks[i] * 1000.0 / Stopwatch.Frequency;
-                line.Append($" {Names[i]} {ms:F0} ms/{Calls[i]}");
-                if (Flops[i] > 0) line.Append($" ({Flops[i] / ms / 1e6:F0} GF/s)");
-                line.Append(';');
-                Ticks[i] = 0; Calls[i] = 0; Flops[i] = 0;
-            }
-            Console.WriteLine(line.ToString());
         }
     }
 }

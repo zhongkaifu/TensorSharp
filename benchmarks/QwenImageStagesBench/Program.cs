@@ -13,6 +13,8 @@ using TensorSharp.Cpu;
 using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 
 static void Usage()
@@ -148,7 +150,7 @@ switch (args[0])
                 string latentPath = Opt(args, "--latent", null);
                 latent = latentPath != null
                     ? new VaeLatent(64, height / 16, width / 16, ReadFloats(latentPath))
-                    : new VaeLatent(64, height / 16, width / 16, QwenImage21Sampling.Noise(checked(width / 16 * (height / 16) * 64), 42));
+                    : new VaeLatent(64, height / 16, width / 16, PhiloxNoise.Draw(checked(width / 16 * (height / 16) * 64), 42));
             }
             else
             {
@@ -219,14 +221,19 @@ switch (args[0])
         int size = int.Parse(args[2]);
         float t = float.Parse(Opt(args, "--t", "0.9"));
         var conds = args.Skip(3).Where(a => a.EndsWith(".f32")).ToArray();
-        float[] latents = QwenImage21Pipeline.ToTokens(QwenImage21Sampling.Noise(size / 16 * (size / 16) * 64, 42), size / 16, size / 16);
-        using var dit = new QwenImage21DiT(args[1], BackendType.GgmlCpu);
+        var family = new QwenImage21Family(BackendType.GgmlCpu, QwenImageVariant.Base);
+        float[] latents = family.ToRows(new LatentTensor(new LatentShape(64, 1, size / 16, size / 16),
+            PhiloxNoise.Draw(size / 16 * (size / 16) * 64, 42)));
+        using var dit = new QwenImage21Denoiser(args[1], BackendType.GgmlCpu);
         float[] first = null;
         foreach (var path in conds)
         {
             float[] cond = ReadFloats(path);
             var watch = Stopwatch.StartNew();
-            float[] velocity = dit.Predict(latents, size / 16, size / 16, cond, cond.Length / 4096, t);
+            var text = new ConditioningSet(cond, cond.Length / 4096, 4096);
+            var layout = QwenImage21Layout.Build(text.Rows, null, new[] { (size / 16, size / 16) }, 128);
+            float[] velocity = (float[])dit.Predict(latents, text, Array.Empty<LatentRef>(), layout, t, 0, false, null).Clone();
+            dit.FinishRequest();
             Console.WriteLine(JsonSerializer.Serialize(new { cond = Path.GetFileName(path), seconds = watch.Elapsed.TotalSeconds,
                 vsFirst = first == null ? null : Stats(first, velocity, false) }));
             first ??= velocity;

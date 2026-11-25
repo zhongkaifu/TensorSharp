@@ -963,7 +963,7 @@ which with capture on can hold prompts (§10.5); and Studio's `job.json`, which 
 Only `ILogger` output reaches the OpenTelemetry pipeline. These go to `Console.WriteLine` and stay there: MiniMax-H3's
 `[h3]` timings (always the text-conditioning, denoiser-load and first-step times; the per-stage split with
 `TS_H3_PHASE=1`; latent statistics with `TS_H3_TRACE=1`); LTX's `[ltx25]`, `[ltx25-timing]` and `[ltx25-conditioning]`;
-Wan's `[wan-timing]`; Qwen-Image's `[qwen21-timing]`/`[qwen21-step]`; `TS_SCHED_STEP_LOG` step lines; the MP4 export
+Wan's `[wan-timing]`; the diffusion runtime's `[diffusion]` step and timing lines (Qwen-Image-2.1, MiniMax-H3-Image) and Qwen-Image-2.1's `[qwen21]` notes; `TS_SCHED_STEP_LOG` step lines; the MP4 export
 fallbacks and FFmpeg failures; and the once-per-architecture template, parser and grammar warnings. Video spans and
 stage attributes replace the video timings as the exported record. The warnings are not converted (§13).
 

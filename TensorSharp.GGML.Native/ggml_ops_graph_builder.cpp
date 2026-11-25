@@ -503,6 +503,9 @@ namespace
         // The program's products have thousands of rows (GraphProgram.WideTokenProducts): on ggml_cuda its run takes the DiT
         // offload's wide routes and it may serve the DiT regions in the graph. Set before the first node.
         bool wide_token_products = false;
+        // The routes the program's family measured for its wide products and attentions (GraphProgram.WideTokenRoutes);
+        // min_rows 0: MiniMax-H3's.
+        tsg::DitWideRoutes wide_routes;
         // The program's NVFP4 products quantize their activations to 8 bits (GraphProgram.Q8Nvfp4Activations): build()
         // requests GGML_PREC_Q8 for src1 of every MUL_MAT and MUL_MAT_ID on an NVFP4 matrix. Set before the first node.
         bool q8_nvfp4_activations = false;
@@ -2951,6 +2954,49 @@ TSG_EXPORT int TSGgml_GraphWideTokenProducts(void* handle, int on)
     return 1;
 }
 
+// The wide routes of a WideTokenProducts program (GraphProgram.WideTokenRoutes), set with it before its first node: products
+// take cuBLAS BF16 from `min_rows` rows; `flags` bit 0: Q6_K weights too, bit 1: cuDNN takes strided queries, bit 2: BF16
+// weights keep ggml's products. Without it a program takes MiniMax-H3's routes.
+TSG_EXPORT int TSGgml_GraphWideTokenRoutes(void* handle, std::int64_t min_rows, int flags)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    if (g == nullptr || g->built || !g->nodes.empty() || min_rows <= 0)
+    {
+        set_last_error("graph builder: wide routes are set on a graph before its first node, with a positive row count.");
+        return 0;
+    }
+    g->wide_token_products = true;
+    g->wide_routes.min_rows = min_rows;
+    g->wide_routes.q6k = (flags & 1) != 0;
+    g->wide_routes.strided_attention = (flags & 2) != 0;
+    g->wide_routes.float_weights_on_ggml = (flags & 4) != 0;
+    return 1;
+}
+
+// Whether the active rank's backend runs ggml_flash_attn_ext on these operands (ggml_backend_supports_op): queries
+// [head_dim, q_rows, heads] F32, keys and values [head_dim, kv_rows, heads] of `kv_type`, an F16 mask [mask_cols,
+// mask_rows] (mask_cols 0: none) and accumulation `prec`. A program emitter that reproduces a native builder's choice
+// between flash and explicit attention asks before it emits (Qwen-Image-2.1's denoiser, as its retired graph did).
+// 1 = supported, 0 = not, -1 = no backend.
+TSG_EXPORT int TSGgml_FlashAttnSupported(std::int64_t head_dim, std::int64_t q_rows, std::int64_t kv_rows, std::int64_t heads,
+                                         int kv_type, std::int64_t mask_cols, std::int64_t mask_rows, int prec)
+{
+    if (!ensure_backend() || g_backend == nullptr) return -1;
+    if (head_dim <= 0 || q_rows <= 0 || kv_rows <= 0 || heads <= 0 || kv_type < 0 || kv_type >= GGML_TYPE_COUNT) return 0;
+    ggml_init_params params{ ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context* ctx = ggml_init(params);
+    if (ctx == nullptr) return 0;
+    ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, q_rows, heads);
+    ggml_tensor* k = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_type), head_dim, kv_rows, heads);
+    ggml_tensor* v = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_type), head_dim, kv_rows, heads);
+    ggml_tensor* mask = mask_cols > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_cols, mask_rows) : nullptr;
+    ggml_tensor* fa = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f, 0.0f, 0.0f);
+    ggml_prec_set_acc(fa, static_cast<ggml_prec>(prec));
+    const int supported = ggml_backend_supports_op(g_backend, fa) ? 1 : 0;
+    ggml_free(ctx);
+    return supported;
+}
+
 // The program's NVFP4 products quantize their activations to 8 bits (GraphProgram.Q8Nvfp4Activations), set before its first
 // node: build() asks ggml for GGML_PREC_Q8 activations on every product of an NVFP4 matrix.
 TSG_EXPORT int TSGgml_GraphQ8Nvfp4Activations(void* handle, int on)
@@ -3171,7 +3217,8 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             // The DiT offload: its fused nodes, cuDNN attention and (wide programs) the cuBLAS/int8 products, between ggml
             // segments; profiled under TS_GGML_NODE_PROFILE as the H3 graphs are. Synchronous.
             const std::uint64_t errors_before = g_ggml_error_count.load(std::memory_order_acquire);
-            status = tsg::dit_offload_compute(graph_backend(g), g->graph, "graph builder dit", g->wide_token_products);
+            status = tsg::dit_offload_compute(graph_backend(g), g->graph, "graph builder dit", g->wide_token_products,
+                                              g->wide_routes.min_rows > 0 ? &g->wide_routes : nullptr);
             if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before)
                 g_backend_compute_failed.store(true, std::memory_order_release);
         }

@@ -117,6 +117,7 @@
     <ReferenceNativeSymbol Include="TSGgml_EnsureDeviceCopyFromHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FlashAttnDecodeF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FlashAttnFallbackCount" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_FlashAttnSupported" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedActMulF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedActMulSplitF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedFFNActProjectQuantF32" SymbolType="Function" />
@@ -227,6 +228,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GraphRunRanked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphShape" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphWideTokenProducts" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphWideTokenRoutes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphQ8Nvfp4Activations" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GreedyFullRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
@@ -356,13 +358,8 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen35GdnDropTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35GdnLayerTP" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderMergedBatchF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderMergedF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_QwenImage21Forward" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_QwenImage21ForwardTp" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_QwenImage21GetPrefixCacheInfo" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_QwenImage21ReleasePrefixCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_QwenImage21ReleasePrefixCaches" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_QwenImage21ResetForwardCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenTeTrunk" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenVaeAttention" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenVaeRun" SymbolType="Function" />
