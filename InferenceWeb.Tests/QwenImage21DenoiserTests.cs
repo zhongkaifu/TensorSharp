@@ -337,6 +337,68 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         declined.FinishRequest();
     }
 
+    /// <summary>A per-step head bundle (a VideoX-Fun PDD LoRA) replaces proj_out with each step's own head: the program
+    /// projects step s through head s, so with head 1 twice head 0 the second step's velocity is exactly twice the first's for
+    /// the same input (scaling by two is exact), and a step the bundle has no head for is refused. The prefix cache is declined
+    /// so both steps run the same whole-sequence graph on every backend; on the GGML executor and the managed one.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_per_step_head_bundle_projects_each_step_through_its_own_head(bool managed)
+    {
+        string path = WriteTransformer(_dir);
+        int headValues = QwenImage21Weights.ReleaseChannels * QwenImage21Weights.ReleaseDim;
+        float[] first = Rand(headValues, 700, 0.05f);
+        var heads = new float[2 * headValues];
+        for (int i = 0; i < headValues; i++) { heads[i] = first[i]; heads[headValues + i] = 2 * first[i]; }
+        string bundle = WritePddBundle(_dir, heads, steps: 2);
+
+        BackendType backend = managed ? BackendType.Cpu : TestGates.PinnedGgmlBackend;
+        using var denoiser = new QwenImage21Denoiser(path, backend) { FreeMemory = () => 1024 };
+        using var set = QwenImage21LoraSet.Load(new[] { new LoraSpec(bundle) }, denoiser.Weights.Gguf, "", backend, 1);
+        Assert.Equal(2, set.OutputHeads.Length);
+        var (text, refs, layout, target) = Request(0, 47);
+        float[] v0 = (float[])denoiser.Predict(target, text, refs, layout, 0.5f, 0, false, set).Clone();
+        Assert.Equal(QwenImage21Denoiser.Mode.Full, denoiser.LastMode);
+        float[] v1 = (float[])denoiser.Predict(target, text, refs, layout, 0.5f, 1, false, set).Clone();
+        Assert.Contains(v0, v => v != 0);
+        Assert.Equal(v0.Select(v => 2 * v).ToArray(), v1);
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => denoiser.Predict(target, text, refs, layout, 0.5f, 2, false, set));
+        Assert.Contains("2 step heads; step 3 has none", ex.Message, StringComparison.Ordinal);
+        denoiser.FinishRequest();
+    }
+
+    /// <summary>A VideoX-Fun PDD bundle holding only per-step output heads ([steps, channels, dim] at the released
+    /// checkpoint's width), with the pdd_config.json beside it that declares the format.</summary>
+    private static string WritePddBundle(string dir, float[] heads, int steps)
+    {
+        string folder = Path.Combine(dir, "pdd-heads-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        string sigmas = string.Join(", ", Enumerable.Range(0, steps + 1)
+            .Select(i => (1.0 - (double)i / steps).ToString(System.Globalization.CultureInfo.InvariantCulture)));
+        File.WriteAllText(Path.Combine(folder, "pdd_config.json"),
+            $$"""{ "pdd_num_steps": {{steps}}, "pdd_block_size": 1, "pdd_sigmas": [{{sigmas}}], "pdd_full_parameters": "['proj_out.weight']", "lora_alpha": 8 }""");
+        var raw = new byte[heads.Length * 4];
+        Buffer.BlockCopy(heads, 0, raw, 0, raw.Length);
+        var header = new JsonObject
+        {
+            ["__metadata__"] = new JsonObject { ["format"] = "qwenimage21_extracted_prefused_v1" },
+            ["proj_out.weight"] = new JsonObject
+            {
+                ["dtype"] = "F32",
+                ["shape"] = new JsonArray(steps, QwenImage21Weights.ReleaseChannels, QwenImage21Weights.ReleaseDim),
+                ["data_offsets"] = new JsonArray(0, raw.Length),
+            },
+        };
+        string path = Path.Combine(folder, "bundle.safetensors");
+        byte[] json = Encoding.UTF8.GetBytes(header.ToJsonString());
+        using var fs = File.Create(path);
+        fs.Write(BitConverter.GetBytes((ulong)json.Length));
+        fs.Write(json);
+        fs.Write(raw);
+        return path;
+    }
+
     /// <summary>The managed tensor executor (the cpu backend) against the retired pure-C# transformer's frozen velocities.</summary>
     [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)]

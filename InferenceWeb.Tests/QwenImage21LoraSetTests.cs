@@ -13,7 +13,7 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// End-to-end tests of <see cref="QwenImage21LoraSet.Load"/> on synthetic files: a tiny
 /// transformer GGUF (8-wide projections, the real module names) and hand-written LoRA
-/// safetensors. The packed native factors are read back from the
+/// safetensors. The packed native factors are read back through the set's
 /// <see cref="QwenImage21Adapter"/> descriptors and the reconstructed update
 /// (up · down) is compared with the intended strength * alpha / rank * B · A.
 /// </summary>
@@ -222,11 +222,9 @@ public sealed class QwenImage21LoraSetTests : IDisposable
 
     // ---- reading the packed native factors back ----------------------------------------------
 
-    private static QwenImage21Adapter AdapterOf(QwenImage21LoraSet set, int rank = 0) =>
-        Marshal.PtrToStructure<QwenImage21Adapter>(set.AdapterFor(rank));
+    private static QwenImage21Adapter AdapterOf(QwenImage21LoraSet set, int rank = 0) => set.Adapter(rank);
 
-    private static QwenImage21BlockLora BlockOf(QwenImage21LoraSet set, int block, int rank = 0) =>
-        Marshal.PtrToStructure<QwenImage21BlockLora>(AdapterOf(set, rank).Blocks + block * Marshal.SizeOf<QwenImage21BlockLora>());
+    private static QwenImage21BlockLora BlockOf(QwenImage21LoraSet set, int block, int rank = 0) => set.Block(block, rank);
 
     private static float[] ReadValues(IntPtr p, long count, int type)
     {
@@ -341,8 +339,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         var adapter = AdapterOf(set);
         var block = BlockOf(set, 0);
 
-        Assert.Equal(Marshal.SizeOf<QwenImage21Adapter>(), adapter.StructBytes);
-        Assert.Equal(QwenImage21Weights.ReleaseLayers, adapter.NumLayers);
+        Assert.Equal(QwenImage21Weights.ReleaseLayers, adapter.Blocks.Length);
         Assert.True(set.SplitGateUp[0]);
         Assert.Equal(new bool[QwenImage21Weights.ReleaseLayers - 1], set.SplitGateUp.Skip(1));
 
@@ -378,7 +375,6 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         }
         foreach (var g in new[] { adapter.ImageIn, adapter.TextIn, adapter.TextOut, adapter.TimeIn, adapter.TimeOut, adapter.Modulation, adapter.NormOut, adapter.ProjOut })
             AssertEmpty(g);
-        Assert.Equal(IntPtr.Zero, adapter.OutputHead);
         Assert.Null(set.Recipe);
         Assert.Empty(set.OutputHeads);
         Assert.True(set.FactorBytes > 0);
@@ -949,16 +945,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         Assert.Equal(1f, recipe.Cfg);
         Assert.Equal(new[] { 1f, 0.5f, 0f }, recipe.Sigmas(2, 4096));
 
-        // Step heads are selected per call on every rank's descriptor.
-        for (int r = 0; r < 2; r++)
-        {
-            Assert.Equal(set.OutputHeads[0], AdapterOf(set, r).OutputHead);
-            Assert.Equal(F32, AdapterOf(set, r).OutputHeadType);
-        }
-        set.SelectOutputHead(1);
-        for (int r = 0; r < 2; r++) Assert.Equal(set.OutputHeads[1], AdapterOf(set, r).OutputHead);
-        Assert.Throws<ArgumentOutOfRangeException>(() => set.SelectOutputHead(2));
-        Assert.Throws<ArgumentOutOfRangeException>(() => set.SelectOutputHead(-1));
+        // (The denoiser projects each step through its own head: QwenImage21DenoiserTests.A_per_step_head_bundle_….)
         Assert.Contains("2 per-step output heads", set.Summary, StringComparison.Ordinal);
         Assert.Contains("3 replaced parameter(s)", set.Summary, StringComparison.Ordinal);
     }
@@ -1307,12 +1294,12 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         using var dit = Transformer();
         var (path, _) = ToQ();
         var set = Load(dit, new LoraSpec(path));
-        Assert.NotEqual(IntPtr.Zero, set.AdapterFor(0));
+        Assert.NotNull(set.Adapter(0));
 
         set.Dispose();
         set.Dispose();   // idempotent
 
-        Assert.Throws<IndexOutOfRangeException>(() => set.AdapterFor(0));
+        Assert.Throws<IndexOutOfRangeException>(() => set.Adapter(0));
     }
 
     // ---- regressions from the adversarial review --------------------------------------------
@@ -1447,7 +1434,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         using var set = QwenImage21LoraSet.Load(new[] { new LoraSpec(weights, null, configPath) }, gguf, prefix, BackendType.GgmlMetal, 1);
 
         Assert.Contains(expected, set.Summary, StringComparison.Ordinal);
-        Assert.NotEqual(IntPtr.Zero, set.AdapterFor(0));
+        Assert.NotNull(set.Adapter(0));
         Assert.True(set.FactorBytes > 0);
         if (config != null)
         {
