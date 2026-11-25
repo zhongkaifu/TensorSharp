@@ -52,6 +52,10 @@ namespace TensorSharp.Models.QwenImage21
 
         /// <summary>The released checkpoint's attention heads (32 x 128), which a tensor-parallel GPU count must divide.</summary>
         internal const int ReleaseHeads = 32;
+
+        /// <summary>The released checkpoint's shape, which LoRA files are keyed and validated against: 32 blocks, a 4096-wide
+        /// stream of 128-wide heads, 64 latent channels and Qwen3-VL-8B's 4096-wide conditioning.</summary>
+        internal const int ReleaseLayers = 32, ReleaseDim = 4096, ReleaseHeadDim = 128, ReleaseChannels = 64, ReleaseTextDim = 4096;
         internal const float Eps = 1e-6f;
 
         private readonly GgufFile _gguf;

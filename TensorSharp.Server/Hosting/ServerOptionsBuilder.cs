@@ -1016,7 +1016,7 @@ public static class ServerOptionsBuilder
                 continue;
             }
             // Default output size for image requests that name neither a size nor a
-            // target area of their own. Read by QwenImage21Pipeline.ResolveDimensions as
+            // target area of their own. Read by QwenImage21Canvas.ResolveDimensions as
             // TS_QWEN_IMAGE_WIDTH/HEIGHT, which needs both (a half-set or unparsable pair is
             // ignored with a warning) and snaps an off-grid side down to a multiple of 32,
             // never below 32, warning once. Per-request sizes and areas from the Web UI /

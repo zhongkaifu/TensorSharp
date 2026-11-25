@@ -21,7 +21,10 @@ dotnet eng/validation/QwenImage21DenoiserAB/bin/Release/net10.0/QwenImage21Denoi
     [--image source.png] [--mask mask.png] [--cfg 2.5 --negative "blurry"] [--previews 2] [--lora voxel.safetensors:1.0]
 ```
 
-`--engines` takes `runtime`, `legacy` (the retired `QwenImage21DiT`) and `runtime2`/`legacy2` (a second, independent
-instance on the same inputs: run-to-run determinism and the warm step time); `--e2e --model legacy` runs the retired
-`QwenImageModel`. The legacy engines are deleted in the next commit; check this one out to compare a backend against them.
-Outputs and logs belong in the ignored `artifacts/` or `docs/validation/`.
+`--engines` takes `runtime` and `runtime2` (a second, independent denoiser on the same inputs: run-to-run determinism and
+the warm step time). The commit that migrated Qwen-Image-2.1 to the diffusion runtime also took `legacy`/`legacy2` (the
+retired `QwenImage21DiT`) and `--e2e --model legacy` (the retired `QwenImageModel`); check that commit out to compare a
+backend against the retired engines. Outputs and logs belong in the ignored `artifacts/` or `docs/validation/`.
+
+Tensor parallelism and the prefix cache on real weights: `eng/QwenImage21CompanionProbe dit-parity` (the whole-sequence
+graph against the cache's extract and cached graphs, then the transformer sharded over a loopback group on one device).

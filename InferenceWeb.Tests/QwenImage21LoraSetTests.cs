@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using TensorSharp.GGML;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 
 namespace InferenceWeb.Tests;
 
@@ -22,7 +23,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
     private const int D = 8;          // hidden width of the synthetic transformer
     private const int Ff = 12;        // MLP width (gate and up halves)
     private const int ModOut = 32;    // modulation.1 output
-    private const int HeadDim = QwenImage21DiT.HeadDim;
+    private const int HeadDim = QwenImage21Weights.ReleaseHeadDim;
     private const int F16 = 1, F32 = 0;
 
     private readonly string _dir;
@@ -341,9 +342,9 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         var block = BlockOf(set, 0);
 
         Assert.Equal(Marshal.SizeOf<QwenImage21Adapter>(), adapter.StructBytes);
-        Assert.Equal(QwenImage21DiT.Layers, adapter.NumLayers);
+        Assert.Equal(QwenImage21Weights.ReleaseLayers, adapter.NumLayers);
         Assert.True(set.SplitGateUp[0]);
-        Assert.Equal(new bool[QwenImage21DiT.Layers - 1], set.SplitGateUp.Skip(1));
+        Assert.Equal(new bool[QwenImage21Weights.ReleaseLayers - 1], set.SplitGateUp.Skip(1));
 
         // q, k, v: one contiguous down allocation (the graph's stacked shrink).
         foreach (var l in new[] { block.Q, block.K, block.V })
@@ -370,7 +371,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
 
         AssertEmpty(block.Out);
         AssertEmpty(block.Down);
-        for (int b = 1; b < QwenImage21DiT.Layers; b++)
+        for (int b = 1; b < QwenImage21Weights.ReleaseLayers; b++)
         {
             var other = BlockOf(set, b);
             foreach (var l in new[] { other.Q, other.K, other.V, other.Out, other.Gate, other.Up, other.Down }) AssertEmpty(l);
@@ -871,7 +872,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
     // ---- VideoX-Fun PDD bundles ----------------------------------------------------------------
 
     private const string PddFormat = "qwenimage21_extracted_prefused_v1";
-    private const int Channels = QwenImage21DiT.Channels, Dim = QwenImage21DiT.HiddenSize, TextDim = QwenImage21DiT.TextDim;
+    private const int Channels = QwenImage21Weights.ReleaseChannels, Dim = QwenImage21Weights.ReleaseDim, TextDim = QwenImage21Weights.ReleaseTextDim;
 
     private (string Path, float[] Heads, float[] NormQ, float[] TextNorm, (float[] A, float[] B) Q) PddBundle(
         string folder, int steps = 2, bool withHeads = true, bool withConfig = true, string fullParameters = null)
@@ -1189,7 +1190,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
     [Fact]
     public void Turbo_TheModelHandsItsScheduleToTheLoad()
     {
-        // Through QwenImageModel.SetLoras, which every host's --lora reaches: the model must
+        // Through QwenImage21DiffusionModel.SetLoras, which every host's --lora reaches: the model must
         // pass its own recipe, and how it was identified, to the load.
         using var dit = Transformer();
         var (path, _) = ToQ();
@@ -1198,7 +1199,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
 
         foreach (var (declared, how) in new[] { (true, "declared"), (false, "assumed from its file name; declare --qwen-image-variant base if it is not") })
         {
-            QwenImageModel turbo = QwenImage21TurboTests.ModelOf(QwenImageVariant.Turbo, declared, dit, BackendType.GgmlCpu);
+            QwenImage21DiffusionModel turbo = QwenImage21TurboTests.ModelOf(QwenImageVariant.Turbo, declared, dit, BackendType.GgmlCpu);
             var ex = Assert.Throws<ArgumentException>(() => turbo.SetLoras(speed));
             Assert.Contains($"this transformer is Qwen-Image-2.1-Turbo ({how}), which is step-distilled already", ex.Message, StringComparison.Ordinal);
             Assert.Null(turbo.Loras);
@@ -1206,7 +1207,7 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         }
 
         // The base checkpoint takes the same plug-in and samples on its recipe.
-        QwenImageModel baseModel = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base, true, dit, BackendType.GgmlCpu);
+        QwenImage21DiffusionModel baseModel = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base, true, dit, BackendType.GgmlCpu);
         baseModel.SetLoras(speed);
         try
         {

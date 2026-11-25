@@ -1,5 +1,5 @@
 using System;
-using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Models.Video;
 
 namespace TensorSharp.Models.Ltx25;
@@ -102,7 +102,7 @@ public sealed record Ltx25GenerationSettings(int Width, int Height, int Frames, 
     public Ltx25StepNoise AncestralNoise(int step, int videoLength, int audioLength, long seedOffset = AncestralNoiseSeedOffset)
     {
         if (step < 0 || videoLength <= 0 || audioLength <= 0) throw new ArgumentOutOfRangeException(nameof(step));
-        float[] packed = QwenImage21Sampling.Noise(checked(videoLength + audioLength),
+        float[] packed = PhiloxNoise.Draw(checked(videoLength + audioLength),
             unchecked(Seed + seedOffset), 0, (uint)step);
         return new(packed.AsSpan(0, videoLength).ToArray(), packed.AsSpan(videoLength).ToArray());
     }
@@ -118,7 +118,7 @@ public sealed record Ltx25GenerationSettings(int Width, int Height, int Frames, 
         int videoLength = checked(tokens * videoChannels);
         int audioLength = checked(AudioTokens * audioChannels * audioBins);
         int extraChannels = checked((audioLength + tokens - 1) / tokens);
-        float[] packed = QwenImage21Sampling.Noise(checked(tokens * (videoChannels + extraChannels)), Seed, stream);
+        float[] packed = PhiloxNoise.Draw(checked(tokens * (videoChannels + extraChannels)), Seed, stream);
         float[] video = Ltx25Geometry.PackVideo(packed.AsSpan(0, videoLength), tokens, videoChannels);
         float[] audio = Ltx25Geometry.PackAudio(packed.AsSpan(videoLength, audioLength), AudioTokens, audioChannels, audioBins);
         return (video, audio);

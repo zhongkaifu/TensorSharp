@@ -1,48 +1,77 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
-using System.Runtime.InteropServices;
 using TensorSharp.GGML;
-using TensorSharp.Models;
-using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 
 namespace InferenceWeb.Tests;
 
-/// <summary>Weight sharding for Qwen-Image-2.1 tensor parallelism. The sharded forward itself
-/// is compared with the unsharded graph natively on a loopback group
-/// (tests/qwen_image21_test.cpp); these pin which bytes each rank receives.</summary>
+/// <summary>Weight sharding for Qwen-Image-2.1 tensor parallelism (QwenImage21Denoiser.ShardBlocks): which bytes each rank
+/// receives, on a synthetic Q8_0 transformer. The sharded programs' numerics are compared with the unsharded ones by
+/// eng/QwenImage21CompanionProbe dit-parity (two ranks of a loopback group on one device).</summary>
 public sealed unsafe class QwenImage21TensorParallelShardTests : IDisposable
 {
-    private readonly List<IntPtr> _allocations = new();
-    private const int Q8Type = 8, Q8Block = 32, Q8Bytes = 34;
+    private const int Q8Type = 8, Q8Block = 32, Q8Bytes = 34, Dim = 128, HeadDim = 16, Ff = 128, Layers = 2;
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-qi21-shard-" + Guid.NewGuid().ToString("N"));
+
+    public QwenImage21TensorParallelShardTests() => Directory.CreateDirectory(_dir);
 
     public void Dispose()
     {
-        foreach (var p in _allocations) Marshal.FreeHGlobal(p);
+        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
     }
 
-    private QwenImage21Weight Q8(long ne0, long ne1)
+    /// <summary>The synthetic transformer of QwenImage21DenoiserTests at 128 wide (8 heads of 16), its block projections in
+    /// Q8_0 (patterned bytes: the shards are compared, never run).</summary>
+    private string Transformer(bool fused)
     {
-        long bytes = ne0 / Q8Block * Q8Bytes * ne1;
-        IntPtr data = Marshal.AllocHGlobal((nint)bytes);
-        _allocations.Add(data);
-        var span = new Span<byte>((void*)data, (int)bytes);
-        for (int i = 0; i < span.Length; i++) span[i] = (byte)(i * 31 + 7);
-        return new QwenImage21Weight { Data = data, Type = Q8Type, Ne0 = ne0, Ne1 = ne1, Bytes = bytes };
+        var tensors = new List<(string, long[], int, byte[])>();
+        int seed = 1;
+        void F32(string name, params long[] dims)
+        {
+            float[] v = QwenImage21DenoiserTests.Rand((int)dims.Aggregate(1L, (a, b) => a * b), seed++, 0.1f);
+            var raw = new byte[v.Length * 4];
+            Buffer.BlockCopy(v, 0, raw, 0, raw.Length);
+            tensors.Add((name + ".weight", dims, 0, raw));
+        }
+        void Q8(string name, long input, long output)
+        {
+            var raw = new byte[input / Q8Block * Q8Bytes * output];
+            for (int i = 0; i < raw.Length; i++) raw[i] = (byte)(i * 31 + seed * 7);
+            seed++;
+            tensors.Add((name + ".weight", new[] { input, output }, Q8Type, raw));
+        }
+        F32("img_in", 16, Dim);
+        F32("txt_in.in_layer", 48, Dim);
+        F32("txt_in.out_layer", Dim, Dim);
+        F32("txt_in.text_norm", 48);
+        F32("time_text_embed.timestep_embedder.linear_1", 256, Dim);
+        F32("time_text_embed.timestep_embedder.linear_2", Dim, Dim);
+        F32("modulation.1", Dim, 4 * Dim);
+        F32("norm_out.linear", Dim, Dim);
+        F32("proj_out", Dim, 16);
+        for (int i = 0; i < Layers; i++)
+        {
+            string p = $"transformer_blocks.{i}.";
+            Q8(p + "attn.to_q", Dim, Dim);
+            Q8(p + "attn.to_k", Dim, Dim);
+            Q8(p + "attn.to_v", Dim, Dim);
+            Q8(p + "attn.to_out.0", Dim, Dim);
+            if (fused) Q8(p + "img_mlp.gate_up", Dim, 2 * Ff);
+            else
+            {
+                Q8(p + "img_mlp.gate_layer", Dim, Ff);
+                Q8(p + "img_mlp.proj", Dim, Ff);
+            }
+            Q8(p + "img_mlp.out", Ff, Dim);
+            F32(p + "attn.norm_q", HeadDim);
+            F32(p + "attn.norm_k", HeadDim);
+        }
+        string path = Path.Combine(_dir, $"shard-{(fused ? "fused" : "separate")}.gguf");
+        QwenImage21DenoiserTests.WriteGguf(path, tensors);
+        return path;
     }
 
     private static byte[] Bytes(QwenImage21Weight w) => new ReadOnlySpan<byte>((void*)w.Data, (int)w.Bytes).ToArray();
-
-    private QwenImage21Block Block(bool fused)
-    {
-        const int dim = 256, ff = 512;
-        var gate = Q8(dim, fused ? ff * 2 : ff);
-        return new QwenImage21Block
-        {
-            Q = Q8(dim, dim), K = Q8(dim, dim), V = Q8(dim, dim), Out = Q8(dim, dim),
-            Gate = gate, Up = fused ? default : Q8(dim, ff), Down = Q8(ff, dim),
-            NormQ = new IntPtr(0x1000), NormK = new IntPtr(0x2000),
-        };
-    }
 
     [Theory]
     [InlineData(true, 2)]
@@ -50,32 +79,36 @@ public sealed unsafe class QwenImage21TensorParallelShardTests : IDisposable
     [InlineData(true, 4)]
     public void RanksReceiveWholeHeadsAndMatchingMlpColumns(bool fused, int ranks)
     {
-        var block = Block(fused);
+        using var w = new QwenImage21Weights(Transformer(fused));
+        Assert.Equal((Dim, Dim / HeadDim, Ff, Layers), (w.Dim, w.Heads, w.Ff, w.Layers));
         var owned = new List<IntPtr>();
         try
         {
-            var shards = QwenImage21DiT.ShardBlocks(new[] { block }, ranks, owned);
+            var shards = QwenImage21Denoiser.ShardBlocks(w, ranks, owned);
             Assert.Equal(ranks, shards.Length);
-            long rowBytes = 256 / Q8Block * Q8Bytes, local = 256 / ranks, ffLocal = 512 / ranks;
+            long rowBytes = Dim / Q8Block * Q8Bytes, local = Dim / ranks, ffLocal = Ff / ranks;
             for (int r = 0; r < ranks; r++)
-            {
-                var s = shards[r][0];
-                // Column-parallel projections are views of consecutive output rows.
-                Assert.Equal(block.Q.Data + (nint)(r * local * rowBytes), s.Q.Data);
-                Assert.Equal((local, local * rowBytes), (s.K.Ne1, s.K.Bytes));
-                Assert.Equal(block.V.Data + (nint)(r * local * rowBytes), s.V.Data);
-                Assert.Equal(block.Gate.Data + (nint)(r * ffLocal * rowBytes), s.Gate.Data);
-                // Up comes after all gate rows in a fused [gate; up] projection.
-                var upSource = fused ? block.Gate.Data + (nint)(512 * rowBytes) : block.Up.Data;
-                Assert.Equal(upSource + (nint)(r * ffLocal * rowBytes), s.Up.Data);
-                Assert.Equal(ffLocal, s.Up.Ne1);
-                // Row-parallel projections copy this rank's input columns of every row.
-                AssertColumns(block.Out, s.Out, r, local);
-                AssertColumns(block.Down, s.Down, r, ffLocal);
-                Assert.Equal(block.NormQ, s.NormQ);
-                Assert.Equal(block.NormK, s.NormK);
-            }
-            Assert.Equal(2 * ranks, owned.Count);
+                for (int layer = 0; layer < Layers; layer++)
+                {
+                    QwenImage21Block block = w.Blocks[layer], s = shards[r][layer];
+                    // Column-parallel projections are views of consecutive output rows: whole heads, a slice of the MLP.
+                    Assert.Equal(block.Q.Data + (nint)(r * local * rowBytes), s.Q.Data);
+                    Assert.Equal((local, local * rowBytes), (s.K.Ne1, s.K.Bytes));
+                    Assert.Equal(block.V.Data + (nint)(r * local * rowBytes), s.V.Data);
+                    Assert.Equal(block.Gate.Data + (nint)(r * ffLocal * rowBytes), s.Gate.Data);
+                    Assert.Equal(ffLocal, s.Gate.Ne1);
+                    // Up comes after all gate rows in a fused [gate; up] projection.
+                    var upSource = fused ? block.Gate.Data + (nint)(Ff * rowBytes) : block.Up.Data;
+                    Assert.Equal(upSource + (nint)(r * ffLocal * rowBytes), s.Up.Data);
+                    Assert.Equal(ffLocal, s.Up.Ne1);
+                    Assert.False(s.FusedGateUp);
+                    // Row-parallel projections copy this rank's input columns of every row.
+                    AssertColumns(block.Out, s.Out, r, local);
+                    AssertColumns(block.Down, s.Down, r, ffLocal);
+                    Assert.Same(block.NormQ, s.NormQ);
+                    Assert.Same(block.NormK, s.NormK);
+                }
+            Assert.Equal(2 * ranks * Layers, owned.Count);
         }
         finally { foreach (var p in owned) QuantizedWeight.FreeBuffer(p); }
     }
@@ -94,15 +127,15 @@ public sealed unsafe class QwenImage21TensorParallelShardTests : IDisposable
     [Fact]
     public void UnsplittableGroupsAreRefused()
     {
+        using var w = new QwenImage21Weights(Transformer(true));
         var owned = new List<IntPtr>();
         try
         {
-            // 32 heads cannot be divided over 3 GPUs.
-            Assert.Throws<NotSupportedException>(() => QwenImage21DiT.ShardBlocks(new[] { Block(true) }, 3, owned));
-            // A 256-wide Q8_0 row has 8 blocks: 16 ranks would split a block.
-            var narrow = Block(true);
-            narrow.Out = Q8(256, 256);
-            Assert.Throws<NotSupportedException>(() => QwenImage21DiT.ShardBlocks(new[] { narrow }, 16, owned));
+            // 8 heads cannot be divided over 3 GPUs.
+            Assert.Throws<NotSupportedException>(() => QwenImage21Denoiser.ShardBlocks(w, 3, owned));
+            // A 128-wide Q8_0 row has 4 blocks: 8 ranks would split a block.
+            var error = Assert.Throws<NotSupportedException>(() => QwenImage21Denoiser.ShardBlocks(w, 8, owned));
+            Assert.Contains("32-element blocks", error.Message);
         }
         finally { foreach (var p in owned) QuantizedWeight.FreeBuffer(p); }
     }

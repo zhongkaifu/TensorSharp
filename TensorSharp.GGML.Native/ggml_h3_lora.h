@@ -151,8 +151,9 @@ inline ggml_tensor* h3_lora_product(ggml_context* ctx, ggml_tensor* factor, ggml
 // Parts whose downs sit back to back in one allocation (same type and `in`, as
 // the loader packs a block's q/k/v) are bound as ONE [in, sum of ranks] tensor
 // keyed by the first down and run as one mul_mat, so x is read once; each part
-// is then a view of its rows. Ported from ggml_ops_qwen_image21.cpp
-// (Builder::shrink), less its shared-factor case, which H3 never has.
+// is then a view of its rows. Ported from the retired Qwen-Image-2.1 native
+// forward (Builder::shrink, now QwenImage21Emitter.Shrink), less its
+// shared-factor case, which H3 never has.
 inline std::vector<ggml_tensor*> h3_lora_shrink(ggml_context* ctx, const H3Bind& bind,
                                                 std::initializer_list<const TSGH3Lora*> parts,
                                                 ggml_tensor* x)

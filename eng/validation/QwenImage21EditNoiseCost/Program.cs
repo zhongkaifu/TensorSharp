@@ -2,7 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 //
 // The cost of keying a Qwen-Image-2.1 edit's noise to its references: the SHA-256 over the
-// pictures (QwenImage21Sampling.ReferenceStream) and, for scale, the Philox draw every request
+// pictures (QwenImage21Noise.ReferenceStream) and, for scale, the Philox draw every request
 // already makes. Synthetic pictures; no weights, encoder, transformer, VAE or device are touched.
 //
 //   dotnet run -c Release --project eng/validation/QwenImage21EditNoiseCost -- [--sizes 1024x1024,2048x2048,4032x3024] [--reps 7]
@@ -16,6 +16,8 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
 
 string Option(string name, string fallback)
 {
@@ -31,13 +33,7 @@ int repetitions = int.Parse(Option("--reps", "7"));
 if (repetitions < 1 || sizes.Any(s => s.Width < 1 || s.Height < 1))
     throw new ArgumentException("Repetitions and sides must be positive.");
 
-// Internal API, by reflection: the same code works against a DLL built elsewhere (ModelsDir).
-Type sampling = typeof(RgbImage).Assembly.GetType("TensorSharp.Models.QwenImage.QwenImage21Sampling", throwOnError: true)!;
-MethodInfo referenceStream = sampling.GetMethod("ReferenceStream", BindingFlags.Static | BindingFlags.NonPublic)
-    ?? throw new MissingMethodException("QwenImage21Sampling.ReferenceStream: this TensorSharp.Models predates edit noise.");
-MethodInfo noise = sampling.GetMethod("Noise", BindingFlags.Static | BindingFlags.NonPublic, new[] { typeof(int), typeof(long), typeof(ulong) })
-    ?? throw new MissingMethodException("QwenImage21Sampling.Noise(int, long, ulong)");
-ulong Stream(RgbImage image) => (ulong)referenceStream.Invoke(null, new object[] { (IReadOnlyList<RgbImage>)new[] { image } })!;
+ulong Stream(RgbImage image) => QwenImage21Noise.ReferenceStream(new[] { image });
 
 static RgbImage Picture(int width, int height, string alpha)
 {
@@ -80,5 +76,5 @@ foreach (var (width, height) in sizes)
 foreach (int side in new[] { 1024, 2048 })
 {
     int count = side / 16 * (side / 16) * 64;
-    Console.WriteLine($"noise draw for a {side}x{side} latent ({count} values): median {Median(() => noise.Invoke(null, new object[] { count, 0L, 0x1234UL })),8:F1} ms");
+    Console.WriteLine($"noise draw for a {side}x{side} latent ({count} values): median {Median(() => PhiloxNoise.Draw(count, 0L, 0x1234UL)),8:F1} ms");
 }

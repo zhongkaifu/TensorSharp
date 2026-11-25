@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using TensorSharp.Models.QwenImage21;
 
 namespace TensorSharp.Models.QwenImage;
 
@@ -44,7 +45,7 @@ internal readonly record struct QwenImage21LoraKey(string Module, QwenImage21Lor
 /// </remarks>
 internal static class QwenImage21LoraKeys
 {
-    internal const int Layers = QwenImage21DiT.Layers;
+    internal const int Layers = QwenImage21Weights.ReleaseLayers;
 
     internal static readonly string[] GlobalModules =
     {

@@ -104,7 +104,9 @@ namespace TensorSharp.Models.QwenImage21
                 if (tensorParallel is { Degree: > 1 })
                 {
                     _ranks = tensorParallel.Degree;
-                    if (_executor is not IRankedGraphExecutor ranked || !ranked.RunsRanks(_ranks))
+                    // A loopback group (one device, for numerics) runs the same ranked graphs.
+                    if (_executor is not IRankedGraphExecutor ranked ||
+                        !(ranked.RunsRanks(_ranks) || _executor is GgmlGraphExecutor { } ggml && ggml.RunsLoopbackRanks(_ranks)))
                         throw new NotSupportedException(
                             $"Qwen-Image-2.1 tensor parallelism over {_ranks} GPUs needs a GGML backend whose GPUs run ranked graphs (ggml_cuda, ggml_vulkan).");
                     _rankBlocks = ShardBlocks(_w, _ranks, _shardOwned);

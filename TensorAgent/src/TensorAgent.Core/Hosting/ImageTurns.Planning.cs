@@ -193,7 +193,7 @@ public static partial class ImageTurns
         /// Change <paramref name="picture"/> as <paramref name="prompt"/> says, in the user's own
         /// words: an edit model takes the instruction as it is given. At the service's seed, as
         /// an attached photo is: the engine keys an edit's noise to its pictures
-        /// (QwenImage21Sampling.ReferenceStream, with the evidence), so a change of a picture the
+        /// (QwenImage21Noise.ReferenceStream, with the evidence), so a change of a picture the
         /// model made never starts from the noise that picture was drawn from, whether it comes
         /// from this rule or from Edit on the picture, which attaches it.
         /// </summary>

@@ -5,7 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// The image model's own Qwen3-VL-8B as a multiple-choice scorer (QwenImageModel.ChooseAnswer):
+// The image model's own Qwen3-VL-8B as a multiple-choice scorer (QwenImage21DiffusionModel.ChooseAnswer):
 // the prompt must be the encoder's shipped ChatML byte for byte, text a user typed must not
 // be able to write turns of its own, every option must be one letter token, and asking once
 // per rotation of the options must cancel any preference for positions. All of that is checked
@@ -22,6 +22,7 @@ using System.Text;
 using System.Threading;
 using TensorSharp;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 using Xunit;
 using Xunit.Abstractions;
@@ -320,7 +321,7 @@ public sealed class QwenImageIntentScorerTests
     public void ChooseAnswer_ChecksItsArgumentsBeforeAnythingElse()
     {
         // No constructor ran: nothing past the argument checks may be reached.
-        var model = (QwenImageModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImageModel));
+        var model = (QwenImage21DiffusionModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImage21DiffusionModel));
         Assert.Throws<ArgumentException>(() => model.ChooseAnswer("s", "u", new[] { "only one" }));
         Assert.Throws<ArgumentNullException>(() => model.ChooseAnswer("s", null!, TwoAnswers));
     }
@@ -348,32 +349,32 @@ public sealed class QwenImageIntentScorerTests
 
         Assert.Equal("options", error.ParamName);
         Assert.False(scored);
-        Assert.Throws<ArgumentException>(() => QwenImageModel.ChooseAnswerPrompt("s", "u", options));
+        Assert.Throws<ArgumentException>(() => QwenImage21DiffusionModel.ChooseAnswerPrompt("s", "u", options));
         // One option that happens to be a letter, beside a real text, is still an option.
         Assert.NotNull(QwenImageIntentScorer.Choose("s", "u", new[] { "A", "Make a new picture" }, CharTokens,
             (_, _) => new float[2], 1024, CancellationToken.None));
     }
 
     /// <summary>
-    /// A model with only what <see cref="QwenImageModel.ChooseAnswer"/> reads before it builds
+    /// A model with only what <see cref="QwenImage21DiffusionModel.ChooseAnswer"/> reads before it builds
     /// the encoder: the backend and, when given, the text encoder's file. No constructor runs,
     /// so a test that reaches the encoder or the native library fails rather than loading 5 GB.
     /// </summary>
-    internal static QwenImageModel ModelWithoutWeights(BackendType backend, string? textEncoder = null)
+    internal static QwenImage21DiffusionModel ModelWithoutWeights(BackendType backend, string? textEncoder = null)
     {
         const BindingFlags fields = BindingFlags.Instance | BindingFlags.NonPublic;
-        var model = (QwenImageModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImageModel));
+        var model = (QwenImage21DiffusionModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImage21DiffusionModel));
         typeof(TensorSharp.Models.ModelBase).GetField("<ExecutionPlan>k__BackingField", fields)!
             .SetValue(model, new TensorSharp.Models.BackendExecutionPlan(backend));
         typeof(TensorSharp.Models.ModelBase).GetField("_backend", fields)!.SetValue(model, backend);
         if (textEncoder != null)
-            typeof(QwenImageModel).GetField("_tePath", fields)!.SetValue(model, textEncoder);
+            typeof(QwenImage21DiffusionModel).GetField("_tePath", fields)!.SetValue(model, textEncoder);
         return model;
     }
 
     /// <summary>Close the text-encoder header a test model opened, so its file can be deleted.</summary>
-    private static void CloseTextEncoder(QwenImageModel model) =>
-        (typeof(QwenImageModel).GetField("_teGguf", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(model) as GgufFile)?.Dispose();
+    private static void CloseTextEncoder(QwenImage21DiffusionModel model) =>
+        (typeof(QwenImage21DiffusionModel).GetField("_teGguf", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(model) as GgufFile)?.Dispose();
 
     /// <summary>
     /// "Cannot answer" is an answer, not an error: on a backend the scorer does not run on, or
@@ -386,7 +387,7 @@ public sealed class QwenImageIntentScorerTests
         Assert.Null(ModelWithoutWeights(BackendType.Cpu).ChooseAnswer("s", "u", TwoAnswers));
 
         string path = WriteTextEncoderHeader(withHead: false, headWidth: 4096, withNorm: true);
-        QwenImageModel headless = ModelWithoutWeights(BackendType.GgmlCpu, path);
+        QwenImage21DiffusionModel headless = ModelWithoutWeights(BackendType.GgmlCpu, path);
         try
         {
             Assert.Null(headless.ChooseAnswer("s", "u", TwoAnswers));
@@ -407,7 +408,7 @@ public sealed class QwenImageIntentScorerTests
     public void ChooseAnswer_Cancellation_IsNotTurnedIntoNoAnswer()
     {
         string path = WriteTextEncoderHeader(withHead: true, headWidth: 4096, withNorm: true);
-        QwenImageModel model = ModelWithoutWeights(BackendType.GgmlCpu, path);
+        QwenImage21DiffusionModel model = ModelWithoutWeights(BackendType.GgmlCpu, path);
         try
         {
             using var cancel = new CancellationTokenSource();
@@ -655,7 +656,7 @@ public sealed class QwenImageIntentScorerTests
     public void TheRealEncoder_TellsAnEditFromANewPicture()
     {
         string dit = TestGates.FindGguf(Environment.GetEnvironmentVariable("TENSORSHARP_QWEN21_DIT")!, "qwen-image-2.1")!;
-        using var model = new QwenImageModel(dit, BackendType.GgmlMetal);
+        using var model = new QwenImage21DiffusionModel(dit, BackendType.GgmlMetal);
         Assert.Null(QwenImageTextEncoder.ScoringHeadRefusal(model.TeGguf));
 
         const string system = "You decide what an image assistant does with the user's newest message in a conversation " +

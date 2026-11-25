@@ -173,6 +173,7 @@ namespace TensorSharp.Models.QwenImage21
 
         private static long FileLength(string path)
         {
+            if (string.IsNullOrEmpty(path)) return 0;
             try { return new FileInfo(path).Length; }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return 0; }
         }
@@ -254,6 +255,10 @@ namespace TensorSharp.Models.QwenImage21
         /// <summary>The checkpoint's own recipe in the LoRA loader's terms (Turbo's), or null for the base checkpoint.</summary>
         internal QwenImage21LoraRecipe CheckpointRecipe => Variant == QwenImageVariant.Turbo ? QwenImage21Turbo.Recipe : null;
 
+        /// <summary>The recipe requests sample with as the LoRA loader states it: the plug-ins' own, else the checkpoint's
+        /// (null: the base checkpoint's scheduler).</summary>
+        internal QwenImage21LoraRecipe SamplingRecipe => Loras?.Recipe ?? CheckpointRecipe;
+
         /// <summary>
         /// Replace the LoRA plug-ins applied to every later request (an empty list removes them). The adapters are validated
         /// against this transformer immediately; a failure leaves the previous set in place.
@@ -334,30 +339,16 @@ namespace TensorSharp.Models.QwenImage21
             // Parse first: a misspelled setting fails before any work, text to image included.
             bool followReferences = QwenImage21Noise.EditNoiseFollowsReferences(
                 Environment.GetEnvironmentVariable(QwenImage21Noise.EditNoiseVariable));
-            if (inputs.Length > 0 && _mmprojPath == null)
+            // An edit needs the vision projector, except one whose selection is empty: the runtime returns its source unchanged.
+            if (inputs.Length > 0 && _mmprojPath == null && (p.Mask == null || QwenImageEditMask.Create(p, inputs[0])?.IsEmpty != true))
                 throw new InvalidOperationException("Qwen-Image-2.1 editing requires the Qwen3-VL-8B vision projector; set --qwen-image-mmproj or TS_QWEN_IMAGE_MMPROJ.");
             Action<int, int, RgbImage> onStep = p.OnStep;
             Action<DiffusionProgress> observer = ProgressObserver;
-            var request = new DiffusionRequest
+            DiffusionRequest request = RequestOf(prompt, p, inputs, onStep == null && observer == null ? null : progress =>
             {
-                Prompt = prompt,
-                References = inputs.Select(i => new DiffusionReference(i)).ToArray(),
-                Width = p.Width,
-                Height = p.Height,
-                TargetArea = p.TargetArea,
-                KeepSourceSize = p.KeepSourceSize,
-                Mask = QwenImageEditMask.Options(p),
-                Seed = p.Seed,
-                Steps = p.Steps,
-                Cfg = p.CfgScale,
-                NegativePrompt = p.NegativePrompt ?? "",
-                PreviewCount = p.PreviewCount,
-                Progress = onStep == null && observer == null ? null : progress =>
-                {
-                    observer?.Invoke(progress);
-                    if (progress.IsStep) onStep?.Invoke(progress.Step, progress.Total, progress.Preview as RgbImage);
-                },
-            };
+                observer?.Invoke(progress);
+                if (progress.IsStep) onStep?.Invoke(progress.Step, progress.Total, progress.Preview as RgbImage);
+            });
             lock (_generationLock)
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(QwenImage21DiffusionModel));
@@ -378,6 +369,26 @@ namespace TensorSharp.Models.QwenImage21
                 return result.Image;
             }
         }
+
+        /// <summary>The runtime request of a host's parameters: the size, area, kept source size and mask, the seed, steps, CFG
+        /// and negative prompt, the previews; <paramref name="inputs"/> are the references in order.</summary>
+        internal static DiffusionRequest RequestOf(string prompt, QwenImageParams p, IReadOnlyList<RgbImage> inputs,
+            Action<DiffusionProgress> progress = null) => new()
+        {
+            Prompt = prompt,
+            References = inputs.Select(i => new DiffusionReference(i)).ToArray(),
+            Width = p.Width,
+            Height = p.Height,
+            TargetArea = p.TargetArea,
+            KeepSourceSize = p.KeepSourceSize,
+            Mask = QwenImageEditMask.Options(p),
+            Seed = p.Seed,
+            Steps = p.Steps,
+            Cfg = p.CfgScale,
+            NegativePrompt = p.NegativePrompt ?? "",
+            PreviewCount = p.PreviewCount,
+            Progress = progress,
+        };
 
         /// <summary>Refuses (ArgumentException, a 400 on the server) a size whose estimated peak does not fit in this machine's
         /// memory (<see cref="QwenImage21CpuMemory"/>), and warns when it exceeds the memory free right now.</summary>

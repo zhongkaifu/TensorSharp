@@ -11,6 +11,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.GGML;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.QwenImage;
@@ -37,7 +38,7 @@ namespace TensorSharp.Models.QwenImage;
 internal sealed class QwenImage21LoraSet : IDisposable
 {
     private const int GgmlF32 = 0, GgmlF16 = 1;
-    private const int Channels = QwenImage21DiT.Channels, Dim = QwenImage21DiT.HiddenSize;
+    private const int Channels = QwenImage21Weights.ReleaseChannels, Dim = QwenImage21Weights.ReleaseDim;
     private const string PddFormatPrefix = "qwenimage21_extracted_prefused";
 
     private readonly LoraFactorBuffers _buffers = new();
@@ -52,10 +53,10 @@ internal sealed class QwenImage21LoraSet : IDisposable
     /// <summary>The sampling recipe of the plug-in that carries one, or null.</summary>
     internal QwenImage21LoraRecipe Recipe { get; private set; }
     /// <summary>Blocks whose fused gate_up weight must be described as its two halves.</summary>
-    internal bool[] SplitGateUp { get; } = new bool[QwenImage21DiT.Layers];
+    internal bool[] SplitGateUp { get; } = new bool[QwenImage21Weights.ReleaseLayers];
     /// <summary>Replacement F32 gains (a PDD bundle), zero where the checkpoint's own is kept.</summary>
-    internal IntPtr[] NormQ { get; } = new IntPtr[QwenImage21DiT.Layers];
-    internal IntPtr[] NormK { get; } = new IntPtr[QwenImage21DiT.Layers];
+    internal IntPtr[] NormQ { get; } = new IntPtr[QwenImage21Weights.ReleaseLayers];
+    internal IntPtr[] NormK { get; } = new IntPtr[QwenImage21Weights.ReleaseLayers];
     internal IntPtr TextNorm { get; private set; }
     /// <summary>Per-step output heads (F32 [dim, channels]) replacing proj_out, or empty.</summary>
     internal IntPtr[] OutputHeads { get; private set; } = Array.Empty<IntPtr>();
@@ -531,7 +532,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
             OutputHeads = result;
             return 1;
         }
-        long length = local switch { "txt_in.text_norm" => QwenImage21DiT.TextDim, "attn.norm_q" or "attn.norm_k" => QwenImage21DiT.HeadDim, _ => -1 };
+        long length = local switch { "txt_in.text_norm" => QwenImage21Weights.ReleaseTextDim, "attn.norm_q" or "attn.norm_k" => QwenImage21Weights.ReleaseHeadDim, _ => -1 };
         if (length < 0 || !(shape.Length == 1 && shape[0] == length))
             throw new InvalidDataException($"LoRA '{file}': {name} has shape [{string.Join(",", shape)}], which does not replace {module}.");
         IntPtr current = local == "txt_in.text_norm" ? TextNorm : local == "attn.norm_q" ? NormQ[block] : NormK[block];
@@ -606,7 +607,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
         foreach (var module in QwenImage21LoraKeys.GlobalModules)
             if (_slots.TryGetValue(module, out var slot) && !slot.Empty)
                 groups.Add((() => new[] { (module, slot) }, false));
-        for (int b = 0; b < QwenImage21DiT.Layers; b++)
+        for (int b = 0; b < QwenImage21Weights.ReleaseLayers; b++)
         {
             Slot Get(string n) => _slots.TryGetValue($"{b}.{n}", out var s) && !s.Empty ? s : null;
             var qkv = new[] { "q", "k", "v" }.Select(n => ($"{b}.{n}", Get(n))).Where(p => p.Item2 != null).ToArray();
@@ -729,8 +730,8 @@ internal sealed class QwenImage21LoraSet : IDisposable
         _adapters = new IntPtr[_ranks];
         for (int r = 0; r < _ranks; r++)
         {
-            var blocks = (QwenImage21BlockLora*)Allocate(sizeof(QwenImage21BlockLora) * QwenImage21DiT.Layers);
-            for (int b = 0; b < QwenImage21DiT.Layers; b++)
+            var blocks = (QwenImage21BlockLora*)Allocate(sizeof(QwenImage21BlockLora) * QwenImage21Weights.ReleaseLayers);
+            for (int b = 0; b < QwenImage21Weights.ReleaseLayers; b++)
             {
                 blocks[b] = new QwenImage21BlockLora
                 {
@@ -744,7 +745,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
             *adapter = new QwenImage21Adapter
             {
                 StructBytes = sizeof(QwenImage21Adapter),
-                NumLayers = QwenImage21DiT.Layers,
+                NumLayers = QwenImage21Weights.ReleaseLayers,
                 ImageIn = Global("img_in"), TextIn = Global("txt_in.in_layer"), TextOut = Global("txt_in.out_layer"),
                 TimeIn = Global("time_text_embed.timestep_embedder.linear_1"),
                 TimeOut = Global("time_text_embed.timestep_embedder.linear_2"),
@@ -865,7 +866,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
     }
 
     /// <summary>The factors' memory (every allocation of the set: factors, per-rank copies, gains, heads), as ranges: the
-    /// transformer that binds them releases it with its own (QwenImage21DiT.AddOwnedHostMemory).</summary>
+    /// transformer that binds them releases it with its own (QwenImage21Denoiser.BindLora).</summary>
     internal void CollectHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges) => _buffers.AddRanges(ranges);
 
     public void Dispose()

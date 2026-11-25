@@ -4,7 +4,6 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json.Nodes;
 using TensorSharp.Models.QwenImage;
@@ -12,15 +11,14 @@ using TensorSharp.GGML;
 using TensorSharp.Models.QwenImage21;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
-using NativeWeight = TensorSharp.GGML.QwenImage21Weight;
-using NativeBlock = TensorSharp.GGML.QwenImage21Block;
-using NativeSegment = TensorSharp.GGML.QwenImage21Segment;
 
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Qwen-Image-2.1's denoiser on the diffusion runtime against the retired native forward (TSGgml_QwenImage21Forward) on a small
-/// synthetic transformer: the same velocities, step for step, through the extract and cached graphs of the prefix cache.
+/// Qwen-Image-2.1's denoiser on the diffusion runtime on a small synthetic transformer (and a diffusers-keyed LoRA over it),
+/// against the retired transformer's velocities frozen before it was deleted (QwenImage21Goldens): the native graph
+/// (TSGgml_QwenImage21Forward) on each GGML lane that froze them, the pure-C# transformer on the host lane. Step for step,
+/// through the extract and cached graphs of the prefix cache.
 /// </summary>
 public sealed class QwenImage21DenoiserTests : IDisposable
 {
@@ -43,7 +41,16 @@ public sealed class QwenImage21DenoiserTests : IDisposable
     }
 
     /// <summary>A minimal GGUF v3: no metadata, F32 tensors, 32-byte alignment.</summary>
-    internal static void WriteGguf(string path, IReadOnlyList<(string Name, long[] Dims, float[] Data)> tensors)
+    internal static void WriteGguf(string path, IReadOnlyList<(string Name, long[] Dims, float[] Data)> tensors) =>
+        WriteGguf(path, tensors.Select(t =>
+        {
+            var raw = new byte[t.Data.Length * 4];
+            Buffer.BlockCopy(t.Data, 0, raw, 0, raw.Length);
+            return (t.Name, t.Dims, 0, raw);
+        }).ToList());
+
+    /// <summary>A minimal GGUF v3 of raw tensors of any GGML type: no metadata, 32-byte alignment.</summary>
+    internal static void WriteGguf(string path, IReadOnlyList<(string Name, long[] Dims, int Type, byte[] Data)> tensors)
     {
         const int Alignment = 32;
         static long Pad(long n) => (n + Alignment - 1) / Alignment * Alignment;
@@ -54,23 +61,21 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         w.Write((ulong)tensors.Count);
         w.Write(0UL);
         long offset = 0;
-        foreach (var (name, dims, data) in tensors)
+        foreach (var (name, dims, type, data) in tensors)
         {
             byte[] bytes = Encoding.UTF8.GetBytes(name);
             w.Write((ulong)bytes.Length);
             w.Write(bytes);
             w.Write((uint)dims.Length);
             foreach (long d in dims) w.Write((ulong)d);
-            w.Write(0u);
+            w.Write((uint)type);
             w.Write((ulong)offset);
-            offset += Pad(data.Length * 4L);
+            offset += Pad(data.Length);
         }
         w.Flush();
         w.Write(new byte[Pad(fs.Position) - fs.Position]);
-        foreach (var (_, _, data) in tensors)
+        foreach (var (_, _, _, raw) in tensors)
         {
-            var raw = new byte[data.Length * 4];
-            Buffer.BlockCopy(data, 0, raw, 0, raw.Length);
             w.Write(raw);
             w.Write(new byte[Pad(raw.Length) - raw.Length]);
         }
@@ -140,148 +145,6 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         shapes.Add((4, 6));
         QwenImage21Layout layout = QwenImage21Layout.Build(textRows, references > 0 ? slots.ToArray() : null, shapes, HeadDim);
         return (text, refs, layout, Rand(24 * Channels, seed + 99));
-    }
-
-    /// <summary>The retired native forward over the same mapped weights.</summary>
-    private sealed class Legacy : IDisposable
-    {
-        private readonly List<GCHandle> _pins = new();
-        private readonly NativeBlock[] _blocks;
-        private QwenImage21ForwardArgs _args;
-
-        private IntPtr _adapter;
-
-        public Legacy(QwenImage21Weights w, QwenImage21LoraSet lora = null) : this(w)
-        {
-            if (lora == null) return;
-            unsafe
-            {
-                var source = (QwenImage21Adapter*)lora.AdapterFor(0);
-                var blocks = new QwenImage21BlockLora[w.Layers];
-                for (int i = 0; i < w.Layers; i++) blocks[i] = lora.Block(i);
-                // The set's split of a fused gate_up into two row views, as the retired transformer described it.
-                for (int i = 0; i < w.Layers; i++)
-                    if (lora.SplitGateUp[i] && w.Blocks[i].FusedGateUp)
-                    {
-                        var g = w.Blocks[i].Gate;
-                        long rowBytes = g.Bytes / g.Ne1;
-                        _blocks[i].Gate = new NativeWeight { Data = g.Data, Type = g.Format, Ne0 = g.Ne0, Ne1 = w.Ff, Bytes = w.Ff * rowBytes };
-                        _blocks[i].Up = new NativeWeight { Data = g.Data + (nint)(w.Ff * rowBytes), Type = g.Format, Ne0 = g.Ne0, Ne1 = w.Ff, Bytes = w.Ff * rowBytes };
-                    }
-                var adapter = *source;
-                adapter.NumLayers = w.Layers;
-                adapter.Blocks = Pin(blocks);
-                _adapter = Pin(new[] { adapter });
-            }
-        }
-
-        public Legacy(QwenImage21Weights w)
-        {
-            static NativeWeight W(TensorSharp.Models.QwenImage21.QwenImage21Weight x) =>
-                new() { Data = x.Data, Type = x.Format, Ne0 = x.Ne0, Ne1 = x.Ne1, Bytes = x.Bytes };
-            _blocks = new NativeBlock[w.Layers];
-            for (int i = 0; i < w.Layers; i++)
-            {
-                var b = w.Blocks[i];
-                _blocks[i] = new NativeBlock
-                {
-                    Q = W(b.Q), K = W(b.K), V = W(b.V), Out = W(b.Out), Gate = W(b.Gate),
-                    Up = b.Up == null ? default : W(b.Up), Down = W(b.Down), NormQ = b.NormQ.Data, NormK = b.NormK.Data,
-                };
-            }
-            _args = new QwenImage21ForwardArgs
-            {
-                ImageIn = W(w.ImageIn), TextIn = W(w.TextIn), TextOut = W(w.TextOut), TimeIn = W(w.TimeIn), TimeOut = W(w.TimeOut),
-                Modulation = W(w.Modulation), NormOut = W(w.NormOut), ProjOut = W(w.ProjOut), TextNorm = w.TextNorm.Data,
-                StructBytes = Marshal.SizeOf<QwenImage21ForwardArgs>(),
-                Dim = w.Dim, Heads = w.Heads, HeadDim = w.HeadDim, Channels = w.Channels, TextDim = w.TextDim,
-                NumLayers = w.Layers, Eps = 1e-6f,
-            };
-        }
-
-        private IntPtr Pin(Array a)
-        {
-            var h = GCHandle.Alloc(a, GCHandleType.Pinned);
-            _pins.Add(h);
-            return h.AddrOfPinnedObject();
-        }
-
-        public (float[] Output, QwenImage21ForwardPath Path) Forward(float[] target, ConditioningSet text, LatentRef[] references,
-            QwenImage21Layout layout, float sigma, ulong cacheKey)
-        {
-            float[] images = references.SelectMany(r => r.Rows).Concat(target).ToArray();
-            var segments = layout.Segments.Select(s => new NativeSegment
-            {
-                Start = s.Start, End = s.End, SourceStart = s.SourceStart, IsImage = s.IsImage ? 1 : 0,
-            }).ToArray();
-            var output = new float[target.Length];
-            var a = _args;
-            a.Images = Pin(images); a.Text = Pin(text.Hidden); a.TimeEmbedding = Pin(QwenImage21Denoiser.TimeEmbedding(sigma, false));
-            a.Cos = Pin(layout.Cos); a.Sin = Pin(layout.Sin); a.Output = Pin(output); a.Blocks = Pin(_blocks); a.Segments = Pin(segments);
-            a.ImageSeq = images.Length / Channels; a.TextSeq = text.Rows; a.TotalSeq = layout.Rows; a.PrefixSeq = layout.Prefix;
-            a.NumSegments = segments.Length; a.PrefixCacheKey = cacheKey; a.Adapter = _adapter;
-            QwenImage21ForwardPath path = GgmlBasicOps.QwenImage21Forward(in a);
-            return (output, path);
-        }
-
-        /// <summary>The retired pure-C# transformer (the cpu backend's) on the same descriptors.</summary>
-        public float[] ForwardManaged(float[] target, ConditioningSet text, LatentRef[] references, QwenImage21Layout layout, float sigma,
-            ref QwenImage21ManagedPrefix store)
-        {
-            _managed ??= new QwenImage21ManagedDiT(_args, _blocks);
-            float[] images = references.SelectMany(r => r.Rows).Concat(target).ToArray();
-            var segments = layout.Segments.Select(s => new NativeSegment
-            {
-                Start = s.Start, End = s.End, SourceStart = s.SourceStart, IsImage = s.IsImage ? 1 : 0,
-            }).ToArray();
-            var output = new float[target.Length];
-            store ??= new QwenImage21ManagedPrefix(QwenImage21PrefixCacheType.Auto);
-            _managed.Forward(images, images.Length / Channels, text.Hidden, text.Rows, QwenImage21Denoiser.TimeEmbedding(sigma, false),
-                layout.Cos, layout.Sin, segments, layout.Prefix, layout.Rows, _adapter, store, output);
-            return output;
-        }
-
-        private QwenImage21ManagedDiT _managed;
-
-        public void Dispose()
-        {
-            _managed?.Dispose();
-            foreach (var h in _pins) h.Free();
-        }
-    }
-
-    [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(2)]
-    public void Program_matches_the_retired_native_forward_through_the_prefix_cache(int references)
-    {
-        string path = WriteTransformer(_dir);
-        using var denoiser = new QwenImage21Denoiser(path, TestGates.PinnedGgmlBackend);
-        using var legacy = new Legacy(denoiser.Weights);
-        var (text, refs, layout, target) = Request(references, 7);
-        ulong key = 0xC0FFEE00UL + (ulong)references;
-        try
-        {
-            float[] x = (float[])target.Clone();
-            foreach (var (sigma, step) in new[] { (1f, 0), (0.75f, 1), (0.3f, 2) })
-            {
-                var (expected, path0) = legacy.Forward(x, text, refs, layout, sigma, key);
-                float[] actual = (float[])denoiser.Predict(x, text, refs, layout, sigma, step, false, null).Clone();
-                Assert.Equal(step == 0 ? QwenImage21ForwardPath.Extract : QwenImage21ForwardPath.Cached, path0);
-                Assert.Equal(step == 0 ? QwenImage21Denoiser.Mode.Extract : QwenImage21Denoiser.Mode.Cached, denoiser.LastMode);
-                Assert.Equal(expected.Length, actual.Length);
-                for (int i = 0; i < expected.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i]),
-                        $"step {step}, value {i}: legacy {expected[i]:R}, runtime {actual[i]:R}");
-                for (int i = 0; i < x.Length; i++) x[i] += (sigma - 0.5f) * actual[i] * 0.1f;
-            }
-        }
-        finally
-        {
-            GgmlBasicOps.QwenImage21ReleasePrefixCache(key);
-            denoiser.FinishRequest();
-        }
     }
 
     /// <summary>The managed tensor executor (the cpu backend) runs the same program: its velocities agree with the GGML CPU
@@ -363,45 +226,6 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         return path;
     }
 
-    /// <summary>The retired native forward with the set's updates (its descriptor cut to the tiny transformer's layers).</summary>
-    [Theory]
-    [InlineData(0, true)]
-    [InlineData(1, true)]
-    [InlineData(1, false)]
-    public unsafe void Program_with_a_LoRA_matches_the_retired_native_forward(int references, bool fused)
-    {
-        string path = WriteTransformer(_dir, fused);
-        string loraPath = WriteLora(_dir);
-        using var denoiser = new QwenImage21Denoiser(path, TestGates.PinnedGgmlBackend);
-        using var set = QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, denoiser.Weights.Gguf, "", TestGates.PinnedGgmlBackend, 1);
-        Assert.Equal(fused, set.SplitGateUp[1]);
-        using var legacy = new Legacy(denoiser.Weights, set);
-        var (text, refs, layout, target) = Request(references, 21);
-        ulong key = 0xBEEF00UL + (ulong)references;
-        try
-        {
-            float[] x = (float[])target.Clone();
-            foreach (var (sigma, step) in new[] { (1f, 0), (0.7f, 1) })
-            {
-                var (expected, _) = legacy.Forward(x, text, refs, layout, sigma, key);
-                float[] actual = (float[])denoiser.Predict(x, text, refs, layout, sigma, step, false, set).Clone();
-                for (int i = 0; i < expected.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i]),
-                        $"step {step}, value {i}: legacy {expected[i]:R}, runtime {actual[i]:R}");
-                for (int i = 0; i < x.Length; i++) x[i] += (sigma - 0.5f) * actual[i] * 0.1f;
-            }
-            // The plug-in changes the velocity (the comparison above is not vacuous).
-            float[] plain = (float[])denoiser.Predict(target, text, refs, layout, 1f, 0, false, null).Clone();
-            var (withLora, _) = legacy.Forward(target, text, refs, layout, 1f, 0);
-            Assert.NotEqual(plain, withLora);
-        }
-        finally
-        {
-            GgmlBasicOps.QwenImage21ReleasePrefixCache(key);
-            denoiser.FinishRequest();
-        }
-    }
-
     // ---- the retired engines' outputs, frozen (QwenImage21Goldens)
 
     /// <summary>The frozen cases: (name, transformer layout, LoRA, references).</summary>
@@ -418,66 +242,6 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         return (dit, loraPath, lora ? QwenImage21Goldens.FixtureSha(dit, loraPath) : QwenImage21Goldens.FixtureSha(dit));
     }
 
-    /// <summary>Writes this lane's frozen legacy outputs (TS_QWEN21_FREEZE_DIR): the native graph's on the pinned GGML backend
-    /// and the pure-C# transformer's on the host lane, each case's steps driven by the legacy velocities. Recorded once, before
-    /// the legacy engines were deleted; a no-op without the variable.</summary>
-    [Fact]
-    public void Freeze_the_retired_engines_outputs()
-    {
-        string dir = Environment.GetEnvironmentVariable(QwenImage21Goldens.FreezeVariable);
-        if (string.IsNullOrWhiteSpace(dir)) return;
-        Directory.CreateDirectory(dir);
-        BackendType backend = TestGates.PinnedGgmlBackend;
-        var native = new Dictionary<string, (string, bool, IReadOnlyList<float[]>)>();
-        var host = new Dictionary<string, (string, bool, IReadOnlyList<float[]>)>();
-        foreach (var (name, fused, withLora, references) in GoldenCases)
-        {
-            var (dit, loraPath, sha) = Fixture(fused, withLora);
-            using var denoiser = new QwenImage21Denoiser(dit, backend) { FreeMemory = () => -1 };
-            using var set = withLora ? QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, denoiser.Weights.Gguf, "", backend, 1) : null;
-            using var legacy = new Legacy(denoiser.Weights, set);
-            var (text, refs, layout, target) = Request(references, 31);
-            ulong key = 0xF00D00UL + (ulong)name.GetHashCode();
-            var legacyOut = new List<float[]>();
-            bool exact = true;
-            float[] x = (float[])target.Clone();
-            try
-            {
-                foreach (var (sigma, step) in QwenImage21Goldens.Steps)
-                {
-                    var (expected, _) = legacy.Forward(x, text, refs, layout, sigma, key);
-                    float[] actual = denoiser.Predict(x, text, refs, layout, sigma, step, false, set);
-                    exact &= expected.AsSpan().SequenceEqual(actual);
-                    legacyOut.Add(expected);
-                    QwenImage21Goldens.Advance(x, expected, sigma);
-                }
-            }
-            finally
-            {
-                GgmlBasicOps.QwenImage21ReleasePrefixCache(key);
-                denoiser.FinishRequest();
-            }
-            native["denoiser/" + name] = (sha, exact, legacyOut);
-
-            // The pure-C# transformer took F32 LoRA factors of its own; its cases are the plain transformer's.
-            if (withLora) continue;
-            QwenImage21ManagedPrefix store = null;
-            var managedOut = new List<float[]>();
-            x = (float[])target.Clone();
-            foreach (var (sigma, _) in QwenImage21Goldens.Steps)
-            {
-                float[] expected = legacy.ForwardManaged(x, text, refs, layout, sigma, ref store);
-                managedOut.Add(expected);
-                QwenImage21Goldens.Advance(x, expected, sigma);
-            }
-            store?.Dispose();
-            host["managed/" + name] = (sha, false, managedOut);
-        }
-        string ggmlLane = MiniMaxH3ImageGoldens.LaneKey(backend), hostLane = MiniMaxH3ImageGoldens.HostLaneKey();
-        File.WriteAllText(Path.Combine(dir, MiniMaxH3ImageGoldens.FileName(ggmlLane)), QwenImage21Goldens.File(ggmlLane, native).ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-        File.WriteAllText(Path.Combine(dir, MiniMaxH3ImageGoldens.FileName(hostLane)), QwenImage21Goldens.File(hostLane, host).ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-    }
-
     /// <summary>The runtime's program on the pinned GGML backend against the retired native graph's frozen velocities: the bytes
     /// on the lane that froze them, within 2e-3 elsewhere (another CPU's or GPU's kernels).</summary>
     [Theory]
@@ -489,17 +253,81 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         BackendType backend = TestGates.PinnedGgmlBackend;
         using var denoiser = new QwenImage21Denoiser(dit, backend) { FreeMemory = () => -1 };
         using var set = withLora ? QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, denoiser.Weights.Gguf, "", backend, 1) : null;
+        if (set != null) Assert.Equal(fused, set.SplitGateUp[1]);
         var (text, refs, layout, target) = Request(references, 31);
         var got = new List<float[]>();
         float[] x = (float[])target.Clone();
         foreach (var (sigma, step) in QwenImage21Goldens.Steps)
         {
             float[] v = (float[])denoiser.Predict(x, text, refs, layout, sigma, step, false, set).Clone();
+            // The first step stores the text and reference prefix's K/V; the later ones compute only the target.
+            Assert.Equal(step == 0 ? QwenImage21Denoiser.Mode.Extract : QwenImage21Denoiser.Mode.Cached, denoiser.LastMode);
             got.Add(v);
             QwenImage21Goldens.Advance(x, v, sigma);
         }
+        if (set != null)
+        {
+            // The plug-in changes the velocity, so the comparison is not vacuous.
+            float[] plain = (float[])denoiser.Predict(target, text, refs, layout, 1f, 0, false, null).Clone();
+            float[] adapted = (float[])denoiser.Predict(target, text, refs, layout, 1f, 0, false, set).Clone();
+            Assert.NotEqual(plain, adapted);
+        }
         denoiser.FinishRequest();
         QwenImage21Goldens.Check("denoiser/" + name, MiniMaxH3ImageGoldens.LaneKey(backend), sha, got, bound: 2e-3);
+    }
+
+    /// <summary>A prefix cache belongs to the request's own conditioning and reference objects (the K/V encode them, and a
+    /// caller may mutate an equal copy independently): a copy, another order or another count of the references extracts its
+    /// own; two are kept (a CFG pair), the least recently used goes first, and FinishRequest drops them all.</summary>
+    [Fact]
+    public void Prefix_caches_follow_the_requests_own_conditioning_and_references()
+    {
+        string path = WriteTransformer(_dir);
+        using var denoiser = new QwenImage21Denoiser(path, TestGates.PinnedGgmlBackend) { FreeMemory = () => -1 };
+        var (text, refs, layout, target) = Request(2, 41);
+        QwenImage21Denoiser.Mode Step(ConditioningSet c, LatentRef[] r)
+        {
+            denoiser.Predict(target, c, r, layout, 0.5f, 1, false, null);
+            return denoiser.LastMode;
+        }
+        var copy = new ConditioningSet((float[])text.Hidden.Clone(), text.Rows, text.Width, (int[])text.Modalities.Clone());
+        Assert.Equal(QwenImage21Denoiser.Mode.Extract, Step(text, refs));
+        Assert.Equal(QwenImage21Denoiser.Mode.Cached, Step(text, refs));
+        Assert.Equal(QwenImage21Denoiser.Mode.Cached, Step(text, new[] { refs[0], refs[1] }));
+        Assert.Equal(QwenImage21Denoiser.Mode.Extract, Step(copy, refs));
+        Assert.Equal(QwenImage21Denoiser.Mode.Cached, Step(text, refs));
+        Assert.Equal(QwenImage21Denoiser.Mode.Cached, Step(copy, refs));
+        // A third prefix evicts the least recently used (text): the copy's stays.
+        Assert.Equal(QwenImage21Denoiser.Mode.Extract, Step(text, new[] { refs[1], refs[0] }));
+        Assert.Equal(QwenImage21Denoiser.Mode.Cached, Step(copy, refs));
+        Assert.Equal(QwenImage21Denoiser.Mode.Extract, Step(text, refs));
+        denoiser.FinishRequest();
+        Assert.Equal(QwenImage21Denoiser.Mode.Extract, Step(copy, refs));
+        denoiser.FinishRequest();
+    }
+
+    /// <summary>A cache larger than half the free memory is declined: every step recomputes the prefix ("full"), with the
+    /// velocities the cached steps give.</summary>
+    [Fact]
+    public void A_declined_prefix_cache_recomputes_the_prefix_every_step()
+    {
+        string path = WriteTransformer(_dir);
+        using var cached = new QwenImage21Denoiser(path, TestGates.PinnedGgmlBackend) { FreeMemory = () => -1 };
+        using var declined = new QwenImage21Denoiser(path, TestGates.PinnedGgmlBackend) { FreeMemory = () => 1024 };
+        var (text, refs, layout, target) = Request(1, 43);
+        float[] x = (float[])target.Clone();
+        foreach (var (sigma, step) in QwenImage21Goldens.Steps)
+        {
+            float[] want = (float[])cached.Predict(x, text, refs, layout, sigma, step, false, null).Clone();
+            float[] got = (float[])declined.Predict(x, text, refs, layout, sigma, step, false, null).Clone();
+            Assert.Equal(QwenImage21Denoiser.Mode.Full, declined.LastMode);
+            double err = 0, norm = 0;
+            for (int i = 0; i < want.Length; i++) { err += (got[i] - want[i]) * (double)(got[i] - want[i]); norm += want[i] * (double)want[i]; }
+            Assert.True(Math.Sqrt(err / norm) < 1e-5, $"step {step}: relative L2 {Math.Sqrt(err / norm):E3} between the full and cached graphs");
+            QwenImage21Goldens.Advance(x, want, sigma);
+        }
+        cached.FinishRequest();
+        declined.FinishRequest();
     }
 
     /// <summary>The managed tensor executor (the cpu backend) against the retired pure-C# transformer's frozen velocities.</summary>
@@ -520,6 +348,72 @@ public sealed class QwenImage21DenoiserTests : IDisposable
             QwenImage21Goldens.Advance(x, v, sigma);
         }
         denoiser.FinishRequest();
+        QwenImage21Goldens.Check("managed/" + name, MiniMaxH3ImageGoldens.HostLaneKey(), sha, got, bound: 1e-4);
+    }
+
+    /// <summary>The frozen cases on <see cref="QwenImage21WideFixture"/> (the released head and conditioning widths): the plain
+    /// transformer, and a plug-in with DoRA magnitudes and replaced norm gains over a fused and a separate MLP.</summary>
+    internal static readonly (string Name, bool Fused, bool Lora, int References)[] WideCases =
+    {
+        ("wide-plain/refs1", true, false, 1), ("wide-lora-fused/refs1", true, true, 1), ("wide-lora-separate/refs0", false, true, 0),
+    };
+
+    private List<float[]> Trajectory(QwenImage21Denoiser denoiser, (ConditioningSet Text, LatentRef[] References, QwenImage21Layout Layout, float[] Target) request,
+        QwenImage21LoraSet set)
+    {
+        var got = new List<float[]>();
+        float[] x = (float[])request.Target.Clone();
+        foreach (var (sigma, step) in QwenImage21Goldens.Steps)
+        {
+            float[] v = (float[])denoiser.Predict(x, request.Text, request.References, request.Layout, sigma, step, false, set).Clone();
+            Assert.Equal(step == 0 ? QwenImage21Denoiser.Mode.Extract : QwenImage21Denoiser.Mode.Cached, denoiser.LastMode);
+            got.Add(v);
+            QwenImage21Goldens.Advance(x, v, sigma);
+        }
+        denoiser.FinishRequest();
+        return got;
+    }
+
+    /// <summary>The runtime's program with DoRA row scales and norm replacements against the retired native graph.</summary>
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void Program_matches_the_frozen_legacy_graph_on_the_wide_transformer(int index)
+    {
+        var (name, fused, withLora, references) = WideCases[index];
+        string dit = QwenImage21WideFixture.WriteTransformer(_dir, fused);
+        string loraPath = withLora ? QwenImage21WideFixture.WriteLora(_dir) : null;
+        string sha = withLora ? QwenImage21Goldens.FixtureSha(dit, loraPath) : QwenImage21Goldens.FixtureSha(dit);
+        BackendType backend = TestGates.PinnedGgmlBackend;
+        using var denoiser = new QwenImage21Denoiser(dit, backend) { FreeMemory = () => -1 };
+        using var set = withLora ? QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, denoiser.Weights.Gguf, "", backend, 1) : null;
+        if (set != null)
+        {
+            Assert.NotEqual(IntPtr.Zero, set.TextNorm);
+            Assert.NotEqual(IntPtr.Zero, set.NormQ[0]);
+            Assert.NotEqual(IntPtr.Zero, set.NormK[1]);
+            Assert.Contains("2 DoRA magnitude(s)", set.Summary, StringComparison.Ordinal);
+        }
+        var got = Trajectory(denoiser, QwenImage21WideFixture.Request(references, 31), set);
+        QwenImage21Goldens.Check("denoiser/" + name, MiniMaxH3ImageGoldens.LaneKey(backend), sha, got, bound: 2e-3);
+    }
+
+    /// <summary>The managed tensor executor (the cpu backend) with LoRA plug-ins (F32 factors, as the cpu backend loads
+    /// them) against the retired pure-C# transformer's frozen velocities.</summary>
+    [Theory]
+    [InlineData("lora-fused/refs1")] [InlineData("lora-separate/refs1")]
+    [InlineData("wide-plain/refs1")] [InlineData("wide-lora-fused/refs1")] [InlineData("wide-lora-separate/refs0")]
+    public void Managed_program_matches_the_frozen_pure_csharp_transformer_with_plug_ins(string name)
+    {
+        bool wide = name.StartsWith("wide-", StringComparison.Ordinal);
+        bool withLora = name.Contains("lora", StringComparison.Ordinal);
+        bool fused = !name.Contains("separate", StringComparison.Ordinal);
+        int references = name.EndsWith("refs1", StringComparison.Ordinal) ? 1 : 0;
+        string dit = wide ? QwenImage21WideFixture.WriteTransformer(_dir, fused) : WriteTransformer(_dir, fused);
+        string loraPath = !withLora ? null : wide ? QwenImage21WideFixture.WriteLora(_dir) : WriteLora(_dir);
+        string sha = withLora ? QwenImage21Goldens.FixtureSha(dit, loraPath) : QwenImage21Goldens.FixtureSha(dit);
+        using var denoiser = new QwenImage21Denoiser(dit, BackendType.Cpu) { FreeMemory = () => -1 };
+        using var set = withLora ? QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, denoiser.Weights.Gguf, "", BackendType.Cpu, 1) : null;
+        var got = Trajectory(denoiser, wide ? QwenImage21WideFixture.Request(references, 31) : Request(references, 31), set);
         QwenImage21Goldens.Check("managed/" + name, MiniMaxH3ImageGoldens.HostLaneKey(), sha, got, bound: 1e-4);
     }
 }

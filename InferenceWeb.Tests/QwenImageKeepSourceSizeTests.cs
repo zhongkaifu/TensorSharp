@@ -1,6 +1,8 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
 
 namespace InferenceWeb.Tests;
 
@@ -62,7 +64,7 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
 
     /// <summary>The size an edit of <paramref name="source"/> comes back at.</summary>
     private static (int Width, int Height) EditedSize(RgbImage source, QwenImageParams p) =>
-        QwenImage21Pipeline.ResolveGeometry(p, source, QwenImageEditMask.Create(p, source)).Output;
+        QwenImage21TestGeometry.ResolveGeometry(p, source, QwenImageEditMask.Create(p, source)).Output;
 
     // ---- the report, reproduced ----------------------------------------------------------
 
@@ -115,7 +117,7 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
     public void SamplingStaysWithinTheBudgetAndTheSourcesOwnArea(int width, int height, long area, int sampledWidth, int sampledHeight)
     {
         var p = Edit(area, keep: true);
-        var (sampling, output) = QwenImage21Pipeline.ResolveGeometry(p, Picture(width, height), null);
+        var (sampling, output) = QwenImage21TestGeometry.ResolveGeometry(p, Picture(width, height), null);
 
         Assert.Equal((sampledWidth, sampledHeight), sampling);
         Assert.Equal((width, height), output);
@@ -123,13 +125,13 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
         // Within the budget and the source's own area, give or take the 32-pixel grid (half a
         // cell on each side), and at the source's aspect ratio to within one cell.
         long sampled = (long)sampling.Width * sampling.Height, own = (long)width * height;
-        long expected = Math.Min(area, Math.Max(own, QwenImage21Pipeline.KeptSourceSamplingFloor));
+        long expected = Math.Min(area, Math.Max(own, QwenImage21TestGeometry.KeptSourceSamplingFloor));
         Assert.True(sampled <= expected * 1.1 && sampled >= expected / 1.1, $"{sampling} is not about the area it should spend ({expected})");
         double aspect = (double)width / height;
         Assert.InRange(sampling.Width / (double)sampling.Height, aspect * (1 - 32.0 / sampling.Height), aspect * (1 + 32.0 / sampling.Height));
         // Larger than the budget, it is exactly the automatic geometry.
         if (own >= area)
-            Assert.Equal(QwenImage21Pipeline.ResolveDimensions(Edit(area, keep: false), Picture(width, height)), sampling);
+            Assert.Equal(QwenImage21TestGeometry.ResolveDimensions(Edit(area, keep: false), Picture(width, height)), sampling);
     }
 
     [Fact]
@@ -141,13 +143,13 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
         Environment.SetEnvironmentVariable("TS_QWEN_IMAGE_HEIGHT", "1024");
         var p = new QwenImageParams { KeepSourceSize = true };
         p.TargetArea = p.ResolveTargetArea();   // as the server parses an omitted area
-        var (sampling, output) = QwenImage21Pipeline.ResolveGeometry(p, Picture(3024, 4032), null);
+        var (sampling, output) = QwenImage21TestGeometry.ResolveGeometry(p, Picture(3024, 4032), null);
         Assert.Equal((3024, 4032), output);
         Assert.Equal((1088, 1440), sampling);
         // Without the option the default size wins outright, as before.
         var plain = new QwenImageParams();
         plain.TargetArea = plain.ResolveTargetArea();
-        Assert.Equal(((1536, 1024), (1536, 1024)), QwenImage21Pipeline.ResolveGeometry(plain, Picture(3024, 4032), null));
+        Assert.Equal(((1536, 1024), (1536, 1024)), QwenImage21TestGeometry.ResolveGeometry(plain, Picture(3024, 4032), null));
     }
 
     [Fact]
@@ -156,9 +158,9 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
         var p = new QwenImageParams { KeepSourceSize = true };
         p.TargetArea = p.ResolveTargetArea();
         Assert.Equal(((1184, 896), (1600, 1200)),
-            QwenImage21Pipeline.ResolveGeometry(p, Picture(1600, 1200), null, BackendType.Cpu));
+            QwenImage21TestGeometry.ResolveGeometry(p, Picture(1600, 1200), null, BackendType.Cpu));
         Assert.Equal(((2368, 1760), (4032, 3024)),
-            QwenImage21Pipeline.ResolveGeometry(p, Picture(4032, 3024), null, BackendType.GgmlMetal));
+            QwenImage21TestGeometry.ResolveGeometry(p, Picture(4032, 3024), null, BackendType.GgmlMetal));
     }
 
     [Fact]
@@ -167,10 +169,10 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
         // What the pipeline does with the decoded image (FinishOutput, called from Run): 1184 x
         // 896 decoded for a 1600 x 1200 photo comes back at 1600 x 1200.
         var p = Edit(TensorAgentArea, keep: true);
-        var (sampling, output) = QwenImage21Pipeline.ResolveGeometry(p, Picture(1600, 1200), null);
+        var (sampling, output) = QwenImage21TestGeometry.ResolveGeometry(p, Picture(1600, 1200), null);
         var decoded = new RgbImage(sampling.Width, sampling.Height,
             Enumerable.Range(0, sampling.Width * sampling.Height * 3).Select(i => (i % 7) / 7f).ToArray());
-        var result = QwenImage21Pipeline.FinishOutput(decoded, null, output);
+        var result = QwenImage21TestGeometry.FinishOutput(decoded, null, output);
         Assert.Equal((1600, 1200), (result.Width, result.Height));
         Assert.Equal(1600 * 1200 * 3, result.Pixels.Length);
     }
@@ -180,9 +182,9 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
     {
         // The same instance: no resize, so outputs without the option are byte-identical to before.
         var p = Edit(TensorAgentArea, keep: false);
-        var (sampling, output) = QwenImage21Pipeline.ResolveGeometry(p, Picture(1600, 1200), null);
+        var (sampling, output) = QwenImage21TestGeometry.ResolveGeometry(p, Picture(1600, 1200), null);
         var decoded = new RgbImage(sampling.Width, sampling.Height, new float[sampling.Width * sampling.Height * 3]);
-        Assert.Same(decoded, QwenImage21Pipeline.FinishOutput(decoded, null, output));
+        Assert.Same(decoded, QwenImage21TestGeometry.FinishOutput(decoded, null, output));
     }
 
     [Theory]
@@ -195,12 +197,12 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
         // A 100 x 100 icon would have been edited from 36 image tokens; it samples at about the
         // floor, where references are conditioned, and is resized down to its own size.
         var p = Edit(TensorAgentArea, keep: true);
-        var (sampling, output) = QwenImage21Pipeline.ResolveGeometry(p, Picture(width, height), null);
+        var (sampling, output) = QwenImage21TestGeometry.ResolveGeometry(p, Picture(width, height), null);
         Assert.Equal((width, height), output);
         long sampled = (long)sampling.Width * sampling.Height;
-        Assert.InRange(sampled, QwenImage21Pipeline.KeptSourceSamplingFloor / 1.1, QwenImage21Pipeline.KeptSourceSamplingFloor * 1.1);
+        Assert.InRange(sampled, QwenImage21TestGeometry.KeptSourceSamplingFloor / 1.1, QwenImage21TestGeometry.KeptSourceSamplingFloor * 1.1);
         // A smaller budget than the floor still bounds it.
-        var tight = QwenImage21Pipeline.ResolveGeometry(Edit(256L * 256, keep: true), Picture(width, height), null).Sampling;
+        var tight = QwenImage21TestGeometry.ResolveGeometry(Edit(256L * 256, keep: true), Picture(width, height), null).Sampling;
         Assert.InRange((long)tight.Width * tight.Height, 0, 256L * 256 * 1.2);
     }
 
@@ -216,14 +218,14 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
     {
         var p = Edit(area, keep: false);
         var reference = Picture(width, height);
-        var (sampling, output) = QwenImage21Pipeline.ResolveGeometry(p, reference, null, backend);
-        Assert.Equal(QwenImage21Pipeline.ResolveDimensions(p, reference, backend), sampling);
+        var (sampling, output) = QwenImage21TestGeometry.ResolveGeometry(p, reference, null, backend);
+        Assert.Equal(QwenImage21TestGeometry.ResolveDimensions(p, reference, backend), sampling);
         Assert.Equal(sampling, output);
     }
 
     [Fact]
     public void TextToImageIsUnchanged() =>
-        Assert.Equal(((2048, 2048), (2048, 2048)), QwenImage21Pipeline.ResolveGeometry(new QwenImageParams(), null, null));
+        Assert.Equal(((2048, 2048), (2048, 2048)), QwenImage21TestGeometry.ResolveGeometry(new QwenImageParams(), null, null));
 
     [Theory]
     [InlineData(false)]
@@ -235,8 +237,8 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
             new() { TargetArea = TensorAgentArea, KeepSourceSize = keep, Mask = HalfSelection(1600, 1200), MaskCrop = crop };
         var plain = Masked(false);
         var kept = Masked(true);
-        var expected = QwenImage21Pipeline.ResolveGeometry(plain, source, QwenImageEditMask.Create(plain, source));
-        Assert.Equal(expected, QwenImage21Pipeline.ResolveGeometry(kept, source, QwenImageEditMask.Create(kept, source)));
+        var expected = QwenImage21TestGeometry.ResolveGeometry(plain, source, QwenImageEditMask.Create(plain, source));
+        Assert.Equal(expected, QwenImage21TestGeometry.ResolveGeometry(kept, source, QwenImageEditMask.Create(kept, source)));
         Assert.Equal((1600, 1200), expected.Output);
     }
 
@@ -246,7 +248,7 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
     public void TheOptionAndAnExplicitSizeAreTwoAnswersToOneQuestion()
     {
         var p = new QwenImageParams { KeepSourceSize = true, Width = 1024, Height = 768 };
-        var error = Assert.Throws<ArgumentException>(() => QwenImage21Pipeline.ResolveGeometry(p, Picture(1600, 1200), null));
+        var error = Assert.Throws<ArgumentException>(() => QwenImage21TestGeometry.ResolveGeometry(p, Picture(1600, 1200), null));
         Assert.Contains("width/height", error.Message, StringComparison.Ordinal);
     }
 
@@ -254,7 +256,7 @@ public sealed class QwenImageKeepSourceSizeTests : IDisposable
     public void TheOptionNeedsAPictureToKeepTheSizeOf()
     {
         var error = Assert.Throws<ArgumentException>(() =>
-            QwenImage21Pipeline.ResolveGeometry(new QwenImageParams { KeepSourceSize = true }, null, null));
+            QwenImage21TestGeometry.ResolveGeometry(new QwenImageParams { KeepSourceSize = true }, null, null));
         Assert.Contains("input image", error.Message, StringComparison.Ordinal);
     }
 }

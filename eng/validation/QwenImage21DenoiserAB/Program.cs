@@ -5,15 +5,17 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Qwen-Image-2.1 denoiser steps on a real transformer: the runtime's QwenImage21Denoiser (graph programs), and before the
-// legacy model's deletion also its QwenImage21DiT, on the same inputs (random conditioning and latents from a seed), with each
-// step's time and the two velocities' distance. Both see the same trajectory (the first engine's Euler updates).
+// Qwen-Image-2.1 denoiser steps on a real transformer: the runtime's QwenImage21Denoiser (graph programs), on random
+// conditioning and latents from a seed, with each step's time; two engines ("runtime", "runtime2": independent instances)
+// see the same trajectory (the first engine's Euler updates) and their velocities are compared.
 //
 //   dotnet run --project eng/validation/QwenImage21DenoiserAB -c Release -- --dit <gguf> --backend ggml_cpu --size 512 \
-//       [--steps 4] [--text-rows 23] [--refs 0] [--engines runtime,legacy] [--out <dir>]
+//       [--steps 4] [--text-rows 23] [--refs 0] [--engines runtime,runtime2] [--out <dir>] [--against <dir>]
 //
-// --out writes each engine's velocities (little-endian F32, one file a step) so a later run (after the legacy engine is
-// gone) compares against them with --against <dir>.
+// --out writes each engine's velocities (little-endian F32, one file a step) so a later run (another backend or build)
+// compares against them with --against <dir>, whose velocities then drive the trajectory. The commit that migrated
+// Qwen-Image-2.1 to the runtime also ran the retired QwenImage21DiT here (engine "legacy") and the retired QwenImageModel
+// end to end (--e2e --model legacy); check it out to compare against the retired engines.
 using System.Diagnostics;
 using System.Globalization;
 using TensorSharp.Models.QwenImage21;
@@ -42,7 +44,7 @@ int size = int.Parse(Arg(args, "--size", "512"), CultureInfo.InvariantCulture);
 int steps = int.Parse(Arg(args, "--steps", "4"), CultureInfo.InvariantCulture);
 int textRows = int.Parse(Arg(args, "--text-rows", "23"), CultureInfo.InvariantCulture);
 int refs = int.Parse(Arg(args, "--refs", "0"), CultureInfo.InvariantCulture);
-string[] engines = Arg(args, "--engines", "runtime,legacy").Split(',', StringSplitOptions.RemoveEmptyEntries);
+string[] engines = Arg(args, "--engines", "runtime,runtime2").Split(',', StringSplitOptions.RemoveEmptyEntries);
 string outDir = Arg(args, "--out", null);
 string against = Arg(args, "--against", null);
 const int Channels = 64, TextDim = 4096, HeadDim = 128;
@@ -97,7 +99,7 @@ if (against != null)
     }
 foreach (string engineName in engines)
 {
-    // "legacy2": a second legacy request in this process (warm JIT); likewise "runtime2".
+    // "runtime2": a second, independent denoiser in this process (warm JIT, run-to-run determinism).
     string engine = engineName.TrimEnd('2');
     var outputs = new List<float[]>();
     float[] x = (float[])start.Clone();
@@ -113,28 +115,6 @@ foreach (string engineName in engines)
             owner = d;
             predict = step => d.Predict(x, conditioning, references, layout, sigmas[step], step, false, null);
             finish = d.FinishRequest;
-            break;
-        }
-        case "legacy":
-        {
-            // Reflection: the legacy engine is deleted once its outputs are frozen; this probe then runs the runtime alone.
-            var asm = typeof(QwenImage21Denoiser).Assembly;
-            Type ditType = asm.GetType("TensorSharp.Models.QwenImage.QwenImage21DiT", throwOnError: true)!;
-            object model = Activator.CreateInstance(ditType, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public |
-                System.Reflection.BindingFlags.NonPublic, null, new object[] { dit, backend, null, null }, null)!;
-            owner = (IDisposable)model;
-            var create = ditType.GetMethod("CreatePrefixCache", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic,
-                new[] { typeof(float[]), typeof(int[]), typeof(float[][]) })!;
-            float[][] refTokens = references.Select(r => r.Rows).ToArray();
-            int[] refH = references.Select(r => r.Shape.Height).ToArray(), refW = references.Select(r => r.Shape.Width).ToArray();
-            int[] slotArray = refs > 0 ? slots.ToArray() : null;
-            object cache = create.Invoke(null, new object[] { conditioning.Hidden, slotArray, refTokens });
-            var predictMethod = ditType.GetMethod("Predict", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-            predict = step => (float[])predictMethod.Invoke(model, new object[]
-            {
-                x, h, w, conditioning.Hidden, rows, sigmas[step], slotArray, refTokens, refH, refW, cache, step, false,
-            })!;
-            finish = () => ((IDisposable)cache)?.Dispose();
             break;
         }
         default: throw new ArgumentException($"unknown engine {engine}");
@@ -198,7 +178,7 @@ foreach (var (engine, outputs) in results)
     }
 
 // End to end through a model's public API (TS_QWEN_IMAGE_* companions and TS_QWEN_IMAGE_VARIANT from the environment):
-//   --e2e --model legacy|runtime --backend B --prompt P --out x.png [--image a.png ...] [--mask m.png] [--width W --height H]
+//   --e2e [--model runtime] --backend B --prompt P --out x.png [--image a.png ...] [--mask m.png] [--width W --height H]
 //   [--seed S] [--steps N] [--cfg C] [--negative N] [--keep-source-size] [--previews K] [--lora path[:scale]]
 public static class EndToEnd
 {
@@ -240,20 +220,9 @@ public static class EndToEnd
             }
         var clock = Stopwatch.StartNew();
         TensorSharp.Models.QwenImage.RgbImage result;
-        if (kind == "legacy")
+        if (kind != "runtime") throw new ArgumentException($"--model {kind}: only the runtime model remains (the retired one ran at the migration commit).");
+        using (var model = new QwenImage21DiffusionModel(dit, backend))
         {
-            var asm = typeof(QwenImage21Denoiser).Assembly;
-            Type type = asm.GetType("TensorSharp.Models.QwenImage.QwenImageModel", throwOnError: true)!;
-            using var model = (TensorSharp.Models.ModelBase)Activator.CreateInstance(type, dit, backend, 1, null)!;
-            var image = (TensorSharp.Models.QwenImage.IImageGenerationModel)model;
-            if (loras.Count > 0) ((ILoraPluginHost)model).SetLoras(loras);
-            Console.WriteLine($"[e2e] legacy loaded {clock.Elapsed.TotalSeconds:F1}s");
-            clock.Restart();
-            result = images.Count == 0 ? image.GenerateImage(Arg(args, "--prompt", ""), p) : image.EditImage(Arg(args, "--prompt", ""), images, p);
-        }
-        else
-        {
-            using var model = new QwenImage21DiffusionModel(dit, backend);
             if (loras.Count > 0) model.SetLoras(loras);
             Console.WriteLine($"[e2e] runtime loaded {clock.Elapsed.TotalSeconds:F1}s");
             clock.Restart();

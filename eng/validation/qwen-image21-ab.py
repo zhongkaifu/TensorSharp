@@ -7,11 +7,11 @@ always runs first or last (a fixed order pins thermal drift on one arm). The sum
 compares every arm's output PNG with the first arm's: identical SHA-256 proves a
 bit-exact change, PSNR quantifies an intentional numerical one.
 
-Example (a baseline build against the current one, with the prefix cache on and off):
+Example (a baseline build against the current one, and the current one with seed-keyed edit noise):
   python3 eng/validation/qwen-image21-ab.py --rounds 2 \\
       --arm base=artifacts/baseline/TensorSharp.Cli/bin/TensorSharp.Cli.dll \\
-      --arm cache=TensorSharp.Cli/bin/TensorSharp.Cli.dll \\
-      --arm nocache=TensorSharp.Cli/bin/TensorSharp.Cli.dll,TS_QWEN21_PREFIX_CACHE=0 \\
+      --arm current=TensorSharp.Cli/bin/TensorSharp.Cli.dll \\
+      --arm seednoise=TensorSharp.Cli/bin/TensorSharp.Cli.dll,TS_QWEN21_EDIT_NOISE=seed \\
       -- --mode edit --image ref.png --width 1024 --height 1024 --steps 40
 
 Arguments after `--` go to qwen-image21-bench.py unchanged (--engine and --cli are

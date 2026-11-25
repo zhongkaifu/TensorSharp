@@ -3838,7 +3838,7 @@ namespace TensorSharp.Models
                 // this model's graph scratch, sized to its widest prefill, and
                 // neither ClearOffloadableState nor ClearHostBufferCache touches
                 // them. The two diffusion pipelines release the scratch by hand
-                // between stages (QwenImage21Pipeline, WanVideoPipeline) precisely
+                // between stages (Qwen-Image-2.1's components, WanVideoPipeline) precisely
                 // because nothing else does; a model that only ever loaded and
                 // unloaded had no such call anywhere, and left them allocated.
                 // On Metal each carries an

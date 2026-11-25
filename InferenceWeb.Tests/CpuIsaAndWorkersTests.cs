@@ -29,7 +29,6 @@ public class CpuIsaAndWorkersTests
 
         Assert.Equal(CpuIsa.Avx512 ? CpuGemmIsa.Avx512 : CpuIsa.Avx2Fma ? CpuGemmIsa.Avx2 : CpuGemmIsa.Portable,
             CpuPackedGemm.DetectIsa());
-        Assert.Equal(CpuIsa.Avx512 ? 16 : CpuIsa.Avx2Fma ? 8 : 1, QwenImage21CpuKernels.DefaultWidth());
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_CPU_SGEMM_KERNEL")))
             Assert.Equal(CpuIsa.Avx512 ? CpuSgemm.KernelKind.Avx512 : CpuIsa.Avx2Fma ? CpuSgemm.KernelKind.Avx2 : CpuSgemm.KernelKind.Portable,
                 CpuSgemm.DefaultKernel());

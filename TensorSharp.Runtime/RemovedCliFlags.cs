@@ -118,6 +118,34 @@ namespace TensorSharp.Runtime
             ("TS_WAN_VAE", "every video model reads TS_VIDEO_VAE (--video-vae)."),
             ("TS_WAN_TE", "every video model reads TS_VIDEO_TEXT_ENCODER (--video-text-encoder)."),
             ("TS_WAN_DIT2", "every video model reads TS_VIDEO_DIT2 (--video-dit2)."),
+            // Qwen-Image-2.1's retired transformers (the native whole graph and the pure-C# one): it runs on the diffusion
+            // runtime's graph programs, which pick their kernels per backend.
+            ("TS_QWEN21_FLASH", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_PAD_MASK", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_CUDNN_ATTENTION", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_CUBLAS_MATMUL", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_CUBLAS_MIN_ROWS", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_GRAPH_REUSE", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_GRAPH_TRACE", Qwen21KernelSwitchRemoved),
+            ("TS_QWEN21_PREFIX_CACHE",
+                "Qwen-Image-2.1 always caches its text and reference prefix's keys and values after the first step; a cache "
+                + "larger than half the device's free memory is declined on its own and the request recomputes the prefix."),
+            ("TS_QWEN21_PREFIX_CACHE_TYPE",
+                "Qwen-Image-2.1's prefix cache stores what its attention reads (F16 on Metal and CUDA, F32 elsewhere), so cached "
+                + "steps equal uncached ones; the 8-bit storage was removed."),
+            ("TS_QWEN21_PREFIX_CACHE_MAX_MIB",
+                "a Qwen-Image-2.1 prefix cache larger than half the device's free memory is declined on its own; the cap has "
+                + "no replacement."),
+            ("TS_QWEN21_CPU_MATMUL", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_GATHER_V", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_DEPTH", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_MLP_ROWS", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_ROUND_ACTIVATIONS", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_GELU_FP16", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_CPU_PROFILE", Qwen21CpuSwitchRemoved),
+            ("TS_QWEN21_MEMORY",
+                "Qwen-Image-2.1's run logs each phase's seconds and the residency plan ([diffusion] lines); the per-phase "
+                + "process memory report has no replacement."),
             ("TS_H3_IMAGE_VAE_BATCH",
                 "MiniMax-H3-Image's VAE decoder sizes its own programs (a row of tiles, at most 64); the native decoder whose "
                 + "tiles a call it capped was removed with the legacy model."),
@@ -594,6 +622,12 @@ namespace TensorSharp.Runtime
         private const string CpuPreviousKernelsRemoved =
             "the pure-C# cpu backend always runs its current kernels; the switch back to the previous ones was removed.";
 
+        private const string Qwen21KernelSwitchRemoved =
+            "Qwen-Image-2.1's transformer runs as the diffusion runtime's graph programs, which choose their kernels per backend "
+            + "(on CUDA cuBLAS from 256 rows and cuDNN attention, as the removed native graph did) and keep their compiled plans.";
+        private const string Qwen21CpuSwitchRemoved =
+            "Qwen-Image-2.1 on the cpu backend runs the transformer's graph programs on the managed tensor executor; the "
+            + "pure-C# transformer these tuned was removed.";
         private const string DiffusionCpuLegacyRemoved =
             "DiffusionGemma on the cpu backend always runs its batched CPU stages "
             + "(DIFFUSION_NO_PKV=1 still turns the prompt-KV cache off).";

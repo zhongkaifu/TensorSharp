@@ -2,6 +2,9 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Runtime.CompilerServices;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
+using TensorSharp.Runtime;
 
 namespace InferenceWeb.Tests;
 
@@ -193,12 +196,13 @@ public sealed class QwenImageMaskTests
     [Fact]
     public void EmptyMaskPipelineReturnsOwnedExactCopyWithoutLoadingModelOrRequiringProjector()
     {
-        // An uninitialized model has no weights, paths, or projector. Any inference access
-        // would fail, so exercising Run verifies that the actual pipeline bypasses them.
-        var model = (QwenImageModel)RuntimeHelpers.GetUninitializedObject(typeof(QwenImageModel));
-        using var pipeline = new QwenImage21Pipeline(model);
+        // The family has no components (no encoder, transformer, VAE or projector): any inference access would fail, so
+        // running the diffusion runtime's pipeline verifies that it bypasses them.
+        using var pipeline = new DiffusionPipeline(new QwenImage21Family(BackendType.GgmlMetal, QwenImageVariant.Base),
+            new DiffusionLoad { Backend = BackendType.GgmlMetal }, new ResidencyPlanner(() => null, _ => { }), _ => { });
         var source = Image(3, 2, i => i / 7f, new[] { 0f, .1f, .3f, .5f, .8f, 1f });
-        var output = pipeline.Run("change the color", new[] { source }, new QwenImageParams { Mask = Image(3, 2, _ => 0f), Width = 32, Height = 32 });
+        var output = pipeline.Run(QwenImage21DiffusionModel.RequestOf("change the color",
+            new QwenImageParams { Mask = Image(3, 2, _ => 0f), Width = 32, Height = 32 }, new[] { source })).Image;
         Assert.Equal((3, 2), (output.Width, output.Height));
         Assert.Equal(source.Pixels, output.Pixels);
         Assert.Equal(source.Alpha, output.Alpha);

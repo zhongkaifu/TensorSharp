@@ -137,7 +137,7 @@ internal static class LiveMedia
                 + "text-encoder GGUF and its mmproj (the files config/qwen-image-2.1.json downloads)";
 
         // The same names the pipeline's own directory scan accepts, so a directory this
-        // finds is one QwenImageModel would also have found.
+        // finds is one QwenImage21DiffusionModel would also have found.
         string[] entries = Directory.GetFiles(directory);
         string? dit = entries.FirstOrDefault(f =>
             (Named(f, "qwen_image_2.1") || Named(f, "qwen-image-2.1")) && !Named(f, "vae")

@@ -1,10 +1,27 @@
 using System.Runtime.InteropServices;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
+using TensorSharp.Models.SharedDiffusion;
+using TensorSharp.Runtime;
 
 namespace InferenceWeb.Tests;
 
+/// <summary>Qwen-Image-2.1's sampling on the diffusion runtime: the Philox noise (QwenImage21Noise, PhiloxNoise) and its
+/// edit streams, the dynamic-shift schedule (DiffusionSchedules.DynamicShift), the latent's token rows and previews.</summary>
 public class QwenImage21SamplingTests
 {
+    private static readonly QwenImage21Family Family = new(BackendType.GgmlCpu, QwenImageVariant.Base);
+
+    /// <summary>A channel-planar [64, h, w] latent as the transformer's token rows [h * w, 64].</summary>
+    internal static float[] ToTokens(float[] chw, int latentHeight, int latentWidth) =>
+        Family.ToRows(new LatentTensor(new LatentShape(64, 1, latentHeight, latentWidth), chw));
+
+    internal static float[] ToChannels(float[] rows, int latentHeight, int latentWidth) =>
+        Family.FromRows(rows, new LatentShape(64, 1, latentHeight, latentWidth)).Data;
+
+    /// <summary>The first draw of a request's noise (seed, stream) for an h x w latent, as token rows.</summary>
+    internal static float[] InitialLatents(long seed, ulong stream, int latentHeight, int latentWidth) =>
+        ToTokens(new QwenImage21Noise(seed, stream).Next(latentHeight * latentWidth * 64), latentHeight, latentWidth);
     [Theory]
     [InlineData(1f, 0.875f)]
     [InlineData(0.75f, 0.5f)]
@@ -22,7 +39,7 @@ public class QwenImage21SamplingTests
         float[] expectedState = (float[])updated.Clone();
         float[] expectedVelocity = (float[])velocity.Clone();
 
-        var preview = QwenImage21Sampling.PreviewLatents(updated, velocity, nextSigma);
+        var preview = EulerFlowSampler.Denoised(updated, velocity, nextSigma);
 
         Assert.Equal(clean, preview);
         Assert.Equal(expectedState, updated);
@@ -40,10 +57,10 @@ public class QwenImage21SamplingTests
             -1.92439914f, .652985454f, -.649441063f, -.817524731f, .527964652f,
             -1.27534986f, -1.66212630f, -.303313762f, -.0925699323f, .199237078f,
             -1.12043273f, 1.85765874f };
-        var actual = QwenImage21Sampling.Noise(expected.Length, 42);
+        var actual = PhiloxNoise.Draw(expected.Length, 42);
         for (int i = 0; i < expected.Length; i++)
             Assert.InRange(Math.Abs(actual[i] - expected[i]), 0, 1e-6f);
-        Assert.NotEqual(actual, QwenImage21Sampling.Noise(expected.Length, 42L + (1L << 32)));
+        Assert.NotEqual(actual, PhiloxNoise.Draw(expected.Length, 42L + (1L << 32)));
     }
 
     // =====================================================================================
@@ -114,8 +131,8 @@ public class QwenImage21SamplingTests
             foreach (long seed in new[] { 0L, 1L, 42L, -1L, long.MaxValue, 1L << 32 })
             {
                 float[] expected = SeedOnlyNoise(count, seed);
-                Assert.True(SameBits(expected, QwenImage21Sampling.Noise(count, seed)), $"count {count}, seed {seed}");
-                Assert.True(SameBits(expected, QwenImage21Sampling.Noise(count, seed, 0)), $"count {count}, seed {seed}");
+                Assert.True(SameBits(expected, PhiloxNoise.Draw(count, seed)), $"count {count}, seed {seed}");
+                Assert.True(SameBits(expected, PhiloxNoise.Draw(count, seed, 0)), $"count {count}, seed {seed}");
             }
     }
 
@@ -124,17 +141,17 @@ public class QwenImage21SamplingTests
     {
         // The pipeline's own call: InitialLatents with the stream NoiseStream gives it.
         var source = Decoded(8, 8, 7);
-        float[] expected = QwenImage21Pipeline.ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6);
-        ulong textToImage = QwenImage21Sampling.NoiseStream(Array.Empty<RgbImage>(), followReferences: true);
-        ulong seedMode = QwenImage21Sampling.NoiseStream(new[] { source }, followReferences: false);
+        float[] expected = ToTokens(SeedOnlyNoise(4 * 6 * 64, 3), 4, 6);
+        ulong textToImage = QwenImage21Noise.StreamFor(Array.Empty<RgbImage>(), followReferences: true);
+        ulong seedMode = QwenImage21Noise.StreamFor(new[] { source }, followReferences: false);
         Assert.Equal(0UL, textToImage);
         Assert.Equal(0UL, seedMode);
-        Assert.True(SameBits(expected, QwenImage21Sampling.InitialLatents(3, textToImage, 4, 6)));
+        Assert.True(SameBits(expected, InitialLatents(3, textToImage, 4, 6)));
 
-        ulong edit = QwenImage21Sampling.NoiseStream(new[] { source }, followReferences: true);
+        ulong edit = QwenImage21Noise.StreamFor(new[] { source }, followReferences: true);
         Assert.NotEqual(0UL, edit);
-        Assert.Equal(QwenImage21Sampling.ReferenceStream(new[] { source }), edit);
-        Assert.False(SameBits(expected, QwenImage21Sampling.InitialLatents(3, edit, 4, 6)));
+        Assert.Equal(QwenImage21Noise.ReferenceStream(new[] { source }), edit);
+        Assert.False(SameBits(expected, InitialLatents(3, edit, 4, 6)));
     }
 
     /// <summary>
@@ -145,9 +162,9 @@ public class QwenImage21SamplingTests
     [Fact]
     public void AnEditsNoiseIsIndependentOfTheTextToImageNoiseAtItsSeed()
     {
-        ulong stream = QwenImage21Sampling.ReferenceStream(new[] { Decoded(8, 8, 7) });
-        float[] textToImage = QwenImage21Sampling.Noise(LatentValues, 0);
-        float[] edit = QwenImage21Sampling.Noise(LatentValues, 0, stream);
+        ulong stream = QwenImage21Noise.ReferenceStream(new[] { Decoded(8, 8, 7) });
+        float[] textToImage = PhiloxNoise.Draw(LatentValues, 0);
+        float[] edit = PhiloxNoise.Draw(LatentValues, 0, stream);
 
         Assert.InRange(Math.Abs(Correlation(textToImage, edit)), 0, Uncorrelated);
         Assert.Equal(0, textToImage.Zip(edit).Count(pair => pair.First == pair.Second));
@@ -158,7 +175,7 @@ public class QwenImage21SamplingTests
 
         // Not the text-to-image noise of a seed derived from the stream either: mixing the
         // stream into the Philox key would make an edit at seed s some picture's noise at s ^ id.
-        float[] alias = QwenImage21Sampling.Noise(LatentValues, 0 ^ (long)stream);
+        float[] alias = PhiloxNoise.Draw(LatentValues, 0 ^ (long)stream);
         Assert.InRange(Math.Abs(Correlation(alias, edit)), 0, Uncorrelated);
     }
 
@@ -172,11 +189,11 @@ public class QwenImage21SamplingTests
         for (int i = 0; i < 4 * 16 * 3; i++) changed[i] = 1f - changed[i];
         var b = new RgbImage(16, 16, changed);
 
-        ulong streamA = QwenImage21Sampling.ReferenceStream(new[] { a });
-        ulong streamB = QwenImage21Sampling.ReferenceStream(new[] { b });
+        ulong streamA = QwenImage21Noise.ReferenceStream(new[] { a });
+        ulong streamB = QwenImage21Noise.ReferenceStream(new[] { b });
         Assert.NotEqual(streamA, streamB);
-        Assert.InRange(Math.Abs(Correlation(QwenImage21Sampling.Noise(LatentValues, 0, streamA),
-            QwenImage21Sampling.Noise(LatentValues, 0, streamB))), 0, Uncorrelated);
+        Assert.InRange(Math.Abs(Correlation(PhiloxNoise.Draw(LatentValues, 0, streamA),
+            PhiloxNoise.Draw(LatentValues, 0, streamB))), 0, Uncorrelated);
     }
 
     [Fact]
@@ -184,19 +201,19 @@ public class QwenImage21SamplingTests
     {
         var first = Decoded(32, 16, 11);
         var second = new RgbImage(32, 16, (float[])first.Pixels.Clone());
-        ulong stream = QwenImage21Sampling.ReferenceStream(new[] { first });
-        Assert.Equal(stream, QwenImage21Sampling.ReferenceStream(new[] { second }));
-        Assert.True(SameBits(QwenImage21Sampling.Noise(1024, 5, stream), QwenImage21Sampling.Noise(1024, 5, stream)));
+        ulong stream = QwenImage21Noise.ReferenceStream(new[] { first });
+        Assert.Equal(stream, QwenImage21Noise.ReferenceStream(new[] { second }));
+        Assert.True(SameBits(PhiloxNoise.Draw(1024, 5, stream), PhiloxNoise.Draw(1024, 5, stream)));
 
         // The v1 encoding, pinned: changing it changes every edit's picture, so it must be a
         // deliberate new version, never an accident. Values from an independent Python
         // (hashlib + NumPy float32) evaluation of the documented encoding and of Philox.
         var ramp = Ramp(4, 2, i => i / 255f);
         var reversed = Ramp(4, 2, i => (255 - i) / 255f);
-        Assert.Equal(0x9DADB36FC2CAF8D2UL, QwenImage21Sampling.ReferenceStream(new[] { ramp }));
-        Assert.Equal(0xA2BB8C9373217B2AUL, QwenImage21Sampling.ReferenceStream(new[] { ramp, reversed }));
+        Assert.Equal(0x9DADB36FC2CAF8D2UL, QwenImage21Noise.ReferenceStream(new[] { ramp }));
+        Assert.Equal(0xA2BB8C9373217B2AUL, QwenImage21Noise.ReferenceStream(new[] { ramp, reversed }));
         float[] expected = { 2.4735303f, .085433364f, 1.3570157f, -1.2013689f };
-        float[] actual = QwenImage21Sampling.Noise(4, 42, QwenImage21Sampling.ReferenceStream(new[] { ramp }));
+        float[] actual = PhiloxNoise.Draw(4, 42, QwenImage21Noise.ReferenceStream(new[] { ramp }));
         for (int i = 0; i < expected.Length; i++)
             Assert.InRange(Math.Abs(actual[i] - expected[i]), 0, 1e-6f);
     }
@@ -206,7 +223,7 @@ public class QwenImage21SamplingTests
     {
         var a = Decoded(4, 4, 1);
         var b = Decoded(4, 4, 2);
-        ulong stream = QwenImage21Sampling.ReferenceStream(new[] { a });
+        ulong stream = QwenImage21Noise.ReferenceStream(new[] { a });
 
         var nudged = (float[])a.Pixels.Clone();
         nudged[5] = nudged[5] < 1f ? nudged[5] + 1 / 255f : nudged[5] - 1 / 255f;
@@ -214,12 +231,12 @@ public class QwenImage21SamplingTests
         translucent[3] = 254 / 255f;
         ulong[] others =
         {
-            QwenImage21Sampling.ReferenceStream(new[] { new RgbImage(4, 4, nudged) }),
-            QwenImage21Sampling.ReferenceStream(new[] { a, b }),
-            QwenImage21Sampling.ReferenceStream(new[] { b, a }),
-            QwenImage21Sampling.ReferenceStream(new[] { a, a }),
-            QwenImage21Sampling.ReferenceStream(new[] { new RgbImage(2, 8, a.Pixels) }),
-            QwenImage21Sampling.ReferenceStream(new[] { new RgbImage(4, 4, a.Pixels, translucent) }),
+            QwenImage21Noise.ReferenceStream(new[] { new RgbImage(4, 4, nudged) }),
+            QwenImage21Noise.ReferenceStream(new[] { a, b }),
+            QwenImage21Noise.ReferenceStream(new[] { b, a }),
+            QwenImage21Noise.ReferenceStream(new[] { a, a }),
+            QwenImage21Noise.ReferenceStream(new[] { new RgbImage(2, 8, a.Pixels) }),
+            QwenImage21Noise.ReferenceStream(new[] { new RgbImage(4, 4, a.Pixels, translucent) }),
         };
         Assert.DoesNotContain(stream, others);
         Assert.Equal(others.Length, others.Distinct().Count());
@@ -236,17 +253,17 @@ public class QwenImage21SamplingTests
         foreach (var picture in new[] { new RgbImage(6, 5, pixels), new RgbImage(6, 5, pixels, alpha) })
         {
             var reloaded = ImageIO.Decode(ImageIO.EncodePng(picture), preserveAlpha: true);
-            Assert.Equal(QwenImage21Sampling.ReferenceStream(new[] { picture }), QwenImage21Sampling.ReferenceStream(new[] { reloaded }));
+            Assert.Equal(QwenImage21Noise.ReferenceStream(new[] { picture }), QwenImage21Noise.ReferenceStream(new[] { reloaded }));
         }
 
         // Values that store as the same byte are the same picture; out-of-range values clamp.
         var exact = Ramp(3, 1, i => i * 40 / 255f);
         var near = Ramp(3, 1, i => i * 40 / 255f + 0.4f / 255f);
-        Assert.Equal(QwenImage21Sampling.ReferenceStream(new[] { exact }), QwenImage21Sampling.ReferenceStream(new[] { near }));
-        Assert.Equal(QwenImage21Sampling.ReferenceStream(new[] { Ramp(3, 1, _ => 1f) }),
-            QwenImage21Sampling.ReferenceStream(new[] { Ramp(3, 1, _ => 1.5f) }));
-        Assert.Equal(QwenImage21Sampling.ReferenceStream(new[] { Ramp(3, 1, _ => 0f) }),
-            QwenImage21Sampling.ReferenceStream(new[] { Ramp(3, 1, _ => float.NaN) }));
+        Assert.Equal(QwenImage21Noise.ReferenceStream(new[] { exact }), QwenImage21Noise.ReferenceStream(new[] { near }));
+        Assert.Equal(QwenImage21Noise.ReferenceStream(new[] { Ramp(3, 1, _ => 1f) }),
+            QwenImage21Noise.ReferenceStream(new[] { Ramp(3, 1, _ => 1.5f) }));
+        Assert.Equal(QwenImage21Noise.ReferenceStream(new[] { Ramp(3, 1, _ => 0f) }),
+            QwenImage21Noise.ReferenceStream(new[] { Ramp(3, 1, _ => float.NaN) }));
     }
 
     [Fact]
@@ -254,10 +271,10 @@ public class QwenImage21SamplingTests
     {
         // The VAE reads a missing alpha plane as opaque, and the hosts decode with alpha.
         var picture = Decoded(4, 4, 9);
-        ulong none = QwenImage21Sampling.ReferenceStream(new[] { picture });
-        Assert.Equal(none, QwenImage21Sampling.ReferenceStream(new[] { new RgbImage(4, 4, picture.Pixels, Enumerable.Repeat(1f, 16).ToArray()) }));
+        ulong none = QwenImage21Noise.ReferenceStream(new[] { picture });
+        Assert.Equal(none, QwenImage21Noise.ReferenceStream(new[] { new RgbImage(4, 4, picture.Pixels, Enumerable.Repeat(1f, 16).ToArray()) }));
         // 0.999 stores as 255, so it is opaque too.
-        Assert.Equal(none, QwenImage21Sampling.ReferenceStream(new[] { new RgbImage(4, 4, picture.Pixels, Enumerable.Repeat(.999f, 16).ToArray()) }));
+        Assert.Equal(none, QwenImage21Noise.ReferenceStream(new[] { new RgbImage(4, 4, picture.Pixels, Enumerable.Repeat(.999f, 16).ToArray()) }));
     }
 
     [Theory]
@@ -269,7 +286,7 @@ public class QwenImage21SamplingTests
     [InlineData("SEED", false)]
     public void EditNoiseSettingAcceptsReferencesAndSeed(string? value, bool followsReferences)
     {
-        Assert.Equal(followsReferences, QwenImage21Sampling.EditNoiseFollowsReferences(value!));
+        Assert.Equal(followsReferences, QwenImage21Noise.EditNoiseFollowsReferences(value!));
     }
 
     [Theory]
@@ -278,7 +295,7 @@ public class QwenImage21SamplingTests
     [InlineData("reference")]
     public void EditNoiseSettingRefusesAnythingElse(string value)
     {
-        var error = Assert.Throws<ArgumentException>(() => QwenImage21Sampling.EditNoiseFollowsReferences(value));
+        var error = Assert.Throws<ArgumentException>(() => QwenImage21Noise.EditNoiseFollowsReferences(value));
         Assert.Contains("TS_QWEN21_EDIT_NOISE", error.Message, StringComparison.Ordinal);
         Assert.Contains("references, seed", error.Message, StringComparison.Ordinal);
     }
@@ -295,7 +312,7 @@ public class QwenImage21SamplingTests
         // stretch_shift_to_terminal methods in Diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c,
         // using https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/scheduler/scheduler_config.json.
         // Covers both official anchors and extrapolation to native 2K (16384 tokens).
-        var actual = QwenImage21Sampling.Sigmas(40, tokens);
+        var actual = DiffusionSchedules.DynamicShift(40, tokens);
         Assert.Equal(41, actual.Length);
         Assert.Equal(1f, actual[0]);
         int[] indices = { 1, 10, 20, 30, 38 };
@@ -317,7 +334,7 @@ public class QwenImage21SamplingTests
     {
         foreach (int tokens in new[] { 4, 256, 4096, 8192, 16384, 65536 })
         {
-            var actual = QwenImage21Sampling.Sigmas(steps, tokens);
+            var actual = DiffusionSchedules.DynamicShift(steps, tokens);
             Assert.Equal(steps + 1, actual.Length);
             Assert.Equal(1f, actual[0]);
             Assert.Equal(0f, actual[^1]);
@@ -334,7 +351,7 @@ public class QwenImage21SamplingTests
     [Fact]
     public void SingleStepKeepsOneEulerUpdateWithoutDividingByZero()
     {
-        Assert.Equal(new[] { 1f, 0f }, QwenImage21Sampling.Sigmas(1, 16384));
+        Assert.Equal(new[] { 1f, 0f }, DiffusionSchedules.DynamicShift(1, 16384));
     }
 
     [Theory]
@@ -344,17 +361,17 @@ public class QwenImage21SamplingTests
     [InlineData(40, -1)]
     public void InvalidScheduleParametersAreRejected(int steps, int tokens)
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => QwenImage21Sampling.Sigmas(steps, tokens));
+        Assert.Throws<ArgumentOutOfRangeException>(() => DiffusionSchedules.DynamicShift(steps, tokens));
     }
 
     [Fact]
     public void LatentTransposePreservesChannelsWithoutOldPatchPacking()
     {
         float[] chw = Enumerable.Range(0, 64 * 2 * 4).Select(i => (float)i).ToArray();
-        var tokens = QwenImage21Pipeline.ToTokens(chw, 2, 4);
+        var tokens = ToTokens(chw, 2, 4);
         Assert.Equal(new float[] { 0, 8, 16, 24 }, tokens.Take(4));
         Assert.Equal(1, tokens[64]);
-        Assert.Equal(chw, QwenImage21Pipeline.ToChannels(tokens, 2, 4));
+        Assert.Equal(chw, ToChannels(tokens, 2, 4));
     }
 
     [Theory]
@@ -364,7 +381,7 @@ public class QwenImage21SamplingTests
     [InlineData(-32, 512)]
     public void InvalidExplicitGeometryFailsBeforeAllocating(int width, int height)
     {
-        Assert.Throws<ArgumentException>(() => QwenImage21Pipeline.ResolveDimensions(
-            new QwenImageParams { Width = width, Height = height }, null));
+        Assert.Throws<ArgumentException>(() => QwenImage21Canvas.ResolveDimensions(
+            new DiffusionRequest { Width = width, Height = height }, null));
     }
 }

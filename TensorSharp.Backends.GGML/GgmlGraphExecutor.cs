@@ -176,6 +176,13 @@ namespace TensorSharp.GGML
         public bool RunsRanks(int ranks)
             => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
 
+        /// <summary>Whether <paramref name="ranks"/> ranks of a loopback group run here (TSGgml_TensorParallelInitLoopback on
+        /// ggml-cpu or ggml-metal: backend instances on the one device, sums through host memory). A caller that opts in
+        /// checks a sharded program's numerics on one device; it says nothing about multi-device speed, and the decoder
+        /// runtime does not opt in (its loopback fixtures keep the per-op tensor-parallel path).</summary>
+        public bool RunsLoopbackRanks(int ranks)
+            => Backend is GgmlBackendType.Cpu or GgmlBackendType.Metal && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
+
         /// <summary>ggml-vulkan's collective (ggml-vulkan-comm) moves every partial through host memory: each device writes its
         /// share to an imported host buffer and its peers read it from there, a host thread or SYNC_FD semaphores ordering the
         /// two. Without a collective that passed its probe (tsg::tp_device_allreduce_usable) the native driver stages the sums

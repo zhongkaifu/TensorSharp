@@ -11,7 +11,8 @@
 //   * TSGgml_QwenVaeAttention - tiled spatial VAE attention
 //   * TSGgml_QwenVaeRun       - the whole VAE encode/decode as one graph
 //   * TSGgml_QwenTeTrunk      - the Qwen3-VL-8B text-encoder trunk as one graph
-// The Qwen-Image-2.1 transformer itself lives in ggml_ops_qwen_image21.cpp.
+// The Qwen-Image-2.1 transformer runs as the diffusion runtime's graph programs
+// (TensorSharp.Models/Models/QwenImage21/QwenImage21Denoiser.Emit.cs).
 // ============================================================================
 #include "ggml_ops_internal.h"
 #include "ggml-alloc.h"

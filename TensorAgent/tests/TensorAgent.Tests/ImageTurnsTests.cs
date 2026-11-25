@@ -16,6 +16,7 @@ using TensorAgent.Core.Sessions;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.QwenImage21;
 using TensorSharp.Server;
 using TensorSharp.Server.Hosting;
 
@@ -845,12 +846,12 @@ public sealed class ImageTurnsTests : IDisposable
             """, scorer);
 
         ImageTurns.PlanQuestion question = Assert.Single(scorer.Asked);
-        string prompt = QwenImageModel.ChooseAnswerPrompt(question.System, question.User, question.Options);
+        string prompt = QwenImage21DiffusionModel.ChooseAnswerPrompt(question.System, question.User, question.Options);
         Assert.Equal(question.Options.Count, Regex.Matches(prompt, @"^[A-Z]\. ", RegexOptions.Multiline).Count);
         Assert.Single(Regex.Matches(prompt, "letter", RegexOptions.IgnoreCase));
         Assert.EndsWith("Answer with the letter of one option.<|im_end|>\n<|im_start|>assistant\n", prompt, StringComparison.Ordinal);
         // A list of bare letters -- what this side used to pass -- is refused, not scored.
-        Assert.Throws<ArgumentException>(() => QwenImageModel.ChooseAnswerPrompt(question.System, question.User, new[] { "A", "B", "C" }));
+        Assert.Throws<ArgumentException>(() => QwenImage21DiffusionModel.ChooseAnswerPrompt(question.System, question.User, new[] { "A", "B", "C" }));
     }
 
     /// <summary>
@@ -921,7 +922,7 @@ public sealed class ImageTurnsTests : IDisposable
         foreach (ImageTurns.PlanQuestion question in scorer.Asked)
         {
             // Measured on what the image model scores: its option lines and reply format included.
-            int estimate = ImageTurns.EstimateTokens(QwenImageModel.ChooseAnswerPrompt(question.System, question.User, question.Options));
+            int estimate = ImageTurns.EstimateTokens(QwenImage21DiffusionModel.ChooseAnswerPrompt(question.System, question.User, question.Options));
             Assert.True(estimate <= ImageTurns.QuestionTokenLimit, $"{estimate} tokens");
             Assert.Contains("HEAD-MARK", question.User, StringComparison.Ordinal);
             Assert.Contains("TAIL-MARK", question.User, StringComparison.Ordinal);

@@ -345,7 +345,6 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_dspine.cpp
     ggml_ops_diffusion.cpp
     ggml_ops_qwen_image.cpp
-    ggml_ops_qwen_image21.cpp
     ggml_ops_wan.cpp
     ggml_ops_minimax_h3.cpp
     ggml_ops_dit_offload.cpp
@@ -1486,25 +1485,11 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     )
     target_link_libraries(GgmlOpsWanDitResidentCacheTest PRIVATE GgmlOps)
 
-    # Backend choice is immutable in the DLL. Generate a CPU explicit-attention
-    # reference in a separate process, then compare GPU forwards against it.
-    add_executable(GgmlOpsQwenImage21Test tests/qwen_image21_test.cpp)
-    target_include_directories(GgmlOpsQwenImage21Test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(GgmlOpsQwenImage21Test PRIVATE GgmlOps)
-    set(TSG_QWEN21_REFERENCE "${CMAKE_BINARY_DIR}/artifacts/qwen-image21-cpu-reference.bin")
-    add_test(NAME qwen-image21-whole-graph-cpu
-        COMMAND GgmlOpsQwenImage21Test cpu --write-reference "${TSG_QWEN21_REFERENCE}")
-    set_tests_properties(qwen-image21-whole-graph-cpu PROPERTIES
-        FIXTURES_SETUP qwen_image21_cpu_reference SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(GgmlOpsQwenImage21VaeShortcutTest tests/qwen_image21_vae_shortcut_test.cpp)
     target_link_libraries(GgmlOpsQwenImage21VaeShortcutTest PRIVATE GgmlOps)
     add_test(NAME qwen-image21-vae-shortcuts-cpu COMMAND GgmlOpsQwenImage21VaeShortcutTest cpu)
     set_tests_properties(qwen-image21-vae-shortcuts-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
-        add_test(NAME qwen-image21-whole-graph-metal
-            COMMAND GgmlOpsQwenImage21Test metal --reference "${TSG_QWEN21_REFERENCE}")
-        set_tests_properties(qwen-image21-whole-graph-metal PROPERTIES
-            FIXTURES_REQUIRED qwen_image21_cpu_reference SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
         add_test(NAME qwen-image21-vae-f32-convolution-metal COMMAND GgmlOpsQwenImage21VaeShortcutTest metal)
         set_tests_properties(qwen-image21-vae-f32-convolution-metal PROPERTIES
             ENVIRONMENT "TS_VAE_MPS_CONV=1;TS_WAN_VAE_MPS_CONV=1"
@@ -1514,17 +1499,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             ENVIRONMENT "TS_VAE_MPS_CONV=0"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
     endif()
-    if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)
-        add_test(NAME qwen-image21-whole-graph-vulkan
-            COMMAND GgmlOpsQwenImage21Test vulkan --reference "${TSG_QWEN21_REFERENCE}")
-        set_tests_properties(qwen-image21-whole-graph-vulkan PROPERTIES
-            FIXTURES_REQUIRED qwen_image21_cpu_reference SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
-    endif()
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
-        add_test(NAME qwen-image21-whole-graph-cuda
-            COMMAND GgmlOpsQwenImage21Test cuda --reference "${TSG_QWEN21_REFERENCE}")
-        set_tests_properties(qwen-image21-whole-graph-cuda PROPERTIES
-            FIXTURES_REQUIRED qwen_image21_cpu_reference SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
         add_test(NAME qwen-image21-vae-shortcuts-cuda COMMAND GgmlOpsQwenImage21VaeShortcutTest cuda)
         set_tests_properties(qwen-image21-vae-shortcuts-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
         if (WIN32 AND TSG_HAVE_CUDNN)

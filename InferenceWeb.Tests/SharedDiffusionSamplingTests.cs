@@ -151,12 +151,13 @@ public sealed class SharedDiffusionSamplingTests
     }
 
     [Fact]
-    public void TheDenoisedEstimateIsQwensPreviewLatent()
+    public void TheDenoisedEstimateIsTheFlowsCleanLatent()
     {
+        // x - sigma * v in float32, element by element (Qwen-Image-2.1's retired pipeline previewed exactly this).
         var random = new Random(3);
         float[] x = Enumerable.Range(0, 257).Select(_ => (float)random.NextDouble()).ToArray();
         float[] v = Enumerable.Range(0, 257).Select(_ => (float)random.NextDouble() - 0.5f).ToArray();
-        Assert.Equal(Bits(QwenImage21Sampling.PreviewLatents(x, v, 0.37f)), Bits(EulerFlowSampler.Denoised(x, v, 0.37f)));
+        Assert.Equal(Bits(x.Zip(v, (a, b) => a - 0.37f * b).ToArray()), Bits(EulerFlowSampler.Denoised(x, v, 0.37f)));
         Assert.Throws<ArgumentOutOfRangeException>(() => EulerFlowSampler.Denoised(x, v, 1.5f));
     }
 
