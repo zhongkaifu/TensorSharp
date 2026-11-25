@@ -697,8 +697,10 @@ The method:
    `SharedDiffusion/EditMask`. Grayscale white edits and black keeps, or alpha transparent
    edits; `maskInvert`; inward feather (0-1024 px); optional `maskCrop` with padding. The mask
    must match `<Picture 1>`'s exact size, and `<Picture 1>` is the picture being edited.
-2. **Canvas:** the source's aspect (or the crop's) at the request's area, with the floor of
-   §4.4. The output is always the source canvas.
+2. **Canvas:** the source's aspect (or the crop's) at the request's area, but never above the
+   selection's own resolution and with no floor (`EditMask.SamplingDimensions`): the output is
+   always the source canvas, so sampling more pixels than it holds only enlarges the latent
+   mask, the denoise and the decode.
 3. **Source latent:** the posterior **mean** of `<Picture 1>` at the sampling canvas. It is the
    VAE copy already encoded for the reference when that copy has the same size; otherwise it is
    a separate tiled encode. The mean keeps the blend independent of the RNG stream. ComfyUI's
@@ -721,8 +723,9 @@ modulated at `t = 1 - m*sigma`, as ComfyUI's H3 video does). It is off by defaul
 it is an experiment for stage S6 to measure.
 
 (S6, as built: the canvas is the unmasked edit's for the whole picture, the crop sampled at
-that canvas's density, then the 4 MP floor and the 20 MP ceiling applied to what is sampled at
-its own aspect; the output is the source canvas. The source latent is the posterior mean
+that canvas's density but never above its own resolution, then the 20 MP ceiling applied to what
+is sampled at its own aspect; the output is the source canvas. The 4 MP floor applied here too
+until masked edits were capped at their own resolution. The source latent is the posterior mean
 through the references' own F16 rounding and latent normalization
 (`IReferencePolicy.SourceLatent`; the S2 pipeline had used the raw mean, which is not the
 space MiniMax-H3-Image's DiT works in), encoded once more at the sampling canvas when the

@@ -63,7 +63,8 @@ public sealed class QwenImageMaskTests
         Assert.Equal((6, 3, 3, 3), (plan.X, plan.Y, plan.Width, plan.Height));
         Assert.Equal(source.Pixels[(3 * 9 + 6) * 3], plan.Reference.Pixels[0]);
         Assert.Equal(source.Alpha[3 * 9 + 6], plan.Reference.Alpha[0]);
-        Assert.Equal((96, 96), plan.SamplingDimensions(288, 224));
+        // A 288 x 224 canvas is 32x the 9 x 7 source: the 3 x 3 crop samples at its own size, one 32-pixel cell, not 96 x 96.
+        Assert.Equal((32, 32), plan.SamplingDimensions(288, 224));
         Assert.Equal(new[] { 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f }, plan.LatentWeights(3, 3));
         var output = plan.Composite(Image(3, 3, _ => 1f));
         Assert.Equal((9, 7), (output.Width, output.Height));
@@ -98,6 +99,37 @@ public sealed class QwenImageMaskTests
         Assert.Equal((2, 1, 1, 1), (plan.X, plan.Y, plan.Width, plan.Height));
         Assert.Equal((32, 32), plan.SamplingDimensions(32, 32));
         Assert.All(plan.LatentWeights(2, 2), weight => Assert.Equal(1f, weight));
+    }
+
+    /// <summary>
+    /// A masked Qwen-Image-2.1 edit samples its selection at most at its own resolution: a 512 x 512 picture no longer
+    /// samples at the automatic 2048 x 2048 area (16x the pixels the composite keeps), its 200 x 100 crop at its own size on
+    /// the 32-pixel grid, and a picture larger than the automatic area still samples below its own pixels. The output is
+    /// the source canvas either way.
+    /// </summary>
+    [Fact]
+    public void MaskedEditsSampleAtMostAtTheSelectionsOwnResolution()
+    {
+        var small = Image(512, 512, _ => .5f);
+        var selection = Image(512, 512, i => i % 512 is >= 100 and < 300 && i / 512 is >= 200 and < 300 ? 1f : 0f);
+        var p = new QwenImageParams { Mask = selection };
+        Assert.Equal(((512, 512), (512, 512)),
+            QwenImage21TestGeometry.ResolveGeometry(p, small, QwenImageEditMask.Create(p, small)));
+        var crop = new QwenImageParams { Mask = selection, MaskCrop = true, MaskCropPadding = 0 };
+        Assert.Equal(((224, 128), (512, 512)),
+            QwenImage21TestGeometry.ResolveGeometry(crop, small, QwenImageEditMask.Create(crop, small)));
+        // An explicit size larger than the picture does not raise it; a smaller one lowers the density.
+        var large = new QwenImageParams { Mask = selection, Width = 2048, Height = 2048 };
+        Assert.Equal(((512, 512), (512, 512)),
+            QwenImage21TestGeometry.ResolveGeometry(large, small, QwenImageEditMask.Create(large, small)));
+        var half = new QwenImageParams { Mask = selection, Width = 256, Height = 256 };
+        Assert.Equal(((256, 256), (512, 512)),
+            QwenImage21TestGeometry.ResolveGeometry(half, small, QwenImageEditMask.Create(half, small)));
+        // 3072 x 3072 is above the automatic 2048 x 2048 area: sampled at that area, below its own pixels.
+        var big = Image(3072, 3072, _ => .5f);
+        var bigParams = new QwenImageParams { Mask = Image(3072, 3072, i => i == 0 ? 1f : 0f) };
+        Assert.Equal(((2048, 2048), (3072, 3072)),
+            QwenImage21TestGeometry.ResolveGeometry(bigParams, big, QwenImageEditMask.Create(bigParams, big)));
     }
 
     [Fact]

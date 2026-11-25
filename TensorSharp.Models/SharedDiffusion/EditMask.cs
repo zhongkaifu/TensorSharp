@@ -131,10 +131,17 @@ namespace TensorSharp.Models.SharedDiffusion
             return value;
         }
 
-        /// <summary>Scale the crop at the full-canvas sampling density, snapping upward to the
-        /// <paramref name="multiple"/>-pixel grid (at least one cell of it).</summary>
+        /// <summary>
+        /// Where the selection samples: the crop (or the whole source) at the density of a full canvas of
+        /// <paramref name="fullWidth"/> x <paramref name="fullHeight"/>, but never above the source's own resolution, snapped
+        /// upward to the <paramref name="multiple"/>-pixel grid (at least one cell of it). A masked edit returns the source
+        /// canvas, so sampling the selection above its own pixels only multiplies the latent mask, the denoise and the decode
+        /// for a picture the composite shrinks back; a full canvas smaller than the source (a large picture at the request's
+        /// area) still samples it below its own resolution.
+        /// </summary>
         public (int Width, int Height) SamplingDimensions(int fullWidth, int fullHeight, int multiple = 32) =>
-            (GridSize(fullWidth, Width, Source.Width, multiple), GridSize(fullHeight, Height, Source.Height, multiple));
+            (GridSize(Math.Min(fullWidth, Source.Width), Width, Source.Width, multiple),
+             GridSize(Math.Min(fullHeight, Source.Height), Height, Source.Height, multiple));
 
         private static int GridSize(int sampleSize, int cropSize, int sourceSize, int multiple) =>
             Math.Max(multiple, checked((int)Math.Ceiling((double)sampleSize * cropSize / sourceSize / multiple) * multiple));

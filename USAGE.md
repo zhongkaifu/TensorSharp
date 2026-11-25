@@ -1089,7 +1089,8 @@ masks (Qwen-Image-2.1 or MiniMax-H3-Image), an input image and matching source d
 See the [Qwen-Image-2.1 mask guide](docs/models/qwenimage21.md#precise-local-editing-with-a-mask)
 for selection semantics, sampling geometry, API examples and validation coverage, and
 [MiniMax-H3-Image's masked edits](docs/models/minimax-h3-image.md#masked-edits) for its
-sampling canvas (the 2048×2048 floor) and multi-reference edits.
+multi-reference edits. Either model samples a masked edit's selection at most at its own
+resolution, since the result is the source canvas.
 
 ### Keeping the source size
 

@@ -652,8 +652,13 @@ it back on the original canvas. `--mask-crop-padding` sets that context in sourc
 pixels (0–16384, default 64). Cropping is optional; small regions can use a smaller
 internal `--width`/`--height` to reduce inference work. These set the nominal
 full-canvas sampling resolution; crop mode scales it to the selected crop's share
-of the canvas and rounds up to the 32-pixel grid. The saved image still has the
-source dimensions. The quality and speed tradeoff depends on the selection,
+of the canvas and rounds up to the 32-pixel grid. A masked edit never samples its
+selection (the whole picture or the crop) above its own resolution: the saved image
+has the source dimensions, so sampling more pixels would only enlarge the latent
+mask, the denoise and the decode. A 512x512 picture's masked edit therefore samples
+512x512 instead of the automatic 2048x2048 area; a larger size or area than the
+picture does not raise it, and a picture larger than the area is still sampled
+below its own resolution. The quality and speed tradeoff depends on the selection,
 context, internal resolution and sampling steps.
 
 Multipart API:

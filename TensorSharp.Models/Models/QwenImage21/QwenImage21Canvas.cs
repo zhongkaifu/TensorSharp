@@ -16,7 +16,9 @@ namespace TensorSharp.Models.QwenImage21
     /// Where a Qwen-Image-2.1 request samples and the size it returns: an explicit size (multiples of 32), the server's default
     /// size, or an area (2048 x 2048 by default, 1024 x 1024 on the pure-C# cpu backend) at the first reference's aspect; an
     /// edit that keeps its source size samples near its source's own area and returns the source's exact size; a masked edit
-    /// returns its source canvas. References are conditioned at about 1 MP (or the output's area if smaller).
+    /// returns its source canvas and samples its selection at that size's density, never above the selection's own resolution
+    /// (<see cref="EditMask.SamplingDimensions"/>). References are conditioned at about 1 MP (or the sampled area if
+    /// smaller).
     /// </summary>
     public static class QwenImage21Canvas
     {

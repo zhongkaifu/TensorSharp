@@ -218,14 +218,14 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
     {
         var family = new MiniMaxH3ImageFamily(MiniMaxH3ImageSampling.ReleaseSigmas);
         var image = new TensorSharp.Models.QwenImage.RgbImage(32, 32, new float[32 * 32 * 3]);
-        // Edits are taken (MiniMaxH3ImageEditTests), masked ones on the source's own canvas.
+        // Edits are taken (MiniMaxH3ImageEditTests), masked ones on the source's own canvas and at its own size.
         Assert.Equal(new DiffusionCanvas((2048, 2048), (1024, 1024)), family.ResolveCanvas(new DiffusionRequest
         {
             Prompt = "x",
             References = new[] { new DiffusionReference(image) },
         }, null));
         EditMask mask = EditMask.Create(new EditMaskOptions { Mask = image }, image);
-        Assert.Equal(new DiffusionCanvas((2048, 2048), (32, 32)), family.ResolveCanvas(new DiffusionRequest
+        Assert.Equal(new DiffusionCanvas((32, 32), (32, 32)), family.ResolveCanvas(new DiffusionRequest
         {
             Prompt = "x",
             References = new[] { new DiffusionReference(image) },

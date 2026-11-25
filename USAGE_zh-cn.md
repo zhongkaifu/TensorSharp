@@ -982,7 +982,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 `maskMode`、`maskInvert`、`maskFeather`、`maskCrop`、`maskCropPadding`。
 非流式 `/api/image-edit` 还支持 multipart 上传 `mask` 文件及同名设置。
 JSON 引用的文件请先通过 `/api/upload` 上传。
-掩码需要支持掩码的图像模型（Qwen-Image-2.1 或 MiniMax-H3-Image）、输入图以及与源图一致的尺寸；MiniMax-H3-Image 的采样画布（2048×2048 下限）与多参考图编辑见[其模型文档](docs/models/minimax-h3-image_zh-cn.md#遮罩编辑)。
+掩码需要支持掩码的图像模型（Qwen-Image-2.1 或 MiniMax-H3-Image）、输入图以及与源图一致的尺寸；MiniMax-H3-Image 的多参考图编辑见[其模型文档](docs/models/minimax-h3-image_zh-cn.md#遮罩编辑)。两个模型对遮罩编辑选区的采样都至多为其自身分辨率，因为结果是源图画布。
 选区语义、采样几何、API 示例与验证范围见[掩码指南](docs/models/qwenimage21_zh-cn.md#用遮罩精确编辑局部区域)。
 
 ### 保持源图尺寸

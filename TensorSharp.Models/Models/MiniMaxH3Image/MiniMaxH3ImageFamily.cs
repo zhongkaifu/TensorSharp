@@ -152,10 +152,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// without one its VAE copy's size (a 1024-2048 short edge). Below <see cref="MinGenerationArea"/> (or a speed adapter's
         /// own floor, <see cref="SamplingContract.MinGenerationArea"/>) the picture samples on diffusers' larger canvas
         /// (get_image_canvas_size) and is resized back.
-        /// <para>A masked edit (section 4.5) returns its source canvas: the same rules give the whole picture's canvas, the
-        /// selection's crop (or the whole picture) samples at that canvas's density (<see cref="EditMask.SamplingDimensions"/>),
-        /// and the floor (the family's or the speed adapter's) and the 20 MP ceiling then apply to what it samples, at the
-        /// crop's aspect.</para>
+        /// <para>A masked edit (section 4.5) returns its source canvas: the same rules give the whole picture's canvas, and the
+        /// selection's crop (or the whole picture) samples at that canvas's density but never above its own resolution
+        /// (<see cref="EditMask.SamplingDimensions"/>), so neither the floor nor the latent mask raises it past the picture it
+        /// is composited into; the 20 MP ceiling still applies to what it samples, at the crop's aspect.</para>
         /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
@@ -192,13 +192,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 width = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vw, multiple));
                 height = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vh, multiple));
             }
-            // A speed adapter's contract may lower the floor (pDMD's 1024 px: an edit samples at the asked size, as the
-            // adapter's diffusers pipeline does); otherwise the family's 4 MP floor. Masked or not.
-            long floor = request.Adapters?.Contract is { MinGenerationArea: > 0 } contract ? contract.MinGenerationArea : MinGenerationArea;
             if (mask != null)
             {
-                var (cw, ch) = mask.SamplingDimensions(width, height, multiple);
-                var selection = EditCanvas(cw, ch, multiple, floor);
+                var selection = mask.SamplingDimensions(width, height, multiple);
                 if ((long)selection.Width * selection.Height > MaxEditArea)
                 {
                     if (request.Width > 0)
@@ -210,6 +206,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 }
                 return new DiffusionCanvas(selection, (mask.Source.Width, mask.Source.Height));
             }
+            // A speed adapter's contract may lower the floor (pDMD's 1024 px: an edit samples at the asked size, as the
+            // adapter's diffusers pipeline does); otherwise the family's 4 MP floor. A masked selection takes neither (above).
+            long floor = request.Adapters?.Contract is { MinGenerationArea: > 0 } contract ? contract.MinGenerationArea : MinGenerationArea;
             var sampling = EditCanvas(width, height, multiple, floor);
             if ((long)sampling.Width * sampling.Height > MaxEditArea)
             {
