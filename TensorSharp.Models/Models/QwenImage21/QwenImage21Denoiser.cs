@@ -70,7 +70,9 @@ namespace TensorSharp.Models.QwenImage21
         private readonly IAllocator _tensorAllocator;   // a tensor executor binds leaves as objects: its F32 vectors live here
         private readonly Style _style;
         private readonly object _gate = new();
-        private readonly Dictionary<IntPtr, object> _handles = new();
+        // A tensor executor's weight objects by address and shape: a split LoRA describes the first half of a fused gate_up at
+        // the projection's own address, and the executor binds a leaf by its object's shape.
+        private readonly Dictionary<(IntPtr Data, long Ne0, long Ne1), object> _handles = new();
         private readonly List<RetainedPlan> _plans = new();
         private readonly List<PrefixCache> _caches = new();
         private long _uses;
@@ -803,8 +805,9 @@ namespace TensorSharp.Models.QwenImage21
             if (_lora == null) return;
             if (_tensorAllocator == null)
                 foreach (IntPtr p in _lora.FactorPointers()) InvalidateEverywhere(p);
-            foreach (IntPtr p in _lora.FactorPointers())
-                if (_handles.Remove(p, out object h) && h is IDisposable d) d.Dispose();
+            var factors = new HashSet<IntPtr>(_lora.FactorPointers());
+            foreach (var key in new List<(IntPtr, long, long)>(_handles.Keys))
+                if (factors.Contains(key.Item1) && _handles.Remove(key, out object h) && h is IDisposable d) d.Dispose();
         }
 
         /// <summary>Forget the bound LoRA set (its device copies and the plans that bind it): the model calls it before it

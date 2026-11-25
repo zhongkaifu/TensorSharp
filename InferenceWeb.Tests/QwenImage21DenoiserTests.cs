@@ -419,4 +419,40 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         var got = Trajectory(denoiser, wide ? QwenImage21WideFixture.Request(references, 31) : Request(references, 31), set);
         QwenImage21Goldens.Check("managed/" + name, MiniMaxH3ImageGoldens.HostLaneKey(), sha, got, bound: 1e-4);
     }
+
+    /// <summary>On a fused gate_up checkpoint a split LoRA (separate gate and up factors) describes the projection's first half
+    /// at its own address: a denoiser that ran without the plug-in, then with it, then without it again, gives each step a
+    /// fresh denoiser's velocities, on the managed executor (which binds a leaf by its weight object's shape) and on GGML.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Switching_a_split_LoRA_on_a_fused_checkpoint_rebinds_the_projection(bool managed)
+    {
+        string dit = WriteTransformer(_dir, fused: true);
+        string loraPath = WriteLora(_dir);
+        BackendType backend = managed ? BackendType.Cpu : TestGates.PinnedGgmlBackend;
+        using var switching = new QwenImage21Denoiser(dit, backend) { FreeMemory = () => -1 };
+        using var set = QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, switching.Weights.Gguf, "", backend, 1);
+        Assert.True(set.SplitGateUp[0]);
+        var (text, refs, layout, target) = Request(1, 47);
+        float[] Fresh(QwenImage21LoraSet lora)
+        {
+            using var fresh = new QwenImage21Denoiser(dit, backend) { FreeMemory = () => -1 };
+            using var own = lora == null ? null : QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, fresh.Weights.Gguf, "", backend, 1);
+            float[] v = (float[])fresh.Predict(target, text, refs, layout, 1f, 0, false, own).Clone();
+            fresh.FinishRequest();
+            return v;
+        }
+        float[] Step(QwenImage21LoraSet lora)
+        {
+            float[] v = (float[])switching.Predict(target, text, refs, layout, 1f, 0, false, lora).Clone();
+            switching.FinishRequest();
+            return v;
+        }
+        float[] plain = Fresh(null), adapted = Fresh(set);
+        Assert.NotEqual(plain, adapted);
+        Assert.Equal(plain, Step(null));
+        Assert.Equal(adapted, Step(set));
+        Assert.Equal(plain, Step(null));
+    }
 }

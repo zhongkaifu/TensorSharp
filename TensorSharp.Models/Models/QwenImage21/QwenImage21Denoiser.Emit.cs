@@ -92,15 +92,15 @@ namespace TensorSharp.Models.QwenImage21
             if (lora != null) e.Mix(lora.Generation);
             e.Mix((long)s.Mode);
 
-            var leaves = new Dictionary<IntPtr, int>();
+            var leaves = new Dictionary<(IntPtr, long, long), int>();
             int Leaf(QwenImage21Weight x)
             {
-                if (leaves.TryGetValue(x.Data, out int node)) return node;
+                if (leaves.TryGetValue((x.Data, x.Ne0, x.Ne1), out int node)) return node;
                 ReadOnlySpan<long> ne = x.Vector ? stackalloc long[] { x.Ne0 } : stackalloc long[] { x.Ne0, x.Ne1 };
                 node = _tensorAllocator == null
                     ? e.HostWeight(x.Format, ne, x.Data, x.Bytes)
                     : e.HostWeight(x.Format, ne, GraphIdentity.Of(Handle(x)), x.Bytes, Handle(x));
-                leaves[x.Data] = node;
+                leaves[(x.Data, x.Ne0, x.Ne1)] = node;
                 return node;
             }
             QwenImage21Weight VectorAt(IntPtr data, long count) => new(GraphFormat.F32, count, 1, data, count * sizeof(float), Vector: true);
@@ -537,7 +537,7 @@ namespace TensorSharp.Models.QwenImage21
         /// <summary>A tensor executor's object for a weight leaf: an F32 vector as a tensor, a projection or factor as itself.</summary>
         private object Handle(QwenImage21Weight x)
         {
-            if (_handles.TryGetValue(x.Data, out object known)) return known;
+            if (_handles.TryGetValue((x.Data, x.Ne0, x.Ne1), out object known)) return known;
             object h = x;
             if (x.Vector)
             {
@@ -547,7 +547,7 @@ namespace TensorSharp.Models.QwenImage21
                 t.SetElementsAsFloat(values);
                 h = t;
             }
-            _handles[x.Data] = h;
+            _handles[(x.Data, x.Ne0, x.Ne1)] = h;
             return h;
         }
     }
