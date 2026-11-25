@@ -249,11 +249,13 @@ Qwen-Image path uses, and the flags and fields are the same:
   | 4 MP, 1920x2176 (the floor) | 33.5-34.6 s | 3.9 s | 33.8 GB | relief or painted surfaces for two seeds |
 
   At 4 MP the three PNGs are byte-identical to the ones from before the cap. The peak is
-  mostly the 32B text encoder's. A crop of a small picture also rises to 4 MP: a crop of a
-  512x512 picture sampled 1472x2848, 16 times the picture's pixels, in 42.9 s (5.1 s a
-  step, 35.0 GB) against 25.3 s at 1 MP (352x704, 2.7 s a step). For that one seed the
-  model kept most of the picture's vase and added only a bottle's neck, where at 1 MP it
-  drew a whole bottle.
+  mostly the 32B text encoder's. A small picture's crop is held to 4 times the picture. A
+  crop of a 512x512 picture (a green bottle in place of a vase, seeds 7, 11 and 23) samples
+  736x1440, 1 MP, in 28.3-28.9 s (3.1 s a step, 34.1 GB). At 4 MP, 16 times the picture,
+  it took 42.9-43.4 s (5.1 s a step, 35.1 GB). At 4 MP two seeds kept most of the vase, and
+  the third drew an illustrated bottle and redrew the cat's edge as a drawing. At 1 MP two
+  seeds drew a clean bottle in the picture's light, and the third (seed 7) kept the vase
+  beside a thin bottle.
 - **The latent.** The mask goes to the latent grid by the largest weight in each 16x16
   cell, so a thin stroke stays editable. `<Picture 1>` (or its crop) at the sampling canvas
   is encoded to its posterior mean, normalized as the references are (its reference copy is
