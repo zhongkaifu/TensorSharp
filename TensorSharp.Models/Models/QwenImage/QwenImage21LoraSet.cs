@@ -47,6 +47,8 @@ internal sealed class QwenImage21LoraSet : IDisposable
     // the managed kernels: it must not reach the native library whatever the process-global
     // NativeDequant route says.
     private bool _managedDequant;
+    private BackendType _backend;
+    private bool _disposed;
     private QwenImage21LoraRecipe _checkpointRecipe;
     private string _checkpointNote;
 
@@ -106,6 +108,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
         var set = new QwenImage21LoraSet
         {
             _managedDequant = backend == BackendType.Cpu,
+            _backend = backend,
             _checkpointRecipe = checkpointRecipe,
             _checkpointNote = checkpointNote,
         };
@@ -869,8 +872,21 @@ internal sealed class QwenImage21LoraSet : IDisposable
     /// transformer that binds them releases it with its own (QwenImage21Denoiser.BindLora).</summary>
     internal void CollectHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges) => _buffers.AddRanges(ranges);
 
+    /// <summary>Test hook: receives each address the set drops instead of the GGML backends.</summary>
+    internal Action<IntPtr> InvalidateHookForTest { get; set; }
+
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+        // Before the free, whatever order the owner disposes it and the transformer in: a GGML backend must never keep a
+        // device copy keyed by a host address the allocator may hand to the next set's factors.
+        Action<IntPtr> hook = InvalidateHookForTest;
+        foreach (IntPtr p in FactorPointers())
+        {
+            if (hook != null) hook(p);
+            else if (_backend != BackendType.Cpu) GgmlBasicOps.InvalidateHostBuffer(p);
+        }
         _buffers.Dispose();
         _adapters = Array.Empty<IntPtr>();
     }

@@ -385,6 +385,29 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         Assert.Contains("diffusers.safetensors: 5 low-rank update(s), rank 2/4", set.Summary, StringComparison.Ordinal);
     }
 
+    /// <summary>The GGML backends keep a device copy of each factor keyed by its host address. The set drops them before it
+    /// frees the factors, whichever of it and the transformer is disposed first: otherwise the next set, whose factors the
+    /// allocator may place at the same addresses, computes with the stale copies (as QwenImage21DenoiserTests' CUDA lane did).</summary>
+    [Fact]
+    public void Disposing_a_set_drops_its_device_copies_on_every_rank_first()
+    {
+        using var dit = Transformer(fused: true);
+        var file = new LoraFile();
+        file.Factors("transformer.transformer_blocks.0.attn.to_q.lora_A.weight", "transformer.transformer_blocks.0.attn.to_q.lora_B.weight", 4, D, D, 1);
+        file.Factors("transformer.transformer_blocks.0.img_mlp.out.lora_A.weight", "transformer.transformer_blocks.0.img_mlp.out.lora_B.weight", 2, Ff, D, 2);
+        string path = Save(file, "dispose.safetensors");
+
+        var set = Load(dit, 2, BackendType.GgmlCpu, new LoraSpec(path));
+        IntPtr[] pointers = set.FactorPointers().ToArray();
+        Assert.NotEmpty(pointers);
+        var seen = new List<IntPtr>();
+        set.InvalidateHookForTest = seen.Add;
+        set.Dispose();
+        Assert.Equal(pointers.OrderBy(p => (long)p), seen.OrderBy(p => (long)p));
+        set.Dispose();
+        Assert.Equal(pointers.Length, seen.Count);
+    }
+
     [Fact]
     public void Diffusers_SplitMlpHalvesOnAnUnfusedCheckpoint_NeedNoSplit()
     {
