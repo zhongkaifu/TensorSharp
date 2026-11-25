@@ -236,8 +236,8 @@ Qwen-Image path uses, and the flags and fields are the same:
   Lanczos. (Before, the 2048x2048 floor applied here too: a 512x512 picture's masked edit
   sampled 2048x2048, 16 times its pixels.)
 - **A crop's floor.** A crop smaller than `<Picture 1>` samples at least 2048x2048 pixels
-  (the edit's own floor) at its own aspect, whatever the picture's size; a speed plug-in's
-  floor does not change it. A crop above 4 MP samples at its own size, and a crop whose
+  (the edit's own floor) at its own aspect, held to 4 times the whole picture's pixels; a
+  speed plug-in's floor does not change it. A crop above 4 MP samples at its own size, and a crop whose
   padding reaches every edge is the whole picture, at its own size. The 448x512 crop of a
   1024x1024 picture samples 1920x2176, as before masked edits were capped. Smaller floors
   were tried first on the A40 (Q4_K_M, a red vase in that crop, seeds 7, 11 and 23):

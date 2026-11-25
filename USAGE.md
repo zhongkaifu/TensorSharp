@@ -1091,7 +1091,8 @@ for selection semantics, sampling geometry, API examples and validation coverage
 [MiniMax-H3-Image's masked edits](docs/models/minimax-h3-image.md#masked-edits) for its
 multi-reference edits. Either model samples a masked edit's selection at most at its own
 resolution, since the result is the source canvas; a MiniMax-H3-Image crop smaller than its
-picture samples at least 2048×2048 pixels at its own aspect.
+picture samples at least 2048×2048 pixels at its own aspect, held to 4 times the picture's
+pixels.
 
 ### Keeping the source size
 
