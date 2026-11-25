@@ -235,16 +235,25 @@ Qwen-Image path uses, and the flags and fields are the same:
   canvas still samples below its own resolution, and the decode is resized back with
   Lanczos. (Before, the 2048x2048 floor applied here too: a 512x512 picture's masked edit
   sampled 2048x2048, 16 times its pixels.)
-- **A crop's floor.** A crop smaller than `<Picture 1>` samples at least 1024x1024 pixels at
-  its own aspect, but never more pixels than the whole picture has; a speed plug-in's floor
-  does not change it. The 448x512 crop of a 1024x1024 picture therefore samples 960x1088,
-  and a crop of a 512x512 picture sampled 352x704, below the picture's 262,144 pixels. A
-  crop whose padding reaches every edge is the whole picture, at its own size. On the A40
-  (Q4_K_M, a red vase in that 448x512 crop, seeds 7, 11 and 23), the crop at its own size
-  came out plain, and one seed drew stray white shapes; at the 1 MP floor all three are
-  clean vases, in 19.9-20.4 s against 16.9-17.5 s (2.1 s a step against 1.7 s; peak
-  32.8 GB, mostly the 32B text encoder). The ornate surfaces that 4 MP sampling drew for
-  two of the seeds (33.4-33.9 s) do not come back at 1 MP.
+- **A crop's floor.** A crop smaller than `<Picture 1>` samples at least 2048x2048 pixels
+  (the edit's own floor) at its own aspect, whatever the picture's size; a speed plug-in's
+  floor does not change it. A crop above 4 MP samples at its own size, and a crop whose
+  padding reaches every edge is the whole picture, at its own size. The 448x512 crop of a
+  1024x1024 picture samples 1920x2176, as before masked edits were capped. Smaller floors
+  were tried first on the A40 (Q4_K_M, a red vase in that crop, seeds 7, 11 and 23):
+
+  | crop sampled at | total | a step | peak | the vases |
+  |---|---|---|---|---|
+  | its own size, 448x512 | 16.9-17.5 s | 1.71 s | 32.5 GB | plain; one seed drew stray white shapes |
+  | 1 MP, 960x1088 | 19.9-20.4 s | 2.1 s | 32.8 GB | clean, but plain |
+  | 4 MP, 1920x2176 (the floor) | 33.5-34.6 s | 3.9 s | 33.8 GB | relief or painted surfaces for two seeds |
+
+  At 4 MP the three PNGs are byte-identical to the ones from before the cap. The peak is
+  mostly the 32B text encoder's. A crop of a small picture also rises to 4 MP: a crop of a
+  512x512 picture sampled 1472x2848, 16 times the picture's pixels, in 42.9 s (5.1 s a
+  step, 35.0 GB) against 25.3 s at 1 MP (352x704, 2.7 s a step). For that one seed the
+  model kept most of the picture's vase and added only a bottle's neck, where at 1 MP it
+  drew a whole bottle.
 - **The latent.** The mask goes to the latent grid by the largest weight in each 16x16
   cell, so a thin stroke stays editable. `<Picture 1>` (or its crop) at the sampling canvas
   is encoded to its posterior mean, normalized as the references are (its reference copy is

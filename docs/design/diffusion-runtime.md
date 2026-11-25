@@ -701,9 +701,8 @@ The method:
    selection's own resolution and without the edit's floor (`EditMask.SamplingDimensions`): the
    output is always the source canvas, so sampling more pixels than it holds only enlarges the
    latent mask, the denoise and the decode. A family may keep a floor of its own for a crop
-   smaller than its picture: MiniMax-H3-Image samples one at least at 1 MP at the crop's
-   aspect, never more pixels than the picture has, since at their own small size its crops
-   came out plain or with stray shapes.
+   smaller than its picture: MiniMax-H3-Image samples one at least at its 4 MP edit floor, at
+   the crop's aspect, since at its own size or at 1 MP a small crop came out plain.
 3. **Source latent:** the posterior **mean** of `<Picture 1>` at the sampling canvas. It is the
    VAE copy already encoded for the reference when that copy has the same size; otherwise it is
    a separate tiled encode. The mean keeps the blend independent of the RNG stream. ComfyUI's
@@ -727,10 +726,10 @@ it is an experiment for stage S6 to measure.
 
 (S6, as built: the canvas is the unmasked edit's for the whole picture, the crop sampled at
 that canvas's density but never above its own resolution, a crop smaller than its picture raised
-to at least 1 MP (`MaskedCropFloor`, at most the picture's pixels), then the 20 MP ceiling applied
-to what is sampled at its own aspect; the output is the source canvas. The 4 MP floor applied here
-too until masked edits were capped at their own resolution; the cap alone left a 448x512 crop
-plain, with stray shapes for one seed in three, hence the crop floor. The source latent is the posterior mean
+to at least 4 MP (`MaskedCropFloor`), then the 20 MP ceiling applied to what is sampled at its own
+aspect; the output is the source canvas. The 4 MP floor applied to every masked edit until they
+were capped at their own resolution. The cap alone left a 448x512 crop plain, with stray shapes
+for one seed in three, and a 1 MP floor left it clean but plain, hence the crop floor. The source latent is the posterior mean
 through the references' own F16 rounding and latent normalization
 (`IReferencePolicy.SourceLatent`; the S2 pipeline had used the raw mean, which is not the
 space MiniMax-H3-Image's DiT works in), encoded once more at the sampling canvas when the
