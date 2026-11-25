@@ -55,10 +55,11 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>The largest area an edit may ask for: the model's 4-20 MP range (4096 x 5120).</summary>
         public const long MaxEditArea = 4096L * 5120;
 
-        /// <summary>The least a masked crop smaller than its picture samples: 1024 x 1024 pixels at the crop's aspect, but never
-        /// more than the whole picture has. Sampled at its own size, a 448 x 512 crop came out plainer than the picture around
-        /// it (docs/models/minimax-h3-image.md, Masked edits). A speed plug-in's floor does not change this one.</summary>
-        public const long MaskedCropFloor = 1024L * 1024;
+        /// <summary>The least a masked crop smaller than its picture samples: the edit's own 2048 x 2048 pixels
+        /// (<see cref="MinGenerationArea"/>) at the crop's aspect, whatever the picture's size. At its own size a 448 x 512
+        /// crop came out plain, and at 1 MP it lost the surface detail 4 MP draws (docs/models/minimax-h3-image.md, Masked
+        /// edits). A speed plug-in's floor does not change this one.</summary>
+        public const long MaskedCropFloor = MinGenerationArea;
 
         /// <summary>The family of the denoiser in <paramref name="path"/>: its grid from the safetensors metadata, or the
         /// release grid for a file without it (the legacy model's rule).</summary>
@@ -161,8 +162,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// selection's crop (or the whole picture) samples at that canvas's density but never above its own resolution
         /// (<see cref="EditMask.SamplingDimensions"/>), so neither the edit's floor nor the latent mask raises it past the
         /// picture it is composited into. A crop smaller than its picture is the exception: it samples at least
-        /// <see cref="MaskedCropFloor"/> at its own aspect, up to the whole picture's pixel count. The 20 MP ceiling still
-        /// applies to what it samples, at the crop's aspect.</para>
+        /// <see cref="MaskedCropFloor"/> at its own aspect. The 20 MP ceiling still applies to what it samples, at the crop's
+        /// aspect.</para>
         /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
@@ -202,16 +203,13 @@ namespace TensorSharp.Models.MiniMaxH3Image
             if (mask != null)
             {
                 var selection = mask.SamplingDimensions(width, height, multiple);
-                if (mask.Width < mask.Source.Width || mask.Height < mask.Source.Height)
+                if ((mask.Width < mask.Source.Width || mask.Height < mask.Source.Height) &&
+                    (long)selection.Width * selection.Height < MaskedCropFloor)
                 {
-                    long cropFloor = Math.Min(MaskedCropFloor, (long)mask.Source.Width * mask.Source.Height);
-                    if ((long)selection.Width * selection.Height < cropFloor)
-                    {
-                        // The floor's area at the crop's aspect, also for a crop that only a smaller canvas took below it.
-                        double scale = Math.Sqrt(cropFloor / ((double)mask.Width * mask.Height));
-                        selection = (Math.Max(selection.Width, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Width * scale, multiple))),
-                                     Math.Max(selection.Height, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Height * scale, multiple))));
-                    }
+                    // The floor's area at the crop's aspect, also for a crop that only a smaller canvas took below it.
+                    double scale = Math.Sqrt(MaskedCropFloor / ((double)mask.Width * mask.Height));
+                    selection = (Math.Max(selection.Width, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Width * scale, multiple))),
+                                 Math.Max(selection.Height, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Height * scale, multiple))));
                 }
                 if ((long)selection.Width * selection.Height > MaxEditArea)
                 {
