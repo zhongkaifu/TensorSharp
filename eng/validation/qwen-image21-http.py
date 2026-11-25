@@ -353,7 +353,8 @@ def main():
                 cancel_section = text[marker:]
                 # Only the cancelled request has eight steps; the recovery has
                 # one. Its HTTP log may appear while waiting for the model lock.
-                steps = [int(x) for x in re.findall(r"\[qwen21-step\] (\d+)/8", cancel_section)]
+                # The diffusion runtime logs "[diffusion] qwen_image step k/8 ..."; older builds "[qwen21-step] k/8".
+                steps = [int(x) for x in re.findall(r"(?:\[qwen21-step\] |\[diffusion\] qwen_image step )(\d+)/8", cancel_section)]
                 report["cancellation_logged_steps"] = steps
                 report["cancellation_stopped_before_final_step"] = bool(steps) and max(steps) < 8
         completed_names = {case["name"] for case in report["cases"]}

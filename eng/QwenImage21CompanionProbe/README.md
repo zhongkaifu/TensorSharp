@@ -56,11 +56,15 @@ real-model conditioning limitations are recorded in
 Real-weight CUDA transformer timing
 ----------------------------------
 
-The `dit` command loads the actual quantized transformer and consumes conditioning
-saved by `text`. It repeats velocity prediction with changing timesteps and fixed
-latents (seed 42), excluding text encoding and VAE decoding from the timings. It
-does **not** produce an image or measure semantic quality. Compare identical
-dimensions and iteration counts; the final velocity depends on the count.
+The `dit` command loads the actual quantized transformer into the diffusion
+runtime's denoiser (`QwenImage21Denoiser`, the graph programs the model runs) and
+consumes conditioning saved by `text`. It repeats velocity prediction with changing
+timesteps and fixed latents (seed 42), excluding text encoding and VAE decoding from
+the timings. The first prediction extracts the text prefix into the prefix KV cache
+and the later ones read it; each iteration's JSON line names the graph it ran
+(`mode`: `Extract`, `Cached`, or `Full` when the cache was declined). It does **not**
+produce an image or measure semantic quality. Compare identical dimensions and
+iteration counts; the final velocity depends on the count.
 
 ```powershell
 dotnet run --project eng/QwenImage21CompanionProbe -c Release --no-build -- `
@@ -73,11 +77,15 @@ dotnet run --project eng/QwenImage21CompanionProbe -c Release --no-build -- `
 ```
 
 Report the first prediction separately from subsequent predictions: it includes
-weight upload, allocator planning and kernel warmup. CUDA graph capture may also
-affect the second prediction. `TS_QWEN21_GRAPH_REUSE=0` rebuilds the transformer
-graph every call. `TS_QWEN21_PAD_MASK=1` restores the previous padded image mask
-and per-segment F32 K/V preparation. Set both before launching a separate process
-for a structural baseline, and compare its final F32 output with `compare`.
+weight upload, program compilation, kernel warmup and the prefix extraction. CUDA
+graph capture may also affect the second prediction. The retired native graph's
+structural switches (`TS_QWEN21_GRAPH_REUSE=0` rebuilt the graph every call,
+`TS_QWEN21_PAD_MASK=1` restored the padded image mask) were removed with it: the
+probe no longer reads them, and the CLI and the server refuse to start while one is
+set. For a baseline, compare the final F32 output of another build with `compare`. The migration commit
+`f981cb6` still has the retired engines, which
+[`eng/validation/QwenImage21DenoiserAB`](../validation/QwenImage21DenoiserAB/README.md)
+ran as `legacy`.
 
 Real-weight VAE checks
 ---------------------
@@ -105,8 +113,8 @@ Real-weight vision and DeepStack checks
 `vision <mmproj.gguf> <output-prefix> <Cpu|Metal|Cuda> [input.png|-] [width=512] [height=width] [iterations=1]`
 loads only the actual Qwen3-VL vision projector. Supply the same reference PNG
 used by an editing run, or `-` for a deterministic RGBA gradient/checkerboard.
-Dimensions are the requested output geometry: the probe calls the pipeline's
-`ResolveReferenceDimensions` and `ImageIO.Resize`, then uses the conditioner's
+Dimensions are the requested output geometry: the probe calls the model's
+`QwenImage21Canvas.ReferenceDimensions` and `ImageIO.Resize`, then uses the conditioner's
 alpha-over-white composition and CHW normalization to [-1,1]. The JSON records
 the resulting reference geometry and normalized-input SHA-256.
 
@@ -140,16 +148,32 @@ probe after production changes so its copied dependencies are current.
 
 ## Prefix KV cache and tensor-parallel parity (real DiT weights)
 
-`dit-parity` loads the real diffusion transformer and predicts one request layout
-(text, one reference image and the target) at two denoising steps. Each step is
-predicted three ways: by the whole-sequence graph, through the prefix KV cache
-(default, `q8_0` and `q8_0_v` storage), and with the blocks sharded over a
-loopback tensor-parallel group of ranks on this one device. It fails when the
-default cache is not bit-identical, when 8-bit storage exceeds 2% relative L2,
-or when the sharded prediction exceeds 1% relative L2. Conditioning and latents
-are seeded noise, so it checks kernels on the real quantized weights, not image
-quality or multi-GPU speed. On macOS, stage the current native library first,
-because the project reference does not refresh a previously copied one:
+`dit-parity` loads the real diffusion transformer into the diffusion runtime's
+denoiser and predicts one request layout (text, one reference image and the target)
+at two denoising steps. Each step is predicted three ways: by the whole-sequence
+graph (a denoiser whose prefix cache is always declined), through the prefix KV
+cache (step 1 extracts the prefix, step 2 reads it), and with the blocks sharded
+over a loopback tensor-parallel group of ranks on this one device (`GgmlCpu` or
+`GgmlMetal`), with and without the cache. It fails when a cached prediction is not
+bit-identical to the whole-sequence one, or when a sharded prediction exceeds 1%
+relative L2. The comparisons against 8-bit cache storage (`q8_0`, `q8_0_v`) were
+removed with that storage. Conditioning and latents are seeded noise, so it checks
+kernels on the real quantized weights, not image quality or multi-GPU speed.
+
+Besides the JSON report, it writes every prediction's velocities as raw F32 into
+`<report>.d/` (`full-step-1.f32`, `cache-step-2.f32`, `tp2-cache-step-1.f32`, …), so
+two builds' predictions can be compared byte for byte, for example with `cmp`, or
+with `compare` for a relative L2. On a Linux x64 `ggml_cpu` build with the
+Qwen-Image-2.1-Turbo Q4_K_M weights, the runtime's predictions (whole sequence,
+cache extract and cached, two-rank loopback whole, extract and cached) were
+byte-identical to the retired native graph's, and its cache predictions to its
+whole-sequence ones. That run still fails the 1% bound: at 256 x 256 with a 128 x 128
+reference the two-rank predictions are 4.3% (whole, extract) and 2.7% (cached) relative
+L2 from the unsharded ones, and the retired TP forward gave exactly the same bytes, so
+this is how the sharded transformer rounds on these random inputs, not a change of the
+migration. Metal has not been run. On macOS, stage the current native
+library first, because the project reference does not refresh a previously copied
+one:
 
 ```sh
 dotnet build eng/QwenImage21CompanionProbe -c Release

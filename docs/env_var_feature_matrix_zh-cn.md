@@ -232,21 +232,31 @@ TestMatrix 配置中 sweep。
 注册进 `EnvVarMatrix.All`。在纯 C# 的 `cpu` 后端上，未指定尺寸的请求使用 1 百万像素的自动面积（1024x1024，
 编辑时沿用第一张参考图的宽高比），而不是原生的 2048x2048；`ggml_cpu` 与 GPU 后端保持 2048x2048。实测数据与其余诊断开关见 [Qwen-Image-2.1 卡片](models/qwenimage21_zh-cn.md)。
 
+Qwen-Image-2.1 已于 2026-11 迁移到共享的扩散运行时，它所取代的两个 Transformer（原生整图前向与纯 C#
+Transformer）的开关随之移除。设置其中任何一个，服务端或 CLI 都会在启动时报错退出，并提示
+`<NAME> was removed: <advice> Unset it.`（见 `TensorSharp.Runtime/RemovedCliFlags.cs` 中的
+`RemovedEnvironmentVariables`）：
+
+- `TS_QWEN21_FLASH`、`TS_QWEN21_PAD_MASK`、`TS_QWEN21_CUDNN_ATTENTION`、`TS_QWEN21_CUBLAS_MATMUL`、
+  `TS_QWEN21_CUBLAS_MIN_ROWS`、`TS_QWEN21_GRAPH_REUSE`、`TS_QWEN21_GRAPH_TRACE`：Transformer 以运行时的计算图
+  程序运行，这些程序按后端选择内核（在 `ggml_cuda` 上与已移除的原生计算图相同：256 行起走 cuBLAS，注意力走
+  cuDNN），并保留编译好的执行计划。
+- `TS_QWEN21_PREFIX_CACHE`：前缀 KV 缓存始终开启；超过设备空闲内存一半的缓存会被自动拒绝，该请求每一步都
+  重新计算前缀。
+- `TS_QWEN21_PREFIX_CACHE_TYPE`：缓存保存注意力实际读取的类型（Metal 与 CUDA 上为 F16，其他为 F32），因此
+  缓存步与不缓存时相同；8 位存储（`q8_0`、`q8_0_v`）已移除。
+- `TS_QWEN21_PREFIX_CACHE_MAX_MIB`：没有替代（"最多使用空闲内存一半"的规则仍然有效）。
+- `TS_QWEN21_CPU_MATMUL`、`TS_QWEN21_CPU_GATHER_V`、`TS_QWEN21_CPU_DEPTH`、`TS_QWEN21_CPU_MLP_ROWS`、
+  `TS_QWEN21_CPU_ROUND_ACTIVATIONS`、`TS_QWEN21_CPU_GELU_FP16`、`TS_QWEN21_CPU_PROFILE`：`cpu` 后端在托管张量
+  执行器上运行 Transformer 的计算图程序；这些开关调节的纯 C# Transformer 已移除。
+- `TS_QWEN21_MEMORY`：运行会记录每个阶段的秒数与驻留计划（`[diffusion]` 日志行）；按阶段的进程内存报告没有
+  替代。
+
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
 | `TS_QWEN21_EDIT_NOISE` | Qwen-Image-2.1 编辑 | `references`（或不设置）：编辑的初始噪声取自由参考图（8 位像素的 SHA-256）决定的 Philox 流，因此在相同种子与尺寸下也不会从画出源图的那份噪声重新开始。`seed`：编辑改用该种子的文生图噪声（与 stable-diffusion.cpp 相同），用于噪声对齐的对比，每次这样的编辑都会打印一行。其他取值会使请求失败。文生图噪声在两种设置下相同 | `references` | 未注册 | 否 |
-| `TS_QWEN21_PREFIX_CACHE` | Qwen-Image-2.1 DiT | `0`（或 `false` / `off` / `no`）关闭前缀 KV 缓存：它在第一个去噪步保存文本与参考图像的 key / value，之后每一步复用 | 启用 | 未注册 | 否 |
-| `TS_QWEN21_PREFIX_CACHE_TYPE` | 同上 | 缓存前缀的存储类型：`auto`（注意力实际读取的类型，输出与不缓存时一致）、`f16`、`f32`、`q8_0` 或 `q8_0_v`（8 bit 设置会对保存的前缀做舍入）。即使缓存关闭，拼错的值也会报错 | `auto` | 未注册 | 否 |
-| `TS_QWEN21_PREFIX_CACHE_MAX_MIB` | 同上 | 单个缓存的上限（MiB），叠加在"缓存最多使用设备空闲内存一半"的规则之上。放不下的缓存会带警告被拒绝，该请求每一步都重新计算前缀 | 未设置 | 未注册 | 否 |
-| `TS_QWEN21_GRAPH_REUSE` | `ggml_cuda` / `ggml_metal` 上的 Qwen-Image-2.1 DiT | 在去噪步之间保留计算图，ggml-cuda 因此可以把它们捕获为 CUDA graph；`0` 为每次预测重建计算图。CPU 与 Vulkan 总是构建临时计算图 | 启用 | 未注册 | 否 |
-| `TS_QWEN21_FLASH` / `TS_QWEN21_PAD_MASK` | Qwen-Image-2.1 DiT | 诊断开关：`TS_QWEN21_FLASH=0` 关闭 flash attention；在 `ggml_cuda` 上，`TS_QWEN21_PAD_MASK=1` 恢复填充掩码注意力路径（其他后端忽略它） | 启用 / 关闭 | 未注册 | 否 |
-| `TS_QWEN21_CUBLAS_MATMUL` / `TS_QWEN21_CUDNN_ATTENTION` | `ggml_cuda` 上的 Qwen-Image-2.1 DiT | `TS_QWEN21_CUBLAS_MATMUL=0` 让宽的 Q4_K / Q6_K 投影留在 ggml 的 MMQ 内核，而不用 cuBLAS BF16 GEMM（需要 sm_80 或更新；`TS_QWEN21_CUBLAS_MIN_ROWS` 为 token 阈值，默认 256）。`TS_QWEN21_CUDNN_ATTENTION=0` 让无掩码注意力留在 ggml 的 flash attention 内核，而不用 cuDNN 的融合 SDPA | 启用 / 启用 | 未注册 | 否 |
 | `TS_QWEN21_VAE_FUSED` | Qwen-Image-2.1 VAE | 整 VAE 计算图，CUDA 与 Metal 上默认使用。`0` 选择逐卷积路径；`1` 在其他 GGML 后端上强制使用，但 Vulkan 除外，那里会被忽略并给出警告 | CUDA / Metal 上启用 | 未注册 | 否 |
 | `TS_QWEN21_VISION_FUSED` | `ggml_cuda` 上的 Qwen-Image-2.1 视觉编码器 | `0` 恢复此前的逐块视觉路径，用于 A/B | 启用 | 未注册 | 否 |
-| `TS_QWEN21_CPU_MATMUL` | `cpu` 上的 Qwen-Image-2.1 DiT | 不设置（或为 `q8`）时，量化投影像 ggml-cpu 那样把激活量化成 Q8_K / Q8_0，并在 `ManagedQuantizedOps` 的多行整数 GEMM 上计算：有了这些内核它是更快的路径（带缓存的单步在 256x256 时 4.0 s 对 7.2-9.0 s，512x512 时 17.6-21.7 s 对 29-38 s），图像也更接近 ggml_cpu（512x512、Pruna 5 步 LoRA：PSNR 32.9 dB 对 31.4）。`f32`（之前的默认值）改用 F32 激活乘以反量化的权重分块：更慢，但数值更稳定——输入 latent 相对变化 1e-6 时，整数流水线的速度场变化约 2.5e-2（相对 L2，ggml-cpu 自己约 1e-2），F32 的只变化约 1e-5 | 整数（Q8）激活 | 未注册 | 否 |
-| `TS_QWEN21_CPU_PROFILE` | 同上 | `1` 每次前向打印一行各阶段耗时 | 关闭 | 未注册 | 否 |
-| `TS_QWEN21_CPU_GATHER_V` / `TS_QWEN21_CPU_MLP_ROWS` / `TS_QWEN21_CPU_DEPTH` | 同上（调优） | 注意力从按头排列的副本读取每个头的 value（`0` 直接读取按 token 排列的 V）；MLP 每块的行数，用来限制其 `[rows, 2 * ff]` 激活的大小；dot 分块一趟的深度（16 的倍数） | 启用 / `1024` / `1024` | 未注册 | 否 |
-| `TS_QWEN21_CPU_GELU_FP16` / `TS_QWEN21_CPU_ROUND_ACTIVATIONS` | 同上（对齐用） | 为 A/B 对比复现 ggml-cpu 的舍入：它的 F16 GELU 表，以及输入 F16/BF16 `img_in` / `txt_in` 权重前按 BF16 舍入。默认是 F32 的 tanh GELU（与 CUDA、Metal 的算法相同）和 F32 输入 | 关闭 / 关闭 | 未注册 | 否 |
 | `TS_QWEN_VAE_PROFILE` | `cpu` 上的 Qwen-Image-2.1 VAE | `1` 打印一次编码或解码中各类算子（conv、norm、add、attention、resample、权重打包）的耗时 | 关闭 | 未注册 | 否 |
 | `TS_QWEN_IMAGE_CPU_MEMORY_CHECK` | `cpu` 上的 Qwen-Image-2.1 | 在开始任何工作之前，估计峰值（VAE 解码：每个输出像素 2304 字节再加约 1.8 GiB；去噪：每个 token 128 KiB 再加 2.5 GiB 与映射的 Transformer）超过机器内存的尺寸会被拒绝，并给出能放下的最大方形尺寸；只超过当前空闲内存的尺寸会得到一条警告。`0` 跳过拒绝 | 启用 | 未注册 | 否 |
 | `TS_CPU_GEMM_THREADS` | `cpu` 上的 Qwen-Image-2.1 VAE | 托管 VAE 专用线程池的宽度。默认每个逻辑 CPU 一个线程：卷积受 FMA 限制，每核两个 SMT 线程能让唯一的 512 位 FMA 端口更忙（512x512 解码 7.9 -> 7.0 s）。文本编码器与视觉塔仍在共享池上，那里多出的自旋线程得不偿失。`TS_CPU_POOL=0` 时 VAE 改用宽度上限为此值的 `Parallel.For`，不再使用专用池 | 逻辑 CPU 数，最多 64（限制在 1-512） | 未注册 | 否 |
@@ -254,9 +264,8 @@ TestMatrix 配置中 sweep。
 | `TS_QWEN_TE_CPU_MATMUL` | `cpu` 上的 Qwen-Image-2.1 文本编码器（Qwen3-VL-8B） | 不设置时，投影像 ggml-cpu 那样把激活量化到 8 位，并在多行整数 GEMM 上计算：37 token 的默认提示用时 0.76-0.88 s，packed F32 GEMM 为 1.8-1.9 s（ggml_cpu 约 1.4 s）。`f32` 改用反量化权重分块上的 packed F32 GEMM（激活为精确的 F32：每个投影与双精度参照相差约 1e-6，8 位路径约 4e-3）。 | 整数（Q8）激活 | 未注册 | 否 |
 | `TS_QWEN_TE_PROFILE` | 同上 | `1` 每次前向打印逐算子路径的耗时拆分（linear / attention / norm） | 关闭 | 未注册 | 否 |
 
-在 `cpu` 上，上述前缀 KV 缓存设置作用于托管缓存，它位于主机内存中："空闲内存"指未被使用的物理内存。
-只对 GGML 有效的开关（`TS_QWEN21_GRAPH_REUSE`、`TS_QWEN21_FLASH`、`TS_QWEN21_PAD_MASK`、
-`TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VISION_FUSED`）在那里不起作用。
+在 `cpu` 上，前缀 KV 缓存是位于主机内存中的托管缓存，它最多可占一半的"空闲内存"指未被使用的物理内存。
+只对 GGML 有效的开关（`TS_QWEN21_VAE_FUSED`、`TS_QWEN21_VISION_FUSED`）在那里不起作用。
 
 ## 矩阵外的 MiniMax-H3-Image 开关
 

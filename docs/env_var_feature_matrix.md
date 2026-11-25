@@ -257,21 +257,36 @@ reference's aspect ratio for an edit) rather than the native 2048x2048; `ggml_cp
 and the GPU backends keep 2048x2048. The [Qwen-Image-2.1 card](models/qwenimage21.md)
 has the measurements and the remaining diagnostic switches.
 
+Qwen-Image-2.1 moved onto the shared diffusion runtime in 2026-11, and the switches of
+the two transformers it retired (the native whole-graph forward and the pure-C#
+transformer) were removed with them. Setting one stops the server or CLI at startup with
+`<NAME> was removed: <advice> Unset it.` (`RemovedEnvironmentVariables` in
+`TensorSharp.Runtime/RemovedCliFlags.cs`):
+
+- `TS_QWEN21_FLASH`, `TS_QWEN21_PAD_MASK`, `TS_QWEN21_CUDNN_ATTENTION`,
+  `TS_QWEN21_CUBLAS_MATMUL`, `TS_QWEN21_CUBLAS_MIN_ROWS`, `TS_QWEN21_GRAPH_REUSE`,
+  `TS_QWEN21_GRAPH_TRACE`: the transformer runs as the runtime's graph programs, which
+  choose their kernels per backend (on `ggml_cuda`, cuBLAS from 256 rows and cuDNN
+  attention, as the removed native graph did) and keep their compiled plans.
+- `TS_QWEN21_PREFIX_CACHE`: the prefix KV cache is always on; a cache larger than half
+  the device's free memory is declined automatically, and that request recomputes the
+  prefix every step.
+- `TS_QWEN21_PREFIX_CACHE_TYPE`: the cache stores what attention reads (F16 on Metal and
+  CUDA, F32 elsewhere), so cached steps equal uncached ones; the 8-bit storage (`q8_0`,
+  `q8_0_v`) was removed.
+- `TS_QWEN21_PREFIX_CACHE_MAX_MIB`: no replacement (the half-of-free-memory rule remains).
+- `TS_QWEN21_CPU_MATMUL`, `TS_QWEN21_CPU_GATHER_V`, `TS_QWEN21_CPU_DEPTH`,
+  `TS_QWEN21_CPU_MLP_ROWS`, `TS_QWEN21_CPU_ROUND_ACTIVATIONS`, `TS_QWEN21_CPU_GELU_FP16`,
+  `TS_QWEN21_CPU_PROFILE`: the `cpu` backend runs the transformer's graph programs on the
+  managed tensor executor; the pure-C# transformer these tuned was removed.
+- `TS_QWEN21_MEMORY`: the run logs each phase's seconds and the residency plan
+  (`[diffusion]` lines); the per-phase process memory report has no replacement.
+
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `TS_QWEN21_EDIT_NOISE` | Qwen-Image-2.1 edits | `references` (or unset): an edit's initial noise is drawn on a Philox stream keyed to its reference images (8-bit pixels, SHA-256), so it never restarts from the noise that drew its source at the same seed and size. `seed`: edits draw the seed's text-to-image noise, as stable-diffusion.cpp does, for matched-noise comparisons; each such edit prints a line. Any other value fails the request. Text-to-image noise is the same either way | `references` | not registered | no |
-| `TS_QWEN21_PREFIX_CACHE` | Qwen-Image-2.1 DiT | `0` (or `false` / `off` / `no`) turns off the prefix KV cache, which stores the text and reference-image keys and values at the first denoising step and reuses them at every later step | ON | not registered | no |
-| `TS_QWEN21_PREFIX_CACHE_TYPE` | same | Storage type of the cached prefix: `auto` (what attention reads, so output matches the uncached run), `f16`, `f32`, `q8_0` or `q8_0_v` (the 8-bit settings round the stored prefix). A misspelled value is an error even while the cache is off | `auto` | not registered | no |
-| `TS_QWEN21_PREFIX_CACHE_MAX_MIB` | same | Cap on one cache in MiB, on top of the rule that a cache may use at most half of the device's free memory. A cache that does not fit is declined with a warning, and that request recomputes the prefix every step | unset | not registered | no |
-| `TS_QWEN21_GRAPH_REUSE` | Qwen-Image-2.1 DiT on `ggml_cuda` / `ggml_metal` | Retain the step graphs across denoising steps, which lets ggml-cuda capture them as CUDA graphs; `0` rebuilds the graph for each prediction. CPU and Vulkan always build transient graphs | ON | not registered | no |
-| `TS_QWEN21_FLASH` / `TS_QWEN21_PAD_MASK` | Qwen-Image-2.1 DiT | Diagnostic switches: `TS_QWEN21_FLASH=0` disables flash attention; on `ggml_cuda`, `TS_QWEN21_PAD_MASK=1` restores the padded-mask attention path (other backends ignore it) | ON / OFF | not registered | no |
-| `TS_QWEN21_CUBLAS_MATMUL` / `TS_QWEN21_CUDNN_ATTENTION` | Qwen-Image-2.1 DiT on `ggml_cuda` | `TS_QWEN21_CUBLAS_MATMUL=0` keeps the wide Q4_K / Q6_K projections on ggml's MMQ kernels instead of a cuBLAS BF16 GEMM (sm_80 or newer; `TS_QWEN21_CUBLAS_MIN_ROWS`, default 256, is the token threshold). `TS_QWEN21_CUDNN_ATTENTION=0` keeps the unmasked attentions on ggml's flash-attention kernel instead of cuDNN's fused SDPA | ON / ON | not registered | no |
 | `TS_QWEN21_VAE_FUSED` | Qwen-Image-2.1 VAE | Whole-VAE graph, the default on CUDA and Metal. `0` selects the per-convolution path; `1` forces the graph on another GGML backend except Vulkan, where it is ignored with a warning | ON on CUDA / Metal | not registered | no |
 | `TS_QWEN21_VISION_FUSED` | Qwen-Image-2.1 vision encoder on `ggml_cuda` | `0` restores the previous per-block vision path for A/B runs | ON | not registered | no |
-| `TS_QWEN21_CPU_MATMUL` | Qwen-Image-2.1 DiT on `cpu` | Unset (or `q8`), the quantized projections quantize their activations to Q8_K / Q8_0 as ggml-cpu does and run the multi-row integer GEMM in `ManagedQuantizedOps`: the faster route with those kernels (a cached step 4.0 s against 7.2-9.0 s at 256x256, 17.6-21.7 s against 29-38 s at 512x512) and closer to ggml_cpu's image (512x512 Pruna-5 LoRA: PSNR 32.9 dB against 31.4). `f32`, the default before, multiplies F32 activations by dequantized weight tiles instead: slower, but numerically steadier - a 1e-6 relative change of the input latents moves the integer pipeline's velocity by about 2.5e-2 relative L2 (ggml-cpu's own by about 1e-2) and the F32 one by about 1e-5 | integer (Q8) activations | not registered | no |
-| `TS_QWEN21_CPU_PROFILE` | same | `1` prints one line per forward with the time of each stage | OFF | not registered | no |
-| `TS_QWEN21_CPU_GATHER_V` / `TS_QWEN21_CPU_MLP_ROWS` / `TS_QWEN21_CPU_DEPTH` | same (tuning) | Attention reads each head's values from a head-major copy (`0` reads the token-major V in place); rows per MLP chunk, which bounds its `[rows, 2 * ff]` activation; depth of one pass of the dot tiles (a multiple of 16) | ON / `1024` / `1024` | not registered | no |
-| `TS_QWEN21_CPU_GELU_FP16` / `TS_QWEN21_CPU_ROUND_ACTIVATIONS` | same (parity) | Reproduce ggml-cpu's rounding for A/B comparisons: its F16 GELU table, and BF16-rounded inputs to the F16/BF16 `img_in` / `txt_in` weights. The defaults are the F32 tanh GELU (as CUDA and Metal compute it) and F32 inputs | OFF / OFF | not registered | no |
 | `TS_QWEN_VAE_PROFILE` | Qwen-Image-2.1 VAE on `cpu` | `1` prints the time per op class (conv, norm, add, attention, resample, weight packing) of one encode or decode | OFF | not registered | no |
 | `TS_QWEN_IMAGE_CPU_MEMORY_CHECK` | Qwen-Image-2.1 on `cpu` | Before any work, a size whose estimated peak (the VAE decode: 2304 bytes per output pixel plus about 1.8 GiB; the denoise: 128 KiB per token plus 2.5 GiB and the mapped transformer) exceeds the machine's memory is refused with the largest square size that fits; one that only exceeds the memory free right now gets a warning. `0` skips the refusal | ON | not registered | no |
 | `TS_CPU_GEMM_THREADS` | Qwen-Image-2.1 VAE on `cpu` | Width of the dedicated pool the managed VAE runs on. One thread per logical CPU by default: the convolutions are FMA-bound, and two SMT threads per core keep the single 512-bit FMA port busier (512x512 decode 7.9 -> 7.0 s). The text encoder and vision tower stay on the shared pool, where the extra spinning workers cost more than they give. Under `TS_CPU_POOL=0` the VAE runs `Parallel.For` capped at this width instead of its own pool | logical CPUs, at most 64 (clamped 1-512) | not registered | no |
@@ -279,11 +294,9 @@ has the measurements and the remaining diagnostic switches.
 | `TS_QWEN_TE_CPU_MATMUL` | Qwen-Image-2.1 text encoder (Qwen3-VL-8B) on `cpu` | Unset, the projections quantize their activations to 8 bits as ggml-cpu does and run the multi-row integer GEMM: 0.76-0.88 s for the 37-token default prompt against 1.8-1.9 s for the packed F32 GEMM (ggml_cpu about 1.4 s). `f32` selects the packed F32 GEMM on dequantized weight tiles (exact F32 activations: about 1e-6 relative to a double-precision reference per projection, against about 4e-3 for the 8-bit route). | integer (Q8) activations | not registered | no |
 | `TS_QWEN_TE_PROFILE` | same | `1` prints a per-forward split of the per-op path (linear / attention / norms) | OFF | not registered | no |
 
-On `cpu`, the prefix KV cache settings above apply to the managed cache, which
-lives in host memory: "free memory" is the physical memory not in use. The
-GGML-only switches (`TS_QWEN21_GRAPH_REUSE`, `TS_QWEN21_FLASH`,
-`TS_QWEN21_PAD_MASK`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no
-effect there.
+On `cpu`, the prefix KV cache is a managed cache in host memory, and the free memory it
+may take half of is the physical memory not in use. The GGML-only switches
+(`TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no effect there.
 
 ## Out-of-Matrix MiniMax-H3-Image Knobs
 

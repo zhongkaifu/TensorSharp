@@ -244,10 +244,22 @@ def parse_log(engine, text):
     text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text).replace("\r", "\n")
     phases, steps, fallbacks = {}, [], []
     if engine == "tensorsharp":
+        # The diffusion runtime's lines: "[diffusion] qwen_image step 3/8 sigma ... 1.23s" per step, and one summary
+        # "[diffusion] qwen_image WxH, ...: text 1.2s, vision 0.0s, VAE encode 0.0s, denoise 9.8s (1.2s/step), decode 3.4s,
+        # total 14.5s". Builds before the runtime printed [qwen21-timing] / [qwen21-step] lines; both are read.
         for name, value, unit in re.findall(r"\[qwen21-timing\]\s+([^:\n]+):\s+([0-9.]+)(ms|s)", text):
             phases[name] = float(value) / (1000 if unit == "ms" else 1)
         for index, count, seconds in re.findall(r"\[qwen21-step\]\s+(\d+)/(\d+):\s+([0-9.]+)s", text):
             steps.append({"step": int(index), "total": int(count), "seconds": float(seconds)})
+        for index, count, seconds in re.findall(r"\[diffusion\] qwen_image step (\d+)/(\d+) sigma [^\n]*? ([0-9.]+)s\s*$", text, re.M):
+            steps.append({"step": int(index), "total": int(count), "seconds": float(seconds)})
+        summary = re.search(r"\[diffusion\] qwen_image \d+x\d+,[^:\n]*:([^\n]*)", text)
+        if summary:
+            runtime_names = {"text": "text and vision encode", "VAE encode": "VAE encode", "denoise": "denoise",
+                             "decode": "VAE decode", "total": "total"}
+            for name, value in re.findall(r"(text|vision|VAE encode|denoise|decode|total) ([0-9.]+)s", summary[1]):
+                if name in runtime_names:
+                    phases[runtime_names[name]] = float(value)
         match = re.search(r"Loaded model[^\n]*elapsedMs=([0-9.]+)", text)
         if match:
             phases["model load"] = float(match[1])/1000

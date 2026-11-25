@@ -2032,7 +2032,7 @@ must be reachable between all nodes.
 | Hunyuan Dense | ✅ + layer split + hybrid | Shared decoder runtime: the same placements as Mistral 3 (`--tp T`, `--layer-split P`, both together), with batched serving in each. |
 | DiffusionGemma | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
 | Wan 2.1 / 2.2, MiniMax-H3 | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
-| Qwen-Image-2.1 | ✅ (local only, diffusion transformer) | `--tp N` (any GPU count that divides the 32 attention heads — 2, 4, 8 or 16 on one machine — subject to block alignment when the weights are sharded) on `ggml_cuda` / `ggml_vulkan` shards the DiT's attention heads and MLP columns; LoRA plug-ins are sharded with it. Measured 1.34-1.57× on 2× A40 with `ggml_cuda`, but slower than one GPU on `ggml_vulkan` (0.86×, host reduction). The text encoder, vision encoder and VAE stay on the first GPU, and multi-node groups are refused. See the [Qwen-Image-2.1 card](docs/models/qwenimage21.md#cuda-graphs-and-tensor-parallelism) |
+| Qwen-Image-2.1 | ✅ (local only, diffusion transformer) | `--tp N` (any GPU count that divides the 32 attention heads — 2, 4, 8 or 16 on one machine — subject to block alignment when the weights are sharded) on `ggml_cuda` / `ggml_vulkan` shards the DiT's attention heads and MLP columns; LoRA plug-ins are sharded with it. Measured with the retired native graph at 1.34-1.57× on 2× A40 with `ggml_cuda`, but slower than one GPU on `ggml_vulkan` (0.86×, host reduction); the diffusion runtime's sharded programs have not been run on two GPUs yet. The text encoder, vision encoder and VAE stay on the first GPU, and multi-node groups are refused. See the [Qwen-Image-2.1 card](docs/models/qwenimage21.md#cuda-graphs-and-tensor-parallelism) |
 
 ### Backend support
 
@@ -2335,12 +2335,19 @@ Every `TS_MINIMAX_M3_*` variable, with its default, is in the
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Prefix KV cache (the text and reference-image keys and values are stored at the first denoising step and reused at every later one) | ON | `TS_QWEN21_PREFIX_CACHE=0` (or `false` / `off` / `no`) turns it off | — |
-| Prefix KV cache storage type | `auto` — what the attention kernel reads, so cached steps reproduce the uncached run | `TS_QWEN21_PREFIX_CACHE_TYPE` = `auto` / `f16` / `f32` / `q8_0` / `q8_0_v` (the 8-bit types round the stored prefix; a misspelled value is an error even while the cache is off) | — |
-| Prefix KV cache size limit | at most half of the memory the device reports free | `TS_QWEN21_PREFIX_CACHE_MAX_MIB` caps one cache further; a cache that does not fit is declined with a warning, and that request recomputes the prefix every step | — |
+| Prefix KV cache (the text and reference-image keys and values are stored at the first denoising step and reused at every later one) | always ON; it stores what attention reads (F16 on Metal and CUDA, F32 elsewhere), so cached steps reproduce the uncached run; a cache larger than half of the memory the device reports free is declined with a warning, and that request recomputes the prefix every step | none: `TS_QWEN21_PREFIX_CACHE`, `TS_QWEN21_PREFIX_CACHE_TYPE` (with its 8-bit `q8_0` / `q8_0_v` storage) and `TS_QWEN21_PREFIX_CACHE_MAX_MIB` were removed, and setting one stops the CLI and the server at startup | — |
 | Edit noise | `references` — an edit's initial noise follows the seed and its reference images, so an edit never restarts from the noise that drew its source | `TS_QWEN21_EDIT_NOISE=seed` draws edits from the seed's text-to-image noise, as stable-diffusion.cpp does, for matched-noise comparisons (each such edit prints a line saying so); any other value is an error | — |
 | Companion overrides | resolved next to the DiT GGUF | `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ` | `--qwen-image-vae`, `--qwen-image-vl`, `--qwen-image-mmproj` |
 | Checkpoint variant (Turbo samples its own 8-step schedule) | none: a file name with the word `turbo` is assumed to be Turbo, said at load; any other is `base` | `TS_QWEN_IMAGE_VARIANT` = `base` / `turbo` (any other value refuses the load) | `--qwen-image-variant` |
+
+Qwen-Image-2.1's transformer runs on the shared diffusion runtime as graph programs, which
+choose their kernels per backend. The switches of the transformers it replaced (the native
+whole graph and the pure-C# one: `TS_QWEN21_FLASH`, `_PAD_MASK`, `_CUDNN_ATTENTION`,
+`_CUBLAS_MATMUL`, `_CUBLAS_MIN_ROWS`, `_GRAPH_REUSE`, `_GRAPH_TRACE`, the `TS_QWEN21_CPU_*`
+switches and `TS_QWEN21_MEMORY`) were removed; setting one stops the CLI and the server at
+startup with `<NAME> was removed: <advice> Unset it.` The
+[environment variable matrix](docs/env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs)
+gives each one's advice.
 
 #### Tensor parallelism & distributed inference
 
@@ -2391,11 +2398,12 @@ regresses; decode still beats the pool-off baseline.
 The same pool also runs the Core CPU kernels: `TensorSharp.Models` binds Core's
 `CpuParallel` hook to it at module load, so the packed F32 SGEMM behind
 `Ops.Addmm`, the SIMD elementwise, norm, softmax and RoPE kernels, the
-DiffusionGemma and Qwen-Image-2.1 transformer kernels and the Qwen-Image text
-encoder and vision tower share one set of workers (the Qwen-Image VAE has a wider
-pool of its own, `TS_CPU_GEMM_THREADS`). With all of that on the pool, 16 threads
-instead of the default 8 on an 8-core / 16-thread i7-11800H made the Qwen-Image
-transformer steps faster but its text-encoder forward and DiffusionGemma's
+DiffusionGemma kernels and the Qwen-Image text encoder and vision tower share one
+set of workers (the Qwen-Image VAE has a wider pool of its own,
+`TS_CPU_GEMM_THREADS`). With all of that on the pool, 16 threads instead of the
+default 8 on an 8-core / 16-thread i7-11800H made the steps of the Qwen-Image
+transformer it then had (the pure-C# one since replaced by the diffusion runtime's
+programs) faster but its text-encoder forward and DiffusionGemma's
 new-prompt reads slower, so the default width was left as it is.
 Quantized weights (Q4_K, Q5_K, Q6_K, Q4_0, Q5_0, Q8_0) go through a multi-row
 int8 GEMM, and F16/BF16/F32 or dequantize-only types through a float-panel GEMM.
@@ -2425,7 +2433,7 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 |---|---|---|---|
 | Worker-pool width (managed matmuls, Core CPU kernels, DiffusionGemma / Qwen-Image kernels) | every core up to 8 CPUs; half above that, never below 8; every core on Apple silicon (no SMT) | `TS_CPU_THREADS=N` | — |
 | Worker-pool width on decode-sized steps (a step whose weight products read at most 4 activation rows: one sequence's token, or a few sequences' tokens in one step) | on a Mac with performance and efficiency cores (`hw.perflevel0` / `hw.perflevel1`) every core but two, never fewer than the performance cores (16 on an M5 Pro); elsewhere the pool's width; `TS_CPU_THREADS` set alone sets both widths | `TS_CPU_DECODE_THREADS=N` — the workers past it park until a wider step, so the process's other threads (a server's request and streaming threads) find a free core instead of taking one from a pool worker in the middle of a job; outputs do not change. A value above the pool's width counts as the pool's width; no effect under `TS_CPU_POOL=0` (no pool) | — |
-| Worker pool at all | ON | `TS_CPU_POOL=0` reverts to ThreadPool `Parallel.For` for every managed kernel that forks — the quantized matmuls, the Core CPU kernels, the DiffusionGemma / Qwen-Image-2.1 transformer kernels and the Qwen-Image VAE, text encoder and vision tower (the VAE caps it at `TS_CPU_GEMM_THREADS`) — for hosts that cannot afford spinning threads and for A/B runs in one binary; results do not change. The Direct video networks' row loops keep the pool | — |
+| Worker pool at all | ON | `TS_CPU_POOL=0` reverts to ThreadPool `Parallel.For` for every managed kernel that forks — the quantized matmuls, the Core CPU kernels, the DiffusionGemma kernels and the Qwen-Image VAE, text encoder and vision tower (the VAE caps it at `TS_CPU_GEMM_THREADS`) — for hosts that cannot afford spinning threads and for A/B runs in one binary; results do not change. The Direct video networks' row loops keep the pool | — |
 | Spin iterations before a worker parks | `4096` | `TS_CPU_SPIN=N` — parking is the expensive part at this width, so the default spins long enough that the steady state never parks | — |
 | Work-item sizing for a managed matmul | `131072` weight bytes per item, at most `4` items per worker | `TS_CPU_TASK_BYTES`, `TS_CPU_TASKS_PER_WORKER` — sized from the work rather than the thread count | — |
 | Multi-row quantized GEMM (Q4_K, Q5_K, Q6_K, Q4_0, Q5_0, Q8_0) | ON where AVX2+FMA exists; hosts without it (ARM64 included) take the per-row managed matmul | `TS_CPU_QGEMM_VERIFY=1` checks every GEMM against the per-row matmul (slow); `TS_CPU_QGEMM_MIN_ROWS`, `TS_CPU_QGEMM_TASK_MACS`, `TS_CPU_QGEMM_L2_BYTES` for diagnosis and tuning | — |
@@ -2433,7 +2441,7 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 | Packed F32 SGEMM behind `Ops.Addmm` and the Direct networks | ON (AVX-512 8x32, AVX2 6x16 or portable kernel) | `TS_CPU_SGEMM_KERNEL`, `TS_CPU_SGEMM_KC` / `_MC` / `_NC`, `TS_CPU_SGEMM_DOT_MAXN` for tuning | — |
 | AVX-512 kernels | ON when the CPU has AVX-512 F/BW/DQ and the runtime accelerates `Vector512` (the older per-row Q4_0 / Q8_0 dots: when it has AVX-512 F/BW) | `TS_CPU_DISABLE_AVX512=1` runs the AVX2 form of every hand-written kernel; `DOTNET_EnableAVX512=0` (not `DOTNET_EnableAVX512F`) makes the whole runtime AVX2-only | — |
 | DiffusionGemma on `cpu` | prompt-KV caching, batched MoE, fused Q/K/V and gate/up projections | `DIFFUSION_NO_PKV=1` turns the prompt-KV cache off; `DIFFUSION_CPU_ATTN_FAST=1`, `DIFFUSION_CPU_MOE_CHUNK` | — |
-| Qwen-Image-2.1 on `cpu` | managed DiT and text encoder with 8-bit activations on the multi-row integer GEMM, packed-GEMM VAE and vision tower; a request with no size renders at 1024×1024 (1 MP) — `ggml_cpu` and the GPU backends keep 2048×2048 | `TS_QWEN21_CPU_MATMUL=f32` and `TS_QWEN_TE_CPU_MATMUL=f32` keep F32 activations against dequantized weight tiles (slower, numerically steadier); `TS_CPU_GEMM_THREADS` sizes the VAE's own pool (every logical CPU, at most 64); `TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` skips the up-front refusal of a size that cannot fit in memory; `TS_QWEN21_CPU_PROFILE=1`, `TS_QWEN_VAE_PROFILE=1`, `TS_QWEN_TE_PROFILE=1` print stage timings | — |
+| Qwen-Image-2.1 on `cpu` | the DiT's graph programs on the managed tensor executor; the text encoder with 8-bit activations on the multi-row integer GEMM; packed-GEMM VAE and vision tower; a request with no size renders at 1024×1024 (1 MP) — `ggml_cpu` and the GPU backends keep 2048×2048 | `TS_QWEN_TE_CPU_MATMUL=f32` keeps the text encoder's F32 activations against dequantized weight tiles (slower, numerically steadier); `TS_CPU_GEMM_THREADS` sizes the VAE's own pool (every logical CPU, at most 64); `TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` skips the up-front refusal of a size that cannot fit in memory; `TS_QWEN_VAE_PROFILE=1`, `TS_QWEN_TE_PROFILE=1` print stage timings (the DiT's `TS_QWEN21_CPU_*` switches were removed with the pure-C# transformer) | — |
 | DeepSeek V4.1 Flash's whole-model executor | pure C# (`DeepSeek4CpuExecutor`) — a whole-model executor here rather than the generic per-op path | `TS_DSV4_THREADS=N` sets its compute width (every processor by default), not `TS_CPU_THREADS` | — |
 | Quantized weights on the direct video networks (Wan, MiniMax-H3) | kept in their GGUF storage type and multiplied there (expanding them to F32 at load took 4x the weight memory; on Wan at 256x160x5f, one step, the in-place path measured 80.9 s against 121.4 s) | — | — |
 

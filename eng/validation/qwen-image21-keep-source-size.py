@@ -160,7 +160,8 @@ def main():
             log.seek(offset)
             text = log.read().decode("utf-8", "replace")
         return [line.strip() for line in text.splitlines()
-                if "Qwen-Image-2.1:" in line or "keeping the source size" in line or "[qwen21-timing] total" in line]
+                if "Qwen-Image-2.1:" in line or "Qwen-Image-2.1-Turbo:" in line or "keeping the source size" in line
+                or "[qwen21-timing] total" in line or ("[diffusion] qwen_image " in line and ", total " in line)]
 
     def finish(name, done, offset, started, expected, judge=None):
         assert not done.get("error"), done

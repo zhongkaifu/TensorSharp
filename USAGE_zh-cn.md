@@ -1782,7 +1782,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | Hunyuan Dense | ✅ + 按层切分 + 混合 | 共享解码运行时：与 Mistral 3 相同的放置方式（`--tp T`、`--layer-split P` 及两者组合），每种放置下都保持批处理。 |
 | DiffusionGemma | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | Wan 2.1 / 2.2、MiniMax-H3 | — | 仅支持单设备：张量并行、按层切分和分布式组均在启动时被拒绝 |
-| Qwen-Image-2.1 | ✅（仅本地，扩散 Transformer） | 在 `ggml_cuda` / `ggml_vulkan` 上，`--tp N`（N 为任何能整除 32 个注意力头的 GPU 数——单机上为 2、4、8 或 16——并受切分时的块对齐约束）切分 DiT 的注意力头与 MLP 列；LoRA 插件随之切分。在 2× A40 上用 `ggml_cuda` 实测加速 1.34-1.57×，但在 `ggml_vulkan` 上比单卡更慢（0.86×，主机归约）。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，不支持多节点组。见 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#cuda-graph-与张量并行) |
+| Qwen-Image-2.1 | ✅（仅本地，扩散 Transformer） | 在 `ggml_cuda` / `ggml_vulkan` 上，`--tp N`（N 为任何能整除 32 个注意力头的 GPU 数——单机上为 2、4、8 或 16——并受切分时的块对齐约束）切分 DiT 的注意力头与 MLP 列；LoRA 插件随之切分。用已退役的原生计算图在 2× A40 上以 `ggml_cuda` 实测加速 1.34-1.57×，但在 `ggml_vulkan` 上比单卡更慢（0.86×，主机归约）；扩散运行时的切分程序尚未在两张 GPU 上运行过。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，不支持多节点组。见 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#cuda-graph-与张量并行) |
 
 ### 后端支持
 
@@ -2053,12 +2053,17 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
-| 前缀 KV 缓存（在第一个去噪步保存文本与参考图像的 key / value，之后每一步复用） | 开启 | `TS_QWEN21_PREFIX_CACHE=0`（或 `false` / `off` / `no`）关闭它 | — |
-| 前缀 KV 缓存的存储类型 | `auto` —— 即注意力内核实际读取的类型，因此缓存后的步骤与不缓存时结果一致 | `TS_QWEN21_PREFIX_CACHE_TYPE` = `auto` / `f16` / `f32` / `q8_0` / `q8_0_v`（8 bit 类型会对保存的前缀做舍入；即使缓存关闭，拼错的值也会报错） | — |
-| 前缀 KV 缓存大小上限 | 最多使用设备报告的空闲内存的一半 | `TS_QWEN21_PREFIX_CACHE_MAX_MIB` 进一步限制单个缓存；放不下的缓存会带警告被拒绝，该请求每一步都重新计算前缀 | — |
+| 前缀 KV 缓存（在第一个去噪步保存文本与参考图像的 key / value，之后每一步复用） | 始终开启；它保存注意力实际读取的类型（Metal 与 CUDA 上为 F16，其他为 F32），因此缓存后的步骤与不缓存时结果一致；超过设备报告的空闲内存一半的缓存会带警告被拒绝，该请求每一步都重新计算前缀 | 无：`TS_QWEN21_PREFIX_CACHE`、`TS_QWEN21_PREFIX_CACHE_TYPE`（及其 8 bit 的 `q8_0` / `q8_0_v` 存储）与 `TS_QWEN21_PREFIX_CACHE_MAX_MIB` 均已移除，设置任何一个都会让 CLI 与服务端在启动时报错退出 | — |
 | 编辑噪声 | `references` —— 编辑的初始噪声由种子与参考图共同决定，因此编辑不会从画出源图的那份噪声重新开始 | `TS_QWEN21_EDIT_NOISE=seed` 让编辑改用该种子的文生图噪声（与 stable-diffusion.cpp 相同），用于噪声对齐的对比（每次这样的编辑都会打印一行说明）；其他取值会报错 | — |
 | 伴随组件覆盖 | 在 DiT GGUF 同目录解析 | `TS_QWEN_IMAGE_VAE`、`TS_QWEN_IMAGE_TE`、`TS_QWEN_IMAGE_MMPROJ` | `--qwen-image-vae`、`--qwen-image-vl`、`--qwen-image-mmproj` |
 | 检查点变体（Turbo 使用自己的 8 步调度） | 不声明：文件名含单词 `turbo` 时按 Turbo 处理，加载时会说明；其他为 `base` | `TS_QWEN_IMAGE_VARIANT` = `base` / `turbo`（其他值会拒绝加载） | `--qwen-image-variant` |
+
+Qwen-Image-2.1 的 Transformer 在共享的扩散运行时上以计算图程序运行，这些程序按后端选择内核。它所取代的
+Transformer（原生整图与纯 C# 实现）的开关——`TS_QWEN21_FLASH`、`_PAD_MASK`、`_CUDNN_ATTENTION`、
+`_CUBLAS_MATMUL`、`_CUBLAS_MIN_ROWS`、`_GRAPH_REUSE`、`_GRAPH_TRACE`、各个 `TS_QWEN21_CPU_*` 开关以及
+`TS_QWEN21_MEMORY`——均已移除；设置任何一个，CLI 与服务端都会在启动时报错退出，并提示
+`<NAME> was removed: <advice> Unset it.`。各自的替代说明见
+[环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md#矩阵外的-qwen-image-21-开关)。
 
 #### 张量并行与分布式推理
 
@@ -2105,9 +2110,10 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 
 同一个线程池也运行 Core 的 CPU 内核：`TensorSharp.Models` 在模块加载时把 Core 的 `CpuParallel`
 钩子绑定到它上面，因此 `Ops.Addmm` 背后的 packed F32 SGEMM、SIMD 逐元素 / norm / softmax / RoPE
-内核、DiffusionGemma 与 Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的文本编码器与视觉塔
+内核、DiffusionGemma 的内核，以及 Qwen-Image 的文本编码器与视觉塔
 共用一组工作线程（Qwen-Image 的 VAE 另有一个更宽的专用池，`TS_CPU_GEMM_THREADS`）。这些都上池之后，
-在 8 核 16 线程的 i7-11800H 上用 16 线程替代默认的 8 线程，Qwen-Image 的 Transformer 步变快，但其文本编码器前向
+在 8 核 16 线程的 i7-11800H 上用 16 线程替代默认的 8 线程，Qwen-Image 当时的 Transformer（此后已由扩散运行时的
+计算图程序取代的纯 C# 实现）每步变快，但其文本编码器前向
 与 DiffusionGemma 对新提示的读取变慢，因此默认宽度保持不变。量化权重（Q4_K、
 Q5_K、Q6_K、Q4_0、Q5_0、Q8_0）走多行 int8 GEMM，F16/BF16/F32 以及只能反量化的类型走浮点面板 GEMM。
 它们各有一个取 `0` 的开关，可在同一个二进制里恢复旧代码（见下表）；带默认值与实测数据的完整列表见
@@ -2129,7 +2135,7 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 |---|---|---|---|
 | 工作线程池宽度（托管 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image 内核） | 8 核及以下取全部核心；8 核以上取一半，且不低于 8；Apple 芯片（无 SMT）取全部核心 | `TS_CPU_THREADS=N` | — |
 | 解码规模步上的工作线程池宽度（权重乘积最多读 4 行激活的步：一条序列的一个 token，或一步里几条序列的 token） | 有性能核与能效核的 Mac（`hw.perflevel0` / `hw.perflevel1`）上取全部核心减二，且不少于性能核数（M5 Pro 上为 16）；其他平台取线程池宽度；只设置 `TS_CPU_THREADS` 时两个宽度都取它 | `TS_CPU_DECODE_THREADS=N` —— 超出这个宽度的工作线程挂起，直到较宽的步到来，这样进程里的其他线程（服务器的请求线程与流式输出线程）能找到空闲核心，而不必在任务进行中抢走某个池内线程的核心；输出不变。大于线程池宽度的值按线程池宽度处理；`TS_CPU_POOL=0`（没有线程池）时不起作用 | — |
-| 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 让所有分派并行任务的托管内核——量化 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的 VAE、文本编码器与视觉塔（VAE 的宽度上限为 `TS_CPU_GEMM_THREADS`）——回退到 ThreadPool 的 `Parallel.For`，用于负担不起自旋线程的主机，也便于在同一个二进制里做 A/B；结果不变。Direct 视频网络的行循环仍在线程池上 | — |
+| 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 让所有分派并行任务的托管内核——量化 matmul、Core 的 CPU 内核、DiffusionGemma 的内核，以及 Qwen-Image 的 VAE、文本编码器与视觉塔（VAE 的宽度上限为 `TS_CPU_GEMM_THREADS`）——回退到 ThreadPool 的 `Parallel.For`，用于负担不起自旋线程的主机，也便于在同一个二进制里做 A/B；结果不变。Direct 视频网络的行循环仍在线程池上 | — |
 | 工作线程挂起前的自旋次数 | `4096` | `TS_CPU_SPIN=N` —— 在这个宽度下挂起才是最贵的部分，所以默认自旋次数足够多，使稳态下根本不会挂起 | — |
 | 单次托管矩阵乘的任务切分 | 每个工作项 `131072` 字节权重，每个线程最多 `4` 个工作项 | `TS_CPU_TASK_BYTES`、`TS_CPU_TASKS_PER_WORKER` —— 按**工作量**而不是线程数来切 | — |
 | 多行量化 GEMM（Q4_K、Q5_K、Q6_K、Q4_0、Q5_0、Q8_0） | 有 AVX2+FMA 时启用；没有的主机（包括 ARM64）走逐行托管 matmul | `TS_CPU_QGEMM_VERIFY=1` 让每次 GEMM 与逐行 matmul 对照（很慢）；`TS_CPU_QGEMM_MIN_ROWS`、`TS_CPU_QGEMM_TASK_MACS`、`TS_CPU_QGEMM_L2_BYTES` 用于诊断与调优 | — |
@@ -2137,7 +2143,7 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 | `Ops.Addmm` 与 Direct 网络背后的 packed F32 SGEMM | 启用（AVX-512 8x32、AVX2 6x16 或可移植内核） | `TS_CPU_SGEMM_KERNEL`、`TS_CPU_SGEMM_KC` / `_MC` / `_NC`、`TS_CPU_SGEMM_DOT_MAXN` 用于调优 | — |
 | AVX-512 内核 | CPU 支持 AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速时启用（旧的逐行 Q4_0 / Q8_0 点积：CPU 支持 AVX-512 F/BW 时启用） | `TS_CPU_DISABLE_AVX512=1` 让所有手写内核以 AVX2 形式运行；`DOTNET_EnableAVX512=0`（不是 `DOTNET_EnableAVX512F`）让整个运行时只用到 AVX2 | — |
 | `cpu` 上的 DiffusionGemma | prompt-KV 缓存、批量 MoE、融合的 Q/K/V 与 gate/up 投影 | `DIFFUSION_NO_PKV=1` 关闭 prompt-KV 缓存；`DIFFUSION_CPU_ATTN_FAST=1`、`DIFFUSION_CPU_MOE_CHUNK` | — |
-| `cpu` 上的 Qwen-Image-2.1 | 托管 DiT 与文本编码器使用 8 位激活、在多行整数 GEMM 上计算，VAE 与视觉塔走 packed GEMM；未指定尺寸的请求输出 1024×1024（1 百万像素）——`ggml_cpu` 与 GPU 后端保持 2048×2048 | `TS_QWEN21_CPU_MATMUL=f32` 与 `TS_QWEN_TE_CPU_MATMUL=f32` 保留 F32 激活乘以反量化权重分块（更慢，数值更稳定）；`TS_CPU_GEMM_THREADS` 设置 VAE 专用池的宽度（每个逻辑 CPU 一个线程，最多 64）；`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` 跳过对内存放不下的尺寸的预先拒绝；`TS_QWEN21_CPU_PROFILE=1`、`TS_QWEN_VAE_PROFILE=1`、`TS_QWEN_TE_PROFILE=1` 打印各阶段耗时 | — |
+| `cpu` 上的 Qwen-Image-2.1 | DiT 的计算图程序在托管张量执行器上运行；文本编码器使用 8 位激活、在多行整数 GEMM 上计算；VAE 与视觉塔走 packed GEMM；未指定尺寸的请求输出 1024×1024（1 百万像素）——`ggml_cpu` 与 GPU 后端保持 2048×2048 | `TS_QWEN_TE_CPU_MATMUL=f32` 让文本编码器保留 F32 激活乘以反量化权重分块（更慢，数值更稳定）；`TS_CPU_GEMM_THREADS` 设置 VAE 专用池的宽度（每个逻辑 CPU 一个线程，最多 64）；`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` 跳过对内存放不下的尺寸的预先拒绝；`TS_QWEN_VAE_PROFILE=1`、`TS_QWEN_TE_PROFILE=1` 打印各阶段耗时（DiT 的 `TS_QWEN21_CPU_*` 开关已随纯 C# Transformer 一并移除） | — |
 | DeepSeek V4.1 Flash 的整模型执行器 | 纯 C#（`DeepSeek4CpuExecutor`）——在这个后端上走整模型执行器，而不是通用逐算子路径 | 它的计算宽度由 `TS_DSV4_THREADS=N` 决定（默认取全部处理器），而不是 `TS_CPU_THREADS` | — |
 | direct 视频网络（Wan、MiniMax-H3）上的量化权重 | 保持 GGUF 存储类型，直接参与乘法（加载时展开成 F32 需要 4 倍权重内存；Wan 在 256x160x5f、单步下，就地路径实测 80.9 秒，展开路径 121.4 秒） | — | — |
 
