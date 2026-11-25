@@ -55,6 +55,11 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>The largest area an edit may ask for: the model's 4-20 MP range (4096 x 5120).</summary>
         public const long MaxEditArea = 4096L * 5120;
 
+        /// <summary>The least a masked crop smaller than its picture samples: 1024 x 1024 pixels at the crop's aspect, but never
+        /// more than the whole picture has. Sampled at its own size, a 448 x 512 crop came out plainer than the picture around
+        /// it (docs/models/minimax-h3-image.md, Masked edits). A speed plug-in's floor does not change this one.</summary>
+        public const long MaskedCropFloor = 1024L * 1024;
+
         /// <summary>The family of the denoiser in <paramref name="path"/>: its grid from the safetensors metadata, or the
         /// release grid for a file without it (the legacy model's rule).</summary>
         public static MiniMaxH3ImageFamily ForDenoiser(string path)
@@ -154,8 +159,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// (get_image_canvas_size) and is resized back.
         /// <para>A masked edit (section 4.5) returns its source canvas: the same rules give the whole picture's canvas, and the
         /// selection's crop (or the whole picture) samples at that canvas's density but never above its own resolution
-        /// (<see cref="EditMask.SamplingDimensions"/>), so neither the floor nor the latent mask raises it past the picture it
-        /// is composited into; the 20 MP ceiling still applies to what it samples, at the crop's aspect.</para>
+        /// (<see cref="EditMask.SamplingDimensions"/>), so neither the edit's floor nor the latent mask raises it past the
+        /// picture it is composited into. A crop smaller than its picture is the exception: it samples at least
+        /// <see cref="MaskedCropFloor"/> at its own aspect, up to the whole picture's pixel count. The 20 MP ceiling still
+        /// applies to what it samples, at the crop's aspect.</para>
         /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
@@ -195,6 +202,17 @@ namespace TensorSharp.Models.MiniMaxH3Image
             if (mask != null)
             {
                 var selection = mask.SamplingDimensions(width, height, multiple);
+                if (mask.Width < mask.Source.Width || mask.Height < mask.Source.Height)
+                {
+                    long cropFloor = Math.Min(MaskedCropFloor, (long)mask.Source.Width * mask.Source.Height);
+                    if ((long)selection.Width * selection.Height < cropFloor)
+                    {
+                        // The floor's area at the crop's aspect, also for a crop that only a smaller canvas took below it.
+                        double scale = Math.Sqrt(cropFloor / ((double)mask.Width * mask.Height));
+                        selection = (Math.Max(selection.Width, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Width * scale, multiple))),
+                                     Math.Max(selection.Height, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Height * scale, multiple))));
+                    }
+                }
                 if ((long)selection.Width * selection.Height > MaxEditArea)
                 {
                     if (request.Width > 0)
@@ -207,7 +225,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 return new DiffusionCanvas(selection, (mask.Source.Width, mask.Source.Height));
             }
             // A speed adapter's contract may lower the floor (pDMD's 1024 px: an edit samples at the asked size, as the
-            // adapter's diffusers pipeline does); otherwise the family's 4 MP floor. A masked selection takes neither (above).
+            // adapter's diffusers pipeline does); otherwise the family's 4 MP floor. A masked selection takes neither (above;
+            // a crop takes the masked crop floor instead).
             long floor = request.Adapters?.Contract is { MinGenerationArea: > 0 } contract ? contract.MinGenerationArea : MinGenerationArea;
             var sampling = EditCanvas(width, height, multiple, floor);
             if ((long)sampling.Width * sampling.Height > MaxEditArea)
