@@ -124,7 +124,7 @@ if (args.Length >= 4 && args[0] == "vision")
             requestedWidth, requestedHeight, width, height, tokenCount, channels = 4096, deepStackCount = 3,
             inputSha256, preprocessingSeconds, loadSeconds, iterations, seconds = timings,
             timingScope = "EncodeWithDeepStack plus readback/finite checks; excludes model loading and output-file writes",
-            backend = device.ToString(), fusedRequested = Environment.GetEnvironmentVariable("TS_QWEN21_VISION_FUSED") != "0",
+            backend = device.ToString(),
             outputs = files, binaries = new {
                 native = Stamp(Path.Combine(AppContext.BaseDirectory, nativeName)),
                 models = Stamp(typeof(Qwen35VisionEncoder).Assembly.Location),
@@ -153,10 +153,8 @@ if (args.Length >= 4 && (args[0] == "vae" || args[0] == "vae-encode"))
     if (width <= 0 || height <= 0 || width % 32 != 0 || height % 32 != 0)
         throw new ArgumentException("Positive dimensions divisible by 32 required.");
     GgmlBasicOps.EnsureBackendAvailable(backendName);
-    // Mirror QwenImage21Vae: fused by default on CUDA and Metal, never on Vulkan.
-    string fused = Environment.GetEnvironmentVariable("TS_QWEN21_VAE_FUSED");
-    VaeReferenceMath.UseFusedGraph21 = backendName != GgmlBackendType.Vulkan &&
-        (fused == "1" || backendName is GgmlBackendType.Cuda or GgmlBackendType.Metal);
+    // Mirror QwenImage21Vae: the whole-VAE graph on CUDA and Metal, per convolution elsewhere.
+    VaeReferenceMath.UseFusedGraph21 = backendName is GgmlBackendType.Cuda or GgmlBackendType.Metal;
     using var file = new SafetensorsFile(args[1]);
     // As the model opens it: the published file uses diffusers names (decoder.conv_in, ...).
     var source = new QwenImage21VaeTensorStore(file);
@@ -377,7 +375,7 @@ if (args.Length >= 4 && args[0] == "dit-parity")
     return 0;
 }
 
-// Run twice, setting TS_QWEN_TE_FUSED=0/1 before process startup, then compare.
+// Compare two runs' F32 outputs (another backend's, or another build's).
 // No model/device scenario is considered passing unless this tool executes it.
 if (args.Length == 3 && args[0] == "compare")
 {
@@ -438,7 +436,7 @@ using (var encoder = new QwenImageTextEncoder(args[1], backend))
     Buffer.BlockCopy(hidden, 0, bytes, 0, bytes.Length);
     File.WriteAllBytes(output, bytes);
     Console.WriteLine(JsonSerializer.Serialize(new { tokens = tokens.Length, hidden = encoder.HiddenSize,
-        seconds, backend = backend.ToString(), fusedRequested = Environment.GetEnvironmentVariable("TS_QWEN_TE_FUSED") != "0", output }));
+        seconds, backend = backend.ToString(), output }));
 }
 GgmlBasicOps.ReleaseReuseComputeBuffers();
 GgmlBasicOps.ClearHostBufferCache();

@@ -146,6 +146,31 @@ namespace TensorSharp.Runtime
             ("TS_QWEN21_MEMORY",
                 "Qwen-Image-2.1's run logs each phase's seconds and the residency plan ([diffusion] lines); the per-phase "
                 + "process memory report has no replacement."),
+            // Qwen-Image-2.1's companions (VAE, Qwen3-VL text encoder, its vision mode) keep their default paths only.
+            ("TS_QWEN_VAE_GPU", Qwen21VaePathRemoved),
+            ("TS_QWEN_VAE_FUSED", Qwen21VaePathRemoved),
+            ("TS_QWEN21_VAE_FUSED", Qwen21VaePathRemoved),
+            ("TS_QWEN21_VAE_ATTN", Qwen21VaePathRemoved),
+            ("TS_QWEN_VAE_CONV_TILE_BYTES",
+                "Qwen-Image-2.1's VAE splits a device convolution into bands once its im2col passes 1 GiB; the budget is fixed."),
+            ("TS_QWEN_VAE_FUSED_IM2COL_BUDGET",
+                "Qwen-Image-2.1's whole-VAE graph lowers a convolution to im2col up to 2 GiB of scratch; the budget is fixed."),
+            ("TS_QWEN21_VAE_TRACE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_VAE_PROFILE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_VAE_POOL_TRACE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_TE_FUSED",
+                "Qwen-Image-2.1's text encoder runs its whole trunk as one graph on every GGML backend, and per operation on "
+                + "the cpu backend; the switch between them was removed."),
+            ("TS_QWEN_TE_CPU_MATMUL",
+                "Qwen-Image-2.1's text encoder on the cpu backend projects through the 8-bit integer GEMM; the F32 GEMM was removed."),
+            ("TS_QWEN21_TE_PRESCALE",
+                "Qwen-Image-2.1's text encoder trunk multiplies without pre-scaling its activations; the older scaling was removed."),
+            ("TS_QWEN_TE_TRACE_DIR", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_TE_TRACE_LAYER", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN_TE_PROFILE", Qwen21CompanionDiagnosticRemoved),
+            ("TS_QWEN21_VISION_FUSED",
+                "Qwen-Image-2.1's vision encoder runs its fused path on ggml_cuda and the per-block one elsewhere; the switch "
+                + "between them was removed."),
             ("TS_H3_IMAGE_VAE_BATCH",
                 "MiniMax-H3-Image's VAE decoder sizes its own programs (a row of tiles, at most 64); the native decoder whose "
                 + "tiles a call it capped was removed with the legacy model."),
@@ -625,6 +650,12 @@ namespace TensorSharp.Runtime
         private const string Qwen21KernelSwitchRemoved =
             "Qwen-Image-2.1's transformer runs as the diffusion runtime's graph programs, which choose their kernels per backend "
             + "(on CUDA cuBLAS from 256 rows and cuDNN attention, as the removed native graph did) and keep their compiled plans.";
+        private const string Qwen21VaePathRemoved =
+            "Qwen-Image-2.1's VAE runs its whole-VAE graph on ggml_cuda and ggml_metal, per convolution on the other GGML backends "
+            + "and in managed code on the cpu backend; the switches between those paths were removed.";
+        private const string Qwen21CompanionDiagnosticRemoved =
+            "Qwen-Image-2.1's VAE and text encoder no longer trace or profile themselves; the run's [diffusion] line keeps "
+            + "each phase's seconds.";
         private const string Qwen21CpuSwitchRemoved =
             "Qwen-Image-2.1 on the cpu backend runs the transformer's graph programs on the managed tensor executor; the "
             + "pure-C# transformer these tuned was removed.";

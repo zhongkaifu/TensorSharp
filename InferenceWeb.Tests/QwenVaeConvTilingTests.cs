@@ -8,15 +8,13 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// The Qwen-Image-2.1 per-conv VAE path (Metal and CPU; the fused VAE graph is CUDA-only)
 /// splits a device convolution into horizontal output bands once its im2col estimate
-/// exceeds TS_QWEN_VAE_CONV_TILE_BYTES (1 GiB by default, which 2048² convolutions do).
+/// exceeds the im2col budget (1 GiB, which 2048² convolutions do).
 /// Each band re-runs the same convolution on a manually zero-padded input slice, so the
 /// result must match the un-tiled device convolution and the scalar reference.
 /// Runs on the GGML backend this test process pins (TS_TEST_GGML_BACKEND, default cpu).
 /// </summary>
 public sealed class QwenVaeConvTilingTests
 {
-    private const string BudgetVariable = "TS_QWEN_VAE_CONV_TILE_BYTES";
-
     [Theory]
     [InlineData(8, 6, 3, 3, 1, 1, 1, 1, 1, 1, 37, 41)]   // standard pad-1 stride-1
     [InlineData(8, 6, 3, 3, 2, 2, 0, 1, 0, 1, 38, 40)]   // encoder downsample: asymmetric pad, stride 2
@@ -35,7 +33,6 @@ public sealed class QwenVaeConvTilingTests
         for (int i = 0; i < bias.Length; i++) bias[i] = (float)(rng.NextDouble() * 2 - 1) * 0.1f;
         int ho = (h + pt + pb - kh) / sh + 1, wo = (w + pl + pr - kw) / sw + 1;
 
-        string savedBudget = Environment.GetEnvironmentVariable(BudgetVariable);
         try
         {
             // The direct scalar loop, not Conv2d: off the device Conv2d now runs the packed-GEMM
@@ -44,13 +41,13 @@ public sealed class QwenVaeConvTilingTests
 
             // TryGpuConv2dMaybeTiled never falls back to the managed loop: false means a
             // device call failed, so a true result proves both paths ran on the device.
-            Environment.SetEnvironmentVariable(BudgetVariable, "999999999999");
+            VaeReferenceMath.Im2colBudgetForTest = 999999999999;
             Assert.True(VaeReferenceMath.TryGpuConv2dMaybeTiled(x, weight, oc, ic, kh, kw, bias,
                 sh, sw, pt, pb, pl, pr, ho, wo, out Feature full), GgmlBasicOps.LastNativeError("untiled device convolution failed"));
 
             // 256 bytes is below one output row's im2col, so every band is a single row.
             Assert.True((long)ic * kh * kw * wo * sizeof(float) > 256);
-            Environment.SetEnvironmentVariable(BudgetVariable, "256");
+            VaeReferenceMath.Im2colBudgetForTest = 256;
             Assert.True(VaeReferenceMath.TryGpuConv2dMaybeTiled(x, weight, oc, ic, kh, kw, bias,
                 sh, sw, pt, pb, pl, pr, ho, wo, out Feature tiled), GgmlBasicOps.LastNativeError("band-tiled device convolution failed"));
 
@@ -70,7 +67,7 @@ public sealed class QwenVaeConvTilingTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable(BudgetVariable, savedBudget);
+            VaeReferenceMath.Im2colBudgetForTest = 0;
         }
     }
 

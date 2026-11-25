@@ -23,7 +23,6 @@
 // pooled and unpooled decodes are bit-identical (tested with released buffers poisoned).
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 
 namespace TensorSharp.Models.QwenImage
 {
@@ -42,10 +41,6 @@ namespace TensorSharp.Models.QwenImage
         // gets fresh memory next to them. Measured at 2048x2048: peak commit 12.8 instead of
         // 14.0 GB at the same decode time; after a 1024x1024 decode 1.2 GB instead of 4.0 GB
         // stayed committed.
-
-        // TS_QWEN_VAE_POOL_TRACE=1 prints every rent with the live/pooled bytes and the process
-        // commit: where a decode's peak comes from.
-        private static readonly bool Trace = Environment.GetEnvironmentVariable("TS_QWEN_VAE_POOL_TRACE") == "1";
 
         // Dropped (unreusable) buffers larger than this are collected before the heap grows.
         private const long CollectThresholdBytes = 64L << 20;
@@ -122,7 +117,6 @@ namespace TensorSharp.Models.QwenImage
             _liveBytes += Bytes(buffer);
             PeakLiveBytes = Math.Max(PeakLiveBytes, _liveBytes);
             PeakHeldBytes = Math.Max(PeakHeldBytes, _liveBytes + _freeBytes);
-            if (Trace) TraceRent(length, hit);
             return buffer;
         }
 
@@ -158,7 +152,7 @@ namespace TensorSharp.Models.QwenImage
             pool.Return(data);
         }
 
-        /// <summary>One-line summary for TS_QWEN_VAE_PROFILE.</summary>
+        /// <summary>One-line summary of the counters, for tests and benches.</summary>
         internal string Describe() =>
             $"feature pool: {Rents} maps, {Hits} reused, peak live {PeakLiveBytes / 1048576.0:F0} MiB, " +
             $"peak held {PeakHeldBytes / 1048576.0:F0} MiB, {Collections} collection(s)";
@@ -204,15 +198,6 @@ namespace TensorSharp.Models.QwenImage
         private static void Collect()
         {
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        }
-
-        private void TraceRent(int length, bool hit)
-        {
-            using var self = Process.GetCurrentProcess();
-            self.Refresh();
-            Console.WriteLine($"  [vae-pool] rent {(long)length * sizeof(float) >> 20} MiB ({(hit ? "hit" : "miss")}): " +
-                $"live {_liveBytes >> 20} MiB, pooled {_freeBytes >> 20} MiB, process private {self.PrivateMemorySize64 >> 20} MiB " +
-                $"(peak {self.PeakPagedMemorySize64 >> 20}), GC committed {GC.GetGCMemoryInfo().TotalCommittedBytes >> 20} MiB");
         }
 
         private static long Bytes(float[] buffer) => (long)buffer.Length * sizeof(float);

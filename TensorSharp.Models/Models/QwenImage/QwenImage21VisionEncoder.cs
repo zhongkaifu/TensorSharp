@@ -9,11 +9,9 @@ namespace TensorSharp.Models
 {
     public partial class Qwen35VisionEncoder
     {
-        // Restrict the new path to GGML CUDA. The switch
-        // restores the previous host-erf/per-block implementation for A/B runs.
+        // The fused path on GGML CUDA; the host-erf/per-block implementation everywhere else.
         private bool UseFusedVision21 => _qwenImage21 &&
-            _allocator is GgmlAllocator allocator && allocator.Context.BackendType == GgmlBackendType.Cuda &&
-            Environment.GetEnvironmentVariable("TS_QWEN21_VISION_FUSED") != "0";
+            _allocator is GgmlAllocator allocator && allocator.Context.BackendType == GgmlBackendType.Cuda;
 
         /// <summary>Qwen3-VL main image embedding and additions for the first language blocks.
         /// The deepstack projectors normalize merged (4*1152) features, unlike the final

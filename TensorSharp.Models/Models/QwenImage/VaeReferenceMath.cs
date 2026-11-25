@@ -42,19 +42,13 @@ namespace TensorSharp.Models.QwenImage
 
     internal static unsafe partial class VaeReferenceMath
     {
-        // When set (by QwenImage21Vae on a GGML backend), the conv stack runs on the
-        // device via TSGgml_Conv2dF32 instead of the pure-C# scalar loops. Disable with
-        // TS_QWEN_VAE_GPU=0. Every device conv is F32 end to end: the Qwen-Image-2.1
-        // VAE reaches finite activations above 65504 before its final norm.
-        internal static bool UseGpuConv =
-            Environment.GetEnvironmentVariable("TS_QWEN_VAE_GPU") != "0";
-
-        // Fused whole-VAE graph (TSGgml_QwenVaeRun): the entire encode/decode as ONE
-        // device-resident ggml graph (resident weights, direct convs, no per-op host
-        // round-trips). Falls back to the per-conv path when the backend can't run it.
-        // TS_QWEN_VAE_FUSED=0 disables.
-        internal static readonly bool UseFusedGraph =
-            Environment.GetEnvironmentVariable("TS_QWEN_VAE_FUSED") != "0";
+        // Set by QwenImage21Vae on a GGML backend: the conv stack runs on the device via
+        // TSGgml_Conv2dF32 instead of the pure-C# loops. Every device conv is F32 end to
+        // end: the Qwen-Image-2.1 VAE reaches finite activations above 65504 before its
+        // final norm. Where QwenImage21Vae enables it, the fused whole-VAE graph
+        // (TSGgml_QwenVaeRun) runs the entire encode/decode as one device-resident ggml
+        // graph instead, falling back to the per-conv path when the backend can't run it.
+        internal static bool UseGpuConv = true;
 
         // ---- primitive ops ----------------------------------------------------
 
@@ -156,14 +150,11 @@ namespace TensorSharp.Models.QwenImage
         // im2col scratch budget (bytes). The F32 device conv materializes an im2col tensor of
         // ~IC*KH*KW * OH * OW * 4 bytes; at high resolution that is several GB and either
         // spills into WDDM shared VRAM (≈3x slower VAE) or OOMs. When the estimate exceeds
-        // this budget the conv is split into horizontal output bands (below). Override with
-        // TS_QWEN_VAE_CONV_TILE_BYTES.
-        private static long Im2colBudgetBytes()
-        {
-            var env = Environment.GetEnvironmentVariable("TS_QWEN_VAE_CONV_TILE_BYTES");
-            if (env != null && long.TryParse(env, out var b) && b > 0) return b;
-            return 1024L * 1024 * 1024;   // 1 GiB
-        }
+        // this budget the conv is split into horizontal output bands (below).
+        // Im2colBudgetForTest > 0 replaces the budget, so tests can force bands at small sizes.
+        internal static long Im2colBudgetForTest;
+
+        private static long Im2colBudgetBytes() => Im2colBudgetForTest > 0 ? Im2colBudgetForTest : 1024L * 1024 * 1024;   // 1 GiB
 
         // Run the device conv whole when its im2col fits the budget; otherwise split the
         // output into horizontal bands. Each band re-runs the SAME conv on a vertical slice
@@ -290,8 +281,7 @@ namespace TensorSharp.Models.QwenImage
             // q,k,v: [C, hw] each (channel-planar). attention over hw positions, single head, dim=C.
             float scale = 1f / MathF.Sqrt(C);
             var outp = new Feature(C, H, W);
-            if (UseGpuConv && Environment.GetEnvironmentVariable("TS_QWEN21_VAE_ATTN") != "0" &&
-                GgmlBasicOps.TryQwenVaeAttention(qkv.D, outp.D, C, hw))
+            if (UseGpuConv && GgmlBasicOps.TryQwenVaeAttention(qkv.D, outp.D, C, hw))
             {
                 var projected = Conv2d(outp, w.Get(prefix + ".proj.weight"), C, C, 1, 1,
                     w.Get(prefix + ".proj.bias"), 1, 1, 0, 0, 0, 0);
