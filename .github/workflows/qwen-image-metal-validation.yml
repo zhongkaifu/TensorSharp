@@ -1,0 +1,70 @@
+name: Qwen-Image-2.1 Metal validation
+
+# Qwen-Image-2.1's diffusion-runtime migration on a GitHub-hosted Apple Silicon runner (ggml-metal on its
+# paravirtualized GPU): at the migration commit f981cb6, where the retired native graph still exists, the runtime's
+# programs against it live and its velocities frozen for the Metal lane; at the head, the runtime's programs against
+# every frozen lane and the shared diffusion and graph suites, pinned to Metal. Skipped tests (no usable Metal device)
+# are counted and reported, never taken as passes. Runs only on this branch's pushes and by hand.
+on:
+  push:
+    branches: [claude/cool-gauss-sadgh3]
+    paths:
+      - ".github/workflows/qwen-image-metal-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metal:
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Metal device
+        run: |
+          system_profiler SPDisplaysDataType | sed -n '1,25p'
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+
+      - name: Migration commit (runtime and retired graph) on Metal
+        env:
+          TS_TEST_GGML_BACKEND: metal
+          TENSORSHARP_GGML_GIT_REF: d9fe7bff3d2bf4d077e25c654486d02c321734aa
+        run: |
+          git worktree add --detach ../migration f981cb6
+          cd ../migration
+          dotnet build InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release 2>&1 | tail -3
+          mkdir -p "$RUNNER_TEMP/goldens"
+          dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --no-build \
+            --filter "FullyQualifiedName~QwenImage21DenoiserTests" --logger "console;verbosity=normal" 2>&1 | tee "$RUNNER_TEMP/migration.log" | grep -E "^\s+(Passed|Failed|Skipped) |Passed!|Failed!|Error Message" || true
+          TS_QWEN21_FREEZE_DIR="$RUNNER_TEMP/goldens" dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --no-build \
+            --filter "FullyQualifiedName~QwenImage21DenoiserTests.Freeze" 2>&1 | tail -3
+          ls -la "$RUNNER_TEMP/goldens"
+
+      - name: Head on Metal
+        env:
+          TS_TEST_GGML_BACKEND: metal
+          TENSORSHARP_GGML_GIT_REF: d9fe7bff3d2bf4d077e25c654486d02c321734aa
+        run: |
+          dotnet build InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release 2>&1 | tail -3
+          dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --no-build \
+            --filter "(FullyQualifiedName~QwenImage|FullyQualifiedName~MiniMaxH3|FullyQualifiedName~Diffusion|FullyQualifiedName~Graph)&Requires!=Cuda&Requires!=Mlx&Requires!=Models" \
+            --logger "console;verbosity=normal" 2>&1 | tee "$RUNNER_TEMP/head.log" | grep -E "^\s+Failed |Passed!|Failed!|QwenImage21DenoiserTests" || true
+          echo "Qwen-Image denoiser tests skipped on Metal: $(grep -cE '^\s+Skipped InferenceWeb.Tests.QwenImage21DenoiserTests' "$RUNNER_TEMP/head.log")"
+          grep -qE "^Failed!" "$RUNNER_TEMP/head.log" "$RUNNER_TEMP/migration.log" && exit 1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen-image-metal-validation
+          path: |
+            ${{ runner.temp }}/goldens
+            ${{ runner.temp }}/migration.log
+            ${{ runner.temp }}/head.log
