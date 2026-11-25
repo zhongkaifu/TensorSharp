@@ -1090,7 +1090,8 @@ See the [Qwen-Image-2.1 mask guide](docs/models/qwenimage21.md#precise-local-edi
 for selection semantics, sampling geometry, API examples and validation coverage, and
 [MiniMax-H3-Image's masked edits](docs/models/minimax-h3-image.md#masked-edits) for its
 multi-reference edits. Either model samples a masked edit's selection at most at its own
-resolution, since the result is the source canvas.
+resolution, since the result is the source canvas; a MiniMax-H3-Image crop smaller than its
+picture samples at least 1024×1024 pixels at its own aspect (never more than the picture has).
 
 ### Keeping the source size
 
