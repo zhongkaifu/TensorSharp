@@ -2481,6 +2481,7 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
    │                           tensorsharp.prompt.uncached_tokens、tensorsharp.prefill.tokens_per_second、
    │                           tensorsharp.decode.tokens_per_second
    ├─ prompt.render            套用聊天模板并分词，直到请求进入引擎
+   │  └─ prompt.media          图片、视频帧和音频经过编码器；tensorsharp.media.*
    ├─ inference.queue          等待调度器
    ├─ inference.prefill        直到生成第一个 token；tensorsharp.compute.prefill_ms
    ├─ inference.decode         其余部分；tensorsharp.compute.decode_ms
@@ -2512,6 +2513,12 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
   `cannot_seed`、`too_few_tokens`，没有任何步骤记下原因时为 `unknown`。
 - Ollama 的 `/api/generate` 为 `text_completion <model>`。嵌入请求（`/v1/embeddings`、`/api/embed`）为
   `embeddings <model>`，带 `tensorsharp.embedding.inputs`。
+- 带图片、视频或音频的提示词在 `prompt.render` 下有一个 `prompt.media`：等待媒体准备锁的时间
+  （`tensorsharp.media.lock_wait_ms`，锁被某个引擎步骤或另一个请求的编码占用）、编码器运行以及把输出放入提示词。
+  它记录历史中的媒体（`tensorsharp.media.images`、`.video_frames`、`.videos`、`.audio`）、提示词最终得到的
+  媒体（`tensorsharp.media.spans`，一张图片、一对帧或一段音频各算一个，以及 `tensorsharp.media.tokens`），
+  过长的提示词重新准备过媒体时还有 `tensorsharp.media.preparations`。只有聊天管线记录它，CLI 和
+  DiffusionGemma 不记录。
 - DiffusionGemma 的聊天 span 下有 `prompt.render` 和一个 `diffusion.denoise` span，每次预览对应一个
   `preview` 事件。Jev 请求（`POST /v1/systemone`）是一个 `chat <model>` span。
 - Skills 与代码执行回合每轮记录一个聊天 span（`tensorsharp.round`）；TensorSharp 执行的每次工具调用记录
@@ -2677,7 +2684,7 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 - 控制台和日志文件保持不变：每个路径、id 和 scope 都原样保留。
 
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` 会导出以上全部内容：不脱敏的日志、真实的请求路径和响应 id、
-聊天 span 上的 `gen_ai.input.messages` 和 `gen_ai.output.messages`（由角色与内容组成的 JSON，最多 64K 字符，
+聊天 span 上的 `gen_ai.input.messages` 和 `gen_ai.output.messages`（按 OpenTelemetry GenAI 约定由角色与 parts 组成的 JSON，最多 64K 字符，
 保留最新的消息）、视频 span 上的 `tensorsharp.video.prompt`、图像 span 上的 `tensorsharp.image.prompt`、
 工具 span 上的 `tensorsharp.tool.arguments` 和 `tensorsharp.tool.result`，以及 `codeexec.run` 上的
 `tensorsharp.codeexec.command`。Studio 的 span 无论如何都不带提示词。只有当数据去往的每个地方（collector 及其后端、Application Insights 资源及其保留策略、

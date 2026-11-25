@@ -524,6 +524,8 @@ namespace TensorSharp.Server
             // request pays one clock read and no span has to be closed on each of the throws
             // in between.
             DateTime renderStartUtc = DateTime.UtcNow;
+            // The media encode inside it, for its prompt.media child; null for a text-only prompt.
+            MediaPreparationRecord mediaPreparation = null;
 
             string arch = model.Config.Architecture;
             // A prompt fact carried on the sampling config (see SamplingConfig.ReasoningEffort).
@@ -682,10 +684,12 @@ namespace TensorSharp.Server
                 // A model whose encoder has a device stream of its own names a separate lock
                 // (ModelBase.MediaPreparationLock): preparation then runs beside engine steps.
                 object preparationLock = model.MediaPreparationLock;
+                mediaPreparation = MediaPreparationRecord.Begin(renderHistory);
                 GpuLockWaiters.Enter(preparationLock);
                 lock (preparationLock)
                 {
                     GpuLockWaiters.Exit(preparationLock);
+                    mediaPreparation.LockedUtc = DateTime.UtcNow;
                     var unexpandedTokens = inputTokens;
                     // ClearPreparedPromptState is safe when preparation fails
                     // before creating a bucket. Arm cleanup first so partial
@@ -693,6 +697,7 @@ namespace TensorSharp.Server
                     // or any other exception before engine submission.
                     injectorBucketCreated = true;
                     inputTokens = PrepareMediaPrompt(model, cancellationToken, renderHistory, inputTokens, requestId);
+                    mediaPreparation.Preparations++;
 
                     // Media placeholders expand only after the encoder runs. If that
                     // expansion consumed the reply reserve, earlier images and recordings
@@ -721,6 +726,7 @@ namespace TensorSharp.Server
                                 tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
                             preparedExpanded = PrepareMediaPrompt(model, cancellationToken,
                                 candidate, preparedUnexpanded, requestId);
+                            mediaPreparation.Preparations++;
                             prepared = candidate;
                             return preparedExpanded.Count;
                         }
@@ -772,6 +778,7 @@ namespace TensorSharp.Server
                     // Where each image/audio span landed and what it is, after any trim:
                     // the engine compares these positionally when it reuses a prefix.
                     mediaSpans = model.MultimodalInjector.GetPreparedMediaSpans(requestId);
+                    mediaPreparation.Finish(mediaSpans);
                 }
             }
             else
@@ -846,7 +853,7 @@ namespace TensorSharp.Server
                 // resumes from this request's end state rather than its prompt tail.
                 PromptTailCheckpointOptional = !budgetThinking,
             };
-            RecordPromptRender(requestTelemetry, renderStartUtc, seq.SubmittedAt);
+            RecordPromptRender(requestTelemetry, renderStartUtc, seq.SubmittedAt, mediaPreparation);
             // Lets the engine link its optional per-step spans to this request. Never a parent
             // there: the engine's thread serves every request.
             seq.TelemetryContext = requestTelemetry.Context;
@@ -1232,7 +1239,7 @@ namespace TensorSharp.Server
                 {
                     // Preparation threw (the prompt did not fit, the model was unloaded): its
                     // span still shows how long it ran first. The error is on the chat span.
-                    RecordPromptRender(requestTelemetry, renderStartUtc, DateTime.UtcNow);
+                    RecordPromptRender(requestTelemetry, renderStartUtc, DateTime.UtcNow, mediaPreparation);
                 }
                 else if (submitted)
                 {
@@ -1446,10 +1453,12 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// <c>prompt.render</c> under the chat span, from <paramref name="startUtc"/> to
-        /// <paramref name="endUtc"/>, built after the fact. Nothing when the request is not
-        /// recorded.
+        /// <paramref name="endUtc"/>, built after the fact, with <c>prompt.media</c> under it
+        /// when the prompt's media were prepared (<paramref name="media"/>). Nothing when the
+        /// request is not recorded.
         /// </summary>
-        private static void RecordPromptRender(GenAiRequestTelemetry requestTelemetry, DateTime startUtc, DateTime endUtc)
+        private static void RecordPromptRender(GenAiRequestTelemetry requestTelemetry, DateTime startUtc, DateTime endUtc,
+            MediaPreparationRecord media = null)
         {
             if (requestTelemetry.Activity is not { } parent)
                 return;
@@ -1460,8 +1469,101 @@ namespace TensorSharp.Server
                 return;
             if (endUtc < startUtc)
                 endUtc = startUtc;
+            if (media != null)
+                media.Record(span, startUtc, endUtc);
             span.SetEndTime(TensorSharpTelemetry.ToUtcOffset(endUtc).UtcDateTime);
             span.Stop();
+        }
+
+        /// <summary>
+        /// A request's media preparation, for <c>prompt.media</c>: the wait for the media preparation
+        /// lock, the encoder and the placement of its output in the prompt (and any re-preparation when
+        /// the prompt was over its budget), what the history carried and what the prompt ended up with.
+        /// Its times are kept, not a span: <c>prompt.render</c>, its parent, is built after the fact.
+        /// </summary>
+        internal sealed class MediaPreparationRecord
+        {
+            public DateTime StartUtc { get; private init; }
+            public DateTime? LockedUtc { get; set; }
+            public DateTime? EndUtc { get; private set; }
+            public int Preparations { get; set; }
+            public int Images { get; private init; }
+            public int VideoFrames { get; private init; }
+            public int Videos { get; private init; }
+            public int AudioClips { get; private init; }
+            public int Spans { get; private set; } = -1;
+            public int Tokens { get; private set; }
+
+            /// <summary>Start now, counting the media <paramref name="history"/> carries: a video message's
+            /// timed frames (<see cref="ChatMessage.ImageTimestamps"/>) are frames, its untimed ones and every
+            /// other message's are still images.</summary>
+            public static MediaPreparationRecord Begin(List<ChatMessage> history)
+            {
+                int images = 0, frames = 0, videos = 0, audio = 0;
+                foreach (ChatMessage message in history ?? new List<ChatMessage>())
+                {
+                    if (message == null) continue;
+                    if (message.ImagePaths is { } paths)
+                    {
+                        for (int i = 0; i < paths.Count; i++)
+                        {
+                            bool timed = message.IsVideo
+                                && (message.ImageTimestamps == null || (i < message.ImageTimestamps.Count && message.ImageTimestamps[i] != null));
+                            if (timed) frames++;
+                            else images++;
+                        }
+                    }
+                    videos += message.VideoFilePaths?.Count ?? 0;
+                    audio += message.AudioPaths?.Count ?? 0;
+                }
+                return new MediaPreparationRecord
+                {
+                    StartUtc = DateTime.UtcNow, Images = images, VideoFrames = frames, Videos = videos, AudioClips = audio,
+                };
+            }
+
+            /// <summary>The media are in the prompt, at <paramref name="spans"/>.</summary>
+            public void Finish(IReadOnlyList<PromptMediaSpan> spans)
+            {
+                EndUtc = DateTime.UtcNow;
+                Spans = spans?.Count ?? 0;
+                Tokens = 0;
+                if (spans != null)
+                    foreach (PromptMediaSpan s in spans)
+                        Tokens += s.End - s.Start;
+            }
+
+            /// <summary><c>prompt.media</c> under <paramref name="render"/>, inside its
+            /// <paramref name="renderStartUtc"/> to <paramref name="renderEndUtc"/>. A preparation that
+            /// threw or was stopped ends with the render, without spans or tokens.</summary>
+            public void Record(Activity render, DateTime renderStartUtc, DateTime renderEndUtc)
+            {
+                DateTime start = StartUtc < renderStartUtc ? renderStartUtc : StartUtc;
+                DateTime end = EndUtc is { } finished && finished < renderEndUtc ? finished : renderEndUtc;
+                if (end < start) end = start;
+                Activity? span = TensorSharpTelemetry.Inference.StartActivity(
+                    "prompt.media", ActivityKind.Internal, render.Context,
+                    startTime: TensorSharpTelemetry.ToUtcOffset(start));
+                if (span is null)
+                    return;
+                if (span.IsAllDataRequested)
+                {
+                    if (Images > 0) span.SetTag(TelemetryAttributes.MediaImages, Images);
+                    if (VideoFrames > 0) span.SetTag(TelemetryAttributes.MediaVideoFrames, VideoFrames);
+                    if (Videos > 0) span.SetTag(TelemetryAttributes.MediaVideos, Videos);
+                    if (AudioClips > 0) span.SetTag(TelemetryAttributes.MediaAudio, AudioClips);
+                    if (LockedUtc is { } locked)
+                        span.SetTag(TelemetryAttributes.MediaLockWaitMs, Math.Round((locked - StartUtc).TotalMilliseconds, 1));
+                    if (Spans >= 0)
+                    {
+                        span.SetTag(TelemetryAttributes.MediaSpans, Spans);
+                        span.SetTag(TelemetryAttributes.MediaTokens, Tokens);
+                    }
+                    if (Preparations > 1) span.SetTag(TelemetryAttributes.MediaPreparations, Preparations);
+                }
+                span.SetEndTime(TensorSharpTelemetry.ToUtcOffset(end).UtcDateTime);
+                span.Stop();
+            }
         }
 
         /// <summary>End a request's <c>diffusion.denoise</c> span; null-safe.</summary>
@@ -1489,12 +1591,17 @@ namespace TensorSharp.Server
             requestTelemetry.SetOutputMessages(() => CapturedMessagesJson(null, text));
 
         /// <summary>
-        /// <c>[{"role":…,"content":…}]</c> for <c>gen_ai.input.messages</c> (<paramref name="messages"/>)
-        /// or <c>gen_ai.output.messages</c> (<paramref name="assistantText"/>), with at most
-        /// <see cref="MaxCapturedContentChars"/> characters of text: past that, a history keeps
-        /// its newest messages and the end of the oldest one kept, an answer its beginning.
-        /// Null when it cannot be built (text with a broken surrogate pair, say): telemetry
-        /// never fails a request.
+        /// <c>gen_ai.input.messages</c> (<paramref name="messages"/>) or <c>gen_ai.output.messages</c>
+        /// (<paramref name="assistantText"/>) in the shape of the OpenTelemetry GenAI conventions'
+        /// message schemas (<c>gen-ai-input-messages.json</c>, <c>gen-ai-output-messages.json</c>):
+        /// <c>[{"role":…,"parts":[{"type":"text","content":…}]}]</c>. An assistant message's tool
+        /// calls are <c>tool_call</c> parts, and a <c>tool</c> message is one
+        /// <c>tool_call_response</c> part. Viewers that read the conventions (the Application
+        /// Insights agent view, for one) show nothing for a message without <c>parts</c>.
+        /// At most <see cref="MaxCapturedContentChars"/> characters of message text: past that, a
+        /// history keeps its newest messages and the end of the oldest one kept, an answer its
+        /// beginning. Null when it cannot be built (text with a broken surrogate pair, say):
+        /// telemetry never fails a request.
         /// </summary>
         internal static string? CapturedMessagesJson(IReadOnlyList<ChatMessage>? messages, string? assistantText)
         {
@@ -1519,14 +1626,14 @@ namespace TensorSharp.Server
                             // A negative budget left: the oldest message kept fits only in part.
                             if (i == first && budget < 0)
                                 content = "…" + TailOf(content, content.Length + budget);
-                            WriteCapturedMessage(writer, message.Role, content);
+                            WriteCapturedMessage(writer, message.Role, content, message.ToolCalls, message.ToolCallId);
                         }
                     }
                     if (assistantText != null)
                     {
                         WriteCapturedMessage(writer, "assistant", assistantText.Length > MaxCapturedContentChars
                             ? HeadOf(assistantText, MaxCapturedContentChars) + "…"
-                            : assistantText);
+                            : assistantText, null, null);
                     }
                     writer.WriteEndArray();
                 }
@@ -1538,12 +1645,65 @@ namespace TensorSharp.Server
             }
         }
 
-        private static void WriteCapturedMessage(Utf8JsonWriter writer, string role, string content)
+        private static void WriteCapturedMessage(Utf8JsonWriter writer, string role, string content,
+            IReadOnlyList<ToolCall>? toolCalls, string? toolCallId)
         {
             writer.WriteStartObject();
             writer.WriteString("role", role ?? string.Empty);
-            writer.WriteString("content", content);
+            writer.WriteStartArray("parts");
+            if (string.Equals(role, "tool", StringComparison.OrdinalIgnoreCase))
+            {
+                writer.WriteStartObject();
+                writer.WriteString("type", "tool_call_response");
+                if (!string.IsNullOrEmpty(toolCallId))
+                    writer.WriteString("id", toolCallId);
+                writer.WriteString("response", content);
+                writer.WriteEndObject();
+            }
+            else
+            {
+                // An assistant turn that only called tools has no text; any other message keeps
+                // its (possibly empty) text part, so it still shows as a message.
+                if (content.Length > 0 || toolCalls is not { Count: > 0 })
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("type", "text");
+                    writer.WriteString("content", content);
+                    writer.WriteEndObject();
+                }
+                if (toolCalls != null)
+                {
+                    foreach (ToolCall call in toolCalls)
+                    {
+                        if (call is null)
+                            continue;
+                        writer.WriteStartObject();
+                        writer.WriteString("type", "tool_call");
+                        if (!string.IsNullOrEmpty(call.Id))
+                            writer.WriteString("id", call.Id);
+                        writer.WriteString("name", call.Name ?? string.Empty);
+                        writer.WritePropertyName("arguments");
+                        writer.WriteRawValue(CapturedToolArguments(call));
+                        writer.WriteEndObject();
+                    }
+                }
+            }
+            writer.WriteEndArray();
             writer.WriteEndObject();
+        }
+
+        // A tool call's arguments as the JSON object the model produced; arguments that do not
+        // serialize (an unexpected value type) become {} rather than lose the whole attribute.
+        private static string CapturedToolArguments(ToolCall call)
+        {
+            try
+            {
+                return JsonSerializer.Serialize(call.Arguments ?? new Dictionary<string, object?>());
+            }
+            catch (Exception)
+            {
+                return "{}";
+            }
         }
 
         // Cut text without splitting a surrogate pair, which the JSON writer refuses.
