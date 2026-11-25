@@ -552,9 +552,9 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
     /// samples the selection (the whole picture or its crop) at the unmasked edit's canvas density but never above the
     /// selection's own resolution, without the edit's floor: a whole picture's latent mask and denoise are never larger than
     /// the picture they are composited into. A crop smaller than its picture samples at least MaskedCropFloor (2048 x 2048
-    /// pixels) at its own aspect, whatever the picture's size. A smaller canvas (an explicit size or area) still lowers the
-    /// density down to that floor; a mask with no picture to edit is refused. (The 20 MP ceiling now needs a picture above
-    /// 20 MP, too large for this test.)
+    /// pixels) at its own aspect, held to 4 times the picture's pixels. A smaller canvas (an explicit size or area) still
+    /// lowers the density down to that floor; a mask with no picture to edit is refused. (The 20 MP ceiling now needs a
+    /// picture above 20 MP, too large for this test.)
     /// </summary>
     [Fact]
     public void AMaskedEditSamplesItsSelectionAndReturnsItsSource()
@@ -581,6 +581,7 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         // below the masked crop floor, so it samples 2048 x 2048, whatever the canvas (as before the cap: the picture's
         // density, then the 4 MP floor; with the cap alone it sampled 384 x 384).
         Assert.Equal(MiniMaxH3ImageFamily.MinGenerationArea, MiniMaxH3ImageFamily.MaskedCropFloor);
+        Assert.Equal(4, MiniMaxH3ImageFamily.MaskedCropPictureMultiple);
         EditMask crop = EditMask.Create(Cropped(big), big);
         Assert.Equal((384, 384), (crop.Width, crop.Height));
         Assert.Equal(new DiffusionCanvas((2048, 2048), (2048, 2048)), Canvas(big, Cropped(big)));
@@ -597,17 +598,17 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         var above = new EditMaskOptions { Mask = RectangleMask(3000, 2000, 200, 200, 2700, 1900), MaskCrop = true, MaskCropPadding = 64 };
         Assert.Equal((2652, 1828), (EditMask.Create(above, wider).Width, EditMask.Create(above, wider).Height));
         Assert.Equal(new DiffusionCanvas((2656, 1824), (3000, 2000)), Canvas(wider, above));
-        // A wide 800 x 120 crop of a 1000 x 750 photo rises to 4 MP at its 20:3 aspect.
+        // A wide 800 x 120 crop of a 1000 x 750 photo rises at its 20:3 aspect to 3 MP, four times the photo's pixels.
         EditMask wide = EditMask.Create(new EditMaskOptions { Mask = RectangleMask(1000, 750, 100, 300, 900, 420, ramp: 0), MaskCrop = true, MaskCropPadding = 0 }, photo);
         Assert.Equal((800, 120), (wide.Width, wide.Height));
         DiffusionCanvas wideCanvas = family.ResolveCanvas(new DiffusionRequest { References = new[] { new DiffusionReference(photo) }, KeepSourceSize = true }, wide);
-        Assert.Equal(new DiffusionCanvas((5280, 800), (1000, 750)), wideCanvas);
-        // A 512 x 512 picture: its 252 x 228 crop rises to 4 MP too, but a crop whose padding reaches every edge is the
-        // whole picture, at its own size.
+        Assert.Equal(new DiffusionCanvas((4480, 672), (1000, 750)), wideCanvas);
+        // A 512 x 512 picture: its 252 x 228 crop rises to 1 MP (four times the picture), and a crop whose padding reaches
+        // every edge is the whole picture, at its own size.
         RgbImage small = Picture(512, 512);
         var smallCrop = new EditMaskOptions { Mask = RectangleMask(512, 512, 200, 200, 300, 300), MaskCrop = true, MaskCropPadding = 64 };
         Assert.Equal((252, 228), (EditMask.Create(smallCrop, small).Width, EditMask.Create(smallCrop, small).Height));
-        Assert.Equal(new DiffusionCanvas((2144, 1952), (512, 512)), Canvas(small, smallCrop));
+        Assert.Equal(new DiffusionCanvas((1088, 960), (512, 512)), Canvas(small, smallCrop));
         Assert.Equal(new DiffusionCanvas((512, 512), (512, 512)), Canvas(small, smallCrop with { MaskCropPadding = 16384 }));
         Assert.Equal(new DiffusionCanvas((512, 512), (512, 512)), Canvas(small, Whole(small)));
         Assert.Contains("requires a first reference image", Assert.Throws<ArgumentException>(() => family.ResolveCanvas(

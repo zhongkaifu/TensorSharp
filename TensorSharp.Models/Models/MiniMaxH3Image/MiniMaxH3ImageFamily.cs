@@ -56,10 +56,14 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public const long MaxEditArea = 4096L * 5120;
 
         /// <summary>The least a masked crop smaller than its picture samples: the edit's own 2048 x 2048 pixels
-        /// (<see cref="MinGenerationArea"/>) at the crop's aspect, whatever the picture's size. At its own size a 448 x 512
-        /// crop came out plain, and at 1 MP it lost the surface detail 4 MP draws (docs/models/minimax-h3-image.md, Masked
-        /// edits). A speed plug-in's floor does not change this one.</summary>
+        /// (<see cref="MinGenerationArea"/>) at the crop's aspect, held to <see cref="MaskedCropPictureMultiple"/> times the
+        /// whole picture's pixels. At its own size a 448 x 512 crop came out plain, and at 1 MP it lost the surface detail
+        /// 4 MP draws (docs/models/minimax-h3-image.md, Masked edits). A speed plug-in's floor does not change this one.</summary>
         public const long MaskedCropFloor = MinGenerationArea;
+
+        /// <summary>How many times its whole picture's pixels a crop's floor may sample: a 1024 x 1024 picture's crop gets
+        /// the full <see cref="MaskedCropFloor"/>, a 512 x 512 picture's 1 MP rather than 16 times the picture.</summary>
+        public const int MaskedCropPictureMultiple = 4;
 
         /// <summary>The family of the denoiser in <paramref name="path"/>: its grid from the safetensors metadata, or the
         /// release grid for a file without it (the legacy model's rule).</summary>
@@ -162,8 +166,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// selection's crop (or the whole picture) samples at that canvas's density but never above its own resolution
         /// (<see cref="EditMask.SamplingDimensions"/>), so neither the edit's floor nor the latent mask raises it past the
         /// picture it is composited into. A crop smaller than its picture is the exception: it samples at least
-        /// <see cref="MaskedCropFloor"/> at its own aspect. The 20 MP ceiling still applies to what it samples, at the crop's
-        /// aspect.</para>
+        /// <see cref="MaskedCropFloor"/> at its own aspect, or <see cref="MaskedCropPictureMultiple"/> times the picture's
+        /// pixels when that is less. The 20 MP ceiling still applies to what it samples, at the crop's aspect.</para>
         /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
@@ -203,11 +207,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
             if (mask != null)
             {
                 var selection = mask.SamplingDimensions(width, height, multiple);
+                long cropFloor = Math.Min(MaskedCropFloor, MaskedCropPictureMultiple * (long)mask.Source.Width * mask.Source.Height);
                 if ((mask.Width < mask.Source.Width || mask.Height < mask.Source.Height) &&
-                    (long)selection.Width * selection.Height < MaskedCropFloor)
+                    (long)selection.Width * selection.Height < cropFloor)
                 {
                     // The floor's area at the crop's aspect, also for a crop that only a smaller canvas took below it.
-                    double scale = Math.Sqrt(MaskedCropFloor / ((double)mask.Width * mask.Height));
+                    double scale = Math.Sqrt(cropFloor / ((double)mask.Width * mask.Height));
                     selection = (Math.Max(selection.Width, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Width * scale, multiple))),
                                  Math.Max(selection.Height, Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(mask.Height * scale, multiple))));
                 }
