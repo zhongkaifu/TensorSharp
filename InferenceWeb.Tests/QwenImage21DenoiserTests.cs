@@ -310,11 +310,15 @@ public sealed class QwenImage21DenoiserTests : IDisposable
     }
 
     /// <summary>A cache larger than half the free memory is declined: every step recomputes the prefix ("full"), with the
-    /// velocities the cached steps give.</summary>
+    /// velocities the cached steps give. On ggml-cpu, to float rounding. A GPU backend picks its kernels, and how they split
+    /// a product, by the rows the product computes, and the cached graph computes fewer: the retired engine's whole-sequence
+    /// steps were 2.3e-3 to 4.6e-3 from its cached ones on ggml-cuda (Turbo Q4_K_M at 512 x 512, RTX 4000 Ada), and this
+    /// fixture's are 8.4e-4 apart there.</summary>
     [Fact]
     public void A_declined_prefix_cache_recomputes_the_prefix_every_step()
     {
         string path = WriteTransformer(_dir);
+        double bound = TestGates.PinnedGgmlBackend == BackendType.GgmlCpu ? 1e-5 : 2e-3;
         using var cached = new QwenImage21Denoiser(path, TestGates.PinnedGgmlBackend) { FreeMemory = () => -1 };
         using var declined = new QwenImage21Denoiser(path, TestGates.PinnedGgmlBackend) { FreeMemory = () => 1024 };
         var (text, refs, layout, target) = Request(1, 43);
@@ -326,7 +330,7 @@ public sealed class QwenImage21DenoiserTests : IDisposable
             Assert.Equal(QwenImage21Denoiser.Mode.Full, declined.LastMode);
             double err = 0, norm = 0;
             for (int i = 0; i < want.Length; i++) { err += (got[i] - want[i]) * (double)(got[i] - want[i]); norm += want[i] * (double)want[i]; }
-            Assert.True(Math.Sqrt(err / norm) < 1e-5, $"step {step}: relative L2 {Math.Sqrt(err / norm):E3} between the full and cached graphs");
+            Assert.True(Math.Sqrt(err / norm) < bound, $"step {step}: relative L2 {Math.Sqrt(err / norm):E3} between the full and cached graphs");
             QwenImage21Goldens.Advance(x, want, sigma);
         }
         cached.FinishRequest();
