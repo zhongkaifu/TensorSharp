@@ -1429,9 +1429,15 @@ request in a fresh process, and peak VRAM was sampled every 200 ms:
 | Keep source size | 28.30 s | 28.19 s | not measured |
 | CFG 2.5, negative prompt, previews, 512² | 11.89 s | 11.41 s | 6310 → 6312 MiB |
 | Voxel LoRA, 1024² | 24.02 s | 21.24 s | 5652 → 5720 MiB |
+| Edit with two references, 1024² | 32.18 s | 32.28 s | 11564 → 11510 MiB |
+| Edit with three references (2048² canvas) | 96.63 s | 97.81 s | 17576 → 17728 MiB |
+| Two references, CFG 2.5, negative prompt, 512² | 20.16 s | 19.65 s | 7374 → 7562 MiB |
+| Two references, keep source size | 32.87 s | 32.69 s | 11558 → 11510 MiB |
 
 The masked edit and keep-source-size requests were timed before the extract step's
-plan freed its own compute memory, and were not measured again. Warm denoising steps
+plan freed its own compute memory, and were not measured again. The multi-reference
+rows were measured at the branch head. A two-reference edit at 512² on `ggml_cpu`
+(4-core Xeon) was byte-identical too: 318 s retired, 311 s runtime. Warm denoising steps
 take the retired graph's time: 1.44 s at 1024² with a reference, 6.90 s at 2048². An
 edit's cached steps hold about 290 MiB more than the retired graph's.
 
