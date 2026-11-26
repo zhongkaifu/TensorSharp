@@ -545,8 +545,9 @@ E4B 在该边界上的行为（2026-09-16 验证活动，B10）改为在采样�
 
 ## 14. 待办
 
-- 直连 CUDA 上 E4B 的 decode 在 512/128 时比旧模型低约 5-10 %（64/64 时持平）：逐算子的 matvec 与 norm 启动开销；其他检查点与后端
-  持平或更快。
+- 在 A40 上，直连 CUDA 的 E4B decode 在 512/128 时为 72-78 tok/s，旧模型为 77.5-79（12B：39-40.5 对 34；26B-A4B：80-85 对
+  66-67）。decode-once kernel 在 Ampere 上每个输出行使用四个 warp（按 RTX 5090 的宽度为 69-72 tok/s）；其余差距来自 d256 decode
+  注意力的分段 flash kernel 及其逐层的 mask cells（每个局部层比旧模型的 partition kernel 多约 5 us）。其他检查点与后端都快于旧模型。
 - 新进程中 12B / 26B-A4B 在 `ggml_cuda` 上的第一次长 prefill 需要为其步骤形状编译计算图（以及惰性上传专家）；预热后的 prefill 是
   旧模型的 1.5-2.4 倍。
 - 本次迁移没有在 Metal、Vulkan、MLX 与多 GPU 放置的真实硬件上运行。

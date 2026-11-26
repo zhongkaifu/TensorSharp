@@ -5077,13 +5077,13 @@ namespace TensorSharp.Cuda
             if (rows < 1 || rows > DenseDecodeRows || weight.Ne2 > 1 || weight.Ne1 <= 0 || weight.Ne1 > int.MaxValue
                 || weight.Bytes % weight.Ne1 != 0 || firstRow < 0 || outRows < 1 || firstRow + outRows > weight.Ne1
                 || x.Storage is not CudaStorage xs || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() != rows * inDim
-                || inDim % 32 != 0 || inDim > int.MaxValue || weight.CacheKey == IntPtr.Zero || cuda.Kernels == null
-                || Dsv4Kernels.DenseFastWarps((int)weight.Ne1) != Dsv4Kernels.DenseFastWarps((int)outRows))
+                || inDim % 32 != 0 || inDim > int.MaxValue || weight.CacheKey == IntPtr.Zero || cuda.Kernels == null)
                 return null;
             if (!CudaGraphCapture.IsCapturing(cuda))
                 CudaQuantizedOps.TryEnsureResident(cuda, weight.CacheKey, weight.Data, weight.Format, inDim, weight.Ne1, weight.Bytes, out _, out _);
             if (!CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type) || type == 30
-                || DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not { } dk)
+                || DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not { } dk
+                || dk.DenseFastWarps((int)weight.Ne1) != dk.DenseFastWarps((int)outRows))
                 return null;
             long rowBytes = weight.Bytes / weight.Ne1, qRow = inDim / 32 * CudaKernels.Q81BlockBytes;
             Tensor xq = QuantizedOnce(cuda, x, xs, inDim, rows);

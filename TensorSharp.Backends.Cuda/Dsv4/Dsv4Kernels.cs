@@ -124,10 +124,24 @@ namespace TensorSharp.Cuda
                 _ => false,
             };
 
-        /// <summary>Warps sharing an output row in the decode-once kernels: by shape alone, so a row's sums never depend on
-        /// how many rows a call holds. Few outputs need the K split to fill the GPU (measured on the RTX 5090 at Qwen3.8
-        /// Flash Next's shapes: 10240 -> 320 and 2560 -> 640 fastest at 4, 2560 -> 6144 at 2, the rest at 1).</summary>
-        internal static int DenseFastWarps(int outDim) => outDim <= 2048 ? 4 : outDim > 4096 && outDim <= 8192 ? 2 : 1;
+        /// <summary>Warps sharing an output row in the decode-once kernels: by shape and device alone, so a row's sums never
+        /// depend on how many rows a call holds. Few outputs need the K split to fill the GPU (measured on the RTX 5090 at
+        /// Qwen3.8 Flash Next's shapes: 10240 -> 320 and 2560 -> 640 fastest at 4, 2560 -> 6144 at 2, the rest at 1). An
+        /// Ampere part (sm_80 - sm_87) reads every shape fastest at 4: on the A40 Gemma 4 E4B's Q8_0 decode took 69-72 tok/s
+        /// under the RTX 5090's widths and 76-77.5 at 4 (its 2560-wide outputs +3 tok/s, the 20480-wide gate|up +2).</summary>
+        internal int DenseFastWarps(int outDim) => Ampere() ? 4 : outDim <= 2048 ? 4 : outDim > 4096 && outDim <= 8192 ? 2 : 1;
+
+        private int _ampere = -1;
+
+        private bool Ampere()
+        {
+            if (_ampere >= 0) return _ampere == 1;
+            CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
+            CudaDriverApi.cuDeviceGetAttribute(out int major, 75 /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */, device).ThrowOnError();
+            CudaDriverApi.cuDeviceGetAttribute(out int minor, 76 /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR */, device).ThrowOnError();
+            _ampere = major == 8 && minor <= 7 ? 1 : 0;
+            return _ampere == 1;
+        }
         private readonly IntPtr hcMean, hcMixPartials, hcPreFinish;
         private readonly IntPtr dsparkPrep;
         private readonly IntPtr dsparkGather;

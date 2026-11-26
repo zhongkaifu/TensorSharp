@@ -700,8 +700,10 @@ are a declared gap: the graph-only family has no graphs for them yet.
 
 ## 14. Open items
 
-- Direct CUDA E4B decode runs ~5-10 % below the legacy model at 512/128 (equal at 64/64): its per-op matvec and norm
-  launches; the other checkpoints and backends are at or above it.
+- Direct CUDA E4B decode at 512/128 runs 72-78 tok/s against the legacy model's 77.5-79 on an A40 (12B: 39-40.5 against
+  34; 26B-A4B: 80-85 against 66-67). The decode-once kernels take four warps an output row on Ampere (69-72 tok/s at the
+  RTX 5090's widths); the rest is the d256 decode attention's split flash kernel and its per-layer mask cells (~5 us a
+  local layer over the legacy partition kernel). The other checkpoints and backends are above the legacy model.
 - The first long prefill of a fresh 12B / 26B-A4B process on `ggml_cuda` pays the graph compile for its step shape (and the
   lazy expert upload); warm prefill is 1.5-2.4x the legacy model's.
 - Metal, Vulkan, MLX and multi-GPU placements were not run on hardware for this migration.
