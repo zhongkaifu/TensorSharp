@@ -232,6 +232,18 @@ Measured on one A40 (`diffusiongemma-26B-A4B-it-Q4_K_M.gguf`, ggml d9fe7bff,
 | canvas step, on-device sampling | 218 ms | 114–128 ms |
 | generation, three prompts (ms per denoising step) | 268–353 | 129–153 |
 
+| other backends (same checkpoint and probe) | legacy | runtime |
+|---|---:|---:|
+| `cuda`: 512-token prompt prefill (warm) | 1.71–1.75 s | 0.39 s |
+| `cuda`: canvas step, host sampling | 1.67–1.76 s | 0.92–0.95 s |
+| `cpu` (host of the A40 VM): 64-token prompt prefill (warm) | 0.65–0.70 s | 0.69–0.71 s |
+| `cpu`: canvas step, host sampling | 2.79–2.89 s | 2.58–2.82 s |
+
+The `cpu` rows are interleaved runs on a shared host (load average 11-13), two pairs. On
+`cpu` the models allocate through a recycling allocator (a step's vocabulary-wide
+intermediates are written in place, not mapped and unmapped every step), a full-context
+cache comes from zeroed pages and a reset zeroes only the rows its prompts wrote.
+
 Teacher-forced on the legacy model's own answers (the same 256-token canvases), the two
 agree on every position's argmax and the mean log-probability of the canvas tokens matches
 (-0.0000 / -0.0000 and -0.0003 / -0.0003 with self-conditioning); the generated answers to

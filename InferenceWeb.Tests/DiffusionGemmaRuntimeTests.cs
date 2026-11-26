@@ -172,7 +172,11 @@ public sealed class DiffusionGemmaRuntimeTests : IDisposable
         }
         double rel = RelL2(continued, fresh);
         _output.WriteLine($"{executor}: continued vs fresh relL2 {rel:E3}");
-        Assert.True(rel <= 1e-4, $"continued block prompt: relL2 {rel:E2}");
+        // A GPU's quantized products pick their kernels by the step's rows (llama.cpp's MMQ against MMVQ), so a prompt
+        // prefilled in two steps rounds apart from one prefilled whole, and a near-tie route of this MoE fixture can then
+        // flip (ggml_cuda on an A40: 1.37e-2); the CPU backends' products do not depend on the step's rows.
+        double tolerance = backend is BackendType.Cpu or BackendType.GgmlCpu ? 1e-4 : 3e-2;
+        Assert.True(rel <= tolerance, $"continued block prompt: relL2 {rel:E2}");
     }
 
     /// <summary>The unified call (prompt and canvas together) is the prompt-cached one.</summary>

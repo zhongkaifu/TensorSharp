@@ -84,7 +84,7 @@ public sealed class PrefixCacheFamilyCoverageTests
             Assert.True(typeof(IPrefixCacheModelDiagnostics).IsAssignableFrom(family), $"{family.Name} does not implement IPrefixCacheModelDiagnostics");
         }
         Assert.Equal(
-            new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4RuntimeModel", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
+            new[] { "DeepSeek41Model", "DeepSeek4Model", "DiffusionGemmaModel", "Gemma4RuntimeModel", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
                     "Inkling2RuntimeModel", "Lfm3RuntimeModel", "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerRuntimeModel",
                     "MuseSparkModel", "NemotronModel", "Qwen35RuntimeModel", "Qwen3VLModel", "Qwen4ExpRuntimeModel", "RaonRuntimeModel" },
             engineServed.Select(t => t.Name).ToArray());

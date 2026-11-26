@@ -265,13 +265,16 @@ namespace TensorSharp.Graph
         protected virtual Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
             CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
-            // The keys every query masks at the window's end (a padded window's unwritten cells, a canvas step's cells past
-            // its rows) weigh exactly nothing: they are left out of the products. A DiffusionGemma canvas step's local
-            // layers read a 512-cell window for 320 keys (a 64-token prompt and the 256 canvas rows).
-            if (mask.HasTensor && mask.Keys > 0 && mask.Keys < k.Sizes[1] && mask.Tensor is { DimensionCount: 2 } full
-                && full.Sizes[1] == k.Sizes[1])
+            // The keys every query masks at the window's end (a padded window's unwritten cells) weigh exactly nothing: whole
+            // 256-key blocks of them are left out of the products (a ring's 1,536 cells hold a few hundred written ones early
+            // in a conversation). Whole blocks, so a row rounds as it did over the padded window: the softmax's vector tail and
+            // the GEMM's depth blocks (CpuSgemm's KC is 256) follow the key count, and a row of a prompt's first chunk, cut to
+            // its own keys, had rounded apart from the same row of the whole prompt (an MoE fixture's routing then flipped).
+            const int KeyBlock = 256;
+            long keep = mask.Keys > 0 ? Math.Min(k.Sizes[1], (mask.Keys + KeyBlock - 1L) / KeyBlock * KeyBlock) : k.Sizes[1];
+            if (mask.HasTensor && keep < k.Sizes[1] && mask.Tensor is { DimensionCount: 2 } full && full.Sizes[1] == k.Sizes[1])
             {
-                using Tensor kt = k.Narrow(1, 0, mask.Keys), vt = v.Narrow(1, 0, mask.Keys), mt = full.Narrow(1, 0, mask.Keys);
+                using Tensor kt = k.Narrow(1, 0, keep), vt = v.Narrow(1, 0, keep), mt = full.Narrow(1, 0, keep);
                 using Tensor at = Attention(q, kt, vt, mt, scale);
                 using Tensor pt = at.Permute(1, 0, 2);
                 return Ops.NewContiguous(pt);
