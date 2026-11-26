@@ -289,8 +289,7 @@ namespace TensorSharp.Models
             // CPU backend keeps host K/V and decodes canvas-only (DiffusionGemmaModel.Cpu.cs).
             _pkvEnabled = (_useDeviceGlue || UsesHostPromptKv) && Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV") != "1";
 
-            // Metal lazy-sync (async compute) is unsafe for this model, exactly as it is for Gemma 4
-            // (see Gemma4Model's SetAsyncCompute(false) and the hazard note there). GgmlContext enables
+            // Metal lazy-sync (async compute) is unsafe for this model's per-op path. GgmlContext enables
             // it by default on Metal: a per-op kernel returns without waiting on its command buffer, and
             // GetFloatPtr / EnsureHostReadable drains pending work before a CPU *read* — but there is no
             // host-WRITE barrier, so a CPU write followed by a device kernel can dispatch against a stale

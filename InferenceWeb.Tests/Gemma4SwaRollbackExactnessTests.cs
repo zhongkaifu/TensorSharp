@@ -156,6 +156,11 @@ public class Gemma4SwaRollbackExactnessTests
     /// acceptance too, putting the evicted positions back over the committed rows.
     ///
     ///   TS_TEST_MODEL_DIR=~/work/models/gemma-4-12b TS_TEST_GGML_BACKEND=metal
+    ///
+    /// The 2% bound holds where a verify window's kernels are its decode rows' (Metal). On ggml_cpu and ggml_cuda the
+    /// 12B UD-Q4_K_XL file's eight-row products round apart from the one-row ones: on an A40 host (2026-11) the decode after
+    /// the window parted from plain decoding by 0.9 / 2.9 logits (1,300 / 600 tokens) on ggml_cpu and 0.85 / 3.0 on
+    /// ggml_cuda for the legacy model, 0.9 / 1.8 and 1.3 / 6.6 for the shared runtime's.
     /// </summary>
     [ModelTheory(EnvModelDir, "gemma-4-12b")]
     [InlineData(1300, 7)]   // past the 1,024-token window

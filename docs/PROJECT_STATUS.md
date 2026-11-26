@@ -384,8 +384,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     `TS_MLX_BASELINE_*` and the rest listed in the startup error. MLX Q4_K / Q5_K
     weights always repack to MLX affine, which was already the default. The Gemma 4
     and Muse-Glimmer spellings of the MLX eval and materialize intervals are gone:
-    every model reads `TS_MLX_EVAL_EVERY_N_LAYERS` and `TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL`
-    (`TS_MLX_KV_MATERIALIZE_INTERVAL` went with the legacy Muse-Glimmer model in 2026-11);
+    every model reads `TS_MLX_EVAL_EVERY_N_LAYERS` (`TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL` went with the legacy
+    Gemma 4 model and `TS_MLX_KV_MATERIALIZE_INTERVAL` with the legacy Muse-Glimmer model in 2026-11);
   - the switches that turned a retained whole-model graph or its pieces off
     (`TS_QWEN35_FD_PERSIST`, `TS_GEMMA4_FD_PERSIST`, `TS_GPTOSS_FD_PERSIST`,
     `TS_MUSE_GLIMMER_PERSIST`, `TS_DFLASH_PERSIST`, the `*_BATCHED_ARENA` switches,

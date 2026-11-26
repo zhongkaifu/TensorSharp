@@ -432,14 +432,8 @@ public class EngineParallelInferenceTests
         var ctx = Load(key);
         using (ctx)
         {
-            // Gemma 4 declines a block-quantized K/V cache on every attention path
-            // (Gemma4Model.SupportsBlockQuantizedKvCache: its circular SWA helpers
-            // are float-only) and loads f16 instead, with a warning. Its q4_0 and
-            // q8_0 rows therefore check that fallback and that long-turn reuse
-            // still holds under it.
-            bool declinesBlockQuantized = ctx.Model is Gemma4Model
-                && (kvDtype == TensorSharp.Models.KvCacheDtype.Q8_0 || kvDtype == TensorSharp.Models.KvCacheDtype.Q4_0);
-            Assert.Equal(declinesBlockQuantized ? TensorSharp.Models.KvCacheDtype.F16 : kvDtype, ctx.Model.KvCacheDtype);
+            // Every family serves the requested cache type (Gemma 4's shared-runtime model takes q8_0 and q4_0 rings too).
+            Assert.Equal(kvDtype, ctx.Model.KvCacheDtype);
             int window = ctx.Model.Config?.SlidingWindow ?? 0;
             _output.WriteLine($"[{key}] kvDtype={ctx.Model.KvCacheDtype.ToShortString()} slidingWindow={window}");
             var sampling = SamplingConfig.Greedy;

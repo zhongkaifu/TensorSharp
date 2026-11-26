@@ -38,7 +38,6 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | 原生批处理 Mamba2 step | 关闭 | `0`, `1` | 否 |
 | `TS_PER_SEQ_FUSED` | fused 能力模型（GGML 后端上的 Gemma 4 与 GPT OSS；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，凡可加载的后端均适用，多节点流水线除外；各自原生执行器上的 DeepSeek V4 / V4.1 与 GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward，每个序列有自己的设备端 K/V holder；`0` 改走逐算子批处理分页路径，其 K/V 位于共享的主机块池（设备内存更少、decode 速率更低、没有保留的 holder） | 启用 | 未注册 | 否 |
 | `TS_BATCHED_FUSED_DECODE` | 具备 token 批量融合 decode 的模型（Gemma 4、Qwen 3.5/3.6/3.8、GPT OSS、GLM 5.x、DeepSeek V4 / V4.1） | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列）。在 GLM 5.x 上 4 个并发请求可得合计 1.81× decode；在 DeepSeek V4.1 Flash 的 Q4_K_M 上为 2.0×（24.3 → 48.9 tok/s），上限来自路由——每个 token 各自从 384 个专家里挑 6 个。批处理会改变 GEMM 形状，2 bit MoE 可能把这点差别放大成不同的专家选择；设为 `0` 可做串行路径 A/B。 | 开启 | 未注册 | 否 |
-| `TS_BATCHED_FUSED_MOE` | Gemma 4 MoE | `1` 允许 Gemma 4 MoE 检查点走 token 批量融合 decode。默认关闭：它的可捕获计算图加上 KV holder 占满了 16 GB 显卡，在那里也不比轮询快 | 关闭 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 具有可保留 request-owned fused holder 的模型（Gemma 4；Qwen 3.5/3.6/3.8；Qwen 3.8 Flash Next；未加载 DSpark 草稿器时的 DeepSeek V4.1；原生执行器上的 GLM 5.x，每个会话交出一个原生 slot） | 为下一轮的精确前缀续接保留多少个已结束会话的终态（holder、原生 slot）；Qwen holder 同时包含 attention K/V 与匹配的 GatedDeltaNet 递归状态。未设置时跟随 `TS_SCHED_MAX_RUNNING_SEQS`（至少 4），使每个可以并行运行的请求都保有自己的终态；字节数由显存而不是这个数量约束。`0` 关闭保留 | 运行中请求上限（16），至少 `4` | 不适用 | 否 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | GGML 后端上的 Gemma 4；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，只要其按请求 slot 在运行且递归状态可复制（多节点流水线除外）。需要开启 `TS_PER_SEQ_FUSED` | 在每个会话共享的提示前缀（系统提示、工具、技能）结束处对模型完整状态做检查点，新会话从其副本继续，只需重新预填自己的消息。取值是同时保留多少个不同共享前缀的检查点（每个占用一份前缀的 K/V，Qwen 还包含递归状态）；`0` 关闭检查点。它是 Radix 前缀缓存保留的公共检查点预算；一个提示在每个边界（系统指令、完整共享前缀）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机 | `4` | 不适用 | 否 |
 | `TS_KV_INITIAL_TOKENS` | 通过 `ModelBase.ResolveInitialCacheAllocationLength` 确定缓存大小的模型家族（Qwen 3.5/3.6、Gemma 4、GPT-OSS 等 ModelBase 家族；不含自行确定大小的 DeepSeek V4 / GLM 5.x） | 缓存创建时（加载时的主缓存、每个 per-request holder）在任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口，否则为后端默认值）。在共享解码运行时上（Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next、Mistral 3、Hunyuan Dense）它只决定主缓存的大小：请求自己的 slot 按其预留量创建（提示、生成预算与验证窗口，取 256 单元的整数倍，至少 512 个单元，`--backend cuda` 上至少 1,024 个；在单 GPU 的 `--backend cuda` 上，设备有空间时取预留量所在的容量档，否则取放得下的最大 slot，并一次扩容一个缓存张量），超出后按需增长；在单个 `ggml_metal` 或 `ggml_cuda` 设备上，或在单 GPU 的 `--backend cuda` 上，设备放不下新 slot 时新的并发请求会等待（在 `--backend cuda` 上，独自运行而 slot 放不下的请求会在提示运行前被拒绝）。在 `--backend cuda` 上取 `0` 时，主缓存无论 `MAX_CONTEXT` 是多少都从一个新 slot 的大小（1,024 个单元）起步：每个请求都在自己的 slot 里运行，所以那里的 `MAX_CONTEXT` 只限定窗口上限。缓存仍按需增长。内存受限设备把它设小，因为每个保留的 holder 都按此大小付费，主机副本与设备镜像各一份 | `0` | 不适用 | 否 |
@@ -70,6 +69,10 @@ Qwen 3.5 / 3.6 / 3.8 家族与 Qwen 3.8 Flash Next 的直连 CUDA 引擎以及 N
 `TS_MOE_TIER_ADAPT_EVERY`、`TS_MOE_TIER_ADAPT_ASYNC`、`TS_MOE_TIER_ADAPT_PROMPT_SWAPS` 与 `TS_NINFER_GGUF_DIR`。完整列表见
 `TensorSharp.Runtime/RemovedCliFlags.cs` 中的 `RemovedEnvironmentVariables`。`TS_PLE_EXPLICIT_READ` 也不再被读取：运行时
 对文件映射表中 1024 行及以上的 PLE 行 gather 总是显式读取（在原生 I/O 线程组上每行一次 `pread`，线程数由 `TS_PLE_IO_THREADS` 决定）。它不在该列表中，设置它不起任何作用。
+
+旧 Gemma 4 模型已于 2026-11 移除（Gemma 4 在所有后端上运行于共享解码器运行时）；它的开关 `TS_GGML_FUSED_PLE`、
+`TS_GEMMA4_TP_FUSED_MOE`、`TS_BATCHED_FUSED_MOE`、`TS_GMTP_PROFILE` 与 `TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL` 现在会在启动时
+让服务端或 CLI 报错退出。
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
@@ -510,7 +513,6 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_GGML_TP_FUSED_MATMUL` | 已移除 | 原为 `1` 表示由单个线程提交两个 rank 的线性层（从不是默认值；在 Qwen 3.5 35B 上实测慢 2.3×）。现在设置它会使主机带着建议退出 | — | 已移除（硬错误） | 否 |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 本地 TP，GGML 后端 | 超过该元素数量时 AllReduce 走设备集合通信，否则在主机内存中归约 | `262144` | 未注册 | 否 |
 | `TS_GGML_F32_RESIDENT` | GGML 后端 | `0` 表示每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） | 开启（常驻设备） | 未注册 | 否 |
-| `TS_GEMMA4_TP_FUSED_MOE` | GGML 上 TP 下的 Gemma 4 MoE | `0` 表示从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径 | 开启（融合主干） | 未注册 | 否 |
 | `TS_GLM_TP_SHARD` | GGML 上 TP 下的 GLM 5.x | 切分哪一半：`1` 注意力头，`2` 路由专家，`3` 两者都切。路由专家是在每个专家内部按行切分，而不是按专家 id 分配，因为 `ggml_mul_mat_id` 要求同一 token 选中的专家 id 互不相同 | `3`（两者） | `1`, `2`, `3` | 否 |
 | `TS_GLM_TP_OVERSUBSCRIBE` | GGML 上 TP 下的 GLM 5.x | `1` 允许多个 rank 共享一张 GPU，用于在单卡机器上验证切分的正确性 | `0`（一 rank 一卡） | `0`, `1` | 否 |
 | `TS_Q80_PAIR_SWAP` | 直连 `cuda` 后端的 Q8_0 成对矩阵向量乘（`CudaKernels`），sm_80 及以上 | `0` 不做打包，成对矩阵向量乘保留基于 GGUF 布局的三个核。开启时，成对核处理的每个稠密 Q8_0 权重在加载时得到一份打包副本（再占一份权重大小），调优可以为其选用交换操作数的张量核，结果逐位相同：在 H100 NVL 上 8 行时比其他核快 1.1-2.0 倍。这些数字测于调用该成对核的、已移除的 Qwen 3.8 Flash Next 直连 CUDA 引擎（两块 H100 NVL 中最后一块上约 2.4 GB 打包副本）。 |

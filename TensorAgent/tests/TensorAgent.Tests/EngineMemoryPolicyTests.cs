@@ -313,7 +313,7 @@ public sealed class EngineMemoryPolicyTests : IDisposable
     /// A catalog entry must not ask for a K/V dtype its family cannot read.
     ///
     /// <para>
-    /// Gemma 4 declines a block-quantized cache (Gemma4Model.SupportsBlockQuantizedKvCache):
+    /// Gemma 4 declines a block-quantized cache (the legacy model's SupportsBlockQuantizedKvCache):
     /// its sliding-window layers use a CIRCULAR cache whose managed helpers are float-only,
     /// and an ordinary prompt can reach them. Setting q8_0 on a Gemma entry therefore
     /// does not merely fall back -- before the load-time refusal it crashed the app

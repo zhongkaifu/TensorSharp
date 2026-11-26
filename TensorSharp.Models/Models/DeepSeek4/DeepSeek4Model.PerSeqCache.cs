@@ -6,7 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // Per-request sequence slots for the server's continuous-batching engine
-// (the DeepSeek V4 analogue of Gemma4Model.PerSeqCache / Qwen35Model.PerSeqCache).
+// (the DeepSeek V4 analogue of Qwen35Model.PerSeqCache).
 //
 // DSV4's whole-model executors (the native ggml one and the direct-CUDA engine)
 // own every cache on the device (raw SWA rings, CSA/HCA compressed-K caches,

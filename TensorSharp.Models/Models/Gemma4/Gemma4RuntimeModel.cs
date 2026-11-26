@@ -14,8 +14,7 @@ namespace TensorSharp.Models
     /// <summary>
     /// Gemma 4 (GGUF <c>gemma4</c>: E2B/E4B, 12B, 31B and the 26B-A4B MoE) on the shared decoder runtime, which provides every
     /// placement, continuous batching, the prefix cache, checkpoints and speculation; its steps run as whole-forward graphs on
-    /// every executor (<see cref="RequiresGraphs"/>). The recipe (llama.cpp <c>src/models/gemma4.cpp</c>, which the legacy
-    /// <c>Gemma4Model</c> followed too):
+    /// every executor (<see cref="RequiresGraphs"/>). The recipe (llama.cpp <c>src/models/gemma4.cpp</c>):
     /// <list type="bullet">
     /// <item>per-layer attention geometry: sliding-window layers (<c>attention.sliding_window_pattern</c>, keys (p - W, p]) of
     /// <c>key_length_swa</c>-wide heads, global layers of <c>key_length</c>-wide heads, each kind its own KV head count
@@ -222,7 +221,7 @@ namespace TensorSharp.Models
         /// <summary>A KV-shared layer has no keys or values of its own to fuse; the others fuse Q/K/V where all three exist.</summary>
         protected override bool FusesQkv(int layer) => layer >= Config.NumLayers || (_kvSource[layer] == layer && _hasValue[layer]);
 
-        protected override string FingerprintExtras =>
+        protected override string FingerprintExtras => _isLocal == null ? "|gemma4" :
             string.Create(CultureInfo.InvariantCulture,
                 $"|gemma4|swa={_window}:{LayerBits(_isLocal)}|hd={_localHeadDim}/{_globalHeadDim}|kv={string.Join(",", _kvHeads)}" +
                 $"|src={string.Join(",", _kvSource)}|rope={_localRope.Dims}@{_localRope.FreqBase:R},{_globalRope.Dims}@{_globalRope.FreqBase:R}|ple={_pleDim}");

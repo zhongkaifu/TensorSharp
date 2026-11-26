@@ -335,10 +335,6 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gptoss_decode.cpp
     ggml_ops_gptoss_batched.cpp
     ggml_ops_gptoss_prefill.cpp
-    ggml_ops_gemma4_decode.cpp
-    ggml_ops_gemma4_batched.cpp
-    ggml_ops_gemma4_verify.cpp
-    ggml_ops_gemma4_moe.cpp
     ggml_ops_muse_spark.cpp
     ggml_ops_minimax_m3_vision.cpp
     ggml_ops_dflash.cpp
@@ -966,19 +962,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
     target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-retention-budget COMMAND GgmlOpsDsv41RetentionTest)
-    add_executable(GgmlOpsGemma4MmMaskTest tests/gemma4_mm_mask_test.cpp)
-    target_include_directories(GgmlOpsGemma4MmMaskTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME gemma4-multimodal-mask-after-reused-prefix COMMAND GgmlOpsGemma4MmMaskTest)
-    add_executable(GgmlOpsGemma4PleNormTest tests/gemma4_ple_norm_test.cpp)
-    target_include_directories(GgmlOpsGemma4PleNormTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(GgmlOpsGemma4PleNormTest PRIVATE ggml-cpu ggml-base)
-    add_test(NAME gemma4-ple-norm-cpu COMMAND GgmlOpsGemma4PleNormTest cpu)
-    if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)
-        target_link_libraries(GgmlOpsGemma4PleNormTest PRIVATE ggml-vulkan)
-        target_compile_definitions(GgmlOpsGemma4PleNormTest PRIVATE TSG_GGML_USE_VULKAN=1)
-        add_test(NAME gemma4-ple-norm-vulkan COMMAND GgmlOpsGemma4PleNormTest vulkan)
-        set_tests_properties(gemma4-ple-norm-vulkan PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
-    endif()
 
     add_executable(GgmlOpsDsv41QuantTest
         tests/dsv41_quant_test.cpp ggml_ops_dsv4_fused_cpu.cpp)

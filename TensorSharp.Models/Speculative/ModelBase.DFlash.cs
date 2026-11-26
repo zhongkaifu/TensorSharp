@@ -232,7 +232,7 @@ namespace TensorSharp.Models
         /// Loads the DFlash drafter GGUF and attaches it to this target model. Its
         /// tensors are merged into the shared weight dictionaries under the
         /// "dflash." prefix so the existing matmul/norm machinery serves them (the
-        /// same trick Gemma4Model.LoadMtpDraftTensors uses with "mtp."); the drafter
+        /// same trick the gemma4-assistant loader uses with "mtp."); the drafter
         /// borrows the TARGET's token_embd.weight and output.weight, which the file
         /// does not carry.
         /// </summary>
@@ -352,7 +352,7 @@ namespace TensorSharp.Models
         /// <summary>
         /// Merges every tensor of the drafter GGUF into the shared weight
         /// dictionaries under the "dflash." prefix. Byte-for-byte the same shape as
-        /// Gemma4Model.LoadMtpDraftTensors (which uses "mtp."), minus the
+        /// the gemma4-assistant loader's (Gemma4RuntimeModel.LoadAssistantTensors, "mtp."), minus the
         /// converter-spelling normalization DFlash does not need: the drafter's
         /// tensor names are already the final ones.
         /// </summary>

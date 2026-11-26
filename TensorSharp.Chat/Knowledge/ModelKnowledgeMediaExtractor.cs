@@ -108,8 +108,8 @@ public sealed class ModelKnowledgeMediaExtractor(ModelService model) : IKnowledg
             else
             {
                 // ModelService.IsAudioEncoderLoaded is the optional Nemotron refusal flag;
-                // Gemma's independently loaded tower is exposed on Gemma4Model itself.
-                if (!model.IsLoaded || !(model.IsAudioEncoderLoaded || model.Model is Gemma4Model { AudioEncoder: not null }))
+                // Gemma's independently loaded tower is exposed on the model itself (IGemma4MediaTowers).
+                if (!model.IsLoaded || !(model.IsAudioEncoderLoaded || model.Model is IGemma4MediaTowers { AudioEncoder: not null }))
                     return BuiltInKnowledgeExtractor.MetadataOnly("Audio content needs a loaded audio model/tower or a configured TS_JEV_TRANSCRIPTION_URL companion. Load/configure one and reindex.");
                 double? duration = WaveDuration(context.FilePath);
                 if (duration == null) return BuiltInKnowledgeExtractor.MetadataOnly("Local bounded audio indexing currently accepts PCM WAV. Convert this recording to WAV or configure a transcription companion and reindex.");

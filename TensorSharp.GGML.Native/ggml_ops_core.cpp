@@ -3406,15 +3406,9 @@ extern "C" void TSGgml_WanResetForwardCache();
 // Tensor-parallel graphs held across calls, defined in their own kernels.
 // TSGgml_Shutdown releases them while the backends are still alive.
 extern "C" void TSGgml_GraphReleaseDeviceIo();
-extern "C" void TSGgml_Gemma4ReleaseVerifyTpGraphs();
 extern "C" void TSGgml_Qwen35GdnDropTpGraphs();
 extern "C" void TSGgml_ReleaseFusedFfnTpGraphs();
 extern "C" void TSGgml_ReleaseFusedMatmulAddTpGraphs();
-extern "C" void TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
-extern "C" void TSGgml_Gemma4MoEResetDecodeCache();
-extern "C" void TSGgml_Gemma4ResetDecodeCache();
-extern "C" void TSGgml_Gemma4ResetBatchedDecodeCache();
-extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
 extern "C" void TSGgml_GptOssResetDecodeCache();
 extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
 extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
@@ -3445,10 +3439,6 @@ TSG_EXPORT void TSGgml_ResetSharedGraphCaches()
     // loaded afterwards whose allocations landed on the old addresses replayed a graph
     // bound to freed MTLBuffers. Each rebuilds on its next call.
     TSGgml_DFlashResetCaches();
-    TSGgml_Gemma4ResetDecodeCache();
-    TSGgml_Gemma4ResetBatchedDecodeCache();
-    TSGgml_Gemma4ResetMoEBatchedDecodeCache();
-    TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_GptOssResetDecodeCache();
     // Per-shape graphs that hold no state between calls, so another live model
     // simply rebuilds its own. Nothing else released them before thread or
@@ -3588,15 +3578,9 @@ TSG_EXPORT void TSGgml_Shutdown()
     // persistent per-rank decode graphs. They own backend buffers, and letting
     // static destructors free them after the CUDA driver has shut down aborts
     // the process ("CUDA error: driver shutting down").
-    TSGgml_Gemma4ReleaseVerifyTpGraphs();
     TSGgml_Qwen35GdnDropTpGraphs();
     TSGgml_ReleaseFusedFfnTpGraphs();
     TSGgml_ReleaseFusedMatmulAddTpGraphs();
-    TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
-    TSGgml_Gemma4MoEResetDecodeCache();
-    TSGgml_Gemma4ResetDecodeCache();
-    TSGgml_Gemma4ResetBatchedDecodeCache();
-    TSGgml_Gemma4ResetMoEBatchedDecodeCache();
     // GPT-OSS keeps per-layer device-resident K/V windows (tsg_gptoss::kv_*)
     // alive for the whole session; nothing else drops them, so on Metal their
     // MTLBuffers were still registered in the device residency set when the
@@ -4060,10 +4044,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     if (!freedDeviceCopy)
         return;
 
-    TSGgml_Gemma4ResetDecodeCache();
-    TSGgml_Gemma4ResetBatchedDecodeCache();
-    TSGgml_Gemma4ResetMoEBatchedDecodeCache();
-    TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
 }

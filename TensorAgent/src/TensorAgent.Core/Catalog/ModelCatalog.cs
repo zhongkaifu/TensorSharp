@@ -115,11 +115,8 @@ public static partial class ModelCatalog
             // own a cache: 3 x 1 x 512 x 2 x 2 bytes. The sliding layers' 512-row rings
             // are a fixed 6 MiB. Desktop window 32,768.
             KvBytesPerToken = 3 * 1 * 512 * 2 * 2,
-            // f16, not q8_0: Gemma 4 declines a block-quantized cache
-            // (Gemma4Model.SupportsBlockQuantizedKvCache). Its sliding-window layers
-            // use a circular cache whose managed helpers are float-only, and the 26B
-            // MoE reaches them on an ordinary prompt: setting q8_0 here crashed with
-            // "Requires a Float32 tensor, but found Q8_0" out of CopyToCacheCircular.
+            // f16: the cache the catalog was measured with. (The legacy Gemma 4 model declined a
+            // block-quantized cache; the shared runtime's model takes q8_0 too, at its own quality.)
             KvCacheDtype = "f16",
             Sampling = new CatalogSampling(1.0f, 64, 0.95f, 0.0f),
             SupportsThinking = true,

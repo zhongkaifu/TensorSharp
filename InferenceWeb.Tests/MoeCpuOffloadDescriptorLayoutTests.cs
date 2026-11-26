@@ -86,12 +86,6 @@ public class MoeCpuOffloadDescriptorLayoutTests
     }
 
     [Fact]
-    public void Gemma4MoELayerDecodeArgs_MatchesNativeLayout()
-        => AssertDescriptorLayout<TensorSharp.GGML.Gemma4MoELayerDecodeArgs>(
-            pointers: 24, int64s: 24, int32s: 25, floats: 4,
-            firstPointerField: "Hidden", firstInt32Field: "StructBytes");
-
-    [Fact]
     public void GptOssLayerDecodeArgs_MatchesNativeLayout()
         => AssertDescriptorLayout<TensorSharp.GGML.GptOssLayerDecodeArgs>(
             pointers: 21, int64s: 21, int32s: 22, floats: 5,

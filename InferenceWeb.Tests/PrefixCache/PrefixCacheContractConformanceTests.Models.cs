@@ -50,16 +50,13 @@ public sealed partial class PrefixCacheContractConformanceTests
 
     [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvModelDir, Gemma4E4B)]
-    public void Gemma4_E4B_PassesTheConformanceScript_WithTheHolderPoolAttached()
+    public void Gemma4_E4B_PassesTheConformanceScript()
     {
-        using var model = (Gemma4Model)Load(Gemma4E4B);
-        // Tree mode's configuration: the pool recycles every released holder, so the script's later
-        // cold runs and fresh binds run on recycled holders.
+        using var model = (Gemma4RuntimeModel)Load(Gemma4E4B);
         model.AttachPrefixCache(new RecordingPayloadSink());
         ConformanceSubject subject = TextSubject(model, "gemma4-e4b") with
         {
-            PayloadDeviceDirty = model.IsRetainedHostDirty,
-            // The fused decode writes K/V on the device and marks the host copy stale.
+            // A graph leaves a slot's rows on the device until a sync.
             ExpectDirtyDonations = true,
         };
         ConformanceReport report = PrefixCacheConformanceScript.Run(subject);
@@ -67,24 +64,8 @@ public sealed partial class PrefixCacheContractConformanceTests
         Assert.Contains("capture", report.Ran);
         Assert.Contains("clone x2", report.Ran);
         Assert.Contains("settle then clone", report.Ran);
-        Assert.Contains("truncate refused (wrapped window)", report.Ran);
-        Assert.Contains(report.Ran, r => r.StartsWith("truncate in range", StringComparison.Ordinal));
         Assert.Contains("primary conversion", report.Ran);
         Assert.Contains(report.Ran, r => r.StartsWith("export/import", StringComparison.Ordinal));
-        Assert.True(model.PooledHolderCount > 0, "the attached pool parked no released holder");
-
-        // A recycled holder (the logical reset the primary gets between requests) decodes exactly.
-        int pooled = model.PooledHolderCount;
-        Assert.True(model.BindSequenceCache("pooled-holder"));
-        Assert.Equal(pooled - 1, model.PooledHolderCount);
-        int[] prompt = subject.SharedPrefix.Concat(subject.Suffix).ToArray();
-        List<int> fromPool = Greedy(model, model.Forward(prompt), subject.DecodeTokens);
-        model.OnSequenceReleased("pooled-holder");
-        model.TrimIdleMemory();
-        Assert.Equal(0, model.PooledHolderCount);
-        Assert.True(model.BindSequenceCache("fresh-allocation"));
-        Assert.Equal(Greedy(model, model.Forward(prompt), subject.DecodeTokens), fromPool);
-        model.OnSequenceReleased("fresh-allocation");
     }
 
     [Trait("Category", "PrefixCacheModel")]

@@ -1678,9 +1678,8 @@ namespace
             // Gemma 4 MoE post-aggregation chain:
             //   residual += rms_norm(moe_out, eps) * post_ffw_norm_2.weight
             //
-            // Mirrors the Gemma4Model.cs MoEForward + RMSNormOp + Ops.Add
-            // sequence (`moeOut → postMoeNormed → mlpOut += postMoeNormed`)
-            // but as one fused graph dispatch instead of three. The RMSNorm
+            // The MoE output, its RMSNorm and the residual add (`moeOut → postMoeNormed →
+            // mlpOut += postMoeNormed`) as one fused graph dispatch instead of three. The RMSNorm
             // reduces along ne0 (hidden_dim per token) which is exactly the
             // unweighted RMSNorm Gemma 4 expects on the MoE output before
             // the post_ffw_norm_2 weighted scale.
@@ -2189,81 +2188,6 @@ namespace
         return moe_ffn_prefill_graph_impl(p);
     }
 
-    // Residual-fused variant: invokes the unified graph builder in residual
-    // mode so the caller's residual buffer ends up containing
-    // `residual + rms_norm(moe_out, eps) * post_norm_w` after one graph
-    // dispatch. Designed for Gemma 4 MoE which routes every layer through
-    // dense_FFN + post_norm_1 + (MoE_FFN -> post_norm_2 -> add). The kernel
-    // collapses the post_norm_2 + add into the same dispatch as the MoE FFN.
-    int gemma4_moe_geglu_residual_f32_impl(
-        float* hidden_in,
-        float* residual_in_out,
-        const float* post_norm_w,
-        float post_norm_eps,
-        int seq_len,
-        int hidden_dim,
-        int n_ff,
-        int num_experts,
-        int n_used,
-        const std::int32_t* selected_experts,
-        const float* routing_weights,
-        void* gate_data, int gate_type, std::int64_t gate_ne0, std::int64_t gate_ne1, std::int64_t gate_total_bytes,
-        void* up_data,   int up_type,   std::int64_t up_ne0,   std::int64_t up_ne1,   std::int64_t up_total_bytes,
-        void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_total_bytes,
-        const float* gate_bias,
-        const float* up_bias,
-        const float* down_bias,
-        int activation_type,
-        float oai_alpha,
-        float oai_limit,
-        int run_on_cpu)
-    {
-        MoEFFNGraphParams p;
-        p.hidden_in = hidden_in;
-        p.residual_in_out = residual_in_out;
-        p.post_norm_w = post_norm_w;
-        p.post_norm_eps = post_norm_eps;
-        p.seq_len = seq_len;
-        p.hidden_dim = hidden_dim;
-        p.n_ff = n_ff;
-        p.num_experts = num_experts;
-        p.n_used = n_used;
-        p.selected_experts = selected_experts;
-        p.routing_weights = routing_weights;
-        p.gate_data = gate_data;
-        p.gate_type = gate_type;
-        p.gate_ne0 = gate_ne0;
-        p.gate_ne1 = gate_ne1;
-        p.gate_total_bytes = gate_total_bytes;
-        p.up_data = up_data;
-        p.up_type = up_type;
-        p.up_ne0 = up_ne0;
-        p.up_ne1 = up_ne1;
-        p.up_total_bytes = up_total_bytes;
-        p.down_data = down_data;
-        p.down_type = down_type;
-        p.down_ne0 = down_ne0;
-        p.down_ne1 = down_ne1;
-        p.down_total_bytes = down_total_bytes;
-        p.gate_bias = gate_bias;
-        p.up_bias = up_bias;
-        p.down_bias = down_bias;
-        p.activation_type = activation_type;
-        p.oai_alpha = oai_alpha;
-        p.oai_limit = oai_limit;
-        p.run_on_cpu = run_on_cpu != 0;
-        // The per-op entry points may stream their experts too, but ONLY
-        // outside tensor parallelism: under TP they are driven through
-        // RunPerRank, where every rank would stream its own copy of the
-        // same unsharded expert layer to its own device at once. A single
-        // device is the case that matters here — it is the path GPT-OSS
-        // and Nemotron-H take at prefill (no fused whole-model prefill
-        // graph, hence no seam), and leaving it host-only cost gpt-oss-20b
-        // 4-10x against llama.cpp on every offloaded prefill.
-        p.allow_device_stream =
-            tsg::g_device_count.load(std::memory_order_acquire) <= 1;
-        return moe_ffn_prefill_graph_impl(p);
-    }
 } // namespace
 
 namespace tsg
@@ -3451,91 +3375,4 @@ extern "C"
         catch (...) { set_last_error("Unknown error in route-scaled MoE prefill."); return 0; }
     }
 
-    // Gemma 4 MoE residual-fused GEGLU kernel.
-    //
-    // Computes the standard MoE FFN body PLUS the post_ffw_norm_2 RMSNorm
-    // (with weighted scale post_norm_w) PLUS the residual add into the
-    // dense-FFN-output buffer in a SINGLE GGML graph dispatch:
-    //
-    //   moe_out      = moe_ffn(hidden_in, gate, up, down, ids, weights)   [batched mul_mat_id]
-    //   moe_normed   = rms_norm(moe_out, eps) * post_norm_w
-    //   residual_in_out += moe_normed                                     [in-place residual]
-    //
-    // Saves two device dispatches per MoE layer (the standalone RMSNorm and
-    // the standalone Add) versus the previous TryMoEFusedGEGLU + RMSNorm +
-    // Add sequence in C#. Mirrors the analogous Qwen 3.5 single-token kernel
-    // TSGgml_MoEExpertsSwiGLUResidual which folds the routed-expert + shared-
-    // expert + residual into one graph submission.
-    //
-    // hidden_in (in):           [seq_len, hidden_dim] F32 contiguous - the MoE
-    //                           input (pre_ffw_norm_2 output of the residual
-    //                           stream in Gemma 4 MoE layers).
-    // residual_in_out (in/out): [seq_len, hidden_dim] F32 contiguous - the
-    //                           dense FFN output that the kernel adds the
-    //                           normed MoE result to. The kernel writes the
-    //                           sum back over the same buffer.
-    // post_norm_w (in):         [hidden_dim] F32 - the post_ffw_norm_2.weight
-    //                           tensor.
-    // post_norm_eps:            RMSNorm epsilon (ModelConfig.Eps in C#).
-    // selected_experts:         i32 [seq_len, n_used] in row-major layout.
-    // routing_weights:          f32 [seq_len, n_used] in row-major layout.
-    //                           Per-expert post-down scales (Gemma 4's
-    //                           ffn_down_exps.scale) must be folded into
-    //                           these by the caller before the call.
-    // gate / up / down weights: per-expert stacked quantized blocks, identical
-    //                           layout to TSGgml_MoEFFNPrefillSwiGLUQuantF32.
-    //                           up_data == nullptr signals a fused gate_up
-    //                           weight (gate_ne1 = 2 * n_ff) - the kernel
-    //                           splits internally.
-    // activation_type:          MoE GLU activation. For Gemma 4 MoE this is
-    //                           always 2 (GEGLU split = gelu(gate) * up); the
-    //                           parameter is passed through for symmetry with
-    //                           the standalone kernel and to leave room for
-    //                           future variants without an ABI change.
-    TSG_EXPORT int TSGgml_Gemma4MoEGEGLUResidualF32(
-        float* hidden_in,
-        float* residual_in_out,
-        const float* post_norm_w,
-        float post_norm_eps,
-        int seq_len,
-        int hidden_dim,
-        int n_ff,
-        int num_experts,
-        int n_used,
-        const std::int32_t* selected_experts,
-        const float* routing_weights,
-        void* gate_data, int gate_type, std::int64_t gate_ne0, std::int64_t gate_ne1, std::int64_t gate_total_bytes,
-        void* up_data,   int up_type,   std::int64_t up_ne0,   std::int64_t up_ne1,   std::int64_t up_total_bytes,
-        void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_total_bytes,
-        const float* gate_bias,
-        const float* up_bias,
-        const float* down_bias,
-        int activation_type,
-        float oai_alpha,
-        float oai_limit,
-        int run_on_cpu)
-    {
-        try
-        {
-            return gemma4_moe_geglu_residual_f32_impl(
-                hidden_in, residual_in_out, post_norm_w, post_norm_eps,
-                seq_len, hidden_dim, n_ff,
-                num_experts, n_used, selected_experts, routing_weights,
-                gate_data, gate_type, gate_ne0, gate_ne1, gate_total_bytes,
-                up_data,   up_type,   up_ne0,   up_ne1,   up_total_bytes,
-                down_data, down_type, down_ne0, down_ne1, down_total_bytes,
-                gate_bias, up_bias, down_bias,
-                activation_type, oai_alpha, oai_limit, run_on_cpu);
-        }
-        catch (const std::exception& ex)
-        {
-            set_last_error(ex.what());
-            return 0;
-        }
-        catch (...)
-        {
-            set_last_error("Unknown error in Gemma 4 MoE GEGLU residual kernel.");
-            return 0;
-        }
-    }
 }

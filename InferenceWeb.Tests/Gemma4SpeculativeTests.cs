@@ -7,7 +7,7 @@
 //
 // Gemma 4 MTP (gemma4-assistant draft head) speculative decoding: correctness +
 // performance. The draft head ships as a SEPARATE GGUF and is attached to the
-// target via Gemma4Model.LoadMtpDraftWeights().
+// target via Gemma4RuntimeModel.LoadMtpDraftWeights() (the shared runtime's per-token family drafter).
 //
 // Greedy speculative decoding accepts drafts against the target's verify logits.
 // Batch-dependent attention and quantized matrix arithmetic can change those
@@ -56,7 +56,7 @@ public class Gemma4SpeculativeTests
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 4);
 
         _output.WriteLine($"[gmtp] target={Path.GetFileName(targetPath)} draft={Path.GetFileName(draftPath)} backend={ResolveBackend()}");
-        using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
+        using var model = (Gemma4RuntimeModel)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
         Xunit.Assert.True(model.HasDraftHead, "model should expose a Gemma 4 MTP draft head");
 
@@ -132,7 +132,7 @@ public class Gemma4SpeculativeTests
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 6);
 
         _output.WriteLine($"[gmtp-long] target={Path.GetFileName(targetPath)} backend={ResolveBackend()}");
-        using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
+        using var model = (Gemma4RuntimeModel)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
         Xunit.Assert.True(model.HasDraftHead);
 
@@ -202,7 +202,7 @@ public class Gemma4SpeculativeTests
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 4);
 
         _output.WriteLine($"[gmtp-bench] target={Path.GetFileName(targetPath)} backend={ResolveBackend()}");
-        using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
+        using var model = (Gemma4RuntimeModel)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
         Xunit.Assert.True(model.HasDraftHead);
 
@@ -233,20 +233,9 @@ public class Gemma4SpeculativeTests
         swDecode.Stop();
         double baseTps = (maxNew - 1) / swDecode.Elapsed.TotalSeconds;
 
-        // Per-op baseline (ForceUnfused): the trunk's per-token path
-        // WITHOUT the fused single-token decode kernel — the same kernel family the
-        // multi-token verify is forced onto (Gemma 4 has no fused multi-token
-        // forward). Comparing spec to this isolates the speculative algorithm's
-        // contribution from the fused-decode advantage the production decode enjoys.
-        model.ForceUnfused = true;
-        model.ResetKVCache();
-        logits = model.ForwardRefill(tokens);
-        var swUnfused = Stopwatch.StartNew();
-        t = Argmax(logits);
-        for (int i = 1; i < maxNew; i++) { logits = model.Forward(new[] { t }); t = Argmax(logits); }
-        swUnfused.Stop();
-        model.ForceUnfused = false;
-        double baseUnfusedTps = (maxNew - 1) / swUnfused.Elapsed.TotalSeconds;
+        // The shared runtime runs decode and verify windows as the same graph programs: there is no separate per-op
+        // baseline to isolate (the legacy model's ForceUnfused).
+        double baseUnfusedTps = baseTps;
 
         // Speculative greedy.
         var spec = new SpeculativeDecoder(model, maxDraft);
@@ -287,7 +276,7 @@ public class Gemma4SpeculativeTests
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 6);
 
         _output.WriteLine($"[gmtp-engine] target={Path.GetFileName(targetPath)} backend={ResolveBackend()}");
-        using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
+        using var model = (Gemma4RuntimeModel)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
         Xunit.Assert.True(model.HasDraftHead);
 
@@ -398,7 +387,7 @@ public class Gemma4SpeculativeTests
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 8);
 
         _output.WriteLine($"[gmtp-oom] target={Path.GetFileName(targetPath)} backend={ResolveBackend()} maxNew={maxNew} maxDraft={maxDraft}");
-        using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
+        using var model = (Gemma4RuntimeModel)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
         Xunit.Assert.True(model.HasDraftHead);
 

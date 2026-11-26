@@ -128,6 +128,33 @@ public sealed class Gemma4RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>The direct CUDA executor (recorded decode steps, the routed experts' fused region on the MoE file) against the
+    /// managed backend, and its runs reproduce bit for bit (a recorded step replays what it recorded).</summary>
+    [CudaTheory]
+    [InlineData("dense")]
+    [InlineData("dense-long")]
+    [InlineData("moe")]
+    public void DirectCudaMatchesTheManagedBackend(string name)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(name);
+        Gemma4LegacySynthetic.Case c = Gemma4LegacySynthetic.Get(name);
+        List<float[]> managed, first, again;
+        using (var model = Create(path)) managed = Gemma4LegacySynthetic.Run(model, c);
+        using (var model = Create(path, BackendType.Cuda))
+        {
+            first = Gemma4LegacySynthetic.Run(model, c);
+            again = Gemma4LegacySynthetic.Run(model, c);
+        }
+        for (int i = 0; i < managed.Count; i++)
+        {
+            double rel = RelL2(first[i], managed[i]);
+            _output.WriteLine($"{name} cuda row {i}: relL2 {rel:E3}");
+            Assert.True(rel <= 2 * NoiseTolerance, $"{name} cuda row {i}: relL2 {rel:E3}");
+            Assert.Equal(first[i], again[i]);
+        }
+    }
+
     /// <summary>A prompt in one chunk and in pieces (across the sliding windows' rings) gives the same logits.</summary>
     [Theory]
     [InlineData("dense-long", "managed")]

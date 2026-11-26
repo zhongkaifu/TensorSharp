@@ -261,7 +261,7 @@ namespace TensorSharp.Models
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(projectorPath);
 
-            // Mirrors Gemma4Model.LoadVisionEncoder: the direct (non-GGML) CUDA backend diverges
+            // Mirrors Gemma4RuntimeModel.LoadVisionEncoder: the direct (non-GGML) CUDA backend diverges
             // numerically inside the gemma4v stack, so keep that one tower on the CPU allocator and let
             // the splice copy the finished embeddings across.
             IAllocator visionAllocator = _backend == BackendType.Cuda

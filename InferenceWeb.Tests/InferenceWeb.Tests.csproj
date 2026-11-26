@@ -14,7 +14,6 @@
     <AdditionalFiles Include="BannedSymbols.txt" />
     <Compile Remove="Fixtures/PdfProcessFixture/**/*.cs" />
     <ProjectReference Include="Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" ReferenceOutputAssembly="false" />
-    <Compile Include="../eng/validation/Gemma4BatchedCacheProbe/Gemma4CacheProbe.cs" Link="Validation/Gemma4CacheProbe.cs" />
     <Compile Include="../eng/validation/ValidationSha256.cs" Link="Validation/ValidationSha256.cs" />
   </ItemGroup>
   <ItemGroup>

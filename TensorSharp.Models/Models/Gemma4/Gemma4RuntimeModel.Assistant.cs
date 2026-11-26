@@ -24,7 +24,8 @@ namespace TensorSharp.Models
     /// </summary>
     internal sealed partial class Gemma4RuntimeModel : IAttachableDraftHead
     {
-        bool IAttachableDraftHead.HasDraftHead => FamilyTokenDrafter != null;
+        /// <summary>A draft head is attached (the gemma4-assistant head, or a DFlash drafter).</summary>
+        public bool HasDraftHead => DraftHeadKind != TensorSharp.Runtime.Speculative.DraftHeadKind.None;
 
         /// <summary>Load a gemma4-assistant GGUF (either converter's spelling) and attach it as the per-token drafter.</summary>
         public void LoadMtpDraftWeights(string draftGgufPath)

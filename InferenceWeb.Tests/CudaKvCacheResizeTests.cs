@@ -1,4 +1,4 @@
-// Direct test of the global KV-cache growth copy used by Gemma4Model.EnsureCacheCapacity:
+// Direct test of the global KV-cache growth copy (ModelBase.CopyCacheRows):
 //
 //   using var srcK = _kvCacheK[l].Narrow(1, 0, _cacheSeqLen);
 //   using var dstK = newK.Narrow(1, 0, _cacheSeqLen);

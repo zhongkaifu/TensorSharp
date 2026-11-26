@@ -87,20 +87,16 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     // ---- files ------------------------------------------------------------------------------
 
-    private static readonly bool[] AllGlobal = { false, false, false, false, false, false };
 
     /// <summary>Synthetic file per family. gpt-oss uses sinks large enough that a path which drops
     /// or misapplies them moves the rows 5-10x more than the backends' rounding (P0's file: 1.5-2x,
-    /// so the review's sink-dropping mutation passed every ggml_cpu row). gemma4moe keeps the
-    /// 26B's 32-row sliding window and its local/global layer mix; gemma4moe_global has only
-    /// global layers.</summary>
+    /// so the review's sink-dropping mutation passed every ggml_cpu row). (Gemma 4 runs on the shared runtime:
+    /// Gemma4RuntimeTests.)</summary>
     private static readonly Dictionary<string, Func<string, string>> Files = new()
     {
         ["gptoss"] = p => GptOssSyntheticModelBuilder.SensitiveSinks().Write(p),
         ["qwen35moe"] = p => new Qwen35MoeSyntheticModelBuilder().Write(p),
         ["qwen35"] = p => new Qwen35DenseSyntheticModelBuilder().Write(p),
-        ["gemma4moe"] = p => new Gemma4MoeSyntheticModelBuilder().Write(p),
-        ["gemma4moe_global"] = p => new Gemma4MoeSyntheticModelBuilder { Pattern = AllGlobal }.Write(p),
         ["nemotron_h"] = p => Nemotron("SFAFSF").Write(p),
         ["nemotron_h_moe"] = p => Nemotron("SMAMSM").Write(p),
         // The real models' storage types at a width whose K holds whole 256-value super-blocks:
@@ -182,7 +178,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     /// Gemma-4 runs its uncaptured decode steps (a graph key's first sighting) as the recorded
     /// kernel sequence, so its first run must be bit-identical too (FirstDecodeSteps_MatchTheirReplays).
     /// </summary>
-    private static double FirstRunDecodeBand(string family) => family is "gemma4moe" or "gemma4moe_global" ? 0 : 1e-4;
+    private static double FirstRunDecodeBand(string family) => 1e-4;
 
     private void AssertReproduces(string what, IReadOnlyList<List<float[]>> runs, string family)
     {
@@ -209,8 +205,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         // sm_120 (the 16-bit-run kernels, --prompt-attention f16: 1.4e-3; a part without the 8-bit kernels runs those).
         ["qwen35"] = new() { [17] = 0.0034, [97] = 0.0029, [160] = 0.0025, [257] = 0.0022, [513] = 0.0026, [1100] = 0.0046 },
         // 257: prompt salt 1 (PrefillSalt); A 6.2e-3, floor 3.6e-3.
-        ["gemma4moe"] = new() { [17] = 0.0077, [97] = 0.0078, [160] = 0.0086, [257] = 0.0093, [513] = 0.0072, [1100] = 0.0075 },
-        ["gemma4moe_global"] = new() { [17] = 0.0083, [97] = 0.0074, [160] = 0.0088, [257] = 0.0075, [513] = 0.0078, [1100] = 0.0069 },
         ["nemotron_h"] = new() { [17] = 0.015, [97] = 0.017, [160] = 0.016, [257] = 0.017, [513] = 0.028, [1100] = 0.021 },
         // Above 512 rows in one forward the expert matmuls take another route (513-2000: 1.4e-2 to
         // 2.7e-2 from managed cpu, against 6e-8 at <= 512); 1100 is D6 (0.33), its tolerance the
@@ -268,7 +262,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     /// alike (255/salt 4, 256/salt 1, a router near-tie). Salt 1 at 257 is well-conditioned (cuda
     /// 6.2e-3 default, 5.2e-3 precise; cpu 5.4e-3; floor 3.6e-3) and runs the same code path.
     /// </summary>
-    private static int PrefillSalt(string family, int length) => (family, length) is ("gemma4moe", 257) ? 1 : 0;
+    private static int PrefillSalt(string family, int length) => 0;
 
     // ---- 2. decode rows against ggml_cpu ----------------------------------------------------
 
@@ -287,10 +281,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         [("qwen35moe", 97)] = (0.049, 0.11, 0.25),
         [("qwen35", 96)] = (0.0025, 0.0032, 0.0042),
         [("qwen35", 97)] = (0.0029, 0.0029, 0.0042),
-        [("gemma4moe_global", 96)] = (0.0056, 0.0082, 0.017),
-        [("gemma4moe_global", 97)] = (0.0074, 0.0080, 0.014),
-        [("gemma4moe", 96)] = (0.0057, 0.0075, 0.024),     // A 3.7e-3 / 5.0e-3 / 1.57e-2 (with the D3 fixes)
-        [("gemma4moe", 97)] = (0.0078, 0.0082, 0.012),     // A 5.2e-3 / 5.4e-3 / 7.8e-3
         [("nemotron_h", 96)] = (0.021, 0.021, 0.023),
         [("nemotron_h", 97)] = (0.017, 0.019, 0.027),
         [("nemotron_h_moe", 96)] = (0.013, 0.019, 0.021),
@@ -308,10 +298,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     [InlineData("qwen35moe", 97)]
     [InlineData("qwen35", 96)]
     [InlineData("qwen35", 97)]
-    [InlineData("gemma4moe_global", 96)]
-    [InlineData("gemma4moe_global", 97)]
-    [InlineData("gemma4moe", 96)]
-    [InlineData("gemma4moe", 97)]
     [InlineData("nemotron_h", 96)]
     [InlineData("nemotron_h", 97)]
     [InlineData("nemotron_h_moe", 96)]
@@ -364,8 +350,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         // decode rows up to 7.1e-4 (A40) since products of 9-32 rows run on the decode-once kernels in pieces of 8 (a decode
         // row's sums however many rows share the step) where 9-16 had taken the q8_1 multi-row kernel.
         "qwen35" => row == 0 ? 0.0025 : 0.001,
-        "gemma4moe" => row == 0 ? 0.0089 : 0.017,  // A 5.9e-3 / 1.08e-2 (with the D3 fixes)
-        "gemma4moe_global" => row == 0 ? 0.0074 : 0.017,
         "nemotron_h" => chunks[0] is 1 or 64 ? 0 : row == 0 ? 0.015 : row == 1 && length == 96 ? 0.013 : 0,
         "nemotron_h_moe" => 0,
         "nemotron_h_q4k" => row == 0 ? 0.0036 : 0.021,
@@ -380,10 +364,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     [InlineData("qwen35moe", 97)]
     [InlineData("qwen35", 96)]
     [InlineData("qwen35", 97)]
-    [InlineData("gemma4moe", 96)]
-    [InlineData("gemma4moe", 97)]
-    [InlineData("gemma4moe_global", 96)]
-    [InlineData("gemma4moe_global", 97)]
     [InlineData("nemotron_h", 96)]
     [InlineData("nemotron_h", 97)]
     [InlineData("nemotron_h_moe", 96)]
@@ -425,8 +405,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         ["gptoss"] = (0.056, 0.032),     // 256-row chunks: 3.7e-2 / 1.1e-2..2.1e-2
         ["qwen35moe"] = (0, 0),
         ["qwen35"] = (0, 0),
-        ["gemma4moe"] = (0, 0),
-        ["gemma4moe_global"] = (0, 0),
         ["nemotron_h"] = (0, 0),
         ["nemotron_h_moe"] = (0, 0),
         ["nemotron_h_q4k"] = (0, 0),
@@ -437,8 +415,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     [InlineData("gptoss")]
     [InlineData("qwen35moe")]
     [InlineData("qwen35")]
-    [InlineData("gemma4moe")]
-    [InlineData("gemma4moe_global")]
     [InlineData("nemotron_h")]
     [InlineData("nemotron_h_moe")]
     [InlineData("nemotron_h_q4k")]
@@ -501,7 +477,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     [InlineData("gptoss")]
     [InlineData("qwen35moe")]
     [InlineData("qwen35")]
-    [InlineData("gemma4moe_global")]
     [InlineData("nemotron_h")]
     [InlineData("nemotron_h_moe")]
     public void RepeatedChunkedPrefill_Reproduces(string family)
@@ -518,132 +493,15 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         AssertReproduces($"{family} chunks [31,2,64]", runs, family);
     }
 
-    [CudaTheory]
-    [InlineData("gemma4moe")]
-    [InlineData("gemma4moe_global")]
-    public void DefaultDecode_Reproduces(string family)
-    {
-        // Gemma-4's default decode replays a captured decode graph from the third step. It must
-        // repeat bit for bit, inside the window too (20 + 10 tokens < 32). D3 (cause 1) failed it on
-        // the local/global file: the unweighted V/router norm kept ONE all-ones weight vector and
-        // reallocated it whenever the width changed, so a global layer freed it in the middle of
-        // the decode-graph capture, later captured kernels reused its block as scratch, and every
-        // replay read the previous replay's activations as the first layers' norm weights.
-        string path = WriteModel(family);
-        int[] prompt = Prompt(20), forced = Forced(10);
-        using var cuda = Load(path, BackendType.Cuda);
-        var runs = Enumerable.Range(0, 3).Select(_ => Trajectory(cuda, prompt, forced)).ToList();
-        AssertReproduces($"{family} default decode", runs, family);
-    }
-
-    /// <summary>Prompt lengths whose first trajectory's uncaptured decode steps rounded differently from their replays
-    /// before Gemma-4 ran those steps as the recorded kernel sequence (RTX PRO 6000 slice, sm_120: the all-global file
-    /// at 33, 510, 511 and 1023 tokens, the sliding-window file at 97 and 514; an A40 and an RTX PRO 4000 failed at
-    /// other lengths), with lengths on both sides of the 512-key attention tier, the 32-row window and 1024.</summary>
-    private static readonly int[] FirstDecodeLengths = { 17, 31, 33, 64, 97, 130, 257, 400, 510, 511, 512, 514, 600, 1023, 1025 };
-
-    [CudaTheory]
-    [InlineData("gemma4moe_global")]
-    [InlineData("gemma4moe")]
-    public void FirstDecodeSteps_MatchTheirReplays(string family)
-    {
-        // A fresh model runs a decode-graph key's first sighting uncaptured: its first decode step, and its first step
-        // past the 512-key attention tier when the trajectory crosses it. Those steps must compute what a replay of the
-        // same step computes, bit for bit. Before they ran the recorded kernel sequence they built their RoPE tables on
-        // the host (MathF.Cos/Sin against the graph's sincosf): a last-bit difference that the Q8_1 activations mostly
-        // round away, so a length showed it only where it flipped a rounding (one in a few dozen decode rows, at lengths
-        // that depend on the GPU: RepeatedPrefill_Reproduces caught it at 511 tokens on an A40 and an RTX PRO 6000,
-        // ForwardRefill_TracksSinglePass at 600 on an RTX PRO 4000). Hence many lengths, each on a fresh model.
-        string path = WriteModel(family);
-        int[] forced = Forced(8);
-        var differing = new List<string>();
-        foreach (int length in FirstDecodeLengths)
-        {
-            int[] prompt = Prompt(length);
-            using var cuda = Load(path, BackendType.Cuda);
-            List<float[]> first = Trajectory(cuda, prompt, forced);
-            List<float[]> replayed = Trajectory(cuda, prompt, forced);
-            AssertFinite(first, family);
-            int same = replayed.Select((row, i) => BitIdentical(row, first[i])).Count(x => x);
-            Report($"{family} {length}: second trajectory vs the first (bit-identical rows {same}/{first.Count})",
-                replayed.Select((row, i) => RelL2(row, first[i])));
-            if (same != first.Count)
-                differing.Add($"{length} ({first.Count - same} rows)");
-        }
-        Assert.True(differing.Count == 0,
-            $"{family}: the second trajectory differs from the first (whose uncaptured decode steps must match their replays) at {string.Join(", ", differing)} tokens");
-    }
-
-    [CudaTheory]
-    [InlineData("cuda", 97)]
-    [InlineData("cuda", 257)]
-    [InlineData("cpu", 97)]
-    [InlineData("cpu", 257)]
-    public void SlidingWindowRing_AfterAPrefillPastTheWindow_HoldsItsLastRows(string backend, int length)
-    {
-        // A prefill longer than the 32-row sliding window writes into the window's ring, where rows
-        // s and s + 32 share a slot and only the later may survive. Layer 0's K/V rows depend only
-        // on (token, position), so two prompts of the same length that share their last 32 tokens
-        // must leave bit-identical layer-0 rings (same GEMM shapes, so the same rounding too). D3
-        // (cause 2): every row was written at once and the CUDA copy kernel's threads (the managed
-        // Parallel.For too, more rarely) raced for each slot, so the ring kept an arbitrary mix of
-        // rows from different windows (97 tokens: 97-106 of 128 slots wrong, varying run to run).
-        string path = WriteModel("gemma4moe");
-        const int window = 32;
-        int[] a = Prompt(length), b = Prompt(length, salt: 7);
-        Array.Copy(a, length - window, b, length - window, window);
-        Assert.NotEqual(a[0], b[0]);
-        using var model = Load(path, backend == "cpu" ? BackendType.Cpu : BackendType.Cuda);
-        for (int repeat = 0; repeat < 3; repeat++)
-        {
-            model.ResetKVCache();
-            model.ForwardPrompt(a);
-            float[] ka = LayerCache(model, 0, value: false), va = LayerCache(model, 0, value: true);
-            model.ResetKVCache();
-            model.ForwardPrompt(b);
-            float[] kb = LayerCache(model, 0, value: false), vb = LayerCache(model, 0, value: true);
-            Assert.Equal(Gemma4MoeSyntheticModelBuilder.LocalKvHeads * window * Gemma4MoeSyntheticModelBuilder.LocalHeadDim, ka.Length);
-            Assert.Contains(ka, x => x != 0);
-            int kDiff = ka.Zip(kb, (x, y) => x != y).Count(d => d), vDiff = va.Zip(vb, (x, y) => x != y).Count(d => d);
-            _output.WriteLine($"{backend} {length} tokens, repeat {repeat}: layer-0 ring elements differing between the two prompts K {kDiff}/{ka.Length}, V {vDiff}/{va.Length}");
-            Assert.True(kDiff == 0 && vDiff == 0, $"{backend} {length} tokens: the layer-0 ring keeps rows from before the last window (K {kDiff}, V {vDiff} elements differ)");
-        }
-    }
-
-    /// <summary>Layer <paramref name="layer"/>'s K or V cache of a Gemma-4 model as floats (the host
-    /// mirror, synchronised from the device), read by reflection.</summary>
-    private static unsafe float[] LayerCache(ModelBase model, int layer, bool value)
-    {
-        var field = typeof(Gemma4Model).GetField(value ? "_kvCacheV" : "_kvCacheK",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("Gemma4Model's _kvCacheK/_kvCacheV were renamed: update LayerCache");
-        var tensor = ((TensorSharp.Tensor[])field.GetValue(model))[layer];
-        long n = tensor.ElementCount();
-        var result = new float[n];
-        if (tensor.ElementType == TensorSharp.DType.Float16)
-        {
-            ushort* p = TensorSharp.TensorComputePrimitives.GetHalfPointer(tensor);
-            for (long i = 0; i < n; i++) result[i] = (float)BitConverter.UInt16BitsToHalf(p[i]);
-        }
-        else
-        {
-            float* p = TensorSharp.TensorComputePrimitives.GetFloatPointer(tensor);
-            for (long i = 0; i < n; i++) result[i] = p[i];
-        }
-        return result;
-    }
-
     // ---- 5. snapshot restore ---------------------------------------------------------------
 
     // Qwen 3.5 runs on the shared decoder runtime, which keeps a recurrent model's state in per-request slots and
     // prefix checkpoints (Qwen35RuntimeTests.CheckpointsContinueExactly) rather than in extracted blocks.
     [CudaTheory]
     [InlineData("gptoss", "cuda")]
-    [InlineData("gemma4moe", "cuda")]
     [InlineData("nemotron_h", "cuda")]
     [InlineData("nemotron_h_moe", "cuda")]
     [InlineData("gptoss", "cpu")]
-    [InlineData("gemma4moe", "cpu")]
     [InlineData("nemotron_h", "cpu")]
     [InlineData("nemotron_h_moe", "cpu")]
     public void SnapshotRestore_ReproducesTheStraightRun(string family, string backend)
@@ -657,7 +515,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         // and the next forward's K/V append treated the cache as write-only, so the injected
         // rows never reached the device and attention ran over a zero prefix.
         string path = WriteModel(family);
-        int prefixLength = family.StartsWith("gemma4") ? 24 : 48;
+        int prefixLength = 48;
         int[] prompt = Prompt(prefixLength + 16);
         int[] forced = Forced(4);
         using var model = Load(path, backend == "cpu" ? BackendType.Cpu : BackendType.Cuda);
@@ -674,7 +532,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     [CudaTheory]
     [InlineData("gptoss", "cuda")]
-    [InlineData("gemma4moe", "cuda")]
     [InlineData("nemotron_h", "cuda")]
     [InlineData("nemotron_h_moe", "cuda")]
     public void SnapshotBlock_RoundTripsThroughInject(string family, string backend)
@@ -684,7 +541,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         // continuation reads after an inject (the device copies / host mirror the next forward
         // attends over), not in the block format or the copy into the cache.
         string path = WriteModel(family);
-        int prefixLength = family.StartsWith("gemma4") ? 24 : 48;
+        int prefixLength = 48;
         using var model = Load(path, backend == "cpu" ? BackendType.Cpu : BackendType.Cuda);
         model.ResetKVCache();
         model.ForwardPrompt(Prompt(prefixLength));
@@ -811,8 +668,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     {
         ["qwen35moe"] = 0.010,          // measured 4.5e-3..6.7e-3
         ["qwen35"] = 0.0037,            // 1.9e-3..2.4e-3 (BF16 GEMM rows vs BF16 matvec rows)
-        ["gemma4moe_global"] = 0.0087,  // 9e-8..5.8e-3, against the DEFAULT (graph) decode
-        ["gemma4moe"] = 0.017,          // past the window: 3.3e-3..1.1e-2 (cuda's decode row 11 is 9.4e-3 from ggml_cpu)
         ["nemotron_h"] = 1e-6,          // 7e-8..9.5e-8: the same arithmetic per row
         ["nemotron_h_moe"] = 1e-6,
         ["nemotron_h_q4k"] = 0.023,      // 6.2e-3..1.5e-2: Q4_K GEMM rows vs Q4_K matvec rows
@@ -844,8 +699,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     [CudaTheory]
     [InlineData("qwen35moe")]
     [InlineData("qwen35")]
-    [InlineData("gemma4moe_global")]
-    [InlineData("gemma4moe")]
     [InlineData("nemotron_h")]
     [InlineData("nemotron_h_moe")]
     [InlineData("nemotron_h_q4k")]
@@ -861,16 +714,10 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         string path = WriteModel(family);
         int[] prompt = Prompt(64);
         using var cuda = Load(path, BackendType.Cuda);
+        // No family here reports its routers' margins (the legacy Gemma 4 model did, RouteMarginHookForTest).
         var margins = new float[16];
         Array.Fill(margins, float.PositiveInfinity);
-        Gemma4Model.RouteMarginHookForTest = (model, rows, row, margin) =>
-        {
-            if (ReferenceEquals(model, cuda) && rows == margins.Length)
-                margins[row] = Math.Min(margins[row], margin);
-        };
-        VerifyResult result;
-        try { result = VerifyWindow(cuda, prompt[..48], prompt[48..64]); }
-        finally { Gemma4Model.RouteMarginHookForTest = null; }
+        VerifyResult result = VerifyWindow(cuda, prompt[..48], prompt[48..64]);
         Assert.True(result.AllRows, $"{family} is not a speculative target");
         AssertFinite(result.Window, family);
         var rel = result.Window.Select((row, i) => RelL2(row, result.Sequential[i])).ToList();
@@ -906,13 +753,12 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     /// <summary>Files whose greedy continuation depends on the history (the sliding-window Gemma
     /// and the tied dense Qwen files repeat their last token: the P0 review found the Gemma row
-    /// could not fail). gemma4moe here is the all-global context-sensitive file.</summary>
+    /// could not fail).</summary>
     private static readonly Dictionary<string, Func<string, string>> ContextFiles = new()
     {
         ["gptoss"] = p => GptOssSyntheticModelBuilder.SensitiveSinks().Write(p),
         ["qwen35moe"] = p => new Qwen35MoeSyntheticModelBuilder().Write(p),
         ["qwen35"] = p => Qwen35DenseSyntheticModelBuilder.ContextSensitive().Write(p),
-        ["gemma4moe"] = p => Gemma4MoeSyntheticModelBuilder.ContextSensitive().Write(p),
         ["nemotron_h"] = p => Nemotron("SFAFSF").Write(p),
         ["nemotron_h_moe"] = p => Nemotron("SMAMSM").Write(p),
     };
@@ -921,7 +767,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     [InlineData("gptoss", "cuda")]
     [InlineData("qwen35moe", "cuda")]
     [InlineData("qwen35", "cuda")]
-    [InlineData("gemma4moe", "cuda")]
     [InlineData("nemotron_h", "cuda")]
     [InlineData("nemotron_h_moe", "cuda")]
     [InlineData("qwen35moe", "cpu")]

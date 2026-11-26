@@ -112,6 +112,12 @@ namespace TensorSharp.Runtime
             // Per-model switches for the per-sequence path: one switch covers every model.
             ("TS_QWEN35_BATCHED", PerModelBatchedRemoved),
             ("TS_GEMMA4_BATCHED", PerModelBatchedRemoved),
+            // The legacy Gemma 4 model's switches (the model now runs on the shared decoder runtime).
+            ("TS_GGML_FUSED_PLE", Gemma4LegacyRemoved),
+            ("TS_GEMMA4_TP_FUSED_MOE", Gemma4LegacyRemoved),
+            ("TS_BATCHED_FUSED_MOE", Gemma4LegacyRemoved),
+            ("TS_GMTP_PROFILE", Gemma4LegacyRemoved),
+            ("TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL", Gemma4LegacyRemoved),
             ("TS_GPTOSS_BATCHED", PerModelBatchedRemoved),
             ("TS_NEMOTRON_BATCHED", PerModelBatchedRemoved),
             ("TS_HUNYUAN_BATCHED", PerModelBatchedRemoved),
@@ -270,7 +276,7 @@ namespace TensorSharp.Runtime
             ("FUSED_ATTN_LAYER_MIN_SEQ_LEN", MlxKernelSwitchRemoved),
             ("TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS", "every MLX model reads TS_MLX_EVAL_EVERY_N_LAYERS."),
             ("TS_MLX_MUSE_GLIMMER_EVAL_EVERY_N_LAYERS", "every MLX model reads TS_MLX_EVAL_EVERY_N_LAYERS."),
-            ("TS_MLX_GEMMA4_LOCAL_KV_MATERIALIZE_INTERVAL", "Gemma 4 reads TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL."),
+            ("TS_MLX_GEMMA4_LOCAL_KV_MATERIALIZE_INTERVAL", Gemma4LegacyRemoved),
             ("TS_MLX_MUSE_GLIMMER_KV_MATERIALIZE", MuseGlimmerLegacyRemoved),
             ("TS_MLX_PIPELINED_DECODE",
                 "the CLI benchmark always uses the pipelined greedy decode where the model supports it."),
@@ -341,9 +347,7 @@ namespace TensorSharp.Runtime
                 "Mistral 3 and Hunyuan Dense run the native paged attention on the GGML backends and the managed one elsewhere."),
             ("TS_STRUCTURED_STREAM_BUFFER",
                 "json_object streams incrementally and only json_schema buffers the whole response."),
-            ("TS_GEMMA4_BATCHED_CAPS",
-                "Gemma 4's token-batched decode always covers per-layer embeddings, shared-KV layers and a wrapped "
-                + "sliding window; TS_BATCHED_FUSED_DECODE=0 decodes concurrent requests round-robin instead."),
+            ("TS_GEMMA4_BATCHED_CAPS", Gemma4LegacyRemoved),
             ("TS_BATCHED_N1_FAST_PATH",
                 "a lone request always takes the model's fused single-sequence decode where the model supports it; "
                 + "the switch was removed."),
@@ -729,6 +733,10 @@ namespace TensorSharp.Runtime
 
         private const string GptOssSwitchRemoved =
             "GPT-OSS always takes its fused and batched paths where the backend supports them; the switch was removed.";
+
+        private const string Gemma4LegacyRemoved =
+            "Gemma 4 runs on the shared decoder runtime on every backend (its batched steps, prefix cache, placements "
+            + "and speculation are the runtime's); the legacy Gemma 4 model that read it was removed.";
 
         private const string MuseGlimmerLegacyRemoved =
             "Muse-Glimmer runs on the shared decoder runtime on every backend, MLX included; the legacy Muse-Glimmer model "

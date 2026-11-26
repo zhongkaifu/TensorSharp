@@ -1,12 +1,14 @@
-// Gemma 4 runtime-migration A/B tool: the legacy Gemma4Model and the shared-runtime Gemma4RuntimeModel in one binary.
+// Gemma 4 validation tool for the shared-runtime Gemma4RuntimeModel (it held the runtime to the legacy Gemma4Model on real
+// checkpoints during the migration, before the legacy model was deleted).
 //
 //   --scenario greedy  --prompts <file, one user prompt a line> --steps N      greedy text, per-step top-5 log-probabilities
 //   --scenario nll     --text <raw text> [--prefix 64] [--steps N]             teacher-forced NLL / perplexity (decode path)
 //   --scenario bench   [--bench-prefill 512 --bench-decode 128 --bench-runs 3] the CLI's --benchmark procedure
-//   --scenario parity  --prompts <file> --steps N                              both families in this process: the legacy argmax
-//                                                                              teacher-forced through both, logits compared per step
-// Common: --model <gguf> --backend ggml_cuda|cuda|ggml_cpu|cpu|... --family legacy|runtime [--tp N] [--layer-split N]
-//         [--mmproj <file>] [--image <file>] [--out report.json]
+//   --scenario spec    --prompts <file> --steps N [--drafter head|ngram] [--draft-model <gemma4-assistant gguf>] [--draft-window 3]
+//                                                                              plain greedy against greedy speculation
+//   --scenario verify  --prompts <file> --steps N [--draft-window 4]           verify windows against the plain steps
+// Common: --model <gguf> --backend ggml_cuda|cuda|ggml_cpu|cpu|... [--tp N] [--layer-split N] [--out report.json]
+// TS_N_CPU_MOE / TS_CPU_MOE and KV_CACHE_DTYPE apply as the CLI and server apply them.
 // Reports are JSON (write them under the ignored artifacts/ or docs/validation/).
 using System.Diagnostics;
 using System.Text.Json;
@@ -26,7 +28,7 @@ string Option(string name, string? fallback)
 string modelPath = Option("--model", null);
 string backendName = Option("--backend", "ggml_cuda");
 string scenario = Option("--scenario", "greedy");
-string family = Option("--family", "runtime");
+string family = "runtime";
 string output = Option("--out", $"artifacts/gemma4-ab/{scenario}-{family}.json");
 int steps = int.Parse(Option("--steps", "128"));
 int tp = int.Parse(Option("--tp", "1"));
@@ -45,15 +47,13 @@ string drafter = Option("--drafter", "head");
 if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath)) throw new ArgumentException("Pass --model <gemma4 gguf>.");
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
     throw new ArgumentException($"Unknown backend '{backendName}'.");
-if (family is not ("legacy" or "runtime")) throw new ArgumentException("--family legacy|runtime");
 MoeCpuOffloadConfig.ConfigureFromEnvironment();   // TS_N_CPU_MOE / TS_CPU_MOE, as the CLI and server apply them
+KvCacheDtypeConfig.ConfigureFromEnvironment();   // KV_CACHE_DTYPE
 
 ModelBase Load(string which)
 {
     var sw = Stopwatch.StartNew();
-    ModelBase m = which == "legacy"
-        ? new Gemma4Model(modelPath, backend, tp)
-        : Gemma4Architecture.CreateRuntimeModel(modelPath, backend, tp, null, layerSplit, draftModel);
+    ModelBase m = Gemma4Architecture.CreateRuntimeModel(modelPath, backend, tp, null, layerSplit, draftModel);
     Console.WriteLine($"[ab] {which}: {m.GetType().Name} loaded in {sw.Elapsed.TotalMilliseconds:F0} ms (kv {m.KvCacheDtype})");
     return m;
 }
@@ -63,6 +63,13 @@ int Argmax(float[] logits, int vocab)
     int best = 0;
     for (int i = 1; i < vocab; i++) if (logits[i] > logits[best]) best = i;
     return best;
+}
+
+double RelL2(float[] a, float[] b)
+{
+    double num = 0, den = 0;
+    for (int i = 0; i < a.Length; i++) { double d = a[i] - b[i]; num += d * d; den += (double)b[i] * b[i]; }
+    return Math.Sqrt(num / den);
 }
 
 (int Id, double LogProb)[] Top(float[] logits, int vocab, int k)
@@ -252,7 +259,9 @@ switch (scenario)
         int vocab = m.Config.VocabSize, w = draftWindow;
         foreach (string p in Prompts())
         {
-            int[] prompt = Render(m, p);
+            int[] prompt = textFile != null
+                ? m.Tokenizer.Encode(File.ReadAllText(textFile), addSpecial: true).Take(prefix).ToArray()
+                : Render(m, p);
             float[] logits = Prefill(m, prompt);
             var plainLogits = new List<float[]> { (float[])logits.Clone() };
             var tokens = new List<int>();
@@ -262,6 +271,22 @@ switch (scenario)
                 tokens.Add(next);
                 logits = m.Forward(new[] { next });
                 plainLogits.Add((float[])logits.Clone());
+            }
+            {
+                // A verify window (all rows' logits) then plain steps: each plain step's logits against the plain run's.
+                Prefill(m, prompt);
+                var rowsOut = new float[w * vocab];
+                target.SpecForward(tokens.GetRange(0, w).ToArray(), null, rowsOut, allLogitsRows: true);
+                target.SpecOnVerifyAccepted(w - 1, w - 1);
+                var parts = new List<string>();
+                for (int j = 0; j < w; j++)
+                    parts.Add($"v{j}:{RelL2(rowsOut.AsSpan(j * vocab, vocab).ToArray(), plainLogits[j + 1]):E1}");
+                for (int i = w; i < Math.Min(tokens.Count, w + 6); i++)
+                {
+                    float[] after = m.Forward(new[] { tokens[i] });
+                    parts.Add($"d{i}:{RelL2(after, plainLogits[i + 1]):E1}");
+                }
+                Console.WriteLine($"[ab] verify-then-decode {family} prompt {prompt.Length} tokens, window {w}: {string.Join(" ", parts)}");
             }
             foreach (bool rewinds in new[] { false, true })
             {
@@ -296,43 +321,6 @@ switch (scenario)
         }
         report = new { Scenario = scenario };
         m.Dispose();
-        break;
-    }
-    case "parity":
-    {
-        ModelBase legacy = Load("legacy");
-        ModelBase runtime = Load("runtime");
-        int vocab = legacy.Config.VocabSize;
-        var results = new List<object>();
-        foreach (string p in Prompts())
-        {
-            int[] prompt = Render(legacy, p);
-            float[] a = Prefill(legacy, prompt), b = Prefill(runtime, prompt);
-            var rows = new List<object>();
-            int agree = 0, n = 0;
-            double worstCos = 1, worstRel = 0;
-            for (int i = 0; i < steps; i++)
-            {
-                (double cos, double rel, double maxAbs) = Compare(a, b, vocab);
-                int la = Argmax(a, vocab), lb = Argmax(b, vocab);
-                var topA = Top(a, vocab, 5);
-                double margin = topA[0].LogProb - topA[1].LogProb;
-                n++;
-                if (la == lb) agree++;
-                worstCos = Math.Min(worstCos, cos);
-                worstRel = Math.Max(worstRel, rel);
-                rows.Add(new { Step = i, Cos = cos, Rel = rel, MaxAbs = maxAbs, Legacy = la, Runtime = lb, LegacyMargin = margin,
-                    RuntimeLogProbOfLegacy = LogProbAt(b, vocab, la), LegacyLogProb = topA[0].LogProb });
-                if (legacy.Tokenizer.IsEos(la) || i + 1 == steps) break;
-                a = legacy.Forward(new[] { la });
-                b = runtime.Forward(new[] { la });
-            }
-            Console.WriteLine($"[ab] parity prompt {results.Count}: {prompt.Length} tokens, {n} steps, argmax agree {agree}/{n}, worst cos {worstCos:F6}, worst rel L2 {worstRel:E3}");
-            results.Add(new { Prompt = p, PromptTokens = prompt.Length, Agree = agree, Steps = n, WorstCos = worstCos, WorstRel = worstRel, Rows = rows });
-        }
-        report = new { Scenario = scenario, Model = modelPath, Backend = backend.ToString(), Results = results };
-        legacy.Dispose();
-        runtime.Dispose();
         break;
     }
     default:

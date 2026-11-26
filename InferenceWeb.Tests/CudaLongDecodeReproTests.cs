@@ -62,7 +62,7 @@ public class CudaLongDecodeReproTests
 
         string mmproj = Environment.GetEnvironmentVariable("TS_REPRO_MMPROJ");
         _output.WriteLine($"[repro] backend={backend} model={modelPath} steps={steps} prompt={promptText} mmproj={mmproj}");
-        var model = (Gemma4Model)ModelBase.Create(modelPath, backend);
+        var model = ModelBase.Create(modelPath, backend);
         try
         {
             if (!string.IsNullOrWhiteSpace(mmproj) && File.Exists(mmproj))
