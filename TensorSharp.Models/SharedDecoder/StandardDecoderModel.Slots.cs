@@ -33,6 +33,7 @@ namespace TensorSharp.Models
             public Tensor[][] V;
             public int Capacity;
             public int Length;
+            public int Touched = int.MaxValue;     // positions its writes reached since its last zero (see _cacheTouched)
             public RecurrentState[][] Recurrent;   // [layer][rank]; hybrid stacks only
             public float[] Logits;                 // reused by batched steps
             public bool DeviceDirty;               // a graph wrote its rows/state in device memory
@@ -332,6 +333,7 @@ namespace TensorSharp.Models
             V = _cacheV,
             Capacity = _cacheCapacity,
             Length = _cacheSeqLen,
+            Touched = _cacheTouched,
             Recurrent = _recurrentPrimary,
             DeviceDirty = _cacheDeviceDirty,
             DraftStart = _draftStart,
@@ -346,6 +348,7 @@ namespace TensorSharp.Models
             _cacheV = slot.V;
             _cacheCapacity = slot.Capacity;
             _cacheSeqLen = slot.Length;
+            _cacheTouched = slot.Touched;
             _recurrentPrimary = slot.Recurrent;
             _cacheDeviceDirty = slot.DeviceDirty;
             _draftStart = slot.DraftStart;
@@ -798,6 +801,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void EnsureSlotCapacity(Slot slot, int required, bool reservation = false, int wanted = 0)
         {
+            if (required > slot.Touched) slot.Touched = required;
             if (required <= slot.Capacity) return;
             if (required > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");

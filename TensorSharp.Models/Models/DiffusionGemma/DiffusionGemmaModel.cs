@@ -49,7 +49,6 @@ namespace TensorSharp.Models
         private bool _promptKv = true;
         private bool _prefilling;
         private float[] _iota;
-        private float[] _logitsCopy;
         private readonly PromptCache _ownCache = new();
         private int _nextSequence;
 
@@ -220,7 +219,7 @@ namespace TensorSharp.Models
 
         /// <summary>The canvas logits [C, vocab] (softcapped) of one step after the prefilled prompt. Self-conditioning reads
         /// <paramref name="scPrevLogits"/> (the previous step's logits) when <paramref name="scUse"/> is not 0. The returned
-        /// buffer is reused by the next step, after that step has read its self-conditioning from it.</summary>
+        /// buffer may be reused by the next step (a replayed graph's), after that step has read its self-conditioning from it.</summary>
         public float[] DecodeCanvas(int[] canvasTokens, float[] scPrevLogits, float scUse, float prevTempInv)
             => CanvasLogits(null, canvasTokens, SoftEmbeddingFromLogits(scPrevLogits, scUse, prevTempInv, canvasTokens.Length));
 
@@ -261,14 +260,10 @@ namespace TensorSharp.Models
                     out StepOutputs outputs, out owned, "diffusion-canvas");
                 long tr = Stopwatch.GetTimestamp();
                 float[] logits = graph.Outputs[outputs.Logits];
-                if (owned)
-                {
-                    // The graph goes with this call: its logits are copied into the buffer the next step reuses.
-                    long total = (long)rows * vocab;
-                    if (_logitsCopy == null || _logitsCopy.LongLength != total) _logitsCopy = new float[total];
-                    Array.Copy(logits, _logitsCopy, total);
-                    logits = _logitsCopy;
-                }
+                // A graph that goes with this call (a streamed step) read its logits into an array of their own, which no
+                // later step writes: it is the answer as it stands. Copied, every pure-C# step moved 268 MB once more.
+                long total = (long)rows * vocab;
+                if (owned && logits.LongLength != total) logits = logits.AsSpan(0, checked((int)total)).ToArray();
                 _tRead += Stopwatch.GetTimestamp() - tr;
                 _canvasSteps++;
                 return logits;

@@ -1110,12 +1110,14 @@ namespace TensorSharp.Models
         /// decoder runtime's K/V), so GgmlCuda keeps its device copy too, as GgmlVulkan and GgmlMetal always do: dropping it
         /// freed and re-allocated every cache's device memory and uploaded the host bytes again on the next step (LFM3-1.7B at
         /// 8K: 35 buffers and ~100 MB, 13 ms of the next 512-token prompt on an A40).</param>
-        protected void ResetCacheTensor(Tensor tensor, bool keepDeviceCopy = false)
+        /// <param name="zeroFill">False where the caller zeroed the rows it wrote itself (the shared decoder runtime's
+        /// caches, which keep their written rows' extent).</param>
+        protected void ResetCacheTensor(Tensor tensor, bool keepDeviceCopy = false, bool zeroFill = true)
         {
             if (tensor == null)
                 return;
 
-            if (ShouldZeroFillCacheTensors)
+            if (zeroFill && ShouldZeroFillCacheTensors)
                 Ops.Fill(tensor, 0f);
 
             // On GgmlVulkan/Metal keep the resident device copy VALID across

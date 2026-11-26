@@ -310,6 +310,28 @@ namespace TensorSharp.Models
             CacheZeroFillBytes += t.Storage.ByteLength / cells * (cells - from);
         }
 
+        /// <summary>A reset of one active cache tensor: zero (where the backend zeroes reset caches) the cells
+        /// <see cref="_cacheTouched"/> positions reach, a ring's whole once they pass its cells.</summary>
+        private void ResetCacheRows(Tensor t)
+        {
+            if (t == null) return;
+            long cells = t.Sizes[1];
+            // A block-quantized cache fills whole (its row ranges are not a fill the backends take).
+            if (!ShouldZeroFillCacheTensors || _cacheTouched >= cells || t.ElementType is not (DType.Float32 or DType.Float16))
+            {
+                ResetCacheTensor(t, keepDeviceCopy: true);
+                return;
+            }
+            if (_cacheTouched > 0)
+                for (long h = 0; h < t.Sizes[0]; h++)
+                {
+                    using Tensor head = t.Narrow(0, h, 1);
+                    using Tensor rows = head.Narrow(1, 0, _cacheTouched);
+                    Ops.Fill(rows, 0f);
+                }
+            ResetCacheTensor(t, keepDeviceCopy: true, zeroFill: false);
+        }
+
         /// <summary>The extra key cache of <paramref name="layer"/> in <paramref name="k"/> (a slot's K array), or null.</summary>
         private protected Tensor ExtraKeyCache(Tensor[][] k, int layer, int rank = 0)
         {
@@ -452,6 +474,7 @@ namespace TensorSharp.Models
 
         /// <summary>The K caches as [layer][rank], for tests that check placement.</summary>
         internal Tensor[][] KeyCachesForTests => _cacheK;
+        internal Tensor[][] ValueCachesForTests => _cacheV;
 
         /// <summary>The ggml type a loaded quantized weight is held in (-1: not a quantized weight).</summary>
         internal int QuantizedWeightTypeForTests(string name) => _quantWeights.TryGetValue(name, out QuantizedWeight w) ? w.GgmlType : -1;
@@ -727,10 +750,21 @@ namespace TensorSharp.Models
             InitRingCaches();
             (_cacheK, _cacheV) = AllocateCaches(initial);
             _cacheSeqLen = 0;
+            _cacheTouched = 0;
         }
+
+        /// <summary>
+        /// Positions [0, this) of the active cache may hold rows written since its last zero (every write past them grows the
+        /// cache's reach through <see cref="EnsureCacheCapacity"/> first); a reset zeroes only those. Zeroed whole, the pure-C#
+        /// backend's full-context cache (262,144 cells: DiffusionGemma's five global layers alone are gigabytes) cost every new
+        /// prompt over a second. A cache whose writes were not followed (a slot the active fields never held) is
+        /// <see cref="int.MaxValue"/>: all of it.
+        /// </summary>
+        private int _cacheTouched;
 
         private void EnsureCacheCapacity(int required)
         {
+            if (required > _cacheTouched) _cacheTouched = required;
             if (required <= _cacheCapacity)
                 return;
             if (required > _maxContextLength)
@@ -795,8 +829,10 @@ namespace TensorSharp.Models
             _forwardCount = 0;
             _forwardSw.Reset();
             // Rows past the length are masked out of every read: the device copies stay (no re-upload on the next step).
-            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t, keepDeviceCopy: true);
-            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t, keepDeviceCopy: true);
+            // Where the backend zeroes a reset cache, only the rows written since its last zero are (the rest still are).
+            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheRows(t);
+            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheRows(t);
+            _cacheTouched = 0;
             ResetRecurrentPrimary();
             // Rows past the length are dead and the states were rewritten on the host.
             _cacheDeviceDirty = false;

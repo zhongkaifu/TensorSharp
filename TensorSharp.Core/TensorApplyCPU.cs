@@ -731,7 +731,8 @@ namespace TensorSharp
             // AccessViolationException during KV-cache zero-init. Mirror the
             // GGML backend's contiguous F16/Q8_0 fast paths so non-F32 caches
             // can be filled safely on the managed CPU backend.
-            if (result.ElementType == DType.Float16 && IsContiguousNonNarrowed(result))
+            // A contiguous range of rows (a cache head's written cells, narrowed) fills from its first element.
+            if (result.ElementType == DType.Float16 && IsContiguousView(result))
             {
                 ushort halfBits = BitConverter.HalfToUInt16Bits((System.Half)value);
                 ushort* halfBuffer = (ushort*)CpuNativeHelpers.GetBufferStart(result);
@@ -772,7 +773,7 @@ namespace TensorSharp
 
             if (result.ElementType != DType.Float32)
                 throw new NotSupportedException(
-                    $"Fill on {result.ElementType} tensors requires a contiguous, non-narrowed layout.");
+                    $"Fill on {result.ElementType} tensors requires a contiguous layout (F16: or a contiguous row range).");
 
 			unsafe void func(float* r)
 			{
@@ -781,6 +782,18 @@ namespace TensorSharp
 
 			Apply1(result, func);
 		}
+
+        // Row-major contiguous from the view's first element; a storage offset is allowed.
+        private static bool IsContiguousView(Tensor t)
+        {
+            long expected = 1;
+            for (int d = t.DimensionCount - 1; d >= 0; d--)
+            {
+                if (t.Sizes[d] != 1 && t.Strides[d] != expected) return false;
+                expected *= t.Sizes[d];
+            }
+            return true;
+        }
 
         private static bool IsContiguousNonNarrowed(Tensor t)
         {

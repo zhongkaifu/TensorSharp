@@ -44,10 +44,11 @@ namespace TensorSharp.GGML
             // Float16 KV-cache initialization path. The F16 KV cache is always allocated
             // contiguous (head, seqLen, headDim) by the model, so we fill it as a flat
             // ushort[]. value=0 is the common reset case which becomes a plain memset.
+            // A contiguous range of rows (a cache head's written cells, narrowed) fills the same way from its first element.
             if (result.ElementType == DType.Float16)
             {
-                if (!IsContiguousNonNarrowed(result))
-                    throw new NotSupportedException("Fill on Float16 GGML tensors requires a contiguous, non-narrowed tensor (used for KV-cache reset).");
+                if (!IsContiguousView(result))
+                    throw new NotSupportedException("Fill on Float16 GGML tensors requires a contiguous tensor or row range (used for KV-cache reset).");
                 ushort halfBits = System.BitConverter.HalfToUInt16Bits((System.Half)value);
                 ushort* halfBuffer = (ushort*)GetBufferStart(result);
                 long elementCount = result.ElementCount();
