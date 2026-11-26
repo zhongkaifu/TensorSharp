@@ -238,6 +238,8 @@ Measured on one A40 (`diffusiongemma-26B-A4B-it-Q4_K_M.gguf`, ggml d9fe7bff,
 | `cuda`: canvas step, host sampling | 1.67–1.76 s | 0.92–0.95 s |
 | `cpu` (host of the A40 VM): 64-token prompt prefill (warm) | 0.65–0.70 s | 0.69–0.71 s |
 | `cpu`: canvas step, host sampling | 2.79–2.89 s | 2.58–2.82 s |
+| `ggml_cpu`: 64-token prompt prefill (warm) | — (no prompt cache) | 0.92–1.07 s |
+| `ggml_cpu`: canvas step, host sampling | 5.97–7.30 s | 3.31–3.55 s |
 
 The `cpu` rows are interleaved runs on a shared host (load average 11-13), two pairs. On
 `cpu` the models allocate through a recycling allocator (a step's vocabulary-wide
