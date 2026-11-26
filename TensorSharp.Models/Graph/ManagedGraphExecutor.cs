@@ -826,6 +826,54 @@ namespace TensorSharp.Models.Graph
             return result;
         }
 
+        /// <summary>
+        /// Every routed expert's product in one batched dispatch (<see cref="ManagedQuantizedOps.TryAddmmQuantizedBatch"/>: the
+        /// activations quantized once, the experts cut into column slices sized from the batch's work so a hot expert is not the
+        /// fork/join's straggler), where the per-expert loop had taken a pool fork/join per expert, most of them a few rows wide
+        /// (a 256-row DiffusionGemma canvas routes about 16 rows to each of 128 experts a layer). Row for row the dense call's
+        /// dot products; other formats and F32 products take the loop.
+        /// </summary>
+        protected override unsafe Tensor ExpertProducts(IGraphExpertWeights set, Tensor rows, int[] offsets, RunState run)
+        {
+            int experts = offsets.Length - 1, routes = (int)rows.Sizes[0];
+            IGraphWeight first = null;
+            int active = 0;
+            for (int e = 0; e < experts; e++)
+            {
+                if (offsets[e + 1] == offsets[e]) continue;
+                IGraphWeight w = set.Expert(e);
+                first ??= w;
+                if (w.Data == IntPtr.Zero || w.Format != first.Format || w.Ne0 != first.Ne0 || w.Ne1 != first.Ne1)
+                    return base.ExpertProducts(set, rows, offsets, run);
+                active++;
+            }
+            if (FloatProducts || first == null || active < 2 || !rows.IsContiguous() || rows.Sizes[1] != first.Ne0)
+                return base.ExpertProducts(set, rows, offsets, run);
+            int inDim = (int)first.Ne0, outDim = (int)first.Ne1;
+            SetStepWidth(routes);
+            var result = new Tensor(Allocator, DType.Float32, routes, outDim);
+            float* x = TensorComputePrimitives.GetFloatPointer(rows), y = TensorComputePrimitives.GetFloatPointer(result);
+            long rowBytes = ManagedQuantizedOps.RowSize(first.Format, inDim);
+            long perItem = Math.Max(1, (long)routes * outDim / Math.Max(1, CpuWorkerPool.Shared.ThreadCount * 4));
+            var jobs = new System.Collections.Generic.List<ManagedQuantizedOps.QuantMatMulJob>(active * 2);
+            for (int e = 0; e < experts; e++)
+            {
+                int count = offsets[e + 1] - offsets[e];
+                if (count == 0) continue;
+                long work = (long)count * outDim;
+                int pieces = (int)Math.Clamp((work + perItem - 1) / perItem, 1, Math.Max(1, outDim / 64));
+                int colsPer = (outDim + pieces - 1) / pieces;
+                IntPtr weights = set.Expert(e).Data;
+                for (int c0 = 0; c0 < outDim; c0 += colsPer)
+                    jobs.Add(new ManagedQuantizedOps.QuantMatMulJob(weights + (nint)(c0 * rowBytes), (IntPtr)(x + (long)offsets[e] * inDim),
+                        (IntPtr)(y + (long)offsets[e] * outDim + c0), Math.Min(colsPer, outDim - c0), count, outDim));
+            }
+            if (ManagedQuantizedOps.TryAddmmQuantizedBatch(first.Format, inDim, inDim, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(jobs)))
+                return result;
+            result.Dispose();
+            return base.ExpertProducts(set, rows, offsets, run);
+        }
+
         /// <summary>Rows of a weight one parallel chunk of <see cref="DequantizeValues"/> takes at least.</summary>
         private const long DequantizeChunkRows = 16;
 

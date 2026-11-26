@@ -2466,30 +2466,48 @@ namespace TensorSharp.Graph
             Tensor bc = Contig(b, run);
             using Tensor b2 = bc.View(nb[1] * rows, nb[0]);
 
-            var byExpert = new List<int>[set.Ne2];
-            for (int t = 0; t < rows; t++)
-                for (int j = 0; j < k; j++)
-                    (byExpert[selected[t * k + j]] ??= new List<int>()).Add(t * k + j);
-            var pieces = new List<Tensor>();
-            var inverse = new int[rows * k];
-            int at = 0;
-            for (int e = 0; e < byExpert.Length; e++)
+            // The routes sorted by expert (counting sort, routes in order within an expert), their rows gathered once, every
+            // expert's product over its run of them (ExpertProducts), then back in route order.
+            int experts = (int)set.Ne2, routes = rows * k;
+            var offsets = new int[experts + 1];
+            for (int i = 0; i < routes; i++) offsets[selected[i] + 1]++;
+            for (int e = 0; e < experts; e++) offsets[e + 1] += offsets[e];
+            var next = (int[])offsets.Clone();
+            var sourceRows = new int[routes];
+            var inverse = new int[routes];
+            for (int i = 0; i < routes; i++)
             {
-                if (byExpert[e] == null) continue;
-                int[] slots = byExpert[e].ToArray();
-                int[] sourceRows = slots.Select(s => nb[1] == 1 ? s / k : s).ToArray();
-                Tensor idx = IntTensor(sourceRows, new long[] { sourceRows.Length }, run);
-                Tensor xs = run.Keep(Ops.IndexSelect(null, b2, idx));
-                pieces.Add(run.Keep(ExpertMatMul(set, e, xs)));
-                foreach (int s in slots) inverse[s] = at++;
+                int at = next[selected[i]]++;
+                sourceRows[at] = nb[1] == 1 ? i / k : i;
+                inverse[i] = at;
             }
-            Tensor sorted = pieces.Count == 1 ? pieces[0] : run.Keep(Ops.Concat(null, 0, pieces.ToArray()));
-            Tensor order = IntTensor(inverse, new long[] { inverse.Length }, run);
+            Tensor idx = IntTensor(sourceRows, new long[] { routes }, run);
+            Tensor xs = run.Keep(Ops.IndexSelect(null, b2, idx));
+            Tensor sorted = run.Keep(ExpertProducts(set, xs, offsets, run));
+            Tensor order = IntTensor(inverse, new long[] { routes }, run);
             Tensor flat = run.Keep(Ops.IndexSelect(null, sorted, order));
             return flat.View(rows, k, set.Ne1);
         }
 
         private static long[] Ids(Value v) => Ne(v.Tensor);
+
+        /// <summary>
+        /// The routed experts' products of a <see cref="GraphOp.MulMatId"/>: <paramref name="rows"/> [routes, Ne0] sorted by
+        /// expert, expert e's run being rows [offsets[e], offsets[e + 1]); returns [routes, Ne1] in the same order. Default: each
+        /// expert's run through <see cref="ExpertMatMul"/> on its own. An executor with a batched kernel runs them together.
+        /// </summary>
+        protected virtual Tensor ExpertProducts(IGraphExpertWeights set, Tensor rows, int[] offsets, RunState run)
+        {
+            var pieces = new List<Tensor>();
+            for (int e = 0; e + 1 < offsets.Length; e++)
+            {
+                int count = offsets[e + 1] - offsets[e];
+                if (count == 0) continue;
+                using Tensor slice = rows.Narrow(0, offsets[e], count);
+                pieces.Add(run.Keep(ExpertMatMul(set, e, Contig(slice, run))));
+            }
+            return pieces.Count == 1 ? pieces[0] : run.Keep(Ops.Concat(null, 0, pieces.ToArray()));
+        }
 
         /// <summary>
         /// <see cref="GraphOp.MoeHostExperts"/> on any tensor executor: x [rows, hidden], the router's top-K ids and
