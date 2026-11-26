@@ -584,7 +584,8 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- the draft head
 
-        public DraftHeadKind DraftHeadKind => HasDFlash || FamilyDrafter != null ? DraftHeadKind.Block : HasDraftLayer ? DraftHeadKind.PerToken : DraftHeadKind.None;
+        public DraftHeadKind DraftHeadKind => HasDFlash || FamilyDrafter != null ? DraftHeadKind.Block
+            : HasDraftLayer || FamilyTokenDrafter != null ? DraftHeadKind.PerToken : DraftHeadKind.None;
 
         public int DraftBlockSize => HasDFlash ? DFlashSettings.MaxDraftTokens : FamilyDrafter?.DraftTokens ?? 0;
 
@@ -608,6 +609,8 @@ namespace TensorSharp.Models
                 DFlashCommit(tokens, hRows, startPos);
                 return;
             }
+            // A family token drafter keeps no rows: the trunk's caches are its context.
+            if (FamilyTokenDrafter != null) return;
             if (!HasDraftLayer) throw new InvalidOperationException($"{Config.Architecture} has no draft head.");
             DraftLayerCatchUp(tokens, hRows, startPos);
         }

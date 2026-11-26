@@ -575,6 +575,7 @@ namespace TensorSharp.Models
                 if (multiDevice)
                     ApplyModelAlignedKvCacheDefaultFromMetadata();
                 BuildMesh(executionIdentity);
+                ValidateSharedKvStages();
                 LoadWeights();
                 FuseProjections();
                 DetectMoeLayers();

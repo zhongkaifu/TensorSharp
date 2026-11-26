@@ -13,6 +13,7 @@ using System.Text.Json;
 using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Speculative;
 
 string Option(string name, string? fallback)
 {
@@ -38,11 +39,14 @@ int benchDecode = int.Parse(Option("--bench-decode", "128"));
 int benchRuns = int.Parse(Option("--bench-runs", "3"));
 bool refill = !args.Contains("--no-refill");
 string? draftModel = Option("--draft-model", null);
+int draftWindow = int.Parse(Option("--draft-window", "3"));
+string drafter = Option("--drafter", "head");
 
 if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath)) throw new ArgumentException("Pass --model <gemma4 gguf>.");
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
     throw new ArgumentException($"Unknown backend '{backendName}'.");
 if (family is not ("legacy" or "runtime")) throw new ArgumentException("--family legacy|runtime");
+MoeCpuOffloadConfig.ConfigureFromEnvironment();   // TS_N_CPU_MOE / TS_CPU_MOE, as the CLI and server apply them
 
 ModelBase Load(string which)
 {
@@ -186,6 +190,111 @@ switch (scenario)
             runs.Add(new { PrefillMs = prefillMs, PrefillTokPerSec = pp, DecodeMs = decodeMs, DecodeTokPerSec = tg, First = produced.Take(16).ToArray() });
         }
         report = new { Scenario = scenario, Family = family, Model = modelPath, Backend = backend.ToString(), Tp = tp, Prefill = benchPrefill, Decode = benchDecode, Runs = runs };
+        m.Dispose();
+        break;
+    }
+    case "spec":
+    {
+        // Plain greedy against greedy speculation (the gemma4-assistant head, --drafter head, or n-gram drafts): the same
+        // tokens (a part only at a near-tie), the drafts' acceptance and the decode rate.
+        ModelBase m = Load(family);
+        if (drafter == "head")
+        {
+            if (draftModel == null) throw new ArgumentException("--drafter head needs --draft-model <gemma4-assistant gguf>.");
+            if (!((IDraftHead)m).HasDraftHead) ((IAttachableDraftHead)m).LoadMtpDraftWeights(draftModel);
+        }
+        var target = (ISpeculativeModel)m;
+        if (target.SpeculationRefusal is { } refusal) throw new InvalidOperationException(refusal);
+        int vocab = m.Config.VocabSize;
+        var results = new List<object>();
+        foreach (string p in Prompts())
+        {
+            int[] prompt = Render(m, p);
+            float[] logits = Prefill(m, prompt);
+            var plain = new List<int>();
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < steps; i++)
+            {
+                int next = Argmax(logits, vocab);
+                plain.Add(next);
+                if (m.Tokenizer.IsEos(next) || i + 1 == steps) break;
+                logits = m.Forward(new[] { next });
+            }
+            double plainMs = sw.Elapsed.TotalMilliseconds;
+            ISpeculator speculator = drafter == "head"
+                ? new DraftHeadSpeculator(target, vocab, target.SpecFeatureSize, draftWindow)
+                : new NGramSpeculator(draftWindow);
+            var decoder = new SpeculativeDecoder(target, speculator);
+            sw.Restart();
+            List<int> ids = decoder.GenerateGreedy(prompt, steps, t => m.Tokenizer.IsEos(t));
+            double specMs = sw.Elapsed.TotalMilliseconds - decoder.LastPrefillSeconds * 1000;
+            int agree = 0;
+            while (agree < Math.Min(plain.Count, ids.Count) && plain[agree] == ids[agree]) agree++;
+            double acceptance = decoder.TokensDrafted > 0 ? decoder.TokensAccepted / (double)decoder.TokensDrafted : 0;
+            double plainRate = (plain.Count - 1) / (plainMs / 1000.0), specRate = (ids.Count - 1) / (specMs / 1000.0);
+            Console.WriteLine($"[ab] spec {family} prompt {results.Count}: {prompt.Length} tokens; plain {plain.Count} at {plainRate:F1} tok/s, " +
+                $"{drafter} x{draftWindow} {ids.Count} at {specRate:F1} tok/s ({specRate / plainRate:F2}x); agree {agree}/{Math.Min(plain.Count, ids.Count)}; " +
+                $"drafted {decoder.TokensDrafted}, accepted {decoder.TokensAccepted} ({acceptance:P1}), verifies {decoder.VerifySteps}, plain steps {decoder.PlainSteps}");
+            results.Add(new { Prompt = p, PromptTokens = prompt.Length, Plain = plain, Speculative = ids, Agree = agree, PlainMs = plainMs, SpecMs = specMs,
+                decoder.TokensDrafted, decoder.TokensAccepted, decoder.VerifySteps, decoder.PlainSteps });
+        }
+        report = new { Scenario = scenario, Family = family, Model = modelPath, Backend = backend.ToString(), Drafter = drafter, Window = draftWindow, Results = results };
+        m.Dispose();
+        break;
+    }
+    case "verify":
+    {
+        // A verify window's rows against the plain steps they replace: plain greedy records each step's logits, then the same
+        // tokens run as windows of --draft-window rows (SpecForward, all rows' logits), every window accepted whole, then with
+        // every other window rewound by two rows and run again (a rejected draft's rollback).
+        ModelBase m = Load(family);
+        var target = (ISpeculativeTarget)m;
+        int vocab = m.Config.VocabSize, w = draftWindow;
+        foreach (string p in Prompts())
+        {
+            int[] prompt = Render(m, p);
+            float[] logits = Prefill(m, prompt);
+            var plainLogits = new List<float[]> { (float[])logits.Clone() };
+            var tokens = new List<int>();
+            for (int i = 0; i < steps; i++)
+            {
+                int next = Argmax(logits, vocab);
+                tokens.Add(next);
+                logits = m.Forward(new[] { next });
+                plainLogits.Add((float[])logits.Clone());
+            }
+            foreach (bool rewinds in new[] { false, true })
+            {
+                Prefill(m, prompt);
+                var outRows = new float[w * vocab];
+                double worst = 0;
+                int agree = 0, rows = 0, window = 0;
+                for (int i = 0; i + w <= tokens.Count; i += w, window++)
+                {
+                    int[] chunk = tokens.GetRange(i, w).ToArray();
+                    if (rewinds && window % 2 == 1)
+                    {
+                        target.SpecForward(chunk, null, outRows, allLogitsRows: true);
+                        target.SpecRewindCache(target.CacheSeqLen - 2);
+                        target.SpecForward(chunk[(w - 2)..], null, new float[2 * vocab], allLogitsRows: true);
+                        target.SpecRewindCache(target.CacheSeqLen - w);
+                    }
+                    target.SpecForward(chunk, null, outRows, allLogitsRows: true);
+                    for (int j = 0; j < w; j++)
+                    {
+                        float[] plain = plainLogits[i + j + 1];
+                        var row = outRows.AsSpan(j * vocab, vocab).ToArray();
+                        double num = 0, den = 0;
+                        for (int v = 0; v < vocab; v++) { double d = row[v] - plain[v]; num += d * d; den += (double)plain[v] * plain[v]; }
+                        worst = Math.Max(worst, Math.Sqrt(num / den));
+                        if (Argmax(row, vocab) == Argmax(plain, vocab)) agree++;
+                        rows++;
+                    }
+                }
+                Console.WriteLine($"[ab] verify {family} prompt {prompt.Length} tokens, windows of {w}{(rewinds ? " with rewinds" : "")}: argmax {agree}/{rows}, worst rel L2 {worst:E3}");
+            }
+        }
+        report = new { Scenario = scenario };
         m.Dispose();
         break;
     }

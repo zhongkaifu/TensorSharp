@@ -3459,6 +3459,10 @@ internal enum GgmlIndexReductionOp
             int gateType, int upType, int downType, int numExperts, int hidden, int nFf, int nUsed, int rows,
             float* x, int* ids, float* weights, byte* skip, float* output);
         [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_HostExpertRowsAct(IntPtr gate, IntPtr up, IntPtr down,
+            int gateType, int upType, int downType, int numExperts, int hidden, int nFf, int nUsed, int rows,
+            float* x, int* ids, float* weights, byte* skip, float* output, int activation);
+        [LibraryImport(DllName)]
         internal static partial void TSGgml_HostExpertIoUnregister(IntPtr baseAddress);
         [LibraryImport(DllName)]
         internal static unsafe partial void TSGgml_HostExpertIoStats(long* stats4);

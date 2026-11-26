@@ -223,7 +223,15 @@ namespace TensorSharp.Models
                 else head = checked(head + resident);
             }
             if (!_gguf.Tensors.ContainsKey("output.weight")) head = checked(head + embedding);
-            return LayerSplitPlan.CreateWeighted(bytes, stages, 0, 1, embedding, head, false);
+            return LayerSplitPlan.CreateWeighted(bytes, stages, 0, 1, embedding, head, false, LayerCutAllowed);
+        }
+
+        /// <summary>A KV-shared layer attends its source's operands of the same step: no stage starts between them.</summary>
+        protected override bool LayerCutAllowed(int layer)
+        {
+            for (int l = layer; l < Config.NumLayers; l++)
+                if (SharesKv(l) && KvSourceOf(l) < layer) return false;
+            return true;
         }
 
         // ---------------------------------------------------------------- weight ownership
@@ -321,16 +329,34 @@ namespace TensorSharp.Models
                         // Each routed expert and the shared expert split by their width, like a dense feed-forward:
                         // every rank runs every selected expert's slice. GGML's mul_mat_id reads one stacked tensor, so
                         // there each rank gets its own stack; other executors take the members one at a time.
+                        // A fused [gate | up] stack (Gemma 4's ffn_gate_up_exps) splits each half by the ranks, so a rank's
+                        // slice of an expert is [gate_r | up_r].
+                        bool fusedExperts = _stackedExpertWeights.ContainsKey(p + "ffn_gate_up_exps.weight");
                         if (IsGgmlBackend)
                         {
-                            ShardStackedExperts(p + "ffn_gate_exps.weight", columns: true, stage);
-                            ShardStackedExperts(p + "ffn_up_exps.weight", columns: true, stage);
+                            if (fusedExperts)
+                                ShardStackedExperts(p + "ffn_gate_up_exps.weight", columns: true, stage, halves: true);
+                            else
+                            {
+                                ShardStackedExperts(p + "ffn_gate_exps.weight", columns: true, stage);
+                                ShardStackedExperts(p + "ffn_up_exps.weight", columns: true, stage);
+                            }
                             ShardStackedExperts(p + "ffn_down_exps.weight", columns: false, stage);
                         }
                         else
                         {
-                            columns.AddRange(new[] { p + "ffn_gate_exps.", p + "ffn_up_exps." });
-                            rows.Add(p + "ffn_down_exps.");
+                            if (fusedExperts)
+                            {
+                                foreach (string member in _stackedExpertMemberNames.Where(n => n.StartsWith(p + "ffn_gate_up_exps.", StringComparison.Ordinal)).ToArray())
+                                    ShardFusedGateUpColumnParallel(member);
+                                // The members by name: the prefix would take the per-expert output scales (ffn_down_exps.scale), read whole.
+                                rows.AddRange(_stackedExpertMemberNames.Where(n => n.StartsWith(p + "ffn_down_exps.", StringComparison.Ordinal)));
+                            }
+                            else
+                            {
+                                columns.AddRange(new[] { p + "ffn_gate_exps.", p + "ffn_up_exps." });
+                                rows.Add(p + "ffn_down_exps.");
+                            }
                         }
                         columns.AddRange(new[] { p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight" });
                         rows.Add(p + "ffn_down_shexp.weight");
@@ -411,7 +437,9 @@ namespace TensorSharp.Models
         /// <paramref name="stage"/>: each expert's output rows [r·ne1/T, (r+1)·ne1/T) (<paramref name="columns"/>, gate and
         /// up), or each row's input blocks [r·ne0/T, ...) (down, split on quantization-block boundaries).
         /// </summary>
-        private unsafe void ShardStackedExperts(string name, bool columns, int stage)
+        /// <param name="halves">A fused [gate | up] stack: each expert's two halves split apart, rank r's slice its gate rows
+        /// then its up rows (output rows [r·h/T, (r+1)·h/T) of each half of h rows).</param>
+        private unsafe void ShardStackedExperts(string name, bool columns, int stage, bool halves = false)
         {
             if (!_stackedExpertWeights.TryGetValue(name, out StackedExpertWeights w))
                 throw new NotSupportedException($"{Config.Architecture}: per-rank graphs on GGML need '{name}' as one stacked tensor.");
@@ -420,7 +448,7 @@ namespace TensorSharp.Models
             long rowBytes = NativeDequant.RowSize(w.GgmlType, ne0), perExpert = rowBytes * ne1;
             var type = (GgmlTensorType)w.GgmlType;
             long blockSize = GgufFile.GetBlockSize(type), typeSize = GgufFile.GetTypeSize(type);
-            if (columns ? ne1 % degree != 0 : (ne0 / blockSize) % degree != 0)
+            if (columns ? ne1 % (halves ? 2 * degree : degree) != 0 : (ne0 / blockSize) % degree != 0)
                 throw new NotSupportedException($"{Config.Architecture}: '{name}' ({ne0} x {ne1}) does not split over {degree} ranks.");
             long shardNe0 = columns ? ne0 : ne0 / degree, shardNe1 = columns ? ne1 / degree : ne1;
             long shardRowBytes = columns ? rowBytes : (ne0 / blockSize / degree) * typeSize;
@@ -435,7 +463,13 @@ namespace TensorSharp.Models
                 {
                     byte* from = src + e * perExpert;
                     byte* to = dst + e * shardRowBytes * shardNe1;
-                    if (columns)
+                    if (columns && halves)
+                    {
+                        long half = ne1 / 2, slice = shardNe1 / 2;
+                        Buffer.MemoryCopy(from + rank * slice * rowBytes, to, slice * rowBytes, slice * rowBytes);
+                        Buffer.MemoryCopy(from + (half + rank * slice) * rowBytes, to + slice * rowBytes, slice * rowBytes, slice * rowBytes);
+                    }
+                    else if (columns)
                         Buffer.MemoryCopy(from + rank * shardNe1 * rowBytes, to, shardRowBytes * shardNe1, shardRowBytes * shardNe1);
                     else
                         for (long j = 0; j < ne1; j++)

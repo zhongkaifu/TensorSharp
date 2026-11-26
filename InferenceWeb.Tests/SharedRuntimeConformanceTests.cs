@@ -59,11 +59,13 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["inkling2"] = typeof(Inkling2RuntimeTests),
         // Raon's RDA layers rewind only to their length or to zero; it declares its placements as gaps.
         ["raon1nano"] = typeof(RaonRuntimeTests),
+        // Gemma 4's fixtures are its own (per-layer embeddings, KV sharing, two head widths, fused GeGLU experts).
+        ["gemma4"] = typeof(Gemma4RuntimeTests),
     };
 
     /// <summary>Shared-runtime families that run whole-forward graphs only (StandardDecoderModel.RequiresGraphs): their
     /// dedicated suite has no per-op path to compare the graphs with. A family leaves the list when it gains one.</summary>
-    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano" };
+    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano", "gemma4" };
 
     /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)
     /// does not declare.</summary>

@@ -2994,6 +2994,15 @@ namespace TensorSharp.GGML
             => GgmlNative.TSGgml_HostExpertRows(gate, up, down, gateType, upType, downType, numExperts, hidden, nFf, nUsed, rows,
                 x, ids, weights, skip, output) != 0;
 
+        /// <summary><see cref="HostExpertRows(IntPtr, IntPtr, IntPtr, int, int, int, int, int, int, int, int, float*, int*, float*, byte*, float*)"/>
+        /// with the activation (0: silu(gate) * up; 2: gelu_tanh(gate) * up) and, when <paramref name="up"/> is zero, a fused
+        /// [gate | up] stack in <paramref name="gate"/> (2 <paramref name="nFf"/> rows an expert, gate first).</summary>
+        public static unsafe bool HostExpertRows(IntPtr gate, IntPtr up, IntPtr down, int gateType, int upType, int downType,
+            int numExperts, int hidden, int nFf, int nUsed, int rows, float* x, int* ids, float* weights, byte* skip, float* output,
+            int activation)
+            => GgmlNative.TSGgml_HostExpertRowsAct(gate, up, down, gateType, upType, downType, numExperts, hidden, nFf, nUsed, rows,
+                x, ids, weights, skip, output, activation) != 0;
+
         public static void HostExpertIoUnregister(IntPtr baseAddress) => GgmlNative.TSGgml_HostExpertIoUnregister(baseAddress);
 
         /// <summary>True when weight uploads can read a registered file directly instead of

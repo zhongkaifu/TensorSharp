@@ -3550,9 +3550,12 @@ namespace TensorSharp.Cuda
         /// steps (prompt chunks, verify windows, routes read on the host) take the executor's own path.
         /// </summary>
         protected override Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false)
         {
-            if (gateValue.Weight is IGraphHostedExperts gate && upValue.Weight is IGraphExpertWeights up
+            // The doorbell's and the staged paths' kernels run SwiGLU over separate gate and up stacks; a fused GeGLU layer
+            // (Gemma 4) takes the executor's own path: its device routes through the generic ops, the host's through the
+            // host kernel at that activation.
+            if (activation == 0 && !fusedGateUp && gateValue.Weight is IGraphHostedExperts gate && upValue.Weight is IGraphExpertWeights up
                 && downValue.Weight is IGraphExpertWeights down)
             {
                 // Every MoE layer the executor meets is remembered, so a long prompt chunk stages each next layer ahead.
@@ -3572,7 +3575,7 @@ namespace TensorSharp.Cuda
             }
             FlushTrades();
             HostExpertFallbacks++;
-            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run);
+            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run, activation, fusedGateUp);
         }
 
         /// <summary>Host-expert calls the doorbell served, and calls that fell to the base executor's host path (routes read

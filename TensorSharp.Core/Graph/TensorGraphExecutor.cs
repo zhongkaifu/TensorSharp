@@ -1952,7 +1952,7 @@ namespace TensorSharp.Graph
                 }
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
                 case GraphOp.MoeHostExperts: return V(HostExperts(T(0), values[n.Srcs[1]], values[n.Srcs[2]], values[n.Srcs[3]],
-                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run));
+                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run, (int)Ip(1, 0), Ip(2, 0) != 0));
                 case GraphOp.Reshape:
                 {
                     // A relaid row block (a packed product's column block, rows a pitch apart) reshaped within its rows stays
@@ -2494,8 +2494,11 @@ namespace TensorSharp.Graph
         /// the host streams (a prompt chunk) runs every route here, the experts outside the tier read in for it and
         /// dropped after. Returns the weighted sum [rows, hidden].
         /// </summary>
+        /// <param name="activation">0: silu(gate) * up; 2: gelu_tanh(gate) * up (the op's ip[1]).</param>
+        /// <param name="fusedGateUp">The gate stack is one fused [gate | up] stack, gate the first half of each expert's rows
+        /// (the op's ip[2]; its up source names the same stack).</param>
         protected virtual Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false)
         {
             if (gateValue.Weight is not IGraphHostedExperts gate || upValue.Weight is not IGraphExpertWeights up
                 || downValue.Weight is not IGraphExpertWeights down)
@@ -2533,7 +2536,7 @@ namespace TensorSharp.Graph
             for (int i = 0; i < routes; i++) anyHost |= skip[i] == 0 && ids[i] >= 0;
 
             // The returned tensor is the caller's to keep (V keeps it); the pieces summed into it are this run's.
-            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run) : null;
+            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run, activation, fusedGateUp) : null;
             if (!anyHost)
             {
                 if (device != null) return device;
@@ -2555,7 +2558,8 @@ namespace TensorSharp.Graph
         /// <summary>The device's routes of <see cref="HostExperts"/>: each expert once over the rows routed to it,
         /// weighted, then every row's routes summed (a host route reads a zero row).</summary>
         private Tensor DeviceExperts(Tensor x, int[] ids, float[] weights, byte[] onDevice, int k, IGraphExpertWeights gate,
-            IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run)
+            IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run,
+            int activation = 0, bool fusedGateUp = false)
         {
             int rows = (int)x.Sizes[0], hidden = (int)x.Sizes[1], routes = ids.Length;
             var byExpert = new List<int>[gate.Ne2];
@@ -2578,9 +2582,21 @@ namespace TensorSharp.Graph
                 }
                 at += list.Count;
                 Tensor xs = run.Keep(Ops.IndexSelect(null, x, IntTensor(sourceRows, new long[] { sourceRows.Length }, run)));
-                Tensor g = run.Keep(ExpertMatMul(gate, e, xs));
-                Tensor u = run.Keep(ExpertMatMul(up, e, xs));
-                Tensor act = run.Keep(Ops.SiLUMul(null, g, u));
+                Tensor g, u;
+                if (fusedGateUp)
+                {
+                    // One product over the fused stack: [n, 2 ff], gate the first half.
+                    Tensor gu = run.Keep(ExpertMatMul(gate, e, xs));
+                    long ff = gu.Sizes[1] / 2;
+                    g = run.Keep(Ops.NewContiguous(run.Keep(gu.Narrow(1, 0, ff))));
+                    u = run.Keep(Ops.NewContiguous(run.Keep(gu.Narrow(1, ff, ff))));
+                }
+                else
+                {
+                    g = run.Keep(ExpertMatMul(gate, e, xs));
+                    u = run.Keep(ExpertMatMul(up, e, xs));
+                }
+                Tensor act = run.Keep(activation == 2 ? Ops.GELUMul(null, g, u) : Ops.SiLUMul(null, g, u));
                 Tensor d = run.Keep(ExpertMatMul(down, e, act));
                 var w = run.Keep(new Tensor(Allocator, DType.Float32, list.Count, 1));
                 w.SetElementsAsFloat(routeWeights);
@@ -2588,7 +2604,7 @@ namespace TensorSharp.Graph
                 if (stream && !host.IsResident(layer, e))
                 {
                     ReleaseStreamedExpert(gate.Expert(e));
-                    ReleaseStreamedExpert(up.Expert(e));
+                    if (!fusedGateUp) ReleaseStreamedExpert(up.Expert(e));
                     ReleaseStreamedExpert(down.Expert(e));
                 }
             }

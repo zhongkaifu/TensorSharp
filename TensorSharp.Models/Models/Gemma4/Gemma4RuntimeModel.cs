@@ -216,6 +216,9 @@ namespace TensorSharp.Models
         protected override string MixerPostNormWeight(int layer) => FirstWeight(layer, "post_attention_norm.weight", "attn_post_norm.weight");
         protected override float FinalLogitSoftcap => _softcap;
 
+        /// <summary>Host-computed experts run GeGLU (gelu_tanh(gate) * up) over the fused gate|up stack.</summary>
+        private protected override int HostExpertActivation => 2;
+
         /// <summary>A KV-shared layer has no keys or values of its own to fuse; the others fuse Q/K/V where all three exist.</summary>
         protected override bool FusesQkv(int layer) => layer >= Config.NumLayers || (_kvSource[layer] == layer && _hasValue[layer]);
 
@@ -229,6 +232,10 @@ namespace TensorSharp.Models
         {
             yield return LayerName(layer, "attn_q_norm.weight");
             if (_kvSource[layer] == layer) yield return LayerName(layer, "attn_k_norm.weight");
+            if (HasPle(layer)) yield return LayerName(layer, "post_norm.weight");
+            if (!IsMoeLayer(layer)) yield break;
+            foreach (string suffix in new[] { "pre_ffw_norm_2.weight", "post_ffw_norm_1.weight", "post_ffw_norm_2.weight", "ffn_gate_inp.scale", "ffn_down_exps.scale" })
+                yield return LayerName(layer, suffix);
         }
 
         /// <summary>The per-op path is not implemented: Gemma 4's layers differ in head width, share caches and take their
@@ -272,10 +279,6 @@ namespace TensorSharp.Models
                         throw new InvalidOperationException($"{Config.Architecture} layer {l} is missing '{LayerName(l, suffix)}'.");
                 if (!HasWeight(LayerName(l, "attn_qkv.weight")) && !HasWeight(LayerName(l, "attn_q.weight")))
                     throw new InvalidOperationException($"{Config.Architecture} layer {l} has no query projection.");
-                if (IsMoeLayer(l) && IsExpertLayerOffloaded(l))
-                    throw new NotSupportedException(
-                        $"{Config.Architecture}: layer {l}'s routed experts would run from host memory, which its GeGLU experts do not do " +
-                        "on the shared runtime yet; load without --n-cpu-moe / --cpu-moe.");
             }
             if (_pleDim > 0)
                 foreach (string name in new[] { "per_layer_token_embd.weight", "per_layer_model_proj.weight", "per_layer_proj_norm.weight" })

@@ -16,6 +16,10 @@ public abstract partial class ModelBase
     /// PLE table, read from the mapping) does not - counted as the head's, it left the last of two A40s 10 of 48 layers.</summary>
     protected virtual bool CountsInLayerBalance(string tensorName) => true;
 
+    /// <summary>Whether a whole-layer stage may start at <paramref name="layer"/> (default: any): a model whose layers read
+    /// another's state within a step keeps them together.</summary>
+    protected virtual bool LayerCutAllowed(int layer) => true;
+
     protected void ConfigureLayerPlacement(string executionIdentity, bool balanceWeightBytes = false)
     {
         if (LayerSplitGroup == null && LayerSplitDegree <= 1) return;
@@ -42,7 +46,7 @@ public abstract partial class ModelBase
         if (topology != null)
             LayerPlacement = LayerSplitPlan.Create(Config.NumLayers, bytes, topology, node, embedding, head, driverLast);
         else if (balanceWeightBytes)
-            LayerPlacement = LayerSplitPlan.CreateWeighted(bytes, LayerSplitDegree, node, nodes, embedding, head, driverLast);
+            LayerPlacement = LayerSplitPlan.CreateWeighted(bytes, LayerSplitDegree, node, nodes, embedding, head, driverLast, LayerCutAllowed);
         else LayerPlacement = new LayerSplitPlan(Config.NumLayers, LayerSplitDegree, node, nodes, driverLast);
         if (topology is { IsUniform: false })
             Console.WriteLine($"  Layer plan over nodes of different shapes: this node (pipeline position {LayerPlacement.StageIndex}) " +

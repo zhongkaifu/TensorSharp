@@ -439,6 +439,8 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
     public int TopK { get; init; } = 4;
     public int ExpertFf { get; init; } = 96;
     public int SlidingWindow { get; init; } = 32;
+    /// <summary>The global layers' KV heads (default <see cref="GlobalKvHeads"/>; two lets them split over two ranks).</summary>
+    public int GlobalKvHeadCount { get; init; } = GlobalKvHeads;
     /// <summary>Scale of the (tied) token embedding. Gemma multiplies the embedding by sqrt(hidden)
     /// before the first layer, so at the default 0.5 the embedding row dominates the residual
     /// stream through all six layers and the next-token argmax depends almost only on the last
@@ -475,7 +477,7 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
         int layers = Pattern.Length;
         var kvHeads = new int[layers];
         for (int l = 0; l < layers; l++)
-            kvHeads[l] = Pattern[l] ? LocalKvHeads : GlobalKvHeads;
+            kvHeads[l] = Pattern[l] ? LocalKvHeads : GlobalKvHeadCount;
         var kv = new List<Kv>
         {
             new Str { Key = "general.architecture", V = a },
@@ -523,7 +525,7 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
             string p = $"blk.{l}.";
             bool local = Pattern[l];
             int hd = local ? LocalHeadDim : GlobalHeadDim;
-            int kvh = local ? LocalKvHeads : GlobalKvHeads;
+            int kvh = local ? LocalKvHeads : GlobalKvHeadCount;
             t.Add(GenAround(p + "attn_norm.weight", 1f, 0.1f, Hidden));
             t.Add(Blocks(p + "attn_q.weight", GgmlType.Q4_0, 0.06f, Hidden, NumHeads * hd));
             t.Add(Blocks(p + "attn_k.weight", GgmlType.Q4_0, 0.06f, Hidden, kvh * hd));

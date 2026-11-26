@@ -48,7 +48,7 @@ using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Models
 {
-    public partial class Gemma4Model : ISpeculativeModel
+    public partial class Gemma4Model : ISpeculativeModel, IAttachableDraftHead
     {
         // Draft-head hyper-parameters (read from the assistant GGUF).
         private int _mtpNumLayers;

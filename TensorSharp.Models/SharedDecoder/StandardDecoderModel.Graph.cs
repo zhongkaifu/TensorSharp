@@ -1347,7 +1347,7 @@ namespace TensorSharp.Models
             result = null;
             int rows = (int)hidden.Sizes[0], stages = _mesh.Stages, hiddenSize = Config.HiddenSize;
             float[][] captures = request.CaptureLayers.Length > 0 ? new float[request.CaptureLayers.Length][] : null;
-            Tensor input = hidden;
+            Tensor input = hidden, carry = null;
             try
             {
                 for (int s = 0; s < stages; s++)
@@ -1355,11 +1355,12 @@ namespace TensorSharp.Models
                     EnterStage(s);
                     (int from, int to) = StageLayers(s);
                     bool last = s == stages - 1;
-                    Tensor stageInput = input;
+                    Tensor stageInput = input, stageCarry = carry;
                     // Each stage keeps its decode step to advance (one replay a stage shape).
                     CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
-                        step => EmitStep(step, stageInput, request, from, to, last), out StepOutputs outputs, out bool owned,
-                        shape: $"{request.Shape}|stage{s}", advanceHidden: request.PositionTable == null ? stageInput : null);
+                        step => EmitStep(step, stageInput, request, from, to, last, stageCarry), out StepOutputs outputs, out bool owned,
+                        shape: $"{request.Shape}|stage{s}", advanceHidden: request.PositionTable == null ? stageInput : null,
+                        advanceInputs: request.PositionTable == null && stageCarry != null ? new[] { stageInput, stageCarry } : null);
                     if (graph == null)
                     {
                         if (s == 0) return false;
@@ -1376,8 +1377,11 @@ namespace TensorSharp.Models
                         {
                             float[] rowsOut = graph.Outputs[outputs.Hidden];
                             if (!ReferenceEquals(input, hidden)) input.Dispose();
+                            carry?.Dispose();
+                            carry = null;
                             EnterStage(s + 1);
                             input = CreateFloatTensor((float[])rowsOut.Clone(), rows, StreamWidth);
+                            if (outputs.CarryAt > 0) carry = CreateFloatTensor((float[])graph.Outputs[outputs.CarryAt - 1].Clone(), rows, StageCarryWidth);
                             continue;
                         }
                         result = new GraphResult
@@ -1398,9 +1402,20 @@ namespace TensorSharp.Models
             finally
             {
                 if (!ReferenceEquals(input, hidden)) input.Dispose();
+                carry?.Dispose();
                 EnterStage(0);
             }
         }
+
+        /// <summary>Floats per row a family carries from one whole-layer stage to the next beside the stream (0: none): what
+        /// the stream input made that later layers read (Gemma 4's per-layer embeddings).</summary>
+        protected virtual int StageCarryWidth => 0;
+
+        /// <summary>The stage's carry [<see cref="StageCarryWidth"/>, rows] for the next stage (a stage that is not the last).</summary>
+        protected virtual int EmitStageCarry(GraphStep step) => throw new NotSupportedException($"{Config.Architecture} carries nothing across stages.");
+
+        /// <summary>A later stage's carry [<see cref="StageCarryWidth"/>, rows], before its layers.</summary>
+        protected virtual void TakeStageCarry(GraphStep step, int carry) { }
 
         /// <summary>The decoder layers of pipeline stage <paramref name="stage"/>: [from, to).</summary>
         private (int From, int To) StageLayers(int stage)
@@ -1661,6 +1676,8 @@ namespace TensorSharp.Models
             /// <summary>The output of the sequences' last final-normed rows, plus one (0: none), so every construction that
             /// does not set it means none.</summary>
             public int LastHiddenAt;
+            /// <summary>The stage's carry for the next stage (<see cref="StageCarryWidth"/>), plus one (0: none).</summary>
+            public int CarryAt;
             public int[] RankLogits;   // each rank's slice of the vocabulary (a vocabulary-split head), in rank order
             public int[] Captures;   // -1: the captured layer is another stage's
             public (int Output, int Layer)[] Routes;   // resident MoE layers' top-K ids while device routes are recorded
@@ -1675,7 +1692,7 @@ namespace TensorSharp.Models
 
         /// <summary>Trace layers [<paramref name="from"/>, <paramref name="to"/>) (one pipeline stage), then
         /// the head when <paramref name="head"/>, else the stage's output rows for the next stage.</summary>
-        private StepOutputs EmitStep(GraphStep step, Tensor hidden, GraphRequest request, int from, int to, bool head)
+        private StepOutputs EmitStep(GraphStep step, Tensor hidden, GraphRequest request, int from, int to, bool head, Tensor carry = null)
         {
             step.PromptChunks = request.PromptChunks;
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
@@ -1683,6 +1700,10 @@ namespace TensorSharp.Models
             // The first stage widens the embedded rows into the residual stream; later stages receive it.
             int embedded = from == 0 ? step.HiddenInput(hidden, hiddenSize, rows) : -1;
             int h = from == 0 ? EmitStreamInput(step, embedded) : step.HiddenInput(hidden, width, rows);
+            // A later stage takes what the family carries beside the stream (Gemma 4's per-layer embeddings).
+            if (from > 0 && StageCarryWidth > 0)
+                TakeStageCarry(step, step.HiddenInput(carry ?? throw new InvalidOperationException($"{Config.Architecture}: stage from layer {from} has no carry."),
+                    StageCarryWidth, rows));
             var positions = new int[rows];
             for (int s = 0; s < n; s++)
                 for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i + step.Slots[s].RopeDelta;
@@ -1734,6 +1755,7 @@ namespace TensorSharp.Models
             if (!head)
             {
                 outputs.Hidden = step.Output(h, (long)width * rows);
+                if (StageCarryWidth > 0) outputs.CarryAt = step.Output(EmitStageCarry(step), (long)StageCarryWidth * rows) + 1;
                 return outputs;
             }
             // A target past the stack taps the stream leaving it.
@@ -2844,6 +2866,16 @@ namespace TensorSharp.Models
         /// <summary>Per layer: whether a later layer shares its cache (its operands are kept for the step's sharers).</summary>
         private bool[] _kvSharers = Array.Empty<bool>();
 
+        /// <summary>A KV-shared layer attends its source's operands of the same step, so whole-layer stages keep the two together.</summary>
+        private void ValidateSharedKvStages()
+        {
+            if (_mesh.Stages <= 1) return;
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (SharesKv(l) && _mesh.StageOf(l) != _mesh.StageOf(KvSourceOf(l)))
+                    throw new NotSupportedException($"{Config.Architecture}: layer {l} shares layer {KvSourceOf(l)}'s K/V, which another " +
+                        $"whole-layer stage holds ({_mesh.Stages} stages); use fewer stages so that every KV-shared layer stays with its source.");
+        }
+
         private void MarkKvSharers()
         {
             _kvSharers = new bool[TotalLayers];
@@ -2898,6 +2930,51 @@ namespace TensorSharp.Models
             if (parts != null) attn = JoinSequenceRows(step, parts);
             attn = EmitAttentionOutput(step, layer, x, attn);
             return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
+        }
+
+        /// <summary>
+        /// A drafter's queries over a trunk layer's cache as it stands (gemma4-assistant's layers attend the trunk's donor
+        /// caches and keep no rows of their own): <paramref name="q"/> [d, <paramref name="heads"/>, rows] of sequence
+        /// <paramref name="s"/>, whose rows are positions <paramref name="cacheLayer"/>'s cache already holds (row i is
+        /// position start + i; nothing is written), attend the keys their decode rows would: the layer's band, ring and
+        /// window cells and its mask, at <paramref name="scale"/>. Returns [heads * dv, rows].
+        /// </summary>
+        private protected int EmitCacheReadAttention(GraphStep step, int cacheLayer, int q, int heads, float scale, int s = 0)
+        {
+            int kvHeads = LocalKvHeadsOf(cacheLayer), d = KeyDimOf(cacheLayer), dv = ValueDimOf(cacheLayer);
+            if (heads % kvHeads != 0)
+                throw new InvalidOperationException($"{Config.Architecture}: {heads} query heads do not group onto layer {cacheLayer}'s {kvHeads} KV heads.");
+            int count = step.Counts[s], start = step.Starts[s];
+            Slot slot = step.Slots[s];
+            int kvType = KvGgmlType(_kvCacheDtype.ToDType());
+            int cap = CacheCells(cacheLayer, slot.Capacity), ring = RingOf(cacheLayer), band = SlidingWindow(cacheLayer);
+            int ck = step.State(slot.K[cacheLayer][step.RankIndex], kvType, KvCacheSplit(cacheLayer), d, cap, kvHeads);
+            int cv = step.State(slot.V[cacheLayer][step.RankIndex], kvType, KvCacheSplit(cacheLayer), dv, cap, kvHeads);
+            int qPerm = step.Permute(step.Cont(q), 0, 2, 1, 3);
+            int gqa = AttendsStridedWindows ? -1 : heads / kvHeads;
+            int fa;
+            if (RingWrapped(cacheLayer, start, count))
+            {
+                int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, ring, kvType, count, gqa });
+                int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
+                int mask = step.RingBandMask(ring, start, count, s, band);
+                fa = step.FlashAttention(qPerm, kWin, vWin, mask, scale, AttentionKvMax(step, cacheLayer, s), false, DeviceBand(step, band, d, kvType));
+            }
+            else
+            {
+                int stepRows = DecodeWindowStep;
+                bool capacity = CapacityWindow(step, d, dv, kvType);
+                int window = capacity ? cap : Math.Min(cap, (start + count + stepRows - 1) / stepRows * stepRows);
+                int first = band > 0 && !capacity ? SlidingWindowFirstCell(start, band, stepRows) : 0;
+                if (band > 0 && !capacity) step.LimitAdvance(start, first + stepRows + band - 1, s);
+                int keys = window - first;
+                int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, first, keys, kvType, count, gqa });
+                int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, first, keys, kvType, count, gqa });
+                int mask = band > 0 ? step.BandMask(keys, first, start, count, s, band) : step.ChunkMask(window, start, count, s);
+                fa = step.FlashAttention(qPerm, kWin, vWin, mask, scale, AttentionKvMax(step, cacheLayer, s), false,
+                    capacity ? DeviceBand(step, band, d, kvType) : 0);
+            }
+            return step.Reshape(fa, (long)heads * dv, count);
         }
 
         /// <summary>What a family applies to the attention result [heads * dv, rows] (the rank's heads) before the output

@@ -116,6 +116,14 @@ namespace TensorSharp.Models
             return rows;
         }
 
+        /// <summary>Whole-layer stages hand the per-layer embeddings [ple, L, rows] on beside the stream.</summary>
+        protected override int StageCarryWidth => _pleDim > 0 ? _pleDim * Config.NumLayers : 0;
+
+        protected override int EmitStageCarry(GraphStep step) => step.Reshape(PerLayerInputs(step), (long)_pleDim * Config.NumLayers, step.Rows);
+
+        protected override void TakeStageCarry(GraphStep step, int carry)
+            => _stepPle.AddOrUpdate(step, new StrongBox<int>(step.Reshape(carry, _pleDim, Config.NumLayers, step.Rows)));
+
         private int PerLayerInputs(GraphStep step)
             => _stepPle.TryGetValue(step, out StrongBox<int> node) ? node.Value
                 : throw new InvalidOperationException($"{Config.Architecture}: a step's per-layer embeddings are emitted with its stream input.");
@@ -213,9 +221,13 @@ namespace TensorSharp.Models
             string fused = LayerName(layer, "ffn_gate_up_exps.weight"), downName = LayerName(layer, "ffn_down_exps.weight");
             string expertScale = LayerName(layer, "ffn_down_exps.scale");
             bool scaled = _weights.TryGetValue(expertScale, out Tensor scales);
+            // Experts kept in host memory (--n-cpu-moe / --cpu-moe, or the runtime's placement plan) run at a pause of the
+            // program on an executor that takes host experts: GGML's host MoE segment, the tensor executors' expert host (the
+            // host's routes through the host kernel, the device's tier through the executor's ops), GeGLU over the fused stack.
+            bool host = IsExpertLayerOffloaded(layer) && GraphExecutor.Capabilities.HostExperts && HasExperts(fused);
             // The selection and the experts as one region an executor may run as its own kernels (direct CUDA's Gemma MoE
             // decode kernels); tests that force or read the routes take them from the ops.
-            bool region = HasExperts(fused) && ForcedRoutesForTests == null && DeviceRoutesForTests == null;
+            bool region = !host && HasExperts(fused) && ForcedRoutesForTests == null && DeviceRoutesForTests == null;
             if (region)
             {
                 if (scaled)
@@ -241,6 +253,12 @@ namespace TensorSharp.Models
                 weights = step.Op(GraphOp.Mul, weights, step.Reshape(each, 1, k, rows));
             }
 
+            if (host)
+            {
+                int stack = step.Experts(fused);
+                return step.Op(GraphOp.MoeHostExperts, stackalloc[] { moeIn, selected, weights, stack, stack, step.Experts(downName) },
+                    stackalloc long[] { layer, 2 /* gelu(gate) * up */, 1 /* fused gate|up */ });
+            }
             int input = step.Reshape(moeIn, hidden, 1, rows);
             int act;
             if (HasExperts(fused))

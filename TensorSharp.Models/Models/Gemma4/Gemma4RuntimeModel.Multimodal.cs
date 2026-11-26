@@ -63,6 +63,8 @@ namespace TensorSharp.Models
             VisionEncoder = null;
             AudioEncoder?.Dispose();
             AudioEncoder = null;
+            FamilyTokenDrafter?.Dispose();
+            FamilyTokenDrafter = null;
             base.Dispose();
         }
     }
