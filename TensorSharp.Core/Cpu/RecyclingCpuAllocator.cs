@@ -43,8 +43,14 @@ namespace TensorSharp.Cpu
             get { lock (_gate) return _retained; }
         }
 
-        internal IntPtr Rent(long bytes)
+        internal IntPtr Rent(long bytes) => Rent(bytes, out _);
+
+        /// <summary>A buffer of <paramref name="bytes"/>: a kept one of that size, else a new one, which at
+        /// <see cref="CpuStorage.ZeroedAllocationBytes"/> and more comes zeroed from the C allocator
+        /// (<paramref name="zero"/>).</summary>
+        internal unsafe IntPtr Rent(long bytes, out bool zero)
         {
+            zero = false;
             if (bytes >= MinRecycledBytes)
                 lock (_gate)
                     if (_free.TryGetValue(bytes, out Stack<IntPtr> stack) && stack.Count > 0)
@@ -59,19 +65,31 @@ namespace TensorSharp.Cpu
                             }
                         return buffer;
                     }
-            return Marshal.AllocHGlobal(new IntPtr(bytes));
+            if (bytes >= CpuStorage.ZeroedAllocationBytes)
+            {
+                zero = true;
+                return (IntPtr)NativeMemory.AllocZeroed((nuint)bytes);
+            }
+            return (IntPtr)NativeMemory.Alloc((nuint)bytes);
         }
+
+        private static unsafe void Free(IntPtr buffer) => NativeMemory.Free((void*)buffer);
 
         internal void Return(IntPtr buffer, long bytes)
         {
             if (buffer == IntPtr.Zero) return;
-            if (bytes < MinRecycledBytes || bytes > MaxRetainedBytes)
+            if (bytes < MinRecycledBytes || bytes > MaxRetainedBytes || _disposed)
             {
-                Marshal.FreeHGlobal(buffer);
+                Free(buffer);
                 return;
             }
             lock (_gate)
             {
+                if (_disposed)
+                {
+                    Free(buffer);
+                    return;
+                }
                 // Make room: the buffers freed longest ago go back to the C allocator.
                 while (_retained + bytes > MaxRetainedBytes && _order.First != null)
                 {
@@ -86,7 +104,7 @@ namespace TensorSharp.Cpu
                     }
                     while (rest.Count > 0) stack.Push(rest.Pop());
                     _retained -= oldBytes;
-                    Marshal.FreeHGlobal(old);
+                    Free(old);
                 }
                 if (!_free.TryGetValue(bytes, out Stack<IntPtr> bucket)) _free[bytes] = bucket = new Stack<IntPtr>();
                 bucket.Push(buffer);
@@ -101,13 +119,21 @@ namespace TensorSharp.Cpu
             lock (_gate)
             {
                 foreach (Stack<IntPtr> stack in _free.Values)
-                    while (stack.Count > 0) Marshal.FreeHGlobal(stack.Pop());
+                    while (stack.Count > 0) Free(stack.Pop());
                 _free.Clear();
                 _order.Clear();
                 _retained = 0;
             }
         }
 
-        public void Dispose() => Trim();
+        private volatile bool _disposed;
+
+        /// <summary>Return every kept buffer, and every buffer freed from now on, to the C allocator: storages that outlive
+        /// their model (a result a caller still holds) give theirs back when they go.</summary>
+        public void Dispose()
+        {
+            lock (_gate) _disposed = true;
+            Trim();
+        }
     }
 }

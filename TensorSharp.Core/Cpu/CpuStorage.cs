@@ -31,7 +31,7 @@ namespace TensorSharp.Cpu
             : base(allocator, ElementType, elementCount)
         {
             if (allocator is RecyclingCpuAllocator recycler)
-                buffer = recycler.Rent(ByteLength);
+                buffer = recycler.Rent(ByteLength, out _allocatedZero);
             else if (ByteLength >= ZeroedAllocationBytes)
             {
                 unsafe { buffer = (IntPtr)NativeMemory.AllocZeroed((nuint)ByteLength); }

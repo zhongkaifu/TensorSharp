@@ -265,6 +265,17 @@ namespace TensorSharp.Graph
         protected virtual Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
             CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
+            // The keys every query masks at the window's end (a padded window's unwritten cells, a canvas step's cells past
+            // its rows) weigh exactly nothing: they are left out of the products. A DiffusionGemma canvas step's local
+            // layers read a 512-cell window for 320 keys (a 64-token prompt and the 256 canvas rows).
+            if (mask.HasTensor && mask.Keys > 0 && mask.Keys < k.Sizes[1] && mask.Tensor is { DimensionCount: 2 } full
+                && full.Sizes[1] == k.Sizes[1])
+            {
+                using Tensor kt = k.Narrow(1, 0, mask.Keys), vt = v.Narrow(1, 0, mask.Keys), mt = full.Narrow(1, 0, mask.Keys);
+                using Tensor at = Attention(q, kt, vt, mt, scale);
+                using Tensor pt = at.Permute(1, 0, 2);
+                return Ops.NewContiguous(pt);
+            }
             using Tensor a = Attention(q, k, v, mask.Pattern == MaskPattern.None && mask.Floor == 0 ? null : mask.Tensor, scale);
             using Tensor p = a.Permute(1, 0, 2);
             return Ops.NewContiguous(p);
