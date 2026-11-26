@@ -291,7 +291,14 @@ public sealed class DiffusionGemmaRuntimeTests : IDisposable
             float[][] together = model.DecodeCanvasBatched(new[] { a, b }, new[] { ca, cb }, new float[2][], new float[2], new[] { 1f, 1f });
             double ra = RelL2(together[0], aloneA), rb = RelL2(together[1], aloneB);
             _output.WriteLine($"{executor}: batched vs alone relL2 {ra:E3} / {rb:E3}");
-            Assert.True(ra <= NoiseTolerance && rb <= NoiseTolerance, $"relL2 {ra:E2} / {rb:E2}");
+            // The managed products are row-independent, so a sequence's rows are its own step's bit for bit (a row that read
+            // another sequence's cache would not be); GGML picks other kernels for more rows.
+            if (executor == "managed")
+            {
+                Assert.Equal(aloneA, together[0]);
+                Assert.Equal(aloneB, together[1]);
+            }
+            else Assert.True(ra <= NoiseTolerance && rb <= NoiseTolerance, $"relL2 {ra:E2} / {rb:E2}");
         }
         finally
         {
