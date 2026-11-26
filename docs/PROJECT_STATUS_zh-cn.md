@@ -285,9 +285,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
     （`json_object` 流式输出，只有 `json_schema` 缓冲整个响应）；
   - `TS_RETAINED_FUSED_CACHE` 与 `TS_PREFIX_CHECKPOINTS`：它们是 `TS_RETAINED_FUSED_CACHE_MAX=0` 与
     `TS_PREFIX_CHECKPOINTS_MAX=0` 的第二种写法，后两者分别关闭结束状态保留与共享前缀检查点；
-  - `TS_GEMMA4_BATCHED_CAPS`：Gemma 4 的 token 批量 decode 始终覆盖 per-layer embedding、共享 KV 层与已回绕的
-    滑动窗口，并只通过一个原生入口（`TSGgml_Gemma4ModelDecodeBatched`）；`TS_BATCHED_FUSED_DECODE=0` 仍可让并发
-    请求改为轮询 decode；
+  - `TS_GEMMA4_BATCHED_CAPS`：Gemma 4 的批量 decode（现为共享解码运行时的批处理图步骤）始终覆盖
+    per-layer embedding、共享 KV 层与已回绕的滑动窗口；
   - 直连 `cuda` 后端切回旧内核或关闭 CUDA graph 的开关：`TS_CUDA_QMM_BATCHED` / `_VEC` / `_F16GEMM`、
     `TS_CUDA_*_DP4A` 系列、`TS_CUDA_Q80_VEC` / `_MMQ` / `_MMQ2` / `_F16_DEQUANT`、`TS_CUDA_Q81_WARP`、
     `TS_CUDA_IQ2_VEC`、`TS_CUDA_BF16_MATVEC`（及其 `TS_DSV4_BF16_MATVEC` 写法）、`TS_CUDA_GQA_*`、

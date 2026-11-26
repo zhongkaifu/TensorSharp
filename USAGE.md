@@ -1037,21 +1037,6 @@ These gate the optional speculative decode path (see [Speculative Decoding](FEAT
 
 | Variable | Description |
 |---|---|
-| `DIFFUSION_NO_SC` | Set to `1` to disable self-conditioning. Enabled by default. |
-| `DIFFUSION_SC_TOPK` | Experimental self-conditioning top-K cutoff (default: `32`). |
-| `DIFFUSION_NO_PKV` | Set to `1` to disable prompt-KV caching on device-glue backends. Enabled by default where supported. |
-| `DIFFUSION_NO_FUSED_DECODE` | Set to `1` to disable the GGML fused model decode path and fall back to per-op / per-layer diffusion decode. |
-| `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | Set to `1` to disable the fused output-norm + lm-head + softcap tail. |
-| `DIFFUSION_BATCHED_FORWARD` | Set to `1` to use true batched `DecodeCanvasBatched` for active diffusion canvases; default time-slices the faster fused single-canvas path. |
-| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | Memory cap for batched diffusion lm-head logits before falling back to per-sequence lm-head (default: `300`). |
-| `DIFFUSION_IMAGE_BIDIRECTIONAL` | Image soft-token spans attend bidirectionally on the sliding-window layers (default on); `0` makes them plain causal, which is what HuggingFace's own DiffusionGemma effectively runs. |
-| `DIFFUSION_FUSED_PREFILL_ATTN` | Fused GGML prompt-prefill attention: on by default on `ggml_cuda`, `1` opts another GGML backend in, `0` restores the per-op reference. Always off for a prompt that carries an image, because the fused kernel cannot express the bidirectional image mask. |
-| `DIFFUSION_VRAM_HEADROOM_MB` | `ggml_cuda`: VRAM left free for activations when deciding which weights stay device-resident (default: `2048`); what does not fit streams per step. |
-| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | `ggml_cuda`: cap on incidental device copies (prompt K/V, masks, activations) once the weights do not all fit (default: `768`). |
-| `DIFFUSION_SEGMENTED_DECODE` | `ggml_cuda`: run each layer as its own fused graph so streamed weights share one bounded staging buffer. Chosen automatically when the model does not fit; `1` / `0` forces it on / off. |
-| `DIFFUSION_PIN_STREAMED` | `ggml_cuda`: `1` copies the streamed weights into page-locked host memory, costing RAM equal to the streamed bytes (default off: measured neutral on Windows, where the pageable upload already runs near DMA speed once the file cache is warm; it may help on Linux). |
-| `DIFFUSION_NO_DEVICE_SAMPLE` | `ggml_cuda`: `1` disables on-device sampling (argmax, entropy, sample and self-conditioning top-K computed on the device logits). It is on by default only while the weights are fully resident; `DIFFUSION_DEVICE_SAMPLE_FORCE=1` keeps it on under segmented decode too, for experiments. |
-| `DIFFUSION_ASYNC_COMPUTE` | `1` forces async GGML compute back on for DiffusionGemma. **Unsafe** — it reintroduces corrupted, off-topic answers — and exists only to A/B the cost of the synchronize. |
 
 Sampling parameter precedence (highest wins), with the default
 `--sampling-precedence config`:
@@ -2240,7 +2225,7 @@ continues to measure its direct backend decode paths, including MLX pipelining.
 | GPT OSS | ON | — | — |
 | Nemotron-H | ON | — | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step (NEON SIMD + GCD parallelism) |
 | GLM 5.x | not implemented — concurrency runs on native per-sequence **slots** instead (each request owns its MLA and indexer caches and its own `n_past`; binding a request switches the active slot without moving KV bytes). MLA keeps one 576-wide row per token and the DSA indexer scores that same contiguous history, so there is no paged-KV layout to batch over | — | Batched fused decode over those slots is ON by default (one graph, one token per sequence, weights read once): 1.81x aggregate decode at 4 concurrent requests. Set `TS_BATCHED_FUSED_DECODE=0` to use serial fused decode. Batching changes GEMM shapes, and a 2-bit MoE can amplify that into different expert picks. |
-| DiffusionGemma | Separate diffusion scheduler in the Web UI path; not an `IBatchedPagedModel` autoregressive path | `DIFFUSION_MAX_BATCH`, `DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` enables true batched canvas decode; fused GGML decode is on by default unless disabled with `DIFFUSION_NO_FUSED_DECODE=1` |
+| DiffusionGemma | Separate diffusion scheduler in the Web UI path; not an `IBatchedPagedModel` autoregressive path | `DIFFUSION_MAX_BATCH`, `DIFFUSION_STEPS` | The prompt and each canvas step run on the shared decoder runtime's graphs (one prompt cache per request); the scheduler admits requests between blocks |
 
 #### Speculative decoding
 
@@ -2448,7 +2433,7 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 | Float-panel GEMM (F16, BF16, F32 and dequantize-only types) | ON where AVX2+FMA exists | — | — |
 | Packed F32 SGEMM behind `Ops.Addmm` and the Direct networks | ON (AVX-512 8x32, AVX2 6x16 or portable kernel) | `TS_CPU_SGEMM_KERNEL`, `TS_CPU_SGEMM_KC` / `_MC` / `_NC`, `TS_CPU_SGEMM_DOT_MAXN` for tuning | — |
 | AVX-512 kernels | ON when the CPU has AVX-512 F/BW/DQ and the runtime accelerates `Vector512` (the older per-row Q4_0 / Q8_0 dots: when it has AVX-512 F/BW) | `TS_CPU_DISABLE_AVX512=1` runs the AVX2 form of every hand-written kernel; `DOTNET_EnableAVX512=0` (not `DOTNET_EnableAVX512F`) makes the whole runtime AVX2-only | — |
-| DiffusionGemma on `cpu` | prompt-KV caching, batched MoE, fused Q/K/V and gate/up projections | `DIFFUSION_NO_PKV=1` turns the prompt-KV cache off; `DIFFUSION_CPU_ATTN_FAST=1`, `DIFFUSION_CPU_MOE_CHUNK` | — |
+| DiffusionGemma on `cpu` | the shared decoder runtime's graphs on the managed executor: the prompt cache, canvas steps and batched canvases of every backend | — | — |
 | Qwen-Image-2.1 on `cpu` | the DiT's graph programs on the managed tensor executor; the text encoder with 8-bit activations on the multi-row integer GEMM; packed-GEMM VAE and vision tower; a request with no size renders at 1024×1024 (1 MP) — `ggml_cpu` and the GPU backends keep 2048×2048 | `TS_CPU_GEMM_THREADS` sizes the VAE's own pool (every logical CPU, at most 64); `TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` skips the up-front refusal of a size that cannot fit in memory (the DiT's `TS_QWEN21_CPU_*` switches were removed with the pure-C# transformer; the text encoder's `TS_QWEN_TE_CPU_MATMUL` and the `TS_QWEN_VAE_PROFILE` / `TS_QWEN_TE_PROFILE` timings were removed as well) | — |
 | DeepSeek V4.1 Flash's whole-model executor | pure C# (`DeepSeek4CpuExecutor`) — a whole-model executor here rather than the generic per-op path | `TS_DSV4_THREADS=N` sets its compute width (every processor by default), not `TS_CPU_THREADS` | — |
 | Quantized weights on the direct video networks (Wan, MiniMax-H3) | kept in their GGUF storage type and multiplied there (expanding them to F32 at load took 4x the weight memory; on Wan at 256x160x5f, one step, the in-place path measured 80.9 s against 121.4 s) | — | — |

@@ -375,16 +375,17 @@ rope_freqs.weight                          # 比例频率因子
 
 ## 7. 在共享解码器运行时上的实现
 
-Gemma 4 运行在共享解码器运行时上：[`Gemma4RuntimeModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.cs) 是一个
+Gemma 4 运行在共享解码器运行时上：[`Gemma4RuntimeModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.cs) 派生自
+[`Gemma4DecoderModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4DecoderModel.cs)（它与 [DiffusionGemma](diffusiongemma_zh-cn.md) 共享的配方），是一个
 [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) 家族，因此槽位、统一步骤、连续批处理、前缀缓存、
 检查点、放置策略与投机解码都由运行时提供，每一步都是由后端执行器（GGML、托管 CPU、直连 CUDA、MLX）运行的整前向计算图程序。
 家族通过运行时的钩子提供模型配方：
 
 | 部分 | 位置 | 内容 |
 |---|---|---|
-| 逐层注意力几何 | `Gemma4RuntimeModel.cs`（`LayerKeyDim`、`LayerKvHeads`、`SlidingWindow`、`AttentionScale`） | 宽 256 的滑窗 head 与宽 512 的全局 head、逐层 KV head 数、缩放为 1 |
+| 逐层注意力几何 | `Gemma4DecoderModel.cs`（`LayerKeyDim`、`LayerKvHeads`、`SlidingWindow`、`AttentionScale`） | 宽 256 的滑窗 head 与宽 512 的全局 head、逐层 KV head 数、缩放为 1 |
 | KV 共享 | `KvSourceLayer`；运行时的 `EmitSharedKvAttention` | 最后 `shared_kv_layers` 层读取同一步中其来源层的操作数，只投影 query |
-| Q/K/V | `Gemma4RuntimeModel.Graph.cs`（`EmitAttentionProjections`、`EmitQueryKey`） | 带权重的 Q/K RMSNorm、无权重的 V norm；没有 `attn_v` 的全局层取 V = K |
+| Q/K/V | `Gemma4DecoderModel.Graph.cs`（`EmitAttentionProjections`、`EmitQueryKey`） | 带权重的 Q/K RMSNorm、无权重的 V norm；没有 `attn_v` 的全局层取 V = K |
 | 旋转位置编码 | 带 `rope_freqs` 因子的 `RotarySpec`（带因子输入的 `GraphOp.RopeExt`） | 局部层 NeoX、基数 10 000；全局层在 512 维上按比例因子旋转 |
 | 前馈 | `EmitFeedForward`、`EmitRoutedExperts` | GeGLU；MoE 层：稠密分支与基于融合 `ffn_gate_up_exps` 的路由 GeGLU 专家并列，带路由缩放与逐专家输出缩放 |
 | Per-layer embedding | `EmitStreamInput` / `EmitPerLayerInputs` / `EmitBlockOutput` | `per_layer_token_embd` 的 token 行加上归一化的模型投影，在每层之后经门控加入残差流 |

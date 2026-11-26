@@ -1165,7 +1165,7 @@ namespace TensorSharp.Models
             // dispatch. Replaces the ~10 separate per-op submissions in the
             // per-op Attention() path (each its own Metal command buffer).
             // Mirrors the reference llama.cpp graph in src/models/openai-moe-iswa.cpp
-            // and the existing TSGgml_Gemma4LayerPrefill template.
+            // and the shared fused-layer-prefill template the other families used.
             //
             // Decode (seqLen == 1) and the non-Metal backends still flow through
             // the original per-op path below.

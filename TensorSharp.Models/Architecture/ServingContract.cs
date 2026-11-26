@@ -408,6 +408,10 @@ namespace TensorSharp.Models.Architecture
                     // runtime's.
                     if (this[mechanism] is { Kind: SupportKind.Supported, Backends.Count: 0 } gap && !string.IsNullOrWhiteSpace(gap.GapReason))
                         continue;
+                    // A non-autoregressive family on the decoder runtime (DiffusionGemma) has no decode steps to batch: its
+                    // own scheduler batches its canvases.
+                    if (mechanism == ServingMechanism.ContinuousBatching && !Autoregressive && this[mechanism].Kind == SupportKind.NotApplicable)
+                        continue;
                     if (this[mechanism].Kind != expected[mechanism].Kind ||
                         !this[mechanism].Backends.OrderBy(b => b).SequenceEqual(expected[mechanism].Backends.OrderBy(b => b)) ||
                         !this[mechanism].BatchedBackends.OrderBy(b => b).SequenceEqual(expected[mechanism].BatchedBackends.OrderBy(b => b)))

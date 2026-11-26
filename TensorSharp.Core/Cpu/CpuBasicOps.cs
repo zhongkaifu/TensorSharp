@@ -211,6 +211,34 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
+        [RegisterOpStorageType("cumsum", typeof(CpuStorage))]
+        public unsafe Tensor CumSum(Tensor result, Tensor src)
+        {
+            if (src.ElementType != DType.Float32) throw new NotSupportedException("cumsum takes F32 tensors");
+            using Tensor contiguous = Ops.AsContiguous(src);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
+            long cols = src.Sizes[^1], rows = src.ElementCount() / Math.Max(1, cols);
+            float* x = (float*)contiguous.Storage.PtrAtElement(contiguous.StorageOffset);
+            if (writeTarget.IsContiguous())
+            {
+                float* y = (float*)writeTarget.Storage.PtrAtElement(writeTarget.StorageOffset);
+                System.Threading.Tasks.Parallel.For(0, rows, r =>
+                {
+                    float run = 0f;
+                    for (long i = 0; i < cols; i++) { run += x[r * cols + i]; y[r * cols + i] = run; }
+                });
+                return writeTarget;
+            }
+            var values = new float[rows * cols];
+            for (long r = 0; r < rows; r++)
+            {
+                float run = 0f;
+                for (long i = 0; i < cols; i++) { run += x[r * cols + i]; values[r * cols + i] = run; }
+            }
+            writeTarget.SetElementsAsFloat(values);
+            return writeTarget;
+        }
+
         [RegisterOpStorageType("log", typeof(CpuStorage))]
         public Tensor Log(Tensor result, Tensor src) 
         {

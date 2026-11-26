@@ -213,21 +213,6 @@ TestMatrix 配置中 sweep。
 |---|---|---|---|---|---|
 | `DIFFUSION_STEPS` | DiffusionGemma Web UI | 服务端路径每个 block 的去噪步数 | `48` | 未注册 | 否 |
 | `DIFFUSION_MAX_BATCH` | DiffusionGemma Web UI | `DiffusionBatchScheduler` 的最大活跃请求数 | `2` | 未注册 | 否 |
-| `DIFFUSION_BATCHED_FORWARD` | DiffusionGemma | 真正批处理 canvas decode vs 按时间片执行融合单 canvas decode | 关闭 | 未注册 | 否 |
-| `DIFFUSION_NO_PKV` | DiffusionGemma | 关闭 prompt-KV 缓存（device-glue 后端与 `cpu`）：之后每次读取、每个去噪步都走统一的 `[prompt\|canvas]` 前向 | 关闭 | 未注册 | 否 |
-| `DIFFUSION_CPU_ATTN_FAST` | `cpu` 上的 DiffusionGemma | `1` 选择 FMA 注意力分块（硬件加速时用 Vector512）与向量化 softmax。默认内核精确复现旧的算术，因为最后一个比特的变化就可能翻转 128 选 8 的专家路由；在 Jev 与聊天的提示长度下，注意力只占一次前向的不到百分之一 | 关闭 | 未注册 | 否 |
-| `DIFFUSION_CPU_MOE_CHUNK` | `cpu` 上的 DiffusionGemma | 每次批量 MoE 处理的 token 数；限制按路由收集的暂存区大小（否则 4k token 的 prefill 要占约 1 GB 的路由行） | `512` | 未注册 | 否 |
-| `DIFFUSION_NO_SC` / `DIFFUSION_SC_TOPK` | DiffusionGemma | self-conditioning 开关与实验 top-K 截断 | 启用 / `32` | 未注册 | 否 |
-| `DIFFUSION_NO_FUSED_DECODE` / `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | GGML 后端上的 DiffusionGemma | 关闭融合整模型 diffusion decode 或融合 lm-head tail | 关闭 | 未注册 | 否 |
-| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | DiffusionGemma | 回退到按序列 lm-head 前的临时 logits 内存上限 | `300` | 未注册 | 否 |
-| `DIFFUSION_VRAM_HEADROOM_MB` | ggml_cuda 上的 DiffusionGemma | 预加载权重之外保留的 VRAM 余量（计算缓冲、device copy） | `2048` | 未注册 | 否 |
-| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | ggml_cuda 上的 DiffusionGemma | 模型放不进 VRAM 时 device-copy 缓存的上限（prompt K/V、mask、激活） | `768` | 未注册 | 否 |
-| `DIFFUSION_SEGMENTED_DECODE` | ggml_cuda 上的 DiffusionGemma | 强制开启（`1`）/关闭（`0`）逐层融合 decode；模型放不进 VRAM 时自动启用 | 自动 | 未注册 | 否 |
-| `DIFFUSION_PIN_STREAMED` | ggml_cuda 上的 DiffusionGemma | 把流式（非常驻）权重复制到页锁定内存以 DMA 速度上传（消耗 RAM） | 关闭 | 未注册 | 否 |
-| `DIFFUSION_IMAGE_BIDIRECTIONAL` | DiffusionGemma 图像输入 | `0` 让图像 soft token 区间内的注意力在滑动窗口层上改为普通因果，而不是双向 | 启用 | 未注册 | 否 |
-| `DIFFUSION_FUSED_PREFILL_ATTN` | GGML 后端上的 DiffusionGemma | 融合的提示 prefill 注意力内核。在 `ggml_cuda` 上默认开启（`0` 恢复逐算子参考路径）；在其他 GGML 后端上用 `1` 显式启用。带图像的提示始终走逐算子掩码路径 | `ggml_cuda` 上启用，其余关闭 | 未注册 | 否 |
-| `DIFFUSION_NO_DEVICE_SAMPLE` / `DIFFUSION_DEVICE_SAMPLE_FORCE` | ggml_cuda 上的 DiffusionGemma | `1` 关闭设备端采样（在设备 logits 上完成 argmax、熵、采样与 self-conditioning top-K）；`FORCE=1` 在分段 decode 下也保持开启，否则那里会因实测更慢而跳过 | 模型放得进 VRAM 时启用设备端采样 | 未注册 | 否 |
-| `DIFFUSION_ASYNC_COMPUTE` | `ggml_metal` 上的 DiffusionGemma | `1` 保持异步计算开启。该模型会关掉它，因为 Metal 的延迟同步对"主机写入后接设备内核"没有屏障，会破坏逐算子 prefill 并丢失提示内容；强行打开是不安全的，只用于 A/B 这次同步的代价 | 关闭 | 未注册 | 否 |
 
 ## 矩阵外的 Qwen-Image-2.1 开关
 

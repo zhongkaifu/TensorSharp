@@ -940,21 +940,6 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 
 | 变量 | 说明 |
 |---|---|
-| `DIFFUSION_NO_SC` | 设为 `1` 关闭 self-conditioning。默认开启。 |
-| `DIFFUSION_SC_TOPK` | 实验用 self-conditioning top-K 截断（默认：`32`）。 |
-| `DIFFUSION_NO_PKV` | 设为 `1` 关闭 device-glue 后端上的 prompt-KV 缓存。支持处默认开启。 |
-| `DIFFUSION_NO_FUSED_DECODE` | 设为 `1` 关闭 GGML 融合整模型 diffusion decode，回退到逐算子 / 逐层 diffusion decode。 |
-| `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | 设为 `1` 关闭融合 output-norm + lm-head + softcap 尾部。 |
-| `DIFFUSION_BATCHED_FORWARD` | 设为 `1` 后，对活跃 diffusion canvas 使用真正的 `DecodeCanvasBatched`；默认按请求时间片执行更快的融合单 canvas 路径。 |
-| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | diffusion lm-head logits 批处理内存上限，超过后回退到按序列 lm-head（默认：`300`）。 |
-| `DIFFUSION_IMAGE_BIDIRECTIONAL` | 图像软 token 片段在滑动窗口层上做双向注意（默认开启）；`0` 改为普通因果注意，这也是 HuggingFace 自己的 DiffusionGemma 实际运行的方式。 |
-| `DIFFUSION_FUSED_PREFILL_ATTN` | 融合的 GGML 提示词 prefill 注意力：在 `ggml_cuda` 上默认开启，`1` 可让其他 GGML 后端启用，`0` 恢复逐算子参考路径。带图像的提示词始终关闭它，因为融合内核表达不了图像所需的双向掩码。 |
-| `DIFFUSION_VRAM_HEADROOM_MB` | `ggml_cuda`：决定哪些权重常驻显存时，为激活预留的显存（默认：`2048`）；放不下的权重每步流式传输。 |
-| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | `ggml_cuda`：权重放不下时，对附带设备拷贝（提示词 K/V、掩码、激活）设的上限（默认：`768`）。 |
-| `DIFFUSION_SEGMENTED_DECODE` | `ggml_cuda`：每层单独作为一张融合图运行，使流式权重共用一块有界的暂存缓冲。模型放不下时自动选用；`1` / `0` 强制开启 / 关闭。 |
-| `DIFFUSION_PIN_STREAMED` | `ggml_cuda`：`1` 把流式权重复制到页锁定主机内存，代价是与流式字节数相等的内存（默认关闭：在 Windows 上实测无收益，文件缓存预热后可分页内存的上传已接近 DMA 速度；在 Linux 上可能有帮助）。 |
-| `DIFFUSION_NO_DEVICE_SAMPLE` | `ggml_cuda`：`1` 关闭设备端采样（在设备 logits 上直接计算 argmax、熵、采样与自条件 top-K）。它默认只在权重完全常驻时开启；`DIFFUSION_DEVICE_SAMPLE_FORCE=1` 可在分段 decode 下也保持开启，仅供实验。 |
-| `DIFFUSION_ASYNC_COMPUTE` | `1` 为 DiffusionGemma 强制重新开启 GGML 异步计算。**不安全**——会重新引入被破坏、答非所问的回答——仅用于 A/B 同步本身的开销。 |
 
 采样参数的优先级（从高到低，对应默认的 `--sampling-precedence config`）：
 
@@ -1956,7 +1941,7 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | GPT OSS | 启用 | — | — |
 | Nemotron-H | 启用 | — | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 步（NEON SIMD + GCD 并行） |
 | GLM 5.x | 未实现——并发走的是原生的按序列**槽位**（每个请求拥有自己的 MLA 与索引器缓存以及自己的 `n_past`；绑定请求只是切换活跃槽位，不搬运任何 KV 字节）。MLA 每个 token 只存一行 576 宽的数据，DSA 索引器打分的也正是这段连续历史，所以这里没有可供批处理的分页 KV 布局 | — | 跨槽位的批处理融合解码默认开启（一张图、每个序列一个 token、权重只读一次）：4 路并发下总解码吞吐 1.81 倍。设置 `TS_BATCHED_FUSED_DECODE=0` 可切回串行融合 decode。批处理会改变 GEMM 形状，而 2-bit MoE 可能把这点差异放大成不同的专家选择。 |
-| DiffusionGemma | Web UI 路径使用独立 diffusion 调度器；不是 `IBatchedPagedModel` 自回归路径 | `DIFFUSION_MAX_BATCH`、`DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` 启用真正的批处理 canvas decode；GGML 融合 decode 默认开启，可用 `DIFFUSION_NO_FUSED_DECODE=1` 关闭 |
+| DiffusionGemma | Web UI 路径使用独立 diffusion 调度器；不是 `IBatchedPagedModel` 自回归路径 | `DIFFUSION_MAX_BATCH`、`DIFFUSION_STEPS` | 提示与每个 canvas 步骤都运行在共享解码运行时的计算图上（每个请求一份提示缓存）；调度器在 block 之间接纳请求 |
 
 #### 投机解码
 
@@ -2145,7 +2130,7 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 | 浮点面板 GEMM（F16、BF16、F32 与只能反量化的类型） | 有 AVX2+FMA 时启用 | — | — |
 | `Ops.Addmm` 与 Direct 网络背后的 packed F32 SGEMM | 启用（AVX-512 8x32、AVX2 6x16 或可移植内核） | `TS_CPU_SGEMM_KERNEL`、`TS_CPU_SGEMM_KC` / `_MC` / `_NC`、`TS_CPU_SGEMM_DOT_MAXN` 用于调优 | — |
 | AVX-512 内核 | CPU 支持 AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速时启用（旧的逐行 Q4_0 / Q8_0 点积：CPU 支持 AVX-512 F/BW 时启用） | `TS_CPU_DISABLE_AVX512=1` 让所有手写内核以 AVX2 形式运行；`DOTNET_EnableAVX512=0`（不是 `DOTNET_EnableAVX512F`）让整个运行时只用到 AVX2 | — |
-| `cpu` 上的 DiffusionGemma | prompt-KV 缓存、批量 MoE、融合的 Q/K/V 与 gate/up 投影 | `DIFFUSION_NO_PKV=1` 关闭 prompt-KV 缓存；`DIFFUSION_CPU_ATTN_FAST=1`、`DIFFUSION_CPU_MOE_CHUNK` | — |
+| `cpu` 上的 DiffusionGemma | 共享解码运行时在托管执行器上的计算图：与所有后端相同的提示缓存、canvas 步骤与批量 canvas | — | — |
 | `cpu` 上的 Qwen-Image-2.1 | DiT 的计算图程序在托管张量执行器上运行；文本编码器使用 8 位激活、在多行整数 GEMM 上计算；VAE 与视觉塔走 packed GEMM；未指定尺寸的请求输出 1024×1024（1 百万像素）——`ggml_cpu` 与 GPU 后端保持 2048×2048 | `TS_CPU_GEMM_THREADS` 设置 VAE 专用池的宽度（每个逻辑 CPU 一个线程，最多 64）；`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` 跳过对内存放不下的尺寸的预先拒绝（DiT 的 `TS_QWEN21_CPU_*` 开关已随纯 C# Transformer 一并移除；文本编码器的 `TS_QWEN_TE_CPU_MATMUL` 以及 `TS_QWEN_VAE_PROFILE` / `TS_QWEN_TE_PROFILE` 计时同样已移除） | — |
 | DeepSeek V4.1 Flash 的整模型执行器 | 纯 C#（`DeepSeek4CpuExecutor`）——在这个后端上走整模型执行器，而不是通用逐算子路径 | 它的计算宽度由 `TS_DSV4_THREADS=N` 决定（默认取全部处理器），而不是 `TS_CPU_THREADS` | — |
 | direct 视频网络（Wan、MiniMax-H3）上的量化权重 | 保持 GGUF 存储类型，直接参与乘法（加载时展开成 F32 需要 4 倍权重内存；Wan 在 256x160x5f、单步下，就地路径实测 80.9 秒，展开路径 121.4 秒） | — | — |

@@ -458,6 +458,16 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
     /// one token whatever the context).</summary>
     public bool UntiedOutput { get; init; }
 
+    /// <summary>Write a DiffusionGemma file (architecture <c>diffusion-gemma</c>) on this backbone: a canvas of
+    /// <see cref="CanvasLength"/> rows, a mask token, the self-conditioning MLP and each layer's encoder scale.</summary>
+    public bool Diffusion { get; init; }
+
+    /// <summary>The DiffusionGemma canvas length (<see cref="Diffusion"/>).</summary>
+    public int CanvasLength { get; init; } = 16;
+
+    /// <summary>The DiffusionGemma mask token (<see cref="Diffusion"/>).</summary>
+    public const int MaskToken = 3;
+
     /// <summary>A file whose greedy continuation depends on the history, not only on the last
     /// token: global layers only (with the sliding window the default decode is D3 and repeats
     /// nothing), an untied head, a small embedding and a stronger attention output. Measured: the
@@ -473,7 +483,7 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
 
     public string Write(string path)
     {
-        const string a = "gemma4";
+        string a = Diffusion ? "diffusion-gemma" : "gemma4";
         int layers = Pattern.Length;
         var kvHeads = new int[layers];
         for (int l = 0; l < layers; l++)
@@ -506,6 +516,11 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
             new U32 { Key = $"{a}.rope.dimension_count_swa", V = LocalHeadDim },
         };
         AddByteTokenizer(kv, Vocab, bos: 1, eos: 2);
+        if (Diffusion)
+        {
+            kv.Add(new U32 { Key = "diffusion.canvas_length", V = (uint)CanvasLength });
+            kv.Add(new U32 { Key = "tokenizer.ggml.mask_token_id", V = MaskToken });
+        }
 
         // Proportional RoPE: the first quarter of the global head's frequency pairs rotate,
         // the rest are pinned by a 1e30 divisor (the 26B's rope_freqs.weight).
@@ -520,6 +535,13 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
         };
         if (UntiedOutput)
             t.Add(GptOssSyntheticModelBuilder.Q8(Gen("output.weight", 0.08f, Hidden, Vocab)));
+        if (Diffusion)
+        {
+            t.Add(GenAround("self_cond_pre_norm.weight", 1f, 0.1f, Hidden));
+            t.Add(Blocks("self_cond_gate.weight", GgmlType.Q4_0, 0.06f, Hidden, DenseFf));
+            t.Add(Blocks("self_cond_up.weight", GgmlType.Q4_0, 0.06f, Hidden, DenseFf));
+            t.Add(Blocks("self_cond_down.weight", GgmlType.Q4_0, 0.06f, DenseFf, Hidden));
+        }
         for (int l = 0; l < layers; l++)
         {
             string p = $"blk.{l}.";
@@ -557,6 +579,8 @@ internal sealed class Gemma4MoeSyntheticModelBuilder
             t.Add(Blocks(p + "ffn_down_exps.weight", GgmlType.Q4_0, 0.06f, ExpertFf, Hidden, Experts));
             t.Add(GenAround(p + "ffn_down_exps.scale", 1f, 0.02f, Experts));
             t.Add(new Tensor { Name = p + "layer_output_scale.weight", Dims = new[] { 1UL }, Data = new[] { local ? 0.95f : 0.9f } });
+            if (Diffusion)
+                t.Add(new Tensor { Name = p + "enc_layer_output_scale.weight", Dims = new[] { 1UL }, Data = new[] { local ? 0.85f : 0.8f } });
         }
         SyntheticGguf.Write(path, kv, t);
         return path;

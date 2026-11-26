@@ -69,6 +69,10 @@ namespace TensorSharp.Graph
         /// approximation). Executors without an erf kernel evaluate erf with Abramowitz and Stegun's 7.1.26 (|error| below
         /// 1.5e-7), as ggml-metal does.</summary>
         GeluErf = 71,
+        /// <summary>The natural logarithm (ggml_log).</summary>
+        Log = 72,
+        /// <summary>The running sum along ne0 (ggml_cumsum): y[i] = x[0] + ... + x[i] in each row.</summary>
+        CumSum = 73,
     }
 
     /// <summary>

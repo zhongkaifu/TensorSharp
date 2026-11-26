@@ -118,34 +118,31 @@ GGUF 必须报告 `general.architecture=diffusion-gemma` 或 `diffusion_gemma`�
 
 ## 2. 前向计算图
 
-模型暴露两种执行路径。
+DiffusionGemma 运行在共享解码运行时上：`DiffusionGemmaModel` 派生自
+[`Gemma4DecoderModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4DecoderModel.cs)，即 Gemma 4 26B-A4B
+的配方（逐层的 head 宽度、V = K 的全局层、分解的 RoPE、三明治归一化、与 128 专家路由分支并列的稠密 GeGLU
+分支），因此它的缓存、放置、专家卸载与计算图执行器在每个后端上都是运行时提供的。
 
-统一正确性路径是 `ForwardCanvas(tokens, promptLen)`：
+一个 block 先做一次提示预填充，之后每个去噪步运行一次 canvas 步骤：
+
+1. `PrefillPrompt(promptTokens)` 把提示作为因果提示写入运行时的缓存（滑动窗口层对其裁剪；图像的软 token
+   只在这些层上彼此双向注意，且每张图像各自独立）。每一层的输出乘以其 `enc_layer_output_scale`。下一个 block
+   的提示在此基础上延伸，因此只预填充新增的行。
+2. `DecodeCanvas(canvasTokens, scBuffer, scUse, prevTempInv)`（或 `DecodeCanvasSampled`）把 canvas 作为提示之后
+   的一组块行（block rows）以一张图运行：在每一层上每个 canvas 行都读取其他所有 canvas 行，并从第一个 canvas
+   行的窗口起读取提示行（全局层读取全部）；每一层的输出乘以其 `layer_output_scale`。不提交任何内容：canvas 的
+   K/V 写入之后会被下一批提示行覆盖的单元，因此一个 block 的每一步读到的是同一份提示。同一个 block 的各步重放
+   同一张已记录的计算图。
 
 ```text
-[prompt tokens | canvas tokens]
-  -> 区域感知 embedding scale
-  -> prompt/canvas attention mask
-  -> N 个 Gemma 风格 transformer 层
-       - local/global QK-norm attention
-       - dense gated-GELU MLP
-       - top-k MoE experts
-       - prompt encoder scale / canvas decoder scale
-  -> output norm
-  -> tied lm-head
-  -> final logit softcap
-  -> canvas logits
+canvas tokens
+  -> rms_norm(embed * sqrt(n_embd) + selfcond(上一步的 top-32))   （无权重）
+  -> 30 层 Gemma 4，作为基于提示缓存的块行
+  -> output norm -> 共享 lm-head -> final logit softcap
+  -> canvas logits，或（设备端采样）每个位置的 argmax / 熵 / 抽样 / top-32
 ```
 
-GPU 优化路径会把每个 block 拆成 prompt prefill 与多次 canvas decode：
-
-1. `PrefillPrompt(promptTokens)` 只计算一次 prompt K/V。
-2. `DecodeCanvas(canvasTokens, scBuffer, scUse, prevTempInv)` 在每个去噪步复用 prompt K/V。
-3. 采样器接受低熵位置，重新噪声化其余位置，然后继续迭代。
-
-Prompt-KV 缓存在 device-glue 后端（`ggml_metal`、`ggml_cuda`、`mlx`、`cuda`）以及纯 C# 的 `cpu`
-后端上启用，`cpu` 把 prompt K/V 保存在主机内存中（见第 5 节）；在 `ggml_cpu` 与 `ggml_vulkan` 上，每一步
-都改走统一的 `[prefix|canvas]` forward。
+`ForwardCanvas(tokens, promptLen)` 在一次调用中接收提示与 canvas，执行同样的两步（提示是因果的，从不读取 canvas）。
 
 ## 3. 采样器契约
 
@@ -194,85 +191,46 @@ Diffusion 专属元数据：
 
 ## 5. 加速状态
 
-当前优化路径包括：
+- 提示缓存、canvas 步骤与批量 canvas 在每个后端上运行（`ggml_cuda`、`ggml_metal`、`ggml_vulkan`、`ggml_cpu`、
+  `cuda`、`mlx`、`cpu`），每一步都是该后端执行器上的一张计算图，每个 block 记录一次后重放。
+- 一个 block 的提示复用上一个 block 已缓存的行，只预填充新增的行。
+- `ggml_cuda` 上的设备端采样：输出头的 `[vocab, canvas]` logits 留在设备上，计算图只返回每个位置的 argmax、熵、
+  多项式抽样与 top-32（下一步的自条件输入）。其他后端把 logits 读回，由主机采样。
+- 自条件（检查点带有 `self_cond_*` 权重时开启）：上一步 top-32 的软嵌入在主机上由词表求和，再在该步的计算图中
+  经过门控 GELU MLP。
+- 放不进设备的路由专家在主机内存中运行（运行时的放置，或 `--n-cpu-moe N` / `--cpu-moe`），每个执行器上都使用
+  融合的 gate|up GeGLU 专家栈。
+- `TensorSharp.Server` 通过 `DiffusionBatchScheduler` 在 block 边界做连续批处理；多个请求的 canvas 可以在一步中
+  一起运行（`DecodeCanvasBatched`）。
 
-- `ggml_metal`、`ggml_cuda`、`mlx`、`cuda` 与 `cpu` 上的 prompt-KV 缓存（`ggml_cpu` 与 `ggml_vulkan` 上没有）。
-- 默认启用 self-conditioning；可用 `DIFFUSION_NO_SC=1` 关闭。
-- GGML 融合 decode layer、融合整模型 decode、融合 lm-head tail。
-- CUDA VRAM 常驻规划：当模型大于 VRAM 时，按优先级把权重预加载到设备
-  （lm_head/embedding、逐层 attention/dense、再到 MoE 专家堆叠），上限为
-  可用 VRAM 减去余量；对 device-copy 缓存设置上限；并把 decode 切换到
-  逐层分段融合路径，使未常驻的部分通过一个有界的复用 staging 缓冲流式
-  上传，而不是超订 VRAM（超订会让 Windows WDDM 在每次提交时换页，实测
-  比流式上传慢约 4 倍）。
-- 与去噪步无关的 decode mask 在 host 端缓存并以 cacheable 方式绑定
-  （每个 block 几何只上传一次，而不是每层每步重建并上传）。
-- SIMD 向量化 host 路径（`TensorPrimitives`）：每位置
-  argmax/熵/多项式采样以及 final-logit softcap；融合 lm-head 的 logits
-  写入一个池化的 pinned 缓冲，而不是每步新分配 268 MB。
-- 针对 DiffusionGemma 多行 canvas 工作负载的 MLX K-quant affine repack。
-- `TensorSharp.Server` 中通过 `DiffusionBatchScheduler` 做 block 边界连续批处理。
-- 带有自己的 prompt-KV 缓存与批处理内核的纯 C# `cpu` 路径，见下文。
+在单张 A40 上实测（`diffusiongemma-26B-A4B-it-Q4_K_M.gguf`，ggml d9fe7bff，`eng/validation/DiffusionGemmaAB`），
+与被本运行时取代的旧模型对比：
 
-### 纯 C# CPU 后端（`--backend cpu`）
+| `ggml_cuda` | 旧模型 | 运行时 |
+|---|---:|---:|
+| 512 token 提示预填充（预热后） | 2.47–2.65 s | 0.14–0.15 s |
+| canvas 步骤，主机采样（256 行，含自条件） | 325–333 ms | 145–160 ms |
+| canvas 步骤，设备端采样 | 218 ms | 114–128 ms |
+| 生成，三个提示（每个去噪步的毫秒数） | 268–353 | 129–153 |
 
-```bash
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --input prompt.txt --backend cpu \
-  --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0 --diffusion-blocks 1
-```
-
-服务端与 [Jev 端点](jev_zh-cn.md)接受同样的 `--backend cpu`。在这个后端上
-（[`DiffusionGemmaModel.Cpu.cs`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaModel.Cpu.cs)）：
-
-- **Prompt K/V 缓存在主机上。** `PrefillPrompt` 把每层经过 norm 与 RoPE 之后的 K/V 按 token 顺序保存；
-  滑动窗口层只保留 canvas 查询能看到的最后若干行。此后每个去噪步只计算 canvas；对已经 prefill 过的提示，
-  Jev 读取会复用保存的 K/V。调度器的多请求 decode 在主机上把活跃的 canvas 批在一起。
-- **同一输入的多个投影共用一次调度**（Q/K/V，以及 gate/up）；MoE 把所有活跃专家的 gate/up 与 down 投影
-  作为两次批量调度，交给多行量化 GEMM，每批 `DIFFUSION_CPU_MOE_CHUNK` 个 token。
-- **注意力**是分块内核，默认算术精确复现旧内核（`DIFFUSION_CPU_ATTN_FAST=1` 改用 FMA 分块）。这个模型对
-  最后一个比特的变化异常敏感：每次 matmul 前都会量化激活，每层又要从 128 个专家里选 8 个，路由上的平局
-  可能翻转。在数值上等价的不同内核之间，单字段 Jev 概率的变化可达 ±0.2，因此下文按标签判定来评估质量。
-- `DIFFUSION_NO_PKV=1` 关闭缓存（该后端的其他变量见
-  [环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的纯-c-cpu-后端变量)）。
-
-在 i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows 上，用 `diffusiongemma-26B-A4B-it-Q4_K_M.gguf` 与
-`eng/JevProbe` 实测（对一个 54 token 的提示做结构化读取；"旧构建"指本次 `cpu` 改动之前的构建）：
-
-| Jev 结构化读取 | `cpu` | `cpu`，旧构建 | `ggml_cpu` |
-|---|---:|---:|---:|
-| 宽度 16，新提示的首次读取 | 0.92 s | 9.5 s | 1.57 s |
-| 宽度 16，同一提示的后续读取 | 0.22–0.25 s | 9.5 s | 1.57 s |
-| 宽度 64，新提示的首次读取 | 1.42 s | 未测 | 2.68 s |
-| 宽度 64，同一提示的后续读取 | 0.63–0.73 s | 未测 | 2.68 s |
-
-`ggml_cpu` 没有 prompt-KV 缓存，所以那里每次读取的代价都一样。在 `--quality` 集合（9 个双问题提示，
-每个分别以宽度 16 与 64 读取）上，`cpu` 与 `ggml_cpu` 都选中了全部 36 个预期标签（平均概率 0.9906 与 0.9886），两者的
-首选标签 36 个全部一致，最大概率差为 0.049。`cpu` 上的聊天生成使用同样的内核与缓存，但其速度没有测量。
+以旧模型自己的回答做 teacher forcing（相同的 256 token canvas），两者在每个位置上的 argmax 都一致，canvas token
+的平均对数概率相同（带自条件时为 -0.0000 / -0.0000 与 -0.0003 / -0.0003）；相同提示与种子下生成的回答内容一致。
 
 重要开关：
 
 | 变量 | 作用 |
 |---|---|
 | `DIFFUSION_STEPS` | 服务端每个 block 的去噪步数，默认 48 |
-| `DIFFUSION_MAX_BATCH` | 服务端 diffusion scheduler 最大活跃请求数，默认 2 |
-| `DIFFUSION_NO_PKV=1` | 关闭 device-glue 后端与 `cpu` 上的 prompt-KV 缓存 |
-| `DIFFUSION_CPU_ATTN_FAST=1` | `cpu`：用 FMA 注意力分块与向量化 softmax 代替精确的默认内核 |
-| `DIFFUSION_CPU_MOE_CHUNK` | `cpu`：每次批量 MoE 处理的 token 数，默认 512 |
-| `DIFFUSION_NO_SC=1` | 关闭 self-conditioning |
-| `DIFFUSION_SC_TOPK` | 实验用 self-conditioning top-K 截断，默认 32 |
-| `DIFFUSION_BATCHED_FORWARD=1` | 使用真正的批处理 canvas decode，而不是按时间片执行融合单 canvas decode |
-| `DIFFUSION_NO_FUSED_DECODE=1` | 关闭 GGML 融合整模型 diffusion decode |
-| `DIFFUSION_NO_FUSED_LMHEAD_TAIL=1` | 关闭融合 output-norm + lm-head + softcap tail |
-| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | 临时批处理 lm-head logits 的内存上限，默认 300 MB |
-| `DIFFUSION_VRAM_HEADROOM_MB` | ggml_cuda：预加载权重之外保留的 VRAM 余量，默认 2048 |
-| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | ggml_cuda：模型放不进 VRAM 时 device-copy 缓存上限，默认 768 |
-| `DIFFUSION_SEGMENTED_DECODE` | ggml_cuda：强制开启/关闭逐层融合 decode（`1`/`0`，放不进 VRAM 时自动启用） |
-| `DIFFUSION_PIN_STREAMED=1` | ggml_cuda：把流式权重复制到页锁定内存以 DMA 速度上传（消耗 RAM） |
-| `DIFFUSION_FUSED_PREFILL_ATTN` | 融合的 GGML prompt 注意力：`ggml_cuda` 上默认开启（`0` 恢复逐算子参考路径），其他 GGML 后端可用 `1` 选择开启，但这不代表已经过验证；图像提示始终关闭，因为它需要图像 span 的双向 mask |
-| `DIFFUSION_NO_DEVICE_SAMPLE=1` | ggml_cuda：关闭设备端 argmax / 熵 / 采样 / self-conditioning top-K（模型放得进 VRAM 时默认开启） |
-| `DIFFUSION_DEVICE_SAMPLE_FORCE=1` | ggml_cuda：即使模型放不进 VRAM（分段 decode，此时通常使用 host 采样器）也保持设备端采样；仅用于实验 |
-| `DIFFUSION_IMAGE_BIDIRECTIONAL=0` | 让图像软 token span 变为因果注意力；默认在滑动窗口层上对 span 内部做双向注意力 |
-| `DIFFUSION_ASYNC_COMPUTE=1` | ggml_metal：保持 Metal 的 lazy-sync 异步计算开启（GGML 只在 Metal 上启用它）。模型在加载时会关闭它，因为其逐算子路径会在 CPU 上写入张量（MoE 专家输入、embedding、mask、self-conditioning、每步重新加噪的 canvas），而 Metal 没有 host 写屏障，整轮缓存的 prompt K/V 可能因此被破坏，回答流畅但答非所问；不安全，仅用于测量同步的开销 |
+| `DIFFUSION_MAX_BATCH` | 服务端 diffusion scheduler 的最大活跃请求数，默认 2 |
+| `TS_VRAM_HEADROOM_MB` | 运行时专家放置为设备保留的空闲显存（默认设备显存的 1/16）；放不下的路由专家在主机内存中运行 |
+
+旧模型的开关（`DIFFUSION_NO_PKV`、`DIFFUSION_NO_SC`、`DIFFUSION_SC_TOPK`、`DIFFUSION_BATCHED_FORWARD`、
+`DIFFUSION_NO_FUSED_DECODE`、`DIFFUSION_NO_FUSED_LMHEAD_TAIL`、`DIFFUSION_LMHEAD_BATCH_CAP_MB`、
+`DIFFUSION_VRAM_HEADROOM_MB`、`DIFFUSION_DEVICE_COPY_BUDGET_MB`、`DIFFUSION_SEGMENTED_DECODE`、
+`DIFFUSION_PIN_STREAMED`、`DIFFUSION_FUSED_PREFILL_ATTN`、`DIFFUSION_NO_DEVICE_SAMPLE`、
+`DIFFUSION_DEVICE_SAMPLE_FORCE`、`DIFFUSION_IMAGE_BIDIRECTIONAL`、`DIFFUSION_ASYNC_COMPUTE`、
+`DIFFUSION_CPU_ATTN_FAST`、`DIFFUSION_CPU_MOE_CHUNK`、`DIFFUSION_CPU_LEGACY*`）已随之移除；设置其中任何一个都会
+提示取代它的方式。
 
 ## 6. 服务端行为
 
@@ -284,16 +242,12 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 - 并发请求共享一个后台 diffusion scheduler，并在 block 之间被接纳。
 - Jev 结构化读取或新一轮对话的图像编码不必等聊天的整个 block：scheduler 会在下一次前向之前把模型交出，
   所以只需等正在进行的那一次前向。block 的输出不变。
-- 在没有 prompt-KV 缓存的后端（`ggml_cpu`、`ggml_vulkan`，以及设置了 `DIFFUSION_NO_PKV=1` 的
-  `cpu`）上，scheduler 会让每个序列的每一步走统一的 `[prefix|canvas]`
-  前向，而不是 prefill + canvas decode；行为与输出完全一致。
+- 每个请求都在运行时中拥有自己的提示缓存（每个 block 预填充一次，由下一个 block 延伸），每一步都在其上运行该请求的 canvas。
 - 在 `cpu` 与 `ggml_cpu` 上，服务端对该模型跳过启动时的共享提示预热。DiffusionGemma 不在请求之间保留
   任何状态，而这次预热是在打开端口之前，按每种思考模式各对 256 token 的 canvas 做一次完整的 48 步去噪
-  （在上文的 `cpu` 改动之前，`cpu` 上第一次就用了 252.8 s）。GPU 后端保留预热：它会在第一个请求之前构建 prefill、融合 decode 与
-  lm-head 计算图。
+  （在上文的 `cpu` 改动之前，`cpu` 上第一次就用了 252.8 s）。GPU 后端保留预热：它会在第一个请求之前记录提示与 canvas 的计算图。
 - 图像回合需要用 `--mmproj` 加载视觉塔。每张图片在上下文检查之前展开为其软 token
-  span；编码后的 span 归 scheduler 中的该序列所有，每次 prefill 该序列的提示时都会
-  重新应用（每个 block 一次；在没有 prompt-KV 缓存的后端上则是每一步），因此图像请求
+  span；编码后的 span 归 scheduler 中的该序列所有，每当该序列的缓存预填充这些行时都会写到占位行上，因此图像请求
   与文本请求可以一起批处理。普通聊天拒绝音频，没有原生视频通路：OpenAI 的 `video_url` 会被拒绝；
   在 Web UI 中上传的视频只以抽取出的帧送入模型，每帧按普通 `<|image>` 渲染（没有
   `<|video>` 标记，也没有帧时间戳）。独立的 [Jev 端点](jev_zh-cn.md#文件文档视频与音频)支持
@@ -325,37 +279,36 @@ skills / 代码执行工具以及子智能体协调工具也永远不会提供�
 
 ## 7. 测试覆盖
 
-[`DiffusionGemmaTests`](../../InferenceWeb.Tests/DiffusionGemmaTests.cs) 通过
-`TS_TEST_MODEL_DIR` 指向真实 GGUF 后按需运行，覆盖：
+[`DiffusionGemmaRuntimeTests`](../../InferenceWeb.Tests/DiffusionGemmaRuntimeTests.cs) 不需要权重：基于 26B-A4B
+骨干的合成 diffusion-gemma 文件（融合 gate|up 专家、V = K 全局层、32 token 窗口、16 行 canvas、自条件 MLP 与
+encoder scale），覆盖 canvas 步骤的注意力（每个 canvas 行读取其他所有行；低于第一个 canvas 行窗口的提示 token
+不会影响 canvas，窗口内的第一个会影响）、不提交任何内容的步骤、延伸已缓存提示与重新预填充的一致性、统一调用、
+固定的 GGML 后端与托管后端的一致性、计算图采样器与主机算术的一致性、两种采样器上的生成、批量 canvas 与单独运行
+的一致性、scheduler 的批量 block、主机上的路由专家，以及结构化读取与其全词表参考的一致性。它是
+`SharedRuntimeConformanceTests` 中该家族的专用测试套件。
 
-- `ForwardCanvas` 有限 logits 正确性。
-- 端到端 EntropyBound 生成。
-- Prompt-KV 等价性与速度探针。
-- 重复 token 输出与 device memory 留存的回归保护。
-- 与服务端调度风格一致的批处理 decode 等价性和双请求生成。
+[`DiffusionGemmaTests`](../../InferenceWeb.Tests/DiffusionGemmaTests.cs) 与
+[`JevStructuredReadTests`](../../InferenceWeb.Tests/JevStructuredReadTests.cs) 通过 `TS_TEST_MODEL_DIR` 在真实 GGUF 上
+按需运行（`TS_TEST_BACKEND` 选择后端）：有限的 logits、端到端生成、提示缓存一致性、重复 token 与显存驻留保护、
+批量 decode，以及选中标签读取与全词表读取的一致性。
+[`DiffusionGemmaInterleaveTests`](../../InferenceWeb.Tests/DiffusionGemmaInterleaveTests.cs) 检查在一个 block 的前向
+之间插入 Jev 读取既不改变 block 也不改变读取结果。
 
-`cpu` 路径另有三组测试。
-[`DiffusionGemmaCpuForwardTests`](../../InferenceWeb.Tests/DiffusionGemmaCpuForwardTests.cs)
-（同样由 `TS_TEST_MODEL_DIR` 启用）在真实 GGUF 上检查：prompt-KV 读取与统一前向逐比特一致（包括超过
-滑动窗口的长提示），批处理 canvas decode 与逐序列 decode 逐比特一致，带缓存的生成与统一前向一致。
-[`DiffusionGemmaCpuKernelTests`](../../InferenceWeb.Tests/DiffusionGemmaCpuKernelTests.cs)
-与 [`DiffusionGemmaQuantContractTests`](../../InferenceWeb.Tests/DiffusionGemmaQuantContractTests.cs)
-不需要权重：它们把融合的 norm/RoPE、GELU、路由与注意力内核逐比特固定到被替换的算术上，并固定"某一行的量化
-matmul 结果与同批有多少行、在哪个批里运行无关"。
+[`DiffusionGemmaProtocolTests`](../../InferenceWeb.Tests/DiffusionGemmaProtocolTests.cs) 不需要权重，固定
+channel 解析：除非请求否则丢弃 thought 块，未闭合的 thought 块即为回答，自发的工具调用以文本呈现。
 
-[`DiffusionGemmaProtocolTests`](../../InferenceWeb.Tests/DiffusionGemmaProtocolTests.cs)
-不需要权重，固定了 channel 解析行为：未请求时丢弃思维块，未闭合的思维块作为答案，模型自行
-写出的工具调用以文本呈现。
+图像输入还有两个测试套件。
+[`DiffusionGemmaVisionConcurrencyTests`](../../InferenceWeb.Tests/DiffusionGemmaVisionConcurrencyTests.cs) 不需要权重，
+固定图像 span 归属于序列，因此两个同时进行的图像请求不会互相覆盖。
+[`Gemma4VisionOracleTests`](../../InferenceWeb.Tests/Gemma4VisionOracleTests.cs)（通过 `TS_DIFFUSIONGEMMA_VISION_DIR`
+按需运行）把从分片加载的视觉塔与 Hugging Face 参考实现的 NumPy 转写（`eng/diffusiongemma-vision-oracle.py`）比较。
 
-图像输入另有两组测试。
-[`DiffusionGemmaVisionConcurrencyTests`](../../InferenceWeb.Tests/DiffusionGemmaVisionConcurrencyTests.cs)
-不需要权重，它固定了“图像 span 属于序列”这一性质，因此两个同时在途的图像请求不会互相覆盖。
-[`Gemma4VisionOracleTests`](../../InferenceWeb.Tests/Gemma4VisionOracleTests.cs)
-（通过 `TS_DIFFUSIONGEMMA_VISION_DIR` 按需启用）把从分片加载的视觉塔与 Hugging Face
-参考实现的 NumPy 转写（`eng/diffusiongemma-vision-oracle.py`）进行比较。
+[`eng/validation/DiffusionGemmaAB`](../../eng/validation/DiffusionGemmaAB/Program.cs) 在真实检查点上比较两个构建
+（teacher forcing 的 logits、生成、计时、批量 canvas、结构化读取）；其报告应放在已忽略的 `artifacts/` 中。
 
 ## 8. 后续工作
 
-- 等 Ollama/OpenAI 适配层有 diffusion-aware 兼容面后，再补充专门 API 示例。
-- 只有在目标 GPU 上胜过当前路径时，才把真正批处理 canvas decode 提升为默认；目前单个 canvas 已经能吃满 GPU 时，融合单 canvas 路径可能更快。
-- 如运维需要更细粒度可见性，可把更多 diffusion scheduler 指标接入 `/api/queue/status`。
+- 当 Ollama/OpenAI 适配器提供面向扩散的兼容接口后，补充专门的 API 示例。
+- `ggml_metal` 与 `ggml_vulkan` 上的设备端采样（它们的计算图带有相同的采样算子，尚未在其上验证），以及多个请求的
+  canvas 在一步中的设备端采样。
+- 如果运维需要按扩散批次观察，把更多 diffusion scheduler 指标并入 `/api/queue/status`。

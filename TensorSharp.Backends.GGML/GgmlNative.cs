@@ -215,79 +215,6 @@ public struct GptOssLayerDecodeArgs
     public IntPtr DownExpsF16;
 }
 
-// Descriptor for the fused DiffusionGemma decode-layer kernel
-// (TSGgml_DiffusionDecodeLayer). Field order/types MUST match the native
-// TSGgmlDiffusionDecodeLayerDesc struct EXACTLY.
-[StructLayout(LayoutKind.Sequential)]
-public struct DiffusionDecodeLayerArgs
-{
-    // pointers (25)
-    public IntPtr Hidden;
-    public IntPtr AttnNormW;
-    public IntPtr QW;
-    public IntPtr KW;
-    public IntPtr VW;
-    public IntPtr QNormW;
-    public IntPtr KNormW;
-    public IntPtr OW;
-    public IntPtr PostAttnNormW;
-    public IntPtr PromptK;
-    public IntPtr PromptV;
-    public IntPtr FreqFactors;
-    public IntPtr FfnNormW;
-    public IntPtr GateW;
-    public IntPtr UpW;
-    public IntPtr DownW;
-    public IntPtr PostFfwNorm1W;
-    public IntPtr GateInpW;
-    public IntPtr GateInpScale;
-    public IntPtr PreFfwNorm2W;
-    public IntPtr GateUpExps;
-    public IntPtr DownExps;
-    public IntPtr DownExpsScale;
-    public IntPtr PostFfwNorm2W;
-    public IntPtr PostFfwNormW;
-
-    // int64 weight shapes (27)
-    public long QNe0, QNe1, QBytes;
-    public long KNe0, KNe1, KBytes;
-    public long VNe0, VNe1, VBytes;
-    public long ONe0, ONe1, OBytes;
-    public long GateNe0, GateNe1, GateBytes;
-    public long UpNe0, UpNe1, UpBytes;
-    public long DownNe0, DownNe1, DownBytes;
-    public long GueNe0, GueNe1, GueBytes;
-    public long DeNe0, DeNe1, DeBytes;
-
-    // int32 scalars / shapes (23)
-    public int StructBytes;
-    public int HiddenSize;
-    public int CanvasLen;
-    public int PromptLen;
-    public int NumHeads;
-    public int NumKvHeads;
-    public int HeadDim;
-    public int IsLocal;
-    public int HasVProj;
-    public int SlidingWindow;
-    public int RopeNDims;
-    public int NumExperts;
-    public int NumExpertsUsed;
-    public int FreqFactorsLen;
-    public int QType, KType, VType, OType;
-    public int GateType, UpType, DownType;
-    public int GueType, DeType;
-    /// <summary>Non-zero keeps this layer's routed experts in system RAM and runs its
-    /// MoE FFN on the host (MoeCpuOffloadConfig / --n-cpu-moe).</summary>
-    public int CpuMoe;
-
-    // float scalars (4)
-    public float Eps;
-    public float RopeBase;
-    public float InvSqrtHidden;
-    public float DecScale;
-}
-
 // One projection weight (+ optional F32 bias) of the fused Qwen-Image-2.1 text-encoder
 // trunk (TSGgml_QwenTeTrunk). MUST match native TSGImgAttnW exactly (48 bytes on 64-bit;
 // pinned by QwenImageNativeAbiTests and a native static_assert).
@@ -1910,13 +1837,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_DiffusionPrefillAttentionF32(
-            IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
-            int numHeads, int numKvHeads, int headDim, int seqLen, int kvLen,
-            int maskStartPos, int slidingWindow, float scale);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_FusedPrefillAttentionF16KV(
             IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
             int numHeads, int numKvHeads, int headDim,
@@ -2375,10 +2295,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_DiffusionDecodeLayer(in DiffusionDecodeLayerArgs desc);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_WanT5Encode(in WanT5EncodeArgs desc);
 
         // Whole UMT5-XXL encoder forward in one resident-weight graph.
@@ -2533,86 +2449,6 @@ internal enum GgmlIndexReductionOp
             int r = TSGgml_Conv2dF32(in desc);
             if (r == 0)
                 Console.Error.WriteLine($"[conv2d FAIL] {GetLastErrorMessage("(no native error)")}");
-            return r != 0;
-        }
-
-        /// <summary>Fused DiffusionGemma decode layer. Returns true on success; false (without throwing)
-        /// when the backend can't run it (e.g. flash-attn unsupported) so the caller falls back.</summary>
-        public static bool TryDiffusionDecodeLayer(in DiffusionDecodeLayerArgs desc)
-        {
-            int r = TSGgml_DiffusionDecodeLayer(in desc);
-            return r != 0;
-        }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_DiffusionLmHead(
-            IntPtr hidden, int hiddenSize, int canvasLen,
-            IntPtr outputNormW,
-            IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr logitsOut, int vocab, float eps, float finalLogitSoftcap);
-
-        /// <summary>Fused DiffusionGemma lm_head tail (output_norm + lm_head + softcap) in one GGML graph.
-        /// Reads canvas hidden [H*C], writes canvas logits [C*vocab]. Returns false on failure.</summary>
-        public static bool TryDiffusionLmHead(
-            IntPtr hidden, int hiddenSize, int canvasLen,
-            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr logitsOut, int vocab, float eps, float finalLogitSoftcap)
-        {
-            int r = TSGgml_DiffusionLmHead(hidden, hiddenSize, canvasLen, outputNormW,
-                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, eps, finalLogitSoftcap);
-            return r != 0;
-        }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_DiffusionLmHeadSample(
-            IntPtr hidden, int hiddenSize, int canvasLen,
-            IntPtr outputNormW,
-            IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocab, float eps, float finalLogitSoftcap,
-            float invTemp, IntPtr uHost, int topK,
-            IntPtr argmaxOut, IntPtr entropyOut, IntPtr sampledOut,
-            IntPtr topTokensOut, IntPtr topProbsOut);
-
-        /// <summary>Fused DiffusionGemma lm_head + on-device sample (CUDA only): runs output_norm + lm_head
-        /// as one graph producing device logits, then a CUDA kernel computes per canvas position the argmax,
-        /// entropy, multinomial sample (with the pre-drawn <paramref name="uHost"/>), and top-K tokens/weights
-        /// — downloading only the small per-position outputs instead of the full [vocab,C] logits. Returns
-        /// false (caller falls back to <see cref="TryDiffusionLmHead"/> + host sampling) on non-CUDA / failure.</summary>
-        public static bool TryDiffusionLmHeadSample(
-            IntPtr hidden, int hiddenSize, int canvasLen,
-            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocab, float eps, float finalLogitSoftcap,
-            float invTemp, IntPtr uHost, int topK,
-            IntPtr argmaxOut, IntPtr entropyOut, IntPtr sampledOut, IntPtr topTokensOut, IntPtr topProbsOut)
-        {
-            int r = TSGgml_DiffusionLmHeadSample(hidden, hiddenSize, canvasLen, outputNormW,
-                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocab, eps, finalLogitSoftcap,
-                invTemp, uHost, topK, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
-            return r != 0;
-        }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_DiffusionModelDecode(
-            [In] DiffusionDecodeLayerArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int canvasLen, int promptLen,
-            IntPtr outputNormW,
-            IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr logitsOut, int vocab, float finalLogitSoftcap);
-
-        /// <summary>Fused DiffusionGemma whole-model decode: all layers + output_norm + lm_head + softcap
-        /// in one GGML graph (canvas hidden stays on-device). Writes canvas logits [C*vocab] to logitsOut.
-        /// Returns false (caller falls back) when the backend can't run it.</summary>
-        public static bool TryDiffusionModelDecode(
-            DiffusionDecodeLayerArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int canvasLen, int promptLen,
-            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr logitsOut, int vocab, float finalLogitSoftcap)
-        {
-            int r = TSGgml_DiffusionModelDecode(layers, numLayers, hidden, hiddenSize, canvasLen, promptLen,
-                outputNormW, lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, finalLogitSoftcap);
             return r != 0;
         }
 
@@ -4349,16 +4185,8 @@ internal enum GgmlIndexReductionOp
             int numHeads, int numKvHeads, int headDim,
             int seqLen, int kvLen,
             int maskStartPos, int slidingWindow,
-            float scale, int inputFormat = 0, bool matchPerOpPrecision = false)
+            float scale, int inputFormat = 0)
         {
-            if (matchPerOpPrecision)
-            {
-                if (inputFormat != 0) throw new ArgumentException("Diffusion prefill requires head-first inputs.", nameof(inputFormat));
-                CheckResult(TSGgml_DiffusionPrefillAttentionF32(qData, kData, vData, outData,
-                    numHeads, numKvHeads, headDim, seqLen, kvLen, maskStartPos, slidingWindow, scale),
-                    "diffusion_prefill_attention");
-                return;
-            }
             CheckResult(TSGgml_FusedPrefillAttentionF32(
                 qData, kData, vData, outData,
                 numHeads, numKvHeads, headDim,

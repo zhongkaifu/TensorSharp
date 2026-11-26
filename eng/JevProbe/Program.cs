@@ -10,7 +10,7 @@ string? modelPath = null, outputPath = null, referencePath = null;
 string backendName = "ggmlcuda";
 int iterations = 3, warmup = 1;
 int prefixWords = 0;
-bool compareAttention = false, chatDiagnostic = false, compareUnified = false, profile = false, quality = false;
+bool chatDiagnostic = false, compareUnified = false, profile = false, quality = false;
 int repeatReads = 0;
 int[] widths = [16, 64, 256];
 for (int i = 0; i < args.Length; i++)
@@ -22,7 +22,6 @@ for (int i = 0; i < args.Length; i++)
         case "--iterations": iterations = int.Parse(args[++i]); break;
         case "--warmup": warmup = int.Parse(args[++i]); break;
         case "--prefix-words": prefixWords = int.Parse(args[++i]); break;
-        case "--compare-attention": compareAttention = true; break;
         case "--chat-diagnostic": chatDiagnostic = true; break;
         case "--compare-unified": compareUnified = true; break;
         case "--repeat-reads": repeatReads = int.Parse(args[++i]); break;
@@ -34,10 +33,10 @@ for (int i = 0; i < args.Length; i++)
         default: throw new ArgumentException($"Unknown argument: {args[i]}");
     }
 }
-int modes = (compareAttention ? 1 : 0) + (chatDiagnostic ? 1 : 0) + (compareUnified ? 1 : 0) + (repeatReads > 0 ? 1 : 0) + (quality ? 1 : 0);
+int modes = (chatDiagnostic ? 1 : 0) + (compareUnified ? 1 : 0) + (repeatReads > 0 ? 1 : 0) + (quality ? 1 : 0);
 if (string.IsNullOrWhiteSpace(modelPath) || iterations < 1 || warmup < 0 || prefixWords < 0 || repeatReads < 0 || modes > 1
     || (referencePath != null && !quality))
-    throw new ArgumentException("Usage: JevProbe --model model.gguf --backend ggmlcuda --iterations 3 --warmup 1 --widths 16,64,256 [--compare-attention --prefix-words 2048 | --chat-diagnostic | --compare-unified | --repeat-reads 4 | --quality [--reference other-backend-quality.json]] [--profile] --output artifacts/jev/projection.json");
+    throw new ArgumentException("Usage: JevProbe --model model.gguf --backend ggmlcuda --iterations 3 --warmup 1 --widths 16,64,256 [--prefix-words N] [--chat-diagnostic | --compare-unified | --repeat-reads 4 | --quality [--reference other-backend-quality.json]] [--profile] --output artifacts/jev/projection.json");
 BackendType backend = backendName.Replace("_", "").ToLowerInvariant() switch
 {
     "cpu" => BackendType.Cpu, "cuda" => BackendType.Cuda, "mlx" => BackendType.Mlx,
@@ -71,65 +70,6 @@ string rendered = renderer.Render(model.Config.ChatTemplate,
     architecture: model.Config.Architecture);
 int[] prompt = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
 int[] labelIds = new[] { "A", "B", "C" }.Select(label => model.Tokenizer.Encode(label, false).Single()).ToArray();
-if (compareAttention)
-{
-    if (backend is not (BackendType.GgmlCuda or BackendType.GgmlMetal))
-        throw new ArgumentException("Attention comparison requires a GGML GPU backend with prompt-KV caching.");
-    string? saved = Environment.GetEnvironmentVariable("DIFFUSION_FUSED_PREFILL_ATTN");
-    try
-    {
-        var samples = new List<object>();
-        double worst = 0;
-        foreach (int width in widths)
-        {
-            int[] canvas = Enumerable.Repeat(model.MaskTokenId, width).ToArray();
-            int[] positions = [0, width - 1];
-            int[][] labels = [labelIds, [labelIds[2], labelIds[1], labelIds[0]]];
-            var baselineTimes = new List<double>();
-            var fusedTimes = new List<double>();
-            float[][]? baseline = null;
-            float[][]? fused = null;
-            for (int iteration = 0; iteration < iterations; iteration++)
-            {
-                foreach (bool useFused in iteration % 2 == 0 ? new[] { false, true } : new[] { true, false })
-                {
-                    Environment.SetEnvironmentVariable("DIFFUSION_FUSED_PREFILL_ATTN", useFused ? "1" : "0");
-                    model.ClearStructuredCache(); // both must recompute prompt K/V using their own attention path
-                    var timer = Stopwatch.StartNew();
-                    float[][] result = model.ReadStructured(prompt, canvas, positions, labels);
-                    (useFused ? fusedTimes : baselineTimes).Add(timer.Elapsed.TotalMilliseconds);
-                    if (useFused) fused = result; else baseline = result;
-                }
-                worst = Math.Max(worst, Difference(baseline!, fused!));
-            }
-            samples.Add(new
-            {
-                canvasWidth = width, promptTokens = prompt.Length, baselinePrefillAndReadMs = baselineTimes,
-                fusedPrefillAndReadMs = fusedTimes, oldOverFusedSpeedup = Median(baselineTimes) / Median(fusedTimes),
-                maxProbabilityDifference = Difference(baseline!, fused!), baselineProbabilities = baseline,
-                fusedProbabilities = fused
-            });
-        }
-        var comparison = new
-        {
-            startedUtc = started, completedUtc = DateTimeOffset.UtcNow, model = Path.GetFullPath(modelPath),
-            backend = backend.ToString(), iterations, prefixWords,
-            vramHeadroomMb = Environment.GetEnvironmentVariable("DIFFUSION_VRAM_HEADROOM_MB") ?? "2048 (default)",
-            deviceCopyBudgetMb = Environment.GetEnvironmentVariable("DIFFUSION_DEVICE_COPY_BUDGET_MB") ?? "768 (default)",
-            maxProbabilityDifference = worst,
-            passed = worst <= 0.01, samples,
-            limitations = new[] {
-                "Independent old materialized-attention versus fused causal/SWA attention; K/V cache cleared before every measurement.",
-                "First measurement includes lazy backend initialization. Attention comparison does not use the projection warmup option.",
-                "The compatibility kernel keeps exact extents and the original default matmul precision; it does not use flash attention.",
-                "Same GGUF and TensorSharp transformer stack; not a comparison against vLLM weights/runtime."
-            }
-        };
-        WriteReport(comparison, outputPath);
-        return comparison.passed ? 0 : 1;
-    }
-    finally { Environment.SetEnvironmentVariable("DIFFUSION_FUSED_PREFILL_ATTN", saved); }
-}
 // The timed modes start with one untimed read so the first measured read pays its prompt's
 // prefill but not the process's lazy initialization, which it used to charge to whichever case
 // (or round) ran first.
@@ -612,8 +552,6 @@ static int RunChatDiagnostic(DiffusionGemmaModel model, BackendType backend, str
         backend = backend.ToString(), text, seed, maxTokens, maxSteps, maxBlocks = 1,
         promptTokenIds = prompt, decodedPrompt = model.Tokenizer.Decode(prompt.ToList()),
         selfConditioning = model.SelfConditioningEnabled, deviceSampling = model.SupportsDeviceSampling,
-        fusedPrefillOption = Environment.GetEnvironmentVariable("DIFFUSION_FUSED_PREFILL_ATTN") ?? "default",
-        vramHeadroomMb = Environment.GetEnvironmentVariable("DIFFUSION_VRAM_HEADROOM_MB") ?? "2048 (default)",
         direct = new { milliseconds = directMs, committedTokenIds = direct, committedCount = direct.Count,
             decodedCommitted = model.Tokenizer.Decode(direct), finalCanvas = Analyze(directCanvas, true), steps = directSteps },
         batched = new { milliseconds = batchedMs, done = batchedDone, committedTokenIds = batched,

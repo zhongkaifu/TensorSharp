@@ -66,6 +66,15 @@ namespace TensorSharp.Models
         /// </summary>
         protected virtual bool MediaAttendsBidirectionally => false;
 
+        /// <summary>Whether a forward's media rows open the masks of the full-attention layers too, not only the sliding-window
+        /// layers' (<see cref="MediaAttendsBidirectionally"/>). Gemma 4: yes. DiffusionGemma keeps its global layers causal over
+        /// an image (vLLM's gemma4_mm). Default: yes.</summary>
+        protected virtual bool MediaOpensFullAttentionLayers => true;
+
+        /// <summary>Whether each run of a forward's media rows (one image's soft tokens) attends only itself in both directions,
+        /// not every media row of the forward (<see cref="MediaAttendsBidirectionally"/>). Default: no.</summary>
+        protected virtual bool MediaSpansAttendApart => false;
+
         /// <summary>The media rows of the forward being run (set when its media are injected, cleared when the next forward
         /// embeds), for <see cref="MediaAttendsBidirectionally"/>: row i of the forward is a media row; null without media.</summary>
         private bool[] _mediaRows;

@@ -44,7 +44,7 @@ PowerShell:
 
 ```powershell
 $env:TENSORSHARP_MODELS = 'C:/Works/models'
-$env:DIFFUSION_VRAM_HEADROOM_MB = '4096'
+$env:TS_VRAM_HEADROOM_MB = '4096'
 $env:MAX_CONTEXT = '4096'
 dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json
 ```
@@ -68,10 +68,11 @@ requests and refuses requests needing image rows with HTTP 503 rather than
 answering from filler rows. The same tower serves ordinary DiffusionGemma chat on
 this server.
 
-The recipe reserves 4 GiB of VRAM for activations on a 16 GiB CUDA GPU. A larger
-reserve leaves fewer weights resident but can avoid severe paging on longer
-prompts. Tune `DIFFUSION_VRAM_HEADROOM_MB` for the device and workload; its model
-default is 2048 MiB. The 4096-token admission ceiling is not a guarantee that
+The recipe reserves 4 GiB of VRAM for activations on a 16 GiB CUDA GPU. The shared
+decoder runtime's expert placement keeps that much free and runs the routed experts
+that do not fit from host memory (`--n-cpu-moe N` / `--cpu-moe` choose them
+explicitly). Tune `TS_VRAM_HEADROOM_MB` for the device and workload; its default is
+1/16 of the device's memory. The 4096-token admission ceiling is not a guarantee that
 every schema and prompt of that size fits in device memory.
 
 ### Running on a CPU
@@ -84,11 +85,11 @@ $env:MAX_CONTEXT = '4096'
 dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json --backend cpu
 ```
 
-`DIFFUSION_VRAM_HEADROOM_MB` has no effect there. The pure-C# backend keeps the
-prompt K/V in host memory, so repeated reads of one prompt (fixed `samples` or
-adaptive extension) skip the prompt's work (a schema split into chunks has one
-prompt per chunk, and the model keeps one prompt cache). The last layer runs only
-for the requested label rows. On `cpu` and `ggml_cpu` the server also skips its
+`TS_VRAM_HEADROOM_MB` has no effect there. Every backend keeps the prompt's K/V in
+the runtime's cache, so repeated reads of one prompt (fixed `samples` or adaptive
+extension) skip the prompt's work (a schema split into chunks has one prompt per
+chunk, and the model keeps one prompt cache). Only the requested label rows go
+through the output head. On `cpu` and `ggml_cpu` the server also skips its
 startup shared-prompt warm-up for this model, so the port opens once the weights
 are loaded.
 
@@ -340,8 +341,7 @@ Decoded bytes are written content-addressed into the server's upload directory, 
 `--upload-max-mb`, `--upload-quota-mb` and `--upload-ttl-hours` govern them, the
 same picture resent across requests stores one file, and its embeddings are encoded
 once and cached (`TS_MM_EMBEDDING_CACHE_MB`, default 1/64 of host memory within 512-4096 MB). Image attention inside
-each soft-token span is bidirectional on sliding layers and causal on global ones;
-`DIFFUSION_IMAGE_BIDIRECTIONAL=0` makes it causal everywhere.
+each soft-token span is bidirectional on sliding layers and causal on global ones.
 
 ## Files, documents, video and audio
 
@@ -597,11 +597,11 @@ or argmax diagnostics from the smaller conditional distribution. The seed
 controls reproducibility within TensorSharp; it does not promise Python/NumPy
 and .NET generate identical noise for the same numeric seed.
 
-The sparse output projection computes only the answer positions and requested
-vocabulary rows. Its conditional probabilities are mathematically equivalent
-to selecting the same labels from the full vocabulary distribution and
-renormalizing. Small floating-point differences can result from different
-matrix multiplication shapes. It does not compute the total probability mass
+The sparse output projection runs only the answer positions through the output
+head (the same head as the full canvas, so each position's logits are the full
+read's). Its conditional probabilities are those of selecting the same labels
+from the full vocabulary distribution and renormalizing; small floating-point
+differences can result from different matrix multiplication shapes. It does not compute the total probability mass
 assigned to all allowed labels, or full-vocabulary entropy.
 
 Quantization, question wording, answer ordering, and the number of reads can
@@ -613,23 +613,12 @@ workload before choosing confidence thresholds.
 
 The answer canvas is sized to the schema, rounded to a 16-token boundary within
 the model's maximum canvas width. Multiple questions share the transformer
-forward. The output head operates on requested label rows instead of allocating
-the full canvas-by-vocabulary logits tensor. `ggml_cuda` and `ggml_metal` use the
-existing DiffusionGemma prompt K/V and fused decode paths, and `cpu` its host
-prompt K/V with a last layer computed only for the requested label rows; other
-backends, `ggml_cpu`, `ggml_vulkan`, `mlx` and `cuda` included, use the unified
-prompt-plus-canvas forward. The model execution lock serializes access to shared
+forward. The output head runs on the requested label rows only, instead of
+allocating the full canvas-by-vocabulary logits tensor. Every backend prefills the
+prompt into the shared decoder runtime's cache once and runs the canvas as one
+graph over it. The model execution lock serializes access to shared
 GPU state with ordinary diffusion chat requests; a read issued while a chat is
 denoising runs before the chat's next forward instead of after its whole block.
-
-GGML CUDA uses fused prompt attention by default, keeping attention operations
-inside one native graph to reduce intermediate transfers and explicit KV-head
-expansion. The DiffusionGemma path preserves exact sequence extents and the
-existing matrix-multiplication precision policy. It uses materialized attention
-scores, with no flash attention or persistent attention-graph cache, so prompt
-memory still grows quadratically. Set `DIFFUSION_FUSED_PREFILL_ATTN=0` before
-launch to restore the per-operation reference path. Other GGML GPU backends can
-opt in with `1`; this does not imply that they have been validated.
 
 Reusable validation tools live in `eng/`; generated evidence belongs in ignored
 `artifacts/jev/`. See the benchmark tool's `--help` for comparing independently

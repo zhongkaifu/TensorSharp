@@ -131,6 +131,8 @@ namespace
         OP_PAD_REFLECT_1D = 59, // srcs: x (F32, contiguous); ip: p0, p1
         OP_DEPTHWISE_CONV_2D = 70, // srcs: x [C, W, H, N] (channels innermost), kernel [KW, KH, 1, C]; ip: s0, s1, p0, p1, d0, d1
         OP_GELU_ERF = 71,       // 0.5 x (1 + erf(x / sqrt 2))
+        OP_LOG = 72,            // ggml_log
+        OP_CUMSUM = 73,         // ggml_cumsum: the running sum along ne0
     };
 
     struct Leaf
@@ -1222,6 +1224,8 @@ namespace
         case OP_SWIGLU: need(1); return ggml_swiglu(ctx, src(0));
         case OP_GEGLU: need(1); return ggml_geglu(ctx, src(0));
         case OP_GELU_ERF: need(1); return ggml_gelu_erf(ctx, src(0));
+        case OP_LOG: need(1); return ggml_log(ctx, src(0));
+        case OP_CUMSUM: need(1); return ggml_cumsum(ctx, src(0));
         case OP_DEPTHWISE_CONV_2D:
             need(2);
             return depthwise_conv_2d(ctx, src(0), src(1), static_cast<int>(ipar(0, 1)), static_cast<int>(ipar(1, 1)),

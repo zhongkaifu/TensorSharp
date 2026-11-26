@@ -234,21 +234,6 @@ These variables are real runtime knobs, but they are not registered in
 |---|---|---|---|---|---|
 | `DIFFUSION_STEPS` | DiffusionGemma Web UI | Denoising steps per block in the server path | `48` | not registered | no |
 | `DIFFUSION_MAX_BATCH` | DiffusionGemma Web UI | Max active requests in `DiffusionBatchScheduler` | `2` | not registered | no |
-| `DIFFUSION_BATCHED_FORWARD` | DiffusionGemma | True batched canvas decode vs time-sliced fused single-canvas decode | OFF | not registered | no |
-| `DIFFUSION_NO_PKV` | DiffusionGemma | Disable prompt-KV caching (the device-glue backends and `cpu`): every read and every denoising step then runs the unified `[prompt\|canvas]` forward | OFF | not registered | no |
-| `DIFFUSION_CPU_ATTN_FAST` | DiffusionGemma on `cpu` | `1` selects FMA attention tiles (Vector512 when accelerated) and a vectorized softmax. The default kernel reproduces the previous arithmetic exactly, because a last-bit change can flip the top-8-of-128 expert routing; attention is a fraction of a percent of a forward at Jev and chat prompt lengths | OFF | not registered | no |
-| `DIFFUSION_CPU_MOE_CHUNK` | DiffusionGemma on `cpu` | Tokens per batched-MoE pass; bounds the gathered per-route scratch (a 4k-token prefill would otherwise hold about 1 GB of routed rows) | `512` | not registered | no |
-| `DIFFUSION_NO_SC` / `DIFFUSION_SC_TOPK` | DiffusionGemma | Self-conditioning enablement and experimental top-K cutoff | ON / `32` | not registered | no |
-| `DIFFUSION_NO_FUSED_DECODE` / `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | DiffusionGemma on GGML backends | Disable fused whole-model diffusion decode or fused lm-head tail | OFF | not registered | no |
-| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | DiffusionGemma | Transient lm-head logits memory cap before per-sequence fallback | `300` | not registered | no |
-| `DIFFUSION_VRAM_HEADROOM_MB` | DiffusionGemma on ggml_cuda | VRAM kept free of preloaded weights (compute buffers, device copies) | `2048` | not registered | no |
-| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | DiffusionGemma on ggml_cuda | Device-copy cache cap when the model does not fit VRAM (prompt K/V, masks, activations) | `768` | not registered | no |
-| `DIFFUSION_SEGMENTED_DECODE` | DiffusionGemma on ggml_cuda | Force per-layer fused decode on (`1`) / off (`0`); auto-selected when the model does not fit VRAM | auto | not registered | no |
-| `DIFFUSION_PIN_STREAMED` | DiffusionGemma on ggml_cuda | Re-home streamed (non-resident) weights into page-locked copies for DMA-speed uploads (costs RAM) | OFF | not registered | no |
-| `DIFFUSION_IMAGE_BIDIRECTIONAL` | DiffusionGemma image input | `0` makes attention inside image soft-token spans plain causal instead of bidirectional on the sliding-window layers | ON | not registered | no |
-| `DIFFUSION_FUSED_PREFILL_ATTN` | DiffusionGemma on GGML backends | Fused prompt-prefill attention kernel. On by default on `ggml_cuda` (`0` restores the per-op reference); `1` opts in on other GGML backends. Image prompts always take the per-op mask path | ON on `ggml_cuda`, else OFF | not registered | no |
-| `DIFFUSION_NO_DEVICE_SAMPLE` / `DIFFUSION_DEVICE_SAMPLE_FORCE` | DiffusionGemma on ggml_cuda | `1` disables on-device sampling (argmax, entropy, sample and self-conditioning top-K on the device logits); `FORCE=1` keeps it on even under segmented decode, where it is otherwise skipped as a measured loss | device sampling ON when the model fits VRAM | not registered | no |
-| `DIFFUSION_ASYNC_COMPUTE` | DiffusionGemma on `ggml_metal` | `1` keeps asynchronous compute on. The model switches it off because Metal's lazy sync has no barrier for a host write followed by a device kernel, which corrupts its per-op prefill and loses the prompt; forcing it back is unsafe and exists only to A/B the cost | OFF | not registered | no |
 
 ## Out-of-Matrix Qwen-Image-2.1 Knobs
 

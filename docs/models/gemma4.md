@@ -465,16 +465,17 @@ rope_freqs.weight                          # proportional frequency factors
 ## 7. Implementation on the shared decoder runtime
 
 Gemma 4 runs on the shared decoder runtime: [`Gemma4RuntimeModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.cs)
-is a [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) family, so slots, the unified
+derives from [`Gemma4DecoderModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4DecoderModel.cs), the recipe it shares with
+[DiffusionGemma](diffusiongemma.md), a [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) family, so slots, the unified
 step, continuous batching, the prefix cache, checkpoints, placements and speculation are the runtime's, and every step is a
 whole-forward graph program run by the backend's executor (GGML, the managed CPU, direct CUDA, MLX). The family supplies
 the recipe through the runtime's hooks:
 
 | Part | Where | What |
 |---|---|---|
-| Per-layer attention geometry | `Gemma4RuntimeModel.cs` (`LayerKeyDim`, `LayerKvHeads`, `SlidingWindow`, `AttentionScale`) | 256-wide sliding-window heads and 512-wide global heads, per-layer KV head counts, scale 1 |
+| Per-layer attention geometry | `Gemma4DecoderModel.cs` (`LayerKeyDim`, `LayerKvHeads`, `SlidingWindow`, `AttentionScale`) | 256-wide sliding-window heads and 512-wide global heads, per-layer KV head counts, scale 1 |
 | KV sharing | `KvSourceLayer`; the runtime's `EmitSharedKvAttention` | the last `shared_kv_layers` layers attend their source's operands of the same step and project queries only |
-| Q/K/V | `Gemma4RuntimeModel.Graph.cs` (`EmitAttentionProjections`, `EmitQueryKey`) | weighted Q/K RMSNorm, unweighted V norm, V = K on global layers without `attn_v` |
+| Q/K/V | `Gemma4DecoderModel.Graph.cs` (`EmitAttentionProjections`, `EmitQueryKey`) | weighted Q/K RMSNorm, unweighted V norm, V = K on global layers without `attn_v` |
 | Rotary | `RotarySpec` with `rope_freqs` factors (`GraphOp.RopeExt` with a factor input) | NeoX local rotary at base 10 000; global rotary over 512 dims with the proportional factors |
 | Feed-forward | `EmitFeedForward`, `EmitRoutedExperts` | GeGLU; MoE layers: dense branch beside routed GeGLU experts over the fused `ffn_gate_up_exps` stack, with the router scale and per-expert output scale |
 | Per-layer embeddings | `EmitStreamInput` / `EmitPerLayerInputs` / `EmitBlockOutput` | token rows of `per_layer_token_embd` plus the normed model projection, gated into the stream after each layer |

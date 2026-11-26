@@ -333,7 +333,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | Muse Spark | 在 `ggml_cuda` / `ggml_vulkan` 上，原生整模型执行器用自己的**序列 slot** 处理并发（每个 slot 在各层所在 GPU 上持有 F16 K/V，`ggml_cuda` 上 `--tp N` 时则按 KV 组切分到各 GPU；46 个滑动窗口层使用环形缓冲）：所有运行中请求的 decode 步共享一张带按序列掩码的计算图，同时到达的文本提示在一张图中 prefill，图像嵌入在图内替换占位行。完成的 slot 会被保留并移交给延续该会话的请求（可先回退），模板前导与共享系统提示会被写入一个检查点 slot，再克隆进新会话。按层切分在 CUDA GPU 间流水化 prefill 时，单个 prompt 按模型选择的步长 prefill（8,192 token；见下文 `TS_SCHED_SOLO_PREFILL_CHUNK`）。逐算子路径（`TS_MUSE_SPARK_NATIVE=0`，以及 `ggml_vulkan` 上的 `--tp`）属于 Radix 页面家族；它的打包分页 `ForwardBatch` 需要 F32 KV 且只接受纯文本请求。 | `TS_MUSE_SPARK_NATIVE=0` 选择逐算子路径；`TS_MUSE_SPARK_PLAN_SLOTS` 在放置规划中预留 slot；`TS_MUSE_SPARK_PIPELINE=0` 关闭流水化 prefill（见 [Muse Spark 卡片](models/muse-spark_zh-cn.md#选项)）。 |
 | DeepSeek V4 / V4.1 | 没有 `ForwardBatch`：压缩注意力缓存没有分页布局。并发由原生执行器的序列 slot 承担（纯 C# `cpu` 与直连 CUDA `cuda` 执行器保持串行）。默认启用的 token 批量融合 decode 每步只读一遍权重，最多 16 个序列，更多时分窗口执行；加载了 DSpark 草稿器时不启用。V4.1 会把已结束会话的 slot 保留给它的下一轮（加载了 DSpark 草稿器时不保留）。 | `TS_BATCHED_FUSED_DECODE=0`；V4.1 保留 slot 的预算由 `TS_DSV41_RETAINED_CACHE_MB`（默认 2048）决定。 |
 | Qwen 3.8 Flash Next（`qwen4exp`） | 共享解码器运行时（`Qwen4ExpRuntimeModel`），与 Qwen 3.5 相同的 slot、批量步与保留机制，另加该家族的 hyper-connection 流、PLE n-gram 行与 QSA。`--layer-split N` 按整层放置，`--tp N` 在 GGML 与 `cuda` 上运行按 rank 的图。共享 MTP 头或 DFlash2 草稿器（`--draft-model`）负责投机。`--backend cuda` 同样运行这一运行时，其图运行在 CUDA 图执行器上。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`TS_MOE_HOT_TIER_GB` 设定主机专家在加速器上的 tier 大小。 |
-| DiffusionGemma | 独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求，并可选择批处理活跃 canvas。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`、`DIFFUSION_BATCHED_FORWARD`；`DIFFUSION_NO_FUSED_DECODE=1` 关闭 GGML 融合整模型 diffusion decode。 |
+| DiffusionGemma | 运行在共享解码运行时上的独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block，每一步都是基于提示缓存的一张计算图。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`。 |
 
 ### Radix 前缀缓存
 
@@ -521,7 +521,6 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_SPEC_DRAFT_MODEL` | 无 | 以独立 GGUF 发布的草稿器路径（`--draft-model`）：Gemma 4 的 `gemma4-assistant`、Qwen 3.8 Flash Next 的共享 MTP 头、DSpark 或 DFlash 草稿器。架构从文件中读取。 |
 | `DIFFUSION_STEPS` | `48` | Web UI DiffusionGemma 每个 block 的去噪步数；与自回归调度器的 step 预算无关。 |
 | `DIFFUSION_MAX_BATCH` | `2` | diffusion scheduler 中同时活跃的 DiffusionGemma Web UI 请求数上限。 |
-| `DIFFUSION_BATCHED_FORWARD` | `0` | 对活跃 DiffusionGemma canvas 启用真正的批处理 decode；默认更偏向融合单 canvas 路径。 |
 
 宿主可以给引擎挂上一个 `IPrefixCheckpointStore`（`InferenceEngine.PrefixCheckpointStore`，
 或 TensorSharp.Chat 中的 `InferenceEngineHost.PrefixCheckpointStore`），让共享前缀检查点

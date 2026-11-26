@@ -13,7 +13,7 @@
   // MAX_CONTEXT is environment-only and limits prompt + canvas tokens. Set it
   // before launch for your memory budget (for example, $env:MAX_CONTEXT='4096').
   // On a 16 GiB CUDA GPU, reserve activation space before launch with
-  // $env:DIFFUSION_VRAM_HEADROOM_MB='4096'; tune this for your device/workload.
+  // $env:TS_VRAM_HEADROOM_MB='4096' (the routed experts that do not fit run from host memory); tune it for your device.
   // Without it the checkpoint's declared context limit applies. max-tokens below
   // caps ordinary chat output, not Jev input length or answer-canvas width.
   "variables": {

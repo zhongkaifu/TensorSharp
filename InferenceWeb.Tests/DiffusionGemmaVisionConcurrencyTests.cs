@@ -20,6 +20,7 @@ using System.Collections.Generic;
 using System.Linq;
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.Models;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -103,67 +104,17 @@ namespace InferenceWeb.Tests
                 () => AttachSpan(a, Span(allocator, 4, hidden, 2f), position: 12));
         }
 
-        // ---- reflection helpers -------------------------------------------------------------
-        // DiffusionSeqState's vision members are internal to TensorSharp.Models; the test asserts
-        // on the state machine without widening that surface just for testing.
+        // ---- helpers: the model's own per-sequence span sets (VisionSet), without a 26B model --------
 
-        private static readonly Type SeqType =
-            typeof(TensorSharp.Models.Gemma4VisionEncoder).Assembly
-                .GetType("TensorSharp.Models.DiffusionSeqState", throwOnError: true);
+        private static DiffusionSeqState NewSeq(int unused) => new DiffusionSeqState("test-seq-" + Guid.NewGuid().ToString("N"));
 
-        private static object NewSeq(int numLayers)
-        {
-            var ctor = SeqType.GetConstructor(
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance,
-                binder: null, new[] { typeof(int) }, modifiers: null);
-            Assert.NotNull(ctor);
-            return ctor.Invoke(new object[] { numLayers });
-        }
+        private static void AttachSpan(DiffusionSeqState seq, Tensor embeddings, int position)
+            => (seq.Vision ??= new VisionSet()).Set(embeddings, position);
 
-        private static List<(Tensor Embeddings, int Position)> ListOf(object seq)
-        {
-            var field = SeqType.GetField("VisionEmbeddings",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            Assert.NotNull(field);
-            return (List<(Tensor Embeddings, int Position)>)field.GetValue(seq);
-        }
+        private static void DisposeVision(DiffusionSeqState seq) => seq.DisposeVision();
 
-        /// <summary>Mirrors DiffusionGemmaModel.SetSequenceVisionEmbeddings' bookkeeping without
-        /// constructing a 26B model: same overlap rule, same per-sequence ownership.</summary>
-        private static void AttachSpan(object seq, Tensor embeddings, int position)
-        {
-            var field = SeqType.GetField("VisionEmbeddings",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var list = (List<(Tensor Embeddings, int Position)>)field.GetValue(seq)
-                       ?? new List<(Tensor Embeddings, int Position)>();
-
-            int rows = (int)embeddings.Sizes[0];
-            foreach (var (existing, pos) in list)
-            {
-                int existingRows = (int)existing.Sizes[0];
-                if (position < pos + existingRows && pos < position + rows)
-                {
-                    embeddings.Dispose();
-                    throw new ArgumentException(
-                        $"Image span [{position},{position + rows}) overlaps [{pos},{pos + existingRows}).");
-                }
-            }
-            list.Add((embeddings, position));
-            list.Sort((x, y) => x.Position.CompareTo(y.Position));
-            field.SetValue(seq, list);
-        }
-
-        private static void DisposeVision(object seq) =>
-            SeqType.GetMethod("DisposeVision",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                .Invoke(seq, null);
-
-        private static (int Start, int Length)[] SpansOf(object seq)
-        {
-            var list = ListOf(seq);
-            if (list == null) return Array.Empty<(int, int)>();
-            return list.Select(x => (x.Position, (int)x.Embeddings.Sizes[0]))
-                       .OrderBy(x => x.Position).ToArray();
-        }
+        private static (int Start, int Length)[] SpansOf(DiffusionSeqState seq)
+            => seq.Vision == null ? Array.Empty<(int, int)>()
+                : seq.Vision.Spans.Select(x => (x.Position, (int)x.Rows.Sizes[0])).OrderBy(x => x.Position).ToArray();
     }
 }

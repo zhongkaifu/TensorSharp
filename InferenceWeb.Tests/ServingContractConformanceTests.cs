@@ -29,7 +29,7 @@ public sealed class ServingContractConformanceTests
     {
         "qwen4exp", "gptoss", "nemotron_h", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
-        "diffusion-gemma", "wan", "ltx-2.5", "minimax-h3",
+        "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
         // families they generate media rather than decode steps, so the decoder runtime does not apply.
         "whisper", "kokoro", "ace-step-1.5",
@@ -61,8 +61,6 @@ public sealed class ServingContractConformanceTests
         "deepseek4: TensorParallel@cuda",
         "deepseek4: TensorParallel@ggml_cuda",
         "deepseek4: TensorParallel@ggml_vulkan",
-        "diffusion-gemma: ExpertOffload@cuda",
-        "diffusion-gemma: ExpertOffload@mlx",
         "diffusion-gemma: HybridParallel@cuda",
         "diffusion-gemma: HybridParallel@ggml_cuda",
         "diffusion-gemma: HybridParallel@ggml_vulkan",
@@ -264,6 +262,8 @@ public sealed class ServingContractConformanceTests
                     if (test == SharedRuntimeConformanceTests.HostExpertsMechanism && !Claims(arch.Serving.ExpertOffload)) continue;
                     if (test == nameof(SharedRuntimeConformanceTests.PlacementMatchesOneDevice) && !Claims(arch.Serving.TensorParallel)
                         && !Claims(arch.Serving.LayerSplit) && !Claims(arch.Serving.HybridParallel)) continue;
+                    // A family that does not decode (DiffusionGemma denoises canvases) has nothing to speculate.
+                    if (test == nameof(SharedRuntimeConformanceTests.SpeculativeDecodingMatchesPlainGreedy) && !arch.Serving.Autoregressive) continue;
                     // A graph-only family has no per-op path to compare.
                     if (test == nameof(SharedRuntimeConformanceTests.WholeForwardGraphMatchesThePerOpPath)
                         && SharedRuntimeConformanceTests.GraphOnlyFamilies.Contains(arch.Id)) continue;

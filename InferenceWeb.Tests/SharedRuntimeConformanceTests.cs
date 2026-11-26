@@ -61,11 +61,13 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["raon1nano"] = typeof(RaonRuntimeTests),
         // Gemma 4's fixtures are its own (per-layer embeddings, KV sharing, two head widths, fused GeGLU experts).
         ["gemma4"] = typeof(Gemma4RuntimeTests),
+        // DiffusionGemma's canvas steps (block rows over the prompt's cache) on the Gemma 4 backbone; it does not decode.
+        ["diffusion-gemma"] = typeof(DiffusionGemmaRuntimeTests),
     };
 
     /// <summary>Shared-runtime families that run whole-forward graphs only (StandardDecoderModel.RequiresGraphs): their
     /// dedicated suite has no per-op path to compare the graphs with. A family leaves the list when it gains one.</summary>
-    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano", "gemma4" };
+    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano", "gemma4", "diffusion-gemma" };
 
     /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)
     /// does not declare.</summary>

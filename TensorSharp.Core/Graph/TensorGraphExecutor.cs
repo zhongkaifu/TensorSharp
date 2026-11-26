@@ -102,6 +102,8 @@ namespace TensorSharp.Graph
             GraphOp.Norm, GraphOp.GeluErf, GraphOp.DepthwiseConv2d,
             // Qwen-Image-2.1's text conditioner (ggml_gelu's tanh form) and its keys padded to their masks.
             GraphOp.Gelu, GraphOp.Pad,
+            // DiffusionGemma's on-device sampling (entropy and the multinomial draw).
+            GraphOp.Log, GraphOp.CumSum,
             // Gemma 4's GeGLU feed-forwards (ggml_geglu / ggml_geglu_split: the tanh GELU of the gate times the up rows).
             GraphOp.Geglu, GraphOp.GegluSplit,
         };
@@ -1906,6 +1908,8 @@ namespace TensorSharp.Graph
                 case GraphOp.Sigmoid: return V(Ops.Sigmoid(null, In(T(0), run)));
                 case GraphOp.Exp: return V(Ops.Exp(null, In(T(0), run)));
                 case GraphOp.Neg: return V(Ops.Neg(null, In(T(0), run)));
+                case GraphOp.Log: return V(Ops.Log(null, In(T(0), run)));
+                case GraphOp.CumSum: return V(Ops.CumSum(null, Contig(In(T(0), run), run)));
                 case GraphOp.Tanh: return V(Ops.Tanh(null, In(T(0), run)));
                 case GraphOp.Relu: return V(Ops.Relu(null, In(T(0), run)));
                 case GraphOp.Softplus: return V(Softplus(In(T(0), run)));

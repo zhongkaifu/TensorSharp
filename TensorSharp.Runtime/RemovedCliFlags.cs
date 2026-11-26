@@ -209,6 +209,31 @@ namespace TensorSharp.Runtime
             ("DIFFUSION_CPU_LEGACY_PROJ", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_ATTN", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_ROUTER", DiffusionCpuLegacyRemoved),
+            ("DIFFUSION_NO_PKV", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_VRAM_HEADROOM_MB",
+                "DiffusionGemma runs on the shared decoder runtime, whose expert placement keeps TS_VRAM_HEADROOM_MB of the device free "
+                + "and runs the routed experts that do not fit from host memory; set TS_VRAM_HEADROOM_MB instead."),
+            ("DIFFUSION_FUSED_PREFILL_ATTN", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_NO_FUSED_DECODE", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_CPU_ATTN_FAST", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_CPU_MOE_CHUNK", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_DEVICE_SAMPLE_FORCE", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_DEVICE_COPY_BUDGET_MB", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_SEGMENTED_DECODE", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_PIN_STREAMED", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_NO_FUSED_LMHEAD_TAIL", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_NO_DEVICE_SAMPLE", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_LMHEAD_BATCH_CAP_MB", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_ASYNC_COMPUTE", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_BATCHED_FORWARD", DiffusionGemmaLegacyRemoved),
+            ("DIFFUSION_NO_SC",
+                "DiffusionGemma's self-conditioning is always on when the checkpoint has its weights; the switch was removed with "
+                + "the legacy model."),
+            ("DIFFUSION_SC_TOPK",
+                "DiffusionGemma's self-conditioning reads each position's top 32 tokens; the switch was removed with the legacy model."),
+            ("DIFFUSION_IMAGE_BIDIRECTIONAL",
+                "DiffusionGemma's image soft tokens always attend each other on the sliding-window layers (each image apart); "
+                + "the switch was removed with the legacy model."),
             // Switches that restored the pure-C# CPU backend's previous kernels.
             ("TS_CPU_QGEMM", CpuPreviousKernelsRemoved),
             ("TS_CPU_FGEMM", CpuPreviousKernelsRemoved),
@@ -686,9 +711,12 @@ namespace TensorSharp.Runtime
         private const string Qwen21CpuSwitchRemoved =
             "Qwen-Image-2.1 on the cpu backend runs the transformer's graph programs on the managed tensor executor; the "
             + "pure-C# transformer these tuned was removed.";
-        private const string DiffusionCpuLegacyRemoved =
-            "DiffusionGemma on the cpu backend always runs its batched CPU stages "
-            + "(DIFFUSION_NO_PKV=1 still turns the prompt-KV cache off).";
+        private const string DiffusionCpuLegacyRemoved = DiffusionGemmaLegacyRemoved;
+
+        private const string DiffusionGemmaLegacyRemoved =
+            "DiffusionGemma runs on the shared decoder runtime and its graph executors on every backend (its prompt cache, "
+            + "canvas steps and on-device sampling are the runtime's); the legacy model's fused kernels and paths this "
+            + "selected were removed.";
 
         private const string MlxKernelSwitchRemoved =
             "the MLX backend always runs its current kernels; the switch to an earlier or experimental one was removed.";

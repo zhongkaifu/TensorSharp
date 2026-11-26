@@ -110,6 +110,8 @@ namespace TensorSharp
 
         public static Tensor Exp(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("exp", result, src)!; }
         public static Tensor Log(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("log", result, src)!; }
+        /// <summary>The running sum along the last dimension: result[.., i] = src[.., 0] + ... + src[.., i].</summary>
+        public static Tensor CumSum(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("cumsum", result, src)!; }
         public static Tensor Log1p(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("log1p", result, src)!; }
         public static Tensor Floor(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("floor", result, src)!; }
         public static Tensor Ceil(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("ceil", result, src)!; }

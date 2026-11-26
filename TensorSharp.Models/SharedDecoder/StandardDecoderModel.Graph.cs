@@ -1890,7 +1890,7 @@ namespace TensorSharp.Models
         /// <see cref="FinalLogitSoftcap"/>): a scale, then a scale by 1/cap, tanh and a scale by cap, the nodes llama.cpp's graphs
         /// and the legacy Muse-Glimmer head emit. No nodes for a family without one. A greedy head (<see cref="GreedyHead"/>)
         /// takes the raw logits: the transform keeps their order.</summary>
-        private int EmitLogitTransform(GraphStep step, int logits)
+        private protected int EmitLogitTransform(GraphStep step, int logits)
         {
             float scale = LogitScale, cap = FinalLogitSoftcap;
             if (scale > 0f && scale != 1f)
@@ -3328,7 +3328,12 @@ namespace TensorSharp.Models
                 Starts = starts;
                 IsDecode = decode;
                 MediaRows = model.MediaRowsOfStep(rows, slots.Length);
+                BlockRows = model._blockRowsStep;
             }
+
+            /// <summary>Each sequence's rows attend each other in both directions, on every layer (DiffusionGemma's canvas:
+            /// <see cref="RunBlockRows"/>), and a sliding-window layer's rows all read the window of the sequence's first row.</summary>
+            internal bool BlockRows { get; }
 
             /// <summary>The step's media rows that attend each other in both directions (MediaAttendsBidirectionally), one
             /// sequence's, or null.</summary>
@@ -3337,20 +3342,45 @@ namespace TensorSharp.Models
             /// <summary>Open, in a mask of sequence <paramref name="sequence"/>'s rows [<paramref name="width"/>, count], the cells
             /// between two media rows of this step (<see cref="MediaRows"/>); <paramref name="column"/> maps a key position to its
             /// column (-1: not in the mask).</summary>
-            private void OpenMediaCells(ushort[] mask, int width, int start, int count, int sequence, Func<int, int> column)
+            /// <param name="fullAttention">The mask is a full-attention layer's (<see cref="MediaOpensFullAttentionLayers"/>).</param>
+            private void OpenMediaCells(ushort[] mask, int width, int start, int count, int sequence, Func<int, int> column, bool fullAttention)
             {
-                if (MediaRows == null || sequence > 0) return;
+                if (BlockRows)
+                {
+                    // Every row of the sequence reads every other (any sequence of the step: each has its own mask).
+                    for (int k = 0; k < count; k++)
+                    {
+                        int c = column(start + k);
+                        if (c < 0 || c >= width) continue;
+                        for (int q = 0; q < count; q++) mask[q * width + c] = 0;
+                    }
+                    return;
+                }
+                if (MediaRows == null || sequence > 0 || (fullAttention && !_m.MediaOpensFullAttentionLayers)) return;
+                bool apart = _m.MediaSpansAttendApart;
                 for (int q = 0; q < count; q++)
                 {
                     if (!MediaRows[q]) continue;
                     for (int k = 0; k < count; k++)
                     {
-                        if (!MediaRows[k]) continue;
+                        if (!MediaRows[k] || (apart && !SameMediaRun(q, k))) continue;
                         int c = column(start + k);
                         if (c >= 0 && c < width) mask[q * width + c] = 0;
                     }
                 }
             }
+
+            /// <summary>Whether media rows <paramref name="a"/> and <paramref name="b"/> of this step stand in one run of media rows
+            /// (<see cref="MediaSpansAttendApart"/>: one image's soft tokens).</summary>
+            private bool SameMediaRun(int a, int b)
+            {
+                for (int i = Math.Min(a, b); i <= Math.Max(a, b); i++)
+                    if (!MediaRows[i]) return false;
+                return true;
+            }
+
+            /// <summary>Whether a mask of this step opens cells past the causal pattern (media rows or block rows).</summary>
+            private bool OpensCells => MediaRows != null || BlockRows;
 
             internal Slot[] Slots { get; }
 
@@ -3648,14 +3678,14 @@ namespace TensorSharp.Models
                 if (_chunkMasks.TryGetValue(key, out int cached)) return cached;
                 var pattern = new CausalMaskInput(window, start, count, FloorOf(sequence));
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
-                if (count > SmallChunkRows && _m.GraphExecutor?.Capabilities.StructuralCausalMasks == true && MediaRows == null)
+                if (count > SmallChunkRows && _m.GraphExecutor?.Capabilities.StructuralCausalMasks == true && !OpensCells)
                 {
                     AddInput(node, IntPtr.Zero, pattern.Values * sizeof(ushort), handle: pattern);
                     return CacheMask(_chunkMasks, key, node);
                 }
                 var mask = GC.AllocateUninitializedArray<ushort>(checked((int)pattern.Values));   // the fill writes every cell
                 pattern.FillF16(mask);
-                OpenMediaCells(mask, window, start, count, sequence, p => p);
+                OpenMediaCells(mask, window, start, count, sequence, p => p, fullAttention: true);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count, sequence: sequence);
                 return CacheMask(_chunkMasks, key, node);
@@ -3678,8 +3708,8 @@ namespace TensorSharp.Models
                 var key = (window, offset, start, count, sequence, band);
                 if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(window * count));   // the fill writes every cell
-                FillBandRows(mask, window, offset, start, count, FloorOf(sequence), band);
-                OpenMediaCells(mask, window, start, count, sequence, p => p - offset);
+                FillBandRows(mask, window, offset, start, count, FloorOf(sequence), band, BlockRows);
+                OpenMediaCells(mask, window, start, count, sequence, p => p - offset, fullAttention: false);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count, sequence: sequence, offset: offset, band: band);
@@ -3697,8 +3727,8 @@ namespace TensorSharp.Models
                 var key = (kv, offset, start, count, sequence, -band);   // negative band: a chunk's mask, not a decode mask
                 if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
-                FillBandRows(mask, kv, offset, start, count, FloorOf(sequence), band);
-                OpenMediaCells(mask, kv, start, count, sequence, p => p - offset);
+                FillBandRows(mask, kv, offset, start, count, FloorOf(sequence), band, BlockRows);
+                OpenMediaCells(mask, kv, start, count, sequence, p => p - offset, fullAttention: false);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
                 (_bandMasks ??= new())[key] = node;
@@ -3723,8 +3753,8 @@ namespace TensorSharp.Models
                 var key = (ring, start, count, sequence, band);
                 if (_ringMasks != null && _ringMasks.TryGetValue(key, out int cached)) return cached;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(ring * count));   // the fill writes every cell
-                FillRingBandRows(mask, ring, start, count, FloorOf(sequence), band);
-                OpenMediaCells(mask, ring, start, count, sequence, p => p % ring);
+                FillRingBandRows(mask, ring, start, count, FloorOf(sequence), band, BlockRows);
+                OpenMediaCells(mask, ring, start, count, sequence, p => p % ring, fullAttention: false);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { ring, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: ring, start: start, count: count, sequence: sequence, band: band, ring: ring);
@@ -3734,14 +3764,15 @@ namespace TensorSharp.Models
 
             /// <summary>A ring band mask (<see cref="RingBandMask"/>): each row zero over the cells of its window's positions,
             /// -inf elsewhere.</summary>
-            private static void FillRingBandRows(ushort[] mask, int ring, int start, int count, int attentionFloor, int band)
+            /// <param name="block">Every row reads the window of the first row (<see cref="BlockRows"/>).</param>
+            private static void FillRingBandRows(ushort[] mask, int ring, int start, int count, int attentionFloor, int band, bool block = false)
             {
                 const ushort negInf = 0xFC00;
                 mask.AsSpan(0, ring * count).Fill(negInf);
                 for (int q = 0; q < count; q++)
                 {
                     Span<ushort> row = mask.AsSpan(q * ring, ring);
-                    int p = start + q, lo = Math.Max(attentionFloor, p - band + 1);
+                    int p = start + q, lo = Math.Max(attentionFloor, (block ? start : p) - band + 1);
                     if (lo > p) continue;
                     int cell = lo % ring, n = p - lo + 1;
                     int first = Math.Min(n, ring - cell);
@@ -3775,7 +3806,7 @@ namespace TensorSharp.Models
                 int kv = start + count;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
                 new CausalMaskInput(kv, start, count, floor).FillF16(mask);
-                OpenMediaCells(mask, kv, start, count, sequence < 0 ? 0 : sequence, p => p);
+                OpenMediaCells(mask, kv, start, count, sequence < 0 ? 0 : sequence, p => p, fullAttention: true);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
                 return CacheMask(_causalMasks, key, node);
@@ -3806,16 +3837,16 @@ namespace TensorSharp.Models
 
             /// <summary>The open cells [Lo, Hi) of row q of a sliding-window mask over cache rows [offset, offset + width), for rows
             /// continuing at <paramref name="start"/>: positions (start + q - band, start + q], none before the attention floor.</summary>
-            private static (int Lo, int Hi) BandRow(int width, int offset, int start, int q, int attentionFloor, int band)
+            private static (int Lo, int Hi) BandRow(int width, int offset, int start, int q, int attentionFloor, int band, bool block = false)
             {
                 int p = start + q;
-                int lo = Math.Clamp(Math.Max(attentionFloor, p - band + 1) - offset, 0, width);
+                int lo = Math.Clamp(Math.Max(attentionFloor, (block ? start : p) - band + 1) - offset, 0, width);
                 int hi = Math.Clamp(p + 1 - offset, 0, width);
                 return (lo, Math.Max(lo, hi));
             }
 
             /// <summary>A sliding-window mask (<see cref="BandMask"/>): each row zero over its open cells, -inf elsewhere.</summary>
-            private static void FillBandRows(ushort[] mask, int width, int offset, int start, int count, int attentionFloor, int band)
+            private static void FillBandRows(ushort[] mask, int width, int offset, int start, int count, int attentionFloor, int band, bool block = false)
             {
                 const ushort negInf = 0xFC00;
                 // Large masks row-parallel, as CausalMaskInput's fill (a chunk of linear sliding-window caches attends its whole length).
@@ -3825,7 +3856,7 @@ namespace TensorSharp.Models
                 void Row(int q)
                 {
                     Span<ushort> row = mask.AsSpan(q * width, width);
-                    (int lo, int hi) = BandRow(width, offset, start, q, attentionFloor, band);
+                    (int lo, int hi) = BandRow(width, offset, start, q, attentionFloor, band, block);
                     row[..lo].Fill(negInf);
                     row[lo..hi].Clear();
                     row[hi..].Fill(negInf);

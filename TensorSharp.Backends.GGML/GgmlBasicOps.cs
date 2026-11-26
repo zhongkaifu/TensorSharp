@@ -2148,13 +2148,6 @@ namespace TensorSharp.GGML
                 blockSize, scale, slidingWindow, sinksData);
         }
 
-        /// <summary>Fused DiffusionGemma decode layer (whole layer in one GGML graph). Returns false
-        /// without throwing when the backend can't run it, so the caller falls back to the per-op path.</summary>
-        public static bool TryDiffusionDecodeLayer(in DiffusionDecodeLayerArgs args)
-        {
-            return GgmlNative.TryDiffusionDecodeLayer(in args);
-        }
-
         /// <summary>Whole UMT5-XXL text-encoder forward (24 layers, per-layer relative attention
         /// bias) in ONE resident-weight ggml graph: token ids in, final hidden states out.</summary>
         public static bool TryWanT5Encode(in WanT5EncodeArgs args)
@@ -2252,44 +2245,6 @@ namespace TensorSharp.GGML
         {
             return GgmlNative.TryQwenVaeRun(in args);
         }
-
-        /// <summary>Fused DiffusionGemma lm_head tail (output_norm + lm_head + softcap) in one GGML graph.</summary>
-        public static bool TryDiffusionLmHead(
-            IntPtr hidden, int hiddenSize, int canvasLen,
-            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr logitsOut, int vocab, float eps, float finalLogitSoftcap)
-        {
-            return GgmlNative.TryDiffusionLmHead(hidden, hiddenSize, canvasLen, outputNormW,
-                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, eps, finalLogitSoftcap);
-        }
-
-        /// <summary>Fused DiffusionGemma lm_head + on-device sample (CUDA only). Computes argmax/entropy/
-        /// multinomial sample/top-K on the device logits and returns only the small per-position outputs.
-        /// Returns false (caller falls back to the host lm_head + sampler) on non-CUDA / failure.</summary>
-        public static bool TryDiffusionLmHeadSample(
-            IntPtr hidden, int hiddenSize, int canvasLen,
-            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocab, float eps, float finalLogitSoftcap,
-            float invTemp, IntPtr uHost, int topK,
-            IntPtr argmaxOut, IntPtr entropyOut, IntPtr sampledOut, IntPtr topTokensOut, IntPtr topProbsOut)
-        {
-            return GgmlNative.TryDiffusionLmHeadSample(hidden, hiddenSize, canvasLen, outputNormW,
-                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocab, eps, finalLogitSoftcap,
-                invTemp, uHost, topK, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
-        }
-
-        /// <summary>Fused DiffusionGemma whole-model decode (all layers + lm_head in one graph). Returns
-        /// false without throwing when the backend can't run it, so the caller falls back.</summary>
-        public static bool TryDiffusionModelDecode(
-            DiffusionDecodeLayerArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int canvasLen, int promptLen,
-            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr logitsOut, int vocab, float finalLogitSoftcap)
-        {
-            return GgmlNative.TryDiffusionModelDecode(layers, numLayers, hidden, hiddenSize, canvasLen, promptLen,
-                outputNormW, lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, finalLogitSoftcap);
-        }
-
 
         /// <summary>Whole GPT-OSS transformer for one token as a single graph
         /// dispatch (all layers + MoE + folded final norm/LM head). Returns false
@@ -2422,17 +2377,6 @@ namespace TensorSharp.GGML
             int numHeads, int numKvHeads, int headDim,
             int seqLen, int kvLen,
             int maskStartPos, int slidingWindow, float scale, int inputFormat = 0)
-            => FusedPrefillAttention(q, k, v, output, numHeads, numKvHeads, headDim,
-                seqLen, kvLen, maskStartPos, slidingWindow, scale, inputFormat, false);
-
-        /// <summary>Fused prefill variant retaining the original per-op attention's default
-        /// matmul precision and exact sequence extent when <paramref name="matchPerOpPrecision"/>
-        /// is true. The original public overload and native ABI remain unchanged.</summary>
-        public static void FusedPrefillAttention(Tensor q, Tensor k, Tensor v, Tensor output,
-            int numHeads, int numKvHeads, int headDim,
-            int seqLen, int kvLen,
-            int maskStartPos, int slidingWindow, float scale, int inputFormat,
-            bool matchPerOpPrecision)
         {
             if (q == null) throw new ArgumentNullException(nameof(q));
             if (k == null) throw new ArgumentNullException(nameof(k));
@@ -2456,7 +2400,7 @@ namespace TensorSharp.GGML
                 qPtr, kPtr, vPtr, outPtr,
                 numHeads, numKvHeads, headDim,
                 seqLen, kvLen,
-                maskStartPos, slidingWindow, scale, inputFormat, matchPerOpPrecision);
+                maskStartPos, slidingWindow, scale, inputFormat);
         }
 
         /// <summary>

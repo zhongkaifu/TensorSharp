@@ -391,6 +391,15 @@ namespace TensorSharp.Cuda
             return CudaCpuFallback.InvokeTensor("rope", writeTarget, writeTarget, src, seqLen, rowOffset);
         }
 
+        [RegisterOpStorageType("cumsum", typeof(CudaStorage))]
+        public static Tensor CumSum(Tensor result, Tensor src)
+        {
+            // No device kernel: nothing on the direct CUDA backend runs a scan on its hot path (DiffusionGemma samples on
+            // the host there, as it always has), so the host copy keeps the op correct for any graph that uses it.
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
+            return CudaCpuFallback.InvokeTensor("cumsum", writeTarget, writeTarget, src);
+        }
+
         [RegisterOpStorageType("rope_ex_ff", typeof(CudaStorage))]
         public static Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode,
             int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow)

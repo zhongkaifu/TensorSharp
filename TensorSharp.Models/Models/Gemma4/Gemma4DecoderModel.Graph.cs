@@ -11,10 +11,10 @@ using TensorSharp.Graph;
 
 namespace TensorSharp.Models
 {
-    /// <summary>Gemma 4's pieces of a step's graph (see <see cref="Gemma4RuntimeModel"/>).</summary>
-    internal sealed partial class Gemma4RuntimeModel
+    /// <summary>Gemma 4's pieces of a step's graph (see <see cref="Gemma4DecoderModel"/>).</summary>
+    public abstract partial class Gemma4DecoderModel
     {
-        private const long F = sizeof(float);
+        private protected const long F = sizeof(float);
 
         /// <summary>The per-layer embeddings [ple, layers, rows] of a step (one node a step; ranks trace steps of their own).</summary>
         private readonly ConditionalWeakTable<GraphStep, StrongBox<int>> _stepPle = new();
@@ -307,9 +307,13 @@ namespace TensorSharp.Models
             }
             int h = step.Op(GraphOp.Add, step.RmsNorm(ffn, FirstWeight(layer, "post_ffw_norm.weight", "ffn_post_norm.weight")), stream);
             if (HasPle(layer)) h = EmitPerLayerEmbedding(step, layer, h);
-            float scale = _layerScale[layer];
+            float scale = LayerOutputScale(step, layer);
             return scale != 1f ? step.Op(GraphOp.Scale, stackalloc[] { h }, default, stackalloc[] { scale }) : h;
         }
+
+        /// <summary>The scale on <paramref name="layer"/>'s output in <paramref name="step"/>: <c>layer_output_scale</c>
+        /// (DiffusionGemma scales a prompt's rows by its encoder scalar instead).</summary>
+        private protected virtual float LayerOutputScale(GraphStep step, int layer) => _layerScale[layer];
 
         /// <summary>h + RMSNorm(proj(gelu(inp_gate h) * ple_l)) by <c>post_norm</c>.</summary>
         private int EmitPerLayerEmbedding(GraphStep step, int layer, int h)
