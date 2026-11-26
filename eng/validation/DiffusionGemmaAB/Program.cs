@@ -295,6 +295,49 @@ switch (scenario)
         }
         break;
     }
+    case "batchdiag":
+    {
+        // Sequence A's canvas logits in every arrangement a batched step can give it, against DecodeCanvasSeq alone.
+        string[] prompts = Prompts();
+        bool sc = model.SelfConditioningEnabled;
+        model.SelfConditioningEnabled = false;
+        var a = model.CreateSeqState(); var a2 = model.CreateSeqState(); var b = model.CreateSeqState();
+        try
+        {
+            int[] pa = Render(prompts[0]), pb = Render(prompts[1]);
+            model.PrefillSeq(a, pa); model.PrefillSeq(a2, pa); model.PrefillSeq(b, pb);
+            int[] canvas = Enumerable.Repeat(model.MaskTokenId, C).ToArray();
+            float[] reference = (float[])model.DecodeCanvasSeq(a, canvas, null, 0f, 1f).Clone();
+            float[] Batch(DiffusionSeqState[] seqs, int at)
+                => (float[])model.DecodeCanvasBatched(seqs, seqs.Select(_ => canvas).ToArray(), new float[seqs.Length][], new float[seqs.Length],
+                    Enumerable.Repeat(1f, seqs.Length).ToArray())[at].Clone();
+            var cases = new (string Name, float[] Logits)[]
+            {
+                ("seq alone again", (float[])model.DecodeCanvasSeq(a, canvas, null, 0f, 1f).Clone()),
+                ("batched [A]", Batch(new[] { a }, 0)),
+                ("batched [A, A']", Batch(new[] { a, a2 }, 0)),
+                ("batched [A', A] second", Batch(new[] { a2, a }, 1)),
+                ("batched [A, B]", Batch(new[] { a, b }, 0)),
+                ("batched [B, A] second", Batch(new[] { b, a }, 1)),
+            };
+            var rows = new List<object>();
+            foreach (var (name, logits) in cases)
+            {
+                double dot = 0, na = 0, nb = 0, max = 0;
+                for (int i = 0; i < logits.Length; i++) { dot += (double)logits[i] * reference[i]; na += (double)logits[i] * logits[i]; nb += (double)reference[i] * reference[i]; max = Math.Max(max, Math.Abs(logits[i] - reference[i])); }
+                double cos = dot / Math.Sqrt(na * nb);
+                rows.Add(new { name, cosine = cos, max_abs = max });
+                Console.WriteLine($"[ab] batchdiag {name}: cosine {cos:F6}, max |d| {max:F4} (prompts {pa.Length}/{pb.Length})");
+            }
+            report["cases"] = rows;
+        }
+        finally
+        {
+            model.DisposeSeqState(a); model.DisposeSeqState(a2); model.DisposeSeqState(b);
+            model.SelfConditioningEnabled = sc;
+        }
+        break;
+    }
     case "structured":
     {
         var cases = new List<object>();
