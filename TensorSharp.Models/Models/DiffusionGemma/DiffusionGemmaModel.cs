@@ -501,18 +501,18 @@ namespace TensorSharp.Models
                 long rowBytes = NativeDequant.RowSize(table.GgmlType, table.Ne0);
                 byte* basePtr = (byte*)table.Data.ToPointer();
                 float tableScale = table.Scale;
+                IntPtr tableBase = (IntPtr)basePtr;
+                // GGML's row dequantizer (the managed one on the pure-C# backend) and a vectorized multiply-add.
                 Parallel.For(0, rows, () => new float[hidden], (c, _, row) =>
                 {
-                    fixed (float* r = row)
-                    fixed (float* dst = &soft[(long)c * hidden])
-                        for (int j = 0; j < k; j++)
-                        {
-                            int t = tokens[c * k + j];
-                            if ((uint)t >= (uint)Config.VocabSize) continue;
-                            ManagedQuantizedOps.DequantizeRowToFloat32(table.GgmlType, (IntPtr)(basePtr + t * rowBytes), r, hidden);
-                            float w = probs[c * k + j] * scale * tableScale;
-                            for (int i = 0; i < hidden; i++) dst[i] += w * r[i];
-                        }
+                    var dst = soft.AsSpan(c * hidden, hidden);
+                    for (int j = 0; j < k; j++)
+                    {
+                        int t = tokens[c * k + j];
+                        if ((uint)t >= (uint)Config.VocabSize) continue;
+                        NativeDequant.DequantizeToFloat32(table.GgmlType, tableBase + (nint)(t * rowBytes), row, 0, hidden);
+                        System.Numerics.Tensors.TensorPrimitives.MultiplyAdd(row, probs[c * k + j] * scale * tableScale, dst, dst);
+                    }
                     return row;
                 }, _ => { });
             }
