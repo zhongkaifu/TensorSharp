@@ -61,7 +61,7 @@ public sealed class TextLoraPlanTests : IDisposable
         // Each opted-in family names the weights it applies a delta to; none relies on a default.
         Assert.All(models.Where(t => Overrides(t, "SupportsTextLora")), t => Assert.True(OverridesMethod(t, "TextLoraWeightRefusal"), t.Name));
         // The families the review tested, by name: they never call the hook on every path.
-        foreach (string name in new[] { "DeepSeek41Model", "DeepSeek4Model", "Qwen35RuntimeModel", "Gemma4Model", "Qwen4ExpRuntimeModel", "GptOssModel" })
+        foreach (string name in new[] { "DeepSeek41Model", "DeepSeek4Model", "Qwen35RuntimeModel", "Gemma4RuntimeModel", "Qwen4ExpRuntimeModel", "GptOssModel" })
             Assert.DoesNotContain(name, optedIn);
         Assert.Contains(models, t => t.Name == "DeepSeek41Model");
     }

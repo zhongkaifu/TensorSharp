@@ -67,7 +67,7 @@ internal static unsafe class Program
             else if (a == "gemma4-vision" && i + 2 < args.Length)
             {
                 // gemma4-vision <mmproj.gguf> <image> [dump.bin] [compare.bin]: the tower the `cuda`
-                // backend keeps on a CpuAllocator (Gemma4Model.LoadVisionEncoder), i.e. Ops.* on
+                // backend keeps on a CpuAllocator (Gemma4RuntimeModel.LoadVisionEncoder), i.e. Ops.* on
                 // CpuStorage - old vs new Core kernels are two runs with the TS_CPU_* switches.
                 string mm = args[i + 1], img = args[i + 2];
                 string dump = i + 3 < args.Length && !args[i + 3].StartsWith("-") ? args[i + 3] : null;

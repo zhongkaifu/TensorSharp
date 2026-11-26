@@ -629,6 +629,74 @@ namespace TensorSharp.MLX
         }
 
         /// <summary>
+        /// <see cref="RoPEEx"/> with ggml_rope_ext's frequency factors (Gemma 4's proportional global RoPE): MLX's fast rope
+        /// over the wavelengths base^(2i/d) * factor_i / freqScale, built once per factor tensor and parameters. YaRN with factors,
+        /// and layouts the fast rope does not take, run on the host fallback.
+        /// </summary>
+        [RegisterOpStorageType("rope_ex_ff", typeof(MlxStorage))]
+        public static Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode,
+            int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow)
+        {
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
+            long cols = LastDimension(src);
+            long rowsLong = cols > 0 ? src.ElementCount() / cols : 0;
+            if (!CanUseNativeWriteTarget(writeTarget) || !AreFloat32(src) || !IsMlxInt32(positions) || !src.IsContiguous()
+                || !positions.IsContiguous() || ropeDim <= 0 || (ropeDim & 1) != 0 || extFactor != 0.0f || attnFactor != 1.0f
+                || cols <= 0 || cols > int.MaxValue || rowsLong > int.MaxValue || positions.ElementCount() != rowsLong || ropeDim > cols
+                || freqFactors == null || freqFactors.ElementType != DType.Float32 || freqFactors.ElementCount() < ropeDim / 2)
+            {
+                return FallbackTensor("rope_ex_ff", writeTarget, src, positions, freqFactors, ropeDim, mode, originalContextLength,
+                    freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
+            }
+            bool traditional = (mode & 2) == 0;
+            int rows = (int)rowsLong, features = (int)cols;
+            MlxNative.MlxArray wavelengths = FactorWavelengths(freqFactors, ropeDim, freqBase, freqScale);
+            MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray srcView = default, positionsView = default, flattened = default, roped = default, reshaped = default;
+                try
+                {
+                    srcView = GetView(src);
+                    positionsView = GetView(positions);
+                    flattened = MlxNative.Reshape(srcView, new[] { rows, 1, 1, features });
+                    roped = MlxNative.FastRopeDynamicWithFreqs(flattened, ropeDim, traditional, 1.0f, positionsView, wavelengths);
+                    reshaped = MlxNative.Reshape(roped, ToIntArray(src.Sizes));
+                    SetDeviceResult(writeTarget, reshaped);
+                    reshaped = default;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(srcView);
+                    MlxNative.FreeArray(positionsView);
+                    MlxNative.FreeArray(flattened);
+                    MlxNative.FreeArray(roped);
+                    MlxNative.FreeArray(reshaped);
+                }
+            });
+            return writeTarget;
+        }
+
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Tensor, Dictionary<(int, float, float), MlxNative.MlxArray>> FactorWavelengthCache = new();
+
+        /// <summary>The wavelengths of a factored rope (read from the factor tensor once per parameters).</summary>
+        private static MlxNative.MlxArray FactorWavelengths(Tensor freqFactors, int ropeDim, float freqBase, float freqScale)
+        {
+            Dictionary<(int, float, float), MlxNative.MlxArray> byParams = FactorWavelengthCache.GetOrCreateValue(freqFactors);
+            lock (byParams)
+            {
+                if (byParams.TryGetValue((ropeDim, freqBase, freqScale), out MlxNative.MlxArray cached)) return cached;
+                int pairs = ropeDim / 2;
+                float[] factors = freqFactors.GetElementsAsFloat(pairs);
+                var wavelengths = new float[pairs];
+                for (int i = 0; i < pairs; i++)
+                    wavelengths[i] = factors[i] / (MathF.Pow(freqBase, -2.0f * i / ropeDim) * freqScale);
+                MlxNative.MlxArray array = ScaledRope.NewFloats(wavelengths);
+                byParams[(ropeDim, freqBase, freqScale)] = array;
+                return array;
+            }
+        }
+
+        /// <summary>
         /// The per-pair wavelengths and output scale of a YaRN / attn-factor RoPE, built once
         /// per parameter set with the same arithmetic as the CPU implementation
         /// (TensorApplyCPU.RoPEEx): angle_i = position * base^(-2i/d) * (freqScale * (1 - ramp_i)
@@ -701,6 +769,8 @@ namespace TensorSharp.MLX
 
             private static float YarnCorrDim(int nDims, int nCtxOrig, float nRot, float freqBase)
                 => nDims * MathF.Log(nCtxOrig / (nRot * 2.0f * MathF.PI)) / (2.0f * MathF.Log(freqBase));
+
+            internal static MlxNative.MlxArray NewFloats(float[] values) => NewFloatArray(values);
 
             private static unsafe MlxNative.MlxArray NewFloatArray(float[] values)
             {

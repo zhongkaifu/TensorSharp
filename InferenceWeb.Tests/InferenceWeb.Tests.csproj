@@ -14,7 +14,6 @@
     <AdditionalFiles Include="BannedSymbols.txt" />
     <Compile Remove="Fixtures/PdfProcessFixture/**/*.cs" />
     <ProjectReference Include="Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" ReferenceOutputAssembly="false" />
-    <Compile Include="../eng/validation/Gemma4BatchedCacheProbe/Gemma4CacheProbe.cs" Link="Validation/Gemma4CacheProbe.cs" />
     <Compile Include="../eng/validation/ValidationSha256.cs" Link="Validation/ValidationSha256.cs" />
   </ItemGroup>
   <ItemGroup>
@@ -35,6 +34,7 @@
     <EmbeddedResource Include="Fixtures/MuseGlimmer/LegacyGoldens/*.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/LegacyReal/*.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/LegacySynthetic/*.json" />
+    <EmbeddedResource Include="Fixtures/Gemma4/LegacySynthetic/*.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/Vision/*.json" />
     <EmbeddedResource Include="Fixtures/MuseSpark/chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/Qwen35/chat_template.jinja" />

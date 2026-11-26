@@ -131,6 +131,8 @@ namespace
         OP_PAD_REFLECT_1D = 59, // srcs: x (F32, contiguous); ip: p0, p1
         OP_DEPTHWISE_CONV_2D = 70, // srcs: x [C, W, H, N] (channels innermost), kernel [KW, KH, 1, C]; ip: s0, s1, p0, p1, d0, d1
         OP_GELU_ERF = 71,       // 0.5 x (1 + erf(x / sqrt 2))
+        OP_LOG = 72,            // ggml_log
+        OP_CUMSUM = 73,         // ggml_cumsum: the running sum along ne0
     };
 
     struct Leaf
@@ -673,7 +675,12 @@ namespace
                 throw std::runtime_error("graph builder: host experts need weight leaves with host data");
         const std::int64_t n = x->ne[0], T = ggml_nelements(x) / n, n_used = ids->ne[0];
         const ggml_tensor* gate = parts[0]->tensor;
-        const std::int64_t n_ff = gate->ne[1], experts = gate->ne[2];
+        // ip[1]: the activation (0 silu(gate) * up, 2 gelu(gate) * up: Gemma 4); ip[2] = 1: srcs[3] is one fused [gate | up]
+        // stack (gate the first half of each expert's rows) and srcs[4] names it again.
+        const int activation = nip > 1 ? static_cast<int>(ip[1]) : 0;
+        const bool fused_gate_up = nip > 2 && ip[2] != 0;
+        if (activation != 0 && activation != 2) throw std::runtime_error("graph builder: host experts take activation 0 (SwiGLU) or 2 (GeGLU)");
+        const std::int64_t n_ff = fused_gate_up ? gate->ne[1] / 2 : gate->ne[1], experts = gate->ne[2];
         auto boundary = [&](ggml_tensor* t) {
             if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
             for (ggml_tensor* p = t; p != nullptr; p = p->view_src) ggml_set_output(p);
@@ -723,14 +730,24 @@ namespace
         for (int i = 0; i < 3; i++)
         {
             parts[i]->host_only = true;
+            if (fused_gate_up && i == 1) continue;   // the fused stack's second name: no up stack of its own
             *data[i] = parts[i]->data;
             *type[i] = parts[i]->tensor->type;
             *bytes[i] = static_cast<std::int64_t>(parts[i]->bytes);
         }
-        hm.gate_ne0 = n; hm.gate_ne1 = n_ff;
-        hm.up_ne0 = n; hm.up_ne1 = n_ff;
+        if (fused_gate_up)
+        {
+            // HostMoeSegment's fused layout: the gate stack holds [gate | up] (2 n_ff rows an expert), no up stack.
+            hm.gate_ne0 = n; hm.gate_ne1 = 2 * n_ff;
+            hm.up_data = nullptr; hm.up_type = 0; hm.up_ne0 = 0; hm.up_ne1 = 0; hm.up_bytes = 0;
+        }
+        else
+        {
+            hm.gate_ne0 = n; hm.gate_ne1 = n_ff;
+            hm.up_ne0 = n; hm.up_ne1 = n_ff;
+        }
         hm.down_ne0 = n_ff; hm.down_ne1 = n;
-        hm.activation = 0;   // silu(gate) * up
+        hm.activation = activation;   // 0: silu(gate) * up; 2: gelu(gate) * up
         hm.num_experts = static_cast<int>(experts);
         hm.n_used = static_cast<int>(n_used);
         hm.n_ff = static_cast<int>(n_ff);
@@ -1207,6 +1224,8 @@ namespace
         case OP_SWIGLU: need(1); return ggml_swiglu(ctx, src(0));
         case OP_GEGLU: need(1); return ggml_geglu(ctx, src(0));
         case OP_GELU_ERF: need(1); return ggml_gelu_erf(ctx, src(0));
+        case OP_LOG: need(1); return ggml_log(ctx, src(0));
+        case OP_CUMSUM: need(1); return ggml_cumsum(ctx, src(0));
         case OP_DEPTHWISE_CONV_2D:
             need(2);
             return depthwise_conv_2d(ctx, src(0), src(1), static_cast<int>(ipar(0, 1)), static_cast<int>(ipar(1, 1)),

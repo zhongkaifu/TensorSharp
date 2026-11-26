@@ -196,7 +196,7 @@ public sealed unsafe class CpuAttentionStackScratchTests : IDisposable
 
     public static IEnumerable<object[]> RowKernels()
     {
-        foreach (string k in new[] { "gemma4", "gpt-oss", "gpt-oss-tp" })
+        foreach (string k in new[] { "gpt-oss", "gpt-oss-tp" })
         {
             yield return new object[] { k, false };
             if (k != "gpt-oss-tp")   // the TP kernel reads an F32 cache only
@@ -356,9 +356,6 @@ public sealed unsafe class CpuAttentionStackScratchTests : IDisposable
         {
             switch (_kernel)
             {
-                case "gemma4":
-                    Gemma4Model.AttentionDecodeWithWindow(_qT, _kT, _vT, _rT, Heads, KvHeads, Dim, Dim, 0, _keys, _scale);
-                    break;
                 case "gpt-oss":
                     GptOssModel.AttentionDecodeWithSinks(_qT, _kT, _vT, _rT, Heads, KvHeads, Dim, _keys, _scale,
                         _sinks, isSWA: false, slidingWindow: 128);

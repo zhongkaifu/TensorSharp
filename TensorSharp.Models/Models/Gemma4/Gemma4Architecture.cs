@@ -4,6 +4,8 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System.Linq;
+
 using TensorSharp.Models.Architecture;
 
 namespace TensorSharp.Models
@@ -11,24 +13,32 @@ namespace TensorSharp.Models
     /// <summary>Gemma 4 architecture plug-in.</summary>
     internal static class Gemma4Architecture
     {
+        /// <summary>The family on the shared decoder runtime (tests and eng/validation/Gemma4RuntimeAB build it directly).</summary>
+        internal static ModelBase CreateRuntimeModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1, string draftModelPath = null)
+            => new Gemma4RuntimeModel(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
+
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
             Id = "gemma4",
             DisplayName = "Gemma 4",
             Aliases = new[] { "gemma4" },
-            Factory = c => new Gemma4Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            // On the shared decoder runtime (Gemma4RuntimeModel): one device, --tp, whole-layer stages and their hybrid,
+            // continuous batching, the prefix cache, checkpoints, speculation (n-gram, the gemma4-assistant head, DFlash).
+            Factory = c => new Gemma4RuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
             ProjectorFileHints = new[] { "gemma-4-mmproj-F16.gguf" },
+            // Gemma4RuntimeTests proves the mechanisms on the family's synthetic fixtures. Routed experts run from host memory on
+            // every backend (GGML's host MoE segment and the tensor executors' expert host take the fused GeGLU stack).
             Serving = new ServingContract
             {
-                Implementation = ServingImplementation.Bespoke,
+                Implementation = ServingImplementation.SharedRuntime,
                 HasRoutedExperts = true,
-                ContinuousBatching = MechanismSupport.On(ServingBackends.All),
-                // The per-op TP forward has no batched variant: concurrent requests take turns.
-                TensorParallel = MechanismSupport.On(ServingBackends.PerOpTensorParallel),
-                LayerSplit = MechanismSupport.None("Gemma 4 does not implement whole-layer placement; use --tp N."),
-                HybridParallel = MechanismSupport.None("Gemma 4 does not implement whole-layer placement, so it cannot combine it with --tp."),
-                ExpertOffload = MechanismSupport.On(ServingBackends.Ggml).ElsewhereGap(
-                    "Gemma 4 offloads routed experts only on the GGML backends; cpu, cuda and mlx serve every expert from their stacked-expert device buffers."),
+                ContinuousBatching = MechanismSupport.On(ServingContract.AllBackends.ToArray()),
+                TensorParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
+                LayerSplit = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
+                // The graph-only family has no graphs for tensor-parallel stages yet (the legacy model had no whole-layer placement).
+                HybridParallel = MechanismSupport.None("Gemma 4 runs whole-forward graphs only, which do not cover tensor-parallel stages yet; use --tp N or --layer-split N."),
+                ExpertOffload = MechanismSupport.On(ServingContract.AllBackends.ToArray()),
             },
         };
     }

@@ -2115,7 +2115,7 @@ namespace TensorSharp.Cuda
         {
             GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
-            GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
+            GraphFusion.RoutedExperts or GraphFusion.SwigluFfn or GraphFusion.GegluRoutedExperts => ((CudaAllocator)Allocator).Kernels != null,
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
             GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep or GraphFusion.DFlashConv => Kernels != null,
             GraphFusion.DeltaNetScans => Kernels is { TakesGdnScanSequences: true },
@@ -2137,6 +2137,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.SigmoidGate) return TrySigmoidGate(inputs, results);
             if (kind == GraphFusion.SharedExpertGate) return TrySharedExpertGate(inputs, weights, results);
             if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs, weights, ip, results);
+            if (kind == GraphFusion.GegluRoutedExperts) return TryGegluRoutedExperts(inputs, weights, ip, results);
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs, weights, ip, results);
             if (kind == GraphFusion.HcRead) return TryHcRead(inputs, weights, ip, fp, results);
             if (kind == GraphFusion.HcScatter) return TryHcScatter(inputs, ip, results);
@@ -3549,9 +3550,12 @@ namespace TensorSharp.Cuda
         /// steps (prompt chunks, verify windows, routes read on the host) take the executor's own path.
         /// </summary>
         protected override Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false)
         {
-            if (gateValue.Weight is IGraphHostedExperts gate && upValue.Weight is IGraphExpertWeights up
+            // The doorbell's and the staged paths' kernels run SwiGLU over separate gate and up stacks; a fused GeGLU layer
+            // (Gemma 4) takes the executor's own path: its device routes through the generic ops, the host's through the
+            // host kernel at that activation.
+            if (activation == 0 && !fusedGateUp && gateValue.Weight is IGraphHostedExperts gate && upValue.Weight is IGraphExpertWeights up
                 && downValue.Weight is IGraphExpertWeights down)
             {
                 // Every MoE layer the executor meets is remembered, so a long prompt chunk stages each next layer ahead.
@@ -3571,7 +3575,7 @@ namespace TensorSharp.Cuda
             }
             FlushTrades();
             HostExpertFallbacks++;
-            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run);
+            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run, activation, fusedGateUp);
         }
 
         /// <summary>Host-expert calls the doorbell served, and calls that fell to the base executor's host path (routes read
@@ -4567,6 +4571,78 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>The Gemma 4 MoE decode kernels' scratch for each expert geometry (never freed while recorded steps may bind it):
+        /// the selected ids and weights, the gate|up products, the GeGLU rows and their q8_1 forms.</summary>
+        private readonly Dictionary<(int Experts, int K, int Hidden, int Ff), Tensor[]> _gegluScratch = new();
+
+        /// <summary>
+        /// Gemma 4's routed experts (<see cref="GraphFusion.GegluRoutedExperts"/>) for decode rows and verify windows (up to
+        /// <see cref="DecodeExpertRows"/> rows), a row at a time on the per-op path's on-device Gemma MoE kernels
+        /// (CudaFusedOps.TryMoEExpertFFNDecode: the router's softmax, top-K renormalized and times the per-expert scale, the
+        /// fused gate|up matvec, GeGLU, the down matvec accumulated by the route weights; q8_1 dp4a products for Q4_0 / Q4_K
+        /// experts), the members read through device tables of their resident copies: no host read, so a recorded decode step
+        /// replays it. A prompt chunk, or members that are not resident, run the region's ops.
+        /// </summary>
+        private bool TryGegluRoutedExperts(Tensor[] inputs, IGraphWeight[] weights, long[] ip, Tensor[] results)
+        {
+            if (ip == null || ip.Length < 2) return false;
+            if (weights[2] is not IGraphExpertWeights gateUp || weights[3] is not IGraphExpertWeights down) return false;
+            Tensor x = inputs[0], logits = inputs[1], scale = ip[1] != 0 && inputs.Length > 4 ? inputs[4] : null;
+            if (x?.Storage is not CudaStorage || logits?.Storage is not CudaStorage || x.ElementType != DType.Float32
+                || logits.ElementType != DType.Float32 || (ip[1] != 0 && (scale?.Storage is not CudaStorage || scale.ElementType != DType.Float32)))
+                return false;
+            int experts = (int)gateUp.Ne2, k = (int)ip[0], hidden = (int)gateUp.Ne0, ff = (int)(gateUp.Ne1 / 2);
+            if (gateUp.Ne1 != 2L * ff || down.Ne0 != ff || down.Ne1 != hidden || down.Ne2 != experts
+                || !CudaFusedOps.IsMoERouterConfigurationSupported(experts, k) || (scale != null && scale.ElementCount() < experts))
+                return false;
+            long count = x.ElementCount() / hidden;
+            if (count < 1 || count > DecodeExpertRows || x.ElementCount() != count * hidden || logits.ElementCount() != count * experts)
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            RequireDevice(x, cuda.DeviceId, "input", 0);
+            RequireDevice(logits, cuda.DeviceId, "input", 1);
+            Tensor gateUpTable = ExpertTable(gateUp), downTable = ExpertTable(down);
+            if (gateUpTable == null || downTable == null) return false;
+            var shape = (experts, k, hidden, ff);
+            if (!_gegluScratch.TryGetValue(shape, out Tensor[] scratch))
+            {
+                // Made on an uncaptured step: a recording binds the scratch the unrecorded steps already use.
+                if (CudaGraphCapture.IsCapturing(cuda)) return false;
+                Tensor Make(DType type, params long[] sizes)
+                {
+                    var t = new Tensor(Allocator, type, sizes);
+                    ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+                    return t;
+                }
+                scratch = new[]
+                {
+                    Make(DType.Int32, k), Make(DType.Float32, k), Make(DType.Float32, k, 2L * ff), Make(DType.Float32, k, ff),
+                    Make(DType.UInt8, (long)(hidden / 32) * CudaFusedOps.Q81BlockBytes),
+                    Make(DType.UInt8, (long)k * (ff / 32) * CudaFusedOps.Q81BlockBytes),
+                };
+                _gegluScratch[shape] = scratch;
+            }
+            int rows = (int)count;
+            IntPtr scalePtr = scale != null ? CudaFusedOps.GetDeviceResidentPtr(scale) : IntPtr.Zero;
+            using Tensor x2 = x.View(rows, hidden);
+            using Tensor logits2 = logits.View(rows, experts);
+            var output = new Tensor(Allocator, DType.Float32, rows, hidden);
+            bool dp4a = hidden % 32 == 0 && ff % 32 == 0;
+            for (int r = 0; r < rows; r++)
+            {
+                using Tensor xr = x2.Narrow(0, r, 1), lr = logits2.Narrow(0, r, 1), yr = output.Narrow(0, r, 1);
+                if (!CudaFusedOps.TryMoEExpertFFNDecode(lr, xr, yr, scratch[0], scratch[1], scratch[2], scratch[3], scalePtr,
+                        Ptr(gateUpTable), Ptr(downTable), gateUp.Format, down.Format, experts, k, hidden, ff,
+                        dp4a ? scratch[4] : null, dp4a ? scratch[5] : null, useDp4a: dp4a))
+                {
+                    output.Dispose();
+                    return false;
+                }
+            }
+            results[0] = output;
+            return true;
+        }
+
         /// <summary>Whether the loaded module's grouped expert kernels read experts of <paramref name="type"/> (an older module
         /// reads some layouts as Q8_0: CudaMoe.RequireExpertDecoders).</summary>
         private static bool ChunkKernelsRead(Dsv4Kernels dk, int type) => CudaMoe.SupportsExpertType(type) && type switch
@@ -5001,13 +5077,13 @@ namespace TensorSharp.Cuda
             if (rows < 1 || rows > DenseDecodeRows || weight.Ne2 > 1 || weight.Ne1 <= 0 || weight.Ne1 > int.MaxValue
                 || weight.Bytes % weight.Ne1 != 0 || firstRow < 0 || outRows < 1 || firstRow + outRows > weight.Ne1
                 || x.Storage is not CudaStorage xs || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() != rows * inDim
-                || inDim % 32 != 0 || inDim > int.MaxValue || weight.CacheKey == IntPtr.Zero || cuda.Kernels == null
-                || Dsv4Kernels.DenseFastWarps((int)weight.Ne1) != Dsv4Kernels.DenseFastWarps((int)outRows))
+                || inDim % 32 != 0 || inDim > int.MaxValue || weight.CacheKey == IntPtr.Zero || cuda.Kernels == null)
                 return null;
             if (!CudaGraphCapture.IsCapturing(cuda))
                 CudaQuantizedOps.TryEnsureResident(cuda, weight.CacheKey, weight.Data, weight.Format, inDim, weight.Ne1, weight.Bytes, out _, out _);
             if (!CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type) || type == 30
-                || DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not { } dk)
+                || DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not { } dk
+                || dk.DenseFastWarps((int)weight.Ne1) != dk.DenseFastWarps((int)outRows))
                 return null;
             long rowBytes = weight.Bytes / weight.Ne1, qRow = inDim / 32 * CudaKernels.Q81BlockBytes;
             Tensor xq = QuantizedOnce(cuda, x, xs, inDim, rows);

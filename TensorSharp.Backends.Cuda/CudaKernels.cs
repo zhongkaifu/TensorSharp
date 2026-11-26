@@ -99,6 +99,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr addCausalMaskF32;
         private readonly IntPtr ropeF32;
         private readonly IntPtr ropeExF32;
+        private readonly IntPtr ropeExFfF32;
         private readonly IntPtr quantMatmulF32;
         private readonly IntPtr quantMatmulBatchedF32;
         private readonly IntPtr quantMatmulVecF32;
@@ -302,6 +303,7 @@ namespace TensorSharp.Cuda
             addCausalMaskF32 = module.GetFunction("ts_add_causal_mask_f32");
             ropeF32 = module.GetFunction("ts_rope_f32");
             ropeExF32 = module.GetFunction("ts_rope_ex_f32");
+            ropeExFfF32 = module.GetFunction("ts_rope_ex_ff_f32");
             quantMatmulF32 = module.GetFunction("ts_quant_matmul_f32");
             quantMatmulBatchedF32 = module.GetFunction("ts_quant_matmul_batched_f32");
             quantMatmulVecF32 = module.GetFunction("ts_quant_matmul_vec_f32");
@@ -2317,6 +2319,27 @@ namespace TensorSharp.Cuda
                 &extFactorArg, &attnFactorArg, &betaFastArg, &betaSlowArg, &addToResultArg
             };
             Launch(ropeExF32, Grid(Math.Max(rows * pairCount, copyWork)), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary><see cref="LaunchRoPEExF32"/> with ggml_rope_ext's frequency factors (a device vector of ropeDim/2 floats).</summary>
+        public void LaunchRoPEExFactorsF32(
+            IntPtr input, IntPtr positions, IntPtr output, int rows, int cols, int ropeDim, int mode, int positionsAreInt32,
+            int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast,
+            float betaSlow, IntPtr freqFactors, IntPtr stream)
+        {
+            IntPtr inputArg = input, positionsArg = positions, outputArg = output, factorsArg = freqFactors;
+            int rowsArg = rows, colsArg = cols, ropeDimArg = ropeDim, modeArg = mode, positionsAreInt32Arg = positionsAreInt32;
+            int originalContextLengthArg = originalContextLength, addToResultArg = 0;
+            float freqBaseArg = freqBase, freqScaleArg = freqScale, extFactorArg = extFactor, attnFactorArg = attnFactor;
+            float betaFastArg = betaFast, betaSlowArg = betaSlow;
+            int pairCount = Math.Min(ropeDim, cols) / 2;
+            void** args = stackalloc void*[]
+            {
+                &inputArg, &positionsArg, &outputArg, &rowsArg, &colsArg, &ropeDimArg, &modeArg,
+                &positionsAreInt32Arg, &originalContextLengthArg, &freqBaseArg, &freqScaleArg,
+                &extFactorArg, &attnFactorArg, &betaFastArg, &betaSlowArg, &addToResultArg, &factorsArg
+            };
+            Launch(ropeExFfF32, Grid(Math.Max(rows * pairCount, rows * cols)), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchQuantMatmulF32(IntPtr weights, IntPtr input, IntPtr output, int type, int inDim, int outDim, int rows, IntPtr stream)

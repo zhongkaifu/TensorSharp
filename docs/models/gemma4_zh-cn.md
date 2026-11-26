@@ -8,7 +8,7 @@
 |---|---|
 | 提供方 | Google |
 | GGUF 架构标识 | `gemma4` |
-| 模型类 | [`Gemma4Model`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.cs)（旧单序列路径）+ [`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs)（`IBatchedPagedModel`） |
+| 模型类 | 共享解码器运行时上的 [`Gemma4RuntimeModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.cs)（`StandardDecoderModel`；所有执行器上的计算图程序） |
 | 视觉编码器 | [`Gemma4VisionEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4VisionEncoder.cs)（SigLIP 风格 ViT） |
 | 音频编码器 | [`Gemma4AudioEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioEncoder.cs)（USM 风格 chunked transformer） |
 | 音频前端 | [`Gemma4AudioPreprocessor`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioPreprocessor.cs)（16 kHz 单声道 → 128 bin log-mel） |
@@ -17,8 +17,8 @@
 | 模态 | 文本、图像、视频（帧栈）、音频 |
 | 思维链模式 | 是（`<\|channel>thought ... <channel\|>`） |
 | 工具调用 | 是（`<\|tool_call>call:name{...}<tool_call\|>`） |
-| 批处理 / 分页前向 | **默认启用** —— `IBatchedPagedModel.ForwardBatch` 处理双 head_dim、KV donor 共享、PLE 注入、SWA + 全局混合的分页 K/V 缓冲。`--no-continuous-batching` 会强制走按序列 KV 交换路径。详见 §11。 |
-| MTP 投机解码 | 可选 —— 通过 `--draft-model`（`TS_SPEC_DRAFT_MODEL`）加载独立的 `gemma4-assistant` EAGLE 风格草稿 GGUF；指定该文件本身就会启用投机（显式 `--no-spec` 可否决）。该标志在**两个宿主上都可用**：`TensorSharp.Cli` 与 `TensorSharp.Server` 共用同一个 [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)。在 ggml 后端与纯 C# `cuda` 后端上有收益。详见 §12。 |
+| 批处理 / 分页前向 | 共享运行时的连续批处理：请求在各自槽位上以批处理步骤运行（prompt 分块与 decode 行同在一步），并带前缀缓存与检查点。见 §10。 |
+| MTP 投机解码 | 可选 —— 通过 `--draft-model`（`TS_SPEC_DRAFT_MODEL`）加载独立的 `gemma4-assistant` EAGLE 风格草稿 GGUF；指定该文件本身就会启用投机（显式 `--no-spec` 可否决）。该标志在**两个宿主上都可用**：`TensorSharp.Cli` 与 `TensorSharp.Server` 共用同一个 [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)。详在所有计算图执行器上运行。见 §12。 |
 | 输出解析器 | `Gemma4OutputParser` |
 
 ## 下载
@@ -77,17 +77,8 @@ Windows/Linux 上带 Vulkan 驱动的 AMD、Intel 或 NVIDIA GPU 使用 `ggml_vu
 纯文本请求不需要 `mmproj-gemma-4-E4B-it-Q8_0.gguf`；图像、视频或音频输入需要从
 同一仓库下载它，并通过 `--mmproj` 传入。
 
-快速路径的依据来自三处相互独立的路由事实：
+每一步都以整前向计算图程序在后端执行器上运行（§7、§8）；同一宽度的 decode 步以前一步推进的方式重放。
 
-- 多 token prefill / verify 使用融合整模型 `NativeGemma4ModelVerify` 图，其中包含
-  E 系列的内核内 PLE gather 与共享 KV donor 处理。
-- 稠密模型的单 token decode 通过一次 GGML 图派发在
-  `NativeGemma4ModelDecode` 中执行完整 transformer。
-- 只有一个调度序列时，调度器的单序列路径会选择线性 `Forward()` 路径，
-  从而进入融合整模型 decode，而不是通用批处理逐算子路径。
-
-实现与路由说明见[E4B prefill 工程记录](../perf/gemma4-prefill-cuda-graph-design.md)与
-[N=1 调度器文档](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 
 多模态 CLI 单次推理（文本提示词通过 `--input` 从文件读取；只给 `--image` 而不给
 `--input` 时会使用默认的描述图片提示词；CLI 采样默认为 greedy，
@@ -232,8 +223,8 @@ residual += combined
 
 ### 3.3 Decode vs prefill
 
-- **Decode**（`seqLen == 1`）在 GGML 后端、所有层均为密集且权重均量化时：单次原生调用（`Gemma4ModelDecode`）一次 GPU 图调度处理整套堆栈，包含 PLE、per-layer head 维、环形 SWA cache、per-layer scalar。
-- **Prefill**（`seqLen > 1`）：符合条件的稠密模型优先使用融合整模型 verify 图，其中包含 E 系列 PLE 与共享 KV donor 层。该入口不可用时，符合条件的稠密、非共享、无 PLE 层仍可走 per-layer `Gemma4LayerPrefill` 图，其余层回退逐算子路径；长 prompt 会分块以控制 SWA score 张量。
+两者是同一计算图程序的不同宽度（§8）：prompt 分块注意已缓存的前缀与自身的行，decode 行在因果（或滑窗带状）掩码下注意填充后的
+缓存窗口，多模态 soft token 在其前向内彼此双向注意。
 
 ## 4. 组件细节
 
@@ -382,243 +373,65 @@ blk.{L}.post_norm.weight                   # PLE post-norm
 rope_freqs.weight                          # 比例频率因子
 ```
 
-## 7. TensorSharp 实现走读
-
-构造函数（`Gemma4Model(string ggufPath, BackendType backend)`）：
-
-1. `ParseBaseConfig()`（通用字段）。
-2. 读取 SWA 模式与窗口、双 head dim、双 KV head 数、双 RoPE base、partial rotary 维、PLE 维、共享 KV 层数、MoE 计数。根据 SWA 模式设置 `Config.UsesCircularKvCache`。
-3. `BuildKVDonorMap()` —— 产生 `_kvDonorMap[layer] → donorLayer`。
-4. `ParseTokenizer()`、`LoadWeights()`。
-5. `_hasTiedOutput` 检测。
-6. `DetectHeadDimsFromWeights()` —— 元数据不一致时修复 head dim。
-7. `LoadLayerScalars()` —— 加载 `_layerScalars[NumLayers]`。
-8. `FuseQKVWeights()`、`FuseGateUpWeights()`、`FuseExpertGateUpWeights()`。
-9. `PrepareCudaQuantizedWeightsForInference()`。
-10. `PrecomputeRoPE()`。
-11. `InitKVCache(maxSeqLen)` —— SWA 层容量为 `slidingWindow`，全局层为 `maxSeqLen`；共享层 alias 到 donor。
-12. `BuildGemma4DecodeArrays()` —— 把 per-layer 指针、类型、维度，以及可选的 MoE / PLE 标志打包到 `_decodeArrays` 给融合 decode kernel 用。
-
-`Forward(int[] tokens)`：
-
-- embedding lookup + 缩放。
-- 可选的图像 / 音频注入（被注入的位置加入 `exceptPositions` 让层代码跳过这些位置上的 RoPE / cache 写入）。
-- 可选 PLE 计算。
-- 然后：
-  - **融合 decode**（一次原生调用，见 § 9），或
-  - 逐层 C# 循环，每个密集层尝试 `TryFusedLayerPrefill`。
-- 最终 RMSNorm、LM head、可选 softcap、复制到 `_logitsBuffer`。
-
-`ForwardRefill(int[] tokens)` 是 prefill-then-decode 入口：把前缀切成 `min(2 × slidingWindow, 2048)`-token 的块（`TS_PREFILL_CHUNK` 可覆盖），最后调 `Forward([lastToken])`。多模态 prompt 跳过分块（注入位置是绝对的）。
-
-## 8. Prefill 优化
-
-### 整模型单图 prefill（`NativeGemma4ModelVerify`）
-
-在 ggml 后端上，普通的多 token prefill 由 MTP 验证所用的同一个融合整模型内核（§12）来执行：所有层在单次 GGML 图派发中完成，激活值常驻设备，而不是每层一张图。`CanUseWholeModelPrefillVerify()` 决定是否走该路径——仅限密集模型，包括 E 系列的内核内 PLE 与共享 KV donor 层；多模态 chunk 在任意起始位置都可通过内核的双向 span mask 走该路径（见[复用前缀之后的图片与音频回合](#复用前缀之后的图片与音频回合)）。`startPos > 0` 的 SWA 包裹 chunk 通过内核内的 swaPrev gather 留在融合路径上。全 MoE 变体（例如 26B-A4B）有对应的融合路径：`CanUseWholeModelMoEPrefillVerify()` / `TryFusedMoEModelVerify()`。注意，块量化（`q8_0` / `q4_0`）KV cache 的多 token prefill *必须*走该路径——逐算子回退无法遍历块量化的 cache 布局。
-
-调度器会把 solo（无争用）prompt 以大分块喂给该路径，分块上限由 `TS_SCHED_SOLO_PREFILL_CHUNK`（默认 8192）控制。实测设计见 [`docs/perf/gemma4-prefill-cuda-graph-design.md`](../perf/gemma4-prefill-cuda-graph-design.md)。
-
-### 复用前缀之后的图片与音频回合
-
-图片、视频帧或音频片段以一段软 token 进入提示，这些软 token 彼此双向注意。prefill 内核用每个 chunk token 一个字节（`is_except`）表达这一点：软 token 查询还会读取本 chunk 中位于其后的软 token 键，而所有查询都因果地读取其之前的键，局部层上限定在滑动窗口之内。当一个会话把缓存续接到图片回合时，图片 chunk 从非零位置 P 开始，位于之前回合留下的文本之后。
-
-在此之前，融合内核（密集的 `TSGgml_Gemma4ModelVerify`、MoE 的 `TSGgml_Gemma4MoEModelVerify`）只在 P = 0 时应用软 token 条件，因为它们拿键在缓冲区中的下标与 chunk 的字节比较。于是门控把 P > 0 的媒体 chunk 交给逐算子路径，这条路径更慢（E4B/Metal，一个复用 179 token 的 457 token 图片回合：首 token 1.25 s，冷启动为 0.64 s），而且环回绕之后是错的：它的掩码把缓冲区下标当作绝对位置，但超出窗口后收集的窗口从 P - 511 开始，而不是 0。Phase 0 因此只能让这样的回合不复用公共前缀之后的内容（`CanPrefillMediaAfterReusedPrefix`）。
-
-融合内核注意的每个缓冲区都把本 chunk 作为最后 N 个真实键：P = 0 时只有 chunk 本身，全局缓存 `[0, P + N)`，未回绕的滑动窗口缓存，或者从已回绕的环中收集并前置到 chunk 之前的上一窗口。因此键在 chunk 中的下标就是它在缓冲区中的下标减去 chunk 之前的真实键数，`gemma4_mm_mask.h` 中的行构造函数应用了这个偏移。在 P = 0 以及文本 chunk 上，它们生成的行与之前相同。逐算子路径把软 token 的绝对位置平移到其键缓冲区的坐标系中（`ShiftPositions`），与张量并行的逐算子路径早已采用的做法一致；张量并行的融合 verify 现在也在任意 P 传入 chunk 掩码（其密集变体过去在 P > 0 运行媒体 chunk 时完全没有软 token 掩码）。
-
-所以 Gemma 4 不再重写 `CanPrefillMediaAfterReusedPrefix`：图片回合在任意提示长度下都会复用会话的文本，图片 chunk 走融合图。在 E4B（Q8_0，Metal，M5 Pro）上用 IMG 会话（文本、文本、图片、文本；贪心；两轮取中位数；Web UI 一列为首 token 时间，OpenAI 一列为整个非流式请求的耗时）测得：
-
-| 第 3 回合（图片） | 6db6dbf6 | Phase 0 | 本改动 |
-|---|---|---|---|
-| Web UI，457 token 提示：复用 / 首 token 时间 | 0 / 0.64 s | 179 / 1.25 s | 179 / **0.57 s** |
-| OpenAI，457 token 提示：复用 / 耗时 | 0 / 1.80 s | 179 / 2.09 s | 179 / **1.46 s** |
-| Web UI，889 token 提示（超出窗口）：复用 / 首 token 时间 | 0 / 0.85 s | 0 / 0.90 s | 611 / **0.62 s** |
-| OpenAI，946 token 提示（超出窗口）：复用 / 耗时 | 0 / 1.86 s | 0 / 1.60 s | 668 / **1.29 s** |
-
-这些运行中的每条回复（短会话 24 个回合、长会话 16 个回合）都与 Phase 0 头部的文本相同，也与本改动关闭前缀缓存（`TS_SCHED_PREFIX_CACHE=0`）时的文本相同，纯文本回合的复用量和耗时保持不变（`AgentTurnBench --scenarios short,long,tool`，每个构建各跑两次：每一行都与 6db6dbf6 和 Phase 0 头部相差不超过 0.5%，token 完全相同）。
-
-在 CUDA 上（E4B Q8_0，A40，一轮），图片回合同样获得复用并且更快：Web UI 449 token 提示 1.10 s（6db6dbf6）/ 2.85 s（Phase 0）/ **0.93 s**，OpenAI 1.45 / 2.49 / **0.98 s**；超出窗口时，Web UI 893 token、复用 615：1.10 / 1.12 / **0.91 s**，OpenAI 870 token、复用 592：2.05 / 1.06 / **0.87 s**。不过在那里，任何构建上从缓存续接的回合都不与冷启动回复逐 token 相同：文本回合和图片回合都一样，6db6dbf6 也一样，复用前缀之后的贪心回复会在几十到几百个字符之后偏离冷启动回复，因为在这些内核上把同样的 token 分两个 chunk 而不是一个 chunk 预填充，在 E4B 上会让 logits 变动 0.65 到 0.8（即下文测试中的文本对照）。在提示完全相同时，Phase 0 头部的图片回合回复在短会话中与本改动相同（两者复用同样的前缀），超出窗口时则不同（Phase 0 头部从零 prefill）。
-
-覆盖：原生测试 `gemma4-multimodal-mask-after-reused-prefix` 保留旧行构造的逐字副本，检查它们在 P = 0 和文本上不变，并检查 P > 0 的 chunk 在每种缓冲区布局下看到的内容与冷启动 prefill 中相同查询看到的完全一致（旧的起始位置门控在其 1,200 个媒体用例中失败 1,102 个）。`Gemma4MediaAfterReusedPrefixExactnessTests`（受模型门控，`TS_TEST_MODEL_DIR`）先 prefill 一个文本回合，再以复用和不复用两种方式 prefill 一个图片或音频回合，分别在窗口内外、融合与逐算子路径上运行。它的容差是同一行中测得的两个噪声估计中较大者的两倍：去掉媒体的同样切分，以及另一条路径上的冷启动媒体 prefill。在 Metal 上（E4B、E2B）两个估计都约为 0.02 logits，融合路径的贪心输出完全相同，prefill logits 相差不超过 0.026，而在 Phase 0 头部，超出窗口时图片相差 3.2、音频相差 2.0 到 7.1（逐算子路径 3.2）。在 CUDA 上（E4B、12B、26B-A4B）两个估计为 0.35 到 1.4（12B 短文本对照为 2.7），所有行都通过；Phase 0 头部的长前缀行相差 3.3 到 3.8（图片）和 2.1（音频），高于本改动在相同行上测得的容差（1.3 到 2.8）；那里的贪心输出只比较到噪声范围内的第一个近乎平局处，通常是第一两个 token。逐算子路径的贪心输出不逐 token 比较：它自身就不可复现（四次相同的冷启动 prefill 在第 16 步解码处翻转了一个近乎平局的 token）。`Gemma4SoftTokenMaskTests` 固定了两种位置换算。
-
-有两个限制沿袭自冷启动路径。掩码标记的是软 token，而不是它们属于哪个媒体项，因此在同一 chunk 中 prefill 的两张图片会彼此双向注意。在较早回合发送过图片的会话，是在该图片自己的 chunk 中 prefill 的，那时它看不到后来的图片；而对整段历史的冷启动 prefill 让它看得到，所以两张图片之后的回复在两者之间可能不同。另外，落在 span 内部的 chunk 边界（调度器在争用时的 256 token 分块可能造成）会切断其双向注意。
-
-### 内核内 PLE gather
-
-per-layer embeddings（PLE）在融合 verify 图内通过对常驻的量化 `per_layer_token_embd` 表做 `ggml_get_rows` 直接收集，而不是在 C# 中计算后每个 chunk 把约 88 MB 的结果做 device→host→device 搬运。内核无法读取其 PLE 表或投影的检查点仍走上传路径。
-
-### KV cache 预扩容（`PrepareForPrefill`）
-
-全新 prefill 开始时，按需增长的全局 KV cache 会被预先扩容到整个 prompt 的大小（`PrepareForPrefill(totalPromptTokens)`）。在 `start_pos == 0` 时 cache 中还没有已提交的 K/V，一次性扩容到最终大小无需拷贝任何数据——从而消除了逐次翻倍扩容（每次扩容都要重新拷贝并对整个全局 cache 做 device↔host 往返，64k 时实测约 7%）。仅 GGML GPU 后端，且钳制到模型上下文长度。
-
-### 短于 256 行或不是 256 倍数的全局缓存
-
-ggml-cuda 只在 grouped-query flash kernel 上运行 512 维全局层，该 kernel 要求 KV 窗口是 256 行的倍数。窗口会补齐到 256，但从不超过已分配的缓存，因此增长到 16 行的缓存（`TS_KV_INITIAL_TOKENS=8`），或上限为 4000 这类长度的缓存（`MAX_CONTEXT=4000`，超过 3840 个 token 后）过去会在 `ggml-cuda/fattn.cu` 中终止进程。现在这些全局层以显式注意力运行，结果相同，并打印一次 `has no flash-attention kernel` 警告；缓存长度重新成为 256 的倍数后即回到 kernel。默认的缓存大小不会走这条路径。参见 [后端没有 kernel 的 flash-attention 形状](../../DEVELOPMENT_zh-cn.md#后端没有-kernel-的-flash-attention-形状)。
-
-### 融合 per-layer prefill（`Gemma4LayerPrefill`）
-
-每个符合条件的层（密集、非共享 KV、当前 chunk 无 PLE 注入、所有权重均量化），`TryFusedLayerPrefill()` 调起单次 GGML 图：
-
-1. `RMSNorm(attn_norm)`
-2. 融合 QKV matmul → 拆 Q/K/V
-3. per-head QK RMSNorm、V 无权 RMSNorm
-4. RoPE（local NeoX 或 global proportional）
-5. 因果 attention（SWA 或全因果），含 KV cache append
-6. output 投影 + `RMSNorm(post_attn_norm)` + 残差
-7. `RMSNorm(ffn_norm)` → ffn_gate_up matmul → `GELU(gate)*up` → ffn_down matmul
-8. `RMSNorm(post_ffw_norm)` + 残差 + layer_output_scale
-
-带 MoE、KV 共享或当前 chunk 中有 PLE 注入的层回退到逐算子托管路径。
-
-### 分块 prefill
-
-`prefillChunkSize = min(2048, max(2 × slidingWindow, 1024))`。每个块走完所有层后再前进，保持 SWA score 张量小。`TS_PREFILL_CHUNK=N` 可覆盖。
-
-### 跨层缓存
-
-forward 内跨层复用的三类缓存：
-
-- `_cachedSWAMaskWidths` —— 当前 `(queryLen, startPos)` 的 per-row SWA mask 宽度；`seqLen` 或 `startPos` 改变时重建。
-- `_neoXRopeCos` / `_neoXRopeSin` —— 全局层 NeoX RoPE cos/sin 表，每次 forward 构建一次，跨所有全局层复用。
-- `_cachedRoPEPosQ` / `_cachedRoPEPosK` —— local 层 RoPE 位置张量，跨层复用，`(seqLen, startPos)` 匹配时不重新分配。
-
-### SWA prev-window gather
-
-长 prompt 在 chunk 内会让 SWA cache 滚动覆盖。chunk-2 起始位置的 query 仍需要 chunk 刚刚覆盖掉的 (W − 1) 个位置。新 chunk 第一层运行前 `PrepareSwaPrevWindowsForChunk(startPos, seqLen)` 快照活跃的 SWA 窗口；SWA 层在跑 attention 前把快照拼到新计算出的 K/V 前面。
-
-### Donor SWA-K/V 发布
-
-存在 KV 共享 SWA 层时，donor 层把刚算出的 K/V 发布到 `_prefillSWAKV`，让共享层 attend 到完整 chunk 的 K/V，而不是滚动 cache 中的不完整窗口。
-
-## 9. Decode 优化
-
-### 融合整模型 decode（`Gemma4ModelDecode`）
-
-`_canUseFusedDecode`（全密集、全量化）且 `seqLen == 1` 时，decode 路径变成单次原生调用。`BuildGemma4DecodeArrays()` 在加载时按层打包：
-
-- 量化权重元数据（`type`、`ne0`、`ne1`、原始字节指针）。
-- per-layer head 维、KV head 数、RoPE base / kind。
-- KV cache 指针（GPU 上的可写 scratch）。
-- layer scalar 值。
-- PLE 标志 / projection 指针。
-
-`NativeGemma4ModelDecode()` 就跑整套 stack —— embedding lookup 在 C# 里，每一层（RMSNorm + QKV + QK-norm + V-norm + RoPE + 环形 cache append + attention + output projection + post-attn norm + GeGLU FFN + post-FFN norm + 残差 + layer scalar）在 Metal / CUDA 上一次 GGML 图调度完成。这把每 token 的几百次 CPU↔GPU 往返压成一次。
-
-`EnsureKvCacheHostSynchronized()` 桥接融合与非融合路径：当下一次 forward 不走融合（如对话中间的 prefill），先把 host KV cache 拷贝从设备同步过来。
-
-### SWA 层环形 KV cache
-
-SWA 层用 `CopyToCacheCircular()` 在 `pos % cacheSize` 写入新 K/V 槽位，`AttentionDecodeCircular()` 走环形读。SWA 层因此无视上下文长度只分配 `slidingWindow` 个槽位 —— 常驻内存有界。
-
-### 并发请求的 token 批量融合 decode（`Gemma4ModelDecodeBatched`）
-
-N >= 2 个请求同时在线时，引擎不再轮询 N 个单 token 图：`Gemma4Model.TryForwardBatchedFusedDecode` 在**一个**融合图（[`ggml_ops_gemma4_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gemma4_batched.cpp) 中的 `TSGgml_Gemma4ModelDecodeBatched`）里为每个序列各 decode 一个 token，每步每个权重只加载一次、作用于 N 个 token。decode 受带宽限制，聚合吞吐正来自这里。每个序列保留自己的 per-request KV holder；内核以 `[layer * N + seq]` 指针数组接收这些 holder，在 `[hidden, N]` 上跑 projection / FFN / LM head，并对每个序列在其自身 cache 窗口的直接视图上跑一次单行 flash-attention。
-
-该内核覆盖 E2B/E4B 所需的全部内容（PLE 维 256、18 个 KV-donor 层、大多数对话都会超出的 512 槽环）：
-
-- **逐行 PLE。** per-layer embedding 在图内从常驻的量化 `per_layer_token_embd` 表通过对 N 个 token id 的一次 `get_rows` 收集（再加 `per_layer_model_proj` projection、其 RMSNorm 与 `1/sqrt(2)` 合并，与单 token decode 和 `ComputePLE` 完全一致），按层以 `[ple_dim, N]` 的跨步列切片注入。图内形式不可用时（`CanGatherPleInKernel` 为 false：`get_rows` 不支持的类型或带缩放的 projection），调用方改为上传 `ComputePLE` 的行，PLE 项永远不会被丢掉。
-- **KV-donor 层。** `kv_source_arr[l]` 指明第 `l` 层要 attend 的 cache 所属层。共享层只跑 Q projection，读取 donor 的逐序列窗口与 mask，不写任何东西。
-- **SWA 回绕。** 序列超出环的 local 层写到 `pos % cache_size`，并把整个环平铺读取、所有槽位有效；decode 的 softmax 对 key 的排列不变，因此旋转不需要 concat。全局（线性）层仍必须容纳整个序列。需要扩容的序列走一次串行步，其他已就绪的序列可以继续批量执行。
-
-内核接收每个序列实际的缓存容量 `cache_size_arr[layer * N + seq]`。保留前缀的克隆有意比新建缓存小，而且每个请求独立扩容，因此内核使用每份分配真实的 KV-head 跨步，以及各自补齐后的注意力窗口与 mask，不会把较短的子请求扩展到最大请求的分配大小。共享 KV 层使用同一序列中 donor 的容量。`TS_BATCHED_FUSED_DECODE=0` 让并发请求改为轮询 decode 以做 A/B。
-
-每步的所有输入（hidden 行、position、每 (层, 序列) 的 `set_rows` 写行、每个序列的 F16 mask、PLE token id 或上传的 PLE 行）都是通过有序的后端上传刷新的图输入，图位于自己的 context 与独占 buffer 中，重复出现的请求集合在稳定地址上重放捕获的图。捕获标识包含全部 K/V 指针、容量与窗口；缓存扩容会先使已捕获的图失效，再替换存储。MoE 批量内核（`TSGgml_Gemma4MoEModelDecodeBatched`）保持无 PLE / 无 donor 的范围。
-
-服务端会记录第一次成功的融合批次，并为第一次被拒绝的批次给出原因。一次拒绝并不意味着之后每一步都串行。`Gemma4Model.BatchedFusedDecodeSteps` 与 `BatchedFusedDecodeTokens` 只统计成功的原生批量执行；`BatchedFusedDecodeDeclines` 统计被拒绝的尝试。[`eng/validation/Gemma4BatchedCacheProbe`](../../eng/validation/Gemma4BatchedCacheProbe) 中的回归与基准覆盖真实的前缀克隆、不同容量、独立扩容、重新排序的请求以及之后的单独续接。
-
-**已验证**（[`Gemma4BatchedFusedDecodeParityTests`](../../InferenceWeb.Tests/Gemma4BatchedFusedDecodeParityTests.cs)，`TS_TEST_GGML_BACKEND=cuda`，gemma-4-E4B-it-Q8_0）：2、3、4 个并发序列（其中一个 prefill 超过 512 token 的 SWA 环）下，批量路径 12 步的贪心续写与轮询单 token decode 逐 token 一致，且每一步都跑在批量内核上。
-
-**实测**（gemma-4-E4B-it-Q8_0、NVIDIA A40、ggml_cuda、f16 KV、prefill 分块 512、4 个运行序列；轮询列对 PLE / 共享 KV / 已回绕 SWA 的模型拒绝批量内核，其余完全相同）：
-
-| 负载 | 轮询（之前） | token 批量（之后） | 倍数 |
-|---|---:|---:|---:|
-| AgentTurnBench `conc`，1 个请求（decode tok/s） | 68.8 | 68.5 | 1.0× |
-| AgentTurnBench `conc`，2 路并发（总 decode tok/s） | 65.1 | 99.0 | 1.5× |
-| AgentTurnBench `conc`，4 路并发（总 decode tok/s） | 66.5 | 148.7 | 2.2× |
-| `validate_inference.py` `decode`（512 个新 token），并发 1（端到端 tok/s） | 76.8 | 77.7 | 1.0× |
-| `validate_inference.py` `decode`，并发 4（总端到端 tok/s） | 70.3 | 148.6 | 2.1× |
-| `validate_inference.py` `decode_8k`（8k prompt），并发 1 | 63.8 | 64.3 | 1.0× |
-| `validate_inference.py` `decode_8k`，并发 4 | 59.0 | 101.7 | 1.7× |
-
-`validate_inference.py` 各行比较的是本树构建的服务器与上一提交构建的服务器；两者单路（并发 1）输出逐字节一致。这里"逐 token 一致"的确切含义：AgentTurnBench `conc` 流（`compare.py` 要求输出 token id 完全相同）与 12 步的进程内 parity 测试与轮询 decode 完全一致；但在数百个贪心 token 之后，边际很小的 token 可能翻转（`ParityHarness --batched` 256 步：每组 2/3/4 路里各有一个序列分叉），而批量内核在 gemma-4-12B（无 PLE、无共享 KV）上同样如此 —— 批处理改变 GEMM 形状从而改变舍入，这正是 GLM 批量 decode 已记录的注意事项。经 HTTP 服务器在并发 4 下，连两次轮询运行都会不同（16 个 case 中 10 个相同），因为 prefill/decode 的交错取决于调度，所以 parity 必须在进程内判断。
-
-## 10. 内存与 KV cache 策略
-
-- **SWA 层**：容量 `_slidingWindow`，环形读写。
-- **全局层**：容量 `maxSeqLen`，线性 append/读。
-- **共享层**：alias 到 donor 的 cache，无独立分配。
-- **量化权重绑定**：在 GGML CPU / Metal / CUDA 上零拷贝 mmap（GGUF 文件用 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`）。Direct CUDA 把量化数据上传到设备一次，释放 host 拷贝。
-
-## 11. 批处理 / 分页前向（连续批处理）
-
-Gemma 4 提供完整的 `IBatchedPagedModel.ForwardBatch` 移植
-（[`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs)），
-通过共享 `InferenceEngine` 连续批处理栈执行
-（[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)）。
-它**默认启用**；`--no-continuous-batching` 会强制走按序列 KV 交换路径。单个请求已经会通过调度器的单序列路径
-进入融合单图 decode。
-
-Gemma 4 是 TensorSharp 中最难移植到分页批处理的模型，因为它有三种引擎默认
-假设跨层一致而 Gemma 4 实际不一致的异构源：
-
-- **异构 head dim 与 KV head 数量**：local 层用 `head_dim_local`（通常
-  256）和与 global 层不同的 `num_kv_heads`（`head_dim_global` 通常 512）。
-  `EnsureGemma4PagedBuffers` 为每层分配各自的 `numKvHeads * headDim` 大小
-  的分页 K/V 缓冲。`_g4PagedKvDimPerLayer[layer]` 记录每层维度，方便
-  scatter / gather 步骤知道每层缓冲的 stride。
-- **逐层 SWA 派发**：原生分页注意力内核每次调用接受一个 `sliding_window`
-  参数。批处理路径会逐层计算 `IsLocalLayer(l) ? _slidingWindow : 0`，并
-  把它传给 `GgmlBasicOps.PagedAttentionForward` —— 这样 local 层得到 SWA
-  窗口掩码、global 层得到完整注意力 —— 都发生在同一次 `ForwardBatch` 调用
-  内部。
-- **KV donor 层别名**：24-41 层和更早的层共享 K/V。"receiver" 层的批处理缓
-  冲是 donor 层缓冲的指针别名（`BlockPool` 内部的引用计数共享），而不是单
-  独的分配。这保留了旧的 KV 共享语义，调度器无需感知别名。
-
-其余的批处理路径机制与 Mistral 3 一致：
-
-- **逐 token NeoX RoPE** 通过 `Ops.RoPEExWithFreqFactors` 派发，使用每层比例
-  / 部分频率因子与显式 `positions[]` tensor。
-- **基于 `slotMapping` 的 K/V 写入** 进入每层的分页缓冲。
-  `EnsureGemma4PagedBuffers` 在扩容时拷贝已有 K/V，保证已经在调度中的序列
-  保留状态。
-- **Per-Layer Embedding（PLE）** 在 `ForwardBatch` 开头**整批计算一次**
-  （`ComputePLE(flatTokens, hiddenStates, numTokens)`），其每层切片在 post-
-  attention residual 之后被加上，与旧路径的注入点一致。
-- **多模态嵌入注入** 走与旧 forward 相同的逐行 `InjectMultimodalEmbeddings`
-  路径；嵌入会按正确的绝对 token 位置写入拼接后的批处理 hidden state。
-
-**已验证的正确性**
-（[`Gemma4BatchedForwardTests`](../../InferenceWeb.Tests/Gemma4BatchedForwardTests.cs)）：
-- 全部 42 层（SWA + GQA + PLE + KV-donor 共享自 L24+）的逐层校验和与旧
-  unfused 路径在 FP 噪声范围内一致。
-- Logit cosine ≥ 0.99，与旧的非批处理路径对比。
-- `EngineParallelInferenceTests.Gemma4_ThreeLongGenerationsParallel` 通过引擎
-  验证多序列批处理路径。
-
-**吞吐**（gemma-4-E4B-it-Q8_0、Apple M4 Pro、GgmlMetal —— 在同一进程内跑按序列与批处理两条路径，详见
-[`Gemma4BatchedPerfBench.cs`](../../InferenceWeb.Tests/Gemma4BatchedPerfBench.cs)）：
-
-| 工作负载 | n | Prompt token | 按序列 tps | 批处理 tps | 加速 |
-|---|---|---|---|---|---|
-| 单序列短 prompt | 1 | 29 | 14.0 | 4.9 | **0.35×**（批处理慢） |
-| 5 个并行短 prompt | 5 | 142 | 10.2 | 13.5 | **1.32×** |
-| 8 个并行短 prompt | 8 | 218 | 10.0 | 15.1 | **1.51×** |
-| 4 个并行长 prompt | 4 | 3 293 | 3.4 | 5.4 | **1.61×** |
-
-加速随 batch 大小增长：batch=8 短 prompt 时分页图构建 / gather 开销已被完
-全摊销。在这次进程内切换中单序列是净亏，因为旧的融合单调用 decode 在没有批处理
-摊销的情况下快约 3 倍。这些数据早于 N=1 快速路径：开启该路径（默认）后，单个序列
-会走融合单图 decode，而不是批处理逐算子路径。
-
-**移植过程中修复的两个已知 bring-up bug**（现已纳入回归测试）：
-
-1. `TSGgml_PagedAttentionForward` 在 permute Q 后没有调用 `ggml_cont`。当
-   Q 是非连续 view 时，Metal 上的 `ggml_flash_attn_ext` 会静默产出错误结果。
-2. `EnsurePagedBuffers` 之前在扩容时会破坏性重建 K/V 数组，把同一 batch 中
-   先调度过的序列已经写入的 K/V 抹掉。第一个序列在后续序列加入后做首次
-   decode 时会退化为单 token 循环。修复（grow-on-copy）也用于 Mistral 3。
+## 7. 在共享解码器运行时上的实现
+
+Gemma 4 运行在共享解码器运行时上：[`Gemma4RuntimeModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.cs) 派生自
+[`Gemma4DecoderModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4DecoderModel.cs)（它与 [DiffusionGemma](diffusiongemma_zh-cn.md) 共享的配方），是一个
+[`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) 家族，因此槽位、统一步骤、连续批处理、前缀缓存、
+检查点、放置策略与投机解码都由运行时提供，每一步都是由后端执行器（GGML、托管 CPU、直连 CUDA、MLX）运行的整前向计算图程序。
+家族通过运行时的钩子提供模型配方：
+
+| 部分 | 位置 | 内容 |
+|---|---|---|
+| 逐层注意力几何 | `Gemma4DecoderModel.cs`（`LayerKeyDim`、`LayerKvHeads`、`SlidingWindow`、`AttentionScale`） | 宽 256 的滑窗 head 与宽 512 的全局 head、逐层 KV head 数、缩放为 1 |
+| KV 共享 | `KvSourceLayer`；运行时的 `EmitSharedKvAttention` | 最后 `shared_kv_layers` 层读取同一步中其来源层的操作数，只投影 query |
+| Q/K/V | `Gemma4DecoderModel.Graph.cs`（`EmitAttentionProjections`、`EmitQueryKey`） | 带权重的 Q/K RMSNorm、无权重的 V norm；没有 `attn_v` 的全局层取 V = K |
+| 旋转位置编码 | 带 `rope_freqs` 因子的 `RotarySpec`（带因子输入的 `GraphOp.RopeExt`） | 局部层 NeoX、基数 10 000；全局层在 512 维上按比例因子旋转 |
+| 前馈 | `EmitFeedForward`、`EmitRoutedExperts` | GeGLU；MoE 层：稠密分支与基于融合 `ffn_gate_up_exps` 的路由 GeGLU 专家并列，带路由缩放与逐专家输出缩放 |
+| Per-layer embedding | `EmitStreamInput` / `EmitPerLayerInputs` / `EmitBlockOutput` | `per_layer_token_embd` 的 token 行加上归一化的模型投影，在每层之后经门控加入残差流 |
+| 多模态 | [`Gemma4RuntimeModel.Multimodal.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Multimodal.cs) | 编码器的 soft token 行在 `sqrt(n_embd)` 缩放之前替换占位行（缩放跳过它们），并且彼此双向注意 |
+| MTP 草稿头 | [`Gemma4RuntimeModel.Assistant.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Assistant.cs) | gemma4-assistant 草稿器（§12） |
+
+Gemma 4 为运行时新增、所有家族可用的部分：逐层的 key/value 宽度与 KV head 数、KV 共享层、所有执行器上的旋转频率因子
+（`Ops.RoPEExFactors`、CUDA kernel、带频率的 MLX `fast.rope`）、双向多模态区段、在流水线阶段之间随残差流传递的 stage carry、
+对主干层缓存的只读注意力（`EmitCacheReadAttention`），以及逐 token 的家族草稿器（`FamilyTokenDrafter`）。
+
+## 8. Prefill 与 decode
+
+prompt 分块与 decode 行是同一个计算图程序的不同宽度。同一宽度的 decode 步以“前一步推进一个位置”的方式重放（位置、掩码、写入行
+与 per-layer embedding 的 token id 原地刷新），在直连 CUDA 上以录制的 kernel 序列重放。滑窗层保留窗口加一个 prompt 步行数的环形缓存。
+在直连 CUDA 上，decode 行的路由专家作为一个融合区域运行（`GraphFusion.GegluRoutedExperts`：融合 stack 的 MoE decode kernel，dp4a），
+在 A40 上把 26B-A4B 的 decode 从 34 提高到 80 tok/s。
+
+## 9. 内存与 KV cache
+
+KV 共享层没有自己的缓存。运行时支持的所有缓存类型都可用，包括块量化类型（`q8_0`、`q4_0`；旧模型会拒绝它们并回退到 `f16`）：
+E4B 在 `ggml_cuda` 上，`q8_0` 缓存在 96 个 teacher-forced 步中与 `f16` 参考的 cos 为 0.9999。路由专家可以留在主机内存
+（`--n-cpu-moe` / `--cpu-moe`），所有后端都支持：GGML 的主机 MoE 段与张量执行器的专家宿主都在原生主机专家 kernel
+（`TSGgml_HostExpertRowsAct`）中对融合 stack 运行 GeGLU；26B-A4B 在 `ggml_cuda` 上把 12 层专家放在主机时，与旧模型全设备运行
+在 96 个 teacher-forced 步中有 95 步一致（另一步是 0.06 nat 的近似平局）。
+
+## 10. 连续批处理、前缀缓存与检查点
+
+请求在各自槽位上以批处理步骤运行（prompt 分块与 decode 行同在一步）；前缀缓存、保留会话、检查点及其导出 / 导入都由运行时提供
+（见[分页注意力与连续批处理](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)）。
+
+## 11. 与旧模型的对照验证
+
+运行时模型取代了旧的 `Gemma4Model`，后者连同其原生整模型计算图（`TSGgml_Gemma4ModelDecode`、`...Verify`、`...DecodeBatched`、
+MoE 变体与 `TSGgml_Gemma4DraftStep`）一并删除。在一张 A40 上测得（ggml 为 d9fe7bff），旧模型与运行时由同一份源码构建：
+
+| 检查 | 结果 |
+|---|---|
+| Teacher-forced argmax 一致性（E4B Q8_0、12B UD-Q4_K_XL、26B-A4B UD-Q4_K_XL；ggml_cuda、cuda、ggml_cpu、cpu） | 除近似平局外每一步都一致（不一致处旧模型的最大 margin 为 0.29 nat） |
+| 验证窗口与普通步对比（E4B，窗口 4，含回滚） | ggml_cuda relL2 1.43e-2（旧模型 1.42e-2）；直连 CUDA 逐位一致（旧模型 1.3e-2） |
+| 经 CLI 的图片（E4B、12B、26B；ggml_cuda 与 cuda）与语音（E4B） | 与旧模型给出相同的描述与相同的转写 |
+| 服务端，5 个提示、3 个并发（ggml_cuda） | E4B 102 tok/s，旧模型 90；26B-A4B 74，旧模型 56 |
+| Prefill（ggml_cuda，预热后） | 旧模型的 1.5-2.4 倍 |
+
+两种模型的贪心输出会在某个 token 的前两个 logit 差距落在后端舍入误差之内时分叉；合成夹具上冻结的旧模型 logits
+（`InferenceWeb.Tests/Fixtures/Gemma4/LegacySynthetic`）在 [`Gemma4RuntimeTests`](../../InferenceWeb.Tests/Gemma4RuntimeTests.cs) 中
+约束运行时与旧模型的数学一致。此处未运行：Metal、Vulkan、MLX 与多 GPU（张量并行与流水线阶段在托管执行器上用模拟设备测试）。
 
 ## 12. MTP 投机解码（gemma4-assistant 草稿头）
 
@@ -628,7 +441,7 @@ Gemma 4 在两个宿主上都支持为单序列（无并发）请求做**多 tok
 （环境变量 `TS_SPEC_DRAFT_MODEL`）加载，
 并由 [`SpeculativeDraftHeadLoader`](../../TensorSharp.Models/SpeculativeDraftHeadLoader.cs)
 在启动时挂到目标模型上。源码：
-[`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs)，
+[`Gemma4RuntimeModel.Assistant.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Assistant.cs)，
 由共享的
 [`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
 起草 / 验证 / 回滚核心驱动 —— Gemma 4 对应可插拔 `--spec-type` 层中的 `draft-head` 算法，
@@ -666,32 +479,23 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
 （[`SpeculationStartupValidation`](../../TensorSharp.Chat/Hosting/SpeculationStartupValidation.cs)），
 而不是静默地不做投机继续运行。
 
-### 12.3 后端收益与融合内核
+### 12.3 运行时上的草稿器
 
-`SpeculationProfitable`
-（[`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs)）
-决定是否真正启用投机：
+assistant 是一个逐 token 的家族草稿器（[`Gemma4RuntimeModel.Assistant.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Assistant.cs)）：
+每一步是活动槽位上的一个计算图程序，其各块经 KV 共享映射，以 `EmitCacheReadAttention` 在主干已提交长度处读取主干的 donor 缓存，
+因此无需追赶，草稿可在任意位置恢复。它在所有计算图执行器上运行。`--tp` 下会拒绝该草稿头（它读取完整缓存，而张量并行按 KV head
+切分缓存）；n-gram 投机仍然可用。A40 上的测量（贪心，128 token，3 个草稿）：
 
-- **ggml 后端（CUDA / Metal；`ggml_vulkan` 与 `ggml_cpu` 通过同一门控）** —— 运行融合单图内核：多 token 验证
-  （`NativeGemma4ModelVerify`，26B-A4B MoE 用 `TryFusedMoEModelVerify`）和融合草稿步
-  （`NativeGemma4DraftStep`）。部分接受时用稠密快速回滚避免重跑已保留前缀。验证主干是
-  模型的线性缓存；融合内核拒绝的形状走逐算子路径。
-- **Direct CUDA（`cuda`，纯 C#）** —— 没有融合内核，但其逐算子验证与草稿完全驻留 GPU：草稿在
-  设备上读取 donor 缓存注意力，global 验证注意力对每行用 GQA decode 内核打实时缓存，global
-  RoPE 用 GPU 内核——因此验证层循环零宿主端同步停顿。在散文 / 聊天负载上有收益，在低接受率的
-  贪心解码上约持平。
-- **纯 C# `cpu` 与 Apple `mlx`** —— 既无融合内核也无驻留 GPU 的逐算子路径，因此投机关闭，引擎走标准融合 decode。
+| 模型、后端 | 普通 tok/s | 使用草稿头 | 接受率 | 旧模型使用其草稿头 |
+|---|---|---|---|---|
+| E4B Q8_0，ggml_cuda | 86-89 | 1.0-2.2 倍 | 22-83 % | 0.9-1.8 倍 |
+| E4B Q8_0，cuda | 69-74 | 1.0-2.1 倍 | 21-83 % | 0.9-1.8 倍 |
+| 12B UD-Q4_K_XL，ggml_cuda | 65-72 | 1.5-2.3 倍 | 52-86 % | 0.7-1.4 倍 |
+| 26B-A4B UD-Q4_K_XL，ggml_cuda | 114-141 | 0.9-1.4 倍 | 44-89 % | 0.6-0.9 倍 |
 
-26B-A4B MoE 目标还需要在 `ggml_cuda` 上修复加载期 OOM（跳过 per-expert 设备预加载）后，MTP
-投机才成为净收益。
-
-启用即传入 `--draft-model` 文件本身；关闭（`--no-spec`）与调优（`--spec-draft` /
-`--spec-pmin`）使用通用参数，它们由 `TensorSharp.Cli` 与
-`TensorSharp.Server` 共用的同一个
-[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs) 解析；
-完整参数列表与其他算法见[投机解码](../../FEATURES_zh-cn.md#投机解码) —— 其中
-`--spec-type ngram` 完全不需要草稿 GGUF，因此即便旁边没有 assistant 文件，也能在
-Gemma 4 checkpoint 上运行。
+启用方式就是 `--draft-model` 文件本身；关闭（`--no-spec`）与调参（`--spec-draft` / `--spec-pmin`）使用共享标志，`TensorSharp.Cli`
+与 `TensorSharp.Server` 都由同一个 [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs) 解析；其他算法见
+[投机解码](../../FEATURES_zh-cn.md#投机解码)（`--spec-type ngram` 完全不需要草稿 GGUF）。
 
 ### 12.4 贪心一致性
 
@@ -731,37 +535,19 @@ E4B 在该边界上的行为（2026-09-16 验证活动，B10）改为在采样�
 
 `response_format` 可以与 `"think": true` 同时使用：JSON 语法在思维通道内保持休眠，在 `<channel|>` 之后启用（`ThinkingGrammarActivationTrigger`）。关闭思考时语法从第一个 token 起生效，这同时排除了 `<|channel>`。
 
-## 13a. 张量并行
+## 13a. 张量并行与整层流水线阶段
 
-Gemma 4 在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上都支持 `--tp N`，并且
-多模态嵌入会被注入 TP 路径，因此切分后视觉 / 音频提示不会丢失。
+`--tp N` 运行每 rank 的计算图：Q/K/V 与 gate/up 按列并行，注意力输出与 down 按行并行；MoE 层的融合 `[gate | up]` 专家按两半切分
+（每个 rank 的切片为 `[gate_r | up_r]`，在 GGML 上是它自己的专家 stack）；`[dense | routed]` 两部分在各自的 norm 之前用一次 all-reduce
+合并。每一层的 KV head 数都必须能被 N 整除。`--layer-split N` 每个阶段运行一个计算图；per-layer embedding 随残差流在阶段之间传递，
+阶段规划器不会在 KV 共享层与其来源层之间开始新的阶段。张量并行的流水线阶段（混合放置）是已声明的缺口：这个只走计算图的家族
+目前还没有对应的计算图。
 
-MoE 变体在 GGML 上需要特殊处理。整模 MoE 内核（`TSGgml_Gemma4MoEModelDecode` /
-`...Verify`）在计算图内部完成路由，`ggml_top_k` 返回的是*全局*专家 id，整专家切分
-无法喂给它们。因此 TP 下的 MoE 层改为在**每个专家内部**按 Megatron 方式切分：每个
-rank 保留全部 128 个专家，但只持有每个专家 FFN 宽度的 `1/tp`（gate/up 沿中间维度
-列并行，保持融合的 `[gate_r | up_r]` 布局；down 沿该维度按整量化块行并行）。
-`sel` 保持全局，计算图与单卡一致、只是专家矩阵更窄，而专家求和的输出成为该层的第
-三个行并行部分和 —— 在路由加权求和之后立即归约；由于该运算是线性的，"先求和再加
-权"与"先加权再求和"等价。这些切片在加载时物化（26B 上约 10.5 GB，约 36 秒）；
-`TS_GEMMA4_TP_FUSED_MOE=0` 可回退到逐算子的整专家路径。
+## 14. 待办
 
-在 2× RTX 2000 Ada 上实测（prefill 512 / decode 64，tok/s）：E4B Q8_0 由单卡的
-2760 / 37.3 变为 `--tp 2` 的 2488 / **51.7**；26B-A4B IQ4_XS 由 1845 / 48.5 变为
-2537 / **51.2**。两者的输出都与单卡运行**逐字节一致**。完整细节见
-[`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md)。
-
-## 14. 优化机会
-
-- **混合 dense+MoE 布局的融合 MoE kernel** —— 全 MoE 变体（例如 26B-A4B）现在已经运行融合整模型 MoE decode（`TryFusedMoEModelDecode` / `TSGgml_Gemma4MoEModelDecode`）与 prefill/verify（`TryFusedMoEModelVerify`），但假想中混合密集层与 MoE 层的模型仍会回退到 per-layer 图。（下文的 expert-batched FFN 已经把未融合路径里的顺序 per-expert 派发去掉了。）
-- **GPU 上的音频 prefill** —— 音频编码器的 conv 子采样仍跑在 CPU。把 conv 栈搬到 Metal / CUDA 可以降低长音频提示的 TTFT。
-
-### 已完成
-
-- **MTP 投机解码（gemma4-assistant 草稿）** —— 独立的 EAGLE 风格草稿 GGUF（`--draft-model`）
-  加速单序列 decode（§12）。ggml 后端运行融合多 token 验证（稠密 `NativeGemma4ModelVerify`
-  与 MoE `TryFusedMoEModelVerify`）和融合草稿步（`NativeGemma4DraftStep`）内核，部分接受时用
-  稠密快速回滚；纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿。26B-A4B MoE 目标还需要
-  先修复 `ggml_cuda` 加载期 OOM（跳过 per-expert 设备预加载），投机才成为净收益。草稿 GGUF
-  不匹配 / 不完整会在启动时立即失败。
-- **Expert-batched FFN（GEGLU）** —— 过去 `MoEForward` 里即便按 expert 分批，decode 路径依然退化成 `num_experts_used` 次单行 matmul。现在整层都通过 `GgmlBasicOps.MoEFFNPrefill(..., MoEActivation.GEGLUSplit)` 一次派发完成：2~3 次 `ggml_mul_mat_id`（gate[+up] / down）加上融合的 `ggml_geglu_split` 激活与专家聚合，每个 MoE 层提交常数个 GGML 图 —— 与 `seq_len`、`num_experts_used` 无关。kernel 直接消费原始的 3D `ffn_gate_up_exps.weight` / `ffn_down_exps.weight`（Apple Silicon 上是 mmap 视图，Windows / Linux 上是共享 buffer，零拷贝）。`ffn_down_exps.scale` 这种 per-expert 因子在 C# 侧提前折进 routing weights，让原生 kernel 保持与激活函数解耦。层级 stacked view 不可用时（比如 F32-only 张量）会回退到原来的 batched-by-expert C# 路径。
+- 在 A40 上，直连 CUDA 的 E4B decode 在 512/128 时为 72-78 tok/s，旧模型为 77.5-79（12B：39-40.5 对 34；26B-A4B：80-85 对
+  66-67）。decode-once kernel 在 Ampere 上每个输出行使用四个 warp（按 RTX 5090 的宽度为 69-72 tok/s）；其余差距来自 d256 decode
+  注意力的分段 flash kernel 及其逐层的 mask cells（每个局部层比旧模型的 partition kernel 多约 5 us）。其他检查点与后端都快于旧模型。
+- 新进程中 12B / 26B-A4B 在 `ggml_cuda` 上的第一次长 prefill 需要为其步骤形状编译计算图（以及惰性上传专家）；预热后的 prefill 是
+  旧模型的 1.5-2.4 倍。
+- 本次迁移没有在 Metal、Vulkan、MLX 与多 GPU 放置的真实硬件上运行。

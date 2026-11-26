@@ -323,7 +323,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | 模型家族 | 批处理 / 分页状态 | 子开关 |
 |---|---|---|
 | Mistral 3 | 默认 `ForwardBatch` 路径。使用分页 K/V、YaRN 感知位置、原生分页注意力，并在 prompt 准备后注入视觉 embedding。已在 Ministral-3-14B 上验证；长上下文原生分页注意力比旧按序列 GGML 路径快约 21%。 | `TS_PAGED_ATTN_KERNEL` 选择 `native`、`tensor` 或 `managed`。 |
-| Gemma 4 | 密集文本负载默认走批处理路径，覆盖逐层 SWA / 全局注意力、可变 head dim、PLE、KV donor 层别名。当前回退场景包括待注入多模态 embedding、MoE 层与块量化 KV cache。已完成请求的 request-owned fused K/V holder 可被保留，用于精确前缀续接。并发（N>=2）的 decode 步骤跑 token 批量融合内核（`TSGgml_Gemma4ModelDecodeBatched`：一张图、每序列一个 token、权重只读一次），它覆盖 per-layer embedding、KV-donor 层、已回绕的 SWA 环，以及每个序列不同的缓存容量（保留前缀的克隆比新建缓存小），因此 E2B/E4B 不再回退到轮询。MoE 检查点仍走轮询，除非设置 `TS_BATCHED_FUSED_MOE=1`。可选地通过独立 `gemma4-assistant` 草稿 GGUF 做 MTP 投机解码。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭 retained-holder 续接。只需 `--draft-model` 即可启用投机（显式 `--no-spec` 可否决）。 |
+| Gemma 4 | 共享解码器运行时的批处理步骤（`Gemma4RuntimeModel`）：覆盖所有检查点（带 per-layer embedding 与 KV 共享层的 E2B/E4B、12B/31B、26B-A4B MoE）、多模态提示、块量化缓存与投机解码（通过 `--draft-model` 加载 `gemma4-assistant` 草稿头、n-gram、DFlash）。 | `--no-continuous-batching` 以及运行时自身的开关。 |
 | Qwen 3.5 / 3.6 / 3.8 family | 共享解码器运行时（`Qwen35RuntimeModel`）。每个请求有自己的 slot：attention K/V 加上 GatedDeltaNet 递归状态。运行中请求的 decode 与 verify 步作为一张图执行（GGML 上为分页批量前向，其他后端为按 slot 的程序）。已结束的会话与共享前缀检查点由 radix 前缀缓存保留，仅限精确前缀，因为递归无法回退。投机使用内嵌的 NextN/MTP 块、DFlash / DFlash2 草稿器或 n-gram。所有后端（包括 `--backend cuda` 上的稠密 NVFP4 检查点）都运行这一运行时。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`--spec` 开启投机。 |
 | GPT OSS | 默认批处理路径。支持 Q/K/V/O bias、YaRN RoPE、滑窗层、attention sinks、MXFP4 MoE expert 与原生 sinks 注意力。已与按序列路径做贪心正确性验证；性能仍主要受逐层图构建限制。在 GGML 后端上（非 TP），并发 decode 改走 per-request fused holder 与 token 批量融合 decode，在 `ggml_cuda` / `ggml_vulkan` 上使用 slot-stable arena。每个结束请求的 holder 会作为它所属会话的终态保留下来并交给下一轮，因此并行的会话各自续接自己的状态（此前，与其他会话并行运行过的会话在下一轮什么都复用不了）。不走 arena 时（Metal），token 批量 decode 的计算图上下文超过了原生上下文池的缓冲区，每个并发步骤都退回到一次只处理一个序列；现在八个并行会话用时 26.8 秒，而不是 45.2 秒。 | — |
 | Nemotron-H | 默认批处理路径。Attention 层使用分页 K/V；Mamba2 层使用每槽位 conv/SSM 状态池；MoE 层使用批处理 expert 内核；准备好的图像 / 音频 embedding 可注入到批处理 hidden state。页面无法在会话中途恢复递归状态，因此结束的批处理序列的 Mamba2 slot 会和它的池块一起作为会话终态保留，并以精确长度交给下一轮：八个并行会话从什么都复用不了变为每一轮都复用上一轮，完成时间缩短 12%。 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 step。 |
@@ -333,7 +333,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | Muse Spark | 在 `ggml_cuda` / `ggml_vulkan` 上，原生整模型执行器用自己的**序列 slot** 处理并发（每个 slot 在各层所在 GPU 上持有 F16 K/V，`ggml_cuda` 上 `--tp N` 时则按 KV 组切分到各 GPU；46 个滑动窗口层使用环形缓冲）：所有运行中请求的 decode 步共享一张带按序列掩码的计算图，同时到达的文本提示在一张图中 prefill，图像嵌入在图内替换占位行。完成的 slot 会被保留并移交给延续该会话的请求（可先回退），模板前导与共享系统提示会被写入一个检查点 slot，再克隆进新会话。按层切分在 CUDA GPU 间流水化 prefill 时，单个 prompt 按模型选择的步长 prefill（8,192 token；见下文 `TS_SCHED_SOLO_PREFILL_CHUNK`）。逐算子路径（`TS_MUSE_SPARK_NATIVE=0`，以及 `ggml_vulkan` 上的 `--tp`）属于 Radix 页面家族；它的打包分页 `ForwardBatch` 需要 F32 KV 且只接受纯文本请求。 | `TS_MUSE_SPARK_NATIVE=0` 选择逐算子路径；`TS_MUSE_SPARK_PLAN_SLOTS` 在放置规划中预留 slot；`TS_MUSE_SPARK_PIPELINE=0` 关闭流水化 prefill（见 [Muse Spark 卡片](models/muse-spark_zh-cn.md#选项)）。 |
 | DeepSeek V4 / V4.1 | 没有 `ForwardBatch`：压缩注意力缓存没有分页布局。并发由原生执行器的序列 slot 承担（纯 C# `cpu` 与直连 CUDA `cuda` 执行器保持串行）。默认启用的 token 批量融合 decode 每步只读一遍权重，最多 16 个序列，更多时分窗口执行；加载了 DSpark 草稿器时不启用。V4.1 会把已结束会话的 slot 保留给它的下一轮（加载了 DSpark 草稿器时不保留）。 | `TS_BATCHED_FUSED_DECODE=0`；V4.1 保留 slot 的预算由 `TS_DSV41_RETAINED_CACHE_MB`（默认 2048）决定。 |
 | Qwen 3.8 Flash Next（`qwen4exp`） | 共享解码器运行时（`Qwen4ExpRuntimeModel`），与 Qwen 3.5 相同的 slot、批量步与保留机制，另加该家族的 hyper-connection 流、PLE n-gram 行与 QSA。`--layer-split N` 按整层放置，`--tp N` 在 GGML 与 `cuda` 上运行按 rank 的图。共享 MTP 头或 DFlash2 草稿器（`--draft-model`）负责投机。`--backend cuda` 同样运行这一运行时，其图运行在 CUDA 图执行器上。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`TS_MOE_HOT_TIER_GB` 设定主机专家在加速器上的 tier 大小。 |
-| DiffusionGemma | 独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求，并可选择批处理活跃 canvas。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`、`DIFFUSION_BATCHED_FORWARD`；`DIFFUSION_NO_FUSED_DECODE=1` 关闭 GGML 融合整模型 diffusion decode。 |
+| DiffusionGemma | 运行在共享解码运行时上的独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block，每一步都是基于提示缓存的一张计算图。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`。 |
 
 ### Radix 前缀缓存
 
@@ -508,7 +508,6 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_SCHED_DECODE_QUANTUM` | `256` | 在偏回退路径中，允许切换序列前的 decode token 数。 |
 | `TS_PER_SEQ_FUSED` | `1` | fused 能力模型上的并发（N≥2）序列走 per-request 融合 Forward，每个序列有自己的设备端 K/V holder；设为 `0` 改走逐算子批处理分页路径，其 K/V 位于共享的主机块池（设备内存更少、decode 速率更低、没有保留的 holder）。 |
 | `TS_BATCHED_FUSED_DECODE` | `1` | `0` 在 per-seq fused 路径内关闭真正的 token 批量融合 decode（一张图同时 decode 全部 N 个序列）。 |
-| `TS_BATCHED_FUSED_MOE` | `0` | `1` 允许 Gemma 4 MoE 检查点走 token 批量融合 decode；默认关闭，因为在实测的 16 GB 显卡上它并不比轮询快。 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 运行中请求上限，至少 `4` | 对声明支持保留 holder 的模型，为下一轮保留多少个已结束会话的终态：Gemma 4 K/V、Qwen 3.5/3.6/3.8 的 attention K/V 与 GDN 递归状态、Qwen 3.8 Flash Next 的按序列 holder、DeepSeek V4.1 的原生 slot，以及 GLM 5.x 交出的原生 slot。每个都会占用模型完整的 per-request 续接状态。未设置时跟随 `TS_SCHED_MAX_RUNNING_SEQS`，使每个并行运行的请求都保有自己的终态；`0` 关闭保留。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `4` | Radix 树在共享提示前缀结束处（由 chat 层在请求上标记的边界）保留多少个模型完整状态的检查点；每个新会话从其中一个的副本开始。适用于能复制自身状态的模型（GGML 后端上的 Gemma 4；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，只要其 slot 的递归状态可复制，多节点流水线除外）。一个提示在每个声明的边界（系统指令末尾与整个共享前缀末尾）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机；`0` 关闭检查点。 |
 | `TS_MM_EMBEDDING_CACHE_MB` | 主机内存的 1/64，512-4096 MB | 视觉/音频嵌入缓存的字节预算，缓存以媒体内容（SHA-256）为键；超出后淘汰没有被已准备提示引用的最近最少使用条目。 |
@@ -522,7 +521,6 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_SPEC_DRAFT_MODEL` | 无 | 以独立 GGUF 发布的草稿器路径（`--draft-model`）：Gemma 4 的 `gemma4-assistant`、Qwen 3.8 Flash Next 的共享 MTP 头、DSpark 或 DFlash 草稿器。架构从文件中读取。 |
 | `DIFFUSION_STEPS` | `48` | Web UI DiffusionGemma 每个 block 的去噪步数；与自回归调度器的 step 预算无关。 |
 | `DIFFUSION_MAX_BATCH` | `2` | diffusion scheduler 中同时活跃的 DiffusionGemma Web UI 请求数上限。 |
-| `DIFFUSION_BATCHED_FORWARD` | `0` | 对活跃 DiffusionGemma canvas 启用真正的批处理 decode；默认更偏向融合单 canvas 路径。 |
 
 宿主可以给引擎挂上一个 `IPrefixCheckpointStore`（`InferenceEngine.PrefixCheckpointStore`，
 或 TensorSharp.Chat 中的 `InferenceEngineHost.PrefixCheckpointStore`），让共享前缀检查点

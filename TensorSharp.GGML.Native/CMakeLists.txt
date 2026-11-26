@@ -154,7 +154,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
         message(STATUS "MSVC ${MSVC_VERSION}: adding -allow-unsupported-compiler to CMAKE_CUDA_FLAGS so nvcc accepts this host toolset (no-op when it already does)")
     endif()
-    # GgmlOps itself compiles a CUDA source (the on-device diffusion sampler), so it needs the
+    # GgmlOps itself compiles CUDA sources (its masks, fused kernels and precision products), so it needs the
     # CUDA language enabled. CMAKE_CUDA_ARCHITECTURES is normally supplied by build-windows.ps1
     # (detected from the local GPU); fall back to a broad default if the caller did not set it.
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -335,15 +335,10 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gptoss_decode.cpp
     ggml_ops_gptoss_batched.cpp
     ggml_ops_gptoss_prefill.cpp
-    ggml_ops_gemma4_decode.cpp
-    ggml_ops_gemma4_batched.cpp
-    ggml_ops_gemma4_verify.cpp
-    ggml_ops_gemma4_moe.cpp
     ggml_ops_muse_spark.cpp
     ggml_ops_minimax_m3_vision.cpp
     ggml_ops_dflash.cpp
     ggml_ops_dspine.cpp
-    ggml_ops_diffusion.cpp
     ggml_ops_qwen_image.cpp
     ggml_ops_wan.cpp
     ggml_ops_minimax_h3.cpp
@@ -437,7 +432,6 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
         OBJECT_DEPENDS "${TSM_SOURCE_INC};${TSM_MPP_INC};${TSM_MOEMM_INC}")
 endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
-    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_mask.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_dsv4_fused.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_matmul_precision.cu)
@@ -605,8 +599,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
                 "TSG_CUDNN_RUNTIME_DIR=\"${TSG_CUDNN_RUNTIME_HINT}\"")
         endif()
     endif()
-    # Fast intrinsic transcendentals (tanhf/expf) for the diffusion sampler kernel — the accurate
-    # library tanhf is ~100x slower on-device and the sampler only needs FP-reduction-level accuracy.
+    # Fast intrinsic transcendentals (tanhf/expf) for the TensorSharp CUDA kernels.
     # Scope fast math to the existing kernels: precision attention needs the
     # normal expf implementation as well as F32 subnormals and IEEE division.
     foreach(TSG_CUDA_SOURCE IN LISTS TSG_GGMLOPS_SOURCES)
@@ -966,19 +959,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
     target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-retention-budget COMMAND GgmlOpsDsv41RetentionTest)
-    add_executable(GgmlOpsGemma4MmMaskTest tests/gemma4_mm_mask_test.cpp)
-    target_include_directories(GgmlOpsGemma4MmMaskTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME gemma4-multimodal-mask-after-reused-prefix COMMAND GgmlOpsGemma4MmMaskTest)
-    add_executable(GgmlOpsGemma4PleNormTest tests/gemma4_ple_norm_test.cpp)
-    target_include_directories(GgmlOpsGemma4PleNormTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(GgmlOpsGemma4PleNormTest PRIVATE ggml-cpu ggml-base)
-    add_test(NAME gemma4-ple-norm-cpu COMMAND GgmlOpsGemma4PleNormTest cpu)
-    if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)
-        target_link_libraries(GgmlOpsGemma4PleNormTest PRIVATE ggml-vulkan)
-        target_compile_definitions(GgmlOpsGemma4PleNormTest PRIVATE TSG_GGML_USE_VULKAN=1)
-        add_test(NAME gemma4-ple-norm-vulkan COMMAND GgmlOpsGemma4PleNormTest vulkan)
-        set_tests_properties(gemma4-ple-norm-vulkan PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
-    endif()
 
     add_executable(GgmlOpsDsv41QuantTest
         tests/dsv41_quant_test.cpp ggml_ops_dsv4_fused_cpu.cpp)

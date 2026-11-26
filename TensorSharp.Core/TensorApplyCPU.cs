@@ -731,7 +731,8 @@ namespace TensorSharp
             // AccessViolationException during KV-cache zero-init. Mirror the
             // GGML backend's contiguous F16/Q8_0 fast paths so non-F32 caches
             // can be filled safely on the managed CPU backend.
-            if (result.ElementType == DType.Float16 && IsContiguousNonNarrowed(result))
+            // A contiguous range of rows (a cache head's written cells, narrowed) fills from its first element.
+            if (result.ElementType == DType.Float16 && IsContiguousView(result))
             {
                 ushort halfBits = BitConverter.HalfToUInt16Bits((System.Half)value);
                 ushort* halfBuffer = (ushort*)CpuNativeHelpers.GetBufferStart(result);
@@ -772,7 +773,7 @@ namespace TensorSharp
 
             if (result.ElementType != DType.Float32)
                 throw new NotSupportedException(
-                    $"Fill on {result.ElementType} tensors requires a contiguous, non-narrowed layout.");
+                    $"Fill on {result.ElementType} tensors requires a contiguous layout (F16: or a contiguous row range).");
 
 			unsafe void func(float* r)
 			{
@@ -781,6 +782,18 @@ namespace TensorSharp
 
 			Apply1(result, func);
 		}
+
+        // Row-major contiguous from the view's first element; a storage offset is allowed.
+        private static bool IsContiguousView(Tensor t)
+        {
+            long expected = 1;
+            for (int d = t.DimensionCount - 1; d >= 0; d--)
+            {
+                if (t.Sizes[d] != 1 && t.Strides[d] != expected) return false;
+                expected *= t.Sizes[d];
+            }
+            return true;
+        }
 
         private static bool IsContiguousNonNarrowed(Tensor t)
         {
@@ -2339,8 +2352,10 @@ namespace TensorSharp
 			}
 		}
 
+        /// <param name="freqFactors">ggml_rope_ext's frequency factors (null: none): pair i's base frequency divided by
+        /// freqFactors[i] before any YaRN mix, as ggml-cpu's rope_cache_init does.</param>
         unsafe static public void RoPEEx(Tensor tOut, Tensor tIn, Tensor positions, int rows, int cols, int ropeDim, int mode, float freqBase, float freqScale,
-            int nCtxOrig = 0, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f)
+            int nCtxOrig = 0, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f, float[] freqFactors = null)
         {
             const int GGML_ROPE_TYPE_NEOX = 2;
 
@@ -2377,6 +2392,7 @@ namespace TensorSharp
                 for (int i = 0; i < pairCount; i++)
                 {
                     invFreqBuffer[i] = MathF.Pow(freqBase, -2.0f * i / activeRopeDim);
+                    if (freqFactors != null) invFreqBuffer[i] /= freqFactors[i];
                 }
 
                 bool useIntPositions = positions.ElementType == DType.Int32;

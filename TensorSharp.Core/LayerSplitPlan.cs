@@ -202,6 +202,8 @@ public sealed class LayerSplitPlan
                 }
             }
         }
+        if (!reachable[partitions, count])
+            throw new ArgumentException($"No split of {count} layers into {partitions} partitions starts every partition where a cut is allowed.");
         int[] boundaries = new int[partitions + 1];
         boundaries[partitions] = count;
         for (int p = partitions; p > 0; p--)
@@ -250,24 +252,32 @@ public sealed class LayerSplitPlan
 
     public static LayerSplitPlan CreateWeighted(long[] layerBytes, int localDegree,
         int nodeId, int nodeCount, long embeddingBytes, long headBytes, bool driverRunsLastStage)
+        => CreateWeighted(layerBytes, localDegree, nodeId, nodeCount, embeddingBytes, headBytes, driverRunsLastStage, null);
+
+    /// <param name="cutAllowed">Whether a stage may start at a layer (null: any): a model whose layers read each other's
+    /// state within a step (Gemma 4's KV-shared layers) keeps them on one stage.</param>
+    public static LayerSplitPlan CreateWeighted(long[] layerBytes, int localDegree,
+        int nodeId, int nodeCount, long embeddingBytes, long headBytes, bool driverRunsLastStage, Func<int, bool> cutAllowed)
     {
         ArgumentNullException.ThrowIfNull(layerBytes);
         // Validate topology before indexing or allocating the dynamic program.
         var topology = new LayerSplitPlan(layerBytes.Length, localDegree, nodeId, nodeCount, driverRunsLastStage);
         int stage = topology.StageIndex;
-        int[] stages = Partition(layerBytes, nodeCount, localDegree, embeddingBytes, headBytes);
+        int[] stages = Partition(layerBytes, nodeCount, localDegree, embeddingBytes, headBytes, cutAllowed);
         int first = stages[stage], end = stages[stage + 1];
         long[] owned = layerBytes.AsSpan(first, end - first).ToArray();
         int[] devices = Partition(owned, localDegree, 1,
-            stage == 0 ? embeddingBytes : 0, stage == nodeCount - 1 ? headBytes : 0);
+            stage == 0 ? embeddingBytes : 0, stage == nodeCount - 1 ? headBytes : 0,
+            cutAllowed == null ? null : layer => cutAllowed(first + layer));
         for (int rank = 0; rank < devices.Length; rank++) devices[rank] += first;
         return new LayerSplitPlan(layerBytes.Length, localDegree, nodeId, nodeCount, topology.DriverRunsLastStage, stages, devices);
     }
 
     /// <summary>Exact minimax partition of an ordered layer sequence. Equal-cost
     /// solutions choose the smallest preceding boundary, deterministically.</summary>
+    /// <param name="cutAllowed">Whether a partition may start at a layer index (null: any).</param>
     public static int[] Partition(long[] layerBytes, int partitions, int minimumLayers,
-        long firstBytes = 0, long lastBytes = 0)
+        long firstBytes = 0, long lastBytes = 0, Func<int, bool> cutAllowed = null)
     {
         ArgumentNullException.ThrowIfNull(layerBytes);
         if (partitions < 1 || minimumLayers < 1 ||
@@ -291,6 +301,7 @@ public sealed class LayerSplitPlan
         for (int begin = (stage - 1) * minimumLayers; begin <= end - minimumLayers; begin++)
         {
             if (!reachable[stage - 1, begin]) continue;
+            if (begin > 0 && cutAllowed != null && !cutAllowed(begin)) continue;
             long bytes = prefix[end] - prefix[begin] + (stage == 1 ? firstBytes : 0) +
                 (stage == partitions ? lastBytes : 0);
             long maximum = Math.Max(best[stage - 1, begin], bytes);

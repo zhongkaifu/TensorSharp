@@ -1,5 +1,8 @@
 # Design: closing the Gemma-4 long-prompt prefill gap vs llama.cpp (CUDA-graph prefill)
 
+> Historical: this note describes the legacy `Gemma4Model` and its native whole-model graphs, removed in 2026-11 when
+> Gemma 4 moved to the shared decoder runtime ([gemma4.md](../models/gemma4.md) §7-§11).
+
 Status: **PARITY/BEAT ACHIEVED (2026-06-30)** with three changes — the CUDA-graph rewrite (below)
 was NOT needed. E4B end-to-end vs llama went 0.78–0.91x → 8k 0.98x, **16k 1.06x, 32k 1.09x**,
 64k 0.98x, **128k 1.01x** (beats at 16k/32k/128k; 0.98x parity at 8k/64k). What shipped:

@@ -43,6 +43,10 @@ namespace TensorSharp.GGML
         DepthwiseConv2d = 70,
         /// <summary>The exact GELU, 0.5 x (1 + erf(x / sqrt 2)) (ggml_gelu_erf).</summary>
         GeluErf = 71,
+        /// <summary>ggml_log.</summary>
+        Log = 72,
+        /// <summary>ggml_cumsum: the running sum along ne0.</summary>
+        CumSum = 73,
     }
 
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>

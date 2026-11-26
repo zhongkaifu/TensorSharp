@@ -1660,7 +1660,7 @@ TSG_EXPORT int TSGgml_TensorParallelFusedAvailableDistributed(int rankCount)
 // Run one fused per-rank graph plan per rank: submit segment k on every rank,
 // AllReduce the segment's partials on-device, advance. Plans come from a fused
 // kernel called once per rank in tensor-parallel build mode (see
-// TSGgml_Gemma4ModelDecode's tp_plan_out).
+// the GPT-OSS tensor-parallel prefill).
 TSG_EXPORT int TSGgml_TensorParallelExecutePlans(void** plans, int rankCount)
 {
     try

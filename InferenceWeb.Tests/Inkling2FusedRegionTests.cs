@@ -379,7 +379,8 @@ public sealed class Inkling2FusedRegionTests(ITestOutputHelper output)
         p.G.EndFused(stackalloc[] { ids, weights });
         var got = p.Run(new[] { ids, weights }, new[] { (long)top * rows, (long)top * rows }, 1, out int served);
         Assert.Equal(1, served);
-        int[] gotIds = got[0][0].Select(f => BitConverter.SingleToInt32Bits(f)).ToArray();
+        // A GGML graph's I32 outputs come back as their F32 values (f5b0ac2: ids read as raw bits had been denormals).
+        int[] gotIds = got[0][0].Select(f => (int)f).ToArray();
         var want = new double[(long)top * rows];
         for (int row = 0; row < rows; row++)
         {

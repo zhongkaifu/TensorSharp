@@ -33,7 +33,7 @@ TensorSharp 使用 DiffusionGemma GGUF 提供与 Jev 兼容的 `POST /v1/systemo
 
 ```powershell
 $env:TENSORSHARP_MODELS = 'C:/Works/models'
-$env:DIFFUSION_VRAM_HEADROOM_MB = '4096'
+$env:TS_VRAM_HEADROOM_MB = '4096'
 $env:MAX_CONTEXT = '4096'
 dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json
 ```
@@ -50,9 +50,9 @@ CPU 执行可覆盖为 `--backend cpu`（纯 C#）或 `--backend ggml_cpu`，受
 下载一次，之后复用。没有它时，服务端仍会回答纯文本请求，对需要图像行的请求返回 HTTP 503，而不是用填充行
 作答。同一个视觉塔也服务于该服务端上的普通 DiffusionGemma 聊天。
 
-这份配置方案在 16 GiB CUDA GPU 上为激活保留 4 GiB 显存。更大的保留量会让常驻的权重更少，但可以
-避免较长提示下的严重换页。请针对设备与负载调整 `DIFFUSION_VRAM_HEADROOM_MB`；模型默认值为
-2048 MiB。4096 token 的准入上限并不保证该规模的每种 schema 与提示都能放进设备内存。
+这份配置方案在 16 GiB CUDA GPU 上为激活保留 4 GiB 显存。共享解码运行时的专家放置会留出这部分空间，
+放不下的路由专家改在主机内存中运行（`--n-cpu-moe N` / `--cpu-moe` 可显式指定）。请针对设备与负载调整
+`TS_VRAM_HEADROOM_MB`；默认值为设备显存的 1/16。4096 token 的准入上限并不保证该规模的每种 schema 与提示都能放进设备内存。
 
 ### 在 CPU 上运行
 
@@ -64,9 +64,9 @@ $env:MAX_CONTEXT = '4096'
 dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json --backend cpu
 ```
 
-`DIFFUSION_VRAM_HEADROOM_MB` 在那里不起作用。纯 C# 后端把 prompt K/V 保存在主机内存中，因此对同一提示的重复读取
+`TS_VRAM_HEADROOM_MB` 在那里不起作用。每个后端都把提示的 K/V 保存在运行时的缓存中，因此对同一提示的重复读取
 （固定 `samples` 或自适应追加读取）会跳过提示部分的计算（拆成多个分块的 schema 每个分块各有一个提示，而模型只保留一份 prompt 缓存）。
-最后一层只为所请求的标签行计算。在 `cpu` 与 `ggml_cpu` 上，服务端还会对该模型跳过启动时的共享提示预热，
+只有所请求的标签行经过输出头。在 `cpu` 与 `ggml_cpu` 上，服务端还会对该模型跳过启动时的共享提示预热，
 因此权重加载完成后端口即会打开。
 
 在 i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows 上，用 `eng/JevProbe`、
@@ -275,7 +275,7 @@ print(answer["answers"]["legible"]["noul"], answer["answers"]["kind"]["choice"])
 解码后的字节以内容寻址的方式写入服务端的上传目录，因此受 `--upload-max-mb`、`--upload-quota-mb` 与
 `--upload-ttl-hours` 管理；跨请求重复发送的同一张图片只存一个文件，其 embedding 只编码一次并被缓存
 （`TS_MM_EMBEDDING_CACHE_MB`，默认为主机内存的 1/64，限定在 512-4096 MB）。每个软 token span 内部的图像注意力在滑动窗口层上是双向的，
-在全局层上是因果的；`DIFFUSION_IMAGE_BIDIRECTIONAL=0` 让它在所有层上都变为因果。
+在全局层上是因果的。
 
 ## 文件、文档、视频与音频
 
@@ -463,8 +463,8 @@ ASR 准确率属于端到端判定质量的一部分：需要在目标语言和�
 推出全词表的概率质量或 argmax 诊断。种子控制的是 TensorSharp 内部的可复现性；它不保证 Python/NumPy
 与 .NET 对同一个数值种子生成相同的噪声。
 
-稀疏输出投影只计算答案位置与所请求的词表行。它的条件概率在数学上等价于从全词表分布中选出相同标签再
-重新归一化；矩阵乘法形状不同可能带来很小的浮点差异。它不计算分配给全部允许标签的总概率质量，也不计算
+稀疏输出投影只让答案位置经过输出头（与完整 canvas 相同的输出头，因此每个位置的 logits 与完整读取一致）。
+它的条件概率等同于从全词表分布中选出相同标签再重新归一化；矩阵乘法形状不同可能带来很小的浮点差异。它不计算分配给全部允许标签的总概率质量，也不计算
 全词表熵。
 
 量化、问题措辞、答案顺序以及读取次数都可能影响结果。条件置信度并不是经过经验校准的正确概率。选择置信度
@@ -473,18 +473,10 @@ ASR 准确率属于端到端判定质量的一部分：需要在目标语言和�
 ## 执行与验证
 
 答案 canvas 按 schema 确定大小，在模型最大 canvas 宽度之内向上取整到 16 token 的边界。多个问题共享
-transformer 前向。输出头只作用于所请求的标签行，而不分配完整的 canvas × 词表 logits 张量。`ggml_cuda`
-与 `ggml_metal` 使用现有的 DiffusionGemma prompt K/V 与融合 decode 路径，`cpu` 使用它自己的主机 prompt K/V，
-并且最后一层只为所请求的标签行计算；其他后端（包括 `ggml_cpu`、`ggml_vulkan`、`mlx` 与 `cuda`）使用统一的
-prompt 加 canvas 前向。
+transformer 前向。输出头只作用于所请求的标签行，而不分配完整的 canvas × 词表 logits 张量。每个后端都只把提示
+预填充进共享解码运行时的缓存一次，再在其上以一张图运行 canvas。
 模型执行锁使其与普通扩散聊天请求串行访问共享的 GPU 状态；聊天正在去噪时发出的读取会在聊天的下一次前向之前运行，
 而不是等整个 block 结束。
-
-GGML CUDA 默认使用融合的 prompt 注意力，把注意力运算保留在一张原生图内，以减少中间传输与显式的 KV head
-展开。DiffusionGemma 路径保持精确的序列范围与现有的矩阵乘法精度策略。它使用物化的注意力分数，没有 flash
-attention，也没有常驻的注意力图缓存，因此 prompt 内存仍按平方增长。启动前设置
-`DIFFUSION_FUSED_PREFILL_ATTN=0` 可恢复逐算子的参考路径。其他 GGML GPU 后端可用 `1` 选择开启；这并不
-代表它们已经过验证。
 
 可复用的验证工具位于 `eng/`；生成的证据应放在已忽略的 `artifacts/jev/` 中。比较以相同请求独立运行的
 多个 `/v1/systemone` 端点的方法见基准工具的 `--help`。一个小型冒烟集检查集成与明显的提示条件作用；它

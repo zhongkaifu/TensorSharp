@@ -130,7 +130,7 @@ public class CudaDecodeAttentionWrapTests
 
     // Same wrap sweep, but the KV cache is Float16 (the default for q4_0 models)
     // and is populated through the real CUDA write kernel (TryCopyHeadFirstToCache),
-    // exactly as Gemma4Model.CopyToCacheDecode does. This exercises the F16 write
+    // exactly as a decode row's cache write does. This exercises the F16 write
     // and F16 read kernels together across the wrap boundary.
     [CudaTheory]
     [InlineData(4, 2, 8, 16)]

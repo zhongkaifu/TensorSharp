@@ -102,6 +102,10 @@ namespace TensorSharp.Graph
             GraphOp.Norm, GraphOp.GeluErf, GraphOp.DepthwiseConv2d,
             // Qwen-Image-2.1's text conditioner (ggml_gelu's tanh form) and its keys padded to their masks.
             GraphOp.Gelu, GraphOp.Pad,
+            // DiffusionGemma's on-device sampling (entropy and the multinomial draw).
+            GraphOp.Log, GraphOp.CumSum,
+            // Gemma 4's GeGLU feed-forwards (ggml_geglu / ggml_geglu_split: the tanh GELU of the gate times the up rows).
+            GraphOp.Geglu, GraphOp.GegluSplit,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -261,6 +265,20 @@ namespace TensorSharp.Graph
         protected virtual Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
             CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
+            // The keys every query masks at the window's end (a padded window's unwritten cells) weigh exactly nothing: whole
+            // 256-key blocks of them are left out of the products (a ring's 1,536 cells hold a few hundred written ones early
+            // in a conversation). Whole blocks, so a row rounds as it did over the padded window: the softmax's vector tail and
+            // the GEMM's depth blocks (CpuSgemm's KC is 256) follow the key count, and a row of a prompt's first chunk, cut to
+            // its own keys, had rounded apart from the same row of the whole prompt (an MoE fixture's routing then flipped).
+            const int KeyBlock = 256;
+            long keep = mask.Keys > 0 ? Math.Min(k.Sizes[1], (mask.Keys + KeyBlock - 1L) / KeyBlock * KeyBlock) : k.Sizes[1];
+            if (mask.HasTensor && keep < k.Sizes[1] && mask.Tensor is { DimensionCount: 2 } full && full.Sizes[1] == k.Sizes[1])
+            {
+                using Tensor kt = k.Narrow(1, 0, keep), vt = v.Narrow(1, 0, keep), mt = full.Narrow(1, 0, keep);
+                using Tensor at = Attention(q, kt, vt, mt, scale);
+                using Tensor pt = at.Permute(1, 0, 2);
+                return Ops.NewContiguous(pt);
+            }
             using Tensor a = Attention(q, k, v, mask.Pattern == MaskPattern.None && mask.Floor == 0 ? null : mask.Tensor, scale);
             using Tensor p = a.Permute(1, 0, 2);
             return Ops.NewContiguous(p);
@@ -1904,6 +1922,8 @@ namespace TensorSharp.Graph
                 case GraphOp.Sigmoid: return V(Ops.Sigmoid(null, In(T(0), run)));
                 case GraphOp.Exp: return V(Ops.Exp(null, In(T(0), run)));
                 case GraphOp.Neg: return V(Ops.Neg(null, In(T(0), run)));
+                case GraphOp.Log: return V(Ops.Log(null, In(T(0), run)));
+                case GraphOp.CumSum: return V(Ops.CumSum(null, Contig(In(T(0), run), run)));
                 case GraphOp.Tanh: return V(Ops.Tanh(null, In(T(0), run)));
                 case GraphOp.Relu: return V(Ops.Relu(null, In(T(0), run)));
                 case GraphOp.Softplus: return V(Softplus(In(T(0), run)));
@@ -1916,6 +1936,16 @@ namespace TensorSharp.Graph
                     using Tensor gate = x.Narrow(last, 0, half);
                     using Tensor up = x.Narrow(last, half, half);
                     return V(Ops.SiLUMul(null, In(gate, run), In(up, run)));
+                }
+                case GraphOp.GegluSplit: return V(Ops.GELUMul(null, In(T(0), run), In(T(1), run)));
+                case GraphOp.Geglu:
+                {
+                    Tensor x = T(0);
+                    int last = x.DimensionCount - 1;
+                    long half = x.Sizes[last] / 2;
+                    using Tensor gate = x.Narrow(last, 0, half);
+                    using Tensor up = x.Narrow(last, half, half);
+                    return V(Ops.GELUMul(null, In(gate, run), In(up, run)));
                 }
                 case GraphOp.RmsNorm: return V(RowNorm(T(0), Fp(0, 1e-6f), run));
                 case GraphOp.Norm: return V(LayerNormRows(T(0), Fp(0, 1e-6f), run));
@@ -1940,7 +1970,7 @@ namespace TensorSharp.Graph
                 }
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
                 case GraphOp.MoeHostExperts: return V(HostExperts(T(0), values[n.Srcs[1]], values[n.Srcs[2]], values[n.Srcs[3]],
-                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run));
+                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run, (int)Ip(1, 0), Ip(2, 0) != 0));
                 case GraphOp.Reshape:
                 {
                     // A relaid row block (a packed product's column block, rows a pitch apart) reshaped within its rows stays
@@ -2001,8 +2031,10 @@ namespace TensorSharp.Graph
                 case GraphOp.RopeExt:
                 case GraphOp.RopeMulti:
                 {
-                    if (n.Srcs.Length > 2) throw new NotSupportedException("rotary frequency factors");
-                    return V(Rope(T(0), values[n.Srcs[1]], n, n.Op == GraphOp.RopeMulti, run, n.Srcs[1]));
+                    // ggml_rope_ext's frequency factors (src 2): the plain rotary only (Gemma 4's proportional global RoPE).
+                    Tensor factors = n.Srcs.Length > 2 ? T(2) : null;
+                    if (factors != null && n.Op == GraphOp.RopeMulti) throw new NotSupportedException("multi-axis rotary with frequency factors");
+                    return V(Rope(T(0), values[n.Srcs[1]], n, n.Op == GraphOp.RopeMulti, run, n.Srcs[1], factors));
                 }
                 case GraphOp.LightningIndexer: return V(LightningIndexer(T(0), T(1), T(2), T(3), run));
                 case GraphOp.AllReduce:
@@ -2448,30 +2480,48 @@ namespace TensorSharp.Graph
             Tensor bc = Contig(b, run);
             using Tensor b2 = bc.View(nb[1] * rows, nb[0]);
 
-            var byExpert = new List<int>[set.Ne2];
-            for (int t = 0; t < rows; t++)
-                for (int j = 0; j < k; j++)
-                    (byExpert[selected[t * k + j]] ??= new List<int>()).Add(t * k + j);
-            var pieces = new List<Tensor>();
-            var inverse = new int[rows * k];
-            int at = 0;
-            for (int e = 0; e < byExpert.Length; e++)
+            // The routes sorted by expert (counting sort, routes in order within an expert), their rows gathered once, every
+            // expert's product over its run of them (ExpertProducts), then back in route order.
+            int stacked = (int)set.Ne2, routes = rows * k;
+            var offsets = new int[stacked + 1];
+            for (int i = 0; i < routes; i++) offsets[selected[i] + 1]++;
+            for (int e = 0; e < stacked; e++) offsets[e + 1] += offsets[e];
+            var next = (int[])offsets.Clone();
+            var sourceRows = new int[routes];
+            var inverse = new int[routes];
+            for (int i = 0; i < routes; i++)
             {
-                if (byExpert[e] == null) continue;
-                int[] slots = byExpert[e].ToArray();
-                int[] sourceRows = slots.Select(s => nb[1] == 1 ? s / k : s).ToArray();
-                Tensor idx = IntTensor(sourceRows, new long[] { sourceRows.Length }, run);
-                Tensor xs = run.Keep(Ops.IndexSelect(null, b2, idx));
-                pieces.Add(run.Keep(ExpertMatMul(set, e, xs)));
-                foreach (int s in slots) inverse[s] = at++;
+                int at = next[selected[i]]++;
+                sourceRows[at] = nb[1] == 1 ? i / k : i;
+                inverse[i] = at;
             }
-            Tensor sorted = pieces.Count == 1 ? pieces[0] : run.Keep(Ops.Concat(null, 0, pieces.ToArray()));
-            Tensor order = IntTensor(inverse, new long[] { inverse.Length }, run);
+            Tensor idx = IntTensor(sourceRows, new long[] { routes }, run);
+            Tensor xs = run.Keep(Ops.IndexSelect(null, b2, idx));
+            Tensor sorted = run.Keep(ExpertProducts(set, xs, offsets, run));
+            Tensor order = IntTensor(inverse, new long[] { routes }, run);
             Tensor flat = run.Keep(Ops.IndexSelect(null, sorted, order));
             return flat.View(rows, k, set.Ne1);
         }
 
         private static long[] Ids(Value v) => Ne(v.Tensor);
+
+        /// <summary>
+        /// The routed experts' products of a <see cref="GraphOp.MulMatId"/>: <paramref name="rows"/> [routes, Ne0] sorted by
+        /// expert, expert e's run being rows [offsets[e], offsets[e + 1]); returns [routes, Ne1] in the same order. Default: each
+        /// expert's run through <see cref="ExpertMatMul"/> on its own. An executor with a batched kernel runs them together.
+        /// </summary>
+        protected virtual Tensor ExpertProducts(IGraphExpertWeights set, Tensor rows, int[] offsets, RunState run)
+        {
+            var pieces = new List<Tensor>();
+            for (int e = 0; e + 1 < offsets.Length; e++)
+            {
+                int count = offsets[e + 1] - offsets[e];
+                if (count == 0) continue;
+                using Tensor slice = rows.Narrow(0, offsets[e], count);
+                pieces.Add(run.Keep(ExpertMatMul(set, e, Contig(slice, run))));
+            }
+            return pieces.Count == 1 ? pieces[0] : run.Keep(Ops.Concat(null, 0, pieces.ToArray()));
+        }
 
         /// <summary>
         /// <see cref="GraphOp.MoeHostExperts"/> on any tensor executor: x [rows, hidden], the router's top-K ids and
@@ -2480,8 +2530,11 @@ namespace TensorSharp.Graph
         /// the host streams (a prompt chunk) runs every route here, the experts outside the tier read in for it and
         /// dropped after. Returns the weighted sum [rows, hidden].
         /// </summary>
+        /// <param name="activation">0: silu(gate) * up; 2: gelu_tanh(gate) * up (the op's ip[1]).</param>
+        /// <param name="fusedGateUp">The gate stack is one fused [gate | up] stack, gate the first half of each expert's rows
+        /// (the op's ip[2]; its up source names the same stack).</param>
         protected virtual Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false)
         {
             if (gateValue.Weight is not IGraphHostedExperts gate || upValue.Weight is not IGraphExpertWeights up
                 || downValue.Weight is not IGraphExpertWeights down)
@@ -2519,7 +2572,7 @@ namespace TensorSharp.Graph
             for (int i = 0; i < routes; i++) anyHost |= skip[i] == 0 && ids[i] >= 0;
 
             // The returned tensor is the caller's to keep (V keeps it); the pieces summed into it are this run's.
-            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run) : null;
+            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run, activation, fusedGateUp) : null;
             if (!anyHost)
             {
                 if (device != null) return device;
@@ -2541,7 +2594,8 @@ namespace TensorSharp.Graph
         /// <summary>The device's routes of <see cref="HostExperts"/>: each expert once over the rows routed to it,
         /// weighted, then every row's routes summed (a host route reads a zero row).</summary>
         private Tensor DeviceExperts(Tensor x, int[] ids, float[] weights, byte[] onDevice, int k, IGraphExpertWeights gate,
-            IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run)
+            IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run,
+            int activation = 0, bool fusedGateUp = false)
         {
             int rows = (int)x.Sizes[0], hidden = (int)x.Sizes[1], routes = ids.Length;
             var byExpert = new List<int>[gate.Ne2];
@@ -2564,9 +2618,21 @@ namespace TensorSharp.Graph
                 }
                 at += list.Count;
                 Tensor xs = run.Keep(Ops.IndexSelect(null, x, IntTensor(sourceRows, new long[] { sourceRows.Length }, run)));
-                Tensor g = run.Keep(ExpertMatMul(gate, e, xs));
-                Tensor u = run.Keep(ExpertMatMul(up, e, xs));
-                Tensor act = run.Keep(Ops.SiLUMul(null, g, u));
+                Tensor g, u;
+                if (fusedGateUp)
+                {
+                    // One product over the fused stack: [n, 2 ff], gate the first half.
+                    Tensor gu = run.Keep(ExpertMatMul(gate, e, xs));
+                    long ff = gu.Sizes[1] / 2;
+                    g = run.Keep(Ops.NewContiguous(run.Keep(gu.Narrow(1, 0, ff))));
+                    u = run.Keep(Ops.NewContiguous(run.Keep(gu.Narrow(1, ff, ff))));
+                }
+                else
+                {
+                    g = run.Keep(ExpertMatMul(gate, e, xs));
+                    u = run.Keep(ExpertMatMul(up, e, xs));
+                }
+                Tensor act = run.Keep(activation == 2 ? Ops.GELUMul(null, g, u) : Ops.SiLUMul(null, g, u));
                 Tensor d = run.Keep(ExpertMatMul(down, e, act));
                 var w = run.Keep(new Tensor(Allocator, DType.Float32, list.Count, 1));
                 w.SetElementsAsFloat(routeWeights);
@@ -2574,7 +2640,7 @@ namespace TensorSharp.Graph
                 if (stream && !host.IsResident(layer, e))
                 {
                     ReleaseStreamedExpert(gate.Expert(e));
-                    ReleaseStreamedExpert(up.Expert(e));
+                    if (!fusedGateUp) ReleaseStreamedExpert(up.Expert(e));
                     ReleaseStreamedExpert(down.Expert(e));
                 }
             }
@@ -2910,7 +2976,7 @@ namespace TensorSharp.Graph
         /// <summary>ggml's rotary over x [d, heads, tokens] at positions [tokens] (multi-axis: [4 * tokens],
         /// axis-major); ip = dims, mode, n_ctx_orig[, sections]; fp = base, freq_scale, ext_factor,
         /// attn_factor, beta_fast, beta_slow.</summary>
-        private Tensor Rope(Tensor x, Value positions, GraphNode n, bool multi, RunState run, int positionsNode = -1)
+        private Tensor Rope(Tensor x, Value positions, GraphNode n, bool multi, RunState run, int positionsNode = -1, Tensor factors = null)
         {
             long[] ne = Ne(x);
             int d = (int)ne[0], heads = (int)ne[1], tokens = (int)ne[2];
@@ -2955,6 +3021,14 @@ namespace TensorSharp.Graph
                         p = run.KeepLasting(NewIntTensor(perRow, new long[] { perRow.Length }));
                     }
                     if (positionsNode >= 0) run.RowPositions[(positionsNode, heads)] = p;
+                }
+                if (factors != null)
+                {
+                    // Frequency factors: the backend's factored rotary over contiguous rows (no strided shortcut).
+                    Tensor factored = Ops.NewContiguous(x);
+                    using Tensor f4 = factored.View(1, tokens, heads, d);
+                    Ops.RoPEExFactors(f4, f4, p, Contig(factors, run), dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, n.Fp[4], n.Fp[5]);
+                    return factored;
                 }
                 if (KernelsReadStridedViews)
                 {

@@ -69,6 +69,10 @@ namespace TensorSharp.Graph
         /// approximation). Executors without an erf kernel evaluate erf with Abramowitz and Stegun's 7.1.26 (|error| below
         /// 1.5e-7), as ggml-metal does.</summary>
         GeluErf = 71,
+        /// <summary>The natural logarithm (ggml_log).</summary>
+        Log = 72,
+        /// <summary>The running sum along ne0 (ggml_cumsum): y[i] = x[0] + ... + x[i] in each row.</summary>
+        CumSum = 73,
     }
 
     /// <summary>
@@ -433,6 +437,13 @@ namespace TensorSharp.Graph
         /// stride-2 views of the pairs, the tables broadcast over the heads, and a concatenation of the two halves). Rotating
         /// q and k by the same permutation leaves their products unchanged.</summary>
         PairRotary = 42,
+        /// <summary>Gemma 4's routed experts (a MoE layer's routed branch): each row's top-K experts by the softmax of its router
+        /// logits (a tie to the lower expert), their probabilities renormalized over the K and times each picked expert's scale
+        /// where Ip[1] = 1, and the weighted sum of their GeGLU feed-forwards: down · (gelu(gate · x) * (up · x)) with gate and up
+        /// the halves of one fused stack (gate first; ggml_gelu's tanh form). Inputs: x [n, rows] (the experts' normed input),
+        /// the router logits [E, rows], the fused gate_up stack [n, 2 ff, E], the down stack [ff, n, E], then (Ip[1] = 1) the
+        /// per-expert scales [E] (F32). Ip: K, scales. Result: [n, rows].</summary>
+        GegluRoutedExperts = 43,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

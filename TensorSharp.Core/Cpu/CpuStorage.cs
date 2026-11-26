@@ -16,16 +16,43 @@ namespace TensorSharp.Cpu
     {
         public IntPtr buffer;
 
+        /// <summary>
+        /// Buffers of at least this many bytes come zeroed from the C allocator (<c>calloc</c>). At this size it maps fresh
+        /// pages, which are zero already, so the zero costs nothing; a caller that needs one (<see cref="TakeAllocationZeroGuarantee"/>:
+        /// a KV cache) skips its own fill. Filled instead, the pure-C# backend's full-context DiffusionGemma cache (262,144
+        /// cells) wrote and committed gigabytes of RAM at load that no request had used.
+        /// </summary>
+        public const long ZeroedAllocationBytes = 64L << 20;
+
+        private readonly bool _zeroedAllocation;
+        private bool _allocatedZero;
 
         public CpuStorage(IAllocator allocator, DType ElementType, long elementCount)
             : base(allocator, ElementType, elementCount)
         {
-            buffer = allocator is RecyclingCpuAllocator recycler ? recycler.Rent(ByteLength) : Marshal.AllocHGlobal(new IntPtr(ByteLength));
+            if (allocator is RecyclingCpuAllocator recycler)
+                buffer = recycler.Rent(ByteLength, out _allocatedZero);
+            else if (ByteLength >= ZeroedAllocationBytes)
+            {
+                unsafe { buffer = (IntPtr)NativeMemory.AllocZeroed((nuint)ByteLength); }
+                _zeroedAllocation = _allocatedZero = true;
+            }
+            else
+                buffer = Marshal.AllocHGlobal(new IntPtr(ByteLength));
+        }
+
+        /// <summary>Whether the buffer came zeroed from the allocator (consumed: later writes do not reset it).</summary>
+        public override bool TakeAllocationZeroGuarantee()
+        {
+            bool zero = _allocatedZero;
+            _allocatedZero = false;
+            return zero;
         }
 
         protected override void Destroy()
         {
             if (Allocator is RecyclingCpuAllocator recycler) recycler.Return(buffer, ByteLength);
+            else if (_zeroedAllocation) { unsafe { NativeMemory.Free((void*)buffer); } }
             else Marshal.FreeHGlobal(buffer);
             buffer = IntPtr.Zero;
         }

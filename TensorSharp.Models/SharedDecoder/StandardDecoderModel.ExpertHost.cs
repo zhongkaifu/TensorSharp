@@ -226,7 +226,7 @@ namespace TensorSharp.Models
                 ReadOnlySpan<byte> skip, int rows, Span<float> output)
             {
                 if (!_m.TryGetLayerExperts(layer, out StackedExpertWeights gate, out StackedExpertWeights up, out StackedExpertWeights down))
-                    return false;
+                    return ComputeFused(layer, x, ids, weights, skip, rows, output);
                 int hidden = (int)gate.PerExpertNe0, ff = (int)gate.PerExpertNe1, k = ids.Length / rows;
                 long hostRoutes = 0;
                 foreach (byte s in skip) if (s == 0) hostRoutes++;
@@ -260,6 +260,34 @@ namespace TensorSharp.Models
                 return true;
             }
 
+            /// <summary>A layer of fused [gate | up] experts (Gemma 4's <c>ffn_gate_up_exps</c>) at the family's activation
+            /// (<see cref="StandardDecoderModel.HostExpertActivation"/>), read from the model's mapping.</summary>
+            private unsafe bool ComputeFused(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
+                ReadOnlySpan<byte> skip, int rows, Span<float> output)
+            {
+                if (!_m._stackedExpertWeights.TryGetValue($"blk.{layer}.ffn_gate_up_exps.weight", out StackedExpertWeights fused)
+                    || !_m._stackedExpertWeights.TryGetValue($"blk.{layer}.ffn_down_exps.weight", out StackedExpertWeights down))
+                    return false;
+                int hidden = (int)fused.PerExpertNe0, ff = (int)fused.PerExpertNe1 / 2, k = ids.Length / rows;
+                long hostRoutes = 0;
+                foreach (byte s in skip) if (s == 0) hostRoutes++;
+                System.Threading.Interlocked.Add(ref HostRoutes, hostRoutes);
+                fixed (float* xp = x, wp = weights, op = output)
+                fixed (int* ip = ids)
+                fixed (byte* sp = skip)
+                {
+                    for (int r0 = 0; r0 < rows; r0 += HostRowsPerCall)
+                    {
+                        int n = Math.Min(HostRowsPerCall, rows - r0);
+                        if (!GgmlBasicOps.HostExpertRows(fused.Data, IntPtr.Zero, down.Data, fused.GgmlType, 0, down.GgmlType,
+                                _m._numExperts, hidden, ff, k, n, xp + (long)r0 * hidden, ip + (long)r0 * k, wp + (long)r0 * k,
+                                sp + (long)r0 * k, op + (long)r0 * hidden, _m.HostExpertActivation))
+                            return false;
+                    }
+                }
+                return true;
+            }
+
             /// <summary>The layer's packed host experts (<see cref="StandardDecoderModel.TryPackHostExperts"/>), or null.</summary>
             public HostExpertCopies Copies(int layer) => _m._hostCopies is { } all && (uint)layer < (uint)all.Length ? all[layer] : null;
         }
@@ -283,6 +311,10 @@ namespace TensorSharp.Models
 
         /// <summary>The executor the model's graphs run on (a test sets a backend executor's own thresholds).</summary>
         internal TensorSharp.Graph.IGraphExecutor GraphExecutorForTests => GraphExecutor;
+
+        /// <summary>The routed experts' activation where the host computes them: 0 silu(gate) * up (the default), 2
+        /// gelu_tanh(gate) * up (Gemma 4).</summary>
+        private protected virtual int HostExpertActivation => 0;
 
         /// <summary>The expert host of an offloaded <paramref name="layer"/> on a tensor executor, or null (a resident layer,
         /// or the GGML backends).</summary>

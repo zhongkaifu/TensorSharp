@@ -552,7 +552,7 @@ public class Gemma4PromptRenderReproTests
         if (modelPath == null) { _output.WriteLine("gemma-4-12b GGUF not found; skipping"); return; }
 
         BackendType backend = TestGates.PinnedGgmlBackend;
-        var model = (Gemma4Model)ModelBase.Create(modelPath, backend);
+        var model = ModelBase.Create(modelPath, backend);
         try
         {
             string mmproj = Path.Combine(Path.GetDirectoryName(modelPath)!, "gemma-4-12b-mmproj-BF16.gguf");
@@ -604,7 +604,7 @@ public class Gemma4PromptRenderReproTests
         if (modelPath == null) { _output.WriteLine("gemma-4-12b GGUF not found; skipping"); return; }
 
         BackendType backend = TestGates.PinnedGgmlBackend;
-        var model = (Gemma4Model)ModelBase.Create(modelPath, backend);
+        var model = ModelBase.Create(modelPath, backend);
         try
         {
             var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
@@ -663,7 +663,7 @@ public class Gemma4PromptRenderReproTests
         if (modelPath == null) { _output.WriteLine("gemma-4-12b GGUF not found; skipping"); return; }
 
         BackendType backend = TestGates.PinnedGgmlBackend;
-        var model = (Gemma4Model)ModelBase.Create(modelPath, backend);
+        var model = ModelBase.Create(modelPath, backend);
         try
         {
             var history = new List<ChatMessage> { new() { Role = "user", Content = "请介绍最终幻想7" } };

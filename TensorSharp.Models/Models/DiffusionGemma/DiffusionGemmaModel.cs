@@ -1,2643 +1,775 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
-//
-// TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Numerics.Tensors;
-using System.Runtime.InteropServices;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
-using TensorSharp;
-using TensorSharp.GGML;
-using TensorSharp.MLX;
+
+using TensorSharp.Graph;
 
 namespace TensorSharp.Models
 {
     /// <summary>
-    /// DiffusionGemma (architecture key <c>diffusion-gemma</c>) — a block text-diffusion
-    /// Mixture-of-Experts language model built on a Gemma-4 backbone.
-    ///
-    /// This is fundamentally different from the autoregressive Gemma 4 model:
-    ///  - A single <b>no-cache, bidirectional</b> forward is run over a concatenated
-    ///    <c>[prompt | canvas]</c> sequence. Split point <c>P = n_tokens - canvas_length</c>.
-    ///  - Prompt queries are causal (and sliding-window clipped on local layers) and never
-    ///    attend to the canvas; canvas queries are bidirectional over prompt + canvas.
-    ///  - Input embeddings are region-aware: prompt = <c>embed*sqrt(n_embd)</c>,
-    ///    canvas = <c>rms_norm_noscale(embed*sqrt(n_embd) [+ self-conditioning])</c>.
-    ///  - Each layer applies a region-aware per-layer scalar: prompt uses the encoder scalar,
-    ///    canvas uses the decoder scalar.
-    ///
-    /// Generation is performed by an iterative denoising loop (the EntropyBound sampler) which
-    /// lives in <see cref="DiffusionGemmaSampler"/>; this class exposes the per-step forward.
-    ///
-    /// The Gemma-4 backbone shared with the AR model:
-    ///  - Per-head Q/K RMSNorm, unweighted V RMSNorm, NeoX RoPE.
-    ///  - Attention scale = 1.0 (the learnable Q/K norms absorb the 1/sqrt(d) factor).
-    ///  - 5 sliding (local) layers : 1 global layer pattern (local head dim 256, global 512).
-    ///  - Global layers omit the V projection (V == raw K projection).
-    ///  - Dense gated-GELU MLP (shared expert) + 128-expert top-8 softmax MoE, summed per layer.
-    ///  - Embedding scaling by sqrt(hidden), tied lm-head, final logit softcapping.
+    /// DiffusionGemma (architecture key <c>diffusion-gemma</c>): a block text-diffusion model on the Gemma 4 26B-A4B backbone,
+    /// on the shared decoder runtime (<see cref="Gemma4DecoderModel"/>'s recipe, its caches and graph executors).
+    /// <list type="bullet">
+    /// <item>The prompt is prefilled into the runtime's cache as a causal prompt (sliding-window layers clip it, an image's soft
+    /// tokens attend each other on those layers only) with each layer's output times its <c>enc_layer_output_scale</c>; a
+    /// block's next prompt reuses the cached rows it extends.</item>
+    /// <item>Each denoising step runs the canvas (<see cref="CanvasLength"/> rows after the prompt) as block rows
+    /// (<see cref="StandardDecoderModel.RunBlockRows"/>): every canvas row reads every other on every layer and the prompt as a
+    /// chunk at the canvas's first position does (a sliding-window layer from that row's window), each layer's output times
+    /// its <c>layer_output_scale</c>; nothing is committed.</item>
+    /// <item>The canvas input rows are <c>rms_norm(embed * sqrt(n_embd) [+ self-conditioning])</c> without a weight; the
+    /// self-conditioning signal is a gated-GELU MLP (<c>self_cond_*</c>) over the previous step's top-32 soft embedding
+    /// (<c>sum_k p_k embed[t_k] * sqrt(n_embd)</c>).</item>
+    /// <item>The head (tied <c>token_embd</c>, softcapped) returns the canvas logits, or, where the executor samples on the device
+    /// (<see cref="SupportsDeviceSampling"/>), each position's argmax, entropy, multinomial draw and top-32 from one graph, so
+    /// only those cross to the host.</item>
+    /// </list>
+    /// Generation (the EntropyBound denoising loop) lives in <see cref="DiffusionGemmaSampler"/>.
     /// </summary>
-    public sealed partial class DiffusionGemmaModel : ModelBase
+    public sealed partial class DiffusionGemmaModel : Gemma4DecoderModel
     {
-        // ---- architecture configuration ----
-        private bool[] _isLocal;            // per-layer: true = sliding-window (local), false = global
-        private int[] _kvHeads;             // per-layer KV head count
-        private int[] _headDim;             // per-layer head dim (local 256, global 512)
-        private bool[] _hasVProj;           // per-layer: whether attn_v.weight exists (false on global layers)
-        private int _localHeadDim;
-        private int _globalHeadDim;
-        private int _slidingWindow;
-        private float _ropeLocalBase;
-        private float _ropeGlobalBase;
-        private int _denseFfn;              // dense MLP intermediate (feed_forward_length)
-        private int _expertFfn;            // per-expert intermediate (expert_feed_forward_length)
-        private int _numExperts;
-        private int _numExpertsUsed;
-        private float _finalLogitSoftcap;
-        private int _canvasLength;
-        private int _maskTokenId;
+        /// <summary>Tokens of the previous step's distribution a position's self-conditioning reads: a tempInv &gt;= 1.25 softmax
+        /// keeps more than 0.9999 of its mass in its top 32.</summary>
+        private const int ScTopK = 32;
 
-        // precomputed RoPE base frequencies per layer type (NeoX). Global folds in rope_freqs (NTK).
-        private float[] _ropeFreqsLocal;    // length localHeadDim/2
-        private float[] _ropeFreqsGlobal;   // length globalHeadDim/2
-        // raw rope_freqs.weight (NOT folded), used by the on-device GGML freq-factors RoPE kernel.
-        private Tensor _ropeFreqsRawTensor;
-
-        // ---- on-device glue-op caches (rebuilt only when N/P change, i.e. once per block) ----
-        // RoPE integer positions [N*numHeads], keyed by (numHeads, startPos).
-        private readonly Dictionary<long, Tensor> _ropePosCache = new();
-        private int _ropePosN = -1;
-        // global cos/sin tables (folded freqs) for the non-GGML RoPE paths (mlx fused / cuda raw).
-        private int _cosSinGlobalN = -1;
-        private float[] _cosGlobalHost, _sinGlobalHost;
-        private Tensor _cosGlobalTensor, _sinGlobalTensor;
-        // additive attention masks [maskHeads,N,N] (0 = attend, large-negative = masked), per layer type.
-        private int _maskN = -1, _maskP = -1;
-        private Tensor _maskLocal, _maskGlobal;
-        private const float MaskNeg = -1e30f;
-        private const int NeoXRopeMode = 2;
-
-        // host cos/sin tables for the CPU raw-pointer RoPE path, cached by N.
-        private int _cosSinHostN = -1;
-        private float[] _cosLocalHost, _sinLocalHost;
-
-        // GPU backends keep the whole forward device-resident (Ops-based glue); CPU backends use the
-        // hand-tuned SIMD raw-pointer glue, which is faster on the CPU and avoids host<->device churn
-        // that doesn't exist there anyway.
-        private bool _useDeviceGlue;
-
-        // ---- prompt-KV caching (PKV) — the headline llama.cpp/vLLM diffusion-gemma optimization ----
-        // The prompt's per-layer K/V do not depend on the canvas (prompt is causal and never attends to
-        // the canvas), so they are identical across every denoising step. PrefillPrompt computes them
-        // once per block and stores them here; DecodeCanvas then processes only the canvas each step and
-        // prepends the cached prompt K/V. Two layouts, chosen by backend and never mixed: the device-glue
-        // (GPU) backends keep head-first [kvHeads, P, hd]; the pure-C# cpu backend keeps token-major
-        // [rows, kvHeads*hd] after norm+RoPE, where a local layer keeps only the last min(P, swa-1)
-        // rows (all a canvas query can see) while the prompt length stays P
-        // (DiffusionGemmaModel.Cpu.cs). ggml_cpu has no prompt-KV cache.
-        private Tensor[] _promptK, _promptV;
-        private int _promptLen = -1;
-        private bool _pkvEnabled;
-        // The GGML compatibility prefill kernel uses native GQA and causal/SWA masking,
-        // keeping scores inside one graph with the established per-op precision policy.
-        // Default on for the independently validated CUDA path; 0 restores the per-op
-        // reference. Other GGML GPU backends can opt in with 1 after local validation.
-        private bool UseFusedPromptAttention
-        {
-            get
-            {
-                string option = Environment.GetEnvironmentVariable("DIFFUSION_FUSED_PREFILL_ATTN");
-                bool enabled = IsGgmlBackend && (option == "1" || (_backend == BackendType.GgmlCuda && option != "0"));
-                // GgmlBasicOps.FusedPrefillAttention builds its own causal/SWA mask inside the kernel and
-                // takes no external mask, so it cannot express the bidirectional block an image span
-                // needs. Fall back to the per-op mask path for image-bearing prompts rather than
-                // silently running the wrong mask. Announced once by WarnFusedPrefillDisabledForVision.
-                if (enabled && _visionSpans.Length != 0)
-                {
-                    WarnFusedPrefillDisabledForVision();
-                    return false;
-                }
-                return enabled;
-            }
-        }
-        private bool _warnedFusedPrefillDisabledForVision;
-
-        private void WarnFusedPrefillDisabledForVision()
-        {
-            if (_warnedFusedPrefillDisabledForVision) return;
-            _warnedFusedPrefillDisabledForVision = true;
-            Console.WriteLine("  [fused prefill attention] disabled for this turn: the prompt carries image soft " +
-                "tokens, whose bidirectional span mask the fused kernel cannot express (it masks internally and " +
-                "accepts no external mask). Using the per-op mask + AttnCoreHeadFirst path (slower prefill). " +
-                "Reported once.");
-        }
-
-        // decode-phase additive masks [maskHeads, C, P+C] (null when no masking is needed, i.e. when the
-        // prompt fits within the sliding window — the common case).
-        private int _decodeMaskP = -1, _decodeMaskC = -1;
-        private Tensor _decodeMaskLocal, _decodeMaskGlobal;
-
-        // per-layer output scalars
-        private float[] _decScale;          // layer_output_scale (canvas / decoder)
-        private float[] _encScale;          // enc_layer_output_scale (prompt / encoder)
-
-        // fused-MoE stacked expert weights (one ggml_mul_mat_id dispatch per layer instead of 128 matmuls)
-        private StackedExpertWeights[] _stackedGateUp;   // pre-fused [n_embd, 2*expertFfn, numExperts]
-        private StackedExpertWeights[] _stackedDown;     // [expertFfn, n_embd, numExperts]
-        private float[][] _perExpertScale;               // per-layer ffn_down_exps.scale
-        private bool _fusedMoeAvailable;
-
-        // cached ones tensors for unweighted RMSNorm, keyed by dim
-        private readonly Dictionary<int, Tensor> _onesByDim = new();
-
-        // self-conditioning (optional)
+        private readonly int _canvasLength;
+        private readonly int _maskTokenId;
+        private readonly bool _hasSelfConditioning;
+        private float[] _encScale;
         private bool _scEnabled;
+        private bool _promptKv = true;
+        private bool _prefilling;
+        private float[] _iota;
+        private readonly PromptCache _ownCache = new();
+        private int _nextSequence;
 
-        // reusable output buffer for canvas logits
-        private float[] _canvasLogits;
-
-        // timing
         private readonly Stopwatch _swForward = new();
-        private long _tEmbed, _tAttn, _tMoe, _tDense, _tLmHead, _tSc, _tMoeRoute, _tMoeFfn;
-        private long _tScTopK, _tScDevice;   // self-conditioning split: host top-K vs on-device gather+MLP
-        // Fused decode-layer kernel: whole layer (attention + dense + MoE) in one GGML graph dispatch.
-        // Correct (output matches the per-op path) but per-LAYER fusion alone doesn't speed up the decode
-        // because `hidden` still round-trips host memory between layers, serialising them. The model-wide
-        // single graph (hidden stays on-device across all layers) is the real throughput win. Opt-in for now
-        // via DIFFUSION_FUSED_DECODE=1 so the default stays on the proven per-op path.
-        // Default ON for GGML: fuse all transformer layers into one graph per decode step (correct + ~1.7x).
-        // Disable via DIFFUSION_NO_FUSED_DECODE=1. The further lm_head fusion (~3-4x) is separately opt-in.
-        private readonly bool _fusedDecodeEnabled = Environment.GetEnvironmentVariable("DIFFUSION_NO_FUSED_DECODE") != "1";
-        private bool _fusedDecodeOk = true;   // flipped false if the kernel ever rejects the layout
-        // Fused lm_head tail (output_norm + lm_head + softcap in one dispatch). Default ON for GGML; the
-        // separate small graph keeps it correct (unlike folding lm_head into the layer graph).
-        private readonly bool _fusedLmHeadTailDisabled = Environment.GetEnvironmentVariable("DIFFUSION_NO_FUSED_LMHEAD_TAIL") == "1";
-        private bool _fusedLmHeadTailOk = true;
-        private string _fusedLmHeadTailError;   // exception message from TryFusedLmHead, for the one-time notice
-        // Segmented (per-layer) fused decode: run each layer as its own fused graph so layers whose
-        // weights are NOT device-resident stream through one bounded, reused staging buffer instead of
-        // all coexisting in VRAM. Selected automatically by PrepareCudaWeightResidency when the model
-        // does not fit; override with DIFFUSION_SEGMENTED_DECODE=1/0.
-        private bool _segmentedDecode;
-        // On-device diffusion sampling (CUDA only): the fused lm_head kernel computes argmax + entropy +
-        // multinomial sample + top-K (for self-conditioning) directly on the device logits, so only the
-        // small per-position outputs come back instead of the full [vocab,C] block — eliminating the
-        // ~268 MB device->host logits download AND the host's two full-vocab CPU sweeps (sampler + SC
-        // top-K) per step. The canonical llama.cpp diffusion-sampling.cu + device-SC optimization.
-        // Default ON for GgmlCuda; disable with DIFFUSION_NO_DEVICE_SAMPLE=1. Flips off if the kernel
-        // ever rejects the layout (then the host logits + host sampler path is used).
-        private readonly bool _deviceSampleEnabled = Environment.GetEnvironmentVariable("DIFFUSION_NO_DEVICE_SAMPLE") != "1";
-        private readonly bool _deviceSampleForce = Environment.GetEnvironmentVariable("DIFFUSION_DEVICE_SAMPLE_FORCE") == "1";
-        private bool _deviceSampleOk = true;
-        // Reusable host buffer for the fused lm_head logits (268 MB at vocab 256K, C 256). A fresh
-        // array per step costs a large-object-heap allocation + zeroing every step; one pooled buffer
-        // is safe because each step's logits are fully consumed (sampling + self-conditioning read)
-        // before the next step's lm_head overwrites it — the same contract the batched scheduler
-        // already documents for the shared readback buffer. Allocated on the pinned object heap and
-        // cudaHostRegister'ed so the per-step 268 MB device->host logits download takes the fast DMA
-        // path instead of the pageable one.
-        private float[] _fusedLogitsBuffer;
-        // Host regions page-locked for fast per-step DMA (streamed weights + the logits buffer).
-        // cudaHostRegister'ed memory MUST be unregistered before it is unmapped/freed (the streamed
-        // weights live in the GGUF mmap), so Dispose undoes these.
-        private readonly List<IntPtr> _pinnedHostRegions = new();
-        // Streamed (non-resident) weights re-homed into page-locked PRIVATE host copies: Windows
-        // cannot cudaHostRegister file-mapped (GGUF mmap) pages, so the bytes are copied once into
-        // an owned allocation that CAN be page-locked — per-step uploads then run at DMA speed
-        // (~2x pageable mmap throughput). Maps original weight pointer -> pinned copy; the fused
-        // decode arg builder substitutes these. Freed (after unregistering) in Dispose.
-        private readonly Dictionary<IntPtr, IntPtr> _pinnedStreamCopies = new();
-        // Batched-decode lm_head memory cap: batch the [B*C, vocab] lm_head into one weight-read while the
-        // logits tensor fits under this many bytes, else fall back to a per-sequence lm_head (one [C, vocab]
-        // transient — the per-seq weight re-read costs ~1ms, negligible vs the per-step compute). Default 300
-        // MB so a single canvas's logits (~262 MB at vocab 256K, C 256) batches but a B>=2 batch falls back —
-        // this is what keeps batched decode inside the tight Metal headroom on a 24 GB machine running a 16.8
-        // GB model. Tunable via DIFFUSION_LMHEAD_BATCH_CAP_MB.
-        private static readonly long LmHeadBatchByteCap =
-            (long)(int.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_LMHEAD_BATCH_CAP_MB"), out int capMb) && capMb > 0 ? capMb : 300) * 1024 * 1024;
+        private long _tPrefill, _tCanvas, _tSc, _tRead, _canvasSteps;
+
+        /// <summary>What a cache holds: the prompt tokens it was prefilled with, the image spans' version then, and whether any
+        /// forward wrote it (a fresh cache needs no reset).</summary>
+        internal sealed class PromptCache
+        {
+            public int[] Tokens;
+            public int VisionVersion;
+            public bool Written;
+        }
+
+        public DiffusionGemmaModel(string ggufPath, BackendType backend) : base(ggufPath, backend)
+        {
+            _canvasLength = (int)_gguf.GetUint32("diffusion.canvas_length", 256);
+            _maskTokenId = (int)_gguf.GetUint32("tokenizer.ggml.mask_token_id", 0);
+            _hasSelfConditioning = HasWeight("self_cond_pre_norm.weight") && HasWeight("self_cond_gate.weight")
+                && HasWeight("self_cond_up.weight") && HasWeight("self_cond_down.weight");
+            _scEnabled = _hasSelfConditioning;
+            Console.WriteLine($"DiffusionGemma ready: canvas_length={_canvasLength}, mask_token={_maskTokenId}, " +
+                $"self_conditioning={_scEnabled}, device_sampling={SupportsDeviceSampling}");
+        }
 
         public int CanvasLength => _canvasLength;
         public int MaskTokenId => _maskTokenId;
         public int VocabSize => Config.VocabSize;
-        public bool SelfConditioningEnabled { get => _scEnabled; set => _scEnabled = value; }
-        /// <summary>Whether prompt-KV caching is active: the sampler calls <see cref="PrefillPrompt"/>
-        /// once per block then <see cref="DecodeCanvas"/> per step. Available on the device-glue (GPU)
-        /// backends and on the pure-C# CPU backend (host glue, DiffusionGemmaModel.Cpu.cs); the setter is
-        /// a no-op on the remaining backend (ggml_cpu).</summary>
+
+        /// <summary>Whether each step after the first adds the previous step's self-conditioning signal (on when the checkpoint
+        /// has the <c>self_cond_*</c> weights).</summary>
+        public bool SelfConditioningEnabled
+        {
+            get => _scEnabled;
+            set => _scEnabled = value && _hasSelfConditioning;
+        }
+
+        /// <summary>Whether the sampler prefills a block's prompt once (<see cref="PrefillPrompt"/>) and then runs only the canvas
+        /// each step (<see cref="DecodeCanvas"/>). The unified <see cref="ForwardCanvas"/> computes the same rows (the prompt is
+        /// causal and never reads the canvas); tests turn this off to run it.</summary>
         public bool SupportsPromptKvCache
         {
-            get => _pkvEnabled;
-            set => _pkvEnabled = value && (_useDeviceGlue || UsesHostPromptKv);
+            get => _promptKv;
+            set => _promptKv = value;
         }
 
-        /// <summary>Whether the per-step argmax/entropy/multinomial/top-K sampling runs on-device (CUDA),
-        /// returning only the small per-canvas-position outputs instead of the full [vocab,C] logits. Gated
-        /// to the GgmlCuda backend (the sample kernel reads the device logits pointer).
-        ///
-        /// IMPORTANT — only enabled when the model FITS in VRAM (<c>!_segmentedDecode</c>). When the model
-        /// oversubscribes VRAM (segmented decode), two things make the on-device sampler a net loss and the
-        /// host path the better choice: (1) the lm_head's [vocab,C] logits tensor gets paged out of VRAM by
-        /// the Windows/WDDM working-set manager (VRAM is full of weights), so the kernel re-reads it over
-        /// PCIe; (2) the streaming-bound decode keeps the GPU mostly idle, so its SM/memory clock stays at
-        /// its idle state and any device-resident read runs ~15x below peak bandwidth — slower than the
-        /// host's copy-engine readback (which uses the clock-independent copy engine) + the SIMD CPU sampler.
-        /// When the model fits, the logits stay resident, the forward keeps the GPU busy (clock ramped), and
-        /// the kernel is a large win (only C ints/floats cross PCIe instead of ~268 MB). Measured on a
-        /// VRAM-oversubscribed RTX 3080 Laptop: device sampling was ~33% slower, hence the gate. Override
-        /// the residency gate for experiments with DIFFUSION_DEVICE_SAMPLE_FORCE=1.
-        ///
-        /// The sampling tail reads the fused layer graph's output, so it also needs the fused decode
-        /// (DIFFUSION_NO_FUSED_DECODE unset and not latched off). Without that check a block started on
-        /// the device path only to fall back at its first step, having skipped the host
-        /// self-conditioning buffers that the fallback path needs.</summary>
-        public bool SupportsDeviceSampling =>
-            _deviceSampleEnabled && _deviceSampleOk && _backend == BackendType.GgmlCuda
-            && _fusedLmHeadTailOk && !_fusedLmHeadTailDisabled
-            && _fusedDecodeEnabled && _fusedDecodeOk
-            && (!_segmentedDecode || _deviceSampleForce);
+        /// <summary>Whether a step can sample on the device (<see cref="DecodeCanvasSampled"/>): the GGML CUDA executor, whose
+        /// graph keeps the [vocab, canvas] logits on the device and returns only each position's picks. Elsewhere the logits
+        /// come back and the sampler draws on the host, as it always has there.</summary>
+        public bool SupportsDeviceSampling => _backend == BackendType.GgmlCuda || DeviceSamplingForTests;
 
-        /// <summary>The number of top-K tokens the device sampler returns for self-conditioning (0 when SC
-        /// is disabled, so the kernel skips the top-K pass).</summary>
+        /// <summary>Tests: sample in the graph on any executor (the managed one holds the sampler's ops to the host's).</summary>
+        internal bool DeviceSamplingForTests { get; set; }
+
+        /// <summary>Canvas steps that ran several sequences in one graph (tests).</summary>
+        internal int BatchedCanvasStepsForTests { get; private set; }
+
+        /// <summary>The number of top tokens a device-sampled step returns for the next step's self-conditioning (0 without it).</summary>
         public int SelfCondTopK => _scEnabled ? Math.Min(ScTopK, Config.VocabSize) : 0;
 
-        public DiffusionGemmaModel(string ggufPath, BackendType backend) : base(ggufPath, backend)
+        // ---------------------------------------------------------------- the runtime's declarations
+
+        private protected override string FamilyNote => ", block diffusion";
+
+        /// <summary>An image's soft tokens attend each other on the sliding-window layers only, each image apart (vLLM's
+        /// gemma4_mm); the global layers stay causal over them.</summary>
+        protected override bool MediaOpensFullAttentionLayers => false;
+        protected override bool MediaSpansAttendApart => true;
+
+        /// <summary>A prompt's rows take the encoder scalar, the canvas's (block rows) the decoder one.</summary>
+        private protected override float LayerOutputScale(GraphStep step, int layer)
+            => step.BlockRows ? _layerScale[layer] : _encScale?[layer] ?? 1f;
+
+        protected override string FingerprintExtras => base.FingerprintExtras + "|diffusion";
+
+        protected override void PrepareLoadedWeights()
         {
-            Config = new ModelConfig { Architecture = _gguf.GetString("general.architecture") };
-            ParseBaseConfig();
-            ParseDiffusionConfig();
-            _maxContextLength = ResolveConfiguredContextLength();
-
-            ParseTokenizer();
-
-            LoadWeights();
-
-            LoadLayerScalars();
-            CacheStackedExpertWeights();
-            PrecomputeRoPE();
-
-            _useDeviceGlue = _backend is BackendType.GgmlMetal or BackendType.GgmlCuda
-                or BackendType.Mlx or BackendType.Cuda;
-            // Prompt-KV caching: the device-resident attention path stores/concats K/V tensors; the pure-C#
-            // CPU backend keeps host K/V and decodes canvas-only (DiffusionGemmaModel.Cpu.cs).
-            _pkvEnabled = (_useDeviceGlue || UsesHostPromptKv) && Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV") != "1";
-
-            // Metal lazy-sync (async compute) is unsafe for this model, exactly as it is for Gemma 4
-            // (see Gemma4Model's SetAsyncCompute(false) and the hazard note there). GgmlContext enables
-            // it by default on Metal: a per-op kernel returns without waiting on its command buffer, and
-            // GetFloatPtr / EnsureHostReadable drains pending work before a CPU *read* — but there is no
-            // host-WRITE barrier, so a CPU write followed by a device kernel can dispatch against a stale
-            // cached device buffer for the same host pointer.
-            //
-            // Every per-op path here mixes CPU writes with device kernels: MoERoute reads the router
-            // scores to the host and top-Ks them, the per-expert MoE fallback builds batchInput with
-            // Buffer.MemoryCopy before dispatching ExpertFFN, and the embedding / mask / self-conditioning
-            // helpers all populate tensors on the CPU. Left async, the forward is not even reproducible —
-            // two identical ForwardCanvas calls returned logits differing on ~all 67M floats (cosine as
-            // low as 0.77) on an M5 Pro.
-            //
-            // That is catastrophic specifically BECAUSE of prompt-KV caching: PrefillPrompt runs the
-            // prompt through the per-op stack ONCE and freezes the result as _promptK/_promptV for every
-            // denoising step of the turn, so a corrupted prefill permanently poisons the model's view of
-            // the prompt. The symptom is the Gemma 4 one — fluent text that has lost the prompt's
-            // conditional content (e.g. "请详细介绍最终幻想7" answered as if the user had only typed
-            // "请介绍").
-            //
-            // Measured cost on an M5 Pro (canvas=256, Q4_K_M): prefill is unchanged (~290 ms either way,
-            // the sync lands on work the prefill was going to wait for anyway), and the decode step goes
-            // 183 -> 199 ms, about +8% (~+6% end-to-end). That is the price of a correct answer.
-            //
-            // Do NOT try to reclaim it by keeping async on for the decode loop only. That looks safe and
-            // is not: with the canvas held constant, 48 decode steps are bitwise reproducible under async
-            // (every step re-uploads identical bytes, so a stale device buffer still holds the right
-            // data), yet a real Generate() — which re-noises the canvas each step, making
-            // Embedding(canvasTokens) a genuine per-step host write — comes back off-topic again.
-            // Reproducibility is not correctness here; only the end-to-end answer is.
-            //
-            // DIFFUSION_ASYNC_COMPUTE=1 forces it back on. That is UNSAFE (it reintroduces the corruption
-            // above) and exists only to A/B the cost of the synchronize.
-            if (IsGgmlBackend && GgmlBasicOps.GetAsyncCompute() &&
-                Environment.GetEnvironmentVariable("DIFFUSION_ASYNC_COMPUTE") != "1")
-                GgmlBasicOps.SetAsyncCompute(false);
-
-            PrepareCudaWeightResidency();
-
-            // Self-conditioning (matches the reference sampler) materially improves quality on longer
-            // outputs and converges in far fewer steps. The top-K soft-embedding makes its per-step cost
-            // negligible (~tens of ms), so it is enabled by default. Disable with DIFFUSION_NO_SC=1.
-            _scEnabled = Environment.GetEnvironmentVariable("DIFFUSION_NO_SC") != "1";
-
-            Console.WriteLine($"DiffusionGemma ready: canvas_length={_canvasLength}, experts={_numExperts}/{_numExpertsUsed}, " +
-                $"softcap={_finalLogitSoftcap}, mask_token={_maskTokenId}, self_conditioning={_scEnabled}, " +
-                $"device_glue={_useDeviceGlue}, prompt_kv_cache={_pkvEnabled}");
+            base.PrepareLoadedWeights();
+            _encScale = new float[Config.NumLayers];
+            for (int l = 0; l < _encScale.Length; l++)
+                _encScale[l] = _weights.TryGetValue(LayerName(l, "enc_layer_output_scale.weight"), out Tensor s) ? s.GetElementAsFloat(0) : 1f;
         }
 
-        private void ParseDiffusionConfig()
+        /// <summary>Autoregressive decoding is refused: the model denoises canvases (<see cref="DiffusionGemmaSampler"/>). Its
+        /// prompt prefills run through the runtime's forward.</summary>
+        protected override float[] ForwardCore(int[] tokens)
         {
-            string arch = Config.Architecture;
-
-            _slidingWindow = (int)_gguf.GetUint32($"{arch}.attention.sliding_window", 1024);
-            Config.SlidingWindow = _slidingWindow;
-
-            _globalHeadDim = (int)_gguf.GetUint32($"{arch}.attention.key_length", 512);
-            _localHeadDim = (int)_gguf.GetUint32($"{arch}.attention.key_length_swa", 256);
-
-            _ropeGlobalBase = Config.RopeBase;
-            _ropeLocalBase = _gguf.GetFloat32($"{arch}.rope.freq_base_swa", 10000f);
-
-            _denseFfn = Config.IntermediateSize > 0 ? Config.IntermediateSize
-                : (int)_gguf.GetUint32($"{arch}.feed_forward_length", 0);
-            _expertFfn = (int)_gguf.GetUint32($"{arch}.expert_feed_forward_length", 0);
-            _numExperts = (int)_gguf.GetUint32($"{arch}.expert_count", 0);
-            _numExpertsUsed = (int)_gguf.GetUint32($"{arch}.expert_used_count", 0);
-
-            _finalLogitSoftcap = _gguf.GetFloat32($"{arch}.final_logit_softcapping", 0f);
-            _canvasLength = (int)_gguf.GetUint32("diffusion.canvas_length", 256);
-            _maskTokenId = (int)_gguf.GetUint32("tokenizer.ggml.mask_token_id", 0);
-
-            // sliding-window pattern: true = local (SWA), false = global.
-            bool[] swaPattern = _gguf.GetBoolArray($"{arch}.attention.sliding_window_pattern");
-            int[] kvArr = _gguf.GetInt32Array($"{arch}.attention.head_count_kv");
-
-            int L = Config.NumLayers;
-            _isLocal = new bool[L];
-            _kvHeads = new int[L];
-            _headDim = new int[L];
-            _hasVProj = new bool[L];
-            for (int i = 0; i < L; i++)
-            {
-                bool local = swaPattern != null && i < swaPattern.Length ? swaPattern[i] : true;
-                _isLocal[i] = local;
-                _headDim[i] = local ? _localHeadDim : _globalHeadDim;
-                if (kvArr != null && i < kvArr.Length)
-                    _kvHeads[i] = kvArr[i];
-                else
-                    _kvHeads[i] = Config.NumKVHeads;
-            }
-
-            Console.WriteLine($"Model: {arch}, Layers={L}, Hidden={Config.HiddenSize}, Heads={Config.NumHeads}");
-            Console.WriteLine($"Head dims: local={_localHeadDim} global={_globalHeadDim}, RoPE local={_ropeLocalBase} global={_ropeGlobalBase}");
-            Console.WriteLine($"Sliding window={_slidingWindow}, dense FFN={_denseFfn}, expert FFN={_expertFfn}");
+            if (!_prefilling)
+                throw new NotSupportedException("DiffusionGemma is a diffusion model and does not support autoregressive Forward(). " +
+                    "Use DiffusionGemmaSampler.Generate() / the diffusion run mode.");
+            return base.ForwardCore(tokens);
         }
 
-        private void LoadLayerScalars()
+        protected override void ResetKVCacheCore()
         {
-            int L = Config.NumLayers;
-            _decScale = new float[L];
-            _encScale = new float[L];
-            for (int l = 0; l < L; l++)
+            base.ResetKVCacheCore();
+            // The active cache is the model's own unless a sequence's is bound (its PromptCache is reset by its caller).
+            if (!SequenceBound)
             {
-                _decScale[l] = _weights.TryGetValue($"blk.{l}.layer_output_scale.weight", out var d) ? d.GetElementAsFloat(0) : 1f;
-                _encScale[l] = _weights.TryGetValue($"blk.{l}.enc_layer_output_scale.weight", out var e) ? e.GetElementAsFloat(0) : 1f;
-                // detect missing V projection (global layers): V == raw K
-                _hasVProj[l] = _weights.ContainsKey($"blk.{l}.attn_v.weight") || _quantWeights.ContainsKey($"blk.{l}.attn_v.weight");
+                _ownCache.Tokens = null;
+                _ownCache.Written = false;
             }
         }
 
-        private void CacheStackedExpertWeights()
+        // ---------------------------------------------------------------- prompts
+
+        /// <summary>Prefill <paramref name="promptTokens"/> into the model's own cache (the single-request paths), reusing the
+        /// rows a previous prompt it extends left there.</summary>
+        public void PrefillPrompt(int[] promptTokens) => PrefillActive(promptTokens, ActiveVision, _ownCache, CancellationToken.None);
+
+        /// <summary>Prefill the active cache with <paramref name="prompt"/>: the rows past what <paramref name="cache"/> already holds
+        /// of it (all of them when it holds another prompt or other images), with the image spans of <paramref name="vision"/> in
+        /// those rows written over their placeholders.</summary>
+        private void PrefillActive(int[] prompt, VisionSet vision, PromptCache cache, CancellationToken cancellationToken)
         {
-            int L = Config.NumLayers;
-            _stackedGateUp = new StackedExpertWeights[L];
-            _stackedDown = new StackedExpertWeights[L];
-            _perExpertScale = new float[L][];
-            int ok = 0;
-            for (int l = 0; l < L; l++)
+            ArgumentNullException.ThrowIfNull(prompt);
+            if (prompt.Length == 0) throw new ArgumentException("A prompt needs at least one token.", nameof(prompt));
+            // The canvas after it must fit too: its step's cache growth refuses past the context window.
+            if (MaxContextLength > 0 && prompt.Length >= MaxContextLength)
+                throw new ArgumentException($"The {prompt.Length}-token prompt leaves no room for a canvas in the {MaxContextLength}-token context window.", nameof(prompt));
+            cancellationToken.ThrowIfCancellationRequested();
+            long t0 = Stopwatch.GetTimestamp();
+            _swForward.Start();
+            try
             {
-                string prefix = $"blk.{l}";
-                _stackedExpertWeights.TryGetValue($"{prefix}.ffn_gate_up_exps.weight", out _stackedGateUp[l]);
-                _stackedExpertWeights.TryGetValue($"{prefix}.ffn_down_exps.weight", out _stackedDown[l]);
-                if (_weights.TryGetValue($"{prefix}.ffn_down_exps.scale", out var scaleT))
+                int version = vision?.Version ?? 0;
+                int keep = 0;
+                if (cache.Tokens != null && cache.VisionVersion == version && cache.Tokens.Length <= prompt.Length
+                    && prompt.AsSpan(0, cache.Tokens.Length).SequenceEqual(cache.Tokens))
+                    keep = cache.Tokens.Length;
+                if (keep == 0 && cache.Written) ResetKVCache();
+                cache.Tokens = null;
+                cache.Written = true;
+                if (keep < prompt.Length)
                 {
-                    var scales = new float[_numExperts];
-                    for (int e = 0; e < _numExperts; e++) scales[e] = scaleT.GetElementAsFloat(e);
-                    _perExpertScale[l] = scales;
-                }
-                if (_stackedGateUp[l] != null && _stackedDown[l] != null) ok++;
-            }
-            _fusedMoeAvailable = IsGgmlBackend && ok == L;
-            Console.WriteLine($"  Fused MoE FFN kernel available on {ok}/{L} layers (enabled={_fusedMoeAvailable}).");
-        }
-
-        /// <summary>
-        /// CUDA VRAM residency plan. The fused decode reads EVERY weight every denoising step, and
-        /// ggml's allocator model means a monolithic whole-model graph needs all of them device-resident
-        /// at once — when the model is larger than VRAM, Windows WDDM transparently pages the
-        /// oversubscribed working set in and out of system RAM on every command submission (measured
-        /// ~4.9 s/step for a ~150 ms compute on a 16 GB GPU with a 16 GB model). The fix mirrors
-        /// llama.cpp's partial-offload discipline: never oversubscribe. We preload weights device-side
-        /// in priority order (lm_head/embedding first — it is also read by every step's lm_head tail —
-        /// then per-layer attention/dense weights, then MoE expert stacks by layer) until a budget of
-        /// free-VRAM-minus-headroom is reached, cap incidental device copies (prompt K/V, masks) with
-        /// the device-copy budget, and switch the decode to the SEGMENTED per-layer fused path so the
-        /// non-resident remainder streams through one bounded reused staging buffer (PCIe-speed
-        /// streaming, ~no paging) instead of joining the whole-model graph's working set.
-        /// No-op when everything fits (the whole-model fused graph stays the default) or off-CUDA.
-        /// </summary>
-        private void PrepareCudaWeightResidency()
-        {
-            if (_backend != BackendType.GgmlCuda)
-                return;
-            EnsureQuantBackendAvailable();   // memory query / preloads must hit the CUDA backend
-            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeBytes, out _))
-                return;
-
-            long headroomMb = long.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_VRAM_HEADROOM_MB"), out long hm) && hm > 0 ? hm : 2048;
-            long copyBudgetMb = long.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_DEVICE_COPY_BUDGET_MB"), out long cm) && cm > 0 ? cm : 768;
-            // Opt-in: re-home streamed weights into page-locked private copies (costs RAM equal to
-            // the streamed bytes). Measured neutral on Windows/WDDM (the pageable mmap upload already
-            // ran near DMA speed once the file cache was warm), so default off; may pay off on Linux.
-            bool pinStreamed = Environment.GetEnvironmentVariable("DIFFUSION_PIN_STREAMED") == "1";
-            long preloadBudget = freeBytes - headroomMb * 1024 * 1024;
-
-            // Priority order: tied lm_head/embedding (read by the per-step lm_head tail), per-layer
-            // non-expert weights (attention + dense MLP), then the per-layer expert stacks — the bulk
-            // of the model; whatever does not fit streams per step.
-            var priority = new List<(IntPtr key, IntPtr host, int type, long ne0, long ne1, long bytes)>();
-            void AddQuant(string name)
-            {
-                if (_quantWeights.TryGetValue(name, out var qw) && qw.HasHostData)
-                    priority.Add((qw.CacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes));
-            }
-            AddQuant("token_embd.weight");
-            int L = Config.NumLayers;
-            for (int l = 0; l < L; l++)
-            {
-                AddQuant($"blk.{l}.attn_q.weight");
-                AddQuant($"blk.{l}.attn_k.weight");
-                AddQuant($"blk.{l}.attn_v.weight");
-                AddQuant($"blk.{l}.attn_output.weight");
-                AddQuant($"blk.{l}.ffn_gate.weight");
-                AddQuant($"blk.{l}.ffn_up.weight");
-                AddQuant($"blk.{l}.ffn_down.weight");
-            }
-            for (int l = 0; l < L; l++)
-            {
-                // MoE CPU offload: this layer's experts are multiplied on the host
-                // straight out of the GGUF mmap, so they must not be preloaded —
-                // uploading them here would spend exactly the VRAM --n-cpu-moe
-                // exists to free, and the decode graph never reads the device copy.
-                if (MoeCpuOffloadConfig.IsLayerOnCpu(l))
-                    continue;
-                var gu = _stackedGateUp[l];
-                var dn = _stackedDown[l];
-                if (gu != null) priority.Add((gu.Data, gu.Data, gu.GgmlType, gu.PerExpertNe0, gu.PerExpertNe1 * _numExperts, gu.TotalRawBytes));
-                if (dn != null) priority.Add((dn.Data, dn.Data, dn.GgmlType, dn.PerExpertNe0, dn.PerExpertNe1 * _numExperts, dn.TotalRawBytes));
-            }
-
-            long preloadedBytes = 0;
-            int preloadedCount = 0;
-            long streamedBytes = 0;
-            int streamedCount = 0;
-            long pinnedBytes = 0;
-            foreach (var w in priority)
-            {
-                if (preloadedBytes + w.bytes <= preloadBudget)
-                {
+                    if (vision != null)
+                        foreach ((Tensor rows, int position) in vision.Spans)
+                        {
+                            int count = (int)rows.Sizes[0];
+                            if (position + count > prompt.Length)
+                                throw new InvalidOperationException($"An image span [{position}, {position + count}) runs past the {prompt.Length}-token prompt.");
+                            if (position >= keep) QueueMedia(Ops.NewContiguous(rows), position - keep);
+                            else if (position + count > keep)
+                                throw new InvalidOperationException($"An image span [{position}, {position + count}) straddles the cached rows' end {keep}.");
+                        }
+                    _prefilling = true;
                     try
                     {
-                        if (GgmlBasicOps.PreloadQuantizedWeight(w.key, w.host, w.type, w.ne0, w.ne1, w.bytes))
-                        {
-                            preloadedBytes += w.bytes;
-                            preloadedCount++;
-                            continue;
-                        }
-                        // false: exceeds the device's single-buffer size limit; stream it per step.
+                        ForwardRefill(prompt.AsSpan(keep).ToArray());
                     }
-                    catch (Exception)
+                    finally
                     {
-                        // Device allocation failed despite the budget (fragmentation); treat the rest
-                        // as streamed.
+                        _prefilling = false;
                     }
                 }
-                streamedBytes += w.bytes;
-                streamedCount++;
-                // Re-home the streamed weight into a page-locked private copy so its per-step PCIe
-                // upload uses the fast DMA path (~2x pageable mmap throughput; the mmap itself cannot
-                // be page-locked on Windows). Costs RAM equal to the streamed bytes, so opt out with
-                // DIFFUSION_PIN_STREAMED=0. Unregistered + freed in Dispose.
-                if (pinStreamed)
-                {
-                    IntPtr copy = IntPtr.Zero;
-                    try
-                    {
-                        copy = GgmlBasicOps.AlignedAlloc(w.bytes);
-                        if (copy != IntPtr.Zero)
-                        {
-                            unsafe { Buffer.MemoryCopy((void*)w.host, (void*)copy, w.bytes, w.bytes); }
-                            if (GgmlBasicOps.TryRegisterPinnedHostBuffer(copy, w.bytes))
-                            {
-                                _pinnedHostRegions.Add(copy);
-                                _pinnedStreamCopies[w.key] = copy;
-                                pinnedBytes += w.bytes;
-                            }
-                            else
-                            {
-                                GgmlBasicOps.AlignedFree(copy);
-                            }
-                        }
-                    }
-                    catch (Exception)
-                    {
-                        if (copy != IntPtr.Zero && !_pinnedHostRegions.Contains(copy))
-                            GgmlBasicOps.AlignedFree(copy);
-                    }
-                }
-            }
-
-            bool everythingFits = streamedCount == 0;
-            string segEnv = Environment.GetEnvironmentVariable("DIFFUSION_SEGMENTED_DECODE");
-            _segmentedDecode = segEnv == "1" || (segEnv != "0" && !everythingFits);
-            if (!everythingFits)
-            {
-                // Cap incidental device copies (prompt K/V, decode masks, activations bound by per-op
-                // kernels) so they cannot push VRAM past physical either. When everything fits there is
-                // no oversubscription risk, so it stays unlimited.
-                GgmlBasicOps.SetDeviceCopyBudget(copyBudgetMb * 1024 * 1024);
-            }
-            Console.WriteLine(
-                $"  CUDA weight residency: preloaded {preloadedBytes / 1024 / 1024} MB / {preloadedCount} tensors " +
-                $"(free VRAM {freeBytes / 1024 / 1024} MB, headroom {headroomMb} MB); " +
-                (everythingFits
-                    ? "model fully resident."
-                    : $"streaming {streamedBytes / 1024 / 1024} MB / {streamedCount} tensors per step " +
-                      $"({pinnedBytes / 1024 / 1024} MB page-locked); segmented decode={(_segmentedDecode ? "on" : "off")}, device-copy budget {copyBudgetMb} MB."));
-        }
-
-        private void PrecomputeRoPE()
-        {
-            int localHalf = _localHeadDim / 2;
-            _ropeFreqsLocal = new float[localHalf];
-            for (int i = 0; i < localHalf; i++)
-                _ropeFreqsLocal[i] = (float)(1.0 / Math.Pow(_ropeLocalBase, 2.0 * i / _localHeadDim));
-
-            int globalHalf = _globalHeadDim / 2;
-            _ropeFreqsGlobal = new float[globalHalf];
-            _weights.TryGetValue("rope_freqs.weight", out var ft);
-            _ropeFreqsRawTensor = ft;   // raw factors for the on-device GGML freq-factors kernel
-            float[] freqFactors = ft != null ? TensorToFloatArray(ft) : null;
-            for (int i = 0; i < globalHalf; i++)
-            {
-                double freq = 1.0 / Math.Pow(_ropeGlobalBase, 2.0 * i / _globalHeadDim);
-                if (freqFactors != null && i < freqFactors.Length)
-                    freq /= freqFactors[i];
-                _ropeFreqsGlobal[i] = (float)freq;
-            }
-        }
-
-        private Tensor GetOnes(int dim)
-        {
-            if (!_onesByDim.TryGetValue(dim, out var t))
-            {
-                t = new Tensor(_allocator, DType.Float32, dim);
-                Ops.Fill(t, 1f);
-                _onesByDim[dim] = t;
-            }
-            return t;
-        }
-
-        // ===================================================================================
-        //  Core per-step forward: runs the bidirectional [prompt|canvas] graph and returns the
-        //  canvas logits [C, vocab] (after final softcap) as a flat float[C*vocab].
-        //  scPrevLogits/scUse/prevTempInv drive self-conditioning (scPrevLogits is [C*vocab] raw
-        //  logits from the previous step; scUse is the {0,1} gate; pass null/0 to disable SC).
-        // ===================================================================================
-        public unsafe float[] ForwardCanvas(int[] tokens, int promptLen,
-            float[] scPrevLogits = null, float scUse = 0f, float prevTempInv = 1f)
-        {
-            _swForward.Start();
-            int C = tokens.Length - promptLen;
-            using Tensor hidden = ForwardCanvasHidden(tokens, promptLen, scPrevLogits, scUse, prevTempInv);
-            if (CpuFastPaths)
-            {
-                float[] cpuLogits = CpuLmHead(hidden, 0, C, pooled: true);
-                if (cpuLogits != null)
-                {
-                    _swForward.Stop();
-                    return cpuLogits;
-                }
-            }
-            using Tensor canvasHidden = RMSNormOp(hidden, "output_norm.weight");
-
-            long ts = Stopwatch.GetTimestamp();
-            Tensor logits = LinearForward(canvasHidden, "token_embd.weight");   // [C, vocab]
-            _tLmHead += Stopwatch.GetTimestamp() - ts;
-
-            if (_finalLogitSoftcap > 0f)
-            {
-                Ops.Mul(logits, logits, 1f / _finalLogitSoftcap);
-                Ops.Tanh(logits, logits);
-                Ops.Mul(logits, logits, _finalLogitSoftcap);
-            }
-
-            int total = C * Config.VocabSize;
-            float[] result = ReadbackLogits(logits, total);
-            logits.Dispose();
-
-            _swForward.Stop();
-            return result;
-        }
-
-        private Tensor ForwardCanvasHidden(int[] tokens, int promptLen,
-            float[] scPrevLogits = null, float scUse = 0f, float prevTempInv = 1f,
-            CancellationToken cancellationToken = default)
-        {
-            int N = tokens.Length;
-            int P = promptLen;
-            int C = N - P;
-            int D = Config.HiddenSize;
-            // 1) embeddings, region-aware
-            long ts = Stopwatch.GetTimestamp();
-            Tensor hidden = Embedding(tokens);          // [N, D]
-            try
-            {
-                Ops.Mul(hidden, hidden, MathF.Sqrt(D));     // embed_scale = sqrt(n_embd)
-                // Image soft tokens replace prompt rows in [0,P). They are spliced in AFTER the
-                // sqrt(n_embd) scale (the tower already carries its own scale) and BEFORE
-                // EmbedCanvasRegion, which only touches [P,P+C) - the two regions never overlap.
-                ApplyPendingVisionEmbeddings(hidden, P);
-                EmbedCanvasRegion(hidden, P, C, scPrevLogits, scUse, prevTempInv);
-                _tEmbed += Stopwatch.GetTimestamp() - ts;
-
-                // 2) transformer stack (all glue ops are on-device; per-N caches are rebuilt lazily)
-                for (int l = 0; l < Config.NumLayers; l++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    hidden = TransformerBlock(hidden, l, N, P, C);
-                }
-
-                using var view = hidden.Narrow(0, P, C);
-                return Ops.NewContiguous(view);
-            }
-            finally { hidden.Dispose(); }
-        }
-
-        /// <summary>One device->host read of the canvas logits. On GGML the storage is host-mapped so a
-        /// pointer copy into the reusable buffer is cheapest; on cuda/mlx GetElementsAsFloat is the single
-        /// read-only sync (GetFloatPtr would also force a host->device re-upload).</summary>
-        private unsafe float[] ReadbackLogits(Tensor logits, int total)
-        {
-            if (IsGgmlBackend)
-            {
-                if (_canvasLogits == null || _canvasLogits.Length != total)
-                    _canvasLogits = new float[total];
-                float* lp = GetFloatPtr(logits);
-                fixed (float* dst = _canvasLogits)
-                    Buffer.MemoryCopy(lp, dst, (long)total * 4, (long)total * 4);
-                return _canvasLogits;
-            }
-            return logits.GetElementsAsFloat(total);
-        }
-
-        /// <summary>Replace the canvas rows of <paramref name="hidden"/> with
-        /// rms_norm_noscale(embed*sqrt [+ self-conditioning signal]).</summary>
-        private unsafe void EmbedCanvasRegion(Tensor hidden, int P, int C,
-            float[] scPrevLogits, float scUse, float prevTempInv)
-        {
-            int D = Config.HiddenSize;
-            float eps = Config.Eps;
-            using var canvasView = hidden.Narrow(0, P, C);   // [C, D] contiguous block
-
-            if (_scEnabled && scPrevLogits != null && scUse != 0f)
-            {
-                long ts = Stopwatch.GetTimestamp();
-                using var scSignal = ComputeSelfConditioning(scPrevLogits, C, prevTempInv); // [C, D]
-                Ops.Mul(scSignal, scSignal, scUse);
-                Ops.Add(canvasView, canvasView, scSignal);
-                _tSc += Stopwatch.GetTimestamp() - ts;
-            }
-
-            Ops.RMSNorm(canvasView, canvasView, GetOnes(D), null, eps);
-        }
-
-        private Tensor TransformerBlock(Tensor hidden, int layer, int N, int P, int C)
-        {
-            string prefix = $"blk.{layer}";
-            float eps = Config.Eps;
-
-            long ts = Stopwatch.GetTimestamp();
-            using var attnNormed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
-            Tensor attnOut = Attention(attnNormed, layer, prefix, N, P);
-            try
-            {
-                // post-attention norm + residual
-                Ops.RMSNorm(attnOut, attnOut, _weights[$"{prefix}.post_attention_norm.weight"], null, eps);
-                Ops.Add(attnOut, attnOut, hidden);
-                hidden.Dispose();
-                _tAttn += Stopwatch.GetTimestamp() - ts;
-
-                attnOut = FeedForward(attnOut, layer, prefix, N);
-
-                // region-aware per-layer scalar
-                ApplyRegionScalar(attnOut, layer, P, C);
-                return attnOut;
-            }
-            catch
-            {
-                attnOut.Dispose();
-                throw;
-            }
-        }
-
-        /// <summary>Dense gated-GELU MLP (shared expert) + 128-expert MoE, summed, post-norm + residual.
-        /// Shared by the unified / prefill / decode forwards. Returns attnOut + post_ffw_norm(dense+moe).</summary>
-        private Tensor FeedForward(Tensor attnOut, int layer, string prefix, int N)
-        {
-            float eps = Config.Eps;
-            long ts = Stopwatch.GetTimestamp();
-            using Tensor mlpOut = DenseMlp(attnOut, prefix, N);
-            Ops.RMSNorm(mlpOut, mlpOut, _weights[$"{prefix}.post_ffw_norm_1.weight"], null, eps);
-            _tDense += Stopwatch.GetTimestamp() - ts;
-
-            ts = Stopwatch.GetTimestamp();
-            using (Tensor moeOut = MoEForward(attnOut, layer, prefix, N))
-            {
-                Ops.RMSNorm(moeOut, moeOut, _weights[$"{prefix}.post_ffw_norm_2.weight"], null, eps);
-                Ops.Add(mlpOut, mlpOut, moeOut);
-            }
-            _tMoe += Stopwatch.GetTimestamp() - ts;
-
-            Ops.RMSNorm(mlpOut, mlpOut, _weights[$"{prefix}.post_ffw_norm.weight"], null, eps);
-            Ops.Add(attnOut, attnOut, mlpOut);
-            return attnOut;
-        }
-
-        private void ApplyRegionScalar(Tensor x, int layer, int P, int C)
-        {
-            float enc = _encScale[layer];
-            float dec = _decScale[layer];
-            if (P > 0 && enc != 1f)
-            {
-                using var prompt = x.Narrow(0, 0, P);
-                Ops.Mul(prompt, prompt, enc);
-            }
-            if (C > 0 && dec != 1f)
-            {
-                using var canvas = x.Narrow(0, P, C);
-                Ops.Mul(canvas, canvas, dec);
-            }
-        }
-
-        private Tensor DenseMlp(Tensor input, string prefix, int N)
-        {
-            if (CpuFastPaths)
-            {
-                Tensor fused = CpuDenseMlp(input, prefix, N);
-                if (fused != null) return fused;
-            }
-            using var normed = RMSNormOp(input, $"{prefix}.ffn_norm.weight");
-            using Tensor gate = LinearForward(normed, $"{prefix}.ffn_gate.weight");
-            using (Tensor up = LinearForward(normed, $"{prefix}.ffn_up.weight"))
-                Ops.GELUMul(gate, gate, up);   // gate = gelu(gate) * up
-            Tensor down = LinearForward(gate, $"{prefix}.ffn_down.weight");
-            return down;
-        }
-
-        // ===================================================================================
-        //  Attention: region-aware bidirectional, no KV cache. Q/K per-head RMSNorm, unweighted
-        //  V RMSNorm, NeoX RoPE, attention scale = 1.0. Fully on-device (backend Ops): the scores are
-        //  computed with a batched matmul, the region-aware mask is added as a precomputed additive
-        //  bias tensor, then softmax and the value matmul. This keeps the whole attention block on the
-        //  GPU for ggml_metal / ggml_cuda / mlx / cuda (no host round-trips).
-        // ===================================================================================
-        private Tensor Attention(Tensor input, int layer, string prefix, int N, int P)
-        {
-            // Pure-C# backend: fused Q/K/V dispatch + fused norm/RoPE + the tiled SIMD attention.
-            if (CpuFastPaths)
-                return CpuUnifiedAttention(input, layer, prefix, N, P);
-
-            bool local = _isLocal[layer];
-            int hd = _headDim[layer];
-            int qHeads = Config.NumHeads;
-            int kvHeads = _kvHeads[layer];
-            int groupSize = qHeads / kvHeads;
-            float eps = Config.Eps;
-
-            Tensor q = LinearForward(input, $"{prefix}.attn_q.weight");   // [N, qHeads*hd]
-            Tensor k = LinearForward(input, $"{prefix}.attn_k.weight");   // [N, kvHeads*hd]
-            Tensor v;
-            if (_hasVProj[layer])
-            {
-                v = LinearForward(input, $"{prefix}.attn_v.weight");
-            }
-            else
-            {
-                v = new Tensor(_allocator, DType.Float32, k.Sizes);       // global layers: V == raw K
-                Ops.Copy(v, k);
-            }
-
-            // per-head Q/K norm (with weight), unweighted V norm
-            using (var qr = q.View(N * qHeads, hd))
-                Ops.RMSNorm(qr, qr, _weights[$"{prefix}.attn_q_norm.weight"], null, eps);
-            using (var kr = k.View(N * kvHeads, hd))
-                Ops.RMSNorm(kr, kr, _weights[$"{prefix}.attn_k_norm.weight"], null, eps);
-            using (var vr = v.View(N * kvHeads, hd))
-                Ops.RMSNorm(vr, vr, GetOnes(hd), null, eps);
-
-            if (!_useDeviceGlue)
-            {
-                // CPU fast path: SIMD raw-pointer RoPE + region-aware attention (host-resident).
-                var (cos, sin) = GetCosSinHost(N, local);
-                ApplyNeoXRoPERaw(q, qHeads, hd, N, cos, sin);
-                ApplyNeoXRoPERaw(k, kvHeads, hd, N, cos, sin);
-                Tensor cpuResult = new Tensor(_allocator, DType.Float32, N, qHeads * hd);
-                AttentionRegionAware(q, k, v, cpuResult, N, P, qHeads, kvHeads, hd, local);
-                q.Dispose(); k.Dispose(); v.Dispose();
-                using (cpuResult)
-                    return LinearForward(cpuResult, $"{prefix}.attn_output.weight");
-            }
-
-            // GPU path: everything stays device-resident.
-            // NeoX RoPE on Q and K (in place, on-device); V is not rotated
-            ApplyRoPE(q, qHeads, hd, N, 0, local);
-            ApplyRoPE(k, kvHeads, hd, N, 0, local);
-
-            // head-first [heads, N, hd]
-            using var qH = ReshapeToHeads(q, qHeads, N, hd);
-            using var kH = ReshapeToHeads(k, kvHeads, N, hd);
-            using var vH = ReshapeToHeads(v, kvHeads, N, hd);
-            q.Dispose(); k.Dispose(); v.Dispose();
-
-            Tensor mask = GetAttentionMask(N, P, local);
-            using var result = AttnCoreHeadFirst(qH, kH, vH, mask, N, N, qHeads, kvHeads, hd);
-            return LinearForward(result, $"{prefix}.attn_output.weight");
-        }
-
-        /// <summary>Shared on-device attention core: expand KV heads, batched Q·Kᵀ (scale 1.0), add the
-        /// additive mask (null = none), softmax, batched ·V, and reshape back to flat [qLen, qHeads*hd].</summary>
-        private Tensor AttnCoreHeadFirst(Tensor qH, Tensor kHfull, Tensor vHfull, Tensor mask,
-            int qLen, int kvLen, int qHeads, int kvHeads, int hd)
-        {
-            int groupSize = qHeads / kvHeads;
-            using var kExp = ExpandKVHeads(kHfull, groupSize, kvLen);   // [qHeads, kvLen, hd]
-            using var vExp = ExpandKVHeads(vHfull, groupSize, kvLen);
-            using var kT = kExp.Transpose(1, 2);                        // [qHeads, hd, kvLen]
-            using var scores = new Tensor(_allocator, DType.Float32, qHeads, qLen, kvLen);
-            Ops.AddmmBatch(scores, 0f, scores, 1f, qH, kT);
-            if (mask != null) Ops.Add(scores, scores, mask);
-            Ops.Softmax(scores, scores);
-            using var attnOut = new Tensor(_allocator, DType.Float32, qHeads, qLen, hd);
-            Ops.AddmmBatch(attnOut, 0f, attnOut, 1f, scores, vExp);
-            return ReshapeFromHeads(attnOut, qHeads, qLen, hd);          // [qLen, qHeads*hd]
-        }
-
-        /// <summary>SIMD raw-pointer region-aware attention for CPU backends (the contiguous allowed-key
-        /// window per query lets us score only the unmasked interval). Scale 1.0.</summary>
-        private unsafe void AttentionRegionAware(Tensor qT, Tensor kT, Tensor vT, Tensor outT,
-            int N, int P, int qHeads, int kvHeads, int hd, bool local)
-        {
-            float* q = GetFloatPtr(qT);
-            float* k = GetFloatPtr(kT);
-            float* v = GetFloatPtr(vT);
-            float* o = GetFloatPtr(outT);
-            int groupSize = qHeads / kvHeads;
-            int swa = _slidingWindow;
-
-            var visionSpans = _visionSpans;
-
-            Parallel.For(0, qHeads, h =>
-            {
-                int kvHead = h / groupSize;
-                float[] scores = new float[N];
-                for (int qi = 0; qi < N; qi++)
-                {
-                    bool qCanvas = qi >= P;
-                    AllowedRange(qi, qCanvas, P, N, local, swa, visionSpans, out int klo, out int khi);
-                    if (khi <= klo) khi = klo + 1;
-
-                    float* qVec = q + ((long)qi * qHeads + h) * hd;
-                    float maxScore = float.NegativeInfinity;
-                    for (int kj = klo; kj < khi; kj++)
-                    {
-                        float dot = VecDot(qVec, k + ((long)kj * kvHeads + kvHead) * hd, hd);
-                        scores[kj] = dot;
-                        if (dot > maxScore) maxScore = dot;
-                    }
-                    float sum = 0f;
-                    for (int kj = klo; kj < khi; kj++)
-                    {
-                        float e = MathF.Exp(scores[kj] - maxScore);
-                        scores[kj] = e;
-                        sum += e;
-                    }
-                    float inv = sum > 0f ? 1f / sum : 0f;
-                    float* oVec = o + ((long)qi * qHeads + h) * hd;
-                    VecZero(oVec, hd);
-                    for (int kj = klo; kj < khi; kj++)
-                        VecScaleAdd(oVec, v + ((long)kj * kvHeads + kvHead) * hd, scores[kj] * inv, hd);
-                }
-            });
-            InvalidateTensorDeviceCache(outT);
-        }
-
-        private (float[] cos, float[] sin) GetCosSinHost(int N, bool isLocal)
-        {
-            if (_cosSinHostN != N)
-            {
-                BuildCosSin(N, _ropeFreqsLocal, out _cosLocalHost, out _sinLocalHost);
-                BuildCosSin(N, _ropeFreqsGlobal, out _cosGlobalHost, out _sinGlobalHost);
-                _cosSinHostN = N;
-            }
-            return isLocal ? (_cosLocalHost, _sinLocalHost) : (_cosGlobalHost, _sinGlobalHost);
-        }
-
-        // ---- on-device NeoX RoPE -----------------------------------------------------------
-        /// <summary>In-place NeoX RoPE on a flat [N, numHeads*hd] tensor, on-device. Local layers use a
-        /// single base; global layers use proportional/NTK RoPE (per-frequency <c>rope_freqs</c>). GGML
-        /// backends use the native freq-factors kernel; mlx uses a fused cos/sin kernel; other backends
-        /// fall back to a cos/sin host kernel.</summary>
-        private void ApplyRoPE(Tensor data, int numHeads, int hd, int N, int startPos, bool isLocal)
-        {
-            Tensor pos = GetRoPEPositions(N, numHeads, startPos);
-            using (var view = data.View(1, N, numHeads, hd))
-            {
-                if (isLocal)
-                {
-                    Ops.RoPEEx(view, view, pos, hd, NeoXRopeMode, 0, _ropeLocalBase, 1f, 0f, 1f, 0f, 0f);
-                    return;
-                }
-                if (IsGgmlBackend && _ropeFreqsRawTensor != null)
-                {
-                    GgmlBasicOps.RoPEExWithFreqFactors(view, view, pos, _ropeFreqsRawTensor,
-                        hd, NeoXRopeMode, 0, _ropeGlobalBase, 1f, 0f, 1f, 0f, 0f);
-                    return;
-                }
-            }
-
-            // non-GGML global: proportional RoPE via cos/sin tables (freqs already fold in rope_freqs)
-            int half = hd / 2;
-            var (cosT, sinT) = GetCosSinGlobalTensors(N, half);
-            if (_backend == BackendType.Mlx &&
-                MlxFusedOps.TryNeoXRoPEFlatInPlace(data, cosT, sinT, numHeads, N, hd, half))
-                return;
-
-            ApplyNeoXRoPERaw(data, numHeads, hd, N, _cosGlobalHost, _sinGlobalHost);
-        }
-
-        private Tensor GetRoPEPositions(int N, int numHeads, int startPos)
-        {
-            if (_ropePosN != N)
-            {
-                foreach (var t in _ropePosCache.Values) t?.Dispose();
-                _ropePosCache.Clear();
-                _ropePosN = N;
-            }
-            long key = ((long)numHeads << 32) | (uint)startPos;
-            if (!_ropePosCache.TryGetValue(key, out var pos))
-            {
-                int[] positions = new int[N * numHeads];
-                for (int s = 0; s < N; s++)
-                    for (int h = 0; h < numHeads; h++)
-                        positions[s * numHeads + h] = startPos + s;
-                pos = CreateIntTensor(positions, N * numHeads);
-                _ropePosCache[key] = pos;
-            }
-            return pos;
-        }
-
-        private (Tensor cos, Tensor sin) GetCosSinGlobalTensors(int N, int half)
-        {
-            if (_cosSinGlobalN != N)
-            {
-                BuildCosSin(N, _ropeFreqsGlobal, out _cosGlobalHost, out _sinGlobalHost);
-                _cosGlobalTensor?.Dispose();
-                _sinGlobalTensor?.Dispose();
-                _cosGlobalTensor = CreateFloatTensor(_cosGlobalHost, N * half);
-                _sinGlobalTensor = CreateFloatTensor(_sinGlobalHost, N * half);
-                _cosSinGlobalN = N;
-            }
-            return (_cosGlobalTensor, _sinGlobalTensor);
-        }
-
-        // ---- region-aware additive attention mask -----------------------------------------
-        /// <summary>Returns a cached additive attention mask [maskHeads, N, N] (0 where the key is
-        /// attended, large-negative where masked) for the given layer type. maskHeads is 1 (broadcast)
-        /// on GGML/MLX and qHeads on cuda (which doesn't broadcast element-wise adds).</summary>
-        private Tensor GetAttentionMask(int N, int P, bool local)
-        {
-            // The span version is part of the key: two requests can share (N,P) and differ only in
-            // where their image sits, and a stale mask would give the second image the first one's
-            // bidirectional block.
-            if (_maskN != N || _maskP != P || _maskSpanVersion != _visionSpanVersion)
-            {
-                _maskLocal?.Dispose(); _maskGlobal?.Dispose();
-                _maskLocal = null; _maskGlobal = null;
-                _maskN = N; _maskP = P; _maskSpanVersion = _visionSpanVersion;
-            }
-            if (local && _maskLocal != null) return _maskLocal;
-            if (!local && _maskGlobal != null) return _maskGlobal;
-
-            int qHeads = Config.NumHeads;
-            int maskHeads = _backend == BackendType.Cuda ? qHeads : 1;
-            var data = new float[(long)maskHeads * N * N];
-            for (int qi = 0; qi < N; qi++)
-            {
-                bool qCanvas = qi >= P;
-                AllowedRange(qi, qCanvas, P, N, local, _slidingWindow, _visionSpans, out int klo, out int khi);
-                if (khi <= klo) khi = klo + 1;
-                long rowBase = (long)qi * N;
-                for (int kj = 0; kj < N; kj++)
-                {
-                    float val = (kj >= klo && kj < khi) ? 0f : MaskNeg;
-                    for (int h = 0; h < maskHeads; h++)
-                        data[(long)h * N * N + rowBase + kj] = val;
-                }
-            }
-            var mask = CreateFloatTensor(data, maskHeads, N, N);
-            if (local) _maskLocal = mask; else _maskGlobal = mask;
-            return mask;
-        }
-
-        // ===================================================================================
-        //  Prompt-KV caching (PKV): PrefillPrompt computes the prompt's per-layer K/V once; DecodeCanvas
-        //  then processes only the canvas each denoising step, reading the cached prompt K/V. This is the
-        //  canonical llama.cpp/vLLM diffusion-gemma optimization — it removes the prompt's projection /
-        //  attention / dense-MLP / MoE-matmul work from every step (computed once instead of S times),
-        //  which is a large saving for long prompts (system prompt + chat history). Device-glue (GPU)
-        //  backends below; the pure-C# cpu backend has its own host implementation (DiffusionGemmaModel.Cpu.cs).
-        // ===================================================================================
-
-        /// <summary>Project + per-head-norm + RoPE (positions startPos..startPos+seqLen-1) and reshape Q/K/V
-        /// to head-first [heads, seqLen, hd]. Shared by the unified, prefill and decode forwards.</summary>
-        private void ComputeQKVHeadFirst(Tensor input, int layer, string prefix, int seqLen, int startPos,
-            out Tensor qH, out Tensor kH, out Tensor vH)
-        {
-            bool local = _isLocal[layer];
-            int hd = _headDim[layer];
-            int qHeads = Config.NumHeads;
-            int kvHeads = _kvHeads[layer];
-            float eps = Config.Eps;
-
-            Tensor q = LinearForward(input, $"{prefix}.attn_q.weight");
-            Tensor k = LinearForward(input, $"{prefix}.attn_k.weight");
-            Tensor v;
-            if (_hasVProj[layer]) v = LinearForward(input, $"{prefix}.attn_v.weight");
-            else { v = new Tensor(_allocator, DType.Float32, k.Sizes); Ops.Copy(v, k); }
-
-            using (var qr = q.View(seqLen * qHeads, hd))
-                Ops.RMSNorm(qr, qr, _weights[$"{prefix}.attn_q_norm.weight"], null, eps);
-            using (var kr = k.View(seqLen * kvHeads, hd))
-                Ops.RMSNorm(kr, kr, _weights[$"{prefix}.attn_k_norm.weight"], null, eps);
-            using (var vr = v.View(seqLen * kvHeads, hd))
-                Ops.RMSNorm(vr, vr, GetOnes(hd), null, eps);
-
-            ApplyRoPE(q, qHeads, hd, seqLen, startPos, local);
-            ApplyRoPE(k, kvHeads, hd, seqLen, startPos, local);
-
-            qH = ReshapeToHeads(q, qHeads, seqLen, hd); q.Dispose();
-            kH = ReshapeToHeads(k, kvHeads, seqLen, hd); k.Dispose();
-            vH = ReshapeToHeads(v, kvHeads, seqLen, hd); v.Dispose();
-        }
-
-        /// <summary>Run the prompt through every layer once and cache each layer's prompt K/V (head-first).
-        /// The prompt uses scaled-embedding input, causal attention, and the encoder per-layer scalar.</summary>
-        public void PrefillPrompt(int[] promptTokens)
-        {
-            if (!_pkvEnabled)
-                throw new InvalidOperationException("Prompt-KV caching is not enabled for this backend.");
-
-            AllocPromptStore();
-            _promptLen = PrefillPromptInto(promptTokens, _promptK, _promptV);
-        }
-
-        /// <summary>Core prompt prefill: run the prompt through every layer once and store each layer's
-        /// prompt K/V into <paramref name="outK"/>/<paramref name="outV"/> (head-first [kvHeads, P, hd] on
-        /// the device-glue backends; token-major and SWA-trimmed on the cpu backend, see
-        /// <see cref="PrefillPromptIntoCpu"/>).
-        /// Shared by the single-request (<see cref="PrefillPrompt"/>) and batched (<see cref="PrefillSeq"/>)
-        /// paths. The caller owns/releases the K/V tensors. Returns the prompt length P.</summary>
-        private int PrefillPromptInto(int[] promptTokens, Tensor[] outK, Tensor[] outV,
-            CancellationToken cancellationToken = default)
-        {
-            if (UsesHostPromptKv)
-                return PrefillPromptIntoCpu(promptTokens, outK, outV, cancellationToken);
-
-            int P = promptTokens.Length;
-            int D = Config.HiddenSize;
-            float eps = Config.Eps;
-
-            Tensor hidden = Embedding(promptTokens);
-            try
-            {
-                Ops.Mul(hidden, hidden, MathF.Sqrt(D));   // prompt = embed*sqrt(n_embd) (no rms-norm, no SC)
-                // Image soft tokens replace prompt rows before any layer runs, so the cached prompt
-                // K/V this prefill freezes already carry the image. See DiffusionGemmaModel.Multimodal.cs.
-                ApplyPendingVisionEmbeddings(hidden, P);
-
-                for (int l = 0; l < Config.NumLayers; l++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    string prefix = $"blk.{l}";
-                    bool local = _isLocal[l];
-                    int hd = _headDim[l];
-                    int qHeads = Config.NumHeads;
-                    int kvHeads = _kvHeads[l];
-
-                    using var normed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
-                    ComputeQKVHeadFirst(normed, l, prefix, P, 0, out var qH, out var kH, out var vH);
-
-                    Tensor attnOut;
-                    using (qH) using (kH) using (vH)
-                    {
-                        // cache this layer's prompt K/V for the denoising steps
-                        outK[l] = Ops.NewContiguous(kH);
-                        outV[l] = Ops.NewContiguous(vH);
-
-                        using var attnRes = PromptAttentionCore(qH, kH, vH, P, qHeads, kvHeads, hd, local);
-                        attnOut = LinearForward(attnRes, $"{prefix}.attn_output.weight");
-                    }
-
-                    using Tensor residual = hidden;
-                    hidden = attnOut; // retain ownership if a norm or FFN dispatch throws
-                    Ops.RMSNorm(hidden, hidden, _weights[$"{prefix}.post_attention_norm.weight"], null, eps);
-                    Ops.Add(hidden, hidden, residual);
-                    residual.Dispose();
-
-                    hidden = FeedForward(hidden, l, prefix, P);
-                    if (_encScale[l] != 1f) Ops.Mul(hidden, hidden, _encScale[l]);   // encoder scalar
-                }
-                return P;
-            }
-            finally { hidden.Dispose(); } // only the cached K/V survive a prefill
-        }
-
-        private Tensor PromptAttentionCore(Tensor q, Tensor k, Tensor v,
-            int length, int qHeads, int kvHeads, int headDim, bool local)
-        {
-            if (!UseFusedPromptAttention)
-            {
-                Tensor mask = GetAttentionMask(length, length, local);
-                return AttnCoreHeadFirst(q, k, v, mask, length, length, qHeads, kvHeads, headDim);
-            }
-
-            var result = new Tensor(_allocator, DType.Float32, length, qHeads * headDim);
-            try
-            {
-                // Prompt queries are causal; unlike canvas queries their SWA window moves
-                // with each query. The native mask uses precisely [q-window+1,q]. No KV
-                // expansion, host score download, or separate managed mask is needed.
-                GgmlBasicOps.FusedPrefillAttention(q, k, v, result,
-                    qHeads, kvHeads, headDim, length, length,
-                    maskStartPos: 0, slidingWindow: local ? _slidingWindow : 0, scale: 1f, inputFormat: 0,
-                    matchPerOpPrecision: true);
-                return result;
-            }
-            catch
-            {
-                result.Dispose();
-                throw;
-            }
-        }
-
-        /// <summary>Denoise one canvas step: process only the canvas (positions P..P+C-1), reading the
-        /// cached prompt K/V, and return the canvas logits [C, vocab]. Uses the canvas embedding
-        /// (rms-norm + self-conditioning) and the decoder per-layer scalar.</summary>
-        public unsafe float[] DecodeCanvas(int[] canvasTokens, float[] scPrevLogits, float scUse, float prevTempInv)
-            => DecodeCanvasCore(_promptK, _promptV, _promptLen, canvasTokens, scPrevLogits, scUse, prevTempInv);
-
-        /// <summary>Core single-canvas decode shared by the instance-cached single-request path
-        /// (<see cref="DecodeCanvas"/>) and the batched scheduler's B==1 fast path: the prompt K/V are
-        /// supplied by the caller (<paramref name="pk"/>/<paramref name="pv"/>, length NumLayers) rather
-        /// than read from the instance fields, so the fused decode kernel can be reused per-sequence.</summary>
-        private unsafe float[] DecodeCanvasCore(Tensor[] pk, Tensor[] pv, int P,
-            int[] canvasTokens, float[] scPrevLogits, float scUse, float prevTempInv)
-        {
-            _swForward.Start();
-            int C = canvasTokens.Length;
-            Tensor hidden = DecodeCanvasHidden(pk, pv, P, canvasTokens, scPrevLogits, scUse, prevTempInv);
-
-            if (UsesHostPromptKv)
-            {
-                float[] cpuLogits = CpuLmHead(hidden, 0, C, pooled: true);
-                if (cpuLogits != null)
-                {
-                    hidden.Dispose();
-                    _swForward.Stop();
-                    return cpuLogits;
-                }
-            }
-
-            // Fused lm_head tail (output_norm + lm_head + softcap in one dispatch) - separate small graph,
-            // correct, and cheaper than the per-op RMSNorm + AddmmQuant + softcap + readback chain.
-            if (IsGgmlBackend && !_fusedLmHeadTailDisabled && _fusedLmHeadTailOk)
-            {
-                float[] flLogits = TryFusedLmHead(hidden, C);
-                if (flLogits != null)
-                {
-                    hidden.Dispose();
-                    _swForward.Stop();
-                    return flLogits;
-                }
-                _fusedLmHeadTailOk = false;
-                Console.WriteLine("  [fused lm_head tail] disabled" +
-                    (_fusedLmHeadTailError != null ? $" after error: {_fusedLmHeadTailError}" : ": kernel declined") +
-                    "; using the per-op output_norm + lm_head + softcap chain (slower; on-device sampling also off). " +
-                    "Reported once.");
-            }
-
-            Tensor normedOut = RMSNormOp(hidden, "output_norm.weight");
-            hidden.Dispose();
-
-            long ts = Stopwatch.GetTimestamp();
-            Tensor logits = LinearForward(normedOut, "token_embd.weight");
-            normedOut.Dispose();
-            if (_finalLogitSoftcap > 0f)
-            {
-                Ops.Mul(logits, logits, 1f / _finalLogitSoftcap);
-                Ops.Tanh(logits, logits);
-                Ops.Mul(logits, logits, _finalLogitSoftcap);
-            }
-            _tLmHead += Stopwatch.GetTimestamp() - ts;
-
-            float[] result = ReadbackLogits(logits, C * Config.VocabSize);
-            logits.Dispose();
-            _swForward.Stop();
-            return result;
-        }
-
-        private Tensor DecodeCanvasHidden(Tensor[] pk, Tensor[] pv, int P,
-            int[] canvasTokens, float[] scPrevLogits, float scUse, float prevTempInv,
-            CancellationToken cancellationToken = default)
-        {
-            if (UsesHostPromptKv)
-                return CpuDecodeHidden(pk, pv, P, canvasTokens, scPrevLogits, scUse, prevTempInv, cancellationToken);
-
-            int C = canvasTokens.Length;
-            int D = Config.HiddenSize;
-            float eps = Config.Eps;
-
-            long ts = Stopwatch.GetTimestamp();
-            Tensor hidden = Embedding(canvasTokens);
-            try
-            {
-                Ops.Mul(hidden, hidden, MathF.Sqrt(D));
-                if (_scEnabled && scPrevLogits != null && scUse != 0f)
-                {
-                    long tsc = Stopwatch.GetTimestamp();
-                    using var scSignal = ComputeSelfConditioning(scPrevLogits, C, prevTempInv);
-                    Ops.Mul(scSignal, scSignal, scUse);
-                    Ops.Add(hidden, hidden, scSignal);
-                    _tSc += Stopwatch.GetTimestamp() - tsc;
-                }
-                Ops.RMSNorm(hidden, hidden, GetOnes(D), null, eps);   // canvas = rms_norm_noscale(embed [+ SC])
-                _tEmbed += Stopwatch.GetTimestamp() - ts;
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // Fast path: all transformer layers (attention + dense + MoE) in one fused GGML graph with the
-                // canvas hidden staying on-device across all layers (the throughput win). C# does the lm_head tail.
-                bool fusedLayers = false;
-                if (IsGgmlBackend && _fusedDecodeEnabled && _fusedDecodeOk)
-                {
-                    bool ok = _segmentedDecode
-                        ? TryFusedModelLayersSegmented(hidden, C, P, pk, pv, cancellationToken)
-                        : TryFusedModelLayers(hidden, C, P, pk, pv);
-                    if (ok) fusedLayers = true;
-                    else _fusedDecodeOk = false;
-                }
-
-                for (int l = 0; !fusedLayers && l < Config.NumLayers; l++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    string prefix = $"blk.{l}";
-                    bool local = _isLocal[l];
-                    int hd = _headDim[l];
-                    int qHeads = Config.NumHeads;
-                    int kvHeads = _kvHeads[l];
-
-                    long tA = Stopwatch.GetTimestamp();
-                    using var normed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
-                    ComputeQKVHeadFirst(normed, l, prefix, C, P, out var qH, out var kH, out var vH);
-
-                    Tensor attnOut;
-                    using (qH) using (kH) using (vH)
-                    using (var kFull = Ops.Concat(null, 1, pk[l], kH))   // [kvHeads, P+C, hd]
-                    using (var vFull = Ops.Concat(null, 1, pv[l], vH))
-                    {
-                        Tensor dmask = GetDecodeMask(P, C, local);
-                        using var attnRes = AttnCoreHeadFirst(qH, kFull, vFull, dmask, C, P + C, qHeads, kvHeads, hd);
-                        attnOut = LinearForward(attnRes, $"{prefix}.attn_output.weight");
-                    }
-
-                    using Tensor residual = hidden;
-                    hidden = attnOut;
-                    Ops.RMSNorm(hidden, hidden, _weights[$"{prefix}.post_attention_norm.weight"], null, eps);
-                    Ops.Add(hidden, hidden, residual);
-                    residual.Dispose();
-                    _tAttn += Stopwatch.GetTimestamp() - tA;
-
-                    hidden = FeedForward(hidden, l, prefix, C);
-                    if (_decScale[l] != 1f) Ops.Mul(hidden, hidden, _decScale[l]);   // decoder scalar
-                }
-
-                return hidden;
-            }
-            catch
-            {
-                hidden.Dispose();
-                throw;
-            }
-        }
-
-        // ===================================================================================
-        //  On-device sampled decode (CUDA): run the layers + lm_head, then compute argmax/entropy/
-        //  multinomial/top-K on the device logits in one kernel — only the small per-position outputs
-        //  cross PCIe. Self-conditioning reads the PREVIOUS step's device-computed top-K (no host logits).
-        //  Returns false (caller falls back to the logits path) if any device step is unavailable.
-        // ===================================================================================
-
-        /// <summary>Instance-cached single-canvas decode + on-device sample (prompt-KV path).
-        /// <paramref name="scPrevTopTokens"/>/<paramref name="scPrevTopProbs"/> are the PREVIOUS step's
-        /// device-computed top-K (for self-conditioning; null/scUse=0 on the first step). <paramref name="u"/>
-        /// is the pre-drawn per-position uniform for the multinomial. Fills the caller-owned output arrays.</summary>
-        public unsafe bool DecodeCanvasSampled(int[] canvasTokens,
-            int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv, float[] u, int K,
-            int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
-            => DecodeCanvasSampledCore(_promptK, _promptV, _promptLen, canvasTokens, scPrevTopTokens, scPrevTopProbs,
-                scUse, tempInv, u, K, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
-
-        /// <summary>Per-sequence single-canvas decode + on-device sample (batched scheduler B==1 fast path).</summary>
-        public unsafe bool DecodeCanvasSampledSeq(DiffusionSeqState seq, int[] canvasTokens,
-            int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv, float[] u, int K,
-            int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
-            => DecodeCanvasSampledCore(seq.PromptK, seq.PromptV, seq.PromptLen, canvasTokens, scPrevTopTokens, scPrevTopProbs,
-                scUse, tempInv, u, K, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
-
-        private unsafe bool DecodeCanvasSampledCore(Tensor[] pk, Tensor[] pv, int P,
-            int[] canvasTokens, int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv,
-            float[] u, int K, int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
-        {
-            if (!SupportsDeviceSampling) return false;
-            // device sampling needs the fused/segmented layer path (keeps hidden on-device for the tail)
-            if (!(IsGgmlBackend && _fusedDecodeEnabled && _fusedDecodeOk)) return false;
-
-            _swForward.Start();
-            int C = canvasTokens.Length;
-            int D = Config.HiddenSize;
-            float eps = Config.Eps;
-
-            long ts = Stopwatch.GetTimestamp();
-            Tensor hidden = Embedding(canvasTokens);
-            Ops.Mul(hidden, hidden, MathF.Sqrt(D));
-            if (_scEnabled && scPrevTopTokens != null && scUse != 0f)
-            {
-                long tsc = Stopwatch.GetTimestamp();
-                using var scSignal = ComputeSelfConditioningFromTopK(scPrevTopTokens, scPrevTopProbs, C, K);
-                Ops.Mul(scSignal, scSignal, scUse);
-                Ops.Add(hidden, hidden, scSignal);
-                _tSc += Stopwatch.GetTimestamp() - tsc;
-            }
-            Ops.RMSNorm(hidden, hidden, GetOnes(D), null, eps);
-            _tEmbed += Stopwatch.GetTimestamp() - ts;
-
-            bool ok = _segmentedDecode
-                ? TryFusedModelLayersSegmented(hidden, C, P, pk, pv)
-                : TryFusedModelLayers(hidden, C, P, pk, pv);
-            if (!ok) { _fusedDecodeOk = false; hidden.Dispose(); _swForward.Stop(); return false; }
-
-            bool sampled = TryFusedLmHeadSampleTail(hidden, C, tempInv, u, K,
-                argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
-            hidden.Dispose();
-            _swForward.Stop();
-            if (!sampled) { _deviceSampleOk = false; return false; }
-            return true;
-        }
-
-        /// <summary>Fused lm_head + on-device sample tail: output_norm + lm_head produce device logits, then
-        /// the CUDA kernel computes argmax/entropy/multinomial/top-K directly on them. No 268 MB readback.</summary>
-        private unsafe bool TryFusedLmHeadSampleTail(Tensor hidden, int C, float tempInv, float[] u, int K,
-            int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
-        {
-            try
-            {
-                if (!_quantWeights.TryGetValue("token_embd.weight", out var lmHead)) return false;
-                if (!_weights.ContainsKey("output_norm.weight")) return false;
-                int vocab = Config.VocabSize;
-                bool wantTopK = K > 0 && topTokensOut != null && topProbsOut != null;
-                fixed (float* uPtr = u)
-                fixed (int* amPtr = argmaxOut)
-                fixed (float* enPtr = entropyOut)
-                fixed (int* smPtr = sampledOut)
-                fixed (int* ttPtr = wantTopK ? topTokensOut : null)
-                fixed (float* tpPtr = wantTopK ? topProbsOut : null)
-                {
-                    return GgmlBasicOps.TryDiffusionLmHeadSample(
-                        (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, C,
-                        WPtr("output_norm.weight"),
-                        PinnedOr(lmHead.CacheKey), lmHead.GgmlType, lmHead.Ne0, lmHead.Ne1, lmHead.RawBytes,
-                        vocab, Config.Eps, _finalLogitSoftcap,
-                        tempInv, (IntPtr)uPtr, wantTopK ? K : 0,
-                        (IntPtr)amPtr, (IntPtr)enPtr, (IntPtr)smPtr, (IntPtr)ttPtr, (IntPtr)tpPtr);
-                }
-            }
-            catch (Exception)
-            {
-                return false;
-            }
-        }
-
-        // ===================================================================================
-        //  Batched (multi-sequence) decode — the parallel-request throughput path.
-        //  Multiple in-flight requests' canvases are processed in ONE forward per denoising step:
-        //  the weight-bound work (embedding, dense MLP, 128-expert MoE, lm_head) runs once over all
-        //  B*C canvas tokens (near-free extra throughput on the GPU since the experts/weights are read
-        //  once for B canvases), while the only per-sequence work — attention over each sequence's own
-        //  cached prompt K/V + its own canvas — loops over the B sequences. Per-sequence RoPE positions
-        //  (canvas token i of sequence b lives at absolute position P_b+i) are supplied via an explicit
-        //  positions tensor. Uses the per-op device path (the fused single-graph decode kernel is for the
-        //  single-canvas case); B==1 still takes the fused fast path via DecodeCanvasSeq.
-        //  Device-glue backends here; the pure-C# cpu backend batches on the host (CpuDecodeCanvasBatched).
-        // ===================================================================================
-
-        /// <summary>Allocate a fresh per-sequence decode state (its own prompt K/V store). The caller must
-        /// <see cref="DisposeSeqState"/> it when the request finishes.</summary>
-        public DiffusionSeqState CreateSeqState()
-        {
-            return new DiffusionSeqState(Config.NumLayers);
-        }
-
-        /// <summary>Free a per-sequence state's cached prompt K/V device buffers (invalidate-then-dispose,
-        /// matching <see cref="ReleasePromptKvTensor"/>) and reset its length.</summary>
-        public void DisposeSeqState(DiffusionSeqState seq)
-        {
-            if (seq == null) return;
-            if (seq.PromptK != null)
-                for (int l = 0; l < seq.PromptK.Length; l++) ReleasePromptKvTensor(ref seq.PromptK[l]);
-            if (seq.PromptV != null)
-                for (int l = 0; l < seq.PromptV.Length; l++) ReleasePromptKvTensor(ref seq.PromptV[l]);
-            // Free this sequence's image embeddings with it, so a finished request cannot leak its
-            // picture into whatever runs next.
-            seq.DisposeVision();
-            seq.PromptLen = -1;
-        }
-
-        /// <summary>Prefill one sequence's prompt into its own K/V store (re-runnable per block; releases the
-        /// previous block's K/V first, like <see cref="AllocPromptStore"/>).</summary>
-        public void PrefillSeq(DiffusionSeqState seq, int[] promptTokens)
-        {
-            if (!_pkvEnabled)
-                throw new InvalidOperationException("Prompt-KV caching is not enabled for this backend.");
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                ReleasePromptKvTensor(ref seq.PromptK[l]);
-                ReleasePromptKvTensor(ref seq.PromptV[l]);
-            }
-            // Prefill against THIS sequence's image spans, not any model-level set, so that two
-            // concurrent image requests cannot splice each other's pictures. Scoped rather than
-            // threaded because every prefill already runs serialized under GpuComputeLock.
-            using (UseSequenceVision(seq))
-                seq.PromptLen = PrefillPromptInto(promptTokens, seq.PromptK, seq.PromptV);
-        }
-
-        /// <summary>Single-canvas decode for a request held in a <see cref="DiffusionSeqState"/> (the batched
-        /// scheduler's B==1 fast path — keeps the fused decode kernel for solo requests).</summary>
-        public float[] DecodeCanvasSeq(DiffusionSeqState seq, int[] canvasTokens,
-            float[] scPrevLogits, float scUse, float prevTempInv)
-            => DecodeCanvasCore(seq.PromptK, seq.PromptV, seq.PromptLen, canvasTokens, scPrevLogits, scUse, prevTempInv);
-
-        /// <summary>Decode B canvases in one batched forward, returning each sequence's canvas logits
-        /// [C, vocab]. <paramref name="canvases"/>/<paramref name="scPrev"/>/<paramref name="scUse"/>/
-        /// <paramref name="prevTempInv"/> are per-sequence (length B). Per-op device path; the heavy matmuls
-        /// run once over all B*C rows, attention loops per sequence over its own prompt K/V.</summary>
-        public unsafe float[][] DecodeCanvasBatched(DiffusionSeqState[] seqs, int[][] canvases,
-            float[][] scPrev, float[] scUse, float[] prevTempInv)
-        {
-            if (UsesHostPromptKv)
-                return CpuDecodeCanvasBatched(seqs, canvases, scPrev, scUse, prevTempInv);
-
-            int B = seqs.Length;
-            int C = _canvasLength;
-            int D = Config.HiddenSize;
-            int vocab = Config.VocabSize;
-            float eps = Config.Eps;
-            int N = B * C;
-            int qHeadsAll = Config.NumHeads;
-
-            int[] P = new int[B];
-            for (int b = 0; b < B; b++) P[b] = seqs[b].PromptLen;
-
-            // 1) batched embedding of every canvas, region-aware (canvas = rms_norm_noscale(embed [+ SC])).
-            int[] allTokens = new int[N];
-            for (int b = 0; b < B; b++) Array.Copy(canvases[b], 0, allTokens, b * C, C);
-            Tensor hidden = Embedding(allTokens);          // [N, D]
-            Ops.Mul(hidden, hidden, MathF.Sqrt(D));
-            if (_scEnabled)
-            {
-                for (int b = 0; b < B; b++)
-                {
-                    if (scPrev == null || scPrev[b] == null || scUse[b] == 0f) continue;
-                    using var scSignal = ComputeSelfConditioning(scPrev[b], C, prevTempInv[b]);   // [C, D]
-                    Ops.Mul(scSignal, scSignal, scUse[b]);
-                    using var slice = hidden.Narrow(0, (long)b * C, C);
-                    Ops.Add(slice, slice, scSignal);
-                }
-            }
-            Ops.RMSNorm(hidden, hidden, GetOnes(D), null, eps);
-
-            // per-call caches (avoid thrashing the instance dimension-keyed caches): RoPE positions keyed by
-            // head count, and decode masks keyed by (P, layerType). Disposed at the end of this call.
-            var posCache = new Dictionary<int, Tensor>();
-            var maskCache = new Dictionary<long, Tensor>();
-            Tensor RoPEPositions(int numHeads)
-            {
-                if (!posCache.TryGetValue(numHeads, out var t)) { t = BuildCanvasRoPEPositions(B, C, P, numHeads); posCache[numHeads] = t; }
-                return t;
-            }
-            Tensor DecodeMask(int promptLen, bool local)
-            {
-                long key = ((long)promptLen << 1) | (local ? 1L : 0L);
-                if (!maskCache.TryGetValue(key, out var t)) { t = BuildDecodeMaskTensor(promptLen, C, local); maskCache[key] = t; }
-                return t;   // may be null (no masking needed)
-            }
-
-            try
-            {
-                for (int l = 0; l < Config.NumLayers; l++)
-                {
-                    string prefix = $"blk.{l}";
-                    bool local = _isLocal[l];
-                    int hd = _headDim[l];
-                    int qHeads = Config.NumHeads;
-                    int kvHeads = _kvHeads[l];
-
-                    using var normed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");        // [N, D]
-                    Tensor q = LinearForward(normed, $"{prefix}.attn_q.weight");               // [N, qHeads*hd]
-                    Tensor k = LinearForward(normed, $"{prefix}.attn_k.weight");               // [N, kvHeads*hd]
-                    Tensor v;
-                    if (_hasVProj[l]) v = LinearForward(normed, $"{prefix}.attn_v.weight");
-                    else { v = new Tensor(_allocator, DType.Float32, k.Sizes); Ops.Copy(v, k); }
-
-                    using (var qr = q.View((long)N * qHeads, hd))
-                        Ops.RMSNorm(qr, qr, _weights[$"{prefix}.attn_q_norm.weight"], null, eps);
-                    using (var kr = k.View((long)N * kvHeads, hd))
-                        Ops.RMSNorm(kr, kr, _weights[$"{prefix}.attn_k_norm.weight"], null, eps);
-                    using (var vr = v.View((long)N * kvHeads, hd))
-                        Ops.RMSNorm(vr, vr, GetOnes(hd), null, eps);
-
-                    // NeoX RoPE on Q and K with per-sequence canvas positions (one dispatch each).
-                    ApplyRoPEWithPos(q, qHeads, hd, N, RoPEPositions(qHeads), local);
-                    ApplyRoPEWithPos(k, kvHeads, hd, N, RoPEPositions(kvHeads), local);
-
-                    // per-sequence attention over (cached prompt K/V_b | fresh canvas K/V_b)
-                    var attnOutFull = new Tensor(_allocator, DType.Float32, N, qHeads * hd);
-                    for (int b = 0; b < B; b++)
-                    {
-                        using var qH = SeqSliceToHeads(q, b, C, qHeads, hd);
-                        using var kCanvas = SeqSliceToHeads(k, b, C, kvHeads, hd);
-                        using var vCanvas = SeqSliceToHeads(v, b, C, kvHeads, hd);
-                        using var kFull = Ops.Concat(null, 1, seqs[b].PromptK[l], kCanvas);   // [kvHeads, P_b+C, hd]
-                        using var vFull = Ops.Concat(null, 1, seqs[b].PromptV[l], vCanvas);
-                        Tensor dmask = DecodeMask(P[b], local);
-                        using var attnRes = AttnCoreHeadFirst(qH, kFull, vFull, dmask, C, P[b] + C, qHeads, kvHeads, hd);
-                        using var dst = attnOutFull.Narrow(0, (long)b * C, C);
-                        Ops.Copy(dst, attnRes);
-                    }
-                    q.Dispose(); k.Dispose(); v.Dispose();
-                    InvalidateTensorDeviceCache(attnOutFull);
-
-                    Tensor attnOut = LinearForward(attnOutFull, $"{prefix}.attn_output.weight");   // [N, D]
-                    attnOutFull.Dispose();
-                    Ops.RMSNorm(attnOut, attnOut, _weights[$"{prefix}.post_attention_norm.weight"], null, eps);
-                    Ops.Add(attnOut, attnOut, hidden);
-                    hidden.Dispose();
-
-                    attnOut = FeedForward(attnOut, l, prefix, N);   // dense + MoE batched over all N rows
-                    if (_decScale[l] != 1f) Ops.Mul(attnOut, attnOut, _decScale[l]);   // decoder scalar (all rows are canvas)
-                    hidden = attnOut;
-                }
-
-                // output_norm batched over all rows. The lm_head (the big tied [D, vocab] matmul) reads its
-                // weight once per dispatch, so batching all B*C rows into one dispatch reads that weight ONCE
-                // for the whole batch (a real throughput win for this large-vocab model). The cost is a
-                // [B*C, vocab] logits tensor; when that would exceed the memory cap we fall back to a
-                // per-sequence lm_head (one weight read each, but only a [C, vocab] transient).
-                Tensor normedOut = RMSNormOp(hidden, "output_norm.weight");   // [N, D]
-                hidden.Dispose();
-
-                var results = new float[B][];
-                long logitsBytes = (long)N * vocab * sizeof(float);
-                if (logitsBytes <= LmHeadBatchByteCap)
-                {
-                    Tensor logits = LinearForward(normedOut, "token_embd.weight");   // [N, vocab]
-                    normedOut.Dispose();
-                    if (_finalLogitSoftcap > 0f)
-                    {
-                        Ops.Mul(logits, logits, 1f / _finalLogitSoftcap);
-                        Ops.Tanh(logits, logits);
-                        Ops.Mul(logits, logits, _finalLogitSoftcap);
-                    }
-                    for (int b = 0; b < B; b++)
-                    {
-                        using var slice = logits.Narrow(0, (long)b * C, C);   // [C, vocab]
-                        using var sliceC = Ops.NewContiguous(slice);
-                        results[b] = ReadbackFresh(sliceC, C * vocab);
-                    }
-                    logits.Dispose();
-                }
-                else
-                {
-                    for (int b = 0; b < B; b++)
-                    {
-                        using var hSlice = normedOut.Narrow(0, (long)b * C, C);   // [C, D]
-                        using var hSliceC = Ops.NewContiguous(hSlice);
-                        Tensor logits = LinearForward(hSliceC, "token_embd.weight");   // [C, vocab]
-                        if (_finalLogitSoftcap > 0f)
-                        {
-                            Ops.Mul(logits, logits, 1f / _finalLogitSoftcap);
-                            Ops.Tanh(logits, logits);
-                            Ops.Mul(logits, logits, _finalLogitSoftcap);
-                        }
-                        results[b] = ReadbackFresh(logits, C * vocab);
-                        logits.Dispose();
-                    }
-                    normedOut.Dispose();
-                }
-                return results;
+                cache.Tokens = (int[])prompt.Clone();
+                cache.VisionVersion = version;
             }
             finally
             {
-                foreach (var t in posCache.Values) t?.Dispose();
-                foreach (var t in maskCache.Values) t?.Dispose();
+                _swForward.Stop();
+                _tPrefill += Stopwatch.GetTimestamp() - t0;
             }
         }
 
-        /// <summary>Narrow the b-th canvas (rows [b*C, b*C+C)) out of a batched [N, heads*hd] tensor and
-        /// reshape to head-first [heads, C, hd].</summary>
-        private Tensor SeqSliceToHeads(Tensor batched, int b, int C, int heads, int hd)
+        // ---------------------------------------------------------------- canvas steps
+
+        /// <summary>The canvas logits [C, vocab] (softcapped) of one step after the prefilled prompt. Self-conditioning reads
+        /// <paramref name="scPrevLogits"/> (the previous step's logits) when <paramref name="scUse"/> is not 0. The returned
+        /// buffer may be reused by the next step (a replayed graph's), after that step has read its self-conditioning from it.</summary>
+        public float[] DecodeCanvas(int[] canvasTokens, float[] scPrevLogits, float scUse, float prevTempInv)
+            => CanvasLogits(null, canvasTokens, SoftEmbeddingFromLogits(scPrevLogits, scUse, prevTempInv, canvasTokens.Length));
+
+        /// <summary>Prompt and canvas in one call (<paramref name="tokens"/> = [prompt | canvas], split at
+        /// <paramref name="promptLen"/>): the prompt prefills the model's cache (reusing what it holds), then the canvas runs.</summary>
+        public float[] ForwardCanvas(int[] tokens, int promptLen, float[] scPrevLogits = null, float scUse = 0f, float prevTempInv = 1f)
         {
-            using var slice = batched.Narrow(0, (long)b * C, C);     // [C, heads*hd] (contiguous block)
-            using var sliceC = Ops.NewContiguous(slice);
-            return ReshapeToHeads(sliceC, heads, C, hd);
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (promptLen <= 0 || promptLen >= tokens.Length) throw new ArgumentOutOfRangeException(nameof(promptLen));
+            PrefillPrompt(tokens.AsSpan(0, promptLen).ToArray());
+            return DecodeCanvas(tokens.AsSpan(promptLen).ToArray(), scPrevLogits, scUse, prevTempInv);
         }
 
-        /// <summary>Build the per-sequence canvas RoPE positions tensor [N*numHeads]: canvas token i of
-        /// sequence b is at absolute position P_b+i (so it rotates as the (P_b+i)-th position, matching the
-        /// unbatched decode where the canvas starts at the prompt length).</summary>
-        private Tensor BuildCanvasRoPEPositions(int B, int C, int[] P, int numHeads)
+        /// <summary>One step sampled on the device (<see cref="SupportsDeviceSampling"/>): per canvas position the argmax, the
+        /// entropy of softmax(logits * <paramref name="tempInv"/>), the multinomial draw at <paramref name="u"/> (the first
+        /// token whose cumulative probability reaches it) and, with <paramref name="K"/> &gt; 0, the top-K tokens with their
+        /// softmax over the K at <paramref name="tempInv"/> (the next step's self-conditioning, read from
+        /// <paramref name="scPrevTopTokens"/> / <paramref name="scPrevTopProbs"/>). False when the device cannot sample.</summary>
+        public bool DecodeCanvasSampled(int[] canvasTokens, int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv,
+            float[] u, int K, int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
+            => CanvasSampled(null, canvasTokens, scPrevTopTokens, scPrevTopProbs, scUse, tempInv, u, K, argmaxOut, entropyOut, sampledOut,
+                topTokensOut, topProbsOut);
+
+        /// <summary>The canvas's logits, on <paramref name="sequence"/>'s cache (null: the model's own).</summary>
+        private float[] CanvasLogits(string sequence, int[] canvas, Tensor soft)
         {
-            int N = B * C;
-            int[] positions = new int[(long)N * numHeads];
-            for (int b = 0; b < B; b++)
-                for (int i = 0; i < C; i++)
-                {
-                    int pos = P[b] + i;
-                    int baseOff = (b * C + i) * numHeads;
-                    for (int h = 0; h < numHeads; h++) positions[baseOff + h] = pos;
-                }
-            return CreateIntTensor(positions, (long)N * numHeads);
-        }
-
-        /// <summary>In-place NeoX RoPE on a flat [N, numHeads*hd] tensor using an explicit positions tensor
-        /// (GGML/device-glue backends). Local layers use a single base; global layers use the freq-factors
-        /// (NTK) kernel.</summary>
-        private void ApplyRoPEWithPos(Tensor data, int numHeads, int hd, int N, Tensor pos, bool local)
-        {
-            using var view = data.View(1, N, numHeads, hd);
-            if (local)
-            {
-                Ops.RoPEEx(view, view, pos, hd, NeoXRopeMode, 0, _ropeLocalBase, 1f, 0f, 1f, 0f, 0f);
-                return;
-            }
-            if (IsGgmlBackend && _ropeFreqsRawTensor != null)
-            {
-                GgmlBasicOps.RoPEExWithFreqFactors(view, view, pos, _ropeFreqsRawTensor,
-                    hd, NeoXRopeMode, 0, _ropeGlobalBase, 1f, 0f, 1f, 0f, 0f);
-                return;
-            }
-            // Non-GGML global RoPE in batched mode is not supported (the scheduler restricts batching to
-            // GGML backends); fall back would require per-position cos/sin tables.
-            throw new NotSupportedException("Batched diffusion decode requires a GGML backend for global RoPE.");
-        }
-
-        /// <summary>Build a fresh decode-phase additive mask [maskHeads, C, P+C] (no instance-field caching),
-        /// or null when every key is attended (global layers, or local layers whose prompt fits the window).</summary>
-        private Tensor BuildDecodeMaskTensor(int P, int C, bool local)
-        {
-            int klo = local ? Math.Max(0, P - _slidingWindow + 1) : 0;
-            if (klo == 0) return null;
-            int qHeads = Config.NumHeads;
-            int maskHeads = _backend == BackendType.Cuda ? qHeads : 1;
-            int kvLen = P + C;
-            var data = new float[(long)maskHeads * C * kvLen];
-            for (int qi = 0; qi < C; qi++)
-            {
-                long rowBase = (long)qi * kvLen;
-                for (int kj = 0; kj < kvLen; kj++)
-                {
-                    float val = kj >= klo ? 0f : MaskNeg;
-                    for (int h = 0; h < maskHeads; h++)
-                        data[(long)h * C * kvLen + rowBase + kj] = val;
-                }
-            }
-            return CreateFloatTensor(data, maskHeads, C, kvLen);
-        }
-
-        /// <summary>Read a logits tensor [.., total] into a freshly-allocated host array (batched decode needs
-        /// one array per sequence, so it can't share the single reusable <c>_canvasLogits</c> buffer).</summary>
-        private unsafe float[] ReadbackFresh(Tensor logits, int total)
-        {
-            if (IsGgmlBackend)
-            {
-                var arr = new float[total];
-                float* lp = GetFloatPtr(logits);
-                fixed (float* dst = arr)
-                    Buffer.MemoryCopy(lp, dst, (long)total * 4, (long)total * 4);
-                return arr;
-            }
-            return logits.GetElementsAsFloat(total);
-        }
-
-        private unsafe IntPtr WPtr(string name) => (IntPtr)GetFloatPtr(_weights[name]);
-
-        /// <summary>Swap a streamed weight's pointer for its page-locked private copy when one exists
-        /// (see <see cref="PrepareCudaWeightResidency"/>); identity for resident weights.</summary>
-        private IntPtr PinnedOr(IntPtr weightPtr)
-            => _pinnedStreamCopies.TryGetValue(weightPtr, out var pinned) ? pinned : weightPtr;
-
-        /// <summary>Run a whole diffusion decode layer (attention over cached prompt K/V + canvas, dense MLP,
-        /// 128-expert MoE) as a single fused GGML graph dispatch. Updates <paramref name="hidden"/> in place.
-        /// Returns false (caller uses the per-op path) if any weight is missing or the backend rejects the
-        /// kernel (e.g. flash-attn unsupported for this head_dim).</summary>
-        private unsafe bool TryBuildLayerArgs(int layer, string prefix, int C, int P,
-            bool local, int hd, int kvHeads, Tensor[] pk, Tensor[] pv, out DiffusionDecodeLayerArgs args)
-        {
-            args = default;
+            CachedGraph graph = null;
+            bool owned = false;
+            Tensor embedded = null;
+            long t0 = Stopwatch.GetTimestamp();
+            _swForward.Start();
+            bool bound = Bind(sequence);
             try
             {
-                if (pk == null || pk[layer] == null) return false;
-                if (!_quantWeights.TryGetValue($"{prefix}.attn_q.weight", out var qw)) return false;
-                if (!_quantWeights.TryGetValue($"{prefix}.attn_k.weight", out var kw)) return false;
-                if (!_quantWeights.TryGetValue($"{prefix}.attn_output.weight", out var ow)) return false;
-                if (!_quantWeights.TryGetValue($"{prefix}.ffn_gate.weight", out var gatew)) return false;
-                if (!_quantWeights.TryGetValue($"{prefix}.ffn_up.weight", out var upw)) return false;
-                if (!_quantWeights.TryGetValue($"{prefix}.ffn_down.weight", out var downw)) return false;
-                if (!_weights.TryGetValue($"{prefix}.ffn_gate_inp.weight", out var gateInpW)) return false;
-                var gateUp = _stackedGateUp[layer];
-                var down = _stackedDown[layer];
-                if (gateUp == null || down == null) return false;
-
-                bool hasV = _hasVProj[layer];
-                IntPtr vwPtr = IntPtr.Zero; int vwType = 0; long vwNe0 = 0, vwNe1 = 0, vwBytes = 0;
-                if (hasV)
-                {
-                    if (!_quantWeights.TryGetValue($"{prefix}.attn_v.weight", out var vw)) return false;
-                    vwPtr = vw.CacheKey; vwType = vw.GgmlType; vwNe0 = vw.Ne0; vwNe1 = vw.Ne1; vwBytes = vw.RawBytes;
-                }
-
-                _weights.TryGetValue($"{prefix}.ffn_gate_inp.scale", out var gateInpScale);
-                _weights.TryGetValue($"{prefix}.ffn_down_exps.scale", out var downExpsScale);
-
-                args = new DiffusionDecodeLayerArgs
-                {
-                    Hidden = IntPtr.Zero,   // per-layer path sets this; ignored by model-wide
-                    AttnNormW = WPtr($"{prefix}.attn_norm.weight"),
-                    QW = PinnedOr(qw.CacheKey), KW = PinnedOr(kw.CacheKey), VW = PinnedOr(vwPtr),
-                    QNormW = WPtr($"{prefix}.attn_q_norm.weight"),
-                    KNormW = WPtr($"{prefix}.attn_k_norm.weight"),
-                    OW = PinnedOr(ow.CacheKey),
-                    PostAttnNormW = WPtr($"{prefix}.post_attention_norm.weight"),
-                    PromptK = (IntPtr)GetFloatPtr(pk[layer]),
-                    PromptV = (IntPtr)GetFloatPtr(pv[layer]),
-                    FreqFactors = (!local && _ropeFreqsRawTensor != null) ? (IntPtr)GetFloatPtr(_ropeFreqsRawTensor) : IntPtr.Zero,
-                    FfnNormW = WPtr($"{prefix}.ffn_norm.weight"),
-                    GateW = PinnedOr(gatew.CacheKey), UpW = PinnedOr(upw.CacheKey), DownW = PinnedOr(downw.CacheKey),
-                    PostFfwNorm1W = WPtr($"{prefix}.post_ffw_norm_1.weight"),
-                    GateInpW = (IntPtr)GetFloatPtr(gateInpW),
-                    GateInpScale = gateInpScale != null ? (IntPtr)GetFloatPtr(gateInpScale) : IntPtr.Zero,
-                    PreFfwNorm2W = WPtr($"{prefix}.pre_ffw_norm_2.weight"),
-                    GateUpExps = PinnedOr(gateUp.Data), DownExps = PinnedOr(down.Data),
-                    DownExpsScale = downExpsScale != null ? (IntPtr)GetFloatPtr(downExpsScale) : IntPtr.Zero,
-                    PostFfwNorm2W = WPtr($"{prefix}.post_ffw_norm_2.weight"),
-                    PostFfwNormW = WPtr($"{prefix}.post_ffw_norm.weight"),
-
-                    QNe0 = qw.Ne0, QNe1 = qw.Ne1, QBytes = qw.RawBytes,
-                    KNe0 = kw.Ne0, KNe1 = kw.Ne1, KBytes = kw.RawBytes,
-                    VNe0 = vwNe0, VNe1 = vwNe1, VBytes = vwBytes,
-                    ONe0 = ow.Ne0, ONe1 = ow.Ne1, OBytes = ow.RawBytes,
-                    GateNe0 = gatew.Ne0, GateNe1 = gatew.Ne1, GateBytes = gatew.RawBytes,
-                    UpNe0 = upw.Ne0, UpNe1 = upw.Ne1, UpBytes = upw.RawBytes,
-                    DownNe0 = downw.Ne0, DownNe1 = downw.Ne1, DownBytes = downw.RawBytes,
-                    GueNe0 = gateUp.PerExpertNe0, GueNe1 = gateUp.PerExpertNe1, GueBytes = gateUp.TotalRawBytes,
-                    DeNe0 = down.PerExpertNe0, DeNe1 = down.PerExpertNe1, DeBytes = down.TotalRawBytes,
-
-                    StructBytes = Marshal.SizeOf<DiffusionDecodeLayerArgs>(),
-                    HiddenSize = Config.HiddenSize,
-                    CanvasLen = C, PromptLen = P,
-                    NumHeads = Config.NumHeads, NumKvHeads = kvHeads, HeadDim = hd,
-                    IsLocal = local ? 1 : 0, HasVProj = hasV ? 1 : 0,
-                    SlidingWindow = _slidingWindow, RopeNDims = hd,
-                    NumExperts = _numExperts, NumExpertsUsed = _numExpertsUsed,
-                    FreqFactorsLen = (!local && _ropeFreqsRawTensor != null) ? (int)_ropeFreqsRawTensor.ElementCount() : 0,
-                    QType = qw.GgmlType, KType = kw.GgmlType, VType = vwType, OType = ow.GgmlType,
-                    GateType = gatew.GgmlType, UpType = upw.GgmlType, DownType = downw.GgmlType,
-                    GueType = gateUp.GgmlType, DeType = down.GgmlType,
-                    // MoE CPU offload: this layer's routed experts stay in system
-                    // RAM and its expert matmuls run on the host between
-                    // accelerator graph segments.
-                    CpuMoe = MoeCpuOffloadConfig.IsLayerOnCpu(layer) ? 1 : 0,
-
-                    Eps = Config.Eps,
-                    RopeBase = local ? _ropeLocalBase : _ropeGlobalBase,
-                    InvSqrtHidden = 1f / MathF.Sqrt(Config.HiddenSize),
-                    DecScale = _decScale[layer],
-                };
-
-                return true;
-            }
-            catch (Exception)
-            {
-                return false;
-            }
-        }
-
-        /// <summary>Run all transformer layers (attention over cached prompt K/V + canvas, dense MLP, MoE) as
-        /// ONE fused GGML graph, keeping the canvas hidden on-device across all layers. Updates
-        /// <paramref name="hidden"/> in place with the final layer output; C# then applies output_norm +
-        /// lm_head. Returns false (caller falls back to the per-op layer loop) on any failure.</summary>
-        /// <summary>Fused lm_head tail: output_norm + lm_head + final-logit softcap in one GGML graph
-        /// (separate small graph, so no layer-graph interference). Returns canvas logits [C*vocab], or null
-        /// (caller falls back to the per-op tail) on failure.</summary>
-        private unsafe float[] TryFusedLmHead(Tensor hidden, int C)
-        {
-            try
-            {
-                if (!_quantWeights.TryGetValue("token_embd.weight", out var lmHead)) return null;
-                if (!_weights.ContainsKey("output_norm.weight")) return null;
-                int vocab = Config.VocabSize;
-                long total = (long)C * vocab;
-                // Pooled buffer: each step's logits are fully consumed (sampling + self-conditioning)
-                // before the next step's lm_head overwrites it, so one reusable buffer replaces a
-                // 268 MB LOH allocation per step. (Not cudaHostRegister'ed: ggml registers read-only,
-                // which is for upload sources, and the device WRITES this buffer.)
-                if (_fusedLogitsBuffer == null || _fusedLogitsBuffer.LongLength != total)
-                    _fusedLogitsBuffer = GC.AllocateArray<float>(checked((int)total), pinned: true);
-                float[] logits = _fusedLogitsBuffer;
-                // The kernel outputs RAW logits (no softcap): the in-graph softcap on the 268 MB logits
-                // tensor produces wrong results on Metal (both in-place and fresh-tensor variants), while
-                // host softcap is correct. Apply the final-logit softcap on the host below.
-                fixed (float* logitsPtr = logits)
-                {
-                    bool ok = GgmlBasicOps.TryDiffusionLmHead(
-                        (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, C,
-                        WPtr("output_norm.weight"),
-                        PinnedOr(lmHead.CacheKey), lmHead.GgmlType, lmHead.Ne0, lmHead.Ne1, lmHead.RawBytes,
-                        (IntPtr)logitsPtr, vocab, Config.Eps, 0f);
-                    if (!ok) return null;
-                }
-                if (_finalLogitSoftcap > 0f)
-                {
-                    float sc = _finalLogitSoftcap, inv = 1f / sc;
-                    System.Threading.Tasks.Parallel.For(0, C, c =>
-                    {
-                        var row = logits.AsSpan(c * vocab, vocab);
-                        TensorPrimitives.Multiply(row, inv, row);
-                        TensorPrimitives.Tanh(row, row);
-                        TensorPrimitives.Multiply(row, sc, row);
-                    });
-                }
+                int rows = canvas.Length, vocab = Config.VocabSize;
+                embedded = Embedding(canvas);
+                graph = RunBlockRows(null, new[] { rows }, step => EmitCanvas(step, embedded, soft, CanvasHead.Logits, null),
+                    out StepOutputs outputs, out owned, "diffusion-canvas");
+                long tr = Stopwatch.GetTimestamp();
+                float[] logits = graph.Outputs[outputs.Logits];
+                // A graph that goes with this call (a streamed step) read its logits into an array of their own, which no
+                // later step writes: it is the answer as it stands. Copied, every pure-C# step moved 268 MB once more.
+                long total = (long)rows * vocab;
+                if (owned && logits.LongLength != total) logits = logits.AsSpan(0, checked((int)total)).ToArray();
+                _tRead += Stopwatch.GetTimestamp() - tr;
+                _canvasSteps++;
                 return logits;
             }
-            catch (Exception ex)
+            finally
             {
-                _fusedLmHeadTailError = ex.Message;
-                return null;
+                if (owned) graph?.Dispose();
+                embedded?.Dispose();
+                soft?.Dispose();
+                if (bound) RestorePrimaryCache();
+                _swForward.Stop();
+                _tCanvas += Stopwatch.GetTimestamp() - t0;
             }
         }
 
-        private unsafe bool TryFusedModelLayers(Tensor hidden, int C, int P, Tensor[] pk, Tensor[] pv)
+        private bool CanvasSampled(string sequence, int[] canvas, int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv,
+            float[] u, int K, int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
         {
+            if (!SupportsDeviceSampling) return false;
+            int rows = canvas.Length;
+            bool wantTopK = K > 0 && topTokensOut != null && topProbsOut != null;
+            int k = wantTopK ? Math.Min(K, Config.VocabSize) : 0;
+            Tensor soft = _scEnabled && scUse != 0f && scPrevTopTokens != null && scPrevTopProbs != null
+                ? SoftEmbedding(scPrevTopTokens, scPrevTopProbs, rows, Math.Min(K, Config.VocabSize)) : null;
+            var sampling = new SamplingInputs(rows, k, tempInv, u);
+            CachedGraph graph = null;
+            bool owned = false;
+            Tensor embedded = null;
+            long t0 = Stopwatch.GetTimestamp();
+            _swForward.Start();
+            bool bound = Bind(sequence);
             try
             {
-                int L = Config.NumLayers;
-                var layers = new DiffusionDecodeLayerArgs[L];
-                for (int l = 0; l < L; l++)
-                {
-                    if (!TryBuildLayerArgs(l, $"blk.{l}", C, P, _isLocal[l], _headDim[l], _kvHeads[l], pk, pv, out layers[l]))
-                        return false;
-                }
-
-                bool ok = GgmlBasicOps.TryDiffusionModelDecode(
-                    layers, L,
-                    (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, C, P,
-                    IntPtr.Zero, IntPtr.Zero, 0, 0L, 0L, 0L,   // lm_head done per-op in C#; kernel outputs the final hidden
-                    IntPtr.Zero, 0, 0f);
-                if (!ok) return false;
-                InvalidateTensorDeviceCache(hidden);   // hidden now holds the final layer output
+                embedded = Embedding(canvas);
+                graph = RunBlockRows(null, new[] { rows }, step => EmitCanvas(step, embedded, soft, CanvasHead.Sample, sampling),
+                    out StepOutputs outputs, out owned, "diffusion-canvas-sample");
+                long tr = Stopwatch.GetTimestamp();
+                ReadSampling(graph, outputs, rows, k, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
+                _tRead += Stopwatch.GetTimestamp() - tr;
+                _canvasSteps++;
                 return true;
             }
-            catch (Exception)
+            finally
             {
-                return false;
+                if (owned) graph?.Dispose();
+                embedded?.Dispose();
+                soft?.Dispose();
+                if (bound) RestorePrimaryCache();
+                _swForward.Stop();
+                _tCanvas += Stopwatch.GetTimestamp() - t0;
             }
         }
 
-        /// <summary>Segmented fused decode: one fused graph dispatch PER LAYER instead of one
-        /// whole-model graph. Numerically identical (the per-layer kernel computes the same layer
-        /// math), but each layer's non-resident weights stream through one bounded, reused staging
-        /// buffer (alloc_ctx_tensors_reuse) rather than the whole model's spill coexisting in VRAM —
-        /// the mode <see cref="PrepareCudaWeightResidency"/> selects when the model is larger than
-        /// VRAM. Costs a small per-layer hidden host round-trip ([H, C] ≈ a few MB).
-        /// Returns false only on layer-0 rejection (clean fallback to the per-op path); a mid-model
-        /// failure cannot fall back (hidden is partially transformed) and throws instead.</summary>
-        private unsafe bool TryFusedModelLayersSegmented(Tensor hidden, int C, int P, Tensor[] pk, Tensor[] pv,
-            CancellationToken cancellationToken = default)
+        /// <summary>Bind <paramref name="sequence"/>'s cache (true: the caller restores the primary after), or keep the active one.</summary>
+        private bool Bind(string sequence)
         {
-            int L = Config.NumLayers;
-            var args = new DiffusionDecodeLayerArgs[L];
-            for (int l = 0; l < L; l++)
-            {
-                if (!TryBuildLayerArgs(l, $"blk.{l}", C, P, _isLocal[l], _headDim[l], _kvHeads[l], pk, pv, out args[l]))
-                    return false;
-            }
-            IntPtr hiddenPtr = (IntPtr)GetFloatPtr(hidden);
-            try
-            {
-                for (int l = 0; l < L; l++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    args[l].Hidden = hiddenPtr;
-                    if (!GgmlBasicOps.TryDiffusionDecodeLayer(in args[l]))
-                    {
-                        if (l == 0) return false;   // hidden untouched -> caller can fall back cleanly
-                        throw new InvalidOperationException(
-                            $"Segmented diffusion decode failed at layer {l} after earlier layers ran; cannot fall back mid-model.");
-                    }
-                }
-                return true;
-            }
-            finally { InvalidateTensorDeviceCache(hidden); }
-        }
-
-        private void AllocPromptStore()
-        {
-            if (_promptK == null) { _promptK = new Tensor[Config.NumLayers]; _promptV = new Tensor[Config.NumLayers]; }
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                // The fused/per-layer GGML decode binds the prompt K/V as *cacheable* device-local
-                // copies keyed by their host pointer (try_get_cacheable_tensor_buffer, USAGE_COMPUTE in
-                // ggml_ops_diffusion.cpp). Every block reallocates the prompt K/V at a new (growing)
-                // size and host address, so the previous block's device buffers are orphaned in
-                // g_host_buffer_cache: disposing the tensor only frees the host pool block, never the
-                // cached MTLBuffer. With block-autoregressive generation (MaxBlocks = maxTokens/canvas)
-                // this leaks dozens of K/V device buffers per turn and exhausts the Metal command-buffer
-                // memory budget within a couple of turns (kIOGPUCommandBufferCallbackErrorOutOfMemory).
-                // Invalidate the cache entry (frees the device buffer) *before* disposing the tensor,
-                // while its host pointer is still valid as the cache key.
-                ReleasePromptKvTensor(ref _promptK[l]);
-                ReleasePromptKvTensor(ref _promptV[l]);
-            }
-        }
-
-        /// <summary>Free a cached prompt K/V tensor: drop its GGML device-buffer-cache entry (so the
-        /// device-local copy bound during decode is reclaimed, not orphaned) and then dispose the host
-        /// storage. Order matters — the cache is keyed by the host pointer, which is only valid until
-        /// dispose returns it to the pool / unmaps it.</summary>
-        private void ReleasePromptKvTensor(ref Tensor t)
-        {
-            if (t == null) return;
-            // Drain any in-flight GPU work that may still reference this tensor's device-local copy
-            // before we free that buffer. invalidate_cached_buffer -> ggml_backend_buffer_free is an
-            // *eager* free; under Metal async-compute a pending command buffer can still hold the
-            // MTLBuffer (see the eager-free hazard documented in ggml_ops_core.cpp::sync_cached_buffer_to_host).
-            // In the denoise loop the prior step's logits readback already drains the queue, so this is a
-            // cheap no-op in practice (single atomic check), but it keeps the free correct if that readback
-            // path ever changes. No-op on non-GGML backends.
-            t.Storage.EnsureHostReadable();
-            InvalidateTensorDeviceCache(t);
-            t.Dispose();
-            t = null;
-        }
-
-        /// <summary>Decode-phase additive mask [maskHeads, C, P+C], or null when every key is attended
-        /// (global layers, or local layers whose prompt fits within the sliding window — the common case).</summary>
-        private Tensor GetDecodeMask(int P, int C, bool local)
-        {
-            int klo = local ? Math.Max(0, P - _slidingWindow + 1) : 0;
-            if (klo == 0) return null;   // all keys allowed -> no masking
-
-            if (_decodeMaskP != P || _decodeMaskC != C)
-            {
-                _decodeMaskLocal?.Dispose(); _decodeMaskGlobal?.Dispose();
-                _decodeMaskLocal = null; _decodeMaskGlobal = null;
-                _decodeMaskP = P; _decodeMaskC = C;
-            }
-            if (local && _decodeMaskLocal != null) return _decodeMaskLocal;
-            if (!local && _decodeMaskGlobal != null) return _decodeMaskGlobal;
-
-            int qHeads = Config.NumHeads;
-            int maskHeads = _backend == BackendType.Cuda ? qHeads : 1;
-            int kvLen = P + C;
-            var data = new float[(long)maskHeads * C * kvLen];
-            for (int qi = 0; qi < C; qi++)
-            {
-                long rowBase = (long)qi * kvLen;
-                for (int kj = 0; kj < kvLen; kj++)
-                {
-                    float val = kj >= klo ? 0f : MaskNeg;
-                    for (int h = 0; h < maskHeads; h++)
-                        data[(long)h * C * kvLen + rowBase + kj] = val;
-                }
-            }
-            var mask = CreateFloatTensor(data, maskHeads, C, kvLen);
-            if (local) _decodeMaskLocal = mask; else _decodeMaskGlobal = mask;
-            return mask;
-        }
-
-        /// <summary>The region-aware DiffusionGemma mask always admits a contiguous key interval
-        /// [klo, khi) per query. Mirrors the per-(q,k) rule from the llama.cpp reference:
-        ///  - prompt query: causal over the prompt (SWA-clipped on local layers), never the canvas;
-        ///  - canvas query (global): all positions; canvas query (local): all canvas + the last
-        ///    (swa-1) prompt positions.
-        /// <paramref name="visionSpans"/> (may be empty) widens a prompt query that sits inside an image
-        /// soft-token span so the whole span is visible - bidirectional image attention, on LOCAL layers
-        /// only, exactly as vLLM's gemma4_mm does. The interval stays contiguous; see
-        /// <c>ExtendKhiForVisionSpan</c> in DiffusionGemmaModel.Multimodal.cs for why.</summary>
-        private static void AllowedRange(int qi, bool qCanvas, int P, int N, bool local, int swa,
-            (int Start, int Length)[] visionSpans, out int klo, out int khi)
-        {
-            if (qCanvas)
-            {
-                klo = local ? Math.Max(0, P - swa + 1) : 0;
-                khi = N;
-            }
-            else
-            {
-                klo = local ? Math.Max(0, qi - swa + 1) : 0;
-                khi = qi + 1;
-                // GLOBAL (full-attention) layers keep plain causal masking over image spans.
-                if (local && visionSpans != null && visionSpans.Length != 0)
-                    khi = ExtendKhiForVisionSpan(qi, khi, swa, visionSpans);
-            }
-        }
-
-        // ===================================================================================
-        //  MoE: 128-expert top-8 softmax routing + per-expert gated-GELU FFN, batched by expert.
-        // ===================================================================================
-        private unsafe Tensor MoEForward(Tensor attnOut, int layer, string prefix, int N)
-        {
-            int D = Config.HiddenSize;
-            using var moeInput = RMSNormOp(attnOut, $"{prefix}.pre_ffw_norm_2.weight");  // [N, D]
-            var output = new Tensor(_allocator, DType.Float32, N, D);
-
-            long tr = Stopwatch.GetTimestamp();
-            (float[] routingWeights, int[] selectedExperts) = MoERoute(attnOut, prefix, N);
-            _tMoeRoute += Stopwatch.GetTimestamp() - tr;
-
-            // Fast path: single fused ggml_mul_mat_id dispatch over all experts (GGML backends).
-            long tf = Stopwatch.GetTimestamp();
-            if (_fusedMoeAvailable && TryFusedMoE(moeInput, output, selectedExperts, routingWeights, layer, N, D))
-            {
-                _tMoeFfn += Stopwatch.GetTimestamp() - tf;
-                return output;
-            }
-
-            // MLX device path: per-expert gather -> FFN -> weighted scatter-add, all on-device.
-            if (_backend == BackendType.Mlx &&
-                TryMoEMlx(moeInput, output, selectedExperts, routingWeights, layer, prefix, N, D))
-                return output;
-
-            // Pure-C# backend: every expert's projections batched into two dispatches.
-            if (CpuFastPaths &&
-                CpuMoEFfn(moeInput, output, selectedExperts, routingWeights, layer, N, D))
-            {
-                _tMoeFfn += Stopwatch.GetTimestamp() - tf;
-                return output;
-            }
-
-            // Host fallback (direct cuda + any backend the above paths reject): correct everywhere
-            // (storage marks host writes dirty so the device re-reads), at the cost of per-layer syncs.
-            Ops.Fill(output, 0f);
-            float* inPtr = GetFloatPtr(moeInput);
-            float* outPtr = GetFloatPtr(output);
-
-            // per-expert post-down scale
-            float[] perExpertScale = null;
-            if (_weights.TryGetValue($"{prefix}.ffn_down_exps.scale", out var scaleT))
-            {
-                perExpertScale = new float[_numExperts];
-                for (int e = 0; e < _numExperts; e++) perExpertScale[e] = scaleT.GetElementAsFloat(e);
-            }
-
-            // group tokens by expert
-            var batches = new List<(int token, float weight)>[_numExperts];
-            for (int e = 0; e < _numExperts; e++) batches[e] = new List<(int, float)>();
-            for (int s = 0; s < N; s++)
-                for (int u = 0; u < _numExpertsUsed; u++)
-                {
-                    int e = selectedExperts[s * _numExpertsUsed + u];
-                    batches[e].Add((s, routingWeights[s * _numExpertsUsed + u]));
-                }
-
-            int rowBytes = D * sizeof(float);
-            for (int e = 0; e < _numExperts; e++)
-            {
-                var batch = batches[e];
-                if (batch.Count == 0) continue;
-                int cnt = batch.Count;
-
-                var batchInput = new Tensor(_allocator, DType.Float32, cnt, D);
-                float* bp = GetFloatPtr(batchInput);
-                for (int b = 0; b < cnt; b++)
-                    Buffer.MemoryCopy(inPtr + (long)batch[b].token * D, bp + (long)b * D, rowBytes, rowBytes);
-
-                Tensor expertOut = ExpertFFN(batchInput, prefix, e, cnt);
-                batchInput.Dispose();
-
-                if (perExpertScale != null && perExpertScale[e] != 1f)
-                    Ops.Mul(expertOut, expertOut, perExpertScale[e]);
-
-                float* ep = GetFloatPtr(expertOut);
-                for (int b = 0; b < cnt; b++)
-                {
-                    int token = batch[b].token;
-                    float w = batch[b].weight;
-                    float* src = ep + (long)b * D;
-                    float* dst = outPtr + (long)token * D;
-                    for (int d = 0; d < D; d++) dst[d] += w * src[d];
-                }
-                expertOut.Dispose();
-            }
-            InvalidateTensorDeviceCache(output);
-            return output;
-        }
-
-        /// <summary>Single-dispatch MoE FFN over all experts via the native ggml_mul_mat_id kernel.
-        /// The per-expert post-down scale is folded into the routing weights. Returns false (and the
-        /// caller falls back to the per-expert loop) if the kernel rejects the layout.</summary>
-        private bool TryFusedMoE(Tensor moeInput, Tensor output, int[] selectedExperts,
-            float[] routingWeights, int layer, int N, int D)
-        {
-            var gateUp = _stackedGateUp[layer];
-            var down = _stackedDown[layer];
-            int nFf = (int)(gateUp.PerExpertNe1 / 2);   // pre-fused gate_up -> ne1 = 2*expertFfn
-            int nUsed = _numExpertsUsed;
-
-            // fold per-expert scale into the routing weights (kernel applies one scalar per route)
-            float[] kernelWeights = routingWeights;
-            float[] scale = _perExpertScale[layer];
-            if (scale != null)
-            {
-                kernelWeights = new float[N * nUsed];
-                for (int s = 0; s < N; s++)
-                    for (int k = 0; k < nUsed; k++)
-                    {
-                        int idx = s * nUsed + k;
-                        kernelWeights[idx] = routingWeights[idx] * scale[selectedExperts[idx]];
-                    }
-            }
-
-            try
-            {
-                GgmlBasicOps.MoEFFNPrefill(
-                    moeInput, output,
-                    N, D, nFf, _numExperts, nUsed,
-                    selectedExperts, kernelWeights,
-                    gateUp.Data, gateUp.GgmlType, gateUp.PerExpertNe0, gateUp.PerExpertNe1, gateUp.TotalRawBytes,
-                    IntPtr.Zero, 0, 0L, 0L, 0L,             // up == null -> fused gate_up, kernel splits internally
-                    down.Data, down.GgmlType, down.PerExpertNe0, down.PerExpertNe1, down.TotalRawBytes,
-                    gateBias: null, upBias: null, downBias: null,
-                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit,
-                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
-                InvalidateTensorDeviceCache(output);
-                return true;
-            }
-            catch (NotSupportedException)
-            {
-                return false;
-            }
-        }
-
-        /// <summary>On-device MLX MoE: group tokens by expert, then per expert gather the assigned rows,
-        /// run the gated-GELU expert FFN, and weighted-scatter-add back — using MLX's device gather/scatter
-        /// kernels so no rows ever round-trip through host memory. The per-expert post-down scale is folded
-        /// into the scatter weights. Returns false (caller uses the host fallback) if a kernel rejects the
-        /// layout.</summary>
-        private bool TryMoEMlx(Tensor moeInput, Tensor output, int[] selectedExperts,
-            float[] routingWeights, int layer, string prefix, int N, int D)
-        {
-            float[] perExpertScale = _perExpertScale[layer];
-            var batchTokens = new List<int>[_numExperts];
-            var batchWeights = new List<float>[_numExperts];
-            for (int e = 0; e < _numExperts; e++) { batchTokens[e] = new List<int>(); batchWeights[e] = new List<float>(); }
-            for (int s = 0; s < N; s++)
-                for (int u = 0; u < _numExpertsUsed; u++)
-                {
-                    int e = selectedExperts[s * _numExpertsUsed + u];
-                    float w = routingWeights[s * _numExpertsUsed + u];
-                    if (perExpertScale != null) w *= perExpertScale[e];
-                    batchTokens[e].Add(s);
-                    batchWeights[e].Add(w);
-                }
-
-            Ops.Fill(output, 0f);
-            for (int e = 0; e < _numExperts; e++)
-            {
-                int cnt = batchTokens[e].Count;
-                if (cnt == 0) continue;
-                using var rowIndices = CreateIntTensor(batchTokens[e].ToArray(), cnt);
-                using var routeWeights = CreateFloatTensor(batchWeights[e].ToArray(), cnt);
-                using var batchInput = new Tensor(_allocator, DType.Float32, cnt, D);
-                if (!MlxFusedOps.TryGatherRows(batchInput, moeInput, rowIndices))
-                    return false;
-                Tensor expertOut = ExpertFFN(batchInput, prefix, e, cnt);   // [cnt, D]
-                bool ok = MlxFusedOps.TryScatterAddWeightedRows(output, expertOut, rowIndices, routeWeights);
-                expertOut.Dispose();
-                if (!ok) return false;
-            }
+            if (sequence == null) return false;
+            BindSequenceCache(sequence);
             return true;
         }
 
-        private Tensor ExpertFFN(Tensor input, string prefix, int expert, int cnt)
+        private void ReadSampling(CachedGraph graph, in StepOutputs outputs, int rows, int k, int[] argmaxOut, float[] entropyOut,
+            int[] sampledOut, int[] topTokensOut, float[] topProbsOut, int offset = 0)
         {
-            // gate_up are fused in this checkpoint: ffn_gate_up_exps.{e}.weight -> [cnt, 2*expertFfn]
-            Tensor gateUp = LinearForward(input, $"{prefix}.ffn_gate_up_exps.{expert}.weight");
-            int half = _expertFfn;
-            Tensor gate, up;
-            using (var gv = gateUp.Narrow(1, 0, half)) gate = Ops.NewContiguous(gv);
-            using (var uv = gateUp.Narrow(1, half, half)) up = Ops.NewContiguous(uv);
-            gateUp.Dispose();
-            Ops.GELUMul(gate, gate, up);
-            up.Dispose();
-            Tensor down = LinearForward(gate, $"{prefix}.ffn_down_exps.{expert}.weight");
-            gate.Dispose();
-            return down;
-        }
-
-        private unsafe (float[] routingWeights, int[] selectedExperts) MoERoute(Tensor input, string prefix, int N)
-        {
-            int D = Config.HiddenSize;
-            float eps = Config.Eps;
-
-            using var normed = Ops.NewContiguous(input);
-            Ops.RMSNorm(normed, normed, GetOnes(D), null, eps);       // unweighted RMSNorm
-            Ops.Mul(normed, normed, 1f / MathF.Sqrt(D));
-            if (_weights.TryGetValue($"{prefix}.ffn_gate_inp.scale", out var scale))
-                Ops.Mul(normed, normed, scale);                       // per-dim learned scale
-
-            int E = _numExperts;
-            int K = _numExpertsUsed;
-            float[] scoresArr = CpuFastPaths ? CpuRouterScores(normed, prefix, N) : null;
-            if (scoresArr == null)
-            {
-                using var scores = LinearForward(normed, $"{prefix}.ffn_gate_inp.weight");  // [N, numExperts]
-                scoresArr = scores.GetElementsAsFloat(N * E);   // one read-only device->host copy
-            }
-
-            var routingWeights = new float[N * K];
-            var selectedExperts = new int[N * K];
-
-            fixed (float* sp = scoresArr)
-            for (int s = 0; s < N; s++)
-            {
-                float* row = sp + (long)s * E;
-                // softmax over all experts
-                float max = float.NegativeInfinity;
-                for (int i = 0; i < E; i++) if (row[i] > max) max = row[i];
-                float sum = 0f;
-                for (int i = 0; i < E; i++) { float ex = MathF.Exp(row[i] - max); row[i] = ex; sum += ex; }
-                float invSum = sum > 0f ? 1f / sum : 0f;
-                for (int i = 0; i < E; i++) row[i] *= invSum;
-
-                // top-K selection by probability
-                int off = s * K;
-                float selSum = 0f;
-                for (int kk = 0; kk < K; kk++)
-                {
-                    int best = -1; float bestV = float.NegativeInfinity;
-                    for (int i = 0; i < E; i++)
-                    {
-                        float val = row[i];
-                        if (val > bestV) { bestV = val; best = i; }
-                    }
-                    selectedExperts[off + kk] = best;
-                    routingWeights[off + kk] = bestV;
-                    selSum += bestV;
-                    row[best] = float.NegativeInfinity; // exclude from next pick
-                }
-                // renormalize over selected
-                if (selSum > 0f)
-                {
-                    float inv = 1f / selSum;
-                    for (int kk = 0; kk < K; kk++) routingWeights[off + kk] *= inv;
-                }
-            }
-            return (routingWeights, selectedExperts);
-        }
-
-        // ===================================================================================
-        //  Self-conditioning: soft_emb = (softmax(prev_logits*temp_inv) @ token_embd) * sqrt(D),
-        //  then a gated-GELU MLP. Returns the additive signal [C, D].
-        //
-        //  The softmax is sharply concentrated (temp_inv in [1.25, 2.5]) so we use a top-K
-        //  soft-embedding: only the K highest-probability tokens contribute meaningfully. This
-        //  turns the otherwise dense [C, vocab] x [vocab, D] matmul (189 GFLOP/step + a 3 GB
-        //  dense embedding table) into C*K embedding-row lookups + a weighted sum, a ~1000x
-        //  reduction with negligible numerical impact (the tail mass is ~0 and is re-normalized
-        //  away by the subsequent RMSNorm).
-        //
-        //  K = 32 (was 128): the dominant SC cost is the on-device gather of the C*K embedding
-        //  rows (each row a Q4_K dequant), NOT the host top-K (~7 ms). Measured on Metal
-        //  (diffusiongemma-26B-A4B, C=256, vocab=262144): K=128 -> ~1065 ms/decode-step, K=32 ->
-        //  ~660 ms, K=16/8 -> ~634 ms (the SC-off floor is ~580 ms). A tempInv>=1.25 softmax puts
-        //  >0.9999 of its mass in the top 32 tokens, so K=32 is numerically indistinguishable from
-        //  K=128 (verified: Paris / FF7 coherence tests unchanged) while running ~1.6x faster.
-        //  Tunable via DIFFUSION_SC_TOPK for experiments.
-        // ===================================================================================
-        private static readonly int ScTopK =
-            int.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_SC_TOPK"), out int _scK) && _scK > 0 ? _scK : 32;
-
-        private unsafe Tensor ComputeSelfConditioning(float[] prevLogits, int C, float prevTempInv)
-        {
-            int D = Config.HiddenSize;
             int vocab = Config.VocabSize;
-            int K = Math.Min(ScTopK, vocab);
-
-            // per canvas position: top-K tokens and their softmax(logits*temp_inv) weights (over top-K)
-            int[] topTokens = new int[C * K];
-            float[] topProbs = new float[C * K];
-            long _scT0 = Stopwatch.GetTimestamp();
-            Parallel.For(0, C, c =>
+            float[] argmax = graph.Outputs[outputs.Draft[0]], entropy = graph.Outputs[outputs.Draft[1]], below = graph.Outputs[outputs.Draft[2]];
+            for (int i = 0; i < rows; i++)
             {
-                long baseOff = (long)c * vocab;
-                int outBase = c * K;
-                TopK(prevLogits, baseOff, vocab, K, topTokens, topProbs, outBase);
+                argmaxOut[i] = (int)argmax[offset + i];
+                entropyOut[i] = entropy[offset + i];
+                // The draw is the first token whose cumulative probability reaches u: the count of tokens below it.
+                sampledOut[i] = Math.Min((int)below[offset + i], vocab - 1);
+            }
+            if (k == 0) return;
+            float[] ids = graph.Outputs[outputs.Draft[3]], probs = graph.Outputs[outputs.Draft[4]];
+            for (int i = 0; i < rows * k; i++)
+            {
+                topTokensOut[i] = (int)ids[offset * k + i];
+                topProbsOut[i] = probs[offset * k + i];
+            }
+        }
 
-                // softmax over the K selected logits (numerically stable), in temp_inv space
+        private enum CanvasHead { Logits, Sample, Rows }
+
+        /// <summary>A device-sampled step's per-run inputs: the temperature (a column, so a replay reads the step's own) and the
+        /// uniform draws.</summary>
+        private sealed class SamplingInputs
+        {
+            public SamplingInputs(int rows, int k, float tempInv, float[] u)
+            {
+                K = k;
+                TempInv = new float[rows];
+                Array.Fill(TempInv, tempInv);
+                U = new float[rows];
+                Array.Copy(u, U, rows);
+            }
+
+            public int K { get; }
+            public float[] TempInv { get; }
+            public float[] U { get; }
+        }
+
+        /// <summary>
+        /// A canvas step's graph: the canvas rows <c>rms_norm(embed * sqrt(n_embd) + selfcond(soft))</c> (no weight), every layer
+        /// as block rows, <c>output_norm</c> and the softcapped head; then the logits, the device sampler's picks, or (structured
+        /// reads) the logits of the rows at <paramref name="keepRows"/> only.
+        /// </summary>
+        private StepOutputs EmitCanvas(GraphStep step, Tensor embedded, Tensor soft, CanvasHead head, SamplingInputs sampling,
+            int[] keepRows = null)
+        {
+            int rows = step.Rows, hidden = Config.HiddenSize, vocab = Config.VocabSize;
+            var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
+            int x = step.Op(GraphOp.Scale, stackalloc[] { step.HiddenInput(embedded, hidden, rows) }, default, stackalloc[] { MathF.Sqrt(hidden) });
+            if (soft != null) x = step.Op(GraphOp.Add, x, EmitSelfConditioning(step, step.Input(soft, hidden, rows)));
+            x = step.Op(GraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { Config.Eps });
+            int h = EmitDecoderLayers(step, x);
+            int normed = EmitStreamOutput(step, h);
+            if (head == CanvasHead.Rows)
+            {
+                // The kept rows through the same head (their arithmetic is the full canvas's, row by row).
+                int picked = keepRows.Length == rows ? normed : step.Op(GraphOp.GetRows, normed, step.ConstantInputI32(keepRows, keepRows.Length));
+                outputs.Logits = step.Output(EmitHeadLogits(step, picked, keepRows.Length), (long)vocab * keepRows.Length);
+                return outputs;
+            }
+            int logits = EmitHeadLogits(step, normed, rows);                                                    // [vocab, rows]
+            if (head == CanvasHead.Logits)
+            {
+                outputs.Logits = step.Output(logits, (long)vocab * rows);
+                return outputs;
+            }
+            outputs.Draft = EmitSampling(step, logits, rows, sampling);
+            return outputs;
+        }
+
+        /// <summary>The self-conditioning signal [hidden, rows] from the soft embedding rows: down(gelu(gate(n)) * up(n)) with
+        /// n = rms_norm(soft) by <c>self_cond_pre_norm</c>.</summary>
+        private static int EmitSelfConditioning(GraphStep step, int soft)
+        {
+            int n = step.RmsNorm(soft, "self_cond_pre_norm.weight");
+            int act = step.Op(GraphOp.GegluSplit, step.MatMul("self_cond_gate.weight", n), step.MatMul("self_cond_up.weight", n));
+            return step.MatMul("self_cond_down.weight", act);
+        }
+
+        /// <summary>
+        /// The device sampler over the softcapped logits [vocab, rows] (DiffusionGemmaSampler.DenoiseStep's host pass, as graph
+        /// ops): s = logits * tempInv; p = softmax(s); argmax a; entropy H = lse(s) - sum p s with lse = s_a - log p_a; the draw
+        /// counts the tokens whose cumulative probability stays below u; the top K tokens of s and their softmax over the K. The
+        /// ids come back as values of an iota table (outputs are F32). Returns the outputs: ids, entropies, counts[, top ids, top
+        /// probabilities].
+        /// </summary>
+        private int[] EmitSampling(GraphStep step, int logits, int rows, SamplingInputs sampling)
+        {
+            int vocab = Config.VocabSize, k = sampling.K;
+            if (_iota == null || _iota.Length != vocab)
+            {
+                _iota = new float[vocab];
+                for (int i = 0; i < vocab; i++) _iota[i] = i;
+            }
+            int iota = step.ConstantInputF32(_iota, 1, vocab);                                                 // [1, vocab]
+            int s = step.Op(GraphOp.Mul, logits, step.InputF32(sampling.TempInv, 1, rows));
+            int p = step.Op(GraphOp.SoftMaxExt, s);
+            // [max(1, K), rows], largest first (a view of the row's sort: copied before it is sliced).
+            int top = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { s }, stackalloc long[] { Math.Max(1, k) }));
+            int first = step.Op(GraphOp.Cont, step.View2(top, 1, rows, (long)Math.Max(1, k) * sizeof(int), 0));   // [1, rows]
+            int argmax = step.Reshape(step.Op(GraphOp.GetRows, iota, step.Reshape(first, rows)), rows);
+            int s3 = step.Reshape(s, 1, vocab, rows), p3 = step.Reshape(p, 1, vocab, rows);
+            int sa = step.Reshape(step.Op(GraphOp.GetRows, s3, first), 1, rows);
+            int pa = step.Reshape(step.Op(GraphOp.GetRows, p3, first), 1, rows);
+            int sumPs = step.Op(GraphOp.SumRows, step.Op(GraphOp.Mul, p, s));                                    // [1, rows]
+            int entropy = step.Op(GraphOp.Sub, step.Op(GraphOp.Sub, sa, step.Op(GraphOp.Log, pa)), sumPs);
+            // u - cdf > 0 marks a token below the draw; times 1e30 and clamped to [0, 1] it is that indicator.
+            int cdf = step.Op(GraphOp.CumSum, p);
+            int over = step.Op(GraphOp.Sub, cdf, step.InputF32(sampling.U, 1, rows));                          // cdf - u
+            int below = step.Op(GraphOp.Clamp, stackalloc[] { step.Op(GraphOp.Scale, stackalloc[] { over }, default, stackalloc[] { -1e30f }) },
+                default, stackalloc[] { 0f, 1f });
+            int count = step.Op(GraphOp.SumRows, below);
+            var outputs = new List<int>
+            {
+                step.Output(step.Op(GraphOp.Cont, argmax), rows),
+                step.Output(step.Op(GraphOp.Cont, entropy), rows),
+                step.Output(step.Op(GraphOp.Cont, count), rows),
+            };
+            if (k > 0)
+            {
+                int topIds = step.Op(GraphOp.GetRows, iota, step.Reshape(top, (long)k * rows));                    // [1, K rows]
+                int topS = step.Reshape(step.Op(GraphOp.GetRows, s3, top), k, rows);                               // [K, rows]
+                outputs.Add(step.Output(step.Op(GraphOp.Cont, topIds), (long)k * rows));
+                outputs.Add(step.Output(step.Op(GraphOp.SoftMaxExt, topS), (long)k * rows));
+            }
+            return outputs.ToArray();
+        }
+
+        // ---------------------------------------------------------------- self-conditioning inputs
+
+        /// <summary>The soft embedding rows [rows, hidden] (or null) from the previous step's logits: each position's top-K tokens
+        /// and their softmax at <paramref name="prevTempInv"/> over the K.</summary>
+        private Tensor SoftEmbeddingFromLogits(float[] prevLogits, float scUse, float prevTempInv, int rows)
+        {
+            if (!_scEnabled || prevLogits == null || scUse == 0f) return null;
+            long t0 = Stopwatch.GetTimestamp();
+            int vocab = Config.VocabSize, k = Math.Min(ScTopK, vocab);
+            if (prevLogits.LongLength < (long)rows * vocab)
+                throw new ArgumentException($"Self-conditioning reads {rows} rows of {vocab} logits.", nameof(prevLogits));
+            var tokens = new int[rows * k];
+            var probs = new float[rows * k];
+            Parallel.For(0, rows, c =>
+            {
+                TopK(prevLogits, (long)c * vocab, vocab, k, tokens, probs, c * k);
                 float max = float.NegativeInfinity;
-                for (int k = 0; k < K; k++)
-                {
-                    float z = topProbs[outBase + k] * prevTempInv;
-                    topProbs[outBase + k] = z;
-                    if (z > max) max = z;
-                }
+                for (int j = 0; j < k; j++) max = Math.Max(max, probs[c * k + j] *= prevTempInv);
                 float sum = 0f;
-                for (int k = 0; k < K; k++)
-                {
-                    float e = MathF.Exp(topProbs[outBase + k] - max);
-                    topProbs[outBase + k] = e;
-                    sum += e;
-                }
+                for (int j = 0; j < k; j++) sum += probs[c * k + j] = MathF.Exp(probs[c * k + j] - max);
                 float inv = sum > 0f ? 1f / sum : 0f;
-                for (int k = 0; k < K; k++) topProbs[outBase + k] *= inv;
+                for (int j = 0; j < k; j++) probs[c * k + j] *= inv;
             });
-            _tScTopK += Stopwatch.GetTimestamp() - _scT0;
-            return ComputeSelfConditioningFromTopK(topTokens, topProbs, C, K);
+            _tSc += Stopwatch.GetTimestamp() - t0;
+            return SoftEmbedding(tokens, probs, rows, k);
         }
 
-        /// <summary>Self-conditioning soft-embedding from PRECOMPUTED per-position top-K tokens
-        /// (<paramref name="topTokens"/> [C*K]) and their softmax-over-top-K weights
-        /// (<paramref name="topProbs"/> [C*K], already in the previous step's temp_inv space). This is the
-        /// device-sampling path: the kernel returns the top-K, so the host top-K sweep over the full logits
-        /// is skipped. Gathers the C*K embedding rows, weighted-sums them, and applies the gated-GELU MLP.</summary>
-        private unsafe Tensor ComputeSelfConditioningFromTopK(int[] topTokens, float[] topProbs, int C, int K)
+        /// <summary>sum_k p_k embed[t_k] * sqrt(n_embd) per position [rows, hidden], from each position's <paramref name="k"/>
+        /// tokens and weights, on the host (the rows are a handful per position of the dequantized table).</summary>
+        private unsafe Tensor SoftEmbedding(int[] tokens, float[] probs, int rows, int k)
         {
-            int D = Config.HiddenSize;
-            long _scT1 = Stopwatch.GetTimestamp();
-
-            // gather the C*K selected embedding rows, then per-position weighted sum as a batched matmul:
-            // soft[c] = probs[c, 1, K] @ rows[c, K, D] -> [c, 1, D]. Fully on-device.
-            using Tensor rows = CpuEmbeddingRows(topTokens);   // [C*K, D] (Embedding() off the pure-C# backend)
-            using var rows3 = rows.View(C, K, D);
-            using var probsT = CreateFloatTensor(topProbs, C, 1, K);
-            using var soft = new Tensor(_allocator, DType.Float32, C, 1, D);
-            Ops.AddmmBatch(soft, 0f, soft, 1f, probsT, rows3);
-            Ops.Mul(soft, soft, MathF.Sqrt(D));
-            using var soft2 = soft.View(C, D);
-
-            // gated-GELU MLP: down( gelu(gate(pre_norm(soft))) * up(pre_norm(soft)) )
-            using var normed = RMSNormOp(soft2, "self_cond_pre_norm.weight");
-            Tensor gate = LinearForward(normed, "self_cond_gate.weight");
-            using (Tensor up = LinearForward(normed, "self_cond_up.weight"))
-                Ops.GELUMul(gate, gate, up);
-            Tensor sig = LinearForward(gate, "self_cond_down.weight");
-            gate.Dispose();
-            _tScDevice += Stopwatch.GetTimestamp() - _scT1;
-            return sig;
+            long t0 = Stopwatch.GetTimestamp();
+            int hidden = Config.HiddenSize;
+            float scale = MathF.Sqrt(hidden);
+            var soft = new float[(long)rows * hidden];
+            if (_quantWeights.TryGetValue("token_embd.weight", out QuantizedWeight table) && table.HasHostData)
+            {
+                long rowBytes = NativeDequant.RowSize(table.GgmlType, table.Ne0);
+                byte* basePtr = (byte*)table.Data.ToPointer();
+                float tableScale = table.Scale;
+                IntPtr tableBase = (IntPtr)basePtr;
+                // GGML's row dequantizer (the managed one on the pure-C# backend) and a vectorized multiply-add.
+                Parallel.For(0, rows, () => new float[hidden], (c, _, row) =>
+                {
+                    var dst = soft.AsSpan(c * hidden, hidden);
+                    for (int j = 0; j < k; j++)
+                    {
+                        int t = tokens[c * k + j];
+                        if ((uint)t >= (uint)Config.VocabSize) continue;
+                        NativeDequant.DequantizeToFloat32(table.GgmlType, tableBase + (nint)(t * rowBytes), row, 0, hidden);
+                        System.Numerics.Tensors.TensorPrimitives.MultiplyAdd(row, probs[c * k + j] * scale * tableScale, dst, dst);
+                    }
+                    return row;
+                }, _ => { });
+            }
+            else
+            {
+                using Tensor embedded = Embedding(tokens);
+                float[] all = embedded.GetElementsAsFloat(rows * k * hidden);
+                Parallel.For(0, rows, c =>
+                {
+                    for (int j = 0; j < k; j++)
+                    {
+                        float w = probs[c * k + j] * scale;
+                        long src = ((long)c * k + j) * hidden, dst = (long)c * hidden;
+                        for (int i = 0; i < hidden; i++) soft[dst + i] += w * all[src + i];
+                    }
+                });
+            }
+            _tSc += Stopwatch.GetTimestamp() - t0;
+            return CreateFloatTensor(soft, rows, hidden);
         }
 
-        /// <summary>Select the top-K values of logits[baseOff .. baseOff+n) via a size-K min-heap.
-        /// Writes the token indices to <paramref name="outTokens"/> and raw logits to
-        /// <paramref name="outVals"/> starting at <paramref name="outBase"/> (unordered).</summary>
-        private static void TopK(float[] logits, long baseOff, int n, int K,
-            int[] outTokens, float[] outVals, int outBase)
+        /// <summary>The top <paramref name="k"/> values of logits[baseOff, baseOff + n) through a min-heap: their tokens into
+        /// <paramref name="outTokens"/> and their raw values into <paramref name="outVals"/> from <paramref name="outBase"/>
+        /// (unordered).</summary>
+        private static void TopK(float[] logits, long baseOff, int n, int k, int[] outTokens, float[] outVals, int outBase)
         {
-            // heap stored in outVals/outTokens[outBase .. outBase+K); heap[0] is the minimum.
             int filled = 0;
             for (int v = 0; v < n; v++)
             {
                 float val = logits[baseOff + v];
-                if (filled < K)
+                if (filled < k)
                 {
-                    int i = outBase + filled;
-                    outVals[i] = val; outTokens[i] = v;
-                    filled++;
-                    if (filled == K) BuildMinHeap(outVals, outTokens, outBase, K);
+                    outVals[outBase + filled] = val;
+                    outTokens[outBase + filled] = v;
+                    if (++filled == k)
+                        for (int i = k / 2 - 1; i >= 0; i--) SiftDown(outVals, outTokens, outBase, k, i);
                 }
                 else if (val > outVals[outBase])
                 {
-                    outVals[outBase] = val; outTokens[outBase] = v;
-                    SiftDown(outVals, outTokens, outBase, K, 0);
+                    outVals[outBase] = val;
+                    outTokens[outBase] = v;
+                    SiftDown(outVals, outTokens, outBase, k, 0);
                 }
             }
         }
 
-        private static void BuildMinHeap(float[] vals, int[] toks, int b, int K)
-        {
-            for (int i = K / 2 - 1; i >= 0; i--) SiftDown(vals, toks, b, K, i);
-        }
-
-        private static void SiftDown(float[] vals, int[] toks, int b, int K, int i)
+        private static void SiftDown(float[] vals, int[] toks, int b, int k, int i)
         {
             while (true)
             {
-                int l = 2 * i + 1, r = 2 * i + 2, smallest = i;
-                if (l < K && vals[b + l] < vals[b + smallest]) smallest = l;
-                if (r < K && vals[b + r] < vals[b + smallest]) smallest = r;
-                if (smallest == i) break;
+                int l = 2 * i + 1, r = l + 1, smallest = i;
+                if (l < k && vals[b + l] < vals[b + smallest]) smallest = l;
+                if (r < k && vals[b + r] < vals[b + smallest]) smallest = r;
+                if (smallest == i) return;
                 (vals[b + i], vals[b + smallest]) = (vals[b + smallest], vals[b + i]);
                 (toks[b + i], toks[b + smallest]) = (toks[b + smallest], toks[b + i]);
                 i = smallest;
             }
         }
 
-        // ===================================================================================
-        //  RoPE helpers (NeoX): pairs (x[j], x[j+halfDim]). cos/sin tables are [N, halfDim].
-        // ===================================================================================
-        private static void BuildCosSin(int N, float[] freqs, out float[] cos, out float[] sin)
+        // ---------------------------------------------------------------- per-sequence states (the batched scheduler)
+
+        /// <summary>A fresh per-sequence state: its own cache in the runtime (bound by its id). Free it with
+        /// <see cref="DisposeSeqState"/>.</summary>
+        public DiffusionSeqState CreateSeqState()
+            => new DiffusionSeqState("diffusion-seq-" + Interlocked.Increment(ref _nextSequence).ToString(CultureInfo.InvariantCulture));
+
+        /// <summary>Release a sequence's cache and its image spans.</summary>
+        public void DisposeSeqState(DiffusionSeqState seq)
         {
-            int half = freqs.Length;
-            cos = new float[N * half];
-            sin = new float[N * half];
-            for (int p = 0; p < N; p++)
+            if (seq == null) return;
+            if (seq.Prefilled) OnSequenceReleased(seq.Id);
+            seq.Prefilled = false;
+            seq.Cache.Tokens = null;
+            seq.Cache.Written = false;
+            seq.DisposeVision();
+        }
+
+        /// <summary>Prefill one sequence's prompt into its own cache, with its own image spans (reusing the rows of the block before).</summary>
+        public void PrefillSeq(DiffusionSeqState seq, int[] promptTokens) => PrefillSeq(seq, promptTokens, CancellationToken.None);
+
+        private void PrefillSeq(DiffusionSeqState seq, int[] promptTokens, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(seq);
+            BindSequenceCache(seq.Id);
+            seq.Prefilled = true;
+            try
             {
-                int baseOff = p * half;
-                for (int j = 0; j < half; j++)
-                {
-                    float angle = p * freqs[j];
-                    cos[baseOff + j] = MathF.Cos(angle);
-                    sin[baseOff + j] = MathF.Sin(angle);
-                }
+                PrefillActive(promptTokens, seq.Vision, seq.Cache, cancellationToken);
+            }
+            finally
+            {
+                RestorePrimaryCache();
             }
         }
 
-        /// <summary>Host cos/sin NeoX RoPE fallback (used only by non-GGML, non-MLX backends e.g. direct
-        /// cuda). Modifies <paramref name="data"/> in place; the storage marks itself host-dirty so the
-        /// next device op re-uploads.</summary>
-        private unsafe void ApplyNeoXRoPERaw(Tensor data, int numHeads, int headDim, int N, float[] cos, float[] sin)
+        /// <summary>One canvas step on a sequence's cache: its logits [C, vocab].</summary>
+        public float[] DecodeCanvasSeq(DiffusionSeqState seq, int[] canvasTokens, float[] scPrevLogits, float scUse, float prevTempInv)
         {
-            float* ptr = GetFloatPtr(data);
-            int half = headDim / 2;
-            Parallel.For(0, N, n =>
+            RequirePrefilled(seq);
+            return CanvasLogits(seq.Id, canvasTokens, SoftEmbeddingFromLogits(scPrevLogits, scUse, prevTempInv, canvasTokens.Length));
+        }
+
+        /// <summary>One device-sampled canvas step on a sequence's cache (<see cref="DecodeCanvasSampled"/>).</summary>
+        public bool DecodeCanvasSampledSeq(DiffusionSeqState seq, int[] canvasTokens, int[] scPrevTopTokens, float[] scPrevTopProbs,
+            float scUse, float tempInv, float[] u, int K, int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut,
+            float[] topProbsOut)
+        {
+            RequirePrefilled(seq);
+            return CanvasSampled(seq.Id, canvasTokens, scPrevTopTokens, scPrevTopProbs, scUse, tempInv, u, K, argmaxOut, entropyOut,
+                sampledOut, topTokensOut, topProbsOut);
+        }
+
+        /// <summary>Several sequences' canvases in one step (one graph: the weights read once for every canvas, each canvas over
+        /// its own cache): each sequence's logits [C, vocab].</summary>
+        public float[][] DecodeCanvasBatched(DiffusionSeqState[] seqs, int[][] canvases, float[][] scPrev, float[] scUse, float[] prevTempInv)
+        {
+            ArgumentNullException.ThrowIfNull(seqs);
+            int n = seqs.Length, vocab = Config.VocabSize, hidden = Config.HiddenSize;
+            if (canvases.Length != n) throw new ArgumentException("One canvas a sequence.", nameof(canvases));
+            var ids = new string[n];
+            var counts = new int[n];
+            int total = 0;
+            for (int b = 0; b < n; b++)
             {
-                int cbase = n * half;
-                float* basePtr = ptr + (long)n * numHeads * headDim;
-                for (int h = 0; h < numHeads; h++)
+                RequirePrefilled(seqs[b]);
+                ids[b] = seqs[b].Id;
+                counts[b] = canvases[b].Length;
+                total += counts[b];
+            }
+            var tokens = new int[total];
+            for (int b = 0, at = 0; b < n; at += counts[b], b++) canvases[b].CopyTo(tokens, at);
+            // Self-conditioning for the sequences that read it; the others' rows are zero, which the MLP keeps zero (no biases,
+            // an RMSNorm of zero is zero).
+            Tensor soft = null;
+            var signals = new Tensor[n];
+            try
+            {
+                bool any = false;
+                for (int b = 0; b < n; b++)
                 {
-                    float* head = basePtr + (long)h * headDim;
-                    for (int j = 0; j < half; j++)
-                    {
-                        float c = cos[cbase + j];
-                        float s = sin[cbase + j];
-                        float x0 = head[j];
-                        float x1 = head[j + half];
-                        head[j] = x0 * c - x1 * s;
-                        head[j + half] = x0 * s + x1 * c;
-                    }
+                    signals[b] = SoftEmbeddingFromLogits(scPrev?[b], scUse?[b] ?? 0f, prevTempInv?[b] ?? 1f, counts[b]);
+                    any |= signals[b] != null;
                 }
-            });
-            InvalidateTensorDeviceCache(data);
+                if (any)
+                {
+                    var all = new float[(long)total * hidden];
+                    for (int b = 0, at = 0; b < n; at += counts[b], b++)
+                        if (signals[b] != null) Array.Copy(signals[b].GetElementsAsFloat(counts[b] * hidden), 0, all, (long)at * hidden, (long)counts[b] * hidden);
+                    soft = CreateFloatTensor(all, total, hidden);
+                }
+            }
+            finally
+            {
+                foreach (Tensor t in signals) t?.Dispose();
+            }
+
+            CachedGraph graph = null;
+            bool owned = false;
+            Tensor embedded = null;
+            long t0 = Stopwatch.GetTimestamp();
+            _swForward.Start();
+            try
+            {
+                embedded = Embedding(tokens);
+                graph = RunBlockRows(ids, counts, step => EmitCanvas(step, embedded, soft, CanvasHead.Logits, null),
+                    out StepOutputs outputs, out owned, "diffusion-canvas-batch");
+                float[] logits = graph.Outputs[outputs.Logits];
+                var result = new float[n][];
+                for (int b = 0, at = 0; b < n; at += counts[b], b++)
+                {
+                    result[b] = new float[(long)counts[b] * vocab];
+                    Array.Copy(logits, (long)at * vocab, result[b], 0, result[b].LongLength);
+                }
+                _canvasSteps += n;
+                BatchedCanvasStepsForTests++;
+                return result;
+            }
+            finally
+            {
+                if (owned) graph?.Dispose();
+                embedded?.Dispose();
+                soft?.Dispose();
+                _swForward.Stop();
+                _tCanvas += Stopwatch.GetTimestamp() - t0;
+            }
         }
 
-        // ===================================================================================
-        //  IModelArchitecture contract
-        // ===================================================================================
-        protected override float[] ForwardCore(int[] tokens)
+        private static void RequirePrefilled(DiffusionSeqState seq)
         {
-            throw new NotSupportedException(
-                "DiffusionGemma is a diffusion model and does not support autoregressive Forward(). " +
-                "Use DiffusionGemmaSampler.Generate() / the diffusion run mode.");
+            ArgumentNullException.ThrowIfNull(seq);
+            if (!seq.Prefilled || seq.Cache.Tokens == null)
+                throw new InvalidOperationException("Prefill the sequence (PrefillSeq) before its canvas steps.");
         }
 
-        protected override void ResetKVCacheCore()
-        {
-            // no KV cache in the unified diffusion forward
-        }
+        // ---------------------------------------------------------------- lifecycle
 
         public override void WarmUpKernels()
         {
-            // Warm the native quantized matmul / norm / MoE kernels with a tiny [prompt|canvas]
-            // forward (1 prompt token + 4 canvas positions). Autoregressive Forward() is unsupported.
+            // A one-token prompt and a four-row canvas: the products, norms, experts and attention kernels of both kinds of step.
             try
             {
-                int bos = Tokenizer != null ? Tokenizer.BosTokenId : 0;
-                if (bos < 0) bos = 0;
-                int[] tokens = { bos, _maskTokenId, _maskTokenId, _maskTokenId, _maskTokenId };
-                ForwardCanvas(tokens, promptLen: 1);
+                int bos = Tokenizer != null && Tokenizer.BosTokenId >= 0 ? Tokenizer.BosTokenId : 0;
+                PrefillPrompt(new[] { bos });
+                DecodeCanvas(new[] { _maskTokenId, _maskTokenId, _maskTokenId, _maskTokenId }, null, 0f, 1f);
+                ResetKVCache();
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"  DiffusionGemma warmup skipped: {ex.Message}");
             }
-            _swForward.Reset();
+            ResetForwardTiming();
+            ResetDiffusionStageTiming();
         }
 
+        /// <summary>The prefill / canvas split of the forwards so far.</summary>
         public void PrintForwardTiming()
         {
             double f = 1000.0 / Stopwatch.Frequency;
-            Console.WriteLine($"  ForwardCanvas total: {_swForward.ElapsedMilliseconds} ms");
-            Console.WriteLine($"    embed={_tEmbed * f:F0}ms  attn={_tAttn * f:F0}ms  denseMLP={_tDense * f:F0}ms  " +
-                $"MoE={_tMoe * f:F0}ms (route={_tMoeRoute * f:F0}ms ffn={_tMoeFfn * f:F0}ms)  " +
-                $"lm_head={_tLmHead * f:F0}ms  selfCond={_tSc * f:F0}ms (topK_host={_tScTopK * f:F0}ms device={_tScDevice * f:F0}ms)");
-            if (CpuFastPaths)
-                Console.WriteLine($"    cpu: qkv+norm+rope={_tCpuQkv * f:F0}ms attnCore={_tCpuAttnCore * f:F0}ms " +
-                    $"moe gate_up={_tCpuMoeGateUp * f:F0}ms down={_tCpuMoeDown * f:F0}ms");
+            Console.WriteLine($"  DiffusionGemma forwards: {_swForward.ElapsedMilliseconds} ms (prefill {_tPrefill * f:F0} ms, " +
+                $"{_canvasSteps} canvas steps {_tCanvas * f:F0} ms of which self-conditioning {_tSc * f:F0} ms and readback {_tRead * f:F0} ms)");
+        }
+
+        /// <summary>Zero the prefill / canvas split <see cref="PrintForwardTiming"/> reports.</summary>
+        public void ResetDiffusionStageTiming()
+        {
+            _swForward.Reset();
+            _tPrefill = _tCanvas = _tSc = _tRead = _canvasSteps = 0;
         }
 
         public override void Dispose()
         {
             ClearStructuredCache();
             DisposeVisionState();
-            foreach (var t in _onesByDim.Values) t?.Dispose();
-            _onesByDim.Clear();
-            foreach (var t in _ropePosCache.Values) t?.Dispose();
-            _ropePosCache.Clear();
-            _cosGlobalTensor?.Dispose();
-            _sinGlobalTensor?.Dispose();
-            _maskLocal?.Dispose();
-            _maskGlobal?.Dispose();
-            _decodeMaskLocal?.Dispose();
-            _decodeMaskGlobal?.Dispose();
-            // Reclaim the GGML device-buffer-cache entries for the prompt K/V (see AllocPromptStore /
-            // ReleasePromptKvTensor) before disposing their host storage, so the cached device-local
-            // copies are freed rather than orphaned.
-            if (_promptK != null) for (int l = 0; l < _promptK.Length; l++) ReleasePromptKvTensor(ref _promptK[l]);
-            if (_promptV != null) for (int l = 0; l < _promptV.Length; l++) ReleasePromptKvTensor(ref _promptV[l]);
-            // Unregister page-locked regions, then free the private streamed-weight copies (the
-            // logits buffer in _pinnedHostRegions is GC-owned and must NOT be freed here).
-            foreach (var region in _pinnedHostRegions) GgmlBasicOps.UnregisterPinnedHostBuffer(region);
-            _pinnedHostRegions.Clear();
-            foreach (var copy in _pinnedStreamCopies.Values) GgmlBasicOps.AlignedFree(copy);
-            _pinnedStreamCopies.Clear();
             base.Dispose();
         }
     }
 
-    /// <summary>Per-sequence decode state for batched (multi-request) diffusion generation: each in-flight
-    /// request owns its own prompt K/V store (per layer: head-first [kvHeads, P, hd] on the device-glue
-    /// backends, token-major [rows, kvHeads*hd] on the cpu backend, where local layers keep only the
-    /// sliding-window tail of the prompt) so several canvases can
-    /// be denoised together in one batched forward without sharing the model's instance-field K/V cache.
-    /// Created via <see cref="DiffusionGemmaModel.CreateSeqState"/>; freed via
-    /// <see cref="DiffusionGemmaModel.DisposeSeqState"/>.</summary>
+    /// <summary>One in-flight diffusion request's state for the batched scheduler: its cache in the runtime (by
+    /// <see cref="Id"/>), what that cache holds, and the request's own image spans. Created by
+    /// <see cref="DiffusionGemmaModel.CreateSeqState"/>, freed by <see cref="DiffusionGemmaModel.DisposeSeqState"/>.</summary>
     public sealed class DiffusionSeqState
     {
-        internal readonly Tensor[] PromptK;
-        internal readonly Tensor[] PromptV;
-        internal int PromptLen = -1;
+        internal DiffusionSeqState(string id) => Id = id;
 
-        /// <summary>
-        /// This sequence's own image spans: projected embeddings <c>[nSoft, hidden]</c> and the index
-        /// of their first row in this sequence's prompt.
-        ///
-        /// <para>These live here, per sequence, rather than on the model, so that concurrent image
-        /// requests cannot overwrite each other. That is the same choice vLLM and SGLang make -- the
-        /// encoded multimodal features hang off the request, never off the runner -- and it is what
-        /// lets the scheduler batch an image turn alongside other turns instead of denoising it
-        /// alone.</para>
-        /// </summary>
-        internal List<(Tensor Embeddings, int Position)> VisionEmbeddings;
+        internal string Id { get; }
 
-        /// <summary>Soft-token spans in prompt coordinates for THIS sequence, ascending by Start.
-        /// Empty when bidirectional image attention is off.</summary>
-        internal (int Start, int Length)[] VisionSpans = Array.Empty<(int Start, int Length)>();
+        internal bool Prefilled;
 
-        /// <summary>Bumped whenever this sequence's spans change, so a cached attention mask built
-        /// for a different span layout is never reused for it.</summary>
-        internal int VisionSpanVersion;
+        internal DiffusionGemmaModel.PromptCache Cache { get; } = new();
 
-        internal bool HasVision => VisionEmbeddings != null && VisionEmbeddings.Count > 0;
+        /// <summary>This sequence's image spans (null until one is set): they live with the request, never on the model, so two
+        /// concurrent image requests cannot overwrite each other's (vLLM's and SGLang's choice too).</summary>
+        internal VisionSet Vision;
 
-        internal DiffusionSeqState(int numLayers)
-        {
-            PromptK = new Tensor[numLayers];
-            PromptV = new Tensor[numLayers];
-        }
+        internal bool HasVision => Vision != null && Vision.Spans.Count > 0;
 
-        /// <summary>Releases this sequence's image embeddings. Called when the sequence is freed, so a
-        /// finished request cannot leak its picture into the next one.</summary>
+        /// <summary>Releases this sequence's image embeddings with it.</summary>
         internal void DisposeVision()
         {
-            if (VisionEmbeddings == null) return;
-            foreach (var (embeddings, _) in VisionEmbeddings)
-                embeddings?.Dispose();
-            VisionEmbeddings = null;
-            VisionSpans = Array.Empty<(int Start, int Length)>();
-            VisionSpanVersion++;
+            Vision?.Dispose();
+            Vision = null;
         }
     }
 }

@@ -110,6 +110,8 @@ namespace TensorSharp
 
         public static Tensor Exp(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("exp", result, src)!; }
         public static Tensor Log(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("log", result, src)!; }
+        /// <summary>The running sum along the last dimension: result[.., i] = src[.., 0] + ... + src[.., i].</summary>
+        public static Tensor CumSum(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("cumsum", result, src)!; }
         public static Tensor Log1p(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("log1p", result, src)!; }
         public static Tensor Floor(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("floor", result, src)!; }
         public static Tensor Ceil(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("ceil", result, src)!; }
@@ -219,6 +221,17 @@ namespace TensorSharp
         public static Tensor RoPEEx(Tensor result, Tensor src, Tensor positions, int ropeDim, int mode, int originalContextLength, float freqBase, float freqScale, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f, bool addToResult = false, bool invertPositions = false)
         {
             return (Tensor)OpRegistry.Invoke("rope_ex", result, src, positions, ropeDim, mode, originalContextLength, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow, addToResult, invertPositions)!;
+        }
+
+        /// <summary>
+        /// <see cref="RoPEEx"/> with ggml_rope_ext's frequency factors (its <c>c</c> operand): pair i of the rotated dims turns
+        /// by <c>position * base^(-2i/ropeDim) / freqFactors[i]</c> before any YaRN mix (Gemma 4's proportional global RoPE,
+        /// whose factors leave three quarters of the pairs unrotated). <paramref name="freqFactors"/> is a contiguous F32 vector
+        /// of at least ropeDim/2 values; its contents are constant for a model (backends may cache what they derive from it).
+        /// </summary>
+        public static Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode, int originalContextLength, float freqBase, float freqScale, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f)
+        {
+            return (Tensor)OpRegistry.Invoke("rope_ex_ff", result, src, positions, freqFactors, ropeDim, mode, originalContextLength, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow)!;
         }
 
 

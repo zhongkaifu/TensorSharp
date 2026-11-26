@@ -134,6 +134,108 @@ namespace TensorSharp.Models
         /// <summary>Decoder layers plus draft layers: what weights, fusion, routing and caches cover.</summary>
         private int TotalLayers => Config.NumLayers + DraftLayerCount;
 
+        // ---------------------------------------------------------------- per-layer attention geometry
+
+        /// <summary>
+        /// The key head width of attention layer <paramref name="layer"/>: the width <see cref="InitializeDecoder"/> was given
+        /// (the default), or a layer's own where a family's layers differ (Gemma 4: 256-wide sliding-window heads, 512-wide
+        /// global ones). Read once, while the decoder initializes; draft layers keep the default. A family whose layers differ
+        /// runs only as graphs (<see cref="RequiresGraphs"/>): the per-op layers take one width.
+        /// </summary>
+        protected virtual int LayerKeyDim(int layer) => _keyDim;
+
+        /// <summary>The value head width of <paramref name="layer"/> (see <see cref="LayerKeyDim"/>).</summary>
+        protected virtual int LayerValueDim(int layer) => _valueDim;
+
+        /// <summary>The KV heads of <paramref name="layer"/> over the whole model, before any tensor-parallel split (Gemma 4's
+        /// global layers keep fewer than its sliding-window ones). Default <c>Config.NumKVHeads</c>.</summary>
+        protected virtual int LayerKvHeads(int layer) => Config.NumKVHeads;
+
+        /// <summary>The attention scale of <paramref name="layer"/>: 1/sqrt(key width) (the default), or the family's (Gemma 4
+        /// attends at 1, its Q/K norms carrying the factor).</summary>
+        protected virtual float AttentionScale(int layer) => 1.0f / MathF.Sqrt(KeyDimOf(layer));
+
+        /// <summary>
+        /// The layer whose K/V cache <paramref name="layer"/> attends: itself (the default), or an earlier layer of the same
+        /// kind it shares the cache of (Gemma 4's KV-shared tail layers, llama.cpp's <c>n_layer_kv_from_start</c>). A sharing
+        /// layer projects its queries only, writes no K/V and holds no cache of its own; it attends the source's keys and values
+        /// with the source's mask (the same window), so the source must be an earlier attention layer of the same geometry.
+        /// Read once, while the decoder initializes.
+        /// </summary>
+        protected virtual int KvSourceLayer(int layer) => layer;
+
+        private int[] _layerKeyDim = Array.Empty<int>();
+        private int[] _layerValueDim = Array.Empty<int>();
+        private int[] _layerKvHeads = Array.Empty<int>();
+        private int[] _kvSource = Array.Empty<int>();
+        private bool _heterogeneousAttention;
+
+        /// <summary>The key head width of <paramref name="layer"/> (draft layers: the default).</summary>
+        private protected int KeyDimOf(int layer) => (uint)layer < (uint)_layerKeyDim.Length ? _layerKeyDim[layer] : _keyDim;
+
+        /// <summary>The value head width of <paramref name="layer"/>.</summary>
+        private protected int ValueDimOf(int layer) => (uint)layer < (uint)_layerValueDim.Length ? _layerValueDim[layer] : _valueDim;
+
+        /// <summary>The KV heads of <paramref name="layer"/> over the whole model.</summary>
+        private protected int KvHeadsOf(int layer) => (uint)layer < (uint)_layerKvHeads.Length ? _layerKvHeads[layer] : Config.NumKVHeads;
+
+        /// <summary>The KV heads of <paramref name="layer"/> one rank holds: the model's over the shard degree (all of them on
+        /// one device and on ggml's meta device, whose graphs keep global shapes).</summary>
+        private protected int LocalKvHeadsOf(int layer)
+            => _graphTpRanks != null || _shardDegree <= 1 ? KvHeadsOf(layer) : KvHeadsOf(layer) / _shardDegree;
+
+        /// <summary>The layer whose cache <paramref name="layer"/> attends (<see cref="KvSourceLayer"/>).</summary>
+        private protected int KvSourceOf(int layer) => (uint)layer < (uint)_kvSource.Length ? _kvSource[layer] : layer;
+
+        /// <summary>Whether <paramref name="layer"/> attends another layer's cache and keeps none of its own.</summary>
+        private protected bool SharesKv(int layer) => KvSourceOf(layer) != layer;
+
+        /// <summary>Whether some layer's attention geometry differs from the default or shares another layer's cache.</summary>
+        private protected bool HeterogeneousAttention => _heterogeneousAttention;
+
+        /// <summary>Read the family's per-layer geometry and KV sources once (decoder and draft layers).</summary>
+        private void BuildAttentionGeometry()
+        {
+            int layers = TotalLayers;
+            _layerKeyDim = new int[layers];
+            _layerValueDim = new int[layers];
+            _layerKvHeads = new int[layers];
+            _kvSource = new int[layers];
+            _heterogeneousAttention = false;
+            for (int l = 0; l < layers; l++)
+            {
+                bool draft = l >= Config.NumLayers;
+                _layerKeyDim[l] = draft ? _keyDim : LayerKeyDim(l);
+                _layerValueDim[l] = draft ? _valueDim : LayerValueDim(l);
+                _layerKvHeads[l] = draft ? Config.NumKVHeads : LayerKvHeads(l);
+                _kvSource[l] = draft ? l : KvSourceLayer(l);
+                if (_layerKeyDim[l] <= 0 || _layerValueDim[l] <= 0 || _layerKvHeads[l] <= 0 || Config.NumHeads % _layerKvHeads[l] != 0)
+                    throw new NotSupportedException(
+                        $"{Config.Architecture} layer {l}: {Config.NumHeads} query heads over {_layerKvHeads[l]} KV heads of " +
+                        $"{_layerKeyDim[l]}/{_layerValueDim[l]} is not an attention geometry the runtime runs.");
+                if (_layerKeyDim[l] != _keyDim || _layerValueDim[l] != _valueDim || _layerKvHeads[l] != Config.NumKVHeads)
+                    _heterogeneousAttention = true;
+            }
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                int src = _kvSource[l];
+                if (src == l) continue;
+                if (src < 0 || src >= l || _kvSource[src] != src)
+                    throw new NotSupportedException(
+                        $"{Config.Architecture} layer {l} shares the K/V of layer {src}: a source must be an earlier layer with a cache of its own.");
+                if (_layerKeyDim[src] != _layerKeyDim[l] || _layerValueDim[src] != _layerValueDim[l] || _layerKvHeads[src] != _layerKvHeads[l]
+                    || SlidingWindow(src) != SlidingWindow(l))
+                    throw new NotSupportedException(
+                        $"{Config.Architecture} layer {l} shares the K/V of layer {src}, whose heads or window differ.");
+                _heterogeneousAttention = true;
+            }
+            MarkKvSharers();
+            if (_heterogeneousAttention && !RequiresGraphs)
+                throw new NotSupportedException(
+                    $"{Config.Architecture}: layers of different attention geometry or shared K/V caches run only as graphs; " +
+                    "the family must declare RequiresGraphs.");
+        }
+
         // ---------------------------------------------------------------- extra key caches
 
         /// <summary>A family's extra per-cell key cache for <paramref name="layer"/>: one head of this many values per
@@ -165,16 +267,17 @@ namespace TensorSharp.Models
             }
             else
             {
-                if (!OwnsLayer(entry) || _recurrentLayer[entry]) return null;
+                // A KV-shared layer attends its source's cache and keeps none (KvSourceLayer).
+                if (!OwnsLayer(entry) || _recurrentLayer[entry] || SharesKv(entry)) return null;
                 // A draft layer is not sharded: under tensor parallelism it runs whole on rank 0, with every KV head.
                 bool draft = entry >= Config.NumLayers && _mesh.TensorParallel > 1;
                 if (draft && rank > 0) return null;
                 IAllocator alloc = _mesh.Allocator(CacheStage(entry), rank);
-                int kvHeads = draft ? Config.NumKVHeads : _localKvHeads;
+                int kvHeads = draft ? Config.NumKVHeads : LocalKvHeadsOf(entry);
                 // A sliding-window layer's ring holds at most its cells (StandardDecoderModel.SlidingRings.cs).
                 int cells = CacheCells(entry, capacity);
-                t = value ? new Tensor(alloc, dtype, kvHeads, cells, _valueDim)
-                          : new Tensor(alloc, dtype, kvHeads, cells, _keyDim);
+                t = value ? new Tensor(alloc, dtype, kvHeads, cells, ValueDimOf(entry))
+                          : new Tensor(alloc, dtype, kvHeads, cells, KeyDimOf(entry));
             }
             ZeroCacheRows(t, zeroFrom);
             return t;
@@ -205,6 +308,28 @@ namespace TensorSharp.Models
                 Ops.Fill(tail, 0f);
             }
             CacheZeroFillBytes += t.Storage.ByteLength / cells * (cells - from);
+        }
+
+        /// <summary>A reset of one active cache tensor: zero (where the backend zeroes reset caches) the cells
+        /// <see cref="_cacheTouched"/> positions reach, a ring's whole once they pass its cells.</summary>
+        private void ResetCacheRows(Tensor t)
+        {
+            if (t == null) return;
+            long cells = t.Sizes[1];
+            // A block-quantized cache fills whole (its row ranges are not a fill the backends take).
+            if (!ShouldZeroFillCacheTensors || _cacheTouched >= cells || t.ElementType is not (DType.Float32 or DType.Float16))
+            {
+                ResetCacheTensor(t, keepDeviceCopy: true);
+                return;
+            }
+            if (_cacheTouched > 0)
+                for (long h = 0; h < t.Sizes[0]; h++)
+                {
+                    using Tensor head = t.Narrow(0, h, 1);
+                    using Tensor rows = head.Narrow(1, 0, _cacheTouched);
+                    Ops.Fill(rows, 0f);
+                }
+            ResetCacheTensor(t, keepDeviceCopy: true, zeroFill: false);
         }
 
         /// <summary>The extra key cache of <paramref name="layer"/> in <paramref name="k"/> (a slot's K array), or null.</summary>
@@ -349,6 +474,7 @@ namespace TensorSharp.Models
 
         /// <summary>The K caches as [layer][rank], for tests that check placement.</summary>
         internal Tensor[][] KeyCachesForTests => _cacheK;
+        internal Tensor[][] ValueCachesForTests => _cacheV;
 
         /// <summary>The ggml type a loaded quantized weight is held in (-1: not a quantized weight).</summary>
         internal int QuantizedWeightTypeForTests(string name) => _quantWeights.TryGetValue(name, out QuantizedWeight w) ? w.GgmlType : -1;
@@ -463,6 +589,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.SetAsyncCompute(false);
             try
             {
+                BuildAttentionGeometry();
                 DetectRecurrentLayers();
                 bool multiDevice = _requestedStages > 1 || _requestedTensorParallel > 1 || LayerSplitGroup != null;
                 // The model-aligned KV default must not depend on placement: a multi-device
@@ -471,6 +598,7 @@ namespace TensorSharp.Models
                 if (multiDevice)
                     ApplyModelAlignedKvCacheDefaultFromMetadata();
                 BuildMesh(executionIdentity);
+                ValidateSharedKvStages();
                 LoadWeights();
                 FuseProjections();
                 DetectMoeLayers();
@@ -543,6 +671,7 @@ namespace TensorSharp.Models
         private Tensor EmbedStep(int[] tokens)
         {
             StepTokens = tokens;
+            _mediaRows = null;   // the media rows a forward opens its masks for are its own (InjectMedia)
             return Embedding(tokens);
         }
 
@@ -621,10 +750,21 @@ namespace TensorSharp.Models
             InitRingCaches();
             (_cacheK, _cacheV) = AllocateCaches(initial);
             _cacheSeqLen = 0;
+            _cacheTouched = 0;
         }
+
+        /// <summary>
+        /// Positions [0, this) of the active cache may hold rows written since its last zero (every write past them grows the
+        /// cache's reach through <see cref="EnsureCacheCapacity"/> first); a reset zeroes only those. Zeroed whole, the pure-C#
+        /// backend's full-context cache (262,144 cells: DiffusionGemma's five global layers alone are gigabytes) cost every new
+        /// prompt over a second. A cache whose writes were not followed (a slot the active fields never held) is
+        /// <see cref="int.MaxValue"/>: all of it.
+        /// </summary>
+        private int _cacheTouched;
 
         private void EnsureCacheCapacity(int required)
         {
+            if (required > _cacheTouched) _cacheTouched = required;
             if (required <= _cacheCapacity)
                 return;
             if (required > _maxContextLength)
@@ -689,8 +829,10 @@ namespace TensorSharp.Models
             _forwardCount = 0;
             _forwardSw.Reset();
             // Rows past the length are masked out of every read: the device copies stay (no re-upload on the next step).
-            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t, keepDeviceCopy: true);
-            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t, keepDeviceCopy: true);
+            // Where the backend zeroes a reset cache, only the rows written since its last zero are (the rest still are).
+            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheRows(t);
+            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheRows(t);
+            _cacheTouched = 0;
             ResetRecurrentPrimary();
             // Rows past the length are dead and the states were rewritten on the host.
             _cacheDeviceDirty = false;

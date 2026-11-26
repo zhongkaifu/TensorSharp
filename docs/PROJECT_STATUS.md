@@ -384,8 +384,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     `TS_MLX_BASELINE_*` and the rest listed in the startup error. MLX Q4_K / Q5_K
     weights always repack to MLX affine, which was already the default. The Gemma 4
     and Muse-Glimmer spellings of the MLX eval and materialize intervals are gone:
-    every model reads `TS_MLX_EVAL_EVERY_N_LAYERS` and `TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL`
-    (`TS_MLX_KV_MATERIALIZE_INTERVAL` went with the legacy Muse-Glimmer model in 2026-11);
+    every model reads `TS_MLX_EVAL_EVERY_N_LAYERS` (`TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL` went with the legacy
+    Gemma 4 model and `TS_MLX_KV_MATERIALIZE_INTERVAL` with the legacy Muse-Glimmer model in 2026-11);
   - the switches that turned a retained whole-model graph or its pieces off
     (`TS_QWEN35_FD_PERSIST`, `TS_GEMMA4_FD_PERSIST`, `TS_GPTOSS_FD_PERSIST`,
     `TS_MUSE_GLIMMER_PERSIST`, `TS_DFLASH_PERSIST`, the `*_BATCHED_ARENA` switches,
@@ -411,10 +411,9 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   - `TS_RETAINED_FUSED_CACHE` and `TS_PREFIX_CHECKPOINTS`, second spellings of
     `TS_RETAINED_FUSED_CACHE_MAX=0` and `TS_PREFIX_CHECKPOINTS_MAX=0`, which turn
     end-state retention and shared-prefix checkpoints off;
-  - `TS_GEMMA4_BATCHED_CAPS`: Gemma 4's token-batched decode always covers
-    per-layer embeddings, shared-KV layers and a wrapped sliding window, through one
-    native entry point (`TSGgml_Gemma4ModelDecodeBatched`); `TS_BATCHED_FUSED_DECODE=0`
-    still decodes concurrent requests round-robin;
+  - `TS_GEMMA4_BATCHED_CAPS`: Gemma 4's batched decode (now the shared decoder
+    runtime's batched graph step) always covers per-layer embeddings, shared-KV layers
+    and a wrapped sliding window;
   - the direct `cuda` backend's switches back to an earlier kernel or off its CUDA
     graphs: `TS_CUDA_QMM_BATCHED` / `_VEC` / `_F16GEMM`, the `TS_CUDA_*_DP4A` family,
     `TS_CUDA_Q80_VEC` / `_MMQ` / `_MMQ2` / `_F16_DEQUANT`, `TS_CUDA_Q81_WARP`,

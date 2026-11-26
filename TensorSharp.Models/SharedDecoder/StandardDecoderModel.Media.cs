@@ -58,11 +58,43 @@ namespace TensorSharp.Models
         /// Default: nothing.</summary>
         protected virtual void OnMediaInjected(int absoluteStart) { }
 
+        /// <summary>
+        /// Whether media rows attend each other in both directions within the forward that carries them (Gemma 4's soft tokens:
+        /// query q reads key k iff k is causally visible inside q's window, or q and k are both media rows of this forward;
+        /// llama.cpp's mtmd non-causal image spans). The graph masks of such a forward open those cells; earlier forwards' media
+        /// rows are reached causally only. Default: no (causal, as text).
+        /// </summary>
+        protected virtual bool MediaAttendsBidirectionally => false;
+
+        /// <summary>Whether a forward's media rows open the masks of the full-attention layers too, not only the sliding-window
+        /// layers' (<see cref="MediaAttendsBidirectionally"/>). Gemma 4: yes. DiffusionGemma keeps its global layers causal over
+        /// an image (vLLM's gemma4_mm). Default: yes.</summary>
+        protected virtual bool MediaOpensFullAttentionLayers => true;
+
+        /// <summary>Whether each run of a forward's media rows (one image's soft tokens) attends only itself in both directions,
+        /// not every media row of the forward (<see cref="MediaAttendsBidirectionally"/>). Default: no.</summary>
+        protected virtual bool MediaSpansAttendApart => false;
+
+        /// <summary>The media rows of the forward being run (set when its media are injected, cleared when the next forward
+        /// embeds), for <see cref="MediaAttendsBidirectionally"/>: row i of the forward is a media row; null without media.</summary>
+        private bool[] _mediaRows;
+
+        /// <summary>The media rows a step of <paramref name="rows"/> rows of <paramref name="sequences"/> sequences opens its masks
+        /// for (<see cref="MediaAttendsBidirectionally"/>), or null.</summary>
+        private bool[] MediaRowsOfStep(int rows, int sequences)
+            => _mediaRows != null && sequences == 1 && _mediaRows.Length == rows ? _mediaRows : null;
+
         private unsafe void InjectMedia(Tensor hidden, int absoluteStart)
         {
             if (_pendingMedia.Count == 0) return;
             OnMediaInjected(absoluteStart);
             int dim = Config.HiddenSize, rows = (int)hidden.Sizes[0];
+            if (MediaAttendsBidirectionally)
+            {
+                _mediaRows = new bool[rows];
+                foreach (var (media, offset) in _pendingMedia)
+                    for (int i = 0; i < media.Sizes[0] && offset + i < rows; i++) _mediaRows[offset + i] = true;
+            }
             float* destination = GetFloatPtr(hidden);
             try
             {

@@ -22,15 +22,16 @@ namespace TensorSharp.Models
             // was left waiting on collectives this rank never issues.
             Serving = new ServingContract
             {
-                Implementation = ServingImplementation.Bespoke,
+                Implementation = ServingImplementation.SharedRuntime,
                 Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.Mlx, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.GgmlVulkan },
                 Autoregressive = false,
                 HasRoutedExperts = true,
                 ContinuousBatching = MechanismSupport.NotApplicable("denoises a canvas instead of decoding; the diffusion scheduler batches requests"),
-                TensorParallel = MechanismSupport.None("diffusion-gemma has no tensor-parallel path; it runs on one GPU and extra GPUs stay idle."),
-                LayerSplit = MechanismSupport.None("diffusion-gemma has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
+                TensorParallel = MechanismSupport.None("diffusion-gemma's canvas steps run on one device; extra GPUs stay idle."),
+                LayerSplit = MechanismSupport.None("diffusion-gemma's canvas steps run on one device; extra GPUs stay idle."),
                 HybridParallel = MechanismSupport.None("diffusion-gemma has no multi-GPU placement to combine."),
-                ExpertOffload = MechanismSupport.On(ServingBackends.Ggml).ElsewhereGap("diffusion-gemma runs host experts through the GGML CPU backend only."),
+                // The shared runtime's host experts (the GeGLU fused stack) on every executor.
+                ExpertOffload = MechanismSupport.On(new[] { BackendType.Cpu, BackendType.Cuda, BackendType.Mlx, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.GgmlVulkan }),
             },
         };
     }

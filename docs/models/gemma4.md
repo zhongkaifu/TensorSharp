@@ -8,7 +8,7 @@
 |---|---|
 | Provider | Google |
 | GGUF architecture key | `gemma4` |
-| Source class | [`Gemma4Model`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.cs) (single-sequence) + [`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs) (`IBatchedPagedModel`) |
+| Source class | [`Gemma4RuntimeModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.cs) on the shared decoder runtime (`StandardDecoderModel`; graph programs on every executor) |
 | Vision encoder | [`Gemma4VisionEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4VisionEncoder.cs) (SigLIP-style ViT) |
 | Audio encoder | [`Gemma4AudioEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioEncoder.cs) (USM-style chunked transformer) |
 | Audio frontend | [`Gemma4AudioPreprocessor`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioPreprocessor.cs) (16 kHz mono → 128-bin log-mel) |
@@ -17,8 +17,8 @@
 | Modalities | Text, image, video (frame stack), audio |
 | Thinking mode | Yes (`<\|channel>thought ... <channel\|>`) |
 | Tool calling | Yes (`<\|tool_call>call:name{...}<tool_call\|>`) |
-| Batched / paged forward | **Default-on** — `IBatchedPagedModel.ForwardBatch` with per-layer paged K/V (handles dual head dims, KV donor sharing, PLE injection, SWA + global mix). `--no-continuous-batching` forces the per-seq KV-swap path. See §11. |
-| MTP speculative decoding | Optional — loads a separate `gemma4-assistant` EAGLE-style draft GGUF via `--draft-model` (`TS_SPEC_DRAFT_MODEL`); naming the file enables speculation by itself (an explicit `--no-spec` vetoes it). The flag works on **either host**: `TensorSharp.Cli` and `TensorSharp.Server` share [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs). Profitable on ggml backends and the pure-C# `cuda` backend. See §12. |
+| Batched / paged forward | The shared runtime's continuous batching: requests run in batched steps over their own slots (prompt chunks and decode rows together), with the prefix cache and checkpoints. See §10. |
+| MTP speculative decoding | Optional — loads a separate `gemma4-assistant` EAGLE-style draft GGUF via `--draft-model` (`TS_SPEC_DRAFT_MODEL`); naming the file enables speculation by itself (an explicit `--no-spec` vetoes it). The flag works on **either host**: `TensorSharp.Cli` and `TensorSharp.Server` share [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs). Runs on every graph executor. See §12. |
 | Output parser | `Gemma4OutputParser` |
 
 ## Downloads
@@ -82,19 +82,9 @@ GPU. The matching `mmproj-gemma-4-E4B-it-Q8_0.gguf` is optional for text-only
 requests; download it from the same repository and pass `--mmproj` for image,
 video, or audio input.
 
-The fast-path claim is backed by three independent routing details:
+Every step runs as a whole-forward graph program on the backend's executor (§7, §8); decode steps of one width replay
+as the previous step advanced.
 
-- Multi-token prefill/verify runs through the fused whole-model
-  `NativeGemma4ModelVerify` graph, including E-series in-kernel PLE gathering
-  and shared-KV donor handling.
-- Single-token dense decode runs the complete transformer through
-  `NativeGemma4ModelDecode` in one GGML graph dispatch.
-- With one scheduled sequence, the scheduler's single-sequence route selects the
-  linear `Forward()` path that reaches that fused whole-model decode instead of
-  the general batched per-op route.
-
-See the [E4B prefill engineering note](../perf/gemma4-prefill-cuda-graph-design.md)
-and the [N=1 scheduler documentation](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 
 Multimodal CLI one-shot (the text prompt comes from a file via `--input`; with
 `--image` and no `--input` a default describe-the-image prompt is used; CLI
@@ -254,15 +244,9 @@ residual += combined
 
 ### 3.3 Decode vs prefill
 
-- **Decode** (`seqLen == 1`) on a GGML backend with all dense layers and all
-  weights quantized: a single native call (`Gemma4ModelDecode`) processes the
-  whole stack, including PLE, per-layer head dims, circular SWA caches, and
-  per-layer scalars in one GPU graph dispatch.
-- **Prefill** (`seqLen > 1`): eligible dense models first use the fused
-  whole-model verify graph, including E-series PLE and shared-KV donor layers.
-  If that gate is unavailable, each eligible dense, non-shared, non-PLE layer
-  can still use the per-layer `Gemma4LayerPrefill` graph; remaining layers use
-  the per-op path. Long prompts are chunked to bound SWA score tensors.
+Both are the same graph program at different widths (§8): a prompt chunk attends the cached prefix and its own rows, a
+decode row the padded cache window under a causal (or band) mask, and media soft tokens attend each other in both
+directions within their forward.
 
 ## 4. Components in detail
 
@@ -478,476 +462,84 @@ blk.{L}.post_norm.weight                   # PLE post-norm
 rope_freqs.weight                          # proportional frequency factors
 ```
 
-## 7. TensorSharp implementation walkthrough
-
-Constructor (`Gemma4Model(string ggufPath, BackendType backend)`):
-
-1. `ParseBaseConfig()` (general fields).
-2. Reads SWA pattern and window, both head dims, both KV head counts, both
-   RoPE bases, partial rotary dims, PLE dim, shared KV layer count, and the
-   MoE expert counts. Sets `Config.UsesCircularKvCache` from the SWA pattern.
-3. `BuildKVDonorMap()` — produces `_kvDonorMap[layer] → donorLayer`.
-4. `ParseTokenizer()`, `LoadWeights()`.
-5. `_hasTiedOutput` detection.
-6. `DetectHeadDimsFromWeights()` — repairs head dims if metadata lies.
-7. `LoadLayerScalars()` — loads `_layerScalars[NumLayers]`.
-8. `FuseQKVWeights()`, `FuseGateUpWeights()`, `FuseExpertGateUpWeights()`.
-9. `PrepareCudaQuantizedWeightsForInference()` — uploads / reorders quant
-   blobs for the direct CUDA backend.
-10. `PrecomputeRoPE()` — fills both local and global frequency tables.
-11. `InitKVCache(maxSeqLen)` — per-layer cache with capacity
-    `slidingWindow` for SWA layers, `maxSeqLen` for global layers; aliases
-    shared layers to their donors.
-12. `BuildGemma4DecodeArrays()` — packs per-layer pointers, types, dims, and
-    the optional MoE / PLE flags into the `_decodeArrays` struct used by the
-    fused single-graph decode kernel.
-
-`Forward(int[] tokens)` orchestrates:
-
-- Embedding lookup + scaling.
-- Optional vision / audio injection (drains the pending lists, marking the
-  injected positions in `exceptPositions` so the layer code skips RoPE / cache
-  writes for those positions).
-- Optional PLE computation.
-- Either:
-  - **Fused decode** (one native call, see § 9), or
-  - **Per-layer C# loop** with optional `TryFusedLayerPrefill` per dense
-    layer.
-- Final RMSNorm, LM head, optional softcap, copy to `_logitsBuffer`.
-
-`ForwardRefill(int[] tokens)` is the prefill-then-decode entry point. It
-splits the prefix into `min(2 × slidingWindow, 2048)`-token chunks
-(overridable via `TS_PREFILL_CHUNK`) and ends with `Forward([lastToken])`.
-Multimodal prompts skip chunking because injection positions are absolute.
-
-## 8. Prefill optimization
-
-### Whole-model single-graph prefill (`NativeGemma4ModelVerify`)
-
-On ggml backends, ordinary multi-token prefill is served by the same fused
-whole-model kernel that MTP verification uses (§12): all layers run in a
-single GGML graph dispatch with activations device-resident, instead of one
-graph per layer. `CanUseWholeModelPrefillVerify()` gates the path — dense
-models only, including E-series in-kernel PLE and shared-KV donor layers, with
-multimodal chunks eligible at any start position via the kernel's
-bidirectional-span mask (see [Image and audio turns after a reused prefix](#image-and-audio-turns-after-a-reused-prefix)). SWA-wrapped chunks at `startPos > 0` stay on the fused path through the
-kernel's in-kernel swaPrev gather.
-All-MoE variants (e.g. 26B-A4B) have a sibling fused path,
-`CanUseWholeModelMoEPrefillVerify()` / `TryFusedMoEModelVerify()`. Note that
-block-quantized (`q8_0` / `q4_0`) KV caches *require* this path for
-multi-token prefill — the per-op fallback cannot walk block-quantized cache
-layouts.
-
-The scheduler feeds a solo (uncontended) prompt to this path in big chunks
-capped by `TS_SCHED_SOLO_PREFILL_CHUNK` (default 8192). See
-[`docs/perf/gemma4-prefill-cuda-graph-design.md`](../perf/gemma4-prefill-cuda-graph-design.md)
-for the measured design.
-
-### Image and audio turns after a reused prefix
-
-An image, video frame or audio clip enters the prompt as a span of soft tokens that
-attend to each other in both directions. The prefill kernels encode that as one byte
-per chunk token (`is_except`): a soft-token query also reads the chunk's soft-token
-keys ahead of it, while every query reads the keys before it causally, inside its
-sliding window on local layers. When a conversation continues its cache into an image
-turn, the image chunk starts at a non-zero position P, after the text the earlier turns
-left behind.
-
-Until this change the fused kernels (dense `TSGgml_Gemma4ModelVerify`, MoE
-`TSGgml_Gemma4MoEModelVerify`) applied the soft-token clause only at P = 0, because they
-compared a key's buffer index with the chunk's bytes. The gates therefore sent a media
-chunk at P > 0 to the per-op path, which was slower (E4B/Metal, a 457-token image turn
-reusing 179 tokens: 1.25 s to first token instead of 0.64 s cold) and, once the ring had
-wrapped, wrong: its mask read the buffer index as the absolute position, but past the
-window the gathered window starts at P - 511, not 0. Phase 0 had to make such a turn
-reuse nothing past its public prefix (`CanPrefillMediaAfterReusedPrefix`).
-
-Every buffer the fused kernels attend keeps the chunk as its last N real keys: the chunk
-alone at P = 0, the global cache `[0, P + N)`, an unwrapped sliding-window cache, or the
-previous window gathered from a wrapped ring prepended to the chunk. A key's chunk index
-is therefore its buffer index minus the number of real keys before the chunk, and the row
-builders in `gemma4_mm_mask.h` apply that offset. At P = 0 and for text chunks they
-produce the same rows as before. The per-op path shifts the absolute soft-token positions
-into the frame of its key buffer (`ShiftPositions`), as the tensor-parallel per-op path
-already did; the tensor-parallel fused verify passes the chunk mask at any P too (its dense
-variant used to run a media chunk at P > 0 with no soft-token mask at all).
-
-So Gemma 4 no longer overrides `CanPrefillMediaAfterReusedPrefix`: an image turn reuses
-the conversation's text at any prompt length, and the image chunk runs on the fused
-graph. Measured on E4B (Q8_0, Metal, M5 Pro) with the IMG conversations (text, text,
-image, text; greedy; median of two rounds; the Web UI column is time to first token, the
-OpenAI column wall time for the whole non-streamed request):
-
-| Image turn 3 | 6db6dbf6 | Phase 0 | this change |
-|---|---|---|---|
-| Web UI, 457-token prompt: reused / time to first token | 0 / 0.64 s | 179 / 1.25 s | 179 / **0.57 s** |
-| OpenAI, 457-token prompt: reused / wall | 0 / 1.80 s | 179 / 2.09 s | 179 / **1.46 s** |
-| Web UI, 889-token prompt (past the window): reused / time to first token | 0 / 0.85 s | 0 / 0.90 s | 611 / **0.62 s** |
-| OpenAI, 946-token prompt (past the window): reused / wall | 0 / 1.86 s | 0 / 1.60 s | 668 / **1.29 s** |
-
-Every reply in those runs (24 short-conversation and 16 long-conversation turns) is the
-same text as the Phase 0 head's and as this change's with the prefix cache off
-(`TS_SCHED_PREFIX_CACHE=0`), and text-only turns keep their reuse and timing
-(`AgentTurnBench --scenarios short,long,tool`, two runs each: within 0.5% of 6db6dbf6 and
-of the Phase 0 head on every row, identical tokens).
-
-On CUDA (E4B Q8_0, A40, one round) the image turn gets the same reuse and runs faster
-too: Web UI 449-token prompt 1.10 s (6db6dbf6) / 2.85 s (Phase 0) / **0.93 s**, OpenAI
-1.45 / 2.49 / **0.98 s**; past the window, Web UI 893 tokens reusing 615: 1.10 / 1.12 /
-**0.91 s**, OpenAI 870 tokens reusing 592: 2.05 / 1.06 / **0.87 s**. There, however, a
-turn continued from a cache is not token-for-token the cold reply on any build: on text
-turns and image turns alike, and on 6db6dbf6 as well, the greedy reply after a reused
-prefix leaves the cold one after a few dozen to a few hundred characters, because
-prefilling the same tokens in two chunks instead of one moves the logits by 0.65 to 0.8
-on E4B with these kernels (the text control of the test below). With identical prompts,
-the Phase 0 head's image-turn reply equals this change's in the short conversation, where
-both reuse the same prefix, and differs past the window, where the Phase 0 head prefilled
-from zero.
-
-Coverage: the native `gemma4-multimodal-mask-after-reused-prefix` test keeps a verbatim
-copy of the old rows, checks they are unchanged at P = 0 and for text, and checks that a
-chunk at P > 0 sees exactly what the same queries see in a cold prefill in every buffer
-layout (the old start-position gate fails 1,102 of its 1,200 media cases).
-`Gemma4MediaAfterReusedPrefixExactnessTests` (model-gated, `TS_TEST_MODEL_DIR`) prefills a
-text turn and then an image or audio turn with and without reuse, inside and past the
-window, on the fused and the per-op path. Its tolerance is twice the larger of two noise
-estimates measured in the same row: the same split with the media left out, and the cold
-media prefill on the other path. On Metal (E4B, E2B) both estimates are about 0.02 logits,
-the fused greedy streams are identical and the prefill logits agree within 0.026, while on
-the Phase 0 head they differed by 3.2 for an image and 2.0 to 7.1 for audio past the window
-(per-op path: 3.2). On CUDA (E4B, 12B, 26B-A4B) the estimates are 0.35 to 1.4 (2.7 for
-12B's short text control), every row passes, and the Phase 0 head's long-prefix rows
-differ by 3.3 to 3.8 (image) and 2.1 (audio), above the tolerances measured for the same
-rows here (1.3 to 2.8); the greedy streams there are compared only up to the first
-near-tie within the noise, which is usually the first token or two. The per-op path's
-greedy stream is not compared token for token: it is not reproducible against itself (four
-identical cold prefills flipped a near-tie at decode step 16). `Gemma4SoftTokenMaskTests`
-pins the two position conversions.
-
-Two limits carry over from the cold path. The mask marks soft tokens, not which media item
-they belong to, so two images prefilled in the same chunk attend to each other in both
-directions. A conversation that sent an image in an earlier turn prefilled that image in
-its own chunk, where it could not see a later image; a cold prefill of the whole history
-lets it, so a reply after two images can differ between the two. And a chunk
-boundary that falls inside a span, which the scheduler's 256-token contention chunks can
-cause, splits its bidirectional attention.
-
-### In-kernel PLE gather
-
-The per-layer embeddings (PLE) are gathered inside the fused verify graph via
-`ggml_get_rows` on the resident quantized `per_layer_token_embd` table,
-instead of computing them in C# and shuttling the ~88 MB result
-device→host→device every chunk. Checkpoints whose PLE table or projection the
-kernel cannot read keep the uploaded path.
-
-### KV cache pre-grow (`PrepareForPrefill`)
-
-At the start of a fresh prefill the grow-on-demand global KV cache is
-pre-sized to the whole prompt (`PrepareForPrefill(totalPromptTokens)`). At
-`start_pos == 0` the cache holds no committed K/V, so growing to the final
-size copies nothing — this eliminates the incremental doubling grows that
-each re-copied and device↔host round-tripped the whole global cache (a
-measured ~7% at 64k). GGML GPU backends only, clamped to the model context.
-
-### Global caches shorter than 256 rows or not a multiple of 256
-
-ggml-cuda runs the 512-dim global layers only on its grouped-query flash
-kernel, which needs a KV window that is a multiple of 256 rows. The window is
-padded to 256 but never past the allocated cache, so a cache that has grown to
-16 rows (`TS_KV_INITIAL_TOKENS=8`) or that is capped at a length like 4000
-(`MAX_CONTEXT=4000`, past 3840 tokens) used to abort the process in
-`ggml-cuda/fattn.cu`. Those global layers now run as explicit attention with the
-same result and a one-time `has no flash-attention kernel` warning, and return
-to the kernel once the cache length is a multiple of 256 again; the default
-cache sizes never take this path. See
-[Flash attention on shapes a backend has no kernel for](../../DEVELOPMENT.md#flash-attention-on-shapes-a-backend-has-no-kernel-for).
-
-### Fused per-layer prefill (`Gemma4LayerPrefill`)
-
-For each eligible layer (dense, non-shared KV, no PLE injection in the
-current chunk, all weights quantized), `TryFusedLayerPrefill()` invokes a
-single GGML graph that performs the entire transformer block in one dispatch:
-
-1. RMSNorm(attn_norm)
-2. Fused QKV matmul → split Q, K, V
-3. Per-head QK RMSNorm, V unweighted RMSNorm
-4. RoPE (local NeoX or global proportional)
-5. Causal attention (SWA or full causal) with KV cache append
-6. Output projection + RMSNorm(post_attn_norm) + residual
-7. RMSNorm(ffn_norm) → ffn_gate_up matmul → GELU(gate)*up → ffn_down matmul
-8. RMSNorm(post_ffw_norm) + residual + layer_output_scale
-
-Layers with MoE, KV sharing, or active PLE injection fall back to the
-standard per-op C# path.
-
-### Chunked prefill
-
-`prefillChunkSize = min(2048, max(2 × slidingWindow, 1024))`. Each chunk
-processes through all layers before advancing, keeping the SWA score tensor
-small. Override with `TS_PREFILL_CHUNK=N` for tuning.
-
-### Cross-layer caches
-
-Three caches re-used across layers within one forward pass:
-
-- `_cachedSWAMaskWidths` — per-row sliding-window mask widths for the current
-  `(queryLen, startPos)`; recomputed only when `seqLen` or `startPos` changes.
-- `_neoXRopeCos` / `_neoXRopeSin` — global-layer NeoX RoPE cos/sin tables
-  built once per forward and reused across all global layers.
-- `_cachedRoPEPosQ` / `_cachedRoPEPosK` — local-layer RoPE position tensors
-  cached across layers when `seqLen` and `startPos` match.
-
-### SWA prev-window gather
-
-Long prompts wrap the SWA cache mid-chunk, so a chunk-2 query near the start
-needs the (W − 1) positions that the chunk just overwrote. Before any layer in
-the new chunk runs, `PrepareSwaPrevWindowsForChunk(startPos, seqLen)` snapshots
-the live SWA window; SWA layers then concatenate the snapshot in front of the
-freshly-computed K/V before running attention.
-
-### Donor SWA-K/V publishing
-
-When KV-shared SWA layers exist, the donor layer publishes its freshly-
-computed K/V into `_prefillSWAKV` so shared layers attend to the full chunk's
-K/V instead of the partial rolling cache.
-
-## 9. Decode optimization
-
-### Fused single-graph decode (`Gemma4ModelDecode`)
-
-When `_canUseFusedDecode` (all dense, all quantized) and `seqLen == 1`, the
-decode path collapses to a single native call. `BuildGemma4DecodeArrays()`
-packs the following per layer once at load time:
-
-- Quantized weight metadata (`type`, `ne0`, `ne1`, raw byte pointers).
-- Per-layer head dim, KV head count, RoPE base / kind.
-- KV cache pointers (writable scratch on GPU).
-- Layer scalar value.
-- PLE flags / projection pointers.
-
-`NativeGemma4ModelDecode()` then runs the entire stack — embedding lookup is
-in C# but every layer (RMSNorm + QKV + QK-norm + V-norm + RoPE + circular
-cache append + attention + output projection + post-attn norm + GeGLU FFN +
-post-FFN norm + residual + layer scalar) executes in one GGML graph dispatch
-on Metal / CUDA. This eliminates hundreds of CPU↔GPU round-trips per token.
-
-`EnsureKvCacheHostSynchronized()` bridges between the fused and unfused
-paths: when the next forward is unfused (e.g. mid-conversation prefill), the
-host KV cache copy is updated from the device.
-
-### Circular KV cache for SWA layers
-
-`CopyToCacheCircular()` writes new K/V slots at `pos % cacheSize` for SWA
-layers. `AttentionDecodeCircular()` traverses the circular buffer for read.
-SWA layers therefore allocate `slidingWindow` slots regardless of context
-length — the resident set is bounded.
-
-### Token-batched fused decode for concurrent requests (`Gemma4ModelDecodeBatched`)
-
-With N >= 2 requests in flight the engine does not round-robin N single-token
-graphs: `Gemma4Model.TryForwardBatchedFusedDecode` decodes one token for every
-sequence in ONE fused graph (`TSGgml_Gemma4ModelDecodeBatched` in
-[`ggml_ops_gemma4_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gemma4_batched.cpp)),
-so every weight is loaded once per step and applied to N tokens. Decode is
-bandwidth-bound, which is where the aggregate throughput comes from. Each
-sequence keeps its own per-request KV holder; the kernel takes the holders as a
-`[layer * N + seq]` pointer array, runs the projections / FFN / LM head over
-`[hidden, N]`, and runs one single-row flash-attention per sequence over a
-direct view of that sequence's cache window.
-
-The kernel covers what the E2B/E4B checkpoints need (PLE dim 256, 18 KV-donor
-layers, a 512-slot ring most chats outgrow):
-
-- **PLE per row.** The per-layer embeddings are gathered *inside* the graph
-  from the resident quantized `per_layer_token_embd` table with one
-  `get_rows` over the N token ids (plus the `per_layer_model_proj` projection,
-  its RMSNorm and the `1/sqrt(2)` combine, exactly as the single-token decode
-  and `ComputePLE`), and injected per layer as a strided `[ple_dim, N]` column
-  slice. When the in-kernel form is unavailable (`CanGatherPleInKernel` false:
-  an unsupported `get_rows` type or a scaled projection) the caller uploads
-  `ComputePLE`'s rows instead, so the PLE term is never dropped.
-- **KV-donor layers.** `kv_source_arr[l]` names the layer whose cache layer
-  `l` attends. A shared layer runs the Q-only projection and reads the donor's
-  per-sequence window and mask; it writes nothing.
-- **SWA wrap.** A local layer whose sequence is past its ring writes at
-  `pos % cache_size` and reads the whole ring flat with every slot valid; decode
-  softmax is permutation-invariant over keys, so the rotation needs no concat.
-  Global (linear) layers must still fit their cache. A sequence that needs growth
-  takes a serial step while other ready sequences can continue batching.
-
-The kernel takes each sequence's actual cache capacity as
-`cache_size_arr[layer * N + seq]`. Retained-prefix clones are intentionally
-smaller than fresh caches, and each request grows independently, so the kernel
-uses each allocation's real KV-head stride and its own padded attention window
-and mask. It does not expand short children to the largest request's allocation.
-Shared-KV layers use their donor's capacity for the same sequence.
-`TS_BATCHED_FUSED_DECODE=0` decodes concurrent requests round-robin for an A/B.
-
-Every per-step input (hidden rows,
-positions, per-(layer, seq) `set_rows` write rows, per-sequence F16 masks, the
-PLE token ids or uploaded PLE rows) is a graph input refreshed with
-ordered backend uploads, and the graph lives in its own context and own-slot
-buffer, so a recurring request set replays a captured graph at stable
-addresses. Capture identity includes all K/V pointers, capacities and windows;
-cache growth invalidates captured graphs before replacing storage. The MoE
-batched kernel (`TSGgml_Gemma4MoEModelDecodeBatched`) keeps
-its no-PLE / no-donor scope.
-
-The server logs the first successful fused batch and gives a reason for the
-first declined batch. One decline does not mean every later step is serial.
-`Gemma4Model.BatchedFusedDecodeSteps` and `BatchedFusedDecodeTokens` count only
-successful native batched executions; `BatchedFusedDecodeDeclines` counts
-rejected attempts. The regression and benchmark in
-[`eng/validation/Gemma4BatchedCacheProbe`](../../eng/validation/Gemma4BatchedCacheProbe)
-exercise real prefix clones, different capacities, independent growth, reordered
-requests, and subsequent solo continuation.
-
-**Verified** ([`Gemma4BatchedFusedDecodeParityTests`](../../InferenceWeb.Tests/Gemma4BatchedFusedDecodeParityTests.cs),
-`TS_TEST_GGML_BACKEND=cuda`, gemma-4-E4B-it-Q8_0): for 2, 3 and 4 concurrent
-sequences, one of them prefilled past the 512-token SWA ring, the 12-step greedy
-continuations of the batched path equal the round-robin single-token decodes
-token for token, and every step ran on the batched kernel.
-
-**Measured** (gemma-4-E4B-it-Q8_0, NVIDIA A40, ggml_cuda, f16 KV, prefill
-chunk 512, 4 running sequences; the round-robin column declined the batched
-kernel for PLE / shared-KV / wrapped-SWA models, everything else identical):
-
-| Workload | Round-robin (before) | Token-batched (after) | Ratio |
-|---|---:|---:|---:|
-| AgentTurnBench `conc`, 1 request (decode tok/s) | 68.8 | 68.5 | 1.0× |
-| AgentTurnBench `conc`, 2 concurrent (aggregate decode tok/s) | 65.1 | 99.0 | 1.5× |
-| AgentTurnBench `conc`, 4 concurrent (aggregate decode tok/s) | 66.5 | 148.7 | 2.2× |
-| `validate_inference.py` `decode` (512 new tokens), concurrency 1 (end-to-end tok/s) | 76.8 | 77.7 | 1.0× |
-| `validate_inference.py` `decode`, concurrency 4 (aggregate end-to-end tok/s) | 70.3 | 148.6 | 2.1× |
-| `validate_inference.py` `decode_8k` (8k prompt), concurrency 1 | 63.8 | 64.3 | 1.0× |
-| `validate_inference.py` `decode_8k`, concurrency 4 | 59.0 | 101.7 | 1.7× |
-
-The `validate_inference.py` rows compare the server built from this tree
-against the server built from the previous commit; their solo (concurrency 1)
-outputs are byte-identical. What "token for token" does and does not mean
-here: the AgentTurnBench `conc` streams (`compare.py`, identical output token
-ids required) and the 12-step in-process parity test match the round-robin
-decode exactly, but over hundreds of greedy tokens a low-margin token can flip
-(`ParityHarness --batched` at 256 steps: one of the sequences in each 2/3/4-way
-set diverged), and the batched kernel does the same on gemma-4-12B
-(no PLE, no shared KV) under the identical run — batching changes GEMM shapes
-and therefore rounding, the caveat already documented for the GLM batched
-decode. Through the HTTP server at concurrency 4 even two round-robin runs
-differ (10/16 identical cases), because prefill/decode interleaving is
-scheduling-dependent, so parity has to be judged in-process.
-
-## 10. Memory and KV cache strategy
-
-- **SWA layers**: capacity `_slidingWindow` slots, circular write/read via
-  `CopyToCacheCircular()` and `AttentionDecodeCircular()`.
-- **Global layers**: capacity `maxSeqLen` slots, linear append/read via
-  `CopyToCacheLinear()` and `AttentionDecodeWithWindow()`.
-- **Shared layers**: alias the donor's `_kvCacheK[donor]` /
-  `_kvCacheV[donor]` — no separate allocation.
-- **Quantized weight binding**: zero-copy mmap on GGML CPU / Metal / CUDA (the
-  GGUF file is `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`).
-  Direct CUDA uploads quantized blobs to device memory once and frees the host
-  copy.
-
-## 11. Batched / paged forward (continuous batching)
-
-Gemma 4 has a full `IBatchedPagedModel.ForwardBatch` port
-([`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs))
-that runs through the shared `InferenceEngine` continuous-batching stack
-([`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)).
-It is enabled **by default**; `--no-continuous-batching` forces the
-per-seq KV-swap path. A solo request already reaches the fused single-graph decode
-through the scheduler's single-sequence route.
-
-Gemma 4 is the hardest model TensorSharp ports to paged batching because
-of three sources of per-layer heterogeneity that the engine assumes is
-uniform across layers:
-
-- **Heterogeneous head dims and KV head counts.** Local layers use
-  `head_dim_local` (typically 256) and a different `num_kv_heads` than
-  global layers (`head_dim_global` 512). `EnsureGemma4PagedBuffers`
-  allocates one paged K/V buffer per layer with its own per-layer
-  `numKvHeads * headDim` size. `_g4PagedKvDimPerLayer[layer]` records the
-  dimensionality so the scatter / gather steps know how to stride into
-  each buffer.
-- **Per-layer SWA dispatch.** The native paged-attention kernel takes a
-  `sliding_window` parameter per call. The batched path computes
-  `IsLocalLayer(l) ? _slidingWindow : 0` per layer and threads it into
-  `GgmlBasicOps.PagedAttentionForward` so local layers get the SWA
-  window mask and global layers get full attention — within the same
-  `ForwardBatch` invocation.
-- **KV donor layer aliasing.** Layers 24-41 share K/V with earlier
-  layers. The batched buffer for a "receiver" layer is a pointer alias
-  of the donor layer's buffer (refcount-shared inside the `BlockPool`)
-  rather than a separate allocation. This preserves the legacy KV-share
-  behaviour while keeping the scheduler oblivious to the aliasing.
-
-The remaining batched-path mechanics mirror Mistral 3:
-
-- **Per-token NeoX RoPE** dispatched through `Ops.RoPEExWithFreqFactors`
-  with the per-layer proportional / partial frequency factors and an
-  explicit `positions[]` tensor.
-- **K/V scatter via `slotMapping`** into the per-layer paged buffer.
-  `EnsureGemma4PagedBuffers` copies existing K/V across grow events so
-  already-scheduled sequences keep their state.
-- **Per-Layer Embedding (PLE)** is computed **once per batch** at the
-  start of `ForwardBatch` (`ComputePLE(flatTokens, hiddenStates, numTokens)`)
-  and the per-layer slice is added after the post-attention residual,
-  matching the legacy injection point.
-- **Multimodal embedding injection** uses the same row-wise
-  `InjectMultimodalEmbeddings` path as the legacy forward; embeddings
-  land at the right absolute token positions inside the concatenated
-  batched hidden state.
-
-**Verified correctness**
-([`Gemma4BatchedForwardTests`](../../InferenceWeb.Tests/Gemma4BatchedForwardTests.cs)):
-- Per-layer checksum trace matches the legacy unfused path within FP
-  noise for all 42 layers (SWA + GQA + PLE + KV-donor sharing at L24+).
-- Logit-cosine ≥ 0.99 against the legacy non-batched path.
-- `EngineParallelInferenceTests.Gemma4_ThreeLongGenerationsParallel`
-  exercises the multi-sequence batched path through the engine.
-
-**Throughput** (gemma-4-E4B-it-Q8_0, Apple M4 Pro, GgmlMetal — per-seq and
-batched paths in one process, see
-[`Gemma4BatchedPerfBench.cs`](../../InferenceWeb.Tests/Gemma4BatchedPerfBench.cs)):
-
-| Workload | n | Prompt tok | Per-seq tps | Batched tps | Speedup |
-|---|---|---|---|---|---|
-| Single sequence, short prompt | 1 | 29 | 14.0 | 4.9 | **0.35×** (batched slower) |
-| 5 short prompts parallel | 5 | 142 | 10.2 | 13.5 | **1.32×** |
-| 8 short prompts parallel | 8 | 218 | 10.0 | 15.1 | **1.51×** |
-| 4 long-context prompts parallel | 4 | 3 293 | 3.4 | 5.4 | **1.61×** |
-
-The speedup grows with batch size: at batch=8 short prompts the per-call
-paged graph build / gather cost is fully amortised. Single-sequence was a
-net loss in this in-process toggle because the legacy fused single-graph
-decode won by ~3× without any batching to amortise. These numbers predate
-the N=1 fast path: with it on (the default) a lone sequence runs the fused
-single-graph decode instead of the batched per-op route.
-
-**Two known bring-up bugs fixed during port** (now regressions-tested):
-
-1. `TSGgml_PagedAttentionForward` was missing `ggml_cont` on Q after the
-   permute. `ggml_flash_attn_ext` silently produced wrong output on
-   Metal when Q was a non-contiguous view.
-2. `EnsurePagedBuffers` previously rebuilt K/V arrays destructively on
-   grow, wiping K/V already written for previously-scheduled sequences
-   in the same batch. The first sequence in a multi-sequence batch
-   would then degenerate into a single-token loop on its first decode
-   after later sequences joined. The fix (copy-on-grow) applies to
-   Mistral 3 too.
+## 7. Implementation on the shared decoder runtime
+
+Gemma 4 runs on the shared decoder runtime: [`Gemma4RuntimeModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.cs)
+derives from [`Gemma4DecoderModel`](../../TensorSharp.Models/Models/Gemma4/Gemma4DecoderModel.cs), the recipe it shares with
+[DiffusionGemma](diffusiongemma.md), a [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) family, so slots, the unified
+step, continuous batching, the prefix cache, checkpoints, placements and speculation are the runtime's, and every step is a
+whole-forward graph program run by the backend's executor (GGML, the managed CPU, direct CUDA, MLX). The family supplies
+the recipe through the runtime's hooks:
+
+| Part | Where | What |
+|---|---|---|
+| Per-layer attention geometry | `Gemma4DecoderModel.cs` (`LayerKeyDim`, `LayerKvHeads`, `SlidingWindow`, `AttentionScale`) | 256-wide sliding-window heads and 512-wide global heads, per-layer KV head counts, scale 1 |
+| KV sharing | `KvSourceLayer`; the runtime's `EmitSharedKvAttention` | the last `shared_kv_layers` layers attend their source's operands of the same step and project queries only |
+| Q/K/V | `Gemma4DecoderModel.Graph.cs` (`EmitAttentionProjections`, `EmitQueryKey`) | weighted Q/K RMSNorm, unweighted V norm, V = K on global layers without `attn_v` |
+| Rotary | `RotarySpec` with `rope_freqs` factors (`GraphOp.RopeExt` with a factor input) | NeoX local rotary at base 10 000; global rotary over 512 dims with the proportional factors |
+| Feed-forward | `EmitFeedForward`, `EmitRoutedExperts` | GeGLU; MoE layers: dense branch beside routed GeGLU experts over the fused `ffn_gate_up_exps` stack, with the router scale and per-expert output scale |
+| Per-layer embeddings | `EmitStreamInput` / `EmitPerLayerInputs` / `EmitBlockOutput` | token rows of `per_layer_token_embd` plus the normed model projection, gated into the stream after each layer |
+| Media | [`Gemma4RuntimeModel.Multimodal.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Multimodal.cs) | the towers' soft-token rows replace their placeholders before the `sqrt(n_embd)` scale (which skips them) and attend each other in both directions |
+| MTP head | [`Gemma4RuntimeModel.Assistant.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Assistant.cs) | the gemma4-assistant drafter (§12) |
+
+The runtime pieces Gemma 4 added for everyone: per-layer key/value widths and KV head counts, KV-shared layers, rotary
+frequency factors on every executor (`Ops.RoPEExFactors`, a CUDA kernel, MLX `fast.rope` with frequencies), bidirectional
+media spans, a stage carry for values the stream input makes that later stages read, read-only attention over a trunk
+layer's cache (`EmitCacheReadAttention`) and per-token family drafters (`FamilyTokenDrafter`).
+
+## 8. Prefill and decode
+
+A prompt chunk and a decode row are the same graph program at different widths. Decode steps of one width replay as the
+previous step advanced (positions, masks, write rows and the per-layer-embedding token ids are refilled in place), and on
+direct CUDA they replay as recorded kernel sequences. Sliding-window layers keep a ring of the window plus a prompt step's
+rows. On direct CUDA the routed experts of a decode row run as one fused region (`GraphFusion.GegluRoutedExperts`: the
+fused-stack MoE decode kernels with dp4a), which took 26B-A4B decode from 34 to 80 tok/s on an A40.
+
+## 9. Memory and KV cache
+
+KV-shared layers own no cache. Every cache type the runtime serves works, the block-quantized ones included (`q8_0`,
+`q4_0`; the legacy model declined them and fell back to `f16`): on E4B `ggml_cuda` a `q8_0` cache matched the `f16`
+reference at cos 0.9999 over 96 teacher-forced steps. Routed experts may stay in host memory (`--n-cpu-moe` / `--cpu-moe`)
+on every backend: GGML's host MoE segment and the tensor executors' expert host run GeGLU over the fused stack in the
+native host-expert kernel (`TSGgml_HostExpertRowsAct`); 26B-A4B with 12 host layers on `ggml_cuda` agreed with the
+legacy model's all-device run on 95 of 96 teacher-forced steps (the other a 0.06-nat near-tie).
+
+## 10. Continuous batching, prefix cache and checkpoints
+
+Requests run in batched steps over their own slots (prompt chunks and decode rows in one step); the prefix cache,
+retained conversations, checkpoints and their export/import are the runtime's (see
+[Paged attention and continuous batching](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)).
+
+## 11. Validation against the legacy model
+
+The runtime model replaced the legacy `Gemma4Model`, which was deleted with its native whole-model graphs
+(`TSGgml_Gemma4ModelDecode`, `...Verify`, `...DecodeBatched`, the MoE variants and `TSGgml_Gemma4DraftStep`). Measured
+on one A40 (ggml at d9fe7bff), with the legacy and runtime binaries built from the same tree:
+
+| Check | Result |
+|---|---|
+| Teacher-forced argmax agreement (E4B Q8_0, 12B UD-Q4_K_XL, 26B-A4B UD-Q4_K_XL; ggml_cuda, cuda, ggml_cpu, cpu) | every step agrees except near-ties (the largest legacy margin at a disagreement 0.29 nat) |
+| Verify windows against plain steps (E4B, windows of 4, with rollbacks) | ggml_cuda relL2 1.43e-2 (legacy 1.42e-2); direct CUDA bit-identical (legacy 1.3e-2) |
+| Images (E4B, 12B, 26B; ggml_cuda and cuda) and speech (E4B) through the CLI | the same descriptions and the same transcription as the legacy model |
+| Server, 5 prompts, 3 concurrent (ggml_cuda) | E4B 102 tok/s against legacy 90; 26B-A4B 74 against 56 |
+| Prefill (ggml_cuda, warm) | 1.5-2.4x the legacy model's |
+
+Greedy streams of the two models part where a token's top two logits are within the backends' rounding; the frozen legacy
+logits of the synthetic fixtures (`InferenceWeb.Tests/Fixtures/Gemma4/LegacySynthetic`) hold the runtime to the legacy
+math in [`Gemma4RuntimeTests`](../../InferenceWeb.Tests/Gemma4RuntimeTests.cs). Not run here: Metal, Vulkan, MLX and
+more than one GPU (tensor parallelism and stages were tested over simulated devices on the managed executor).
 
 ## 12. MTP speculative decoding (gemma4-assistant draft head)
 
 Gemma 4 supports **multi-token-prediction (MTP) speculative decoding**
-for solo (non-concurrent) sequences on both hosts. Unlike Qwen 3.6,
+on both hosts. Unlike Qwen 3.6,
 whose NextN block is embedded in the trunk GGUF, the Gemma 4 draft head ships as
 a **separate small `gemma4-assistant` GGUF** loaded with `--draft-model`
 (env `TS_SPEC_DRAFT_MODEL`)
 and attached to the target at startup by
 [`SpeculativeDraftHeadLoader`](../../TensorSharp.Models/SpeculativeDraftHeadLoader.cs).
 Source:
-[`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs),
+[`Gemma4RuntimeModel.Assistant.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Assistant.cs),
 driven through the shared
 [`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
 draft / verify / rollback core — Gemma 4 is the `draft-head` algorithm of the
@@ -989,38 +581,26 @@ the target's hidden size** — pair the 12B target with its 12B draft, not the
 ([`SpeculationStartupValidation`](../../TensorSharp.Chat/Hosting/SpeculationStartupValidation.cs))
 rather than silently running without speculation.
 
-### 12.3 Backend profitability and fused kernels
+### 12.3 The drafter on the runtime
 
-`SpeculationProfitable`
-([`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs))
-gates whether speculation actually engages:
+The assistant is a per-token family drafter ([`Gemma4RuntimeModel.Assistant.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4RuntimeModel.Assistant.cs)):
+each step is one graph program over the active slot whose blocks read the trunk's donor caches (through the KV-sharing
+map) with `EmitCacheReadAttention` at the trunk's committed length, so there is nothing to catch up and a draft resumes at
+any position. It runs on every graph executor. Under `--tp` the head is refused (it reads whole caches, which tensor
+parallelism shards by KV head); n-gram speculation still runs. Measured on an A40 (greedy, 128 tokens, 3 drafts):
 
-- **ggml backends (CUDA / Metal; `ggml_vulkan` and `ggml_cpu` pass the same
-  gate)** — run fused single-graph kernels: a multi-token
-  verify (`NativeGemma4ModelVerify`, or `TryFusedMoEModelVerify` for the 26B-A4B
-  MoE) and a fused draft step (`NativeGemma4DraftStep`). On partial acceptance a
-  dense fast-rollback avoids re-running the kept prefix. The verify trunk is the
-  model's linear cache; a shape the fused kernels decline runs per-op.
-- **Direct CUDA (`cuda`, pure C#)** — has no fused kernels, but its per-op verify
-  and draft are fully GPU-resident: the draft attends the donor cache on-device,
-  global verify attention runs the GQA decode kernel per row against the live
-  cache, and global RoPE uses a GPU kernel — so the verify layer loop issues zero
-  host-sync stalls. A win on prose/chat workloads, ~break-even on low-acceptance
-  greedy.
-- **Pure-C# `cpu` and Apple `mlx`** — no fused kernels and no GPU-resident per-op
-  path, so speculation stays off and the engine serves the standard fused decode.
+| Model, backend | Plain tok/s | With the head | Acceptance | Legacy with its head |
+|---|---|---|---|---|
+| E4B Q8_0, ggml_cuda | 86-89 | 1.0-2.2x | 22-83 % | 0.9-1.8x |
+| E4B Q8_0, cuda | 69-74 | 1.0-2.1x | 21-83 % | 0.9-1.8x |
+| 12B UD-Q4_K_XL, ggml_cuda | 65-72 | 1.5-2.3x | 52-86 % | 0.7-1.4x |
+| 26B-A4B UD-Q4_K_XL, ggml_cuda | 114-141 | 0.9-1.4x | 44-89 % | 0.6-0.9x |
 
-The 26B-A4B MoE target additionally required a load-time OOM fix on `ggml_cuda`
-(skipping the per-expert device preload) before MTP speculation became a net win.
-
-Opt-in is the `--draft-model` file itself; opt-out (`--no-spec`) and tuning
-(`--spec-draft` / `--spec-pmin`) use the shared flags, which
-`TensorSharp.Cli` and `TensorSharp.Server` parse from the same
-[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs);
-see [Speculative decoding](../../FEATURES.md#speculative-decoding) for the full
-flag list and the other algorithms — `--spec-type ngram` in particular needs no
-draft GGUF at all and so runs on a Gemma 4 checkpoint with no assistant file
-beside it.
+Opt-in is the `--draft-model` file itself; opt-out (`--no-spec`) and tuning (`--spec-draft` / `--spec-pmin`) use the
+shared flags, which `TensorSharp.Cli` and `TensorSharp.Server` parse from the same
+[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs); see
+[Speculative decoding](../../FEATURES.md#speculative-decoding) for the other algorithms (`--spec-type ngram` needs no
+draft GGUF at all).
 
 ### 12.4 Greedy parity
 
@@ -1109,67 +689,21 @@ through the thought channel and arms after `<channel|>`
 (`ThinkingGrammarActivationTrigger`). With thinking off it enforces from the
 first token, which also excludes `<|channel>`.
 
-## 13a. Tensor parallelism
+## 13a. Tensor parallelism and whole-layer stages
 
-Gemma 4 runs under `--tp N` on the direct `cuda` backend and on the GGML CUDA /
-Vulkan backends, with multimodal embeddings injected into the TP path so
-vision/audio prompts survive sharding.
+`--tp N` runs per-rank graphs: Q/K/V and gate/up column-parallel, the attention output and down row-parallel, a MoE
+layer's fused `[gate | up]` experts split by halves (each rank's slice is `[gate_r | up_r]`, on GGML as its own expert
+stack); the `[dense | routed]` partials reduce in one all-reduce before their norms. KV heads must divide by N on every
+layer. `--layer-split N` runs one graph per stage; the per-layer embeddings travel from stage to stage beside the stream,
+and the stage planner never starts a stage between a KV-shared layer and its source. Tensor-parallel stages (the hybrid)
+are a declared gap: the graph-only family has no graphs for them yet.
 
-The MoE variants need special handling on GGML. The whole-model MoE kernels
-(`TSGgml_Gemma4MoEModelDecode` / `...Verify`) compute the router inside the
-graph and `ggml_top_k` returns *global* expert ids, which whole-expert sharding
-cannot feed. Under TP the MoE layers are therefore sharded the Megatron way
-*inside* each expert: every rank keeps all 128 experts and holds `1/tp` of each
-expert's FFN width (gate/up column-parallel on the intermediate dim keeping the
-fused `[gate_r | up_r]` layout, down row-parallel on it over whole quant
-blocks). `sel` stays global, the graph is the single-GPU graph with narrower
-expert matrices, and the expert-sum output becomes a third row-parallel partial
-per layer — reduced right after the routing-weighted sum, which is linear, so
-summing then weighting equals weighting then summing. The slices are
-materialized at load (~10.5 GB on the 26B, ~36 s); `TS_GEMMA4_TP_FUSED_MOE=0`
-falls back to the whole-expert per-op path.
+## 14. Open items
 
-Measured on 2× RTX 2000 Ada (prefill 512 / decode 64, tok/s): E4B Q8_0 goes from
-2760 / 37.3 on one GPU to 2488 / **51.7** at `--tp 2`; 26B-A4B IQ4_XS from
-1845 / 48.5 to 2537 / **51.2**. Both produce output **byte-identical** to their
-single-GPU runs. Full detail:
-[`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md).
-
-## 14. Optimization opportunities
-
-- **Fused MoE kernels for mixed dense+MoE layouts** — all-MoE variants
-  (e.g. 26B-A4B) now run fused whole-model MoE decode
-  (`TryFusedMoEModelDecode` / `TSGgml_Gemma4MoEModelDecode`) and prefill/verify
-  (`TryFusedMoEModelVerify`), but a hypothetical model mixing dense and MoE
-  layers would still fall back to the per-layer graphs. (The expert-batched
-  FFN kernel described below already removes the sequential per-expert
-  dispatches from the unfused path.)
-- **Audio prefill on GPU** — the audio encoder currently dispatches its
-  conv subsampling on CPU. Moving the conv stack onto Metal / CUDA would
-  improve TTFT for long audio prompts.
-
-### Completed
-
-- **MTP speculative decoding (gemma4-assistant draft)** — a separate EAGLE-style
-  draft GGUF (`--draft-model`) accelerates solo decode (§12). ggml backends run
-  fused multi-token-verify (dense `NativeGemma4ModelVerify` and MoE
-  `TryFusedMoEModelVerify`) and fused draft-step (`NativeGemma4DraftStep`) kernels,
-  with a dense fast-rollback on partial acceptance; the pure-C# `cuda` backend runs
-  a fully GPU-resident per-op verify/draft. The 26B-A4B MoE target also needed a
-  `ggml_cuda` load-time OOM fix (skip per-expert device preload) before speculation
-  became a net win. Mismatched / incomplete draft GGUFs fail fast at startup.
-- **Expert-batched FFN (GEGLU)** — `MoEForward` previously ran a
-  batched-by-expert loop that degenerated into `num_experts_used` single-row
-  matmuls on the decode path. It now dispatches the entire layer through
-  `GgmlBasicOps.MoEFFNPrefill(..., MoEActivation.GEGLUSplit)`, which issues
-  two or three `ggml_mul_mat_id` ops (gate[+up] / down) plus a fused
-  `ggml_geglu_split` activation and expert aggregation — a constant-bounded
-  graph submission per MoE layer regardless of `seq_len` or
-  `num_experts_used`. The kernel consumes the original 3D
-  `ffn_gate_up_exps.weight` / `ffn_down_exps.weight` blocks as zero-cost
-  stacked views (mmap-backed on Apple Silicon, single shared buffer on
-  Windows / Linux), and the pre-existing `ffn_down_exps.scale` per-expert
-  factor is folded into the routing weights in C# so the native kernel
-  stays activation-agnostic. Falls back to the previous batched-by-expert
-  C# path when a layer's stacked views are unavailable (e.g. F32-only
-  tensors).
+- Direct CUDA E4B decode at 512/128 runs 72-78 tok/s against the legacy model's 77.5-79 on an A40 (12B: 39-40.5 against
+  34; 26B-A4B: 80-85 against 66-67). The decode-once kernels take four warps an output row on Ampere (69-72 tok/s at the
+  RTX 5090's widths); the rest is the d256 decode attention's split flash kernel and its per-layer mask cells (~5 us a
+  local layer over the legacy partition kernel). The other checkpoints and backends are above the legacy model.
+- The first long prefill of a fresh 12B / 26B-A4B process on `ggml_cuda` pays the graph compile for its step shape (and the
+  lazy expert upload); warm prefill is 1.5-2.4x the legacy model's.
+- Metal, Vulkan, MLX and multi-GPU placements were not run on hardware for this migration.

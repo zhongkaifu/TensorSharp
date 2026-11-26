@@ -1005,8 +1005,8 @@ namespace TensorSharp.Models
         // On MLX every op is a hand-off to the MLX worker thread (MlxWorker.Invoke: a queue
         // push and a wait, ~5-25 us), and a decode token issues roughly a thousand of them —
         // a Metal trace of gpt-oss-20b decode showed the GPU busy 42% of the time. Running
-        // the whole forward as ONE hand-off lets every nested op run inline on the worker,
-        // as Gemma4Model does. The parallel host loops in this forward (CPU attention, F16
+        // the whole forward as ONE hand-off lets every nested op run inline on the worker.
+        // The parallel host loops in this forward (CPU attention, F16
         // dequant) touch only raw pointers, never MLX, so they cannot wait on the worker.
         private bool RunOnMlxWorker =>
             _backend == BackendType.Mlx && !IsTensorParallel && !MlxWorker.Shared.IsOnWorkerThread;
@@ -1165,7 +1165,7 @@ namespace TensorSharp.Models
             // dispatch. Replaces the ~10 separate per-op submissions in the
             // per-op Attention() path (each its own Metal command buffer).
             // Mirrors the reference llama.cpp graph in src/models/openai-moe-iswa.cpp
-            // and the existing TSGgml_Gemma4LayerPrefill template.
+            // and the shared fused-layer-prefill template the other families used.
             //
             // Decode (seqLen == 1) and the non-Metal backends still flow through
             // the original per-op path below.

@@ -924,7 +924,7 @@ plain decoding, and AgentTurnBench's streams diverged from plain greedy at token
 10 of 192 (spec prompt, n-gram and draft head alike, on CUDA and Metal) and at
 token 88 of 96 over a checkpoint clone; the stale context also cost acceptance
 (n-gram 57% before, 89% after, 67.9 -> 100.8 tok/s against 46.5 plain on an A40).
-`Gemma4Model.SwaSlotsToRestore` now restores every saved row only when the kept
+The legacy `Gemma4Model.SwaSlotsToRestore` (removed with that model in 2026-11) restored every saved row only when the kept
 prefix will be re-forwarded (`acceptedRows < verifyRows`) and nothing on a full
 acceptance. `Gemma4SwaVerifyRestoreTests` pins the rule;
 `Gemma4SwaRollbackExactnessTests.AcceptedDraftWindow_LeavesTheNextDecodeExact`
@@ -960,7 +960,7 @@ drafts 12, a 13-row verify that crosses into the large-batch GEMM on purpose (se
 `--spec-draft` still wins.
 
 Two more things were hiding in the 8-row verify, both found with the phase
-counters (`TS_GMTP_PROFILE=1`) on the real TensorAgent host path:
+counters (`TS_GMTP_PROFILE=1`, removed with the legacy Gemma 4 model in 2026-11) on the real TensorAgent host path:
 
 - **The per-op tail.** After the fused kernel the trunk ran the output norm, a
   262K-vocab LM-head matmul over the 8 rows and the tanh softcap as separate ops
@@ -1403,8 +1403,8 @@ The culprit is the per-row recurrent-state snapshot path. Turning the snapshots 
 them on diverges. Nine rows
 is also where ggml's 2..8-row matvec kernels give way to the large-batch path,
 which is the same boundary Gemma 4 already avoids for speed
-(`Gemma4Model.SpecPreferredDraftWindow`: 7, or 2 for a dense, mostly IQ4_XS
-checkpoint on `ggml_metal`).
+(the legacy `Gemma4Model.SpecPreferredDraftWindow`: 7, or 2 for a dense, mostly IQ4_XS
+checkpoint on `ggml_metal`; that model was removed in 2026-11).
 
 **The default on `ggml_cuda` is not affected.** `Qwen35Model.SpecPreferredDraftWindow` is at most 7
 on a recurrent trunk (a DFlash drafter on `ggml_cuda`; 3 otherwise), and a preferred window
@@ -1501,8 +1501,8 @@ other half of the A/B.
 TensorAgent use — with the conversation shapes an agent produces and reports,
 per request, the tokens per prefill step, TTFT, prefill and decode rates and the
 speculative counters; it compares every speculative stream against plain greedy
-token for token. `TS_GMTP_PROFILE=1` prints the Gemma 4 verify's phase timing
-(embed+PLE / kernel / norm+head+copy), `TS_SPEC_DRAFT=N` sets the window.
+token for token. `TS_SPEC_DRAFT=N` sets the window (the legacy Gemma 4 model's `TS_GMTP_PROFILE` phase timing went
+with it in 2026-11).
 
 Final Mac numbers on the TensorAgent host path (M5 Pro, ggml_metal, the phone's
 settings, a 5k-token system prompt, greedy; `benchmarks/TensorAgentTtftBench

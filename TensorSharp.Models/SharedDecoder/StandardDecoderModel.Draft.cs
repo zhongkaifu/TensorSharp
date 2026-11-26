@@ -244,6 +244,14 @@ namespace TensorSharp.Models
         public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
             if (HasDFlash) throw new NotSupportedException("A DFlash drafter proposes whole blocks; use DraftBlock.");
+            if (FamilyTokenDrafter is { } family)
+            {
+                SettlePendingVerify();
+                _forwardSw.Start();
+                try { family.Step(token, hPrev, logitsOut, hOut); }
+                finally { _forwardSw.Stop(); }
+                return;
+            }
             if (!HasDraftLayer) throw new InvalidOperationException($"{Config.Architecture} has no NextN/MTP draft layer.");
             RunDraftLayer(new[] { token }, hPrev, pos, logitsOut, hOut);
         }
@@ -536,7 +544,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>After plain steps (no trunk rows to replay) the draft layer resumes on a fresh suffix.</summary>
-        public bool DraftHeadResumesAfterGap => HasDraftLayer && !HasDFlash;
+        public bool DraftHeadResumesAfterGap => (HasDraftLayer && !HasDFlash) || FamilyTokenDrafter != null;
 
         // ---- the draft layer following the trunk's own forwards
 

@@ -17,8 +17,6 @@
     <ProbeNativeName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</ProbeNativeName>
     <ProbeNativeName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</ProbeNativeName>
   </PropertyGroup>
-  <!-- ProjectReference copy items can be resolved before the native dependency
-       rebuild completes. Always measure the current native build, not a stale copy. -->
   <Target Name="CopyNativeProbeBinary" AfterTargets="Build" Condition="'$(ProbeNativeName)' != ''">
     <ItemGroup>
       <ProbeNativeBinary Include="$(ProbeNativeDir)/$(ProbeNativeName)" Condition="Exists('$(ProbeNativeDir)/$(ProbeNativeName)')" />

@@ -488,8 +488,10 @@ namespace TensorSharp.Models
             }
         }
 
-        internal List<int> ProcessGemma4History(Gemma4Model model, List<ChatMessage> history, List<int> inputTokens)
-            => ProcessGemma4MediaHistory(model.VisionEncoder, model.AudioEncoder, history, inputTokens);
+        /// <summary>Gemma 4's image, video and audio spans for a model holding these towers.</summary>
+        internal List<int> ProcessGemma4History(Gemma4VisionEncoder visionEncoder, Gemma4AudioEncoder audioEncoder,
+            List<ChatMessage> history, List<int> inputTokens)
+            => ProcessGemma4MediaHistory(visionEncoder, audioEncoder, history, inputTokens);
 
         /// <summary>
         /// The image half of <see cref="ProcessGemma4History"/> for a Gemma-4-family

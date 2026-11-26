@@ -267,8 +267,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
     `TS_MLX_KQUANT_AFFINE`、`TS_MLX_Q5K_*`、`TS_MLX_Q6K_*` 与 `TS_MLX_IQ*` 内核开关（`*_MATVEC_MAX_ROWS` 阈值保留）、
     `TS_MLX_PIPELINED_DECODE`、`TS_MLX_DEVICE_*`、`TS_MLX_BASELINE_*`，以及启动报错中列出的其余开关。MLX 上的
     Q4_K / Q5_K 权重总是重新打包为 MLX affine（此前的默认行为）。Gemma 4 与 Muse-Glimmer 专用的 MLX eval /
-    materialize 间隔拼写已移除：所有模型都读取 `TS_MLX_EVAL_EVERY_N_LAYERS` 与 `TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL`
-    （`TS_MLX_KV_MATERIALIZE_INTERVAL` 已于 2026-11 随旧 Muse-Glimmer 模型一并移除）；
+    materialize 间隔拼写已移除：所有模型都读取 `TS_MLX_EVAL_EVERY_N_LAYERS`
+    （`TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL` 与 `TS_MLX_KV_MATERIALIZE_INTERVAL` 已于 2026-11 分别随旧 Gemma 4 与旧 Muse-Glimmer 模型一并移除）；
   - 关闭保留（重放）整模型计算图或其部件的开关（`TS_QWEN35_FD_PERSIST`、`TS_GEMMA4_FD_PERSIST`、
     `TS_GPTOSS_FD_PERSIST`、`TS_MUSE_GLIMMER_PERSIST`、`TS_DFLASH_PERSIST`、各 `*_BATCHED_ARENA` 开关、
     `TS_QWEN35_METAL_*` 等），GPT OSS 的 decode 与张量并行开关（`TS_GPTOSS_MODEL_DECODE`、
@@ -285,9 +285,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
     （`json_object` 流式输出，只有 `json_schema` 缓冲整个响应）；
   - `TS_RETAINED_FUSED_CACHE` 与 `TS_PREFIX_CHECKPOINTS`：它们是 `TS_RETAINED_FUSED_CACHE_MAX=0` 与
     `TS_PREFIX_CHECKPOINTS_MAX=0` 的第二种写法，后两者分别关闭结束状态保留与共享前缀检查点；
-  - `TS_GEMMA4_BATCHED_CAPS`：Gemma 4 的 token 批量 decode 始终覆盖 per-layer embedding、共享 KV 层与已回绕的
-    滑动窗口，并只通过一个原生入口（`TSGgml_Gemma4ModelDecodeBatched`）；`TS_BATCHED_FUSED_DECODE=0` 仍可让并发
-    请求改为轮询 decode；
+  - `TS_GEMMA4_BATCHED_CAPS`：Gemma 4 的批量 decode（现为共享解码运行时的批处理图步骤）始终覆盖
+    per-layer embedding、共享 KV 层与已回绕的滑动窗口；
   - 直连 `cuda` 后端切回旧内核或关闭 CUDA graph 的开关：`TS_CUDA_QMM_BATCHED` / `_VEC` / `_F16GEMM`、
     `TS_CUDA_*_DP4A` 系列、`TS_CUDA_Q80_VEC` / `_MMQ` / `_MMQ2` / `_F16_DEQUANT`、`TS_CUDA_Q81_WARP`、
     `TS_CUDA_IQ2_VEC`、`TS_CUDA_BF16_MATVEC`（及其 `TS_DSV4_BF16_MATVEC` 写法）、`TS_CUDA_GQA_*`、

@@ -211,6 +211,34 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
+        [RegisterOpStorageType("cumsum", typeof(CpuStorage))]
+        public unsafe Tensor CumSum(Tensor result, Tensor src)
+        {
+            if (src.ElementType != DType.Float32) throw new NotSupportedException("cumsum takes F32 tensors");
+            using Tensor contiguous = Ops.AsContiguous(src);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
+            long cols = src.Sizes[^1], rows = src.ElementCount() / Math.Max(1, cols);
+            float* x = (float*)contiguous.Storage.PtrAtElement(contiguous.StorageOffset);
+            if (writeTarget.IsContiguous())
+            {
+                float* y = (float*)writeTarget.Storage.PtrAtElement(writeTarget.StorageOffset);
+                System.Threading.Tasks.Parallel.For(0, rows, r =>
+                {
+                    float run = 0f;
+                    for (long i = 0; i < cols; i++) { run += x[r * cols + i]; y[r * cols + i] = run; }
+                });
+                return writeTarget;
+            }
+            var values = new float[rows * cols];
+            for (long r = 0; r < rows; r++)
+            {
+                float run = 0f;
+                for (long i = 0; i < cols; i++) { run += x[r * cols + i]; values[r * cols + i] = run; }
+            }
+            writeTarget.SetElementsAsFloat(values);
+            return writeTarget;
+        }
+
         [RegisterOpStorageType("log", typeof(CpuStorage))]
         public Tensor Log(Tensor result, Tensor src) 
         {
@@ -841,6 +869,27 @@ namespace TensorSharp.Cpu
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
             TensorApplyCPU.RoPE(writeTarget, src, (int)rows, (int)cols, seqLen, rowOffset);
+            return writeTarget;
+        }
+
+        [RegisterOpStorageType("rope_ex_ff", typeof(CpuStorage))]
+        public Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode, int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow)
+        {
+            if (positions == null) throw new ArgumentNullException(nameof(positions));
+            if (freqFactors == null) throw new ArgumentNullException(nameof(freqFactors));
+            int ndim = src.DimensionCount;
+            long storageSize = TensorDimensionHelpers.GetStorageSize(src.Sizes, src.Strides);
+            long cols = src.Sizes[ndim - 1];
+            if (storageSize % cols != 0) throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
+            long rows = storageSize / cols;
+            if (positions.ElementCount() != rows)
+                throw new InvalidOperationException("rope_ex_ff expects one explicit position value per logical row.");
+            int pairs = (int)Math.Min(ropeDim, cols) / 2;
+            if (freqFactors.ElementType != DType.Float32 || !freqFactors.IsContiguous() || freqFactors.ElementCount() < pairs)
+                throw new InvalidOperationException($"rope_ex_ff expects at least {pairs} contiguous F32 frequency factors.");
+            float[] factors = freqFactors.GetElementsAsFloat(pairs);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
+            TensorApplyCPU.RoPEEx(writeTarget, src, positions, (int)rows, (int)cols, ropeDim, mode, freqBase, freqScale, originalContextLength, extFactor, attnFactor, betaFast, betaSlow, factors);
             return writeTarget;
         }
 

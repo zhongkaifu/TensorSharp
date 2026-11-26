@@ -143,7 +143,7 @@ namespace TensorSharp.Models
                 return true;
             }
 
-            if (model is not Gemma4Model gemma4)
+            if (model is not IAttachableDraftHead gemma4)
             {
                 // A draft GGUF was named but this architecture does not consume a
                 // separate draft file (Qwen 3.6 embeds its NextN block in the
@@ -176,7 +176,7 @@ namespace TensorSharp.Models
         /// <summary>True when the file at <paramref name="path"/> declares itself a
         /// DFlash drafter. Read from the GGUF rather than inferred from the name:
         /// the same flag also names MTP-only assistant files.</summary>
-        private static bool IsDFlashDrafter(string path)
+        internal static bool IsDFlashDrafter(string path)
         {
             try
             {
@@ -211,5 +211,13 @@ namespace TensorSharp.Models
         /// <see cref="SpeculativeDraftHeadLoader"/>, which attaches drafters AFTER the
         /// constructor and must honour the tensor-parallel exclusions the constructors apply.</summary>
         internal bool TensorParallelActive => IsTensorParallel;
+    }
+
+    /// <summary>A target that attaches a separate per-token draft GGUF after its load (Gemma 4's gemma4-assistant head).</summary>
+    internal interface IAttachableDraftHead
+    {
+        void LoadMtpDraftWeights(string draftGgufPath);
+
+        bool HasDraftHead { get; }
     }
 }

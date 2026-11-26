@@ -350,8 +350,6 @@ large part of what TP just saved.
 
 | Kernel | Covers | Split points per layer |
 |---|---|---|
-| `TSGgml_Gemma4ModelDecode` | Gemma 4 dense decode (whole model) | attn output proj, FFN down proj |
-| `TSGgml_Gemma4ModelVerify` | Gemma 4 dense prefill (whole model) | attn output proj, FFN down proj |
 | `TSGgml_Qwen35AttentionLayerPrefill` | Qwen 3.5/3.6 full-attention block | attn output proj |
 | `TSGgml_FusedFFNSwiGLUQuantF32` | any dense SwiGLU FFN block | FFN down proj |
 | `TSGgml_FusedMatMulQuantAddF32` | any row-parallel linear + residual | the matmul |

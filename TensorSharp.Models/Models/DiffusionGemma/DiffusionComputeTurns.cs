@@ -158,71 +158,6 @@ namespace TensorSharp.Models
         }
     }
 
-    /// <summary>
-    /// DiffusionGemma's run-time fallback switches. Each fast path starts enabled and is latched off the
-    /// first time its kernel rejects a layout; every later forward then takes the slower path.
-    /// </summary>
-    internal readonly record struct DiffusionFallbackLatches(
-        bool FusedDecodeOk, bool FusedLmHeadTailOk, bool DeviceSampleOk)
-    {
-        /// <summary>Both sets applied: a path is off if either turned it off.</summary>
-        public DiffusionFallbackLatches Merge(DiffusionFallbackLatches other) => new(
-            FusedDecodeOk && other.FusedDecodeOk,
-            FusedLmHeadTailOk && other.FusedLmHeadTailOk,
-            DeviceSampleOk && other.DeviceSampleOk);
-    }
-
-    /// <summary>
-    /// Runs the jobs a denoising block lets in between its forwards (the <c>beforeForward</c> of
-    /// <see cref="DiffusionGemmaSampler.RunBlockBatched"/>) without letting them change the block's path.
-    /// A job can latch one of the model's fallback switches (<see cref="DiffusionFallbackLatches"/>), for
-    /// example when a Jev read's much longer prompt makes the fused decode graph fail to allocate. Applied
-    /// at once, that would move the rest of the block onto the fallback path: other arithmetic, and on the
-    /// device-sampling path the loss of the self-conditioning carried in the device top-K. Run after the
-    /// block, the same job would have left the block alone. So the block keeps its own view of the switches
-    /// until it ends; a job sees what earlier jobs of the block latched, as it would have in that order;
-    /// and <see cref="EndBlock"/> hands the jobs' latches to the model for the blocks that follow.
-    /// </summary>
-    internal sealed class DiffusionBlockHandoff
-    {
-        private readonly DiffusionGemmaModel _model;
-        private readonly Action _jobs;
-        private DiffusionFallbackLatches? _latchedByJobs;
-
-        public DiffusionBlockHandoff(DiffusionGemmaModel model, Action jobs)
-        {
-            _model = model ?? throw new ArgumentNullException(nameof(model));
-            _jobs = jobs ?? throw new ArgumentNullException(nameof(jobs));
-        }
-
-        /// <summary>Let the waiting jobs run. Called before each forward, on the thread that runs the block,
-        /// while it holds the compute lock (so every switch read and write here is serialized with the jobs').</summary>
-        public void BeforeForward()
-        {
-            DiffusionFallbackLatches block = _model.FallbackLatches;
-            if (_latchedByJobs is { } earlier) _model.FallbackLatches = block.Merge(earlier);
-            try
-            {
-                _jobs();
-            }
-            finally
-            {
-                DiffusionFallbackLatches afterJobs = _model.FallbackLatches;
-                if (afterJobs != block)
-                {
-                    _latchedByJobs = afterJobs;
-                    _model.FallbackLatches = block;
-                }
-            }
-        }
-
-        /// <summary>Apply what the jobs latched, once the block has run its last forward (or failed).</summary>
-        public void EndBlock()
-        {
-            if (_latchedByJobs is { } jobs) _model.FallbackLatches = _model.FallbackLatches.Merge(jobs);
-        }
-    }
-
     public sealed partial class DiffusionGemmaModel
     {
         private DiffusionComputeTurns _computeTurns;
@@ -237,19 +172,6 @@ namespace TensorSharp.Models
                 if (turns != null) return turns;
                 Interlocked.CompareExchange(ref _computeTurns, new DiffusionComputeTurns(GpuComputeLock), null);
                 return _computeTurns;
-            }
-        }
-
-        /// <summary>The fallback switches as one value, for <see cref="DiffusionBlockHandoff"/>. Read and
-        /// written under <see cref="ModelBase.GpuComputeLock"/>, like the forwards that latch them.</summary>
-        internal DiffusionFallbackLatches FallbackLatches
-        {
-            get => new(_fusedDecodeOk, _fusedLmHeadTailOk, _deviceSampleOk);
-            set
-            {
-                _fusedDecodeOk = value.FusedDecodeOk;
-                _fusedLmHeadTailOk = value.FusedLmHeadTailOk;
-                _deviceSampleOk = value.DeviceSampleOk;
             }
         }
     }

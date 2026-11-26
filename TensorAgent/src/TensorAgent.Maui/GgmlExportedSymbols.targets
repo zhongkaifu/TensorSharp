@@ -68,11 +68,6 @@
     <ReferenceNativeSymbol Include="TSGgml_DequantizeToF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceCopyCacheResidentBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceMemoryInfo" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_DiffusionDecodeLayer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_DiffusionLmHead" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_DiffusionLmHeadSample" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_DiffusionModelDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_DiffusionPrefillAttentionF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DirectReadRegister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DirectReadSupported" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DirectReadUnregister" SymbolType="Function" />
@@ -141,22 +136,6 @@
     <ReferenceNativeSymbol Include="TSGgml_Gemma4AudioConformerStackF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4AudioDepthwiseF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4AudioSscpF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4DraftStep" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4LayerPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEGEGLUResidualF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4MoELayerDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEModelDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEModelDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEModelVerify" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEReleaseVerifyTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEResetDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelVerify" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4ReleaseVerifyTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4ResetBatchedDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4ResetDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Gemma4ResetMoEBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4VisionStackF32PreciseCuda" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GetActiveDevice" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GetAsyncCompute" SymbolType="Function" />
@@ -240,6 +219,7 @@
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoUnregister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRows" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertRowsAct" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />

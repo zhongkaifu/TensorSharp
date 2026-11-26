@@ -497,7 +497,10 @@ namespace TensorSharp.Models
                     _allocator = new MlxAllocator(0);
                     break;
                 case BackendType.Cpu:
-                    _allocator = new CpuAllocator(BlasEnum.DotNet);
+                    // A step frees and allocates the same large intermediates every run: recycled, they are written in place
+                    // rather than mapped, faulted in and unmapped again (a DiffusionGemma canvas step's five vocabulary-wide
+                    // logits buffers, 268 MB each, cost it ~280 ms in munmap alone on the A40 VM's host).
+                    _allocator = new RecyclingCpuAllocator(BlasEnum.DotNet, CpuRetainedBytes);
                     break;
                 default:
                     throw new ArgumentException($"Unsupported backend: {backend}");
@@ -1076,6 +1079,9 @@ namespace TensorSharp.Models
         // GgmlVulkan and GgmlMetal follow GgmlCuda here: the fused prefill/decode
         // paths mask or overwrite every cache position they read, so zero-filling
         // 100s of MB of host KV arrays on every request reset is pure waste.
+        /// <summary>The most free bytes the pure-C# backend's allocator keeps for the next step (released with the model).</summary>
+        internal const long CpuRetainedBytes = 2L << 30;
+
         protected bool ShouldZeroFillCacheTensors =>
             _backend != BackendType.GgmlCuda && _backend != BackendType.Mlx &&
             _backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal;
@@ -1110,12 +1116,14 @@ namespace TensorSharp.Models
         /// decoder runtime's K/V), so GgmlCuda keeps its device copy too, as GgmlVulkan and GgmlMetal always do: dropping it
         /// freed and re-allocated every cache's device memory and uploaded the host bytes again on the next step (LFM3-1.7B at
         /// 8K: 35 buffers and ~100 MB, 13 ms of the next 512-token prompt on an A40).</param>
-        protected void ResetCacheTensor(Tensor tensor, bool keepDeviceCopy = false)
+        /// <param name="zeroFill">False where the caller zeroed the rows it wrote itself (the shared decoder runtime's
+        /// caches, which keep their written rows' extent).</param>
+        protected void ResetCacheTensor(Tensor tensor, bool keepDeviceCopy = false, bool zeroFill = true)
         {
             if (tensor == null)
                 return;
 
-            if (ShouldZeroFillCacheTensors)
+            if (zeroFill && ShouldZeroFillCacheTensors)
                 Ops.Fill(tensor, 0f);
 
             // On GgmlVulkan/Metal keep the resident device copy VALID across

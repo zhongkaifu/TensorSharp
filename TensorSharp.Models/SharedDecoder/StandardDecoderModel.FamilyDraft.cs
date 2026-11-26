@@ -56,10 +56,56 @@ namespace TensorSharp.Models
         public virtual void Dispose() { }
     }
 
+    /// <summary>
+    /// A family's own per-token drafter that keeps no rows of its own (gemma4-assistant: its layers query the trunk's
+    /// caches at the trunk's length and chain their state through the hidden row alone). The scheduler's per-token
+    /// speculation (DraftHeadSpeculator) runs it through the model's IDraftHead members: there is nothing to catch up, and
+    /// it resumes at any position.
+    /// </summary>
+    internal abstract class FamilyTokenDrafter : IDisposable
+    {
+        /// <summary>Floats of the hidden row each step reads and chains (the trunk's final-normed row first).</summary>
+        public abstract int FeatureWidth { get; }
+
+        /// <summary>One draft: <paramref name="token"/> after the row <paramref name="hPrev"/>, over the active cache as it
+        /// stands; the next token's logits and the row the next step reads.</summary>
+        public abstract void Step(int token, float[] hPrev, float[] logitsOut, float[] hOut);
+
+        public virtual void Dispose() { }
+    }
+
     public abstract partial class StandardDecoderModel
     {
         /// <summary>The family's own block drafter, or null (<see cref="FamilyBlockDrafter"/>).</summary>
         internal FamilyBlockDrafter FamilyDrafter { get; private protected set; }
+
+        /// <summary>The family's own per-token drafter, or null (<see cref="FamilyTokenDrafter"/>).</summary>
+        internal FamilyTokenDrafter FamilyTokenDrafter { get; private protected set; }
+
+        /// <summary>The active cache's committed rows (a pending verify settled first): where a family token drafter's
+        /// queries stand.</summary>
+        private protected int ActiveCommittedLength => SnapshotActive().Length;
+
+        /// <summary>
+        /// A family token drafter's program over the active cache: <paramref name="rows"/> rows from <paramref name="start"/>
+        /// (positions the cache holds; the program writes none), traced and replayed by <paramref name="shape"/> as the draft
+        /// layer's steps are, on the stage that holds <paramref name="stageLayer"/>.
+        /// </summary>
+        private protected CachedGraph RunActiveDraftProgram(int rows, int start, int stageLayer, Func<GraphStep, StepOutputs> emit,
+            Tensor[] advanceInputs, out StepOutputs outputs, out bool owned, string shape)
+        {
+            Slot active = SnapshotActive();
+            EnterStage(StageOfLayer(stageLayer));
+            try
+            {
+                return RunTraced(rows, new[] { active }, new[] { 0 }, new[] { rows }, new[] { start }, replayable: rows <= SmallChunkRows,
+                    snapshots: false, attentionFloor: 0, emit, out outputs, out owned, shape: DraftShapePrefix + shape, advanceInputs: advanceInputs);
+            }
+            finally
+            {
+                EnterStage(0);
+            }
+        }
 
         /// <summary>The trunk's steps capture block-drafter features: a DFlash drafter's or a family drafter's.</summary>
         private bool HasBlockFeatures => HasDFlash || FamilyDrafter != null;

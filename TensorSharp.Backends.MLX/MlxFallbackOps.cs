@@ -51,6 +51,7 @@ namespace TensorSharp.MLX
             Tensor("rsqrt", 2),
             Tensor("exp", 2),
             Tensor("log", 2),
+            Tensor("cumsum", 2),
             Tensor("log1p", 2),
             Tensor("floor", 2),
             Tensor("ceil", 2),

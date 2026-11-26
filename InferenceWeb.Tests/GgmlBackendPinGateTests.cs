@@ -58,7 +58,6 @@ public sealed class GgmlBackendPinGateTests
             (nameof(DeepSeekNativeRetentionFixtureTests), nameof(DeepSeekNativeRetentionFixtureTests.RetainedNativeHolderPreservesContinuation_AndOutlivesANewPrimaryWhileMemoryAllows), BackendType.GgmlCpu),
             (nameof(DeepSeek41DsparkIntegrationTests), nameof(DeepSeek41DsparkIntegrationTests.CpuAttachedBlockHead_EngagesAndPreservesSixteenGreedyTokens), BackendType.GgmlCpu),
             (nameof(DeepSeek41DsparkIntegrationTests), nameof(DeepSeek41DsparkIntegrationTests.VerifyRewindAndTwoSlots_PreserveAcceptedPrefixAndUnrelatedContinuation), BackendType.GgmlCpu),
-            (nameof(Gemma4CacheResidencyTests), nameof(Gemma4CacheResidencyTests.InitializeResidentCache_DoesNotRestorePreviousDeviceContents), BackendType.GgmlCuda),
             // Weight-free tests that build ggml-cpu themselves ([GgmlFact]/[GgmlTheory]).
             (nameof(GgmlCopyDtypeTests), nameof(GgmlCopyDtypeTests.Copy_Float16_ContiguousTensors_RoundTripsExactBits), BackendType.GgmlCpu),
             (nameof(GgmlCopyDtypeTests), nameof(GgmlCopyDtypeTests.Copy_Float16_NarrowedKvCacheLayout_PreservesEachHeadIndependently), BackendType.GgmlCpu),

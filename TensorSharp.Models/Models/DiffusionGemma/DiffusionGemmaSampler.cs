@@ -57,10 +57,8 @@ namespace TensorSharp.Models
         //    On a GPU already compute-saturated by one canvas (the case for this 128-expert MoE at
         //    canvas=256), this is the fastest aggregate path — the fused kernel is ~3x faster per canvas
         //    than the per-op true-batched forward, and true batching can't beat a compute-bound GPU.
-        //  - DIFFUSION_BATCHED_FORWARD=1: fuse all live canvases into ONE per-op batched forward
-        //    (DecodeCanvasBatched). Correct, and a win only when a single canvas leaves the GPU
-        //    under-utilised (small canvas / large GPU); a loss when already compute-bound.
-        private readonly bool _useBatchedForward = Environment.GetEnvironmentVariable("DIFFUSION_BATCHED_FORWARD") == "1";
+        //  - BatchedForward: all live canvases in ONE step (DecodeCanvasBatched: the weights read once for every canvas).
+        internal bool BatchedForward { get; set; }
 
         // One-time notice when the on-device sampling kernel rejects a step and the
         // block continues on the host logits path (full [vocab,C] logits cross PCIe
@@ -389,30 +387,14 @@ namespace TensorSharp.Models
         /// those points, everything the block carries from one forward to the next lives in this method's
         /// locals (canvases, RNGs, the self-conditioning copies in <c>scBuffer</c> or the device top-K
         /// buffers, convergence state) and in each sequence's own <see cref="DiffusionSeqState"/>, which
-        /// nothing else writes. The model state another job touches is either keyed caches that are rebuilt
-        /// from their key (masks, RoPE tables, positions; the image-span version is part of the mask key),
-        /// or the pooled logits buffers, which the previous forward's sampling has already consumed. A job
-        /// can also latch one of the model's fallback switches (a fused kernel rejecting the job's layout);
-        /// <see cref="DiffusionBlockHandoff"/> keeps that from the block until it ends, so the block
-        /// finishes on the path it started on, as it would have with the job after it.</para></summary>
+        /// nothing else writes. A job's own forwards run on caches of their own (a Jev read's sequence, the
+        /// model's own cache), and the pooled logits buffers it may reuse were consumed by the previous
+        /// forward's sampling.</para></summary>
         public void RunBlockBatched(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken = default,
             Action beforeForward = null)
         {
             if (active.Count == 0) return;
-            if (beforeForward == null)
-            {
-                RunBlock(active, stopToken, null);
-                return;
-            }
-            var handoff = new DiffusionBlockHandoff(_model, beforeForward);
-            try
-            {
-                RunBlock(active, stopToken, handoff.BeforeForward);
-            }
-            finally
-            {
-                handoff.EndBlock();
-            }
+            RunBlock(active, stopToken, beforeForward);
         }
 
         private void RunBlock(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken, Action beforeForward)
@@ -434,7 +416,7 @@ namespace TensorSharp.Models
 
             // Prompt-KV caching (device-glue backends and the pure-C# cpu backend): prefill each sequence's
             // prefix K/V once, then each step decodes only its canvas. Backends without a prompt-KV store
-            // (ggml_cpu, or DIFFUSION_NO_PKV=1) run the unified [prefix|canvas] forward per sequence
+            // (SupportsPromptKvCache off) run the unified [prefix|canvas] forward per sequence
             // instead — the same fallback DenoiseBlock uses.
             bool usePkv = _model.SupportsPromptKvCache;
             var unifiedTokens = usePkv ? null : new int[A][];   // per-seq [prefix|canvas] buffer
@@ -513,7 +495,7 @@ namespace TensorSharp.Models
                 int L = live.Count;
                 if (L == 0) break;
 
-                if (_useBatchedForward && usePkv && L > 1)
+                if (BatchedForward && usePkv && L > 1)
                 {
                     // EXPERIMENTAL true-batched forward: all live canvases through one per-op forward. A win
                     // only when a single canvas under-utilises the GPU; a loss when compute-bound (this model).
@@ -555,7 +537,7 @@ namespace TensorSharp.Models
                     // DEFAULT: decode each live sequence with the fast FUSED single-canvas kernel, then sample
                     // immediately (the kernel returns the model's shared readback buffer, so its logits must be
                     // consumed before the next sequence's decode overwrites it). Time-slices the GPU across the
-                    // active requests at full fused speed. Without prompt-KV (ggml_cpu, DIFFUSION_NO_PKV=1) each
+                    // active requests at full speed. Without prompt-KV (SupportsPromptKvCache off) each
                     // sequence runs the unified [prefix|canvas] forward instead, which has the same
                     // shared-buffer contract.
                     for (int j = 0; j < L; j++)

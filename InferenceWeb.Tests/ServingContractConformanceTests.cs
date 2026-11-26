@@ -27,9 +27,9 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly HashSet<string> LegacyBespokeFamilies = new(StringComparer.Ordinal)
     {
-        "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-spark",
+        "qwen4exp", "gptoss", "nemotron_h", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
-        "diffusion-gemma", "wan", "ltx-2.5", "minimax-h3",
+        "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
         // families they generate media rather than decode steps, so the decoder runtime does not apply.
         "whisper", "kokoro", "ace-step-1.5",
@@ -61,8 +61,6 @@ public sealed class ServingContractConformanceTests
         "deepseek4: TensorParallel@cuda",
         "deepseek4: TensorParallel@ggml_cuda",
         "deepseek4: TensorParallel@ggml_vulkan",
-        "diffusion-gemma: ExpertOffload@cuda",
-        "diffusion-gemma: ExpertOffload@mlx",
         "diffusion-gemma: HybridParallel@cuda",
         "diffusion-gemma: HybridParallel@ggml_cuda",
         "diffusion-gemma: HybridParallel@ggml_vulkan",
@@ -72,17 +70,9 @@ public sealed class ServingContractConformanceTests
         "diffusion-gemma: TensorParallel@cuda",
         "diffusion-gemma: TensorParallel@ggml_cuda",
         "diffusion-gemma: TensorParallel@ggml_vulkan",
-        "gemma4: ExpertOffload@cuda",
-        "gemma4: ExpertOffload@mlx",
         "gemma4: HybridParallel@cuda",
         "gemma4: HybridParallel@ggml_cuda",
         "gemma4: HybridParallel@ggml_vulkan",
-        "gemma4: LayerSplit@cuda",
-        "gemma4: LayerSplit@ggml_cuda",
-        "gemma4: LayerSplit@ggml_vulkan",
-        "gemma4: TensorParallel+batching@cuda",
-        "gemma4: TensorParallel+batching@ggml_cuda",
-        "gemma4: TensorParallel+batching@ggml_vulkan",
         "glm-dsa: ContinuousBatching@cpu",
         "glm-dsa: HybridParallel@ggml_cuda",
         "glm-dsa: HybridParallel@ggml_vulkan",
@@ -272,6 +262,8 @@ public sealed class ServingContractConformanceTests
                     if (test == SharedRuntimeConformanceTests.HostExpertsMechanism && !Claims(arch.Serving.ExpertOffload)) continue;
                     if (test == nameof(SharedRuntimeConformanceTests.PlacementMatchesOneDevice) && !Claims(arch.Serving.TensorParallel)
                         && !Claims(arch.Serving.LayerSplit) && !Claims(arch.Serving.HybridParallel)) continue;
+                    // A family that does not decode (DiffusionGemma denoises canvases) has nothing to speculate.
+                    if (test == nameof(SharedRuntimeConformanceTests.SpeculativeDecodingMatchesPlainGreedy) && !arch.Serving.Autoregressive) continue;
                     // A graph-only family has no per-op path to compare.
                     if (test == nameof(SharedRuntimeConformanceTests.WholeForwardGraphMatchesThePerOpPath)
                         && SharedRuntimeConformanceTests.GraphOnlyFamilies.Contains(arch.Id)) continue;
@@ -293,11 +285,15 @@ public sealed class ServingContractConformanceTests
         try
         {
             MoeCpuOffloadConfig.SetAllLayers();
-            Assert.True(ModelArchitectureRegistry.TryGet("gemma4", out var gemma));
+            Assert.True(ModelArchitectureRegistry.TryGet("inkling2", out var inkling));
             var error = Assert.Throws<NotSupportedException>(() =>
-                ModelBase.ValidateExpertOffloadRequest(gemma, BackendType.Mlx, 1));
+                ModelBase.ValidateExpertOffloadRequest(inkling, BackendType.GgmlCuda, 1));
             Assert.Contains("--n-cpu-moe / --cpu-moe", error.Message, StringComparison.Ordinal);
-            Assert.Contains("stacked-expert", error.Message, StringComparison.Ordinal);
+            Assert.Contains("host-expert path", error.Message, StringComparison.Ordinal);
+            // Gemma 4's fused GeGLU experts run from host memory on every backend, the tensor executors' included.
+            Assert.True(ModelArchitectureRegistry.TryGet("gemma4", out var gemma));
+            ModelBase.ValidateExpertOffloadRequest(gemma, BackendType.Mlx, 1);
+            ModelBase.ValidateExpertOffloadRequest(gemma, BackendType.Cuda, 1);
             ModelBase.ValidateExpertOffloadRequest(gemma, BackendType.GgmlMetal, 1);
 
             // Dense families take the option as a no-op with a note, never a refusal.
