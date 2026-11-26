@@ -15,11 +15,21 @@ sequence. TensorSharp exposes it through `MiniMaxH3Model.GenerateVideo`, the CLI
 and the video HTTP routes. FL2VA handles text and keyframes; Ref2VA handles text
 and reference media.
 
-Six backends have separate execution paths: `ggml_metal`, `ggml_cuda` and
-`ggml_cpu` use TensorSharp-owned native graphs against unchanged ggml;
-`mlx`, `cuda` and `cpu` use direct tensor implementations. CUDA and MLX execute
-DiT, text/vision encoding, audio VAEs and the causal 3-D video encoder on their
-selected devices. The `cpu` forward path uses managed C# arithmetic.
+A clip runs on the shared diffusion runtime's video pipeline
+(`SharedDiffusion/DiffusionVideoPipeline`, with the MiniMax-H3 family's hooks in
+`MiniMaxH3Family`), and the diffusion transformer is the runtime's denoiser
+(`MiniMaxH3Denoiser`): each step is one graph program (the token refiner a program
+of its own, run once a prompt), which the GGML graph executor runs on `ggml_metal`,
+`ggml_cuda` and `ggml_cpu` (with the CUDA offload's fused modulation, attention and
+cuBLAS/cuDNN routes) and the tensor executors run on `cpu` (managed C#), `cuda` and
+`mlx`, each with the products, attention and row kernels the retired direct DiT took
+on its backend. The text encoder, vision tower and VAEs are
+the runtime's components: TensorSharp-owned native graphs against unchanged ggml on
+the GGML backends, direct tensor implementations on `mlx`, `cuda` and `cpu`. The
+residency plan keeps what fits on the device between phases and clips (on
+`ggml_metal` the denoiser and both VAEs release after each phase instead); the 17 GB
+text encoder is always released after its phase, so it never sits beside the
+denoiser.
 
 ```sh
 TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend cuda \
@@ -33,6 +43,98 @@ and a stereo WAV sidecar. The larger 640×384×22, eight-step workload is a sepa
 validation case.
 
 ## Current validation
+
+### Diffusion-runtime migration (2026-11-25)
+
+The clip moved to the diffusion runtime's video pipeline and the denoiser to one graph program a step
+([above](#minimax-h3)). Validated on an NVIDIA A40 (46 GB, driver 595.112.07, CUDA 13.2) with an Intel Xeon Gold 6342
+(96 threads) and .NET 10.0.404, against unchanged upstream ggml `2ca32666e16586ff4e8008b8c92f2e534b8e4f51`; the retired
+pipeline is the migration's base commit `d23ee0be` built with the same ggml. The direct `cuda` figures are the final
+binary's; the `ggml_cuda` and CPU ones are the build before it, whose successor changed only code those backends do not
+run (the CUDA executor's attention grouping and its pool trim after the denoise).
+
+- **Steps against the retired DiT** (`MiniMaxH3DenoiserTests`, the synthetic fixture's eight cases: text with vision
+  spans, keyframes, Ref2VA's picture and sound references, two sigmas, BF16, Q8_0 and Q4_K projections, two with the
+  LoRA). The retired steps are frozen per lane in `InferenceWeb.Tests/Fixtures/MiniMaxH3/LegacyGoldens/`. `ggml_cuda`
+  gives their bytes in all eight; `ggml_cpu` in the six without LoRA, and the LoRA cases within 7.6e-4 of the largest
+  value (ggml-cpu runs q, k and v's three updates as three products where the retired graph stacked them into one;
+  against the direct CUDA F32 steps the runtime and the retired graph are as far: 1.46e-3/1.15e-3 against
+  1.29e-3/1.26e-3, video/audio, on BF16, 6.46e-3 both on Q4_K). Direct `cuda` lands within 3.1e-7 of the retired direct
+  DiT in every case, managed `cpu` within 5.3e-7 in seven and 7.6e-4 on Q8_0 (its block-format products quantize their
+  activations, as the retired direct CPU DiT's did, and a last-bit difference upstream flips one rounding).
+- **Whole clips on `ggml_cuda`** (FL2VA Q4_K, 640×384×22; Ref2VA on its checkpoint with a picture and a sound): t2v at 20
+  steps, i2v, fl2v and Ref2VA at 8 gave the retired pipeline's decoded RGB and WAV byte for byte, in every round.
+
+Wall time (`eng/validation/minimax-h3-ab.py`, alternating rounds, the retired binary without `TS_H3_PHASE`; whole CLI
+processes, model loading and codecs included):
+
+| `ggml_cuda`, 640×384×22 | Decoded media | Retired median | Runtime median | Ratio (rounds) |
+|---|---|---:|---:|---|
+| t2v, 20 steps | identical, 4/4 | 28.11 s | 28.41 s | 0.989× (0.986, 0.995, 0.993, 1.009) |
+| fl2v, 8 steps | identical, 4/4 | 26.73 s | 26.34 s | 1.015× (1.033, 1.023, 1.001, 1.011) |
+| Ref2VA, 8 steps | identical, 6/6 | 21.99 s | 21.90 s | 1.004× (1.067, 0.973, 1.004, 0.983, 0.989, 1.025) |
+| Turbo-8 t2v | changed (below) | 21.77 s | 21.37 s | 1.019× (1.082, 0.984, 1.079, 1.026) |
+| Turbo-4 i2v | changed (below) | 20.92 s | 20.44 s | 1.023× (1.022, 1.014, 1.005, 1.070) |
+
+The t2v median ratio over three sessions of four rounds was 1.006×, 1.007× and 0.989× (the retired binary itself moved
+by 2% between sessions): within run-to-run noise. Steady steps are the retired ones without a plug-in (0.89 s at 1,768
+tokens, 1.12 s at 2,250, 1.55 s at 2,735) and faster with one (0.92 against 1.15 s, Turbo-8; 1.17 against 1.37 s, Turbo-4
+i2v). Peak device memory was the retired pipeline's without a plug-in and 110 MiB more with one (the K-concatenated
+product's scratch). The runtime's first step varies more from run to run (2.5–4.5 s against 2.7–3.6 s).
+
+- **Turbo plug-ins on `ggml_cuda`** take the runtime's unmerged route: a Q4_K projection's update rides in its cuBLAS
+  GEMM as `[W | up] [x ; down x]`, where the retired graph added it to the dequantized weight before the BF16 rounding.
+  The clips therefore changed (Turbo-8 t2v min frame PSNR 25.2 dB, WAV cosine 0.968 from the retired one; Turbo-4 i2v
+  32.0 dB, 0.989). Against two F32 references (direct `cuda`, the retired DiT and the runtime), neither route is
+  closer: Turbo-8 video 22.14/22.52 dB mean PSNR (runtime) against 22.29/22.65 (retired), WAV cosine 0.943 against
+  0.967; Turbo-4 i2v 32.36/32.24 dB against 32.67/32.47, WAV cosine 0.976 against 0.958. An eight-step distilled
+  sampler amplifies rounding: the two F32 implementations are themselves 29 dB apart on Turbo-8. The final binary's
+  Turbo clips are those clips' bytes.
+
+Direct `cuda` (one pair a case, the retired run first; then three alternating rounds of a three-step i2v):
+
+| Direct `cuda`, 640×384×22 | Retired | Runtime | Steady step | Peak VRAM | Min frame PSNR, WAV cosine |
+|---|---:|---:|---|---|---|
+| t2v, 20 steps | 140.8 s | 122.7 s | 5.78–5.94 → 4.96–5.02 s | 23,289 → 22,417 MiB | 63.6 dB, 0.999996 |
+| Turbo-8 t2v | 77.7 s | 69.7 s | 6.12–6.18 → 5.19–5.24 s | 25,825 → 24,721 MiB | 39.2 dB, 0.9977 |
+| Turbo-4 i2v | 60.2 s | 55.0 s | 6.48–6.51 → 6.35–6.38 s | 27,387 → 25,495 MiB | 41.6 dB, 0.99997 |
+| i2v, 8 steps | 78.8 s | 77.2 s | 6.15–6.21 → 6.04–6.08 s | 24,753 → 23,191 MiB | 52.5 dB, 0.999997 |
+| i2v, 3 steps, ×3 | 46.8, 46.3, 45.4 s | 48.6, 45.2, 46.1 s | 6.16–6.18 → 6.01–6.03 s | | |
+
+The runtime's first step on direct CUDA is 0.1–0.3 s longer than the retired one at 2,250 tokens without a plug-in and
+shorter at 1,768 and with one. The peak is the decode's, beside the resident denoiser: the runtime hands the step's
+pooled intermediates back to the driver before it (`CudaAllocator.TrimPool`), where the retired pipeline kept them, so
+its peak is 0.9–1.9 GB lower; a server's next clip allocates them again in its first step (each CLI run here is one
+clip, so that cost is not measured).
+
+CPU (one pair a case):
+
+| CPU | Retired | Runtime | Steps | Decoded media |
+|---|---:|---:|---|---|
+| `ggml_cpu`, 256×160×5, 1 step | 22.77 s | 22.60 s | 4.05 → 4.01 s | identical |
+| `cpu`, 256×160×5, 2 steps | 35.67 s | 35.11 s | 4.93, 4.51 → 4.74, 3.97 s | min frame PSNR 37.1 dB, WAV cosine 0.992 |
+| `cpu`, 640×384×22, 2 steps | 241.9 s | 226.7 s | 72.3, 67.0 → 62.1, 63.3 s | 43.3 dB, 0.956 |
+
+Managed `cpu` and the retired direct CPU DiT both quantize their block-format products' activations, so their clips
+part with run-to-run rounding; against an F32 reference (direct `cuda`, whose retired and runtime clips agree at 74.8
+dB) they are as far: 640×384×22 mean frame PSNR 38.51 dB (runtime) against 37.65 dB (retired), WAV cosine 0.944 against
+0.942; 256×160×5 32.59 against 34.33 dB, 0.930 against 0.919.
+
+Found and fixed on the tensor executors during the migration, each measured against the retired direct DiT: the
+step's attention held every head's scores at once (0.7 GB at 1,768 tokens, 274 GB at a 1280×768×107 clip's 35K; now
+served in bounded scratch, on CUDA as strided-batched GEMMs that read the heads where they lie); the LoRA update ran
+an add over a strided view on the host (175 s a step); the denoiser's device copies outlived it in the resident-weight
+cache (a later file mapped at a reused address computed with them); the managed executor multiplied F32 copies of every
+weight (4.5× slower a step than the retired DiT's quantized products, which it now takes); its intermediates faulted
+their pages in again every block (now recycled); the modulation, gated residual and q/k rotation ran as many
+elementwise passes where the retired DiT had one kernel (now its kernels); the token refiner ran every step (now once a
+prompt, as the retired DiT cached it); CUDA's `neg` ran on the host; the step's pooled device memory stayed beside the
+decode (now returned to the driver before it).
+
+Not validated here: `ggml_metal` and `mlx` (no Apple hardware on this host); the MLX DiT's fused packed-modulation
+kernel was deleted with the direct DiT, and the `mlx` tensor executor runs the modulation, attention and rotation
+regions as their ops (their cost there is not measured); the real-checkpoint component oracles (their PyTorch
+reference fixtures are not on this host); long clips (1280×768 and longer) and multi-clip server sessions.
 
 The latest 2026-10-15 preservation checks use unchanged upstream ggml
 `3612c0af93f2cfc8f048295300a61187723b12ae`, an Apple M5 Pro with 48 GiB and an
@@ -164,8 +266,7 @@ Two exact changes account for these results:
   projection. The median Metal step went from 5.44 to 4.85 s and the median A40
   step from 1.39 to 1.31 s.
 - **Read-ahead on `ggml_cuda`.** The text-encoder and denoiser files are read
-  ahead by sixteen concurrent 8 MiB readers (`TS_VIDEO_READAHEAD`,
-  `TS_H3_PREFAULT_THREADS`). The upload previously warmed their pages one fault
+  ahead by sixteen concurrent 8 MiB readers (`TS_VIDEO_READAHEAD`). The upload previously warmed their pages one fault
   at a time, at ~1 GB/s on the A40 pod's network volume. With the read-ahead,
   the median encoder trunk went from 13.3 to 6.4 s and the median first denoise
   step from 11.5 to 7.6 s.
@@ -559,9 +660,9 @@ flash-attention call went from 8.05 s to 3.24 s:
 - The mask needs a row per query, 2.45 GB at this length. Every row is the same, so
   the queries run in chunks that share one mask of about 4 MB.
 
-The video VAE then decoded in 146–148 s. On `ggml_metal` the pipeline now releases
-the denoiser's weights and its reused compute buffers before the decode
-(`TS_H3_KEEP_RESIDENT=1` keeps the weights). Without that, only 3.3 GB of the
+The video VAE then decoded in 146–148 s. On `ggml_metal` the denoiser's weights and
+its step's compute buffer are released before the decode (on the diffusion runtime the
+denoiser declares it: it releases after every denoise on Metal). Without that, only 3.3 GB of the
 38.3 GB Metal budget stayed free, and the decode could fail with
 `kIOGPUCommandBufferCallbackErrorOutOfMemory`. For comparison, MLX's fused SDPA at
 the same shape took 4.08 s per call in F32 and 1.68 s in F16; it was not adopted.
@@ -804,9 +905,8 @@ The plug-in itself is also refused, with the reason:
   [gate | value] order.
 - **Memory.** The factors take 1.38 GB as F16 on `ggml_metal` and `ggml_cuda` (a
   group with a value too large for F16 stays F32) and 2.77 GB as F32 on `ggml_cpu`.
-  The direct `cpu`, `mlx` and `cuda` backends build exact F32 factors per block on
-  first use. With fc1 updated, the native graph splits the fc1 base into its gate and
-  value halves, so the update adds no full-size activation.
+  The tensor executors (`cpu`, `mlx`, `cuda`) hold the exact F32 factors as read
+  (2.77 GB), unbalanced and unpadded.
 - **Strength.** `--lora-scale` (default the config's 1.0) multiplies the update and
   must be ≥ 0. Any other strength than 1 logs that the schedule was distilled at
   strength 1. Strength 0 keeps every term with zero up factors, so each forward
@@ -815,9 +915,12 @@ The plug-in itself is also refused, with the reason:
 - **Canvas.** No default changes. Text-to-video still runs at 640×384 and keyframes
   take the [recipe canvas](#sizes-and-settings). The adapters were trained at 768p,
   so a clip whose short edge is not 768 logs one line saying so, and still runs.
-- **Backends.** The native graph applies the adapter on `ggml_metal`, `ggml_cuda` and
-  `ggml_cpu`; the direct `cpu`, `mlx` and `cuda` backends apply it themselves. Which
-  of them have run is listed below.
+- **Backends.** The denoiser's step program applies the adapter as `LoraLinear` regions
+  (`y = W x + up (down x)` per slot: q, k and v are the three slots of the qkv
+  projection) on every executor; on `ggml_cuda` a region over a Q4_K weight on a wide
+  step is served as one K-concatenated cuBLAS product, and the `cpu` and `cuda` tensor
+  executors add each part's update into its slot of the product in place. Which of them
+  have run is listed below.
 
 On the server the startup `--lora` applies to every clip, and a request cannot
 choose plug-ins; send requests without `steps`, as the Web UI does
@@ -836,7 +939,9 @@ Recorded for this change on 2026-10-17, against unchanged ggml
   sigma grids, every refusal above on the CLI, the server, `--config`, the request
   routes and Studio, and process tests in which each refusal prints one
   `Configuration error:` line, exits 1 and starts no download.
-- **Native helpers** (`eng/validation/minimax-h3-lora.cpp`, ctest `minimax-h3-lora`)
+- **Native helpers** (`eng/validation/minimax-h3-lora.cpp`, ctest `minimax-h3-lora`; retired
+  with the native DiT on 2026-11-25, the runtime's LoRA regions are covered by
+  `MiniMaxH3LoraParityTests`)
   on `cpu` and `metal`: the stacked q/k/v shrink, the folds, the split fc1 and the
   zero-up identity are bit-equal, and a rank-0 adapter builds the unchanged graph.
 - **Synthetic two-block parity** with tiny random weights through the real code:
@@ -1074,18 +1179,12 @@ but a track that is spectrally plausible and merely wrong.
 
 | Variable | Scope |
 |---|---|
-| `TS_H3_CUDA_F32_BANDS` | Direct CUDA H3 quantized projections: default pedantic F32 bands; `0` selects legacy F32 kernels, `1`/`tf32` opts into approximate large TF32 products |
+| `TS_H3_CUDA_F32_BANDS` | Direct CUDA H3 quantized projections (the denoiser's step on the CUDA tensor executor, and the encoders and VAEs): default pedantic F32 bands; `0` selects legacy F32 kernels, `1`/`tf32` opts into approximate large TF32 products |
 | `TS_H3_CUDA_MAPPED_VAE_WEIGHTS=1` | Opt-in direct CUDA mapped F16 VAE weights; cold/warm tradeoff above |
 | `TS_H3_CUDA_BF16_PEDANTIC` | Pedantic F32 for H3 BF16 dense projections by default; `0` restores the historical TF32 approximation |
-| `TS_H3_PHASE=1` | Stage timings including text, denoiser and VAEs |
-| `TS_H3_TRACE=1` | Latent/velocity magnitude diagnostics |
-| `TS_H3_DIT_TRACE_DIR` / `TS_H3_LINEAR_TRACE_FILE` | Synchronizing boundary/projection diagnostics; exclude from formal timings |
-| `TS_H3_PREFAULT` | Denoiser file reading: 0 off, 1 serial, 2 early overlap, 3 default pipelined |
-| `TS_H3_PREFAULT_THREADS` | Denoiser-read readers; default 1 on macOS, 16 on Linux (concurrent 8 MiB reads of one sweep, which network volumes need) |
 | `TS_VIDEO_READAHEAD=0` | Disables the `ggml_cuda` text-encoder read-ahead (concurrent reads ahead of the upload's page warming); shared with LTX 2.5 |
 | `TS_VIDEO_READAHEAD_WORKERS` | Readers for that read-ahead, 1–32; default 16 on Linux, 1 elsewhere |
 | `TS_H3_TE_GROUP` | Optional grouped native text-encoder trunk; off by default |
-| `TS_H3_KEEP_RESIDENT=1` | Optional Metal residency policy between clips |
 | `TS_METAL_FLASH_KV_PAD=0` | Turns off the key padding that puts long `ggml_metal` flash attention on the tensor-API kernel ([above](#long-sequence-attention-on-metal)); for A/B runs |
 | `TS_H3_UPLOAD_PREFAULT` | Native CUDA bulk page-prefault policy: automatic half-memory/cgroup guard; `0` disables, `1` forces; final default coverage is recorded above |
 | `TS_H3_UPLOAD_WORKERS` | Native bulk-prefault workers (1–8, default 8); distinct from the pipeline's denoiser file-read streams |
@@ -1093,13 +1192,22 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`: keeps every attention on ggml's flash-attention kernel instead of cuDNN's fused SDPA ([below](#long-clips-on-ggml_cuda)); `TS_H3_CUDNN_ATTENTION_VERBOSE=1` prints the cuDNN plans and declines |
 | `TS_H3_FLASH_ATTENTION` | `ggml_cuda`, builds with `-DTENSORSHARP_FLASH_ATTENTION=ON` only: `0` keeps the DiT attention on cuDNN's SDPA instead of FlashAttention-2, `1` uses FlashAttention-2 on a GPU newer than sm_8x too. Unset: FlashAttention-2 on sm_8x, cuDNN on newer GPUs |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`: keeps the DiT's wide Q4_K projections on MMQ instead of cuBLAS BF16; `TS_H3_CUBLAS_MIN_ROWS` (default 1024) is the token threshold |
-| `TS_H3_FUSED=0` | `ggml_cuda`: builds the unfused DiT and VAE graphs (no fused attention prep, modulation, gated residual or merged LoRA) |
-| `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`: runs the DiT forward's weight products (F32/F16/BF16 weights and LoRA factors; quantized weights and the attention's own products excluded) on TensorSharp's F32 GEMM over a pedantic cuBLAS handle instead of ggml-cuda's TF32 cuBLAS. Off by default (its cost on a real checkpoint is not measured); on the all-F32 LoRA parity fixture the native-vs-direct-CPU floor went from 6.08e-4 to 8.07e-6. A product that cannot take the path is named once on stderr and runs on ggml |
+| `TS_H3_FUSED=0` | `ggml_cuda`: runs the denoiser program's diffusion-transformer regions as their unfused ops, and builds the unfused VAE graphs |
+| `TS_H3_LINEAR_TRACE_FILE` | Direct CUDA: appends one JSON line per H3 projection (its route and shapes); a synchronizing diagnostic, excluded from formal timings |
+| `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`: runs the denoiser step's weight products (F32/F16/BF16 weights and LoRA factors; quantized weights and the attention's own products excluded) on TensorSharp's F32 GEMM over a pedantic cuBLAS handle instead of ggml-cuda's TF32 cuBLAS. Off by default (its cost on a real checkpoint is not measured); on the all-F32 LoRA parity fixture the native-vs-direct-CPU floor went from 6.08e-4 to 8.07e-6. A product that cannot take the path is named once on stderr and runs on ggml |
 | `TS_H3_DIRECT_READ=0` | `ggml_cuda` on Windows: uploads weights from the mapping instead of reading the file unbuffered; `TS_H3_DIRECT_READ_THREADS` (1–32, default 8) is the reader count |
 | `TS_H3_FP8_MATMUL` | `ggml_cuda`: opt-in FP8 (E4M3) projections through cuBLASLt; `1` for the DiT, `vae` for the video VAE, `all` for both. Changes the output |
 | `TS_H3_INT8_MATMUL` | **Removed** (stage S10, design D4): the option `--diffusion-products` (config key `diffusion-products`, variable `TS_DIFFUSION_PRODUCTS`) replaces it, `int8` for the DiT's projections (the variable's `1`), `int8-all` with the VAE decoders' too (its `all`); its `vae` alone has no replacement. Both hosts refuse to start with it set. The option also covers Qwen-Image-2.1's Q4_K projections on cuBLAS and MiniMax-H3-Image's BF16 ones ([its card](minimax-h3-image.md)). Changes the output |
 | `TS_H3_INT8_DEFER=0`, `TS_H3_INT8_ONE_PASS=0`, `TS_H3_INT8_KEEP_WEIGHTS=0` | `ggml_cuda` with `--diffusion-products int8` or `int8-all`: scale every int8 product to F32 with its own pass, round activations in two passes, round the DiT's weights on every call. The output is the same either way; the switches are for A/B timing and for a device short of memory |
 | `TS_H3_STAGE_PROFILE=1` | Synchronizing per-stage timings inside the fused CUDA attention and GEMM nodes, printed when the scratch is released; exclude from formal timings |
+
+The switches of the retired pipeline and DiTs (`TS_H3_PHASE`, `TS_H3_TRACE`,
+`TS_H3_DIT_LAYERS`, `TS_H3_DIT_TRACE_DIR`, `TS_H3_DUMP_VEL_V` / `_A`, `TS_H3_PREFAULT`,
+`TS_H3_PREFAULT_THREADS`, `TS_H3_KEEP_RESIDENT`) were removed with it: both hosts refuse
+to start with one set and say what replaces it. The runtime logs every phase's and every
+step's time (`[diffusion]` lines) without a switch, reads the denoiser file ahead of its
+upload after the text encoder runs, and its residency plan decides what stays on the
+device.
 
 ## Reproducing validation
 

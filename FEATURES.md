@@ -367,15 +367,16 @@ agreement slightly *worse*, so the F16 K/V cast is not the cause. That route is 
 claimed as parity.
 
 The DiT is not bit-identical to GGML and cannot be: truncating the trunk on both
-paths with `TS_H3_DIT_LAYERS` shows 1-cosine ~1e-5 through 25 layers and then
+paths (with `TS_H3_DIT_LAYERS`, since retired) showed 1-cosine ~1e-5 through 25 layers and then
 *non-monotonic* amplification (1.15e-3 at depth 40, 1.5e-4 at 44, 1.26e-3 at 50) --
 and non-monotonic is what rules out a bug.
 
 Speed is mixed rather than uniformly slower, `--backend cpu` against `ggml_cpu` on
 the same clip: t2v 69 s vs 14 s, i2v 70 s vs 176 s, ref-audio 63 s vs 71 s,
 ref-image 112 s vs 20 s. The vision tower is the expensive managed stage.
-Diagnostics: `TS_H3_DUMP_TE`, `TS_H3_DUMP_VEL_V`, `TS_H3_DUMP_VEL_A`,
-`TS_H3_DUMP_VIS` and `TS_H3_DIT_LAYERS`, plus the pre-existing `TS_H3_NO_FLASH`.
+Those measurements predate the diffusion runtime, which now runs the DiT as one graph
+program per step on every backend; the dump and truncation switches went with the retired
+pipeline, and `TS_H3_NO_FLASH` remains.
 
 ## Tensor Parallelism & Distributed Inference
 

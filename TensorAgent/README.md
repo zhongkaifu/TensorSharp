@@ -1511,7 +1511,8 @@ rather than 24 (`CatalogTests.EachDesktopEntryFitsItsTierBesideMacOS`). That fit
 because the engine now hands the denoiser and both VAEs back before the next clip's text
 encoder runs; it used to keep all three device-resident between clips. Measured on a
 quiet machine, two identical clips from words per arm: peak wired memory 19.1 GB by
-default against 33.3 GB with `TS_H3_KEEP_RESIDENT=1` (the old behaviour, reached in the
+default against 33.3 GB with `TS_H3_KEEP_RESIDENT=1` (the old behaviour, a switch since
+removed, reached in the
 second clip's text phase), for 1.3 s more text conditioning on the second clip (2.8 s
 against 1.5 s). The clips took 151.4 and 148.9 s against 148.4 and 147.4 s, about 1%
 apart and inside the 3 s by which the identical first clips differed between the arms.

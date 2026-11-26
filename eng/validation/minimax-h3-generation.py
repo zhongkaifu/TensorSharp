@@ -244,7 +244,7 @@ def main():
     env = os.environ.copy()
     env.update(TS_VIDEO_VAE=str(components["video_vae"]), TS_VIDEO_TEXT_ENCODER=str(components["text"]),
                TS_VIDEO_AUDIO_VAE=str(components["audio_vae"]), TS_VIDEO_TOKENIZER=str(args.models.resolve()),
-               TS_CPU_THREADS="8", DOTNET_PROCESSOR_COUNT="8", OMP_NUM_THREADS="8", GGML_N_THREADS="8", TS_H3_PHASE="1")
+               TS_CPU_THREADS="8", DOTNET_PROCESSOR_COUNT="8", OMP_NUM_THREADS="8", GGML_N_THREADS="8")
     for name in ("TS_H3_DIT_LAYERS", "TS_H3_VIS_STOP", "TS_H3_ENC3D_STOP", "TS_GGML_NODE_PROFILE"):
         env.pop(name,None)
     baseline_backend = args.sdcpp_backend or {"cpu": "cpu", "ggml_cpu": "cpu", "mlx": "metal", "ggml_metal": "metal"}.get(args.backend, "cuda0")

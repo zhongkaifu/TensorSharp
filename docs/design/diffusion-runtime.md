@@ -128,8 +128,8 @@ the unfused graph that the same builder emits.
 | `TS_H3_CUDNN_ATTENTION`, `TS_H3_CUDNN_ATTENTION_VERBOSE`, `TS_H3_NO_FLASH`, `TS_H3_FLASH_ATTENTION`, `TS_H3_CUDA_BATCHED_ATTENTION` | native attention | no |
 | `TS_H3_FUSED`, `TS_H3_INT8_DEFER`, `TS_H3_INT8_KEEP_WEIGHTS`, `TS_H3_INT8_ONE_PASS`, `TS_H3_FP8_MATMUL` | native fused stages and products | no |
 | `TS_H3_CUDA_F32_PRODUCTS`, `TS_H3_CUDA_F32_BANDS`, `TS_H3_CUDA_BF16_PEDANTIC` | precision oracles | no |
-| `TS_H3_DIT_LAYERS`, `TS_H3_DIT_TRACE_DIR`, `TS_H3_DUMP_*`, `TS_H3_TRACE`, `TS_H3_STAGE_PROFILE`, `TS_H3_UPLOAD_PROFILE`, `TS_H3_PHASE` | measurement and oracle switches (keep list) | no |
-| `TS_H3_UPLOAD_PREFAULT`, `TS_H3_UPLOAD_WORKERS`, `TS_H3_PREFAULT*`, `TS_H3_DIRECT_READ*`, `TS_H3_KEEP_RESIDENT` | weight upload and residency | no |
+| `TS_H3_DIT_LAYERS`, `TS_H3_DIT_TRACE_DIR`, `TS_H3_DUMP_*`, `TS_H3_TRACE`, `TS_H3_STAGE_PROFILE`, `TS_H3_UPLOAD_PROFILE`, `TS_H3_PHASE` | measurement and oracle switches (keep list; all but the two profiles were removed with the retired video pipeline, §3.11) | no |
+| `TS_H3_UPLOAD_PREFAULT`, `TS_H3_UPLOAD_WORKERS`, `TS_H3_PREFAULT*`, `TS_H3_DIRECT_READ*`, `TS_H3_KEEP_RESIDENT` | weight upload and residency (`TS_H3_PREFAULT*` and `TS_H3_KEEP_RESIDENT` were removed with the retired video pipeline, §3.11) | no |
 
 H3-Image itself has no CLI flags. It reuses the generic image flags and the H3 companion flags.
 `QwenImageParams` is the request type, even though the name belongs to another family.
@@ -469,6 +469,10 @@ product) where that moves fewer bytes than the ops beside the product: ggml-meta
 product that accumulates into its result, so beside it the expand writes an [out, rows] F32
 delta that the add reads again (16 bytes an element, plus the slots' concatenation of a stacked
 qkv). At 4 MP that is qkv, out and fc1; fc2 (its input 2.7 times its output) keeps its ops.
+The `cpu` and `cuda` tensor executors serve the region in a diffusion transformer's wide step (a
+program with F32 products, or on an executor its family marked `ServesWideDitRegions`:
+`TensorGraphExecutor.TryLoraLinearInPlace`, the product once, each part's update added into its
+slot's columns), with the ops' bytes and without their per-slot sums and concatenation.
 Elsewhere the region's ops run (shrink, expand and an add per slot).
 
 ### 3.8 Cancellation, progress and previews
@@ -530,6 +534,46 @@ numerics: the commit before the deletion (f981cb6) keeps the live A/B tests and 
 The legacy path's tuning switches went with it (`TS_QWEN21_FLASH`, `_PAD_MASK`, `_CUDNN_ATTENTION`, `_CUBLAS_MATMUL`,
 `_CUBLAS_MIN_ROWS`, `_GRAPH_REUSE`, `_GRAPH_TRACE`, `_PREFIX_CACHE`, `_PREFIX_CACHE_TYPE`, `_PREFIX_CACHE_MAX_MIB`, the seven
 `_CPU_*` and `_MEMORY`); `RemovedCliFlags` refuses each at startup with what to do instead.
+
+### 3.11 MiniMax-H3 video on the runtime (as built)
+
+MiniMax-H3 (FL2VA and Ref2VA, with and without its LightX2V Turbo plug-ins) runs only on the diffusion runtime's video
+pipeline. The bespoke `MiniMaxH3Pipeline`, the audio-video DiT that the native whole graph served (`MiniMaxH3DiT`,
+`TSGgml_MiniMaxH3DitForward`, `ggml_h3_lora.h`, `ggml_h3_graph_inputs.h`) and the direct DiT (`MiniMaxH3DirectDiT`) were
+deleted once their steps were frozen.
+
+| Piece | On the runtime |
+|---|---|
+| Pipeline | `SharedDiffusion/DiffusionVideoPipeline`: the image pipeline's sibling for a clip (phases Condition, EncodeReferences, EncodeAudio, Denoise, Decode, DecodeAudio), with the same residency plan (`ResidencyPlanner`, which now plans an audio VAE as a fourth component) and component contract; several streams a step (`DenoiseStepInputs.Streams`, `SamplingRecipe.StreamShifts`); progress and telemetry stages as the retired pipeline reported them |
+| Family | `MiniMaxH3Family` (`IVideoDiffusionFamily`): request rules (`MiniMaxH3Requests`), the packed layout, Philox noise for both streams, keyframe and reference encodes, the dual-shift audio carrier and its endpoint scale, the base schedule (shift 12 / 3) and a plug-in's recipe (Turbo: linspace, shift 6 / 3) |
+| Denoiser | `MiniMaxH3Denoiser`: the 50-block trunk emitted as one `GraphProgram` a step and the 2 token-refiner blocks (with the condition projection) as a program of their own, run once a prompt and LoRA set and read by the step as an input (the retired direct DiT cached its refined text the same way), node for node as the retired native graph built them (curve-table AdaLN, three-axis float RoPE, the refiner without it, the q8_1 guard around quantized products on the GGML executor); on the GGML graph executor (`ggml_cpu`, `ggml_cuda` with the shared DiT offload's fused regions, `ggml_metal`) and the tensor executors (`cpu`, `cuda`, `mlx`), each with the products the retired direct DiT took on its backend: F32 on direct CUDA (`FloatProducts`, the retired DiT's pedantic-F32 bands, `CudaGraphExecutor.FloatDitProduct`) and MLX, the managed executor's own on `cpu` (`ManagedQuantizedOps`, whose block-format kernels quantize a few rows' activations; its intermediates recycled from block to block, `RecyclingCpuAllocator`), none with the guard. The `cpu` and `cuda` executors serve the step's `DitAttention` regions in F32 with bounded scratch (the retired direct DiT's blocked attention on the host; on CUDA strided-batched GEMMs that read the heads where they lie, over groups of eight heads, or one past 100 GFLOP with half operands as the retired DiT took them, in chunks of query rows, each block's with its q/k norm and NeoX rotation on the retired DiT's kernels), its `LoraLinear` regions in place (`TryLoraLinearInPlace`) and its `AdaLnModulate` and `GatedResidual` regions with the retired direct DiT's row kernels (the RMS norm with its weight in one pass, then each segment's rows modulated or gated in place, the segments read from the table's host values); one plan per geometry; on direct CUDA the plans and the step's pooled intermediates go back before the decode; the audio prediction's shift slope applied on the host |
+| LoRA | `MiniMaxH3LoraSet` as an `AdapterSet`: unmerged `LoraLinear` regions (q, k, v as the three slots of the qkv product; fc1's [value; gate] halves swapped at load); F16 factors on the GGML GPU backends, F32 on `ggml_cpu` and the tensor executors |
+| Components | the existing text encoder and vision tower (released after their phase, as the retired pipeline disposed them per clip), the video VAE and the audio VAE; on `ggml_metal` the denoiser and both VAEs release after every phase (the retired pipeline released them before each text encoder) |
+
+Runtime pieces added for it, all family-neutral: `DiffusionVideoPipeline` and `IVideoDiffusionFamily`, the
+`EncodeAudio` and `DecodeAudio` phases, `DiffusionComponent.AudioVae`, step streams, `GraphEmitter`'s float-products
+mode, and the tensor executors' served `DitAttention`, in-place `LoraLinear` and row-kernel `AdaLnModulate` and
+`GatedResidual` for a diffusion transformer's wide steps (programs with F32 products, or an executor marked
+`ServesWideDitRegions`; the generic attention held every head's scores of the sequence at once: 0.7 GB at 1,768 tokens,
+274 GB at a 1280x768x107 clip's 35K). ggml stays unpatched.
+
+The retired path's switches went with it (`TS_H3_PHASE`, `TS_H3_TRACE`, `TS_H3_DIT_LAYERS`, `TS_H3_DIT_TRACE_DIR`,
+`TS_H3_DUMP_VEL_V`, `TS_H3_DUMP_VEL_A`, `TS_H3_PREFAULT`, `TS_H3_PREFAULT_THREADS`, `TS_H3_KEEP_RESIDENT`); `RemovedCliFlags`
+refuses each at startup with what to do instead.
+
+Evidence (NVIDIA A40, Intel Xeon Gold 6342, ggml `2ca32666` unchanged; the retired path built from `d23ee0be` with the same
+ggml): the retired DiT's steps on the synthetic fixture's eight cases (text with vision spans, keyframes, Ref2VA's picture
+and sound references, two sigmas, BF16/Q8_0/Q4_K, two with the LoRA) are frozen per lane in
+`InferenceWeb.Tests/Fixtures/MiniMaxH3/LegacyGoldens/` and `MiniMaxH3DenoiserTests` holds the runtime to them: `ggml_cuda`
+gives their bytes in all eight, `ggml_cpu` in the six without LoRA (the LoRA cases within 7.6e-4: the retired graph ran
+q, k and v's downs as one stacked product), direct `cuda` lands within 3.1e-7 of the retired direct DiT in every case and
+managed `cpu` within 5.3e-7 in seven (Q8_0 7.6e-4: its quantized activations flip one rounding). Whole clips on `ggml_cuda`
+(640x384x22: t2v at 20 steps, i2v, fl2v and Ref2VA at 8) gave the retired pipeline's decoded RGB and WAV byte for byte in
+every alternating round, at 0.989x to 1.015x its median wall time; the Turbo plug-ins take the unmerged route above and
+changed numerically, as close to two F32 references as the retired merged route was, at 1.02x. Direct `cuda` clips ran
+2-13% faster and managed `cpu` 2-6% faster. Each served region of the tensor executors replaced a measured regression
+against the retired direct DiT (the model card lists them). The model card has the timings. Not yet validated on Metal or
+MLX hardware.
 
 ---
 

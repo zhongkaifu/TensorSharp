@@ -6,6 +6,54 @@ dirty or unavailable dependency checkouts. Put outputs in ignored `artifacts/`
 or `docs/validation/`. A structural media pass does not establish perceptual
 quality or benchmark parity.
 
+## 2026-11-25 diffusion-runtime migration
+
+The clip moved from `MiniMaxH3Pipeline` and the native whole-graph/direct DiTs to the diffusion runtime
+(`DiffusionVideoPipeline`, `MiniMaxH3Denoiser`). Host: NVIDIA A40 46 GB (driver 595.112.07, CUDA 13.2), Intel Xeon Gold
+6342 (96 threads), .NET 10.0.404. Both trees were built against unchanged ggml
+`2ca32666e16586ff4e8008b8c92f2e534b8e4f51`: the baseline from the migration's base commit `d23ee0be`, the candidate
+from the migrated tree. Evidence was kept on the pod (`/workspace/e2e-h3/`, `/workspace/ab/`, `/workspace/prof/`);
+nothing generated was committed. Results are in the [model card](../../docs/models/minimax-h3.md#diffusion-runtime-migration-2026-11-25).
+
+**Steps.** The retired DiT's outputs on the synthetic fixture (eight cases) were frozen per lane with the baseline
+tree and are committed as test fixtures (`InferenceWeb.Tests/Fixtures/MiniMaxH3/LegacyGoldens/`). Then, in the
+candidate tree:
+
+```sh
+dotnet test InferenceWeb.Tests -c Release --filter "FullyQualifiedName~MiniMaxH3DenoiserTests"            # ggml_cpu, cpu
+TS_TEST_GGML_BACKEND=cuda dotnet test InferenceWeb.Tests -c Release --filter "FullyQualifiedName~MiniMaxH3DenoiserTests"
+```
+
+31 tests each, all passing on the A40 host (ggml_cpu, cpu; ggml_cuda, cuda), including the served-region tests (each
+asserts its region counter, so a region that silently fell back to its ops fails).
+
+**Whole clips.** Alternating rounds with the updated A/B runner (the baseline without `TS_H3_PHASE`, which the runtime
+refuses; `--lora` for a plug-in, `--allow-changed-media` where the route changed by design):
+
+```sh
+python3 eng/validation/minimax-h3-ab.py --baseline-cli <base>/TensorSharp.Cli.dll --candidate-cli <new>/TensorSharp.Cli.dll \
+  --models <models> --backend ggml_cuda --rounds 4 --steps 20 --output <fresh dir> \
+  --ggml-source ExternalProjects/ggml --expected-ggml-revision 2ca32666e16586ff4e8008b8c92f2e534b8e4f51
+# Turbo-8: --steps 8 --lora config/lora/minimax-h3-fl2v-turbo-8step.json --allow-changed-media
+# Ref2VA: --checkpoint ref2va --steps 8 --ref-image <png> --ref-audio <wav> --rounds 6
+```
+
+The direct `cuda`, `cpu` and `ggml_cpu` pairs ran both CLIs with the same arguments and compared decoded frames (PSNR)
+and WAV (cosine); kernel-level comparisons used `nsys profile -t cuda` and `nsys stats -r cuda_gpu_kern_sum` on a
+three-step i2v. Back-to-back runs on one A40 differ by about 1% with the GPU's temperature (the first run of a
+sequence is the fastest), so per-step comparisons alternated the trees.
+
+**Coverage and limits.** Passing: the step goldens on four lanes; whole clips on `ggml_cuda` (t2v, i2v, fl2v, Ref2VA,
+Turbo-8, Turbo-4 i2v), direct `cuda` (t2v, i2v, Turbo-8, Turbo-4 i2v), `cpu` (two geometries) and `ggml_cpu` (one);
+`InferenceWeb.Tests` filtered to MiniMaxH3, Diffusion, Lora, Studio, WebUiVideo, Telemetry, RemovedCliFlags,
+GgufPrefault, GraphDit, VideoGeneration, Residency, Cuda, ManagedGraph and TensorGraph (4,253 tests: 3,944 passed, 309
+skipped for missing models or hardware, none failed) and its CUDA-pinned subset (MiniMaxH3, GraphDit and Cuda: 2,832
+tests, 2,642 passed, 190 skipped, none failed), both on the build before the final one; the final build (its changes
+on direct CUDA only) passed the CUDA-pinned MiniMaxH3, GraphDit, Studio, WebUiVideo, CudaGraph and Diffusion tests
+(1,286: 1,187 passed, 99 skipped, none failed) and the denoiser tests above. Not run: `ggml_metal`
+and `mlx` (no Apple hardware), the real-checkpoint component oracles (their PyTorch fixtures are not on the pod),
+1280×768 and longer clips, multi-clip server sessions, and the ggml_cpu/cpu Turbo clips.
+
 ## 2026-10-17 exact RoPE/view rewrite and CUDA read-ahead
 
 Evidence is in ignored `artifacts/perf/local/final-h3-ab/` (M5 Pro) and in
@@ -19,7 +67,8 @@ build of the previous commit (3f422687), and the candidate is built from the
 same ggml.
 
 **Gates.** The first-step video and audio velocities
-(`TS_H3_DUMP_VEL_V`/`TS_H3_DUMP_VEL_A`) were byte-identical. Then:
+(`TS_H3_DUMP_VEL_V`/`TS_H3_DUMP_VEL_A`, switches since removed with the retired
+pipeline) were byte-identical. Then:
 
 ```sh
 python3 eng/validation/minimax-h3-ab.py --baseline-cli <base>/TensorSharp.Cli.dll \
@@ -293,8 +342,9 @@ weights, automatically bounded by half the smaller of physical RAM and the
 cgroup memory limit. Unknown capacity disables automatic warming.
 `TS_H3_UPLOAD_PREFAULT=0` disables it and `1` forces it;
 `TS_H3_UPLOAD_WORKERS` selects 1–8 workers (default 8). The independent managed denoiser read
-retains `TS_H3_PREFAULT=3`; removing it did not establish a repeatable process
-gain. Retain the exact policy/environment in each frozen-binary report.
+retained `TS_H3_PREFAULT=3`; removing it did not establish a repeatable process
+gain. (The diffusion runtime always reads the denoiser file ahead as that mode did, after
+the text encoder runs; the switch was removed with the retired pipeline on 2026-11-25.) Retain the exact policy/environment in each frozen-binary report.
 
 The final native default passed all nine actual component oracle cases and
 both alternating generation pairs with no skips. Eight before/experimental/final
@@ -392,7 +442,8 @@ The actual image-plus-canonical-audio eight-step pair achieved RGB PSNR
 request and the FL2VA first/last-frame case establish conditioning execution
 and diagnostic agreement, not natural-media perceptual quality or speed parity.
 
-`MiniMaxH3DitProbe` rejects inherited `TS_H3_DIT_LAYERS`. Its trace-free mode
+`MiniMaxH3DitProbe` runs the runtime's denoiser (`MiniMaxH3Denoiser`) on any
+`--backend`; the hosts refuse the retired `TS_H3_DIT_LAYERS`. Its trace-free mode
 measures complete DiT forwards including returned host arrays, separately from
 text encoding, sampling and VAEs. Use one warmup and at least three repeats.
 `minimax-h3-prediction-compare.py` binds saved velocities to the probe's digest,
