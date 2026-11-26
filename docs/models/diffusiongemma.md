@@ -228,8 +228,8 @@ Measured on one A40 (`diffusiongemma-26B-A4B-it-Q4_K_M.gguf`, ggml d9fe7bff,
 | `ggml_cuda` | legacy | runtime |
 |---|---:|---:|
 | 512-token prompt prefill (warm) | 2.47–2.65 s | 0.14–0.15 s |
-| canvas step, host sampling (256 rows, self-conditioning) | 325–333 ms | 145–160 ms |
-| canvas step, on-device sampling | 218 ms | 114–128 ms |
+| canvas step, host sampling (256 rows, self-conditioning) | 325–333 ms | 145–178 ms |
+| canvas step, on-device sampling | 218 ms | 113–128 ms |
 | generation, three prompts (ms per denoising step) | 268–353 | 129–153 |
 
 | other backends (same checkpoint and probe) | legacy | runtime |
