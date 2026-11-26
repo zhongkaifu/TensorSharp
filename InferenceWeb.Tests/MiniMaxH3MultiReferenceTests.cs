@@ -267,7 +267,7 @@ namespace InferenceWeb.Tests
                 new MiniMaxH3PromptImage { TokenIndex = 40, Vision = Vision(2) },
             };
 
-            var tags = MiniMaxH3Pipeline.BuildTextModalities(60, images);
+            var tags = MiniMaxH3Requests.BuildTextModalities(60, images);
             Assert.Equal(60, tags.Count);
 
             // The span covers the placeholders AND the <|vision_start|>/<|vision_end|>
@@ -291,7 +291,7 @@ namespace InferenceWeb.Tests
         public void AVisualSpanIsClampedToThePromptRatherThanRunningOffTheEnd()
         {
             var images = new[] { new MiniMaxH3PromptImage { TokenIndex = 0, Vision = Vision(9) } };
-            var tags = MiniMaxH3Pipeline.BuildTextModalities(10, images);
+            var tags = MiniMaxH3Requests.BuildTextModalities(10, images);
             Assert.Equal(10, tags.Count);
             Assert.All(tags, t => Assert.Equal(MiniMaxH3Modality.Visual, t));
         }
@@ -310,7 +310,7 @@ namespace InferenceWeb.Tests
             string b = dir.WritePng("b.png", 200, 400);
             string c = dir.WritePng("c.png", 96, 96);
 
-            var loaded = MiniMaxH3Pipeline.LoadReferenceImages(
+            var loaded = MiniMaxH3Requests.LoadReferenceImages(
                 new VideoGenerationParams { ReferenceImagePaths = new List<string> { a, b, c } },
                 width: 256, height: 256);
 
@@ -340,7 +340,7 @@ namespace InferenceWeb.Tests
             using var dir = new TempDir();
             string p = dir.WritePng("tie.png", 80, 144);
 
-            var loaded = MiniMaxH3Pipeline.LoadReferenceImages(
+            var loaded = MiniMaxH3Requests.LoadReferenceImages(
                 new VideoGenerationParams { ReferenceImagePaths = new List<string> { p } },
                 width: 640, height: 384);   // far larger area, so scale is exactly 1
 
@@ -355,7 +355,7 @@ namespace InferenceWeb.Tests
             var paths = Enumerable.Range(0, MiniMaxH3Geometry.MaxReferences + 1)
                 .Select(i => dir.WritePng($"r{i}.png", 64, 64)).ToList();
 
-            var ok = MiniMaxH3Pipeline.LoadReferenceImages(
+            var ok = MiniMaxH3Requests.LoadReferenceImages(
                 new VideoGenerationParams
                 {
                     ReferenceImagePaths = paths.Take(MiniMaxH3Geometry.MaxReferences).ToList()
@@ -363,7 +363,7 @@ namespace InferenceWeb.Tests
                 width: 256, height: 256);
             Assert.Equal(MiniMaxH3Geometry.MaxReferences, ok.Count);
 
-            var ex = Assert.Throws<ArgumentException>(() => MiniMaxH3Pipeline.LoadReferenceImages(
+            var ex = Assert.Throws<ArgumentException>(() => MiniMaxH3Requests.LoadReferenceImages(
                 new VideoGenerationParams { ReferenceImagePaths = paths },
                 width: 256, height: 256));
             Assert.Contains(MiniMaxH3Geometry.MaxReferences.ToString(), ex.Message);
@@ -379,7 +379,7 @@ namespace InferenceWeb.Tests
             string named = dir.WritePng("named.png", 128, 128);
             string plain = dir.WritePng("plain.png", 128, 128);
 
-            var loaded = MiniMaxH3Pipeline.LoadReferenceImages(
+            var loaded = MiniMaxH3Requests.LoadReferenceImages(
                 new VideoGenerationParams
                 {
                     ReferenceImagePaths = new List<string> { named },
@@ -491,7 +491,7 @@ namespace InferenceWeb.Tests
                 return;
             }
 
-            using var model = new MiniMaxH3DiT(dit);
+            using var model = new MiniMaxH3Denoiser(dit, TestGates.PinnedGgmlBackend);
             _output.WriteLine("[ref-bench] " + model.Config);
             var shape = MiniMaxH3Geometry.Resolve(640, 384, 22);
             int videoCount = shape.VideoTokenCount, audioCount = shape.AudioTokenCount;

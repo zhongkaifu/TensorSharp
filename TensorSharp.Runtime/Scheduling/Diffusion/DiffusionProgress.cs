@@ -23,6 +23,10 @@ public enum DiffusionPhase
     Decode,
     /// <summary>Resizing to the requested size and compositing a masked edit.</summary>
     Composite,
+    /// <summary>A joint audio-video family's audio encode of its sound conditioning (after <see cref="EncodeReferences"/>).</summary>
+    EncodeAudio,
+    /// <summary>A joint audio-video family's audio decode (after <see cref="Decode"/>).</summary>
+    DecodeAudio,
 }
 
 /// <summary>

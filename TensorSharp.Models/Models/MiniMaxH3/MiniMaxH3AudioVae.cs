@@ -672,7 +672,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         /// <summary>Hand the device copies of the weights back without tearing the VAE down
-        /// (see <see cref="MiniMaxH3DiT.ReleaseDeviceResidency"/>); the next encode or decode
+        /// (as the denoiser releases its own); the next encode or decode
         /// binds them again from the same host memory.</summary>
         public void ReleaseDeviceResidency()
         {

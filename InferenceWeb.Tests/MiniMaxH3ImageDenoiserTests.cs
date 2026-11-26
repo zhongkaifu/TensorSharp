@@ -201,7 +201,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         for (int c = 0; c < 24; c++)
             for (int i = 0; i < 48; i++)
                 hwc[i * 24 + c] = chw[c * 48 + i];
-        Assert.Equal(MiniMaxH3DiT.PatchifyVideo(hwc, 1, 6, 8, 24), rows);
+        Assert.Equal(MiniMaxH3Latents.PatchifyVideo(hwc, 1, 6, 8, 24), rows);
         Assert.Equal(chw, family.FromRows(rows, shape).Data);
         // A per-cell mask in the rows' layout: every value of a token carries its own cell's weight.
         float[] cells = Enumerable.Range(0, 48).Select(i => (float)i).ToArray();

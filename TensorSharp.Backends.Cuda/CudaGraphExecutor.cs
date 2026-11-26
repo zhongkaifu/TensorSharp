@@ -2121,6 +2121,12 @@ namespace TensorSharp.Cuda
             GraphFusion.DeltaNetScans => Kernels is { TakesGdnScanSequences: true },
             GraphFusion.DeltaNetPreps or GraphFusion.GatedRmsNorms => Kernels is { TakesPrepSequences: true } && !PrepSequencesDisabledForTests,
             GraphFusion.RingAttentionLanes => Kernels is { TakesRingAttentionLanes: true } && !RingAttentionDisabledForTests,
+            GraphFusion.LoraLinear => ServesLoraLinearInPlace,
+            GraphFusion.DitAttention => ServesDitAttention,
+            // With the attention it feeds (TryTableRopeQkNormAttention: a table pair it cannot rotate on the device it rotates on
+            // the host, so only a layout it does not take at all leaves that attention to the region's ops).
+            GraphFusion.TableRopeQkNorm => ServesDitAttention,
+            GraphFusion.AdaLnModulate or GraphFusion.GatedResidual => ServesDitModulation,
             _ => false,
         };
 
@@ -2144,6 +2150,11 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.DeltaNetPreps) return TryDeltaNetPreps(inputs, ip, fp, results);
             if (kind == GraphFusion.GatedRmsNorms) return TryGatedRmsNorms(inputs, ip, fp, results);
             if (kind == GraphFusion.RingAttentionLanes) return TryRingAttentionLanes(inputs, ip, fp, results);
+            if (kind == GraphFusion.LoraLinear) return TryLoraLinearInPlace(inputs, weights, ip, results);
+            if (kind == GraphFusion.DitAttention) return TryDitAttention(inputs, fp, results);
+            if (kind == GraphFusion.TableRopeQkNorm) return TryTableRopeQkNormAttention(inputs, ip, fp, results);
+            if (kind == GraphFusion.AdaLnModulate) return TryAdaLnModulate(inputs, ip, fp, results);
+            if (kind == GraphFusion.GatedResidual) return TryGatedResidual(inputs, ip, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -2424,11 +2435,13 @@ namespace TensorSharp.Cuda
         internal long NormedProducts { get; private set; }
 
         /// <summary>The gated delta rule's regions read views of a packed in-projection where they are (<see cref="TryRows"/>), as
-        /// the attention's gate and prep read the query projection's heads (<see cref="TryHeadRows"/>); the others take contiguous
-        /// inputs.</summary>
+        /// the attention's gate and prep read the query projection's heads (<see cref="TryHeadRows"/>) and a DiT attention and its
+        /// rotary prep their heads (<see cref="TryDitAttention"/>, <see cref="TryTableRopeQkNormAttention"/>); the others take
+        /// contiguous inputs.</summary>
         protected override bool RegionReadsStridedInputs(GraphFusion kind)
             => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate or GraphFusion.AttentionPrep
-                or GraphFusion.RingAttentionLanes or GraphFusion.DeltaNetPreps or GraphFusion.GatedRmsNorms;
+                or GraphFusion.RingAttentionLanes or GraphFusion.DeltaNetPreps or GraphFusion.GatedRmsNorms or GraphFusion.DitAttention
+                or GraphFusion.TableRopeQkNorm;
 
         /// <summary>
         /// DFlash2's grouped dynamic convolution (<see cref="GraphFusion.DFlashConv"/>) in one launch (ts_graph_dflash_conv_f32)
@@ -3048,6 +3061,284 @@ namespace TensorSharp.Cuda
             using var act = new Tensor(Allocator, DType.Float32, rows, ff);
             Launch(new[] { gu }, act, (_, stream) => cuda.Kernels.LaunchSiLUMulSplitF32(Ptr(gu), Ptr(act), checked((int)rows), (int)ff, stream));
             results[0] = QuantizedMatMul(down, act);
+            return true;
+        }
+
+        /// <summary>Rotary regions this executor served itself (tests).</summary>
+        internal long DitRopesServedForTests;
+
+        // The half tables of the last rotary table pair served (cos[j] and sin[j] of a row's first half; NeoX tables repeat
+        // them in the second), keyed by the host arrays a run binds (every region of the run reads the same ones), or null
+        // where the pair is not NeoX.
+        private float[] _ropeCosKey, _ropeSinKey;
+        private Tensor _ropeCosHalf, _ropeSinHalf;
+        private bool _ropeNeox;
+
+        /// <summary>
+        /// <see cref="GraphFusion.TableRopeQkNorm"/> with the attention it feeds (Ip[2] = 1), where the executor serves that
+        /// attention (<see cref="TensorGraphExecutor.ServesDitAttention"/>), as the retired direct CUDA DiT ran its q/k prep:
+        /// each of q and k copied out of the projection, RMS-normed with its weight over each head (one kernel), and rotated in
+        /// place on its first rot dims (ts_neox_rope_flat_f32, the half tables of a NeoX table pair: cos and sin repeat over
+        /// a row's two halves, checked on the tables' host values), then <see cref="TryDitAttention"/>. A table pair whose
+        /// halves differ is rotated on the host instead (no family emits one), so the attention is never left to the region's
+        /// ops. The region's ops normed, multiplied by the weight, swapped the halves and multiplied and added the tables as
+        /// tensors of their own: about 0.04 s a step at 2,250 tokens. False (the ops run) for the form without the attention
+        /// (it holds none) or any other layout.
+        /// </summary>
+        private bool TryTableRopeQkNormAttention(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            if (ip == null || ip.Length < 3 || ip[2] != 1 || fp == null || fp.Length < 3 || results.Length < 1) return false;
+            long norms = ip[1];
+            if (inputs.Length != 5 + ((norms & 1) != 0 ? 1 : 0) + ((norms & 2) != 0 ? 1 : 0)) return false;
+            int at = 0;
+            Tensor q = inputs[at++], k = inputs[at++];
+            Tensor qNorm = (norms & 1) != 0 ? inputs[at++] : null, kNorm = (norms & 2) != 0 ? inputs[at++] : null;
+            int cosAt = at++, sinAt = at++;
+            if (at != inputs.Length - 1) return false;
+            Tensor cos = inputs[cosAt], sinSigned = inputs[sinAt], v = inputs[at];
+            using Tensor q3 = Rows3(q), k3 = Rows3(k);
+            if (q3 == null || k3 == null || v == null || q3.ElementType != DType.Float32 || k3.ElementType != DType.Float32
+                || cos == null || sinSigned == null || cos.ElementType != DType.Float32 || sinSigned.ElementType != DType.Float32)
+                return false;
+            long rows = q3.Sizes[0], heads = q3.Sizes[1], d = q3.Sizes[2], rot = ip[0];
+            if (k3.Sizes[0] != rows || k3.Sizes[1] != heads || k3.Sizes[2] != d || rot <= 0 || rot % 2 != 0 || rot > d
+                || cos.ElementCount() != rows * rot || sinSigned.ElementCount() != rows * rot
+                || (qNorm != null && qNorm.ElementCount() != d) || (kNorm != null && kNorm.ElementCount() != d)
+                || rows > int.MaxValue || heads > int.MaxValue || d > int.MaxValue)
+                return false;
+            float[] hostCos = RegionInputFloats(cosAt) ?? cos.GetElementsAsFloat(checked((int)(rows * rot)));
+            float[] hostSin = RegionInputFloats(sinAt) ?? sinSigned.GetElementsAsFloat(checked((int)(rows * rot)));
+            if (hostCos.LongLength != rows * rot || hostSin.LongLength != rows * rot) return false;
+            HalfTables(hostCos, hostSin, rows, (int)rot);
+            // q or k normed and rotated [rows, heads, d]; null where a kernel declines (the region's ops run).
+            Tensor Prepared(Tensor x3, Tensor weight)
+            {
+                using Tensor x = x3.IsContiguous() ? x3.CopyRef() : Ops.NewContiguous(x3);
+                using Tensor flat = x.View(rows * heads, d);
+                var normed = new Tensor(Allocator, DType.Float32, rows, heads, d);
+                try
+                {
+                    bool done;
+                    using (Tensor normedFlat = normed.View(rows * heads, d))
+                        done = CudaKernelOps.TryRMSNorm(normedFlat, flat, weight, null, fp[0]);
+                    if (done && _ropeNeox)
+                        done = CudaKernelOps.TryNeoxRopeFlat(normed, _ropeCosHalf, _ropeSinHalf, (int)heads, (int)rows, (int)d, (int)(rot / 2));
+                    else if (done)
+                        RotateOnHost(normed, hostCos, hostSin, rows, heads, d, rot);
+                    if (done) return normed;
+                    normed.Dispose();
+                    return null;
+                }
+                catch { normed.Dispose(); throw; }
+            }
+            using Tensor qr = Prepared(q3, qNorm);
+            if (qr == null) return false;
+            using Tensor kr = Prepared(k3, kNorm);
+            if (kr == null || !TryDitAttention(new[] { qr, kr, v }, new[] { fp[1], fp[2] }, results)) return false;
+            DitRopesServedForTests++;
+            return true;
+        }
+
+        /// <summary>The device half tables of a NeoX rotary pair (see <see cref="TryTableRopeQkNormAttention"/>), made once a pair
+        /// of host arrays; <see cref="_ropeNeox"/> false where the halves differ.</summary>
+        private void HalfTables(float[] cos, float[] sinSigned, long rows, int rot)
+        {
+            if (ReferenceEquals(cos, _ropeCosKey) && ReferenceEquals(sinSigned, _ropeSinKey)) return;
+            _ropeCosHalf?.Dispose();
+            _ropeSinHalf?.Dispose();
+            (_ropeCosHalf, _ropeSinHalf, _ropeCosKey, _ropeSinKey) = (null, null, cos, sinSigned);
+            int half = rot / 2;
+            var c = new float[rows * half];
+            var sn = new float[rows * half];
+            bool neox = true;
+            for (long r = 0; r < rows && neox; r++)
+                for (int j = 0; j < half; j++)
+                {
+                    long a = r * rot + j, b = a + half;
+                    // cos repeats over the halves, and the signed sine is [-sin, sin] of one angle (bit for bit: -0 for +0).
+                    if (BitConverter.SingleToInt32Bits(cos[a]) != BitConverter.SingleToInt32Bits(cos[b])
+                        || BitConverter.SingleToInt32Bits(sinSigned[a]) != BitConverter.SingleToInt32Bits(-sinSigned[b]))
+                    {
+                        neox = false;
+                        break;
+                    }
+                    c[r * half + j] = cos[a];
+                    sn[r * half + j] = sinSigned[b];
+                }
+            _ropeNeox = neox;
+            if (!neox) return;
+            _ropeCosHalf = new Tensor(Allocator, DType.Float32, rows, half);
+            _ropeCosHalf.SetElementsAsFloat(c);
+            _ropeSinHalf = new Tensor(Allocator, DType.Float32, rows, half);
+            _ropeSinHalf.SetElementsAsFloat(sn);
+        }
+
+        /// <summary>The region ops' rotation on the host, for a table pair that is not NeoX: x * cos + [x2, x1] * sinSigned on
+        /// each head's first rot dims of x [rows, heads, d] (contiguous), in place.</summary>
+        private static void RotateOnHost(Tensor x, float[] cos, float[] sinSigned, long rows, long heads, long d, long rot)
+        {
+            float[] values = x.GetElementsAsFloat(checked((int)x.ElementCount()));
+            long half = rot / 2;
+            var rotated = new float[rot];
+            for (long r = 0; r < rows; r++)
+                for (long h = 0; h < heads; h++)
+                {
+                    long at = (r * heads + h) * d, table = r * rot;
+                    for (long i = 0; i < rot; i++)
+                    {
+                        float swapped = i < half ? values[at + i + half] : values[at + i - half];
+                        rotated[i] = values[at + i] * cos[table + i] + swapped * sinSigned[table + i];
+                    }
+                    Array.Copy(rotated, 0, values, at, rot);
+                }
+            x.SetElementsAsFloat(values);
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.AdaLnModulate"/> where the executor serves it (<see cref="TensorGraphExecutor.ServesDitModulation"/>)
+        /// as the retired direct CUDA DiT ran it: the RMS norm with its weight (one kernel), then each segment's rows
+        /// x (1 + scale) + shift in place (ts_wan_modulate_f32). False (the region's ops run) for any other layout.
+        /// </summary>
+        private bool TryAdaLnModulate(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            if (inputs.Length != 4 || ip == null || ip.Length < 2 || fp == null || fp.Length < 1 || results.Length < 1) return false;
+            Tensor w = inputs[1];
+            if (w == null || inputs[2] == null || w.ElementCount() == 0) return false;
+            long hidden = w.ElementCount();
+            using Tensor x = Rows2(inputs[0], hidden), mods = Rows2(inputs[2], hidden);
+            if (x == null || mods == null || !w.IsContiguous()) return false;
+            long rows = x.Sizes[0];
+            if (!TryRegionSegments(3, rows, mods.Sizes[0], Math.Max(ip[0], ip[1]), out var segments)) return false;
+            var y = new Tensor(Allocator, DType.Float32, rows, hidden);
+            try
+            {
+                if (!CudaKernelOps.TryRMSNorm(y, x, w, null, fp[0])) { y.Dispose(); return false; }
+                foreach (var (start, count, column) in segments)
+                {
+                    using Tensor shift = mods.Narrow(0, column + ip[0], 1), scale = mods.Narrow(0, column + ip[1], 1);
+                    if (!CudaWanOps.TryModulateRows(y, y, shift, scale, start, count)) { y.Dispose(); return false; }
+                }
+            }
+            catch { y.Dispose(); throw; }
+            results[0] = y;
+            DitModulationsServedForTests++;
+            return true;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.GatedResidual"/> without a bias or a delta where the executor serves it
+        /// (<see cref="TensorGraphExecutor.ServesDitModulation"/>), as the retired direct CUDA DiT ran it: the residual copied,
+        /// then each segment's rows += mm * gate in place (ts_wan_gate_add_f32). False (the region's ops run) for any other form.
+        /// </summary>
+        private bool TryGatedResidual(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            if (inputs.Length != 4 || ip == null || ip.Length < 1 || (ip.Length > 1 && ip[1] != 0) || (ip.Length > 2 && ip[2] != 0)
+                || results.Length < 1 || inputs[0] == null)
+                return false;
+            long hidden = inputs[0].Sizes[^1];
+            using Tensor residual = Rows2(inputs[0], hidden), mm = Rows2(inputs[1], hidden), mods = Rows2(inputs[2], hidden);
+            if (residual == null || mm == null || mods == null || mm.Sizes[0] != residual.Sizes[0]) return false;
+            long rows = residual.Sizes[0];
+            if (!TryRegionSegments(3, rows, mods.Sizes[0], ip[0], out var segments)) return false;
+            Tensor y = Ops.NewContiguous(residual);
+            try
+            {
+                foreach (var (start, count, column) in segments)
+                {
+                    using Tensor gate = mods.Narrow(0, column + ip[0], 1);
+                    if (!CudaWanOps.TryGateAddRows(y, mm, gate, start, count)) { y.Dispose(); return false; }
+                }
+            }
+            catch { y.Dispose(); throw; }
+            results[0] = y;
+            DitModulationsServedForTests++;
+            return true;
+        }
+
+        /// <summary>Score elements a chunk of query rows holds, over a group of heads, in <see cref="TryDitAttention"/> (256 MB of
+        /// F32: the retired direct DiT's per-head chunk).</summary>
+        private const long DitAttentionChunkScores = 64L << 20;
+
+        /// <summary>Heads <see cref="TryDitAttention"/> takes a batched product over at once on its F32 route; past 100 GFLOP
+        /// (the half-operand route) it takes one head at a time. Measured on the A40 against one head at a time: groups of eight
+        /// 1-2% faster a step at 1,768 tokens (F32 products), the same at 2,250 (half operands), where one head's scores are
+        /// 20 MB of scratch against eight heads' 162 MB.</summary>
+        private const int DitAttentionHeadGroup = 8;
+
+        /// <summary>
+        /// A diffusion transformer's full attention (<see cref="GraphFusion.DitAttention"/>) where the executor serves it
+        /// (<see cref="TensorGraphExecutor.ServesDitAttention"/>: MiniMax-H3's denoiser on direct CUDA) as batched GEMMs over
+        /// groups of heads (<see cref="DitAttentionHeadGroup"/>) in chunks of query rows, at most 64M scores a chunk: scale q k^T, the row softmax and its
+        /// product with v, all F32 (past 100 GFLOP the two products take IEEE-half operands, as the retired direct DiT's
+        /// long-sequence route did). The products read a group's heads where they lie in q, k and v (strided-batched cuBLAS:
+        /// a head's rows a row of heads apart) and write the result into the group's columns of the output, so the scratch is
+        /// the chunk's scores at any length. Copying each group head-major and the result back, as this did first, cost 0.3 s
+        /// a step at 2,250 tokens (an F32 copy kernel at a tenth of the device's bandwidth). The region's ops (F16 K and V,
+        /// then the generic attention) held every head's scores of the whole sequence at once: 0.7 GB at 1,768 tokens, 1.1 GB
+        /// at 2,250 (8% slower a step there than the retired DiT), and a 1280x768x107 clip's 35K tokens would need 274 GB.
+        /// The retired DiT's own route below 100 GFLOP, a scalar streaming kernel, took 0.9 s more a step at 1,768 tokens than
+        /// these products. The V scale and F16 narrowing of the region are the ggml flash path's headroom; F32 attention needs
+        /// neither.
+        /// </summary>
+        private bool TryDitAttention(Tensor[] inputs, float[] fp, Tensor[] results)
+        {
+            if (inputs.Length != 3 || fp == null || fp.Length < 1 || results.Length < 1) return false;
+            // [rows, heads, d] each, as a view (an operand may arrive with ggml's leading unit extent, and v as a view of the
+            // stacked qkv product: RegionReadsStridedInputs).
+            using Tensor q = Rows3(inputs[0]), k = Rows3(inputs[1]), v = Rows3(inputs[2]);
+            if (q == null || k == null || v == null
+                || q.Storage is not CudaStorage || k.Storage is not CudaStorage || v.Storage is not CudaStorage
+                || q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32)
+                return false;
+            long sq = q.Sizes[0], sk = k.Sizes[0], heads = q.Sizes[1], hd = q.Sizes[2];
+            if (k.Sizes[1] != heads || v.Sizes[1] != heads || k.Sizes[2] != hd || v.Sizes[2] != hd || v.Sizes[0] != sk
+                || sq <= 0 || sk <= 0 || heads <= 0 || Math.Min(heads, DitAttentionHeadGroup) * sk > DitAttentionChunkScores)
+                return false;
+            float scale = fp[0];
+            bool half = 4.0 * sq * sk * heads * hd > 100e9;
+            // result = alpha a b over the group: in place where cuBLAS reads the layouts, else on packed copies.
+            void Product(Tensor result, float alpha, Tensor a, Tensor b)
+            {
+                if (CudaBlas.TryAddmmBatchStrided(result, alpha, a, b, half ? CublasApi.CUBLAS_COMPUTE_32F_FAST_16F : CudaBlas.Unnamed))
+                    return;
+                using Tensor ac = a.IsContiguous() ? a.CopyRef() : Ops.NewContiguous(a);
+                using Tensor bc = b.IsContiguous() ? b.CopyRef() : Ops.NewContiguous(b);
+                using Tensor rc = result.IsContiguous() ? result.CopyRef() : new Tensor(Allocator, DType.Float32, result.Sizes);
+                if (!half || !CudaHalfOperandGemm.TryAddmmBatch(rc, 0f, rc, alpha, ac, bc)) Ops.AddmmBatch(rc, 0f, rc, alpha, ac, bc);
+                if (!ReferenceEquals(rc.Storage, result.Storage) || rc.StorageOffset != result.StorageOffset) Ops.Copy(result, rc);
+            }
+            var output = new Tensor(Allocator, DType.Float32, sq, heads * hd);
+            try
+            {
+                using Tensor rowsOut = output.View(sq, heads, hd);
+                long group = half ? 1 : DitAttentionHeadGroup;
+                for (long h0 = 0; h0 < heads; h0 += group)
+                {
+                    long g = Math.Min(group, heads - h0);
+                    // The group's heads: [group, rows, d] views (k as [group, d, keys]) and their columns of the output.
+                    using Tensor qGroup = q.Narrow(1, h0, g), kGroup = k.Narrow(1, h0, g), vGroup = v.Narrow(1, h0, g);
+                    using Tensor qh = qGroup.Permute(1, 0, 2), kt = kGroup.Permute(1, 2, 0), vh = vGroup.Permute(1, 0, 2);
+                    using Tensor outGroup = rowsOut.Narrow(1, h0, g);
+                    using Tensor outHeads = outGroup.Permute(1, 0, 2);
+                    long chunk = Math.Max(1, Math.Min(sq, DitAttentionChunkScores / (g * sk)));
+                    for (long q0 = 0; q0 < sq; q0 += chunk)
+                    {
+                        long n = Math.Min(chunk, sq - q0);
+                        using Tensor qc = qh.Narrow(1, q0, n), oc = outHeads.Narrow(1, q0, n);
+                        using var scores = new Tensor(Allocator, DType.Float32, g, n, sk);
+                        Product(scores, scale, qc, kt);
+                        Ops.Softmax(scores, scores);
+                        Product(oc, 1f, scores, vh);
+                    }
+                }
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            results[0] = output;
+            DitAttentionsServedForTests++;
             return true;
         }
 
@@ -4836,10 +5127,31 @@ namespace TensorSharp.Cuda
             return product;
         }
 
+        /// <summary>
+        /// A diffusion transformer's step whose products keep their activations in F32 (a program with both
+        /// <see cref="GraphProgram.FloatProducts"/> and <see cref="GraphProgram.WideTokenProducts"/>: MiniMax-H3's denoiser on
+        /// direct CUDA) takes the products the retired direct MiniMax-H3 DiT took (<see cref="CudaMiniMaxH3Ops.TryLinear"/>): a
+        /// block-format weight in bounded F32 bands (at most 64 MiB of it converted at a time) on a pedantic F32 cuBLAS GEMM,
+        /// BF16 weights on pedantic F32 too, F32 and F16 ones on the F32 GEMM (TF32 past 16M multiply-adds). The activations and
+        /// the result stay F32: no q8_1 or half rounding of the inputs. Null where that route does not take the product.
+        /// </summary>
+        private Tensor FloatDitProduct(IGraphWeight weight, Tensor x)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            if (weight.Ne2 > 1 || weight.Data == IntPtr.Zero || weight.CacheKey != weight.Data || CudaGraphCapture.IsCapturing(cuda)
+                || x.Storage is not CudaStorage || x.ElementType != DType.Float32 || !x.IsContiguous() || x.DimensionCount != 2)
+                return null;
+            var result = new Tensor(Allocator, DType.Float32, x.Sizes[0], weight.Ne1);
+            if (CudaMiniMaxH3Ops.TryLinear(result, x, weight.Data, weight.Format, weight.Ne0, weight.Ne1, weight.Bytes)) return result;
+            result.Dispose();
+            return null;
+        }
+
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
             if (_deferredNorms.Count > 0 && DeferredNormProduct(weight, x) is { } normedProduct) return normedProduct;
             ReadNow(x);
+            if (FloatProducts && WideTokenProducts && FloatDitProduct(weight, x) is { } ditProduct) return ditProduct;
             if (FloatProducts && FloatQ8Product(weight, x) is { } floatProduct) return floatProduct;
             var cuda = (CudaAllocator)Allocator;
             long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;

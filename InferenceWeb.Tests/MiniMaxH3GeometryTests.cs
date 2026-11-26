@@ -180,7 +180,7 @@ namespace InferenceWeb.Tests
 
             var frames = new List<TensorSharp.Models.QwenImage.RgbImage>();
             var atEnd = new List<bool>();
-            MiniMaxH3Pipeline.ResolveKeyframes(
+            MiniMaxH3Requests.ResolveKeyframes(
                 new VideoGenerationParams { Image = wide, EndImage = tall }, shape, frames, atEnd);
 
             Assert.Equal(2, frames.Count);
@@ -193,7 +193,7 @@ namespace InferenceWeb.Tests
 
             // An end frame on its own is still marked as the END of the timeline.
             frames.Clear(); atEnd.Clear();
-            MiniMaxH3Pipeline.ResolveKeyframes(
+            MiniMaxH3Requests.ResolveKeyframes(
                 new VideoGenerationParams { EndImage = tall }, shape, frames, atEnd);
             Assert.Single(frames);
             Assert.Equal(new[] { true }, atEnd);
@@ -568,7 +568,7 @@ namespace InferenceWeb.Tests
 
             // The pipeline's fit gives the lone last keyframe one end-pinned frame and nothing at the start.
             var frames = new List<TensorSharp.Models.QwenImage.RgbImage>(); var atEnd = new List<bool>();
-            MiniMaxH3Pipeline.ResolveKeyframes(null, new(64, 40, new float[64 * 40 * 3]), shape, frames, atEnd, unsetCanvas: null);
+            MiniMaxH3Requests.ResolveKeyframes(null, new(64, 40, new float[64 * 40 * 3]), shape, frames, atEnd, unsetCanvas: null);
             Assert.Equal((shape.Width, shape.Height), (Assert.Single(frames).Width, frames[0].Height));
             Assert.Equal(new[] { true }, atEnd);
         }
@@ -831,7 +831,7 @@ namespace InferenceWeb.Tests
             // Regression: the default used to be 256x256, which is far too small for
             // faces to hold together — the Web UI sends no size, so every clip came
             // back blurry with no way for the user to tell why.
-            var (w, h) = MiniMaxH3Pipeline.ResolveCanvas(new VideoGenerationParams(), MiniMaxH3Mode.TextToVideo);
+            var (w, h) = MiniMaxH3Requests.ResolveCanvas(new VideoGenerationParams(), MiniMaxH3Mode.TextToVideo);
             Assert.Equal(640, w);
             Assert.Equal(384, h);
         }
@@ -842,12 +842,12 @@ namespace InferenceWeb.Tests
             // "Animate this photo" should not letterbox or stretch the photo it is
             // meant to become. The compact host policy keeps 640x384's area.
             var compact = VideoCanvasPolicy.CompactPreview;
-            var (w, h) = MiniMaxH3Pipeline.ResolveCanvas(
+            var (w, h) = MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { Image = Img(1024, 768), CanvasPolicy = compact }, MiniMaxH3Mode.ImageToVideo);
             Assert.InRange(w / (double)h, 1.30, 1.37);          // 4:3 preserved
             Assert.InRange((long)w * h, 640L * 384 / 2, 640L * 384 * 2);
 
-            var (pw, ph) = MiniMaxH3Pipeline.ResolveCanvas(
+            var (pw, ph) = MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { Image = Img(768, 1024), CanvasPolicy = compact }, MiniMaxH3Mode.ImageToVideo);
             Assert.InRange(pw / (double)ph, 0.72, 0.78);        // 3:4 preserved
         }
@@ -904,28 +904,28 @@ namespace InferenceWeb.Tests
             // and the portrait LAST frame is cropped into it rather than steering it.
             var first = Img(1253 / 4, 836 / 4);
             var last = Img(3808 / 32, 5712 / 32);
-            Assert.Equal((1152, 768), MiniMaxH3Pipeline.ResolveCanvas(
+            Assert.Equal((1152, 768), MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { Image = first, EndImage = last }, MiniMaxH3Mode.FirstLastFrame));
-            Assert.Equal((1152, 768), MiniMaxH3Pipeline.ResolveCanvas(
+            Assert.Equal((1152, 768), MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams(), MiniMaxH3Mode.FirstLastFrame, first, last));
-            Assert.Equal((768, 1152), MiniMaxH3Pipeline.ResolveCanvas(
+            Assert.Equal((768, 1152), MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { EndImage = last }, MiniMaxH3Mode.FirstLastFrame));
-            Assert.Equal((1152, 768), MiniMaxH3Pipeline.ResolveCanvas(
+            Assert.Equal((1152, 768), MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { Image = first }, MiniMaxH3Mode.ImageToVideo));
         }
 
         [Fact]
         public void TextToVideoAndReferencesKeepTheCompactCanvasUnderTheRecipePolicy()
         {
-            Assert.Equal((640, 384), MiniMaxH3Pipeline.ResolveCanvas(new VideoGenerationParams(), MiniMaxH3Mode.TextToVideo));
-            Assert.Equal((640, 384), MiniMaxH3Pipeline.ResolveCanvas(
+            Assert.Equal((640, 384), MiniMaxH3Requests.ResolveCanvas(new VideoGenerationParams(), MiniMaxH3Mode.TextToVideo));
+            Assert.Equal((640, 384), MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { ReferenceImagePaths = new List<string> { "unused.png" } }, MiniMaxH3Mode.Reference));
         }
 
         [Fact]
         public void ExplicitSizeAlwaysWins()
         {
-            var (w, h) = MiniMaxH3Pipeline.ResolveCanvas(
+            var (w, h) = MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { Width = 832, Height = 480, Image = Img(1024, 768) }, MiniMaxH3Mode.ImageToVideo);
             Assert.Equal(832, w);
             Assert.Equal(480, h);
@@ -934,12 +934,12 @@ namespace InferenceWeb.Tests
         [Fact]
         public void OneGivenDimensionTakesTheOtherFromTheImage()
         {
-            var (w, h) = MiniMaxH3Pipeline.ResolveCanvas(
+            var (w, h) = MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { Width = 800, Image = Img(1024, 768) }, MiniMaxH3Mode.ImageToVideo);
             Assert.Equal(800, w);
             Assert.InRange(h, 590, 610);                        // 800 / (4/3)
 
-            var (w2, h2) = MiniMaxH3Pipeline.ResolveCanvas(
+            var (w2, h2) = MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { Height = 600, Image = Img(1024, 768) }, MiniMaxH3Mode.ImageToVideo);
             Assert.Equal(600, h2);
             Assert.InRange(w2, 790, 810);
@@ -948,7 +948,7 @@ namespace InferenceWeb.Tests
         [Fact]
         public void EndImageAloneStillSetsTheAspect()
         {
-            var (w, h) = MiniMaxH3Pipeline.ResolveCanvas(
+            var (w, h) = MiniMaxH3Requests.ResolveCanvas(
                 new VideoGenerationParams { EndImage = Img(1920, 1080) }, MiniMaxH3Mode.FirstLastFrame);
             Assert.InRange(w / (double)h, 1.72, 1.82);          // 16:9
         }
@@ -958,7 +958,7 @@ namespace InferenceWeb.Tests
         {
             // The reported run: a 3808x5712 portrait as the LAST keyframe on a forced 640x384 canvas, where an
             // unset size would have followed the 3:2 first keyframe to 1152x768.
-            var lines = MiniMaxH3Pipeline.DescribeKeyframeFit("last", 3808, 5712, 640, 384, anchor: false, unsetCanvas: (1152, 768));
+            var lines = MiniMaxH3Requests.DescribeKeyframeFit("last", 3808, 5712, 640, 384, anchor: false, unsetCanvas: (1152, 768));
             Assert.Equal(2, lines.Count);
             Assert.Contains("middle 40% of its height", lines[0]);
             Assert.DoesNotContain("Leave the size unset", lines[0]); // the last keyframe would be cropped either way
@@ -967,12 +967,12 @@ namespace InferenceWeb.Tests
             Assert.Contains("Leave the size unset for 1152x768", lines[1]);
 
             // On the recipe canvas the same photo is still cropped, but no longer starved of pixels.
-            var recipe = MiniMaxH3Pipeline.DescribeKeyframeFit("last", 3808, 5712, 1152, 768, anchor: false, unsetCanvas: null);
+            var recipe = MiniMaxH3Requests.DescribeKeyframeFit("last", 3808, 5712, 1152, 768, anchor: false, unsetCanvas: null);
             Assert.Contains("middle 44% of its height", Assert.Single(recipe));
-            Assert.Empty(MiniMaxH3Pipeline.DescribeKeyframeFit("first", 1253, 836, 1152, 768, anchor: true, unsetCanvas: null));
+            Assert.Empty(MiniMaxH3Requests.DescribeKeyframeFit("first", 1253, 836, 1152, 768, anchor: true, unsetCanvas: null));
             // A 16:9 last keyframe on a square first keyframe's 768x768 recipe canvas is scaled exactly as far as
             // its own 1344x768 recipe would scale it: cropped, but not reported as losing detail.
-            Assert.Single(MiniMaxH3Pipeline.DescribeKeyframeFit("last", 1920, 1080, 768, 768, anchor: false, unsetCanvas: null));
+            Assert.Single(MiniMaxH3Requests.DescribeKeyframeFit("last", 1920, 1080, 768, 768, anchor: false, unsetCanvas: null));
         }
 
         private static MiniMaxH3ModulationSpan FindSpanCovering(MiniMaxH3PackedLayout layout, int token)

@@ -224,6 +224,10 @@ namespace TensorSharp.Models.SharedDiffusion
         public required DiffusionLayout Layout { get; init; }
         public required StepState Step { get; init; }
         public required SamplingRecipe Recipe { get; init; }
+
+        /// <summary>The further named streams the denoiser reads beside <see cref="Latent"/> (MiniMax-H3 video's audio), in the
+        /// form the denoiser takes them; null for none.</summary>
+        public IReadOnlyDictionary<string, float[]> Streams { get; init; }
     }
 
     /// <summary>A denoiser step's prediction: the target rows' flow velocity, and any further named streams (MiniMax-H3

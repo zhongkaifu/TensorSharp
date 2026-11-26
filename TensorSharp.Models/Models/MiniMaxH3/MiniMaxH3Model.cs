@@ -19,16 +19,23 @@
 // LoRA plug-ins (--lora / TS_LORAS) are minimax-h3-lora configs: the LightX2V Turbo
 // step-distillation adapters for the FL2VA checkpoint, applied unmerged, which also
 // lock the sampling recipe they were distilled on (MiniMaxH3LoraConfig).
+//
+// A clip runs on the diffusion runtime's video pipeline (SharedDiffusion/DiffusionVideoPipeline)
+// with the MiniMax-H3 family's hooks (MiniMaxH3Family): the denoiser's steps are graph programs
+// (MiniMaxH3Denoiser) that the GGML graph executor runs on ggml_cuda / ggml_metal / ggml_cpu and
+// the tensor executors run on cpu / cuda / mlx.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
 using TensorSharp.MLX;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.MiniMaxH3
 {
@@ -53,7 +60,10 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly string _tePath;
         private readonly string _vaePath;
         private readonly string _audioVaePath;
-        private MiniMaxH3Pipeline _pipeline;
+        private DiffusionVideoPipeline _pipeline;
+
+        /// <summary>The audio VAE's role among the diffusion load's files.</summary>
+        internal const string AudioVaeRole = "audio-vae";
 
         // One clip at a time, and never across a plug-in swap or an unload: GenerateVideo,
         // SetLoras and Dispose all hold it. Lock order is GpuComputeLock (the hosts'), then
@@ -204,8 +214,12 @@ namespace TensorSharp.Models.MiniMaxH3
         public bool AcceptsLora(LoraSpec spec) =>
             LoraCliFlags.DeclaredPluginType(spec) == LoraCliFlags.MiniMaxH3PluginType;
 
-        /// <summary>The loaded plug-in, or null; the pipeline applies it to every step.</summary>
+        /// <summary>The loaded plug-in, or null; the denoiser applies it to every step.</summary>
         internal MiniMaxH3LoraSet Loras { get; private set; }
+
+        /// <summary>The plug-in a clip on <paramref name="partition"/>'s checkpoint runs with: the loaded one when it was written
+        /// for that checkpoint, else none.</summary>
+        internal MiniMaxH3LoraSet LoraFor(MiniMaxH3Partition partition) => Loras?.Partition == partition ? Loras : null;
 
         /// <summary>The recipe the loaded plug-in locks (steps, linspace grid, shifts, Euler,
         /// CFG 1), or null when clips sample with the base checkpoint's own schedule.</summary>
@@ -244,7 +258,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (resolved.Count > 0)
                 {
                     var timer = Stopwatch.StartNew();
-                    loaded = MiniMaxH3LoraSet.Load(resolved, DitConfig, Partition, Backend, UsesDirectBackend);
+                    loaded = MiniMaxH3LoraSet.Load(resolved, DitConfig, Partition, Backend, tensorExecutor: UsesDirectBackend);
                     try
                     {
                         LoraLoadedHookForTest?.Invoke(loaded);
@@ -269,7 +283,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 LoraSpecs = resolved;
                 if (!ReferenceEquals(previous, loaded))
                 {
-                    _pipeline?.ReleaseLora();
+                    (_pipeline?.LoadedDenoiser as MiniMaxH3Denoiser)?.ReleaseLora();
                     previous?.Dispose();
                 }
             }
@@ -304,11 +318,6 @@ namespace TensorSharp.Models.MiniMaxH3
             }
             return null;
         }
-
-        internal MiniMaxH3TextEncoder CreateTextEncoder() => new(_tePath, null, Backend, _allocator);
-        internal MiniMaxH3DiT CreateDiT() => new(_ditPath, Backend, _allocator);
-        internal MiniMaxH3DiT CreateDiT(MiniMaxH3Partition partition) => new(DenoiserPathFor(partition), Backend, _allocator);
-        internal MiniMaxH3VideoVae CreateVideoVae() => new(_vaePath, Backend, _allocator);
 
         /// <summary>Whether this installation has the denoiser for a generation mode.</summary>
         public bool SupportsPartition(MiniMaxH3Partition partition) =>
@@ -366,12 +375,9 @@ namespace TensorSharp.Models.MiniMaxH3
                 // 66.6 s). Linux model storage is often a network volume that needs concurrency
                 // instead (an A40 pod's: 0.31 GiB/s for one 8 MiB reader, 2.3 GiB/s for sixteen),
                 // so there sixteen readers take consecutive chunks of ONE sweep, staying near the
-                // same position, and skip chunks that are already cached. TS_H3_PREFAULT_THREADS
-                // overrides the reader count.
-                string tenv = Environment.GetEnvironmentVariable("TS_H3_PREFAULT_THREADS");
-                int? threads = !string.IsNullOrEmpty(tenv) && int.TryParse(tenv, out int tset) && tset > 0 ? tset : null;
+                // same position, and skip chunks that are already cached.
                 using var read = Video.MappedFileReadAhead.TryStart(path, Video.MappedFileReadAhead.WholeFile(path),
-                    windowBytes: long.MaxValue, workers: threads, honorSwitch: false);
+                    windowBytes: long.MaxValue, workers: null, honorSwitch: false);
                 if (read == null) return -1;
                 read.Wait();
                 return sw.Elapsed.TotalSeconds;
@@ -380,60 +386,8 @@ namespace TensorSharp.Models.MiniMaxH3
             catch (UnauthorizedAccessException) { return -1; }
         }
 
-        /// <summary>The denoiser GGUF, for prefaulting.</summary>
-        internal string DiTPath => _ditPath;
-
-        /// <summary>The text-encoder GGUF, for reading ahead.</summary>
-        internal string TextEncoderPath => _tePath;
-
-        /// <summary>The video VAE file, for prefaulting.</summary>
-        internal string VideoVaePath => _vaePath;
-
-        /// <summary>Roughly what the video VAE will occupy on the device once resident, used
-        /// to decide whether it can share the card with the still-resident denoiser.
-        ///
-        /// <para>The safetensors file size is the weight footprint almost exactly - the VAE is
-        /// dense F16 with no quantized block overhead - and the extra eighth covers the decode's
-        /// own activations, which are bounded because the decoder already runs 5 latent frames
-        /// at a time and tiles at 256 px. Returns 0 when the size cannot be read, which the
-        /// caller treats as "do not intervene".</para></summary>
-        internal long VideoVaeResidentBytesEstimate()
-        {
-            try
-            {
-                if (string.IsNullOrEmpty(_vaePath)) return 0;
-                var fi = new FileInfo(_vaePath);
-                if (!fi.Exists) return 0;
-                return fi.Length + fi.Length / 8;
-            }
-            catch (IOException) { return 0; }
-            catch (UnauthorizedAccessException) { return 0; }
-        }
-
-        /// <summary>Roughly what the text encoder occupies on the device while it runs, used
-        /// to decide whether the networks kept from the previous request can stay beside it.
-        ///
-        /// <para>The GGUF is uploaded as it is stored, and the encode's own activations are
-        /// small beside it, so the file size is the estimate. Returns 0 when the size cannot
-        /// be read, which the caller treats as "do not intervene".</para></summary>
-        internal long TextEncoderResidentBytesEstimate()
-        {
-            try
-            {
-                if (string.IsNullOrEmpty(_tePath)) return 0;
-                var fi = new FileInfo(_tePath);
-                return fi.Exists ? fi.Length : 0;
-            }
-            catch (IOException) { return 0; }
-            catch (UnauthorizedAccessException) { return 0; }
-        }
-
-        internal MiniMaxH3AudioVae CreateAudioVae() =>
-            _audioVaePath != null
-                ? new MiniMaxH3AudioVae(_audioVaePath, Backend, UsesDirectBackend, _allocator)
-                : null;
-        /// <summary>True on the backends with no ggml graph to call, which run the
-        /// generator through the managed direct implementations instead.</summary>
+        /// <summary>True on the backends with no ggml graph to call: their denoiser steps run on a tensor executor, and
+        /// the encoders and VAEs on the managed direct implementations.</summary>
         internal bool UsesDirectBackend =>
             _allocator != null && Backend is not (BackendType.GgmlCuda or BackendType.GgmlCpu
                 or BackendType.GgmlMetal or BackendType.GgmlVulkan);
@@ -451,9 +405,87 @@ namespace TensorSharp.Models.MiniMaxH3
             lock (_generationLock)
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(MiniMaxH3Model));
-                _pipeline ??= new MiniMaxH3Pipeline(this);
-                return _pipeline.Generate(prompt, p ?? new VideoGenerationParams());
+                p ??= new VideoGenerationParams();
+                _pipeline ??= new DiffusionVideoPipeline(new MiniMaxH3Family(this), Load());
+                long seed = p.Seed >= 0 ? p.Seed : Random.Shared.NextInt64() & 0x7fffffff;
+                var clock = Stopwatch.StartNew();
+                MiniMaxH3Partition partition = PartitionFor(p);
+                DiffusionVideoResult result = _pipeline.Run(new DiffusionVideoRequest
+                {
+                    Prompt = prompt ?? string.Empty,
+                    Seed = seed,
+                    Adapters = LoraFor(partition)?.AdapterSet ?? AdapterSet.Empty,
+                    DecodeAudio = p.GenerateAudio,
+                    FamilyRequest = p,
+                    Progress = progress => Report(p, progress, clock),
+                });
+                // The decoders' reuse gallocr and scratch are of no use to the next request, which starts with the largest upload.
+                if (Backend == BackendType.GgmlCuda)
+                    RunWhileOtherGgmlModelsAreIdle(TensorSharp.GGML.GgmlBasicOps.ReleaseReuseComputeBuffers);
+                Report(p, new DiffusionVideoProgress(DiffusionPhase.Composite, result.Job.Steps, result.Job.Steps), clock);
+                return new GeneratedVideo
+                {
+                    Frames = result.Frames,
+                    Fps = ((MiniMaxH3Job)result.Job).Shape.Fps,
+                    Seed = seed,
+                    Audio = result.Audio == null ? null : new GeneratedVideoAudio { Channels = result.Audio, SampleRate = result.AudioSampleRate },
+                };
             }
+        }
+
+        /// <summary>The runtime's load: the denoisers, the text encoder and the VAEs this model resolved.</summary>
+        private DiffusionLoad Load()
+        {
+            var files = new Dictionary<string, string>
+            {
+                [DiffusionLoad.Denoiser] = _ditPath,
+                [DiffusionLoad.TextEncoder] = _tePath,
+                [DiffusionLoad.Vae] = _vaePath,
+            };
+            if (_audioVaePath != null) files[AudioVaeRole] = _audioVaePath;
+            return new DiffusionLoad { Backend = Backend, Files = files };
+        }
+
+        /// <summary>A runtime report as the hosts' progress: "text-encode" (with the encoder, the denoiser's load and the
+        /// keyframe or reference encodes as its stages), "denoise" per step, "vae-decode" (its stages and tiles),
+        /// "audio-decode" and "done", as the hosts and telemetry have always read them.</summary>
+        private static void Report(VideoGenerationParams p, DiffusionVideoProgress progress, Stopwatch clock)
+        {
+            if (progress.IsStep) p.OnStep?.Invoke(progress.Step, progress.Total);
+            if (p.OnProgress == null) return;
+            string phase = progress.Phase switch
+            {
+                DiffusionPhase.Prepare => null,
+                DiffusionPhase.Condition => "text-encode",
+                DiffusionPhase.EncodeReferences => "text-encode",
+                DiffusionPhase.EncodeAudio => "text-encode",
+                DiffusionPhase.Denoise => "denoise",
+                DiffusionPhase.Decode => "vae-decode",
+                DiffusionPhase.DecodeAudio => "audio-decode",
+                DiffusionPhase.Composite => "done",
+                _ => null,
+            };
+            if (phase == null) return;
+            // The steps a phase reports are the steps finished: none before the loop, all of them after it.
+            int step = progress.Phase switch
+            {
+                DiffusionPhase.Denoise => progress.Step,
+                DiffusionPhase.Decode or DiffusionPhase.DecodeAudio
+                    or DiffusionPhase.Composite => progress.Total,
+                _ => 0,
+            };
+            double elapsed = clock.Elapsed.TotalSeconds;
+            p.OnProgress(new VideoGenerationProgress
+            {
+                Phase = phase,
+                Step = step,
+                TotalSteps = progress.Total,
+                Detail = progress.Detail,
+                ElapsedSeconds = elapsed,
+                EtaSeconds = step > 0 && step < progress.Total ? elapsed / step * (progress.Total - step) : -1,
+                Stage = progress.Stage,
+                Attributes = progress.Attributes,
+            });
         }
 
         // ---- IVideoGenerationModel ----
@@ -482,7 +514,7 @@ namespace TensorSharp.Models.MiniMaxH3
         public override void WarmUpKernels() { }
 
         // The pipeline keeps the denoiser and both VAEs between requests, each holding
-        // pinned arrays, its own file mapping and the device wraps of its weights.
+        // pinned arrays, its own file mapping and the device copies of its weights.
         // Without this every unload leaked them, and the Metal wraps still registered
         // with the device are what ggml-metal asserts on at process exit. The LoRA set
         // goes after the pipeline, whose denoiser may still hold its device copies.

@@ -76,7 +76,7 @@ public sealed class MiniMaxH3TurboRealAdapterTests
     private static MiniMaxH3LoraSet Load(string manifest, BackendType backend, bool direct, MiniMaxH3Config cfg,
         MiniMaxH3Partition partition = MiniMaxH3Partition.FirstLastFrame) =>
         // TensorAgent's form: the weights, with the shipped config as --lora-config (the tie is checked).
-        MiniMaxH3LoraSet.Load(new[] { new LoraSpec(WeightsOf(manifest), null, Shipped(manifest)) }, cfg, partition, backend, direct);
+        MiniMaxH3LoraSet.Load(new[] { new LoraSpec(WeightsOf(manifest), null, Shipped(manifest)) }, cfg, partition, backend, tensorExecutor: direct);
 
     // ---- the ComfyUI reference rows -------------------------------------------------------------
 
@@ -258,21 +258,21 @@ public sealed class MiniMaxH3TurboRealAdapterTests
             _output.WriteLine($"{backend}: packed in {clock.Elapsed.TotalSeconds:F1} s; {set.Summary}");
             Assert.Equal(parameters * elem, set.FactorBytes);
 
-            var adapter = Marshal.PtrToStructure<H3DitAdapter>(set.NativeAdapter);
+            var targets = new[] { MiniMaxH3LoraTarget.Q, MiniMaxH3LoraTarget.K, MiniMaxH3LoraTarget.V,
+                MiniMaxH3LoraTarget.Out, MiniMaxH3LoraTarget.Fc1, MiniMaxH3LoraTarget.Fc2 };
             for (int b = 0; b < 52; b++)
             {
                 bool refiner = b < 2;
-                var block = Marshal.PtrToStructure<H3BlockLora>((refiner ? adapter.Refiner : adapter.Blocks) +
-                    (refiner ? b : b - 2) * Marshal.SizeOf<H3BlockLora>());
-                foreach (var l in new[] { block.Q, block.K, block.V, block.Out, block.Fc1, block.Fc2 })
+                foreach (var target in targets)
                 {
-                    Assert.Equal(type, l.Type);
+                    var l = set.PartFor(refiner, refiner ? b : b - 2, target);
+                    Assert.Equal(type, l.Format);
                     Assert.Equal(Rank, l.Rank);
                 }
             }
 
-            // The balanced, packed factors apply the same update as the exact direct ones.
-            var fc1 = Marshal.PtrToStructure<H3BlockLora>(adapter.Blocks + Block * Marshal.SizeOf<H3BlockLora>()).Fc1;
+            // The balanced, packed factors apply the same update as the exact ones.
+            var fc1 = set.PartFor(false, Block, MiniMaxH3LoraTarget.Fc1);
             float[] actual = DeltaRow(Read(fc1.Up, Rank, type), Read(fc1.Down, Rank * fc1.In, type), Rank, fc1.In, row: 0);
             float max = expected.Max(v => Math.Abs(v));
             for (int i = 0; i < expected.Length; i++)

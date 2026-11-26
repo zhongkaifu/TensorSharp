@@ -961,9 +961,8 @@ which with capture on can hold prompts (§10.5); and Studio's `job.json`, which 
 ### 7.8 Console output is not exported
 
 Only `ILogger` output reaches the OpenTelemetry pipeline. These go to `Console.WriteLine` and stay there: MiniMax-H3's
-`[h3]` timings (always the text-conditioning, denoiser-load and first-step times; the per-stage split with
-`TS_H3_PHASE=1`; latent statistics with `TS_H3_TRACE=1`); LTX's `[ltx25]`, `[ltx25-timing]` and `[ltx25-conditioning]`;
-Wan's `[wan-timing]`; the diffusion runtime's `[diffusion]` step and timing lines (Qwen-Image-2.1, MiniMax-H3-Image) and Qwen-Image-2.1's `[qwen21]` notes; `TS_SCHED_STEP_LOG` step lines; the MP4 export
+`[h3]` notes (the text-conditioning and first-step times, the keyframe and reference encodes); LTX's `[ltx25]`, `[ltx25-timing]` and `[ltx25-conditioning]`;
+Wan's `[wan-timing]`; the diffusion runtime's `[diffusion]` step and timing lines (Qwen-Image-2.1, MiniMax-H3-Image, MiniMax-H3) and Qwen-Image-2.1's `[qwen21]` notes; `TS_SCHED_STEP_LOG` step lines; the MP4 export
 fallbacks and FFmpeg failures; and the once-per-architecture template, parser and grammar warnings. Video spans and
 stage attributes replace the video timings as the exported record. The warnings are not converted (§13).
 
@@ -1033,13 +1032,12 @@ POST /api/video-generate/stream        server span (minutes long)
    ├─ lora.apply                       only when the request chose plug-ins (Studio jobs): tensorsharp.lora.count
    ├─ text-encode
    │  ├─ text-encoder                  tensorsharp.video.open_s, .run_s, .teardown_s
-   │  ├─ prefault-wait                 only in TS_H3_PREFAULT modes 1-2 (the default is 3)
    │  ├─ dit-load                      tensorsharp.video.cached
    │  ├─ image-encode                  i2v, first/last frame
    │  └─ reference-encode              Ref2VA
    ├─ denoise                          one "step" event per finished step
    ├─ vae-decode
-   │  ├─ denoiser-release              tensorsharp.video.release_reason = metal | vram; only when something is released
+   │  ├─ denoiser-release              tensorsharp.video.release_reason = metal | vram; only when the denoiser is released
    │  ├─ vae-open                      tensorsharp.video.cached
    │  └─ vae-decode                    tensorsharp.video.tiles; Detail "tile i/N"
    ├─ audio-decode
@@ -1050,16 +1048,17 @@ H3 sends nothing between its `text-encode` and `denoise` reports, so before stag
 prefault wait, the DiT build and the keyframe encodes all counted as text encoding, and the first clip's `text-encode`
 included the DiT load while later clips' did not. The stages now separate them. What they mean:
 
-- `dit-load cached=true` means the DiT object was reused (the partition did not change), not that its weights are still
-  on the device. Creating the DiT only maps the file; weights upload inside the first denoising forward, and again after
-  any `ReleaseDeviceResidency` (before every text encode on Metal; after denoising on CUDA when the VAE would not fit).
+- `dit-load cached=true` means the denoiser object was reused (the partition did not change), not that its weights are
+  still on the device. Creating the denoiser only maps the file; weights upload inside the first denoising step, and again
+  after a release (after every denoise on Metal; on CUDA when the residency plan finds the VAE would not fit beside it).
   That cost shows in the first denoise step.
-- `prefault-wait` exists only in modes 1–2. In the default mode 3 the read-ahead overlaps the first step's upload and is
-  joined after the loop, inside `denoise`.
-- `teardown_s` is the remainder `TS_H3_PHASE` prints, so it includes the vision-tower encodes and tokenization that run
-  between the open and the trunk.
-- `denoiser-release` happens on Metal always and on CUDA only when the spare VRAM is below the VAE estimate. It drops
-  residency only.
+- `prefault-wait` is no longer reported: on the diffusion runtime the denoiser file's read-ahead always overlaps the first
+  step's upload (the retired pipeline's mode 3) and is joined inside `denoise`. (`TS_H3_PREFAULT`, which selected the
+  modes that waited, was removed with that pipeline.)
+- `teardown_s` is the text encoder's time outside its open and its trunk, so it includes the vision-tower encodes and
+  tokenization that run between them.
+- `denoiser-release` happens on Metal always (`metal`: the denoiser releases after its phase) and on CUDA only when the
+  residency plan finds the spare VRAM below the decode's need (`vram`). It drops residency only.
 - `vae-open cached=true` (kept from an earlier clip or created for a keyframe encode) is close to free; the VAE's
   weights upload inside the decode either way.
 

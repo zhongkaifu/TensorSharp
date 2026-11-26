@@ -593,7 +593,7 @@ public sealed class VideoTelemetryTests : IDisposable
             Attributes = attributes, Heartbeat = heartbeat,
         };
 
-    /// <summary>The reports MiniMaxH3Pipeline makes, stage for stage.</summary>
+    /// <summary>The reports a MiniMax-H3 clip makes on the diffusion runtime's video pipeline, stage for stage.</summary>
     private static List<ScriptItem> MiniMaxScript(int steps, bool ditCached)
     {
         var reports = new List<VideoGenerationProgress>

@@ -339,7 +339,7 @@ selection and words). In TensorAgent:
   layer, with no audio stream. On `ggml_cuda` the modulations, gated residuals,
   attention (cuDNN) and the BF16 SwiGLU-in-GEMM run as fused stages and the wide
   products on cuBLAS (or int8); elsewhere the same program runs ggml's own kernels.
-  The program is the graph MiniMax-H3's native DiT builds, node for node, so the
+  The program is the graph MiniMax-H3's retired native DiT built, node for node, so the
   velocities are the same bit for bit.
 - **VAE.** The image decoder (24 blocks of 1024, 16 heads, RoPE over (h, w) on half of
   each head, 16x16 RGB patches) on 256-pixel tiles overlapping by at least 64 pixels,

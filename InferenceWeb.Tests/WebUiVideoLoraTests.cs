@@ -635,7 +635,7 @@ public sealed class WebUiVideoLoraTests : IDisposable
                 if (_set != null)
                     _set.Recipe.Validate(p ?? new VideoGenerationParams());
                 else
-                    MiniMaxH3Pipeline.ValidateSamplingParameters(p ?? new VideoGenerationParams());
+                    MiniMaxH3Requests.ValidateSamplingParameters(p ?? new VideoGenerationParams());
                 throw new NotSupportedException(Reached);
             }
             finally

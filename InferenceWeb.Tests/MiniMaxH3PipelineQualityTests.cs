@@ -16,10 +16,10 @@ public class MiniMaxH3PipelineQualityTests
     {
         var references = new[]
         {
-            new MiniMaxH3Pipeline.MiniMaxH3Reference { Kind = MiniMaxH3ReferenceKind.Audio },
-            new MiniMaxH3Pipeline.MiniMaxH3Reference { Kind = MiniMaxH3ReferenceKind.Audio },
+            new MiniMaxH3Requests.MiniMaxH3Reference { Kind = MiniMaxH3ReferenceKind.Audio },
+            new MiniMaxH3Requests.MiniMaxH3Reference { Kind = MiniMaxH3ReferenceKind.Audio },
         };
-        MiniMaxH3Pipeline.RequireReferenceVision(false, references);
+        MiniMaxH3Requests.RequireReferenceVision(false, references);
     }
 
     [Theory]
@@ -30,13 +30,13 @@ public class MiniMaxH3PipelineQualityTests
     {
         var references = new[]
         {
-            new MiniMaxH3Pipeline.MiniMaxH3Reference { Kind = MiniMaxH3ReferenceKind.Audio },
-            new MiniMaxH3Pipeline.MiniMaxH3Reference { Kind = visualKind },
+            new MiniMaxH3Requests.MiniMaxH3Reference { Kind = MiniMaxH3ReferenceKind.Audio },
+            new MiniMaxH3Requests.MiniMaxH3Reference { Kind = visualKind },
         };
         var error = Assert.Throws<InvalidOperationException>(() =>
-            MiniMaxH3Pipeline.RequireReferenceVision(false, references));
+            MiniMaxH3Requests.RequireReferenceVision(false, references));
         Assert.Contains("vision tower", error.Message);
-        MiniMaxH3Pipeline.RequireReferenceVision(true, references);
+        MiniMaxH3Requests.RequireReferenceVision(true, references);
     }
 
     [Theory]
@@ -47,7 +47,7 @@ public class MiniMaxH3PipelineQualityTests
     {
         var pixels = new[] { 0.25f, invalid, 0.75f };
         var error = Assert.Throws<InvalidOperationException>(() =>
-            MiniMaxH3Pipeline.RequireFiniteOutput(pixels, "video VAE output"));
+            MiniMaxH3Requests.RequireFiniteOutput(pixels, "video VAE output"));
         Assert.Contains("video VAE output", error.Message);
         Assert.Contains("element 1", error.Message);
     }
@@ -57,7 +57,7 @@ public class MiniMaxH3PipelineQualityTests
     {
         var pixels = new[] { 0f, float.PositiveInfinity, float.NegativeInfinity };
         Assert.Throws<InvalidOperationException>(() =>
-            MiniMaxH3Pipeline.RequireFiniteOutput(pixels, "video VAE output"));
+            MiniMaxH3Requests.RequireFiniteOutput(pixels, "video VAE output"));
         MiniMaxH3VideoVae.ToRgb(pixels, frames: 1, height: 1, width: 1);
         Assert.All(pixels, value => Assert.True(float.IsFinite(value)));
         Assert.Equal(1f, pixels[1]);
@@ -69,10 +69,10 @@ public class MiniMaxH3PipelineQualityTests
     {
         var latent = new[] { float.MaxValue };
         var velocity = new[] { -float.MaxValue };
-        MiniMaxH3Pipeline.RequireFinite(velocity, "video velocity", 7, 8, 118);
+        MiniMaxH3Requests.RequireFinite(velocity, "video velocity", 7, 8, 118);
         MiniMaxH3Scheduler.EulerStep(latent, velocity, 1f, 0f);
         var error = Assert.Throws<InvalidOperationException>(() =>
-            MiniMaxH3Pipeline.RequireFinite(latent, "video latent", 7, 8, 118));
+            MiniMaxH3Requests.RequireFinite(latent, "video latent", 7, 8, 118));
         Assert.Contains("video latent", error.Message);
         Assert.Contains("step 8/8", error.Message);
     }
@@ -80,8 +80,8 @@ public class MiniMaxH3PipelineQualityTests
     [Fact]
     public void FiniteDecoderValuesIncludingHighlightsRemainAccepted()
     {
-        MiniMaxH3Pipeline.RequireFiniteOutput(new[] { -1000f, 0f, 1000f }, "video VAE output");
-        MiniMaxH3Pipeline.RequireFiniteOutput(new[] { -1f, 0f, 1f }, "audio VAE output");
+        MiniMaxH3Requests.RequireFiniteOutput(new[] { -1000f, 0f, 1000f }, "video VAE output");
+        MiniMaxH3Requests.RequireFiniteOutput(new[] { -1f, 0f, 1f }, "audio VAE output");
     }
 
     [Theory]
@@ -93,7 +93,7 @@ public class MiniMaxH3PipelineQualityTests
     public void UnsupportedGuidanceIsRejectedBeforeLoadingWeights(float cfg)
     {
         var error = Assert.Throws<ArgumentException>(() =>
-            MiniMaxH3Pipeline.ValidateSamplingParameters(new VideoGenerationParams { CfgScale = cfg }));
+            MiniMaxH3Requests.ValidateSamplingParameters(new VideoGenerationParams { CfgScale = cfg }));
         Assert.Contains("guidance 1.0", error.Message);
     }
 
@@ -105,17 +105,17 @@ public class MiniMaxH3PipelineQualityTests
     public void InvalidFlowShiftIsRejectedBeforeLoadingWeights(float shift)
     {
         var error = Assert.Throws<ArgumentException>(() =>
-            MiniMaxH3Pipeline.ValidateSamplingParameters(new VideoGenerationParams { FlowShift = shift }));
+            MiniMaxH3Requests.ValidateSamplingParameters(new VideoGenerationParams { FlowShift = shift }));
         Assert.Contains("flow shift", error.Message);
     }
 
     [Fact]
     public void DefaultsAndCustomPositiveFlowShiftsRemainAccepted()
     {
-        MiniMaxH3Pipeline.ValidateSamplingParameters(new VideoGenerationParams());
-        MiniMaxH3Pipeline.ValidateSamplingParameters(new VideoGenerationParams { CfgScale = 1f, Steps = 8, FlowShift = 6f });
+        MiniMaxH3Requests.ValidateSamplingParameters(new VideoGenerationParams());
+        MiniMaxH3Requests.ValidateSamplingParameters(new VideoGenerationParams { CfgScale = 1f, Steps = 8, FlowShift = 6f });
         var error = Assert.Throws<ArgumentException>(() =>
-            MiniMaxH3Pipeline.ValidateSamplingParameters(new VideoGenerationParams { Steps = -1 }));
+            MiniMaxH3Requests.ValidateSamplingParameters(new VideoGenerationParams { Steps = -1 }));
         Assert.Contains("steps", error.Message);
     }
 

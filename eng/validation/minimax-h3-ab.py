@@ -49,6 +49,14 @@ def main():
     parser.add_argument("--end-image", type=Path)
     parser.add_argument("--ref-image", type=Path, action="append", default=[])
     parser.add_argument("--ref-audio", type=Path, action="append", default=[])
+    parser.add_argument("--lora", type=Path,
+                        help="A minimax-h3-lora plug-in config for both binaries; its recipe sets the schedule, so --steps "
+                             "is the count it fixes and no steps, shift or sampler are passed")
+    parser.add_argument("--baseline-env", action="append", default=[], metavar="KEY=VALUE",
+                        help="An environment variable for the baseline binary alone (TS_H3_PHASE=1 makes a pre-runtime "
+                             "baseline print its step times; the runtime refuses that switch)")
+    parser.add_argument("--allow-changed-media", action="store_true",
+                        help="Record pairs whose decoded media differ instead of failing (a deliberate numerical change)")
     parser.add_argument("--ggml-source", type=Path,
                         default=Path(__file__).resolve().parents[2] / "ExternalProjects/ggml")
     parser.add_argument("--expected-ggml-revision", required=True,
@@ -80,7 +88,13 @@ def main():
         parser.error("Reference inputs require Ref2VA without keyframes")
     if (args.image or args.end_image) and args.checkpoint != "fl2va":
         parser.error("Keyframes require FL2VA")
-    paths = [args.baseline_cli, args.candidate_cli, *components.values(),
+    baseline_env = {}
+    for item in args.baseline_env:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            parser.error(f"--baseline-env takes KEY=VALUE, not {item!r}")
+        baseline_env[key] = value
+    paths = [args.baseline_cli, args.candidate_cli, *components.values(), *([args.lora] if args.lora else []),
              *[args.models / filename for filename in ("vocab.json", "merges.txt", "tokenizer_config.json")],
              *[path for _, items in conditioning for path in items]]
     for path in paths:
@@ -95,7 +109,7 @@ def main():
     env.update(TS_VIDEO_VAE=str(components["video_vae"].resolve()),
                TS_VIDEO_TEXT_ENCODER=str(components["text"].resolve()),
                TS_VIDEO_AUDIO_VAE=str(components["audio_vae"].resolve()),
-               TS_VIDEO_TOKENIZER=str(args.models.resolve()), TS_H3_PHASE="1",
+               TS_VIDEO_TOKENIZER=str(args.models.resolve()),
                TS_CPU_THREADS="8", DOTNET_PROCESSOR_COUNT="8", OMP_NUM_THREADS="8", GGML_N_THREADS="8")
     if args.bf16_pedantic:
         env["TS_H3_CUDA_BF16_PEDANTIC"] = "1"
@@ -104,7 +118,9 @@ def main():
               "precision_policy": "BF16 projections forced to pedantic F32 in both binaries" if args.bf16_pedantic else "binary defaults",
               "geometry": [args.width, args.height, args.frames], "fps": args.fps,
               "prompt": args.prompt, "seed": args.seed, "steps": args.steps,
-              "cfg": 1, "flow_shift": 12, "sigmas_f32": helpers.sigmas(args.steps, 12),
+              "cfg": 1, "flow_shift": None if args.lora else 12,
+              "sigmas_f32": None if args.lora else helpers.sigmas(args.steps, 12),
+              "lora": str(args.lora.resolve()) if args.lora else None, "baseline_env": baseline_env,
               "hardware": helpers.hardware(), "ggml": ggml,
               "binary_files": helpers.binary_artifacts(args.baseline_cli, args.baseline_cli)
                               + helpers.binary_artifacts(args.candidate_cli, args.candidate_cli),
@@ -136,14 +152,17 @@ def main():
                        "--video-text-encoder", str(components["text"].resolve()),
                        "--audio-vae", str(components["audio_vae"].resolve()), "--prompt", args.prompt,
                        "--width", str(args.width), "--height", str(args.height), "--video-frames", str(args.frames),
-                       "--diffusion-steps", str(args.steps), "--fps", str(args.fps), "--cfg", "1",
-                       "--flow-shift", "12", "--sampler", "euler", "--diffusion-seed", str(args.seed)]
+                       "--fps", str(args.fps), "--cfg", "1", "--diffusion-seed", str(args.seed)]
+            # A plug-in's recipe fixes the steps, shifts and sampler (an explicit one is refused).
+            command += ["--lora", str(args.lora.resolve())] if args.lora else \
+                ["--diffusion-steps", str(args.steps), "--flow-shift", "12", "--sampler", "euler"]
             command += [value for flag, items in conditioning for path in items for value in (flag, str(path.resolve()))]
             command += ["--output", str(output)]
             record = {"version": version, "round": repeat, "argv": command, "passed": False}
             started = time.perf_counter()
             with (args.output / f"{version}-{repeat}.log").open("w") as log:
-                process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                run_env = {**env, **baseline_env} if version == "baseline" else env
+                process = subprocess.Popen(command, env=run_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
                     record["exit_code"] = process.wait(timeout=args.timeout)
                 except subprocess.TimeoutExpired:
@@ -156,12 +175,16 @@ def main():
                     record.update(exit_code=124, timeout=True)
             record["wall_seconds"] = time.perf_counter() - started
             log_text = (args.output / f"{version}-{repeat}.log").read_text(errors="replace")
-            record["denoise_step_seconds"] = [float(value) for value in
-                re.findall(r"\[h3\] \.\. step \d+/\d+ ([0-9.]+)s", log_text)]
+            # The diffusion runtime's step lines; a pre-runtime baseline prints its own with TS_H3_PHASE=1.
+            record["denoise_step_seconds"] = [float(value) for value in re.findall(
+                r"(?:\[diffusion\] minimax-h3 step \d+/\d+ sigma \S+ -> \S+|\[h3\] \.\. step \d+/\d+) ([0-9.]+)s", log_text)]
             if record["exit_code"] == 0:
                 try:
                     record["media"], _, _ = helpers.validate_media(output, args, "tensorsharp")
-                    if len(record["denoise_step_seconds"]) != args.steps:
+                    # A pre-runtime baseline prints its steps only under TS_H3_PHASE=1 (--baseline-env), which a
+                    # wall-clock comparison may leave off; the candidate always prints them.
+                    if (version == "candidate" or record["denoise_step_seconds"]) and \
+                            len(record["denoise_step_seconds"]) != args.steps:
                         raise RuntimeError("Denoising step count does not match the requested schedule")
                     record["passed"] = True
                 except (RuntimeError, subprocess.TimeoutExpired, ValueError, OSError) as error:
@@ -180,8 +203,10 @@ def main():
         report["pairs"].append(pair)
         save()
         if not (pair["rgb_exact"] and pair["audio_exact"]):
-            print("FAIL: before/after decoded media changed", flush=True)
-            return 1
+            if not args.allow_changed_media:
+                print("FAIL: before/after decoded media changed", flush=True)
+                return 1
+            print("NOTE: before/after decoded media changed (--allow-changed-media)", flush=True)
     medians = {version: statistics.median(record["wall_seconds"] for record in report["executions"]
                                          if record["version"] == version) for version in ("baseline", "candidate")}
     report.update(passed=True, median_seconds=medians,

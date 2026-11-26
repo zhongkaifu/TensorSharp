@@ -48,7 +48,7 @@ namespace InferenceWeb.Tests
             // silent failure: a prompt longer than the placeholders it was built from.
             Assert.Equal(13, tokenizer.Encode("<|image_pad|>", addSpecial: false).Count);
             var ex = Assert.Throws<InvalidOperationException>(
-                () => MiniMaxH3Pipeline.RequireVisionTokens(tokenizer));
+                () => MiniMaxH3Requests.RequireVisionTokens(tokenizer));
             Assert.Contains("tokenizer_config.json", ex.Message);
         }
 
@@ -56,15 +56,15 @@ namespace InferenceWeb.Tests
         public void ReferencesThatAreAllSoundsNeedNoTokenizerConfig()
         {
             var tokenizer = MiniMaxH3TextEncoder.LoadTokenizer(_dir);
-            MiniMaxH3Pipeline.MiniMaxH3Reference Of(MiniMaxH3ReferenceKind kind) => new() { Kind = kind };
+            MiniMaxH3Requests.MiniMaxH3Reference Of(MiniMaxH3ReferenceKind kind) => new() { Kind = kind };
 
             // A soundtrack reaches the prompt only as its "<Audio N>: " label.
-            MiniMaxH3Pipeline.RequireVisionTokens(tokenizer,
+            MiniMaxH3Requests.RequireVisionTokens(tokenizer,
                 new[] { Of(MiniMaxH3ReferenceKind.Audio), Of(MiniMaxH3ReferenceKind.Audio) });
             // Anything the vision tower is shown needs the markers, a clip with its sound too.
             foreach (var shown in new[] { MiniMaxH3ReferenceKind.Image, MiniMaxH3ReferenceKind.Video, MiniMaxH3ReferenceKind.VideoAudio })
             {
-                var ex = Assert.Throws<InvalidOperationException>(() => MiniMaxH3Pipeline.RequireVisionTokens(
+                var ex = Assert.Throws<InvalidOperationException>(() => MiniMaxH3Requests.RequireVisionTokens(
                     tokenizer, new[] { Of(MiniMaxH3ReferenceKind.Audio), Of(shown) }));
                 Assert.Contains("tokenizer_config.json", ex.Message);
             }
@@ -83,7 +83,7 @@ namespace InferenceWeb.Tests
             var tokenizer = MiniMaxH3TextEncoder.LoadTokenizer(_dir);
 
             Assert.Equal(new[] { 151655 }, tokenizer.Encode("<|image_pad|>", addSpecial: false));
-            MiniMaxH3Pipeline.RequireVisionTokens(tokenizer);
+            MiniMaxH3Requests.RequireVisionTokens(tokenizer);
         }
     }
 }

@@ -17,51 +17,9 @@ internal sealed class MiniMaxH3TensorOps : IDisposable
     private float[] _lastCos, _lastSin;
     private int _lastRotary, _lastSequence;
     private Tensor _cos, _sin;
-    private H3DitSegment[] _lastModulationSegments;
-    private Tensor _modulationRows;
-    private int _lastModulationRows, _lastModulationCount;
     internal bool IsAccelerated => _context.Allocator is CudaAllocator or MlxAllocator;
 
     internal MiniMaxH3TensorOps(DirectContext context) => _context = context;
-
-    internal bool TryModulatePacked(Tensor values, Tensor update, Tensor modulation, H3DitSegment[] segments,
-        int firstIndex, int secondIndex, bool gatedResidual)
-    {
-        if (!_context.IsMlx || values.DimensionCount != 2 || modulation.DimensionCount != 2 ||
-            values.Sizes[0] > int.MaxValue || modulation.Sizes[0] > int.MaxValue) return false;
-        Tensor rows=GetModulationRows(segments,checked((int)values.Sizes[0]),checked((int)modulation.Sizes[0]));
-        return rows != null && MlxMiniMaxH3Ops.TryPackedModulation(values,values,update,modulation,rows,
-            firstIndex,secondIndex,gatedResidual);
-    }
-
-    private Tensor GetModulationRows(H3DitSegment[] segments,int rows,int modulationCount)
-    {
-        bool same=_modulationRows != null && rows == _lastModulationRows && modulationCount == _lastModulationCount &&
-            segments.Length == _lastModulationSegments.Length;
-        for (int i=0; same && i<segments.Length; i++)
-            same=segments[i].Start == _lastModulationSegments[i].Start && segments[i].End == _lastModulationSegments[i].End &&
-                segments[i].Col == _lastModulationSegments[i].Col;
-        if (same) return _modulationRows;
-        // Layouts may reuse and mutate their segment array between scheduler
-        // steps. Snapshot values, and retain the original sequential path for
-        // overlapping segments instead of silently changing its semantics.
-        int[] indices=new int[rows]; Array.Fill(indices,-1);
-        foreach (var segment in segments)
-        {
-            if (segment.End <= segment.Start) continue;
-            if (segment.Start < 0 || segment.End > rows || segment.Col < 0 || segment.Col > modulationCount-6) return null;
-            for (int row=segment.Start; row<segment.End; row++)
-            {
-                if (indices[row] != -1) return null;
-                indices[row]=segment.Col;
-            }
-        }
-        Tensor replacement=Tensor.FromArray(_context.Allocator,indices);
-        _modulationRows?.Dispose(); _modulationRows=replacement;
-        _lastModulationSegments=(H3DitSegment[])segments.Clone();
-        _lastModulationRows=rows; _lastModulationCount=modulationCount;
-        return _modulationRows;
-    }
 
     internal void RopeHalf(Tensor values, float[] cos, float[] sin, int sequence, int heads, int head, int rotary)
     {
@@ -175,8 +133,6 @@ internal sealed class MiniMaxH3TensorOps : IDisposable
 
     public void Dispose()
     {
-        _modulationRows?.Dispose(); _modulationRows=null;
-        _lastModulationSegments=null;
         _cos?.Dispose(); _sin?.Dispose();
         _cos = _sin = null;
         _lastCos = _lastSin = null;

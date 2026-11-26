@@ -258,7 +258,7 @@ TensorAgent 的聊天（其 `/api/chat` 轮次）会把每条消息与之前的�
   同一个已编译的步骤。
 - **DiT。** 每步一个计算图程序：token refiner、50 个块与最后一层，不含音频流。在 `ggml_cuda` 上，
   调制、门控残差、注意力（cuDNN）与 BF16 的 SwiGLU-in-GEMM 以融合阶段运行，宽矩阵乘走 cuBLAS
-  （或 int8）；其他后端用 ggml 自身的内核运行同一程序。该程序与 MiniMax-H3 原生 DiT 构建的计算图
+  （或 int8）；其他后端用 ggml 自身的内核运行同一程序。该程序与 MiniMax-H3 已退役的原生 DiT 所构建的计算图
   逐节点相同，因此速度场逐位一致。
 - **VAE。** 图像解码器（24 个 1024 宽的块、16 个头、在每个头的一半维度上对 (h, w) 做 RoPE、
   16x16 RGB patch）在至少重叠 64 像素的 256 像素瓦片上解码，并完全按 ComfyUI 的

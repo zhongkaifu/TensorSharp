@@ -437,7 +437,8 @@ public sealed class CatalogTests
         ["qwen-image-2.1-turbo-q5ks"] = (4.50, 14.43, "an edit at 1248x832, 8 steps (maximum CLI peak footprint of two runs)"),
         ["qwen-image-2.1-turbo-q8-0"] = (7.64, 15.14, "an edit at 1248x832, 8 steps (maximum CLI peak footprint of two runs)"),
         // The largest stage is the 18.2 GB text encoder: the denoiser and the VAEs kept from the
-        // previous clip are taken off the device before it runs (MiniMaxH3Pipeline), and wired
+        // previous clip are taken off the device before it runs (on ggml_metal each of them releases
+        // after its phase on the diffusion runtime's video pipeline), and wired
         // memory peaked at 20 GB with the decode (denoiser + video VAE) on top of the system's.
         // A photo (keyframe or reference) is what takes the footprint to its highest: the
         // video VAE's encoder converts its kernels to F32 in managed memory.

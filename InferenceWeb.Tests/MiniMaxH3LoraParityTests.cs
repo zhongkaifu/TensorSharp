@@ -4,34 +4,29 @@
 // A MiniMax-H3 LoRA plug-in applied unmerged is the same denoiser as the checkpoint with the
 // update merged into its weights. Checked on a tiny transformer (MiniMaxH3LoraFixtures: an
 // 8-wide residual stream, 2 heads of 8, ffn 16, two trunk blocks and one token-refiner block)
-// over one full DiT step with text, a conditioning keyframe, audio and video in the sequence:
+// over one full step of the runtime's denoiser (MiniMaxH3Denoiser: the step's graph program) with
+// text, a conditioning keyframe, audio and video in the sequence:
 //
-// - the direct CPU path with the plug-in against the direct CPU path on a GGUF with
+// - the managed tensor executor with the plug-in against the same executor on a GGUF with
 //   strength * alpha / rank * B * A added to its weights in the checkpoint's row order (fc1's
 //   halves swapped from diffusers' [value; gate]), for every target and for the gate-only,
 //   value-only, q-only and refiner-only updates, with the unswapped merge as the negative
 //   control;
-// - the native graph on the process's pinned GGML backend (TS_TEST_GGML_BACKEND; GgmlCpu by
-//   default) with the packed factors against the direct CPU path, on both native attention
-//   paths, after measuring the two paths' disagreement without a plug-in;
+// - the GGML graph executor on the process's pinned GGML backend (TS_TEST_GGML_BACKEND; GgmlCpu
+//   by default) with the packed factors against the managed executor with the exact ones, after
+//   measuring the two executors' disagreement without a plug-in;
 // - strength 0 (every term kept with zero up factors) bit-identical to no plug-in;
-// - the direct path's refined-text cache across a plug-in switched off, on and off;
-// - the direct MLX path against the direct CPU path, its factors held once, on the device;
-// - the native refusals of a corrupted adapter.
-using System.Reflection;
-using System.Runtime.InteropServices;
+// - the MLX tensor executor against the managed one;
+// - the refusals of a set packed for the other executor, or disposed.
 using TensorSharp;
-using TensorSharp.Cpu;
-using TensorSharp.GGML;
 using TensorSharp.MLX;
-using TensorSharp.Models.Direct;
 using TensorSharp.Models.MiniMaxH3;
 using Xunit.Abstractions;
 using Adapter = InferenceWeb.Tests.MiniMaxH3LoraFixtures.Adapter;
 
 namespace InferenceWeb.Tests;
 
-/// <summary>One DiT step of the tiny fixture transformer: 5 text tokens, one conditioning
+/// <summary>One denoiser step of the tiny fixture transformer: 5 text tokens, one conditioning
 /// keyframe (4 tokens), 6 audio tokens and 8 video tokens, every segment kind the trunk
 /// modulates. Inputs are deterministic, so two runs see identical buffers.</summary>
 internal static class TinyH3Step
@@ -56,35 +51,15 @@ internal static class TinyH3Step
         MiniMaxH3Layout.Build(TextTokens, Shape, sigma, conditionFrames: new[] { 1 }, keyframeAtEnd: new[] { false });
 
     /// <summary>The step's video velocities followed by its audio velocities.</summary>
-    internal static float[] Run(MiniMaxH3DiT dit, MiniMaxH3LoraSet lora, float sigma = .75f)
+    internal static float[] Run(MiniMaxH3Denoiser dit, MiniMaxH3LoraSet lora, float sigma = .75f)
     {
         var (video, audio) = dit.Forward(lora, Video, Shape.VideoTokenCount, Audio, Shape.AudioTokenCount,
             Text, TextTokens, Layout(sigma), sigma, Condition, ConditionTokens);
         return video.Concat(audio).ToArray();
     }
 
-    /// <summary>The distinct factor pointers of a packed set, read from its native descriptors.</summary>
-    internal static HashSet<IntPtr> FactorPointers(MiniMaxH3LoraSet set)
-    {
-        var pointers = new HashSet<IntPtr>();
-        var adapter = Marshal.PtrToStructure<H3DitAdapter>(set.NativeAdapter);
-        void Collect(IntPtr blocks, int count)
-        {
-            for (int b = 0; b < count; b++)
-            {
-                var block = Marshal.PtrToStructure<H3BlockLora>(blocks + b * Marshal.SizeOf<H3BlockLora>());
-                foreach (var l in new[] { block.Q, block.K, block.V, block.Out, block.Fc1, block.Fc2 })
-                {
-                    if (l.Rank == 0) continue;
-                    pointers.Add(l.Down);
-                    pointers.Add(l.Up);
-                }
-            }
-        }
-        Collect(adapter.Blocks, adapter.NumBlocks);
-        Collect(adapter.Refiner, adapter.NumRefinerBlocks);
-        return pointers;
-    }
+    /// <summary>The distinct factor pointers of a packed set.</summary>
+    internal static HashSet<IntPtr> FactorPointers(MiniMaxH3LoraSet set) => set.FactorPointers().ToHashSet();
 
     /// <summary>max |a - b| over max |b|.</summary>
     internal static double Rel(float[] actual, float[] expected)
@@ -131,22 +106,15 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
 
     private readonly ITestOutputHelper _out;
     private readonly MiniMaxH3LoraFixtures _fx = new();
-    private readonly CpuAllocator _allocator = new(BlasEnum.DotNet);
-    private readonly EnvScope _env = new();
     private readonly string _base;
 
     public MiniMaxH3LoraParityTests(ITestOutputHelper output)
     {
         _out = output;
-        _env.Set("TS_H3_DIT_LAYERS", null);
         _base = _fx.WriteTransformer();
     }
 
-    public void Dispose()
-    {
-        _env.Dispose();
-        _fx.Dispose();
-    }
+    public void Dispose() => _fx.Dispose();
 
     public static TheoryData<string> Cases => new() { "all", "fc1-gate", "fc1-value", "q", "refiner" };
 
@@ -193,38 +161,40 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
         return _fx.WriteManifest(manifest);
     }
 
-    private static MiniMaxH3LoraSet LoadSet(LoraSpec spec, string transformer, BackendType backend, bool direct) =>
+    private static MiniMaxH3LoraSet LoadSet(LoraSpec spec, string transformer, BackendType backend, bool tensorExecutor) =>
         MiniMaxH3LoraSet.Load(new[] { spec }, MiniMaxH3LoraFixtures.ConfigOf(transformer),
-            MiniMaxH3Partition.FirstLastFrame, backend, direct);
+            MiniMaxH3Partition.FirstLastFrame, backend, tensorExecutor);
 
-    private MiniMaxH3DiT Direct(string path) => new(path, BackendType.Cpu, _allocator);
+    /// <summary>The denoiser on the managed tensor executor (the pure-C# cpu backend).</summary>
+    private static MiniMaxH3Denoiser Managed(string path) => new(path, BackendType.Cpu);
 
-    private static MiniMaxH3DiT Native(string path) => new(path, TestGates.PinnedGgmlBackend, null);
+    /// <summary>The denoiser on the GGML graph executor of the process's pinned backend.</summary>
+    private static MiniMaxH3Denoiser Graph(string path) => new(path, TestGates.PinnedGgmlBackend);
 
-    // ---- direct CPU against a merged checkpoint --------------------------------------------
+    // ---- the managed executor against a merged checkpoint -----------------------------------
 
     [Theory]
     [MemberData(nameof(Cases))]
-    public void DirectCpuLora_EqualsTheMergedCheckpoint(string id)
+    public void ManagedLora_EqualsTheMergedCheckpoint(string id)
     {
         var adapter = Build(id);
         string merged = _fx.WriteTransformer(deltas: adapter.MergedDeltas(Scale), fileName: "merged.gguf");
-        using var set = LoadSet(new LoraSpec(Plugin(adapter)), _base, BackendType.Cpu, direct: true);
+        using var set = LoadSet(new LoraSpec(Plugin(adapter)), _base, BackendType.Cpu, tensorExecutor: true);
         Assert.Equal(new[] { Scale }, set.Scales);
-        using var dit = Direct(_base);
-        using var mergedDit = Direct(merged);
+        using var dit = Managed(_base);
+        using var mergedDit = Managed(merged);
 
         float[] baseline = TinyH3Step.Run(dit, null);
         float[] unmerged = TinyH3Step.Run(dit, set);
         float[] expected = TinyH3Step.Run(mergedDit, null);
         double rel = TinyH3Step.Rel(unmerged, expected), moved = TinyH3Step.Rel(baseline, expected);
-        _out.WriteLine($"[h3-lora-parity] direct-cpu {id}: unmerged vs merged rel {rel:E3}; the update moves the step by rel {moved:E3}");
+        _out.WriteLine($"[h3-lora-parity] managed {id}: unmerged vs merged rel {rel:E3}; the update moves the step by rel {moved:E3}");
         Assert.True(moved > 1e-3, $"{id}: the update moved the step by only rel {moved:E3}; the case proves nothing.");
         Assert.True(rel <= 1e-5, $"{id}: unmerged vs merged rel {rel:E3} > 1e-5");
     }
 
     [Fact]
-    public void DirectCpuLora_DiffersFromAMergeThatKeepsDiffusersFc1Order()
+    public void ManagedLora_DiffersFromAMergeThatKeepsDiffusersFc1Order()
     {
         // fc1 updates with both halves populated in every block: applying them without the
         // [value; gate] -> [gate | value] swap is a different model, by far more than the tolerance.
@@ -234,10 +204,10 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
         adapter.Term(true, 0, MiniMaxH3LoraTarget.Fc1, Rank, seed: 53, dtype: "F32");
         string swapped = _fx.WriteTransformer(deltas: adapter.MergedDeltas(Scale), fileName: "swapped.gguf");
         string unswapped = _fx.WriteTransformer(deltas: adapter.MergedDeltas(Scale, swapFc1: false), fileName: "unswapped.gguf");
-        using var set = LoadSet(new LoraSpec(Plugin(adapter)), _base, BackendType.Cpu, direct: true);
-        using var dit = Direct(_base);
-        using var swappedDit = Direct(swapped);
-        using var unswappedDit = Direct(unswapped);
+        using var set = LoadSet(new LoraSpec(Plugin(adapter)), _base, BackendType.Cpu, tensorExecutor: true);
+        using var dit = Managed(_base);
+        using var swappedDit = Managed(swapped);
+        using var unswappedDit = Managed(unswapped);
 
         float[] unmerged = TinyH3Step.Run(dit, set);
         double right = TinyH3Step.Rel(unmerged, TinyH3Step.Run(swappedDit, null));
@@ -247,134 +217,76 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
         Assert.True(wrong > 1e-2, $"the unswapped merge is only rel {wrong:E3} away; the control cannot tell the orders apart");
     }
 
-    // ---- the direct MLX path -----------------------------------------------------------------
+    // ---- the MLX tensor executor ---------------------------------------------------------------
 
-    private static readonly FieldInfo DitDirect = typeof(MiniMaxH3DiT).GetField("_direct", BindingFlags.NonPublic | BindingFlags.Instance)!;
-    private static readonly FieldInfo DirectLora = typeof(MiniMaxH3DirectDiT).GetField("_lora", BindingFlags.NonPublic | BindingFlags.Instance)!;
-    private static readonly FieldInfo LinearWeight = typeof(DirectLinear).GetField("_wCpu", BindingFlags.NonPublic | BindingFlags.Instance)!;
-    private static readonly FieldInfo MlxHostBuffer = typeof(MlxStorage).GetField("buffer", BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-    /// <summary>
-    /// The MLX direct path applies the plug-in as the CPU one does, and keeps each factor once:
-    /// as a device array, with no host copy beside it (a host-written F32 tensor would hold
-    /// both for as long as the set is applied, doubling the 8-step adapter's 2.77 GB).
-    /// </summary>
+    /// <summary>The MLX tensor executor applies the plug-in as the managed one does.</summary>
     [MlxFact]
-    public void DirectMlxLora_MatchesDirectCpu_AndKeepsNoHostCopyOfItsFactors()
+    public void MlxLora_MatchesManaged()
     {
         var adapter = Build("all");
-        using var set = LoadSet(new LoraSpec(Plugin(adapter)), _base, BackendType.Mlx, direct: true);
-        using var cpu = Direct(_base);
+        using var set = LoadSet(new LoraSpec(Plugin(adapter)), _base, BackendType.Mlx, tensorExecutor: true);
+        using var cpu = Managed(_base);
         float[] cpuBase = TinyH3Step.Run(cpu, null), cpuLora = TinyH3Step.Run(cpu, set);
 
         using var allocator = new MlxAllocator();
-        var (mlxLora, mlxBase, factors, hostCopies) = MlxWorker.Shared.Invoke(() =>
+        var (mlxLora, mlxBase) = MlxWorker.Shared.Invoke(() =>
         {
-            using var dit = new MiniMaxH3DiT(_base, BackendType.Mlx, allocator);
+            using var dit = new MiniMaxH3Denoiser(_base, BackendType.Mlx, allocator);
             float[] withLora = TinyH3Step.Run(dit, set);
-            // Before the plug-in-free step below, which drops the built factors.
-            var linears = BuiltLoraLinears(dit);
-            int host = linears.Count(l => MlxHostBuffer.GetValue(((Tensor)LinearWeight.GetValue(l)!).Storage) is IntPtr p && p != IntPtr.Zero);
             float[] without = TinyH3Step.Run(dit, null);
-            return (withLora, without, linears.Count, host);
+            return (withLora, without);
         });
 
         double rel = TinyH3Step.Rel(mlxLora, cpuLora), baseRel = TinyH3Step.Rel(mlxBase, cpuBase);
         double moved = TinyH3Step.Rel(cpuLora, cpuBase);
         double cosine = TinyH3Step.Cosine(TinyH3Step.Minus(mlxLora, mlxBase), TinyH3Step.Minus(cpuLora, cpuBase));
-        // MLX and CPU disagree by ~1e-3 here without any plug-in (9.5e-4 measured on Apple silicon),
-        // so the bound is the device one the native lanes use, never tighter than that floor
-        // allows; the update's direction is the sharp check.
+        // MLX and the CPU disagree by ~1e-3 here without any plug-in, so the bound is the device one the GGML lanes use,
+        // never tighter than that floor allows; the update's direction is the sharp check.
         double bound = Math.Max(2e-3, 2.5 * baseRel);
-        _out.WriteLine($"[h3-lora-parity] direct-mlx all: vs direct cpu rel {rel:E3} (no plug-in floor {baseRel:E3}, " +
-            $"bound {bound:E3}), the update moves the step by rel {moved:E3}, update cosine {cosine:F7}; " +
-            $"{factors} factor linears, {hostCopies} with a host copy");
-        Assert.True(factors > 0, "the MLX forward built no LoRA factors; the plug-in was not applied there.");
-        Assert.Equal(0, hostCopies);
+        _out.WriteLine($"[h3-lora-parity] mlx all: vs managed rel {rel:E3} (no plug-in floor {baseRel:E3}, bound {bound:E3}), " +
+            $"the update moves the step by rel {moved:E3}, update cosine {cosine:F7}");
         Assert.True(moved > 10 * bound, $"the update moved the step by only rel {moved:E3}; the case proves nothing on MLX.");
-        Assert.True(rel <= bound, $"direct MLX vs direct CPU rel {rel:E3} > {bound:E3}");
+        Assert.True(rel <= bound, $"MLX vs managed rel {rel:E3} > {bound:E3}");
         Assert.True(cosine >= .9999, $"update cosine {cosine:F7} < 0.9999");
     }
 
-    /// <summary>Every factor linear the direct DiT has built for its current plug-in.</summary>
-    private static List<DirectLinear> BuiltLoraLinears(MiniMaxH3DiT dit)
-    {
-        object state = DirectLora.GetValue(DitDirect.GetValue(dit)!)!;
-        var linears = new List<DirectLinear>();
-        foreach (string arrayName in new[] { "Trunk", "Refiner" })
-        {
-            foreach (object? block in (Array)state.GetType().GetField(arrayName)!.GetValue(state)!)
-            {
-                if (block == null) continue;
-                foreach (FieldInfo field in block.GetType().GetFields())
-                {
-                    object? value = field.GetValue(block);
-                    if (value is DirectLinear linear) linears.Add(linear);
-                    else if (value is DirectLinear[] many) linears.AddRange(many.Where(l => l != null));
-                }
-            }
-        }
-        return linears;
-    }
-
-    // ---- the native graph against the direct path ---------------------------------------------
-
-    public static TheoryData<string, bool> NativeCases
-    {
-        get
-        {
-            var data = new TheoryData<string, bool>();
-            foreach (string id in new[] { "all", "fc1-gate", "fc1-value", "q", "refiner" })
-            {
-                data.Add(id, true);
-                data.Add(id, false);
-            }
-            return data;
-        }
-    }
+    // ---- the GGML graph executor against the managed one ---------------------------------------
 
     /// <summary>
-    /// The native graph with the packed factors against the direct CPU path, on both of the
-    /// native attention paths. The flash kernel takes K and V as F16, which is the whole of
-    /// the two paths' disagreement without a plug-in (measured on GgmlCpu: rel 1.5e-5 with
-    /// flash, 2.5e-7 with the explicit softmax, TS_H3_NO_FLASH=1), and an update as large as
-    /// the synthetic "all" case (it moves the step by 38%) scales that rounding up with q/k/v.
-    /// So the explicit softmax is where GgmlCpu is held to 1e-4: it isolates the LoRA wiring.
-    /// The flash path, and any device, are held to rel 2e-3 and an update cosine of 0.9999.
+    /// The GGML graph executor with the packed factors against the managed executor with the exact ones. Both run the
+    /// program's attention with K and V cast to F16, so their disagreement without a plug-in is the executors' product
+    /// arithmetic alone; an update as large as the synthetic "all" case (it moves the step by ~38%) scales that rounding up
+    /// with q/k/v. GgmlCpu is held to rel 1e-4, any device to rel 2e-3 and an update cosine of 0.9999.
     ///
-    /// GgmlCuda runs its float products on cuBLAS handles ggml-cuda sets to TF32 tensor-op math,
-    /// which put the no-plug-in floor at rel 6.1e-4 on this all-F32 fixture (1.5e-7 with TF32
-    /// off). So there the 0.9999 cosine is held under TS_H3_CUDA_F32_PRODUCTS=1, which moves the
-    /// DiT's weight products to TensorSharp's pedantic F32 GEMM (floor 8.1e-6), and the default
-    /// TF32 path gets a bound derived from its own floor (below).
+    /// GgmlCuda runs its float products on cuBLAS handles ggml-cuda sets to TF32 tensor-op math, so there the default path
+    /// gets a bound derived from its own floor, and the 0.9999 cosine is held under TS_H3_CUDA_F32_PRODUCTS=1, which moves
+    /// the step's weight products to TensorSharp's pedantic F32 GEMM.
     /// </summary>
     [Theory]
-    [MemberData(nameof(NativeCases))]
-    public void NativeLoraOnThePinnedGgmlBackend_MatchesDirectCpu(string id, bool flash)
+    [MemberData(nameof(Cases))]
+    public void GraphLoraOnThePinnedGgmlBackend_MatchesManaged(string id)
     {
         BackendType backend = TestGates.PinnedGgmlBackend;
-        using var attentionPath = new NativeEnvScope();
-        attentionPath.Set("TS_H3_NO_FLASH", flash ? null : "1");
+        using var products = new NativeEnvScope();
         // The default path first, whatever the process environment says.
-        attentionPath.Set("TS_H3_CUDA_F32_PRODUCTS", null);
+        products.Set("TS_H3_CUDA_F32_PRODUCTS", null);
         var adapter = Build(id);
         string manifest = Plugin(adapter);
-        using var packed = LoadSet(new LoraSpec(manifest), _base, backend, direct: false);
-        using var exact = LoadSet(new LoraSpec(manifest), _base, BackendType.Cpu, direct: true);
-        using var native = Native(_base);
-        using var direct = Direct(_base);
-        string attention = flash ? "flash attention" : "explicit softmax";
+        using var packed = LoadSet(new LoraSpec(manifest), _base, backend, tensorExecutor: false);
+        using var exact = LoadSet(new LoraSpec(manifest), _base, BackendType.Cpu, tensorExecutor: true);
+        using var graph = Graph(_base);
+        using var managed = Managed(_base);
 
-        // The two paths' disagreement without a plug-in: the floor the comparison stands on.
-        float[] directBase = TinyH3Step.Run(direct, null), directLora = TinyH3Step.Run(direct, exact);
-        double moved = TinyH3Step.Rel(directLora, directBase);
+        // The two executors' disagreement without a plug-in: the floor the comparison stands on.
+        float[] managedBase = TinyH3Step.Run(managed, null), managedLora = TinyH3Step.Run(managed, exact);
+        double moved = TinyH3Step.Rel(managedLora, managedBase);
         (double floor, double rel, double cosine) Compare(string label)
         {
-            float[] nativeBase = TinyH3Step.Run(native, null), nativeLora = TinyH3Step.Run(native, packed);
-            double f = TinyH3Step.Rel(nativeBase, directBase);
-            double r = TinyH3Step.Rel(nativeLora, directLora);
-            double c = TinyH3Step.Cosine(TinyH3Step.Minus(nativeLora, nativeBase), TinyH3Step.Minus(directLora, directBase));
-            _out.WriteLine($"[h3-lora-parity] {backend} ({attention}{label}) vs direct-cpu {id}: no-plug-in floor rel {f:E3}; " +
+            float[] graphBase = TinyH3Step.Run(graph, null), graphLora = TinyH3Step.Run(graph, packed);
+            double f = TinyH3Step.Rel(graphBase, managedBase);
+            double r = TinyH3Step.Rel(graphLora, managedLora);
+            double c = TinyH3Step.Cosine(TinyH3Step.Minus(graphLora, graphBase), TinyH3Step.Minus(managedLora, managedBase));
+            _out.WriteLine($"[h3-lora-parity] {backend}{label} vs managed {id}: no-plug-in floor rel {f:E3}; " +
                 $"with the plug-in rel {r:E3}; update cosine {c:F7}; the update moves the step by rel {moved:E3}");
             return (f, r, c);
         }
@@ -383,135 +295,83 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
         Assert.True(moved > 1e-3, $"{id}: the update moved the step by only rel {moved:E3}");
         if (backend == BackendType.GgmlCuda)
         {
-            // The default (TF32) path. Its native step carries noise of relative size `floor` against the direct
-            // CPU path, and the update - the difference of two steps whose noise does not cancel - has size
-            // `moved`: its direction is off by up to about floor / moved, so its cosine falls short of 1 by up to
-            // about (floor / moved)^2 / 2. The bound is that, doubled, from this run's own floor; measured 1 - cos
-            // was 0.23-0.47 (floor / moved)^2 across these cases.
-            // The update has a floor of its own the base step does not show: the packed factors are F16 on ggml_cuda
-            // and ggml-cuda rounds the activations of an F16 product to F16, so the update is off by about 2 u (u =
-            // 2^-11, F16's unit roundoff) and its cosine short of 1 by about (2 u)^2 / 2 whatever the base floor. Where
-            // the base products are F32-exact (sm_86: floor 8.1e-6, against 6.1e-4 where cuBLAS runs TF32) that term
-            // dominates: the "all" case measured 1 - cos 3.1e-7 there against (floor / moved)^2 = 4.5e-10. So the
-            // bound is the larger of the two, the F16 term doubled: (2 u)^2 = 2^-20 = 9.5e-7.
+            // The default (TF32) path: the update, a difference of two noisy steps, is off by up to about floor / moved in
+            // direction, and the F16 factors add (2 u)^2 = 2^-20 of their own (see the H3-Image LoRA tests).
             double bound = Math.Max((floor / moved) * (floor / moved), Math.Pow(2, -20));
-            Assert.True(rel <= 2e-3, $"{id}: {backend} ({attention}, TF32) vs direct CPU rel {rel:E3} > 2e-3 (no-plug-in floor {floor:E3})");
-            Assert.True(1 - cosine <= bound,
-                $"{id}: {backend} ({attention}, TF32) update 1 - cosine {1 - cosine:E3} > (floor / moved)^2 = {bound:E3}");
-            // The same step with the DiT's weight products in pedantic F32: held to the bound every device meets.
-            attentionPath.Set("TS_H3_CUDA_F32_PRODUCTS", "1");
+            Assert.True(rel <= 2e-3, $"{id}: {backend} (TF32) vs managed rel {rel:E3} > 2e-3 (no-plug-in floor {floor:E3})");
+            Assert.True(1 - cosine <= bound, $"{id}: {backend} (TF32) update 1 - cosine {1 - cosine:E3} > {bound:E3}");
+            products.Set("TS_H3_CUDA_F32_PRODUCTS", "1");
             (floor, rel, cosine) = Compare(", TS_H3_CUDA_F32_PRODUCTS=1");
         }
-        if (backend == BackendType.GgmlCpu && !flash)
+        if (backend == BackendType.GgmlCpu)
         {
-            Assert.True(rel <= 1e-4, $"{id}: GgmlCpu ({attention}) vs direct CPU rel {rel:E3} > 1e-4 (no-plug-in floor {floor:E3})");
+            Assert.True(rel <= 1e-4, $"{id}: GgmlCpu vs managed rel {rel:E3} > 1e-4 (no-plug-in floor {floor:E3})");
         }
         else
         {
-            Assert.True(rel <= 2e-3, $"{id}: {backend} ({attention}) vs direct CPU rel {rel:E3} > 2e-3 (no-plug-in floor {floor:E3})");
-            Assert.True(cosine >= 0.9999, $"{id}: {backend} ({attention}) update cosine {cosine:F7} < 0.9999");
+            Assert.True(rel <= 2e-3, $"{id}: {backend} vs managed rel {rel:E3} > 2e-3 (no-plug-in floor {floor:E3})");
+            Assert.True(cosine >= 0.9999, $"{id}: {backend} update cosine {cosine:F7} < 0.9999");
         }
     }
 
     // ---- strength 0 ----------------------------------------------------------------------------
 
     [Fact]
-    public void StrengthZero_IsBitIdenticalToNoPlugIn_OnBothPaths()
+    public void StrengthZero_IsBitIdenticalToNoPlugIn_OnBothExecutors()
     {
         var adapter = Build("all");
         var spec = new LoraSpec(Plugin(adapter), 0f);
-        using var packed = LoadSet(spec, _base, TestGates.PinnedGgmlBackend, direct: false);
-        using var exact = LoadSet(spec, _base, BackendType.Cpu, direct: true);
+        using var packed = LoadSet(spec, _base, TestGates.PinnedGgmlBackend, tensorExecutor: false);
+        using var exact = LoadSet(spec, _base, BackendType.Cpu, tensorExecutor: true);
         // Every term is kept, with zero up factors: the identity probe exercises the whole wiring.
         Assert.Equal(adapter.Targets.Count(), packed.TermCount);
         Assert.Equal(new[] { 0f }, packed.Scales);
-        using var native = Native(_base);
-        using var direct = Direct(_base);
+        using var graph = Graph(_base);
+        using var managed = Managed(_base);
 
-        TinyH3Step.AssertBits(TinyH3Step.Run(native, null), TinyH3Step.Run(native, packed), $"{TestGates.PinnedGgmlBackend} strength 0");
-        TinyH3Step.AssertBits(TinyH3Step.Run(direct, null), TinyH3Step.Run(direct, exact), "direct CPU strength 0");
+        TinyH3Step.AssertBits(TinyH3Step.Run(graph, null), TinyH3Step.Run(graph, packed), $"{TestGates.PinnedGgmlBackend} strength 0");
+        TinyH3Step.AssertBits(TinyH3Step.Run(managed, null), TinyH3Step.Run(managed, exact), "managed strength 0");
     }
 
-    // ---- the direct path's refined-text cache --------------------------------------------------
-
+    /// <summary>A plug-in switched off, on and off again: each step binds the set it is given (its plan is recompiled for
+    /// it), so "on" never runs with the plain checkpoint's plan nor "off" with the plug-in's.</summary>
     [Fact]
-    public void RefinedTextCache_FollowsThePlugIn_OffOnOff()
+    public void ThePlanFollowsThePlugIn_OffOnOff()
     {
-        // Refiner-only terms change the step through the refined text alone, so a cache that
-        // ignored the plug-in would hand the plain tokens back and the "on" step would match "off".
-        using var set = LoadSet(new LoraSpec(Plugin(Build("refiner"))), _base, BackendType.Cpu, direct: true);
-        using var dit = Direct(_base);
+        using var set = LoadSet(new LoraSpec(Plugin(Build("refiner"))), _base, BackendType.Cpu, tensorExecutor: true);
+        using var dit = Managed(_base);
         float[] off = TinyH3Step.Run(dit, null);
         float[] on = TinyH3Step.Run(dit, set);
         float[] offAgain = TinyH3Step.Run(dit, null);
         float[] onAgain = TinyH3Step.Run(dit, set);
-        float[] onAgainSameSet = TinyH3Step.Run(dit, set, sigma: .75f);
         Assert.True(TinyH3Step.Rel(on, off) > 1e-3, "the refiner-only plug-in did not change the step");
         TinyH3Step.AssertBits(off, offAgain, "off after on");
         TinyH3Step.AssertBits(on, onAgain, "on after off");
-        TinyH3Step.AssertBits(on, onAgainSameSet, "on, cached");
 
-        using var fresh = Direct(_base);
-        TinyH3Step.AssertBits(on, TinyH3Step.Run(fresh, set), "on, uncached");
+        using var fresh = Managed(_base);
+        TinyH3Step.AssertBits(on, TinyH3Step.Run(fresh, set), "on, a fresh denoiser");
 
-        // A residency release drops the built factors and the cache; the next step rebuilds both.
-        dit.ReleaseDeviceResidency();
+        // A residency release drops the plan; the next step compiles it again with the same factors.
+        dit.ReleaseDevice();
         TinyH3Step.AssertBits(on, TinyH3Step.Run(dit, set), "on after a residency release");
     }
 
     // ---- refusals ----------------------------------------------------------------------------
 
     [Fact]
-    public void NativeForward_RefusesACorruptedAdapter_WithTheNativeMessage()
-    {
-        using var packed = LoadSet(new LoraSpec(Plugin(Build("all"))), _base, TestGates.PinnedGgmlBackend, direct: false);
-        using var native = Native(_base);
-        float[] good = TinyH3Step.Run(native, packed);
-
-        // A managed build paired with a GgmlOps of another adapter size.
-        IntPtr adapter = packed.NativeAdapter;
-        int structBytes = Marshal.ReadInt32(adapter);
-        Assert.Equal(Marshal.SizeOf<H3DitAdapter>(), structBytes);
-        Marshal.WriteInt32(adapter, 31);
-        try
-        {
-            var e = Assert.Throws<InvalidOperationException>(() => TinyH3Step.Run(native, packed));
-            Assert.Equal("MiniMax-H3 DiT forward failed: MiniMaxH3DitForward: LoRA adapter is 31 bytes, this GgmlOps expects 32; " +
-                "the managed TensorSharp build and the native library differ, rebuild GgmlOps.", e.Message);
-        }
-        finally { Marshal.WriteInt32(adapter, structBytes); }
-
-        // One part's factor type, named by block and diffusers module.
-        var descriptor = Marshal.PtrToStructure<H3DitAdapter>(adapter);
-        IntPtr vType = descriptor.Blocks + Marshal.SizeOf<H3BlockLora>()
-            + (int)Marshal.OffsetOf<H3BlockLora>(nameof(H3BlockLora.V)) + (int)Marshal.OffsetOf<H3Lora>(nameof(H3Lora.Type));
-        int type = Marshal.ReadInt32(vType);
-        Marshal.WriteInt32(vType, 7);
-        try
-        {
-            var e = Assert.Throws<InvalidOperationException>(() => TinyH3Step.Run(native, packed));
-            Assert.Equal("MiniMax-H3 DiT forward failed: MiniMaxH3DitForward: LoRA block 1 attn.to_v: factor type 7 is " +
-                "neither F32 (0) nor F16 (1).", e.Message);
-        }
-        finally { Marshal.WriteInt32(vType, type); }
-
-        TinyH3Step.AssertBits(good, TinyH3Step.Run(native, packed), "after the repairs");
-    }
-
-    [Fact]
-    public void ASetLoadedForTheOtherPath_OrDisposed_IsRefused()
+    public void ASetPackedForTheOtherExecutor_OrDisposed_IsRefused()
     {
         string manifest = Plugin(Build("q"));
-        using var packed = LoadSet(new LoraSpec(manifest), _base, TestGates.PinnedGgmlBackend, direct: false);
-        using var exact = LoadSet(new LoraSpec(manifest), _base, BackendType.Cpu, direct: true);
-        using var native = Native(_base);
-        using var direct = Direct(_base);
-        Assert.Contains("loaded for a direct backend", Assert.Throws<ArgumentException>(() => TinyH3Step.Run(native, exact)).Message);
-        Assert.Contains("packed for the native graph", Assert.Throws<ArgumentException>(() => TinyH3Step.Run(direct, packed)).Message);
+        using var packed = LoadSet(new LoraSpec(manifest), _base, TestGates.PinnedGgmlBackend, tensorExecutor: false);
+        using var exact = LoadSet(new LoraSpec(manifest), _base, BackendType.Cpu, tensorExecutor: true);
+        using var graph = Graph(_base);
+        using var managed = Managed(_base);
+        Assert.Contains("packed for a tensor executor", Assert.Throws<ArgumentException>(() => TinyH3Step.Run(graph, exact)).Message);
+        Assert.Contains("packed for the GGML graph executor", Assert.Throws<ArgumentException>(() => TinyH3Step.Run(managed, packed)).Message);
 
         packed.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => TinyH3Step.Run(native, packed));
+        Assert.Throws<ObjectDisposedException>(() => TinyH3Step.Run(graph, packed));
         exact.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => TinyH3Step.Run(direct, exact));
+        Assert.Throws<ObjectDisposedException>(() => TinyH3Step.Run(managed, exact));
     }
 }

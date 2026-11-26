@@ -614,18 +614,22 @@ namespace TensorSharp.Models.Direct
                     throw new InvalidOperationException("CUDA ModulateRows kernel unavailable (stale PTX?).");
                 return;
             }
-            unsafe
+            ModulateRowsOnHost(y, x, shift, scale, rowFrom, rowCount);
+        }
+
+        /// <summary><see cref="ModulateRows"/> on host tensors (contiguous F32 rows; shift and scale [cols]).</summary>
+        internal static unsafe void ModulateRowsOnHost(Tensor y, Tensor x, Tensor shift, Tensor scale, long rowFrom, long rowCount)
+        {
+            long cols = x.Sizes[1];
+            float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
+            float* py = (float*)CpuNativeHelpers.GetBufferStart(y);
+            float* ps = (float*)CpuNativeHelpers.GetBufferStart(shift);
+            float* pc = (float*)CpuNativeHelpers.GetBufferStart(scale);
+            RowsParallel(rowCount, rr =>
             {
-                float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
-                float* py = (float*)CpuNativeHelpers.GetBufferStart(y);
-                float* ps = (float*)CpuNativeHelpers.GetBufferStart(shift);
-                float* pc = (float*)CpuNativeHelpers.GetBufferStart(scale);
-                RowsParallel(rowCount, rr =>
-                {
-                    long r = rowFrom + rr;
-                    ModulateRowSimd(py + r * cols, px + r * cols, pc, ps, cols);
-                });
-            }
+                long r = rowFrom + rr;
+                ModulateRowSimd(py + r * cols, px + r * cols, pc, ps, cols);
+            });
         }
 
         /// <summary>Gated residual x[r, c] += v[r, c] * gate[c] over rows [rowFrom, rowFrom+rowCount).</summary>
@@ -648,17 +652,27 @@ namespace TensorSharp.Models.Direct
                     throw new InvalidOperationException("CUDA GateAddRows kernel unavailable (stale PTX?).");
                 return;
             }
-            unsafe
+            GateAddRowsOnHost(x, v, gate, rowFrom, rowCount);
+        }
+
+        /// <summary><see cref="GateAddRows"/> on host tensors (contiguous F32 rows; gate [cols]).</summary>
+        internal static void GateAddRowsOnHost(Tensor x, Tensor v, Tensor gate, long rowFrom, long rowCount)
+            => GateAddRowsOnHost(x, x, v, gate, rowFrom, rowCount);
+
+        /// <summary>y[r, c] = x[r, c] + v[r, c] * gate[c] over rows [rowFrom, rowFrom + rowCount) on host tensors (contiguous F32
+        /// rows; gate [cols]): <see cref="GateAddRows"/>' arithmetic into another tensor (y and x may alias).</summary>
+        internal static unsafe void GateAddRowsOnHost(Tensor y, Tensor x, Tensor v, Tensor gate, long rowFrom, long rowCount)
+        {
+            long cols = x.Sizes[1];
+            float* py = (float*)CpuNativeHelpers.GetBufferStart(y);
+            float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
+            float* pv = (float*)CpuNativeHelpers.GetBufferStart(v);
+            float* pg = (float*)CpuNativeHelpers.GetBufferStart(gate);
+            RowsParallel(rowCount, rr =>
             {
-                float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
-                float* pv = (float*)CpuNativeHelpers.GetBufferStart(v);
-                float* pg = (float*)CpuNativeHelpers.GetBufferStart(gate);
-                RowsParallel(rowCount, rr =>
-                {
-                    long r = rowFrom + rr;
-                    GateAddRowSimd(px + r * cols, pv + r * cols, pg, cols);
-                });
-            }
+                long r = rowFrom + rr;
+                GateAddRowSimd(py + r * cols, px + r * cols, pv + r * cols, pg, cols);
+            });
         }
 
         /// <summary>Scale rows by a per-column vector: x[r, c] *= gain[c] (RMS/LayerNorm gains
@@ -730,7 +744,7 @@ namespace TensorSharp.Models.Direct
         }
 
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
-        private static unsafe void GateAddRowSimd(float* x, float* v, float* gate, long cols)
+        private static unsafe void GateAddRowSimd(float* y, float* x, float* v, float* gate, long cols)
         {
             int w = System.Numerics.Vector<float>.Count;
             long c = 0;
@@ -739,9 +753,9 @@ namespace TensorSharp.Models.Direct
                 var vx = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + c);
                 var vv = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(v + c);
                 var vg = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(gate + c);
-                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(x + c, vx + vv * vg);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(y + c, vx + vv * vg);
             }
-            for (; c < cols; c++) x[c] += v[c] * gate[c];
+            for (; c < cols; c++) y[c] = x[c] + v[c] * gate[c];
         }
 
         // ---- norms -------------------------------------------------------------------
@@ -928,7 +942,7 @@ namespace TensorSharp.Models.Direct
         /// GEMMs and the softmax); otherwise the blocks run in turn on the parallel GEMM. Same
         /// arithmetic as the chunked path, which still serves the layouts this one declines.
         /// </summary>
-        private static unsafe bool TryCpuBlockedAttention(Tensor outT, Tensor q, Tensor k, Tensor v, Tensor bias,
+        internal static unsafe bool TryCpuBlockedAttention(Tensor outT, Tensor q, Tensor k, Tensor v, Tensor bias,
                                                           int heads, int sq, int sk, int hd, float scale)
         {
             if (q.DimensionCount != 2 || k.DimensionCount != 2 || v.DimensionCount != 2 ||

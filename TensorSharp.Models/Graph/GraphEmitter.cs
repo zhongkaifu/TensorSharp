@@ -39,6 +39,13 @@ namespace TensorSharp.Models.Graph
             _executor = executor ?? throw new ArgumentNullException(nameof(executor));
         }
 
+        /// <summary>As <see cref="GraphEmitter(IGraphExecutor, bool)"/>, the program's block-format products keeping their
+        /// activations in F32 when <paramref name="floatProducts"/> (<see cref="GraphProgram.FloatProducts"/>).</summary>
+        public GraphEmitter(IGraphExecutor executor, bool record, bool floatProducts) : this(record, floatProducts)
+        {
+            _executor = executor ?? throw new ArgumentNullException(nameof(executor));
+        }
+
         /// <summary>A trace whose executor a derived emitter supplies (<see cref="Executor"/>). <paramref name="floatProducts"/>
         /// keeps the program's block-format products' activations in F32 (<see cref="GraphProgram.FloatProducts"/>).</summary>
         private protected GraphEmitter(bool record, bool floatProducts = false)

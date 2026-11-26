@@ -2038,15 +2038,13 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
-| 视频 VAE 加载前先交还去噪器的设备驻留 | 两者放不进空闲显存时开启（16 GB 卡上解码峰值 16 041 → 约 5 600 MiB，640×384 上值 22 秒） | —（按实测空闲显存自动判断） | — |
-| 第一次上传前预读去噪器 GGUF | `3` —— 预读与上传流水线并行 | `TS_H3_PREFAULT`：`0` 关闭，`1` 串行，`2` 与文本条件编码重叠（更差——编码器自己的 17 GB 会流过同一份页缓存，把刚放进去的页挤掉），`3` 默认 | — |
-| 预读使用的读取线程 | macOS `1`，Linux `16` | `TS_H3_PREFAULT_THREADS=N`。各线程领取同一遍扫描中相邻的 8 MiB 块，并跳过已缓存的块。本地 SSD 一个流就能跑满；按线程把文件切成独立区间在那里更慢（16 GB RTX 3080 Laptop、640×384、三次取最好：1 流 63.9 s，4 流 64.9 s，16 流 66.6 s）。网络卷则需要并发：A40 pod 单线程 0.31 GiB/s，16 线程 2.3 GiB/s | — |
+| 视频 VAE 加载前先交还去噪器的设备驻留 | 两者放不进空闲显存时开启（16 GB 卡上解码峰值 16 041 → 约 5 600 MiB，640×384 上值 22 秒）；`ggml_metal` 上去噪器与两个 VAE 在每个阶段后释放 | —（扩散运行时的驻留计划，按实测空闲显存判断） | — |
+| 第一次上传前预读去噪器 GGUF | 开启，在文本编码器运行之后（并发 8 MiB 读取：macOS 1 个读取线程，Linux 16 个，网络卷需要这种并发） | —（`TS_H3_PREFAULT` 与 `TS_H3_PREFAULT_THREADS` 已随退役管线删除） | — |
 | `ggml_cuda` 文本编码器预读 | 开启 | `TS_VIDEO_READAHEAD=0` 关闭；`TS_VIDEO_READAHEAD_WORKERS=N`（1–32）设置读取线程。上传按缺页逐页预热编码器 GGUF 时，它并发地提前读取文件（A40 pod、640×384×22、四次中位数：主干 13.3 → 6.4 s，输出一致） | — |
 | 文本编码器主干分组运行，每组用完即释放其设备副本 | 关闭 | `TS_H3_TE_GROUP=N` 指定每组层数 —— 能消掉编码器自身的溢出（峰值 16 041 → 12 981 MiB）且逐位一致，但在 16 GB RTX 3080 Laptop 上实测慢约 3 秒：一次性 prefill 每个权重只读一遍，分组照样要搬完 17 GB，还多出分配/失效的开销 | — |
-| 分阶段耗时（编码器打开 / 主干 / 拆卸、预读、每个去噪步、VAE 打开 / 解码） | 关闭 | `TS_H3_PHASE=1` | — |
-| 每步的潜变量 / 速度幅值 | 关闭 | `TS_H3_TRACE=1` | — |
-| 执行路径 | 七张原生整网络 ggml 计算图 | — | `--backend cpu` 改用纯 C# 跑同一条流程（t2v、i2v、fl2v 与参考条件） |
-| 托管路径与 GGML 的对拍诊断 | 关闭 | `TS_H3_DUMP_TE`、`TS_H3_DUMP_VEL_V`、`TS_H3_DUMP_VEL_A`、`TS_H3_DUMP_VIS` 把这些张量写到磁盘，使两条路径可以在**同一次**前向上比较；`TS_H3_DIT_LAYERS=N` 在**两条路径上**同时截断主干，把比较变成误差随深度的曲线；`TS_H3_NO_FLASH=1` 让 GGML 走显式 softmax 注意力而不是它的 flash 内核 | — |
+| 各阶段与每步耗时 | 开启（`[diffusion]` 行） | —（`TS_H3_PHASE` 与 `TS_H3_TRACE` 已随退役管线删除） | — |
+| 执行路径 | 扩散运行时：去噪器的每一步是一个图程序（ggml 后端上由 GGML 图执行器运行，`cpu`、`cuda`、`mlx` 上由张量执行器运行），编码器与 VAE 为原生 ggml 计算图 | — | `--backend cpu` 改用纯 C# 跑同一条流程（t2v、i2v、fl2v 与参考条件） |
+| GGML 注意力诊断 | 关闭 | `TS_H3_NO_FLASH=1` 让 GGML 走显式 softmax 注意力而不是它的 flash 内核（转储与主干截断开关已随退役管线删除） | — |
 | 伴随网络与分词器覆盖 | 在去噪器同目录解析 | `TS_VIDEO_TEXT_ENCODER`、`TS_VIDEO_VAE`、`TS_VIDEO_AUDIO_VAE`、`TS_VIDEO_TOKENIZER`、`TS_VIDEO_UPSCALER`、`TS_VIDEO_DIFFUSION_VAE` | `--video-text-encoder`、`--video-vae`、`--video-upscaler`、`--video-diffusion-vae`、`--audio-vae` |
 
 #### Qwen-Image-2.1

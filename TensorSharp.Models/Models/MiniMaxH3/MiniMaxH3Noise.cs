@@ -22,7 +22,7 @@ internal static class MiniMaxH3Noise
         // that counter geometry rather than drawing separate video/audio streams.
         float[] packed = PhiloxNoise.Draw(checked(volume * (MiniMaxH3Geometry.VideoLatentChannels + extraChannels)), seed);
         float[] thwc = ToThwc(packed, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth);
-        float[] video = MiniMaxH3DiT.PatchifyVideo(thwc, shape.LatentFrames, shape.LatentHeight,
+        float[] video = MiniMaxH3Latents.PatchifyVideo(thwc, shape.LatentFrames, shape.LatentHeight,
             shape.LatentWidth, MiniMaxH3Geometry.VideoLatentChannels);
         var audio = new float[audioLength];
         for (int channel = 0; channel < MiniMaxH3Geometry.AudioChannels; ++channel)

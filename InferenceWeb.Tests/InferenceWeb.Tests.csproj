@@ -54,6 +54,7 @@
     <EmbeddedResource Include="Fixtures/MiniMaxH3Image/diffusers-edit-golden.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3Image/vae-encoder-oracle.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3Image/LegacyGoldens/*.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3/LegacyGoldens/*.json" />
     <EmbeddedResource Include="Fixtures/QwenImage21/LegacyGoldens/*.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3Image/PinnedQ4K/denoiser-seed2051.bin.gz" LogicalName="InferenceWeb.Tests.Fixtures.MiniMaxH3Image.PinnedQ4K.denoiser-seed2051.bin.gz" />
     <EmbeddedResource Include="Fixtures/MiniMaxM3/chat_reference.json" />

@@ -67,8 +67,10 @@ namespace TensorSharp.Cuda
         [RegisterOpStorageType("abs", typeof(CudaStorage))]
         public static Tensor Abs(Tensor result, Tensor src) => Unary("abs", result, src);
 
+        /// <summary>-x as x * -1 on the device's scalar kernel (the same value for every number; there is no negation kernel,
+        /// and the element-by-element host fallback took a device round trip a call).</summary>
         [RegisterOpStorageType("neg", typeof(CudaStorage))]
-        public static Tensor Neg(Tensor result, Tensor src) => Unary("neg", result, src);
+        public static Tensor Neg(Tensor result, Tensor src) => Scalar("mulv", result, src, -1f, CudaScalarOp.Mul);
 
         [RegisterOpStorageType("sign", typeof(CudaStorage))]
         public static Tensor Sign(Tensor result, Tensor src) => Unary("sign", result, src);

@@ -805,6 +805,8 @@ namespace TensorSharp.Graph
                 }
                 var inputs = new Tensor[region.Srcs.Length];
                 var weights = new IGraphWeight[region.Srcs.Length];
+                var hostInts = new int[region.Srcs.Length][];
+                var hostFloats = new float[region.Srcs.Length][];
                 // A region whose kernel finishes writes left for later to its inputs itself takes them unread.
                 bool unread = _x.RegionFinishesDeferredInputs((GraphFusion)region.Node);
                 for (int i = 0; i < inputs.Length; i++)
@@ -815,7 +817,9 @@ namespace TensorSharp.Graph
                         weights[i] = weight;
                         continue;
                     }
+                    hostInts[i] = _values[region.Srcs[i]].Ints;
                     inputs[i] = _x.Device(_values, region.Srcs[i], Run, read: !unread);
+                    hostFloats[i] = _values[region.Srcs[i]].Floats;
                     if (!_x.RegionReadsStridedInputs((GraphFusion)region.Node) && !inputs[i].IsContiguous())
                     {
                         if (unread && _x.PendingWrites) _x.BeforeRead(inputs[i]);
@@ -843,7 +847,11 @@ namespace TensorSharp.Graph
                     return;
                 }
                 var outs = new Tensor[results.Length];
-                if (_x.TryFused((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs))
+                bool fused;
+                (_x._regionInputInts, _x._regionInputFloats) = (hostInts, hostFloats);
+                try { fused = _x.TryFused((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs); }
+                finally { (_x._regionInputInts, _x._regionInputFloats) = (null, null); }
+                if (fused)
                 {
                     for (int i = 0; i < results.Length; i++)
                     {
@@ -1429,6 +1437,168 @@ namespace TensorSharp.Graph
         /// and the region's ops run instead.</summary>
         protected virtual bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results) => false;
 
+
+        // The host values of the inputs of the region TryFused is serving that were bound from the host (inputs fixed for a
+        // request: a packed sequence's segment table, a rotary table), by input index; null outside TryFused or for an input
+        // that has none.
+        private int[][] _regionInputInts;
+        private float[][] _regionInputFloats;
+
+        /// <summary>While <see cref="TryFused"/> runs: the host values of the region's input <paramref name="input"/> where it is
+        /// an integer input bound from the host (a segment table), else null.</summary>
+        protected int[] RegionInputInts(int input) => _regionInputInts is { } a && (uint)input < (uint)a.Length ? a[input] : null;
+
+        /// <summary>While <see cref="TryFused"/> runs: the host values of the region's input <paramref name="input"/> where it is
+        /// an F32 or F16 input bound from the host (a rotary table), else null. The same array for every region of a run that
+        /// reads the input.</summary>
+        protected float[] RegionInputFloats(int input) => _regionInputFloats is { } a && (uint)input < (uint)a.Length ? a[input] : null;
+
+        /// <summary>Runs <see cref="GraphFusion.AdaLnModulate"/> and <see cref="GraphFusion.GatedResidual"/> as their ops where an
+        /// executor would serve them (tests).</summary>
+        internal bool DitModulationServedDisabledForTests { get; set; }
+
+        /// <summary>Whether this program's <see cref="GraphFusion.AdaLnModulate"/> and <see cref="GraphFusion.GatedResidual"/>
+        /// regions run on the executor's own row kernels (a diffusion transformer's step, as <see cref="ServesDitAttention"/>
+        /// takes it): the RMS norm with its weight in one pass, then each segment's rows modulated (x (1 + scale) + shift) or
+        /// gated into the residual in place, as the retired direct DiTs ran them. The region's ops norm, multiply by the weight
+        /// and modulate each segment as tensors of their own and concatenate them: several more passes over the sequence a
+        /// region, four regions a block.</summary>
+        protected bool ServesDitModulation => ServesWideDitStep && !DitModulationServedDisabledForTests;
+
+        /// <summary>Modulation regions this executor served itself (tests).</summary>
+        protected internal long DitModulationsServedForTests;
+
+        /// <summary>
+        /// The segments of a served modulation region (<see cref="ServesDitModulation"/>): from the host values of its segment
+        /// table (input <paramref name="table"/>, [3, segments] I32: start, end, column base), each non-empty run's first row,
+        /// row count and column base; false where the table has no host values or is not sorted, contiguous and covering
+        /// [0, <paramref name="rows"/>) with every column base plus <paramref name="maxOffset"/> inside <paramref name="columns"/>.
+        /// </summary>
+        protected bool TryRegionSegments(int table, long rows, long columns, long maxOffset, out (long Start, long Count, long Column)[] segments)
+        {
+            segments = null;
+            int[] t = RegionInputInts(table);
+            if (t == null || t.Length == 0 || t.Length % 3 != 0 || maxOffset < 0) return false;
+            var list = new List<(long, long, long)>(t.Length / 3);
+            long at = 0;
+            for (int i = 0; i < t.Length; i += 3)
+            {
+                long start = t[i], end = t[i + 1], column = t[i + 2];
+                if (start != at || end < start || end > rows || column < 0 || column + maxOffset >= columns) return false;
+                if (end > start) list.Add((start, end - start, column));
+                at = end;
+            }
+            if (at != rows) return false;
+            segments = list.ToArray();
+            return true;
+        }
+
+        /// <summary>A region operand of ggml extents [hidden, rows] (any trailing ones) as a contiguous [rows, hidden] view; null
+        /// for any other shape.</summary>
+        protected static Tensor Rows2(Tensor t, long hidden)
+        {
+            if (t == null || !t.IsContiguous() || hidden <= 0 || t.Sizes[^1] != hidden) return null;
+            long n = t.ElementCount();
+            if (n % hidden != 0) return null;
+            return t.DimensionCount == 2 ? t.CopyRef() : t.View(n / hidden, hidden);
+        }
+
+        /// <summary>Runs <see cref="GraphFusion.DitAttention"/> as its ops where an executor would serve it (tests).</summary>
+        internal bool DitAttentionServedDisabledForTests { get; set; }
+
+        /// <summary>The executor serves a wide-token program's diffusion-transformer regions (<see cref="ServesDitAttention"/>,
+        /// <see cref="ServesLoraLinearInPlace"/>, <see cref="ServesDitModulation"/>) whether or not its products keep F32
+        /// activations: set by a family that owns this executor and whose step takes the executor's own products (MiniMax-H3
+        /// on the managed executor, as the retired direct CPU DiT took them).</summary>
+        public bool ServesWideDitRegions { get; init; }
+
+        /// <summary>Whether this program's <see cref="GraphFusion.DitAttention"/> regions run on the executor's own attention: a
+        /// diffusion transformer's step over thousands of rows (WideTokenProducts with FloatProducts, or on an executor that
+        /// <see cref="ServesWideDitRegions"/>), whose full attention the generic path would compute with every head's scores of
+        /// the whole sequence held at once.</summary>
+        protected bool ServesDitAttention => ServesWideDitStep && !DitAttentionServedDisabledForTests;
+
+        private bool ServesWideDitStep => WideTokenProducts && (FloatProducts || ServesWideDitRegions);
+
+        /// <summary>A region operand of ggml extents [d, heads, rows] (or [d, heads, rows, 1]) as a [rows, heads, d] view; null
+        /// for any other shape or a null operand.</summary>
+        protected static Tensor Rows3(Tensor t)
+        {
+            if (t == null) return null;
+            if (t.DimensionCount == 3) return t.CopyRef();
+            return t.DimensionCount == 4 && t.Sizes[0] == 1 ? t.Select(0, 0) : null;
+        }
+
+        /// <summary>DiT attentions and LoRA regions this executor served itself (tests).</summary>
+        protected internal long DitAttentionsServedForTests, LoraLinearsServedForTests;
+
+        /// <summary>Runs <see cref="GraphFusion.LoraLinear"/> as its ops where an executor would serve it in place (tests: the
+        /// served region gives their bytes).</summary>
+        internal bool LoraLinearInPlaceDisabledForTests { get; set; }
+
+        /// <summary>Whether this program's <see cref="GraphFusion.LoraLinear"/> regions run in place
+        /// (<see cref="TryLoraLinearInPlace"/>): products over thousands of rows (a diffusion transformer's step on a tensor
+        /// executor, as <see cref="ServesDitAttention"/> takes it).</summary>
+        protected bool ServesLoraLinearInPlace => ServesWideDitStep && !LoraLinearInPlaceDisabledForTests;
+
+        /// <summary>
+        /// <see cref="GraphFusion.LoraLinear"/> in place, for an executor that serves it (<see cref="ServesLoraLinearInPlace"/>):
+        /// w · x once, then each part's up · (down · x) added into its slot's columns of that product. The region's ops compute
+        /// the same products and the same adds, but build every slot's sum as a tensor of its own and concatenate them (and
+        /// fc1's whole update beside its product): for MiniMax-H3's Turbo plug-in on direct CUDA that took 1.5 GB more device
+        /// memory at 1,768 tokens and 2.2 GB at 2,250 than the retired direct DiT's in-place updates, and 8% more time a step
+        /// at 2,250. The base product is the executor's own (<see cref="QuantizedMatMul"/>), without any power-of-two scale pair
+        /// the region's product may carry. The bias form (Ip[2] = 1) and any other layout run the region's ops.
+        /// </summary>
+        protected bool TryLoraLinearInPlace(Tensor[] inputs, IGraphWeight[] weights, long[] ip, Tensor[] results)
+        {
+            if (ip == null || ip.Length < 2 || (ip.Length > 2 && ip[2] != 0) || inputs.Length < 4 || (inputs.Length - 2) % 2 != 0
+                || weights.Length != inputs.Length || weights[1] is not { } w || w.Ne2 > 1)
+                return false;
+            Tensor x = inputs[0];
+            if (x == null || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() % w.Ne0 != 0) return false;
+            long mask = ip[0], slotRows = ip[1] > 0 ? ip[1] : w.Ne1;
+            int parts = (inputs.Length - 2) / 2;
+            if (slotRows <= 0 || w.Ne1 % slotRows != 0 || parts > 3) return false;
+            var slots = new int[parts];
+            for (int i = 0, slot = 0; i < parts; i++, slot++)
+            {
+                while (slot < 3 && (mask & (1L << slot)) == 0) slot++;
+                if (slot >= 3 || weights[2 + 2 * i] is not { } down || weights[3 + 2 * i] is not { } up || down.Ne2 > 1 || up.Ne2 > 1
+                    || down.Ne0 != w.Ne0 || up.Ne0 != down.Ne1 || up.Ne1 != slotRows || (slot + 1) * slotRows > w.Ne1)
+                    return false;
+                slots[i] = slot;
+            }
+            long rows = x.ElementCount() / w.Ne0;
+            using Tensor x2 = x.View(rows, w.Ne0);
+            Tensor y = QuantizedMatMul(w, x2);   // [rows, out]
+            try
+            {
+                for (int i = 0; i < parts; i++)
+                {
+                    using Tensor shrunk = QuantizedMatMul(weights[2 + 2 * i], x2);   // [rows, rank]
+                    using Tensor delta = QuantizedMatMul(weights[3 + 2 * i], shrunk);   // [rows, slot rows]
+                    if (slotRows == w.Ne1) Ops.Add(y, y, delta);
+                    else
+                    {
+                        // The slot's columns through a contiguous copy: an elementwise add over a strided view is not every
+                        // backend's kernel (direct CUDA's ran it on the host, 0.9 s a q/k/v slot at 1,768 tokens).
+                        using Tensor band = y.Narrow(1, slots[i] * slotRows, slotRows);
+                        using Tensor sum = Ops.NewContiguous(band);
+                        Ops.Add(sum, sum, delta);
+                        Ops.Copy(band, sum);
+                    }
+                }
+            }
+            catch
+            {
+                y.Dispose();
+                throw;
+            }
+            results[0] = y;
+            LoraLinearsServedForTests++;
+            return true;
+        }
 
         /// <summary>Whether a region of <paramref name="kind"/> (<see cref="GraphFusion.ConcurrentBranch"/>) runs its ops at its
         /// end, where <see cref="BeginConcurrent"/> may move them beside the step's later work.</summary>

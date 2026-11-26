@@ -227,6 +227,60 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>
+        /// result = alpha m1 m2 over a batch (beta 0) where each operand's matrices have any row stride and batch stride: m1's
+        /// and the result's rows unit-stride, m2's rows or columns. The heads of an attention laid out side by side in each row
+        /// ([rows, heads, d] viewed as [heads, rows, d]) multiply where they lie, without copying them out or the result back.
+        /// False (nothing written) for any other layout.
+        /// </summary>
+        internal static bool TryAddmmBatchStrided(Tensor result, float alpha, Tensor m1, Tensor m2, int computeType = Unnamed)
+        {
+            if (!TryGetCudaStorage(result, out CudaStorage resultStorage) || !TryGetCudaStorage(m1, out CudaStorage m1Storage)
+                || !TryGetCudaStorage(m2, out CudaStorage m2Storage))
+                return false;
+            if (result.ElementType != DType.Float32 || m1.ElementType != DType.Float32 || m2.ElementType != DType.Float32
+                || result.DimensionCount != 3 || m1.DimensionCount != 3 || m2.DimensionCount != 3)
+                return false;
+            long batch = m1.Sizes[0], rows = m1.Sizes[1], shared = m1.Sizes[2], cols = m2.Sizes[2];
+            if (m2.Sizes[0] != batch || m2.Sizes[1] != shared || result.Sizes[0] != batch || result.Sizes[1] != rows
+                || result.Sizes[2] != cols || batch <= 0 || rows <= 0 || shared <= 0 || cols <= 0)
+                return false;
+            // Column-major as cuBLAS sees row-major data: C^T [cols, rows] = op(A) [cols, shared] B [shared, rows], A = m2, B = m1.
+            if (m1.Strides[2] != 1 || m1.Strides[1] < shared || result.Strides[2] != 1 || result.Strides[1] < cols
+                || m1.Strides[0] < 0 || m2.Strides[0] < 0 || result.Strides[0] < 0)
+                return false;
+            int transa;
+            long lda;
+            if (m2.Strides[2] == 1 && m2.Strides[1] >= cols) { transa = CublasApi.CUBLAS_OP_N; lda = m2.Strides[1]; }
+            else if (m2.Strides[1] == 1 && m2.Strides[2] >= shared) { transa = CublasApi.CUBLAS_OP_T; lda = m2.Strides[2]; }
+            else return false;
+
+            resultStorage.EnsureDeviceCurrent();
+            m1Storage.EnsureDeviceCurrent();
+            m2Storage.EnsureDeviceCurrent();
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            allocator.Context.MakeCurrent();
+            allocator.Blas.SetStream(allocator.Stream.Handle);
+            IntPtr aPtr = m2Storage.DevicePtrAtElement(m2.StorageOffset);
+            IntPtr bPtr = m1Storage.DevicePtrAtElement(m1.StorageOffset);
+            IntPtr cPtr = resultStorage.DevicePtrAtElement(result.StorageOffset);
+            float beta = 0f;
+            if (computeType == Unnamed)
+                CublasApi.cublasSgemmStridedBatched(allocator.Blas.Handle, transa, CublasApi.CUBLAS_OP_N,
+                    checked((int)cols), checked((int)rows), checked((int)shared), ref alpha,
+                    aPtr, checked((int)lda), m2.Strides[0], bPtr, checked((int)m1.Strides[1]), m1.Strides[0],
+                    ref beta, cPtr, checked((int)result.Strides[1]), result.Strides[0], checked((int)batch)).ThrowOnCublasError();
+            else
+                CublasApi.cublasGemmStridedBatchedEx(allocator.Blas.Handle, transa, CublasApi.CUBLAS_OP_N,
+                    checked((int)cols), checked((int)rows), checked((int)shared), ref alpha,
+                    aPtr, CublasApi.CUDA_R_32F, checked((int)lda), m2.Strides[0],
+                    bPtr, CublasApi.CUDA_R_32F, checked((int)m1.Strides[1]), m1.Strides[0],
+                    ref beta, cPtr, CublasApi.CUDA_R_32F, checked((int)result.Strides[1]), result.Strides[0],
+                    checked((int)batch), computeType, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         private static bool TryGetCudaStorage(Tensor tensor, out CudaStorage storage)
         {
             storage = tensor?.Storage as CudaStorage;

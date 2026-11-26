@@ -252,7 +252,6 @@
     <ReferenceNativeSymbol Include="TSGgml_IsMetalAvailable" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3AudioVaeDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3AudioVaeEncode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3DitForward" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3TextEncode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VideoVaeDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VideoVaeEncode" SymbolType="Function" />

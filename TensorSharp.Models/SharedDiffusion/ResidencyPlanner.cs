@@ -13,7 +13,7 @@ using TensorSharp.Runtime.Scheduling.Diffusion;
 namespace TensorSharp.Models.SharedDiffusion
 {
     /// <summary>The components a diffusion pipeline keeps resident or releases.</summary>
-    public enum DiffusionComponent { Conditioner, Vae, Denoiser }
+    public enum DiffusionComponent { Conditioner, Vae, Denoiser, AudioVae }
 
     /// <summary>What one phase needs on the device: its component's weights and its working memory.</summary>
     public readonly record struct PhaseDemand(DiffusionPhase Phase, DiffusionComponent Component, long WorkingBytes);

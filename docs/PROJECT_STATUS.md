@@ -147,6 +147,16 @@ CUDA results are committed. See the [Bonsai2 card](models/bonsai2.md).
 
 The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse Spark, loading split GGUFs from any shard, native skill discovery and the latest MiniMax-H3 work are newer than `v2026.10.11`, as described above. Knowledge collections and active-turn steering are included in that tag; the entries below retain compatibility and measured-performance history from earlier work.
 
+- **MiniMax-H3 runs on the diffusion runtime, and its legacy pipeline and DiTs are removed.** A clip runs on the shared
+  video pipeline (`DiffusionVideoPipeline`) and the denoiser is one graph program a step on every backend, its LightX2V
+  Turbo plug-ins as unmerged LoRA regions. On `ggml_cuda` (A40) the clips without a plug-in are byte-identical to the
+  retired pipeline's, with median wall times from 0.989× to 1.015× of it (within run-to-run noise; steady steps equal);
+  the Turbo plug-ins take the runtime's unmerged route and changed numerically, at faster steps (1.02× wall). On direct
+  `cuda` the clips are 2–13% faster and on managed `cpu` 2–6% faster, each within rounding of the retired direct DiT's
+  arithmetic; peak device memory on direct `cuda` is 0.9–1.9 GB lower. The retired `TS_H3_PHASE`, `TS_H3_TRACE`, `TS_H3_DIT_LAYERS`,
+  `TS_H3_DIT_TRACE_DIR`, `TS_H3_DUMP_VEL_V`/`_A`, `TS_H3_PREFAULT`, `TS_H3_PREFAULT_THREADS` and `TS_H3_KEEP_RESIDENT`
+  stop the server or CLI at startup. `ggml_metal` and `mlx` are not yet validated on the runtime. See the
+  [model card](models/minimax-h3.md#diffusion-runtime-migration-2026-11-25).
 - **Muse-Glimmer runs on the shared decoder runtime, and its legacy model is removed.** Every backend and placement
   serves it (`--tp 2`, `--layer-split N` and their hybrid included), with continuous batching, the prefix cache with
   checkpoint files, DFlash and n-gram speculation (n-gram needs no drafter) and the graph vision tower. The legacy
@@ -224,7 +234,9 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   Measured in the TensorAgent Mac app on an M5 Pro (two identical clips from words per
   arm), releasing them cut peak wired memory from 33.3 GB to 19.1 GB for 1.3 s more text
   conditioning on the second clip (2.8 s against 1.5 s), with the clip totals about 1%
-  apart. `TS_H3_KEEP_RESIDENT=1` keeps the old behaviour; discrete GPUs are unchanged.
+  apart. Discrete GPUs are unchanged. (`TS_H3_KEEP_RESIDENT=1`, which kept the old
+  behaviour, was removed when the clip moved to the diffusion runtime; there each of the
+  three releases after its phase on `ggml_metal`.)
 - **MiniMax-H3's soundtrack follows the 24 fps clip whatever fps is requested.** Frames
   are always written at 24 fps, but the audio timeline was sized from the requested rate
   (fps 16 on 39 frames asked for 98 audio latents instead of 65), which laid the

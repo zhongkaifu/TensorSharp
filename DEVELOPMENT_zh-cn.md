@@ -194,14 +194,13 @@ tensor API 开启时 VAE 依然**正确**：在支持 tensor API 的设备上，
 
 MiniMax-H3 对**一条**无 mask 的打包序列做双向注意力——文本、条件帧、目标音频与目标视频都在其中——因此 key 数量**就是**整段片段：22 帧为 2364 个打包 token，107 帧为 8646 个。vendored ggml 中 CUDA 的 flash-attention kernel 在支持快速 FP16 的 GPU 上用 FP16 寄存器累加 `sum_j exp(s_j - max) * V_j`（`ggml-cuda/fattn-mma-f16.cuh` 中的 `T_C_VKQ = tile<…, half2>`）。在 CUDA 上用 `ggml_prec_set_acc(out, GGML_PREC_F32)`（取代已弃用的 `ggml_flash_attn_ext_set_prec`）请求 F32 累加器不起作用——`ggml-cuda/` 里没有任何代码读取 `GGML_OP_FLASH_ATTN_EXT` 的这一精度请求。ggml-metal 同样不读取它，但其 F16/F32 kernel 本来就以 F32 累加输出（`ggml-metal/kernels/fa.metal` 中 `o_t = float`）；ggml-vulkan 则会读取它并改用 F32 累加器（三者均对照 vendored ggml `353b63b` 核实）。CUDA kernel 留给累加器的余量只有 3 个 bit（`FATTN_KQ_MAX_OFFSET` 把运行最大值抬高 log(8)，使每个 softmax 权重上限为 1/8），因此 N 个 key 的一行会累加到 N/8 × |V|，一旦 N × |V| > 8 × 65504 就溢出为 Inf。只有 H3 会撞上这个上限：checkpoint 里有 `q_norm` 和 `k_norm`，唯独没有 `v_norm`，value 这一路的幅值不受约束。640×384 实测：73 帧正常，107 帧则在**第一个**去噪步就出现 Inf，返回的视频每个像素全黑、每个音频采样被钳位——视频与音频共用同一主干，溢出会连同声音一起拖垮。
 
-修复在 `h3_attend`（`ggml_ops_minimax_h3.cpp`）：按 key 数量取"能把它压到 `kH3FlashKeyBudget` 以内的最小 2 的幂"预先缩放 V，输出时再还原。注意力对 V 是线性的，所以这个修正是**精确**的；又因为倍数是 2 的幂，经过 F16 转换也只是指数位平移而非舍入，因此足够短的序列（包括测试套件里所有 oracle 用例）保持逐位一致。`h3_mm` 对两个激活无界的量化 matmul（送入 `o_proj` 的注意力输出、送入 `down_proj` 的 SwiGLU 隐状态）做同样处理，那里的上限则是 q8_1 每个 block 的 FP16 求和。
+修复在 `h3_attend`（`ggml_h3_attention.h`）：按 key 数量取"能把它压到 `kH3FlashKeyBudget` 以内的最小 2 的幂"预先缩放 V，输出时再还原。注意力对 V 是线性的，所以这个修正是**精确**的；又因为倍数是 2 的幂，经过 F16 转换也只是指数位平移而非舍入，因此足够短的序列（包括测试套件里所有 oracle 用例）保持逐位一致。`h3_mm` 对两个激活无界的量化 matmul（送入 `o_proj` 的注意力输出、送入 `down_proj` 的 SwiGLU 隐状态）做同样处理，那里的上限则是 q8_1 每个 block 的 FP16 求和。
 
 | 环境变量 | 作用 |
 |---|---|
-| `TS_H3_TRACE=1` | 打印每个去噪步的 latent 与 velocity 幅值——样本发散时，latent 的 absmax 会比真正变成无穷早若干步露出端倪 |
 | `TS_H3_NO_FLASH=1` | 强制走显式 softmax 路径，用于区分是 flash-attention kernel 的问题还是建模的问题 |
 
-采样器也不再无条件相信结果：velocity 出现非有限值时直接让请求失败并指明是第几步（`MiniMaxH3Pipeline.cs` 的 `RequireFinite`），而不是写出一个长度、帧率、音轨时长都正常但通体全黑的文件——这种失败本来是无声的，因为 RGB 钳位会把 NaN 像素固定成 0，WAV 写出会把 NaN 采样钳到 -1。
+采样器也不再无条件相信结果：velocity 出现非有限值时直接让请求失败并指明是第几步（`MiniMaxH3Requests.cs` 的 `RequireFinite`），而不是写出一个长度、帧率、音轨时长都正常但通体全黑的文件——这种失败本来是无声的，因为 RGB 钳位会把 NaN 像素固定成 0，WAV 写出会把 NaN 采样钳到 -1。
 
 #### 后端没有 kernel 的 flash-attention 形状
 

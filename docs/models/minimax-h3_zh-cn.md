@@ -14,10 +14,15 @@ MiniMax-H3 在同一条打包扩散序列中生成视频与原生 **32 kHz 立�
 TensorSharp 通过 `MiniMaxH3Model.GenerateVideo`、CLI 和视频 HTTP API 提供该模型。
 FL2VA 用于文本和关键帧；Ref2VA 用于文本和参考媒体，两者是独立检查点。
 
-`ggml_metal`、`ggml_cuda`、`ggml_cpu` 使用 TensorSharp 自有的原生图和未修改的
-上游 ggml；`mlx`、`cuda`、`cpu` 使用直接张量实现。CUDA 与 MLX 的 DiT、
-文本/视觉编码器、音频 VAE 和因果 3-D 视频编码器均在所选设备上执行；
-`cpu` 前向使用托管 C# 算术。实现某条路径不表示已验证每种输入或长片段。
+片段运行在共享扩散运行时的视频管线上（`SharedDiffusion/DiffusionVideoPipeline`，
+MiniMax-H3 系列的钩子位于 `MiniMaxH3Family`），扩散 Transformer 是运行时的去噪器
+（`MiniMaxH3Denoiser`）：每一步是一个图程序（token refiner 是单独的程序，每个提示词运行一次），
+在 `ggml_metal`、`ggml_cuda`、`ggml_cpu` 上由 GGML 图执行器运行（含 CUDA 卸载的融合调制、注意力与
+cuBLAS/cuDNN 路线），在 `cpu`（托管 C#）、`cuda` 与 `mlx` 上由张量执行器运行，各自采用退役直接 DiT
+在该后端上的乘积、注意力与逐行内核。文本编码器、视觉塔和各 VAE 是
+运行时的组件：GGML 后端上为 TensorSharp 自有的原生图（上游 ggml 未修改），`mlx`、`cuda`、
+`cpu` 上为直接张量实现。驻留计划在阶段与片段之间保留设备上放得下的部分（`ggml_metal` 上去噪器与两个 VAE 则在每个阶段后释放）；17 GB 的
+文本编码器总在其阶段结束后释放，从不与去噪器同时驻留。实现某条路径不表示已验证每种输入或长片段。
 
 ```sh
 TensorSharp.Cli --config config/minimax-h3-fl2va.json --backend ggml_metal \
@@ -30,6 +35,82 @@ TensorSharp.Cli --config config/minimax-h3-fl2va.json --backend ggml_metal \
 不能由文件成功导出推断感知质量。
 
 ## 当前验证范围
+
+### 扩散运行时迁移（2026-11-25）
+
+片段迁到扩散运行时的视频管线，去噪器每步是一个图程序（见上文）。验证主机为 NVIDIA A40（46 GB，驱动 595.112.07，CUDA 13.2）、
+Intel Xeon Gold 6342（96 线程）与 .NET 10.0.404，使用未修改的上游 ggml `2ca32666e16586ff4e8008b8c92f2e534b8e4f51`；退役管线由迁移
+的基础提交 `d23ee0be` 以同一 ggml 构建。直接 `cuda` 的数据来自最终二进制；`ggml_cuda` 与 CPU 的数据来自其前一个构建，最终构建只改动了
+这些后端不运行的代码（CUDA 执行器注意力的分组与去噪后的显存池回收）。
+
+- **与退役 DiT 的逐步对比**（`MiniMaxH3DenoiserTests`，合成夹具的八个用例：带视觉片段的文本、关键帧、Ref2VA 的图像与声音参考、
+  两个 sigma、BF16/Q8_0/Q4_K 投影，其中两个带 LoRA）。退役 DiT 的各步按通道冻结在
+  `InferenceWeb.Tests/Fixtures/MiniMaxH3/LegacyGoldens/`。`ggml_cuda` 在全部八个用例上给出相同字节；`ggml_cpu` 在不带 LoRA 的
+  六个用例上相同，两个 LoRA 用例在最大值的 7.6e-4 以内（ggml-cpu 把 q、k、v 的三个更新作为三次乘法运行，退役图把它们堆成一次；
+  相对直接 CUDA 的 F32 结果，运行时与退役图同样接近：BF16 上 1.46e-3/1.15e-3 对 1.29e-3/1.26e-3（视频/音频），Q4_K 上均为
+  6.46e-3）。直接 `cuda` 在每个用例上与退役直接 DiT 相差不超过 3.1e-7；托管 `cpu` 在七个用例上不超过 5.3e-7，Q8_0 上为 7.6e-4
+  （它的分块格式乘积像退役直接 CPU DiT 一样量化激活，上游末位的差异会翻转一次舍入）。
+- **`ggml_cuda` 上的完整片段**（FL2VA Q4_K，640×384×22；Ref2VA 用其检查点、一张图与一段声音）：20 步 t2v，8 步 i2v、fl2v 与
+  Ref2VA，每一轮解码出的 RGB 与 WAV 都与退役管线逐字节相同。
+
+墙钟时间（`eng/validation/minimax-h3-ab.py`，交替轮次，退役二进制不设 `TS_H3_PHASE`；完整 CLI 进程，含模型加载与编解码）：
+
+| `ggml_cuda`，640×384×22 | 解码媒体 | 退役中位数 | 运行时中位数 | 比值（各轮） |
+|---|---|---:|---:|---|
+| t2v，20 步 | 相同，4/4 | 28.11 s | 28.41 s | 0.989×（0.986、0.995、0.993、1.009） |
+| fl2v，8 步 | 相同，4/4 | 26.73 s | 26.34 s | 1.015×（1.033、1.023、1.001、1.011） |
+| Ref2VA，8 步 | 相同，6/6 | 21.99 s | 21.90 s | 1.004×（1.067、0.973、1.004、0.983、0.989、1.025） |
+| Turbo-8 t2v | 有变化（见下） | 21.77 s | 21.37 s | 1.019×（1.082、0.984、1.079、1.026） |
+| Turbo-4 i2v | 有变化（见下） | 20.92 s | 20.44 s | 1.023×（1.022、1.014、1.005、1.070） |
+
+t2v 在三次各四轮的测量中中位数比值为 1.006×、1.007× 与 0.989×（退役二进制本身在两次测量之间也变动了 2%），在运行间噪声之内。
+不带插件时稳定步与退役管线相同（1,768 token 0.89 s，2,250 token 1.12 s，2,735 token 1.55 s），带插件时更快（Turbo-8 0.92 对
+1.15 s；Turbo-4 i2v 1.17 对 1.37 s）。峰值显存不带插件时相同，带插件时多 110 MiB（K 维拼接乘积的暂存）。运行时的首步在各次运行
+之间波动更大（2.5–4.5 s 对 2.7–3.6 s）。
+
+- **`ggml_cuda` 上的 Turbo 插件**改走运行时的未合并路线：Q4_K 投影的更新在其 cuBLAS GEMM 中以 `[W | up] [x ; down x]` 参与，
+  而退役图把更新加到反量化权重上再做 BF16 舍入。因此片段有变化（Turbo-8 t2v 与退役结果的最小帧 PSNR 25.2 dB、WAV 余弦 0.968；
+  Turbo-4 i2v 32.0 dB、0.989）。以两个 F32 参考（直接 `cuda` 上的退役 DiT 与运行时）衡量，两条路线并无优劣：Turbo-8 视频平均
+  PSNR 22.14/22.52 dB（运行时）对 22.29/22.65（退役），WAV 余弦 0.943 对 0.967；Turbo-4 i2v 32.36/32.24 dB 对 32.67/32.47，
+  WAV 余弦 0.976 对 0.958。八步蒸馏采样器会放大舍入差异：两个 F32 实现之间在 Turbo-8 上本身就相差 29 dB。最终二进制的 Turbo
+  片段与这些片段逐字节相同。
+
+直接 `cuda`（每个用例一对，先运行退役；另有三轮交替的三步 i2v）：
+
+| 直接 `cuda`，640×384×22 | 退役 | 运行时 | 稳定步 | 峰值显存 | 最小帧 PSNR、WAV 余弦 |
+|---|---:|---:|---|---|---|
+| t2v，20 步 | 140.8 s | 122.7 s | 5.78–5.94 → 4.96–5.02 s | 23,289 → 22,417 MiB | 63.6 dB、0.999996 |
+| Turbo-8 t2v | 77.7 s | 69.7 s | 6.12–6.18 → 5.19–5.24 s | 25,825 → 24,721 MiB | 39.2 dB、0.9977 |
+| Turbo-4 i2v | 60.2 s | 55.0 s | 6.48–6.51 → 6.35–6.38 s | 27,387 → 25,495 MiB | 41.6 dB、0.99997 |
+| i2v，8 步 | 78.8 s | 77.2 s | 6.15–6.21 → 6.04–6.08 s | 24,753 → 23,191 MiB | 52.5 dB、0.999997 |
+| i2v，3 步，×3 | 46.8、46.3、45.4 s | 48.6、45.2、46.1 s | 6.16–6.18 → 6.01–6.03 s | | |
+
+直接 CUDA 上运行时的首步在 2,250 token 不带插件时比退役长 0.1–0.3 s，在 1,768 token 与带插件时更短。峰值出现在解码阶段、
+去噪器常驻之时：运行时在解码前把步内中间张量的池化显存交还驱动（`CudaAllocator.TrimPool`），而退役管线保留了它们，因此峰值
+低 0.9–1.9 GB；服务端的下一段片段会在首步重新分配它们（这里每次 CLI 运行只有一段片段，该开销未测）。
+
+CPU（每个用例一对）：
+
+| CPU | 退役 | 运行时 | 各步 | 解码媒体 |
+|---|---:|---:|---|---|
+| `ggml_cpu`，256×160×5，1 步 | 22.77 s | 22.60 s | 4.05 → 4.01 s | 相同 |
+| `cpu`，256×160×5，2 步 | 35.67 s | 35.11 s | 4.93、4.51 → 4.74、3.97 s | 最小帧 PSNR 37.1 dB，WAV 余弦 0.992 |
+| `cpu`，640×384×22，2 步 | 241.9 s | 226.7 s | 72.3、67.0 → 62.1、63.3 s | 43.3 dB，0.956 |
+
+托管 `cpu` 与退役直接 CPU DiT 都量化分块格式乘积的激活，因此两者的片段随舍入分开；以 F32 参考（直接 `cuda`，其退役与运行时片段
+相互一致到 74.8 dB）衡量两者同样接近：640×384×22 平均帧 PSNR 38.51 dB（运行时）对 37.65 dB（退役），WAV 余弦 0.944 对 0.942；
+256×160×5 为 32.59 对 34.33 dB，0.930 对 0.919。
+
+迁移中在张量执行器上发现并修复（均以退役直接 DiT 为基准测量）：步内注意力同时持有所有头的分数（1,768 token 0.7 GB，1280×768×107
+片段的 35K token 需 274 GB；现在用有界暂存服务，CUDA 上为就地读取各头的跨步批量 GEMM）；LoRA 更新在主机上对跨步视图做加法
+（每步 175 s）；去噪器的设备副本在常驻权重缓存中比它活得久（之后映射到同一地址的文件会用旧值计算）；托管执行器对每个权重的 F32
+副本做乘法（每步比退役 DiT 的量化乘积慢 4.5 倍，现在改用后者）；其中间张量每个块都重新缺页（现在循环复用）；调制、门控残差与
+q/k 旋转以许多逐元素遍历运行，而退役 DiT 各用一个内核（现在用它的内核）；token refiner 每步都运行（现在每个提示词一次，如退役
+DiT 的缓存）；CUDA 的 `neg` 在主机上运行；步内池化的显存留在解码旁边（现在于解码前交还驱动）。
+
+未在此验证：`ggml_metal` 与 `mlx`（本机没有 Apple 硬件）；MLX DiT 的融合打包调制内核已随直接 DiT 删除，`mlx` 张量执行器按算子运行
+调制、注意力与旋转区域（其开销未测）；真实检查点的组件 oracle（其 PyTorch 参考夹具不在本机）；长片段（1280×768 及更长）与多片段
+服务会话。
 
 最新记录为 **2026-10-15**：本地 Apple M5 Pro、48 GiB 统一内存，远端 NVIDIA A40、
 46,068 MiB 显存，使用未修改的上游 ggml
@@ -88,7 +169,7 @@ A40 为 03f0267b（更新的上游 ggml 已无法构建 TensorSharp 的 DSV4 CUD
   因此一次旋转只需 5 遍逐元素运算而不是 10 遍，q、k、v 也保持为融合投影的视图。
   Metal 每步中位数 5.44 → 4.85 秒，A40 每步中位数 1.39 → 1.31 秒。
 - **`ggml_cuda` 预读。** 文本编码器与去噪器文件由 16 路并发 8 MiB 读取提前读入
-  （`TS_VIDEO_READAHEAD`、`TS_H3_PREFAULT_THREADS`）。上传原先按缺页逐页预热这些文件，
+  （`TS_VIDEO_READAHEAD`）。上传原先按缺页逐页预热这些文件，
   在 A40 pod 的网络卷上约 1 GB/s。有了预读，编码器主干中位数 13.3 → 6.4 秒，
   首个去噪步中位数 11.5 → 7.6 秒。
 
@@ -214,8 +295,8 @@ FL2VA 上 1280×768×107 的首尾帧片段有 34,991 个打包 token，此时�
 - 遮罩每个 query 需要一行，在这一长度下为 2.45 GB；各行相同，因此 query 分块运行，共用
   一份约 4 MB 的遮罩。
 
-随后视频 VAE 解码耗时 146–148 秒。在 `ggml_metal` 上，管线现在会在解码前释放去噪器的
-权重和复用的计算缓冲区（`TS_H3_KEEP_RESIDENT=1` 保留权重）；此前 38.3 GB 的 Metal 预算
+随后视频 VAE 解码耗时 146–148 秒。在 `ggml_metal` 上，去噪器的权重和其步的计算缓冲区
+会在解码前释放（在扩散运行时上由去噪器声明：Metal 上每次去噪后释放）；此前 38.3 GB 的 Metal 预算
 只剩 3.3 GB 空闲，解码可能以 `kIOGPUCommandBufferCallbackErrorOutOfMemory` 失败。作为
 对照，MLX 融合 SDPA 在同一形状下每次调用 F32 为 4.08 秒、F16 为 1.68 秒，未被采用。
 以上是同一台机器上的单次运行，按 CLI 报告的整段耗时计；改动前后的日志分别位于
@@ -378,16 +459,16 @@ Ref2VA Turbo）；以裸 `.safetensors` 传入（H3 只接受声明分区与契�
   q/k/v 更新位于 q/k RMSNorm 与 RoPE 之前，fc1 位于 SwiGLU 之前，out 与 fc2 位于各自投影之后。
   Diffusers 文件按 [value; gate] 存放 fc1，两半会交换为检查点的 [gate | value] 顺序。
 - **内存。** 因子在 `ggml_metal` 与 `ggml_cuda` 上为 F16，1.38 GB（数值超出 F16 范围的组保持
-  F32）；在 `ggml_cpu` 上为 F32，2.77 GB。直接 `cpu`、`mlx` 与 `cuda` 后端在首次使用时逐块构建
-  精确的 F32 因子。fc1 有更新时，原生图把 fc1 基础权重拆为 gate 与 value 两半，更新不会新增
-  完整尺寸的激活。
+  F32）；在 `ggml_cpu` 上为 F32，2.77 GB。张量执行器（`cpu`、`mlx`、`cuda`）按读入的样子保存精确的
+  F32 因子（2.77 GB），不做均衡与补齐。
 - **强度。** `--lora-scale`（默认取配置中的 1.0）乘到更新上，必须 ≥ 0；不等于 1 时日志会说明
   该调度是在强度 1 下蒸馏的。强度 0 保留所有项而上投影因子为零，因此每次前向都与基础检查点
   在同一输入上的结果相同，而片段仍按插件的调度采样，可作恒等探针。
 - **画布。** 默认值不变：文生视频仍为 640×384，关键帧使用[配方画布](#尺寸与设置)。适配器在
   768p 下训练，短边不是 768 的片段会记录一行说明，照常运行。
-- **后端。** 原生图在 `ggml_metal`、`ggml_cuda` 与 `ggml_cpu` 上应用适配器；直接 `cpu`、`mlx`
-  与 `cuda` 后端自行应用。哪些已经运行见下文。
+- **后端。** 去噪器的步程序在每个执行器上以 `LoraLinear` 区域应用适配器（每个槽
+  `y = W x + up (down x)`：q、k、v 是 qkv 投影的三个槽）；在 `ggml_cuda` 上，宽步中基于
+  Q4_K 权重的区域以一次 K 拼接的 cuBLAS 乘法完成；`cpu` 与 `cuda` 张量执行器把每部分的更新原地加到乘积的对应槽中。哪些已经运行见下文。
 
 服务端启动时的 `--lora` 作用于每个片段，请求不能选择插件；请求不要带 `steps`，与 Web UI 一样
 （见 [API 示例](../../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#minimax-h3--视频与原生-32-khz-立体声音频)）。
@@ -403,7 +484,8 @@ Studio 中按片段应用，且从不发送步数、flow shift 或采样器。
 - **契约与宿主。** 托管 CPU 测试覆盖插件配置、配方与 sigma 网格、上述在 CLI、服务端、
   `--config`、请求路由和 Studio 中的全部拒绝，以及进程测试：每次拒绝都只输出一行
   `Configuration error:`、退出码 1、不开始任何下载。
-- **原生辅助函数**（`eng/validation/minimax-h3-lora.cpp`，ctest `minimax-h3-lora`）在 `cpu` 与
+- **原生辅助函数**（`eng/validation/minimax-h3-lora.cpp`，ctest `minimax-h3-lora`；已随原生 DiT
+  于 2026-11-25 退役，运行时的 LoRA 区域由 `MiniMaxH3LoraParityTests` 覆盖）在 `cpu` 与
   `metal` 上：堆叠的 q/k/v shrink、折叠、拆分 fc1 与零上投影恒等均逐位相同，rank 0 的适配器
   构建出与原来相同的图。
 - **两块合成对比**（真实代码、随机小权重）：带插件的直接 CPU 与合并了更新的 GGUF 在五种情况下
@@ -502,9 +584,10 @@ FL2VA 与 Ref2VA 去噪器、共享网络和三份分词器文件。在 Video St
 ## 架构与内存
 
 主要实现位于 [`MiniMaxH3Model`](../../TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Model.cs)、
-[`MiniMaxH3Pipeline`](../../TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Pipeline.cs)、
-[`MiniMaxH3DirectDiT`](../../TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3DirectDiT.cs)
-和 TensorSharp 自有的原生图
+[`MiniMaxH3Family`](../../TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Family.cs)（共享运行时
+[`DiffusionVideoPipeline`](../../TensorSharp.Models/SharedDiffusion/DiffusionVideoPipeline.cs) 的钩子）、
+去噪器 [`MiniMaxH3Denoiser`](../../TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Denoiser.cs)
+（每步一个图程序，由各图执行器运行），以及编码器与 VAE 的 TensorSharp 自有原生图
 [`ggml_ops_minimax_h3.cpp`](../../TensorSharp.GGML.Native/ggml_ops_minimax_h3.cpp)。
 
 去噪器为约 193 亿参数、50 块单流 Transformer，hidden 5376，56×128 维注意力，
@@ -521,8 +604,8 @@ AdaLN 来自学习的 `[8,1025]` 曲线表，三模态分别取调制参数。
 因果 CNN 编码器处理单图时有两帧前导零填充。音频 DAC/BigVGAN 使用 40 Hz、32 通道
 潜变量，800 倍上采样至 32 kHz；解码前需恢复通道均值/标准差。
 
-模型分阶段交还设备权重。Metal 默认在下一段文本编码前释放上段去噪器和 VAE，
-`TS_H3_KEEP_RESIDENT=1` 保留旧行为。原生 CUDA 预读不可变待上传权重，
+模型分阶段交还设备权重，由运行时的驻留计划决定：文本编码器在其阶段后释放；Metal 上
+去噪器在每次去噪后释放，CUDA 上每段片段结束时释放其步的工作区。原生 CUDA 预读不可变待上传权重，
 自动预算为物理/cgroup 内存较小值的一半，未知容量时关闭；它不同于托管去噪器文件预读。
 
 ## 环境变量
@@ -538,17 +621,18 @@ AdaLN 来自学习的 `[8,1025]` 曲线表，三模态分别取调制参数。
 | `TS_H3_FLASH_ATTENTION` | `ggml_cuda`，仅限以 `-DTENSORSHARP_FLASH_ATTENTION=ON` 构建：`0` 让 DiT 注意力保留在 cuDNN SDPA；`1` 在比 sm_8x 更新的 GPU 上也使用 FlashAttention-2。未设置时：sm_8x 用 FlashAttention-2，更新的 GPU 用 cuDNN |
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`：注意力保留在 ggml 的 flash attention，而不用 cuDNN 融合 SDPA；`TS_H3_CUDNN_ATTENTION_VERBOSE=1` 打印 cuDNN 计划与回退 |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`：DiT 的宽 Q4_K 投影保留在 MMQ，而不用 cuBLAS BF16；`TS_H3_CUBLAS_MIN_ROWS`（默认 1024）为 token 阈值 |
-| `TS_H3_FUSED=0` | `ggml_cuda`：构建未融合的 DiT 与 VAE 图（不融合注意力前处理、调制、门控残差与 LoRA 合并） |
-| `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`：DiT 前向的权重矩阵乘（F32/F16/BF16 权重与 LoRA 因子；量化权重与注意力自身的乘法不在内）改在 TensorSharp 的 F32 GEMM（pedantic cuBLAS 句柄）上计算，而不用 ggml-cuda 的 TF32 cuBLAS。默认关闭（真实检查点上的开销未测）；在全 F32 的 LoRA 一致性夹具上，原生路径对直接 CPU 路径的底噪由 6.08e-4 降到 8.07e-6。无法走该路径的乘法会在 stderr 上点名一次并在 ggml 上运行 |
-| `TS_H3_PREFAULT` | 托管去噪器预读：0 关、1 串行、2 提前重叠、3 默认流水线 |
-| `TS_H3_PREFAULT_THREADS` | 去噪器预读的读取线程；macOS 默认 1，Linux 默认 16（同一遍扫描中并发读取 8 MiB 块，网络卷需要这种并发） |
+| `TS_H3_FUSED=0` | `ggml_cuda`：去噪器程序中的扩散 Transformer 区域按未融合的算子运行，并构建未融合的 VAE 图 |
+| `TS_H3_LINEAR_TRACE_FILE` | 直接 CUDA：每个 H3 投影追加一行 JSON（路线与形状）；会同步的诊断，不能混入正式计时 |
+| `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`：去噪器步的权重矩阵乘（F32/F16/BF16 权重与 LoRA 因子；量化权重与注意力自身的乘法不在内）改在 TensorSharp 的 F32 GEMM（pedantic cuBLAS 句柄）上计算，而不用 ggml-cuda 的 TF32 cuBLAS。默认关闭（真实检查点上的开销未测）；在全 F32 的 LoRA 一致性夹具上，原生路径对直接 CPU 路径的底噪由 6.08e-4 降到 8.07e-6。无法走该路径的乘法会在 stderr 上点名一次并在 ggml 上运行 |
 | `TS_VIDEO_READAHEAD=0` | 关闭 `ggml_cuda` 文本编码器预读（在上传的页预热之前并发读取）；与 LTX 2.5 共用 |
 | `TS_VIDEO_READAHEAD_WORKERS` | 该预读的读取线程，1–32；Linux 默认 16，其他平台默认 1 |
 | `TS_H3_TE_GROUP` | 可选原生文本主干分组，默认关闭 |
-| `TS_H3_KEEP_RESIDENT=1` | Metal 片段间保留网络 |
 | `TS_METAL_FLASH_KV_PAD=0` | 关闭让 `ggml_metal` 长 flash attention 走 tensor-API 内核的 key 补齐（见[上文](#metal-上的长序列注意力)），供 A/B 对比 |
-| `TS_H3_PHASE=1` / `TS_H3_TRACE=1` | 阶段耗时 / 潜变量与速度幅度 |
-| `TS_H3_DIT_TRACE_DIR` / `TS_H3_LINEAR_TRACE_FILE` | 会同步下载的边界诊断，排除在正式性能数据外 |
+
+已退役管线与 DiT 的开关（`TS_H3_PHASE`、`TS_H3_TRACE`、`TS_H3_DIT_LAYERS`、`TS_H3_DIT_TRACE_DIR`、
+`TS_H3_DUMP_VEL_V` / `_A`、`TS_H3_PREFAULT`、`TS_H3_PREFAULT_THREADS`、`TS_H3_KEEP_RESIDENT`）随之删除：
+设置其中任何一个，两个宿主都会拒绝启动并说明替代方式。运行时无需开关即记录每个阶段与每一步的耗时
+（`[diffusion]` 行），在文本编码器运行后、上传之前预读去噪器文件，并由驻留计划决定哪些部分留在设备上。
 
 ## 复现验证
 

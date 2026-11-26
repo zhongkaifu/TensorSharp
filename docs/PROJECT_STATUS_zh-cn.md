@@ -115,6 +115,14 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 
 以下变化跨越多个发布标签。上文的 LTX 2.5、EmbeddingGemma 2、Muse Spark、从任意分片加载分片 GGUF、原生技能发现和最新 MiniMax-H3 改动晚于 `v2026.10.11`；知识集合与生成中引导已包含于该标签。下面保留早期工作的兼容性说明和性能实测记录。
 
+- **MiniMax-H3 运行在扩散运行时上，旧管线与 DiT 已移除。** 片段运行在共享视频管线（`DiffusionVideoPipeline`）上，
+  去噪器在每个后端上每步是一个图程序，LightX2V Turbo 插件以未合并的 LoRA 区域应用。在 `ggml_cuda`（A40）上，不带插件的
+  片段与退役管线逐字节相同，中位墙钟时间为其 0.989×–1.015×（在运行间噪声之内，稳定步相同）；Turbo 插件改走运行时的未合并
+  路线，数值有变化，每步更快（墙钟 1.02×）。直接 `cuda` 上片段快 2–13%，托管 `cpu` 上快 2–6%，均在退役直接 DiT 算术的舍入
+  范围内；直接 `cuda` 上峰值显存低 0.9–1.9 GB。已退役的
+  `TS_H3_PHASE`、`TS_H3_TRACE`、`TS_H3_DIT_LAYERS`、`TS_H3_DIT_TRACE_DIR`、`TS_H3_DUMP_VEL_V`/`_A`、`TS_H3_PREFAULT`、
+  `TS_H3_PREFAULT_THREADS` 与 `TS_H3_KEEP_RESIDENT` 会让服务端或 CLI 在启动时拒绝运行。`ggml_metal` 与 `mlx` 在运行时上
+  尚未验证。见[模型卡片](models/minimax-h3_zh-cn.md#扩散运行时迁移2026-11-25)。
 - **Muse-Glimmer 运行在共享解码运行时上，旧模型已移除。** 所有后端与放置方式都可服务它（包括 `--tp 2`、`--layer-split N`
   及二者的混合），并支持连续批处理、带检查点文件的前缀缓存、DFlash 与 n-gram 推测解码（n-gram 无需草稿模型）以及图形化
   视觉塔。旧的 `TS_MUSE_GLIMMER_*` 环、分块与追踪开关以及 `TS_MLX_KV_MATERIALIZE_INTERVAL` 现在会让服务器或 CLI 在启动时
@@ -165,8 +173,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 - **Metal 上的 MiniMax-H3 在下一段视频的文本编码器运行前交还保留的网络。** 去噪器与两个 VAE 过去在两段视频之间
   一直驻留在设备上，因此从第二段起，文本编码器运行时旁边还 wire 着约 16 GB 已经用完的网络。在 M5 Pro 上的
   TensorAgent Mac 应用中实测（每组两段相同的文生视频），先释放它们使峰值 wired 内存从 33.3 GB 降到 19.1 GB，代价是
-  第二段的文本条件阶段多 1.3 秒（2.8 秒对 1.5 秒），两组总耗时相差约 1%。`TS_H3_KEEP_RESIDENT=1` 保留旧行为；
-  独立显卡不受影响。
+  第二段的文本条件阶段多 1.3 秒（2.8 秒对 1.5 秒），两组总耗时相差约 1%。独立显卡不受影响。
+  （保留旧行为的 `TS_H3_KEEP_RESIDENT=1` 已在片段迁到扩散运行时后删除；在那里，`ggml_metal` 上三者各在其阶段后释放。）
 - **MiniMax-H3 的音轨始终跟随 24 fps 的画面，无论请求的 fps 是多少。** 画面总以 24 fps 写出，但音频时间轴过去按
   请求的帧率计算（39 帧、fps 16 时请求了 98 个音频潜变量而不是 65 个），音轨因此按另一条时间轴铺排，与它最后
   裁剪对齐的画面并不同步。按默认的 24 fps 请求不受影响。

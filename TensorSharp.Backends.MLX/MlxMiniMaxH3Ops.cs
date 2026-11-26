@@ -41,50 +41,6 @@ public static class MlxMiniMaxH3Ops
         });
     }
 
-    /// <summary>Apply H3's packed AdaLN or gated residual in one pass. Each row
-    /// index names the first modulation row; -1 leaves that input row intact.</summary>
-    public static bool TryPackedModulation(Tensor output, Tensor input, Tensor update, Tensor modulation,
-        Tensor rowIndices, int firstIndex, int secondIndex, bool gatedResidual)
-    {
-        if (input?.Storage is not MlxStorage xs || output?.Storage is not MlxStorage os ||
-            modulation?.Storage is not MlxStorage ms || rowIndices?.Storage is not MlxStorage rs ||
-            input.ElementType != DType.Float32 || output.ElementType != DType.Float32 ||
-            modulation.ElementType != DType.Float32 || rowIndices.ElementType != DType.Int32 ||
-            input.DimensionCount != 2 || output.DimensionCount != 2 || modulation.DimensionCount != 2 ||
-            rowIndices.DimensionCount != 1 || !input.IsContiguous() || !output.IsContiguous() ||
-            !modulation.IsContiguous() || !rowIndices.IsContiguous() || firstIndex < 0 || secondIndex < 0 ||
-            firstIndex >= modulation.Sizes[0] || secondIndex >= modulation.Sizes[0] ||
-            input.ElementCount() <= 0 || input.ElementCount() > int.MaxValue || modulation.ElementCount() > int.MaxValue ||
-            output.Sizes[0] != input.Sizes[0] || output.Sizes[1] != input.Sizes[1] ||
-            rowIndices.Sizes[0] != input.Sizes[0] || modulation.Sizes[1] != input.Sizes[1] ||
-            !ReferenceEquals(xs.AllocatorImpl, os.AllocatorImpl) || !ReferenceEquals(xs.AllocatorImpl, ms.AllocatorImpl) ||
-            !ReferenceEquals(xs.AllocatorImpl, rs.AllocatorImpl) || ReferenceEquals(output.Storage, modulation.Storage) ||
-            (gatedResidual && (update?.Storage is not MlxStorage us || update.ElementType != DType.Float32 ||
-                update.DimensionCount != 2 || !update.IsContiguous() || update.Sizes[0] != input.Sizes[0] ||
-                update.Sizes[1] != input.Sizes[1] || !ReferenceEquals(xs.AllocatorImpl, us.AllocatorImpl)))) return false;
-        return MlxWorker.Shared.Invoke(() =>
-        {
-            MlxNative.MlxArray x=default, u=default, m=default, r=default, result=default;
-            try
-            {
-                x=xs.CreateArrayView(input);
-                u=((MlxStorage)(gatedResidual ? update : input).Storage).CreateArrayView(gatedResidual ? update : input);
-                m=ms.CreateArrayView(modulation); r=rs.CreateArrayView(rowIndices);
-                result=MlxNative.H3PackedModulation(x,u,m,r,checked((int)input.Sizes[0]),checked((int)input.Sizes[1]),
-                    checked((int)modulation.Sizes[0]),firstIndex,secondIndex,gatedResidual);
-                if (output.StorageOffset == 0 && output.ElementCount() == output.Storage.ElementCount)
-                { os.ReplaceDeviceArray(result); result=default; }
-                else os.UpdateDeviceSlice(output,result);
-                return true;
-            }
-            finally
-            {
-                MlxNative.FreeArray(x); MlxNative.FreeArray(u); MlxNative.FreeArray(m);
-                MlxNative.FreeArray(r); MlxNative.FreeArray(result);
-            }
-        });
-    }
-
     public static bool TryClamp(Tensor output, Tensor input, float lower, float upper)
     {
         if (lower > upper || output?.Storage is not MlxStorage os || input?.Storage is not MlxStorage xs ||
@@ -221,40 +177,8 @@ public sealed class MlxH3ClampOps
 
 internal static partial class MlxNative
 {
-    private static MlxFastMetalKernel h3PackedModulationKernel;
     private static MlxFastMetalKernel h3TransformKernel;
     private static MlxFastMetalKernel h3GroupNormSiluKernel;
-
-    internal static MlxArray H3PackedModulation(MlxArray input,MlxArray update,MlxArray modulation,MlxArray rowIndices,
-        int rows,int channels,int modulationRows,int firstIndex,int secondIndex,bool gatedResidual)
-    {
-        lock(fastKernelSync)
-            if (!h3PackedModulationKernel.IsValid)
-                h3PackedModulationKernel=CreateFastMetalKernel("tensorsharp_h3_packed_modulation_f32",
-                    ["x","update","modulation","row_indices"],["y"],"""
-                    #pragma clang fp reassociate(off)
-                    #pragma clang fp contract(off)
-                    const uint i=thread_position_in_grid.x;
-                    if (i >= Elements) return;
-                    const int row=row_indices[i/Channels];
-                    const int channel=i%Channels;
-                    const float value=x[i];
-                    // Inactive rows are copied, including their signed-zero bits.
-                    if (row < 0 || row >= ModulationRows-max(FirstIndex,SecondIndex)) {
-                        y[i]=value;
-                    } else if (GatedResidual) {
-                        const float product=update[i]*modulation[(row+FirstIndex)*Channels+channel];
-                        y[i]=value+product;
-                    } else {
-                        const float scale=modulation[(row+SecondIndex)*Channels+channel]+1.0f;
-                        const float product=value*scale;
-                        y[i]=product+modulation[(row+FirstIndex)*Channels+channel];
-                    }
-                    """,string.Empty);
-        return ApplyVisionSpatialKernel(h3PackedModulationKernel,[input,update,modulation,rowIndices],[rows,channels],
-            [("Elements",checked(rows*channels)),("Channels",channels),("ModulationRows",modulationRows),
-             ("FirstIndex",firstIndex),("SecondIndex",secondIndex),("GatedResidual",gatedResidual ? 1 : 0)]);
-    }
 
     // Each group belongs to one frame, as in upstream H3 TemporalGroupNorm.
     // Work directly in NHWC so normalization, affine and SiLU need no layout

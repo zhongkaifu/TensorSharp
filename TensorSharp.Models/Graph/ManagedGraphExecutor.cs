@@ -194,7 +194,108 @@ namespace TensorSharp.Models.Graph
             return true;
         }
 
-        protected override bool Fuses(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.PairRotary;
+        protected override bool Fuses(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.PairRotary
+            || (kind == GraphFusion.LoraLinear && ServesLoraLinearInPlace) || (kind == GraphFusion.DitAttention && ServesDitAttention)
+            || (kind is GraphFusion.AdaLnModulate or GraphFusion.GatedResidual && ServesDitModulation);
+
+        /// <summary>
+        /// <see cref="GraphFusion.AdaLnModulate"/> where the executor serves it (<see cref="TensorGraphExecutor.ServesDitModulation"/>)
+        /// as the retired direct CPU DiT ran it: the RMS norm with its weight in one pass, then each segment's rows
+        /// x (1 + scale) + shift in place (DirectOps' row loops). False (the region's ops run) for any other layout.
+        /// </summary>
+        private bool TryAdaLnModulate(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            if (inputs.Length != 4 || ip == null || ip.Length < 2 || fp == null || fp.Length < 1 || results.Length < 1) return false;
+            Tensor w = inputs[1];
+            if (w == null || inputs[2] == null || w.ElementCount() == 0 || !w.IsContiguous()) return false;
+            long hidden = w.ElementCount();
+            using Tensor x = Rows2(inputs[0], hidden), mods = Rows2(inputs[2], hidden);
+            if (x == null || mods == null || x.ElementType != DType.Float32 || mods.ElementType != DType.Float32) return false;
+            long rows = x.Sizes[0];
+            if (!TryRegionSegments(3, rows, mods.Sizes[0], Math.Max(ip[0], ip[1]), out var segments)) return false;
+            var y = new Tensor(Allocator, DType.Float32, rows, hidden);
+            try
+            {
+                Ops.RMSNorm(y, x, w, null, fp[0]);
+                foreach (var (start, count, column) in segments)
+                {
+                    using Tensor shift = mods.Narrow(0, column + ip[0], 1), scale = mods.Narrow(0, column + ip[1], 1);
+                    TensorSharp.Models.Direct.DirectOps.ModulateRowsOnHost(y, y, shift, scale, start, count);
+                }
+            }
+            catch { y.Dispose(); throw; }
+            results[0] = y;
+            DitModulationsServedForTests++;
+            return true;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.GatedResidual"/> without a bias or a delta where the executor serves it
+        /// (<see cref="TensorGraphExecutor.ServesDitModulation"/>) with the retired direct CPU DiT's arithmetic (residual + mm *
+        /// gate, its in-place gated add written to a new tensor): one pass over each segment's rows. False (the region's ops
+        /// run) for any other form.
+        /// </summary>
+        private bool TryGatedResidual(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            if (inputs.Length != 4 || ip == null || ip.Length < 1 || (ip.Length > 1 && ip[1] != 0) || (ip.Length > 2 && ip[2] != 0)
+                || results.Length < 1 || inputs[0] == null)
+                return false;
+            long hidden = inputs[0].Sizes[^1];
+            using Tensor residual = Rows2(inputs[0], hidden), mm = Rows2(inputs[1], hidden), mods = Rows2(inputs[2], hidden);
+            if (residual == null || mm == null || mods == null || mm.Sizes[0] != residual.Sizes[0]
+                || residual.ElementType != DType.Float32 || mm.ElementType != DType.Float32 || mods.ElementType != DType.Float32)
+                return false;
+            long rows = residual.Sizes[0];
+            if (!TryRegionSegments(3, rows, mods.Sizes[0], ip[0], out var segments)) return false;
+            var y = new Tensor(Allocator, DType.Float32, rows, hidden);
+            try
+            {
+                foreach (var (start, count, column) in segments)
+                {
+                    using Tensor gate = mods.Narrow(0, column + ip[0], 1);
+                    TensorSharp.Models.Direct.DirectOps.GateAddRowsOnHost(y, residual, mm, gate, start, count);
+                }
+            }
+            catch { y.Dispose(); throw; }
+            results[0] = y;
+            DitModulationsServedForTests++;
+            return true;
+        }
+
+        /// <summary>
+        /// A diffusion transformer's full attention (<see cref="GraphFusion.DitAttention"/>, served where
+        /// <see cref="TensorGraphExecutor.ServesDitAttention"/>) as the retired direct CPU DiT ran it: the blocked F32 attention
+        /// of DirectOps (each head's query blocks against all keys in an L2-sized scratch, the output written in place). The
+        /// region's ops (F16 K and V, then the generic attention) held every head's scores of the whole sequence at once.
+        /// </summary>
+        private bool TryDitAttention(Tensor[] inputs, float[] fp, Tensor[] results)
+        {
+            if (inputs.Length != 3 || fp == null || fp.Length < 1 || results.Length < 1) return false;
+            // [rows, heads, d] each, as a view (an operand may arrive with ggml's leading unit extent).
+            using Tensor q = Rows3(inputs[0]), k = Rows3(inputs[1]), v = Rows3(inputs[2]);
+            if (q == null || k == null || v == null || q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32)
+                return false;
+            long sq = q.Sizes[0], sk = k.Sizes[0], heads = q.Sizes[1], hd = q.Sizes[2];
+            if (k.Sizes[1] != heads || v.Sizes[1] != heads || k.Sizes[2] != hd || v.Sizes[2] != hd || v.Sizes[0] != sk
+                || sq > int.MaxValue || sk > int.MaxValue || heads > int.MaxValue || hd > int.MaxValue)
+                return false;
+            Tensor Flat(Tensor t, long rows)
+            {
+                Tensor c = t.IsContiguous() ? t.CopyRef() : Ops.NewContiguous(t);
+                try { return c.View(rows, heads * hd); }
+                finally { c.Dispose(); }
+            }
+            using Tensor qf = Flat(q, sq), kf = Flat(k, sk), vf = Flat(v, sk);
+            var output = new Tensor(Allocator, DType.Float32, sq, heads * hd);
+            if (!TensorSharp.Models.Direct.DirectOps.TryCpuBlockedAttention(output, qf, kf, vf, null, (int)heads, (int)sq, (int)sk, (int)hd, fp[0]))
+            {
+                output.Dispose();
+                return false;
+            }
+            results[0] = output;
+            DitAttentionsServedForTests++;
+            return true;
+        }
 
         /// <summary>Tokens of a fused region below which it runs on the calling thread.</summary>
         private const int ParallelRegionRows = 8;
@@ -205,6 +306,11 @@ namespace TensorSharp.Models.Graph
         /// </summary>
         protected override unsafe bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
         {
+            // A diffusion transformer's unmerged LoRA (its weights are leaves of their own, not tensors).
+            if (kind == GraphFusion.LoraLinear) return TryLoraLinearInPlace(inputs, weights, ip, results);
+            if (kind == GraphFusion.DitAttention) return TryDitAttention(inputs, fp, results);
+            if (kind == GraphFusion.AdaLnModulate) return TryAdaLnModulate(inputs, ip, fp, results);
+            if (kind == GraphFusion.GatedResidual) return TryGatedResidual(inputs, ip, results);
             foreach (Tensor t in inputs)
                 if (t == null || t.ElementType != DType.Float32) return false;
             float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;

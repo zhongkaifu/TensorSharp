@@ -460,7 +460,7 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             float[] scratch = null;
             return DecodeClip(
-                (tile, t, h, w) => scratch = DecodeTileTimed(tile, t, h, w, scratch),
+                (tile, t, h, w) => scratch = DecodeTokens(tile, t, h, w, scratch),
                 latent, latentT, latentH, latentW, onTile);
         }
 
@@ -474,16 +474,8 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             float[] scratch = null;
             return DecodeClipFrames(
-                (tile, t, h, w) => scratch = DecodeTileTimed(tile, t, h, w, scratch),
+                (tile, t, h, w) => scratch = DecodeTokens(tile, t, h, w, scratch),
                 latent, latentT, latentH, latentW, maxFrames, onTile);
-        }
-
-        private float[] DecodeTileTimed(float[] tile, int latentT, int latentH, int latentW, float[] scratch)
-        {
-            var nativeClock = System.Diagnostics.Stopwatch.StartNew();
-            float[] patches = DecodeTokens(tile, latentT, latentH, latentW, scratch);
-            _decodeNativeSeconds += nativeClock.Elapsed.TotalSeconds;
-            return patches;
         }
 
         /// <summary>Decodes one tile of latents, [latentT][h][w][24], to its patch
@@ -817,17 +809,6 @@ namespace TensorSharp.Models.MiniMaxH3
                     });
                     onTile?.Invoke(++done);
                 }
-        }
-
-        // Seconds this decoder spent inside the native per-tile decode, for TS_H3_PHASE's
-        // split of the VAE stage into GPU graphs and the managed tiling around them.
-        private double _decodeNativeSeconds;
-
-        internal double TakeDecodeNativeSeconds()
-        {
-            double s = _decodeNativeSeconds;
-            _decodeNativeSeconds = 0;
-            return s;
         }
 
         private static float[] Ramp(int length, int lead, int trail)
@@ -1364,7 +1345,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         /// <summary>Hand the device copies of the VAE's weights back without tearing it down,
-        /// exactly as <see cref="MiniMaxH3DiT.ReleaseDeviceResidency"/> does for the denoiser:
+        /// exactly as the denoiser releases its own (MiniMaxH3Denoiser.ReleaseDevice):
         /// the host pointers stay valid and the next encode or decode binds them again.</summary>
         public void ReleaseDeviceResidency()
         {

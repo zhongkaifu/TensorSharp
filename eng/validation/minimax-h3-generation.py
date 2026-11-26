@@ -244,8 +244,8 @@ def main():
     env = os.environ.copy()
     env.update(TS_VIDEO_VAE=str(components["video_vae"]), TS_VIDEO_TEXT_ENCODER=str(components["text"]),
                TS_VIDEO_AUDIO_VAE=str(components["audio_vae"]), TS_VIDEO_TOKENIZER=str(args.models.resolve()),
-               TS_CPU_THREADS="8", DOTNET_PROCESSOR_COUNT="8", OMP_NUM_THREADS="8", GGML_N_THREADS="8", TS_H3_PHASE="1")
-    for name in ("TS_H3_DIT_LAYERS", "TS_H3_VIS_STOP", "TS_H3_ENC3D_STOP", "TS_GGML_NODE_PROFILE"):
+               TS_CPU_THREADS="8", DOTNET_PROCESSOR_COUNT="8", OMP_NUM_THREADS="8", GGML_N_THREADS="8")
+    for name in ("TS_H3_VIS_STOP", "TS_H3_ENC3D_STOP", "TS_GGML_NODE_PROFILE"):
         env.pop(name,None)
     baseline_backend = args.sdcpp_backend or {"cpu": "cpu", "ggml_cpu": "cpu", "mlx": "metal", "ggml_metal": "metal"}.get(args.backend, "cuda0")
     sdcpp_source=args.sdcpp_source or args.sdcpp_cli.resolve().parents[2]/"src"
@@ -275,7 +275,7 @@ def main():
             "Reference audio preprocessing differs by engine: TensorSharp caps/pads to output duration and floors 800-sample hops; "
             "SD preserves the complete waveform and ceil-pads. Identical file hashes do not establish identical processed conditioning; "
             "use explicit benchmark canonicalization and inspect effective lengths before interpreting cross-engine quality metrics.")
-    if any(env.get(name) for name in ("TS_H3_DIT_TRACE_DIR","TS_H3_SD_TRACE_DIR","SD_TRACE_DIR","TS_H3_LINEAR_TRACE_FILE")):
+    if any(env.get(name) for name in ("TS_H3_SD_TRACE_DIR","SD_TRACE_DIR","TS_H3_LINEAR_TRACE_FILE")):
         report["timing_scope"] = "synchronized diagnostic CLI process; excluded from formal performance timings"
         report["limitations"].append("Boundary downloads and eval callbacks change diagnostic synchronization")
     engines = ["sdcpp", "tensorsharp"] if args.engine == "both" else [args.engine]

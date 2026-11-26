@@ -539,7 +539,7 @@ namespace TensorSharp.Models.MiniMaxH3
         public void Validate(VideoGenerationParams p)
         {
             if (p == null) return;
-            MiniMaxH3Pipeline.ValidateSamplingParameters(p);
+            MiniMaxH3Requests.ValidateSamplingParameters(p);
             if (p.Steps != 0 && p.Steps != Steps)
                 throw new ArgumentException(
                     $"{Name} ({WeightsFileName}) samples exactly {Steps} steps on its own schedule; {p.Steps} steps contradicts it. " +

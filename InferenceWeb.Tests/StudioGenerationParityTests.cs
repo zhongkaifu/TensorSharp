@@ -87,7 +87,7 @@ public sealed class StudioGenerationParityTests : IDisposable
         Assert.Equal(expectedHeight, capability.DefaultHeight);
         if (family == "minimax")
         {
-            var canvas = MiniMaxH3Pipeline.ResolveCanvas(new() { Width = width, Height = height }, MiniMaxH3Mode.TextToVideo);
+            var canvas = MiniMaxH3Requests.ResolveCanvas(new() { Width = width, Height = height }, MiniMaxH3Mode.TextToVideo);
             Assert.Equal(MiniMaxH3Geometry.AlignSpatial(canvas.Width), capability.DefaultWidth);
             Assert.Equal(MiniMaxH3Geometry.AlignSpatial(canvas.Height), capability.DefaultHeight);
         }
@@ -206,14 +206,14 @@ public sealed class StudioGenerationParityTests : IDisposable
         string path = Path.Combine(root, "banner.png");
         TensorSharp.Models.QwenImage.ImageIO.SavePng(path, new(313, 209, new float[313 * 209 * 3]));
         var studio = NativeStudioGenerationAdapter.FirstFrameCanvas(path);
-        var chat = MiniMaxH3Pipeline.ResolveCanvas(new() { ImagePath = path }, MiniMaxH3Mode.ImageToVideo);
+        var chat = MiniMaxH3Requests.ResolveCanvas(new() { ImagePath = path }, MiniMaxH3Mode.ImageToVideo);
         Assert.Equal((1152, 768), studio);
         Assert.Equal(chat, studio);
         // A shape beyond the recipe's 4:1 is clamped, exactly as chat clamps it.
         string strip = Path.Combine(root, "strip.png");
         TensorSharp.Models.QwenImage.ImageIO.SavePng(strip, new(500, 100, new float[500 * 100 * 3]));
         Assert.Equal((2016, 512), NativeStudioGenerationAdapter.FirstFrameCanvas(strip));
-        Assert.Equal(MiniMaxH3Pipeline.ResolveCanvas(new() { ImagePath = strip }, MiniMaxH3Mode.ImageToVideo), NativeStudioGenerationAdapter.FirstFrameCanvas(strip));
+        Assert.Equal(MiniMaxH3Requests.ResolveCanvas(new() { ImagePath = strip }, MiniMaxH3Mode.ImageToVideo), NativeStudioGenerationAdapter.FirstFrameCanvas(strip));
         Assert.Equal("invalid_generation", Assert.Throws<StudioException>(() => NativeStudioGenerationAdapter.FirstFrameCanvas(null)).Code);
     }
 
@@ -253,7 +253,7 @@ public sealed class StudioGenerationParityTests : IDisposable
         Assert.Equal("fl2v", NativeStudioGenerationAdapter.ApplyImageCanvas(capability, request, null, last));
         // The portrait keyframe's own aspect at the recipe's 768 short edge, exactly the canvas chat gives it.
         Assert.Equal((768, 1152), (request.Width, request.Height));
-        Assert.Equal(MiniMaxH3Pipeline.ResolveCanvas(new() { EndImagePath = last }, MiniMaxH3Mode.FirstLastFrame), (request.Width, request.Height));
+        Assert.Equal(MiniMaxH3Requests.ResolveCanvas(new() { EndImagePath = last }, MiniMaxH3Mode.FirstLastFrame), (request.Width, request.Height));
     }
 
     [Theory]
