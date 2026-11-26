@@ -379,10 +379,10 @@ activations, partial bands and near cancellation. The optional TF32 mode's prior
 full50 errors were 0.0003162 / 0.0007305; it can lose adversarial cancellation
 residuals and is not the default.
 
-Direct DiT now retains one exact, device-resident refined prompt, following
-SGLang's separation of request-static text refinement. Byte comparison detects
-caller mutation; conditioning changes, residency release and disposal invalidate
-it. Tracing deliberately executes every refiner boundary. Real checkpoint
+The direct DiT (since retired) retained one exact, device-resident refined prompt,
+following SGLang's separation of request-static text refinement; the runtime's
+token-refiner program keeps the same contract (run once a prompt and LoRA set,
+byte comparison of the text rows, invalidated by another set). Real checkpoint
 miss/hit tests preserve every F32 output value. MLX also fuses per-frame centered
 GroupNorm, affine and SiLU in the causal reference encoder: representative
 operator medians improve 1.25–3.00×, with five-/17-frame independent encoder

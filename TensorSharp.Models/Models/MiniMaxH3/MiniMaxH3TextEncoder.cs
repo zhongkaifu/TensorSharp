@@ -701,8 +701,8 @@ namespace TensorSharp.Models.MiniMaxH3
             // ~1.3 GB costs a single PCIe crossing. Grouping cannot make that cheaper - it
             // still moves all 17 GB - and it adds an allocate/invalidate cycle per group.
             // Spill only compounds when weights are re-read per step, which is the DENOISER
-            // (see MiniMaxH3DiT.ReleaseDeviceResidency, where releasing before the VAE was
-            // worth 22 s), not this trunk.
+            // (the retired MiniMaxH3DiT's release before the VAE was worth 22 s; the
+            // diffusion runtime's residency plan decides it now), not this trunk.
             //
             // Kept because it is the right tool when device memory, not time, is the
             // binding constraint - a smaller card, or another process needing the VRAM.

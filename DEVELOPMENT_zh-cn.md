@@ -200,7 +200,7 @@ MiniMax-H3 对**一条**无 mask 的打包序列做双向注意力——文本�
 |---|---|
 | `TS_H3_NO_FLASH=1` | 强制走显式 softmax 路径，用于区分是 flash-attention kernel 的问题还是建模的问题 |
 
-采样器也不再无条件相信结果：velocity 出现非有限值时直接让请求失败并指明是第几步（`MiniMaxH3Pipeline.cs` 的 `RequireFinite`），而不是写出一个长度、帧率、音轨时长都正常但通体全黑的文件——这种失败本来是无声的，因为 RGB 钳位会把 NaN 像素固定成 0，WAV 写出会把 NaN 采样钳到 -1。
+采样器也不再无条件相信结果：velocity 出现非有限值时直接让请求失败并指明是第几步（`MiniMaxH3Requests.cs` 的 `RequireFinite`），而不是写出一个长度、帧率、音轨时长都正常但通体全黑的文件——这种失败本来是无声的，因为 RGB 钳位会把 NaN 像素固定成 0，WAV 写出会把 NaN 采样钳到 -1。
 
 #### 后端没有 kernel 的 flash-attention 形状
 

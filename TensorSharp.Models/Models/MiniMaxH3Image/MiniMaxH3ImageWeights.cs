@@ -7,7 +7,7 @@
 //
 // MiniMax-H3-Image's denoiser weights as graph leaves: every projection a pointer into the file's mapping in its stored
 // format (the device caches key on it), every norm and bias an F32 copy on the host (BF16 and F16 widened exactly), as
-// MiniMaxH3DiT binds them for the native graph. The PDD head bank and the curve table stay F32 on the host: the head of
+// the retired MiniMaxH3DiT bound them for the native graph. The PDD head bank and the curve table stay F32 on the host: the head of
 // a step is combined there and bound as an input, the curve table is interpolated there.
 using System;
 using System.Collections.Generic;
@@ -42,7 +42,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
     /// <summary>
     /// The tensors of a MiniMax-H3-Image denoiser file bound the way the retired MiniMaxH3DiT bound them for
     /// TSGgml_MiniMaxH3DitForward: the same host bytes for every projection (so both share one device copy), F32 norms and
-    /// biases converted as MiniMaxH3DiT converts them, and no bias where its graph adds none (qkv, out, fc1, fc2).
+    /// biases converted as MiniMaxH3DiT converted them, and no bias where its graph adds none (qkv, out, fc1, fc2).
     /// </summary>
     internal sealed class MiniMaxH3ImageWeights : IDisposable
     {

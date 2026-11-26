@@ -15,7 +15,7 @@
 #endif
 
 namespace {
-    using Dependencies = std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>>;
+    using Dependencies = tsg_alloc_dependencies;
 
     void add_dependency(void * data, ggml_tensor * tensor, ggml_tensor * until) {
         if (!tensor || !until) throw std::runtime_error("Backend optimizer requested a null allocation dependency");
@@ -42,15 +42,20 @@ namespace {
     void set_scratch(Params &, long) {}
 }
 
-void tsg_optimize_graph_with_alloc_dependencies(ggml_backend_t backend, ggml_context * ctx, ggml_cgraph * graph) {
+void tsg_collect_graph_optimize_dependencies(ggml_backend_t backend, ggml_cgraph * graph, tsg_alloc_dependencies & dependencies) {
     if (!backend || !graph || !backend->iface.graph_optimize) return;
-    Dependencies dependencies;
     // By field, not position: the struct's layout differs between ggml revisions.
     ggml_backend_graph_optimize_params params{};
     params.add_alloc_dep = add_dependency;
     params.user_data = &dependencies;
     set_scratch(params, 0);
     backend->iface.graph_optimize(backend, graph, &params);
+}
+
+void tsg_optimize_graph_with_alloc_dependencies(ggml_backend_t backend, ggml_context * ctx, ggml_cgraph * graph) {
+    if (!backend || !graph || !backend->iface.graph_optimize) return;
+    Dependencies dependencies;
+    tsg_collect_graph_optimize_dependencies(backend, graph, dependencies);
     insert_dependencies(ctx, graph, dependencies);
 }
 

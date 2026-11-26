@@ -211,7 +211,7 @@ MiniMax-H3 attends bidirectionally over **one** packed sequence with no mask —
 |---|---|
 | `TS_H3_NO_FLASH=1` | Force the explicit softmax path, to separate a flash-attention kernel problem from a modelling one |
 
-The sampler no longer trusts the result either. A non-finite velocity fails the request naming the step it appeared at (`RequireFinite` in `MiniMaxH3Pipeline.cs`) rather than writing out a file of the right length, frame rate and soundtrack duration that is uniformly black — the failure mode is silent by construction, because the RGB clamp pins a NaN pixel at 0 and the WAV writer clamps a NaN sample to -1.
+The sampler no longer trusts the result either. A non-finite velocity fails the request naming the step it appeared at (`RequireFinite` in `MiniMaxH3Requests.cs`) rather than writing out a file of the right length, frame rate and soundtrack duration that is uniformly black — the failure mode is silent by construction, because the RGB clamp pins a NaN pixel at 0 and the WAV writer clamps a NaN sample to -1.
 
 #### Flash attention on shapes a backend has no kernel for
 

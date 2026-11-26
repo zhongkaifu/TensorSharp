@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_cuda_launch_policy.h"
 #include "ggml_ops_internal.h"
+#include "ggml_ops_graph_optimize.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "gguf.h"
@@ -509,16 +510,8 @@ struct encoder {
             // Preserve external inputs until the last node of each fused Metal
             // operation, exactly as ggml's scheduler does. The dependency views
             // belong only to the allocation graph, so compute fusion stays intact.
-            std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> dependencies;
-            ggml_backend_graph_optimize_params params = {
-                [](void * state, ggml_tensor * tensor, ggml_tensor * until) {
-                    auto & deps = *static_cast<std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> *>(state);
-                    auto & keep = deps[until];
-                    if (std::find(keep.begin(), keep.end(), tensor) == keep.end()) keep.push_back(tensor);
-                },
-                &dependencies,
-            };
-            backend->iface.graph_optimize(backend, g->gf, &params);
+            tsg_alloc_dependencies dependencies;
+            tsg_collect_graph_optimize_dependencies(backend, g->gf, dependencies);
             if (!dependencies.empty()) {
                 size_t count = 0;
                 for (const auto & item : dependencies) count += (item.second.size() + GGML_MAX_SRC - 1) / GGML_MAX_SRC;

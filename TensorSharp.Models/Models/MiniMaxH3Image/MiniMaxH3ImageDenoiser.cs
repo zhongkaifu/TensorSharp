@@ -7,8 +7,8 @@
 //
 // MiniMax-H3-Image's denoiser on the diffusion runtime: one step is one GraphProgram (the token refiner, the 50 blocks
 // and the final layer with the step's PDD head), emitted through GraphEmitter with the diffusion-transformer regions and
-// run by the backend's graph executor. The program is the graph TSGgml_MiniMaxH3DitForward builds, node for node, so a
-// backend that lowers it as the native graph does computes the same velocity bit for bit (see the emission below).
+// run by the backend's graph executor. The program is the graph the retired TSGgml_MiniMaxH3DitForward built, node for node,
+// so a backend that lowers it as that native graph did computes the same velocity bit for bit (see the emission below).
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -463,7 +463,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         }
 
         /// <summary>
-        /// The step's program, in the order and with the operands of TSGgml_MiniMaxH3DitForward's graph (ggml_ops_minimax_h3.cpp,
+        /// The step's program, in the order and with the operands of the retired TSGgml_MiniMaxH3DitForward's graph (ggml_ops_minimax_h3.cpp,
         /// audio_count 0): the q8_1 guard around every block-quantized product but the AdaLN projections' (h3_mm), the token
         /// refiner unmodulated and without RoPE, each block's modulations, attention, gated residuals and SwiGLU as the
         /// diffusion-transformer regions (whose ops are that graph's unfused nodes, and which ggml_cuda serves as its fused
