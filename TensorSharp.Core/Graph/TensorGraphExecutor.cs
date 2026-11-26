@@ -2468,10 +2468,10 @@ namespace TensorSharp.Graph
 
             // The routes sorted by expert (counting sort, routes in order within an expert), their rows gathered once, every
             // expert's product over its run of them (ExpertProducts), then back in route order.
-            int experts = (int)set.Ne2, routes = rows * k;
-            var offsets = new int[experts + 1];
+            int stacked = (int)set.Ne2, routes = rows * k;
+            var offsets = new int[stacked + 1];
             for (int i = 0; i < routes; i++) offsets[selected[i] + 1]++;
-            for (int e = 0; e < experts; e++) offsets[e + 1] += offsets[e];
+            for (int e = 0; e < stacked; e++) offsets[e + 1] += offsets[e];
             var next = (int[])offsets.Clone();
             var sourceRows = new int[routes];
             var inverse = new int[routes];
