@@ -33,9 +33,14 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 
 ## 连续批处理 / 批处理前向
 
+旧的 Nemotron-H 模型（`NemotronModel`）已于 2026-11 删除（Nemotron-H 在所有后端上都运行在共享解码运行时上）；它的开关
+`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE`、`TS_NEMOTRON_MAMBA2_NATIVE_PREFILL_MIN_TOKENS`、`TS_MAMBA2_PREFILL_CACHE_MB`、
+`TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`、`TS_NEMOTRON_MOE_PREFILL_BATCHED_MIN_TOKENS`、`TS_NEMOTRON_MULTIMODAL_WARMUP`、
+`TS_NEMOTRON_MULTIMODAL_WARMUP_TILES` 与 `TS_TP_SNAPSHOT_TRACE` 现在会让服务器或 CLI 在启动时停止，并给出说明变更的消息。
+`TS_NEMOTRON_IMAGE_MAX_TILES` 与 `TS_NEMOTRON_AUDIO_MMPROJ` 仍然有效。
+
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | 原生批处理 Mamba2 step | 关闭 | `0`, `1` | 否 |
 | `TS_PER_SEQ_FUSED` | fused 能力模型（GGML 后端上的 Gemma 4 与 GPT OSS；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，凡可加载的后端均适用，多节点流水线除外；各自原生执行器上的 DeepSeek V4 / V4.1 与 GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward，每个序列有自己的设备端 K/V holder；`0` 改走逐算子批处理分页路径，其 K/V 位于共享的主机块池（设备内存更少、decode 速率更低、没有保留的 holder） | 启用 | 未注册 | 否 |
 | `TS_BATCHED_FUSED_DECODE` | 具备 token 批量融合 decode 的模型（Gemma 4、Qwen 3.5/3.6/3.8、GPT OSS、GLM 5.x、DeepSeek V4 / V4.1） | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列）。在 GLM 5.x 上 4 个并发请求可得合计 1.81× decode；在 DeepSeek V4.1 Flash 的 Q4_K_M 上为 2.0×（24.3 → 48.9 tok/s），上限来自路由——每个 token 各自从 384 个专家里挑 6 个。批处理会改变 GEMM 形状，2 bit MoE 可能把这点差别放大成不同的专家选择；设为 `0` 可做串行路径 A/B。 | 开启 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 具有可保留 request-owned fused holder 的模型（Gemma 4；Qwen 3.5/3.6/3.8；Qwen 3.8 Flash Next；未加载 DSpark 草稿器时的 DeepSeek V4.1；原生执行器上的 GLM 5.x，每个会话交出一个原生 slot） | 为下一轮的精确前缀续接保留多少个已结束会话的终态（holder、原生 slot）；Qwen holder 同时包含 attention K/V 与匹配的 GatedDeltaNet 递归状态。未设置时跟随 `TS_SCHED_MAX_RUNNING_SEQS`（至少 4），使每个可以并行运行的请求都保有自己的终态；字节数由显存而不是这个数量约束。`0` 关闭保留 | 运行中请求上限（16），至少 `4` | 不适用 | 否 |
@@ -290,8 +295,8 @@ MiniMax-H3-Image 运行在共享扩散运行时上，其驻留计划、VAE 程�
 Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1 DSpark 路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证；
 以及无需权重的 n-gram 投机器）。投机仅对单序列（无并发）请求生效，且只在模型声明有收益时启用，这由各
 模型自己决定：Qwen 3.5/3.6/3.8 与 GLM 5.2 / GLM-5.3 在所有后端上，GLM-5.3-Flash（仅 n-gram）在其 KDA
-回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其可加载的所有后端上，Muse-Glimmer 在所有后端上，DeepSeek V4 / V4.1 只在加载了各自草稿器时。Nemotron-H
-拒绝一切投机器，GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
+回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其可加载的所有后端上，Muse-Glimmer 在所有后端上，DeepSeek V4 / V4.1 只在加载了各自草稿器时，Nemotron-H
+在所有后端上（n-gram 与 Nemotron 3.5 MTP 头）。GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
 它们未注册在 `EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫描——矩阵特性目录目前
 没有投机解码特性，请用显式运行来验证这些变量。
 

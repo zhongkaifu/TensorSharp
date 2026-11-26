@@ -106,6 +106,8 @@ namespace TensorSharp.Graph
             GraphOp.Log, GraphOp.CumSum,
             // Gemma 4's GeGLU feed-forwards (ggml_geglu / ggml_geglu_split: the tanh GELU of the gate times the up rows).
             GraphOp.Geglu, GraphOp.GegluSplit,
+            // Nemotron-H's Mamba-2 layers (ggml_ssm_scan).
+            GraphOp.SsmScan,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -336,6 +338,65 @@ namespace TensorSharp.Graph
                     CopyInto(dst, src);
                 at += inputRows * rowFloats;
             }
+            return result;
+        }
+
+        /// <summary>
+        /// ggml_ssm_scan for Mamba-2 (a scalar decay per head): states [ns', n_head, head_dim, d_state] (sequence i starts from
+        /// row <paramref name="ids"/>[i]), x [ns, n_t, n_head, head_dim], dt [1, ns, n_t, n_head] (before softplus), A
+        /// [n_head, 1], B and C [ns, n_t, n_group, d_state]. Returns ggml's result as one F32 vector: y [ns, n_t, n_head,
+        /// head_dim], then <paramref name="keep"/> state slots [ns, n_head, head_dim, d_state] (slot 0 the newest; a slot older
+        /// than the tokens is left zero). Default: on the host, as ggml-cpu computes it.
+        /// </summary>
+        protected virtual Tensor SsmScan(Tensor state, Tensor x, Tensor dt, Tensor a, Tensor b, Tensor c, int[] ids, int keep)
+            => SsmScanHost(state, x, dt, a, b, c, ids, keep);
+
+        /// <summary>The host selective scan (ggml-cpu's loop).</summary>
+        protected Tensor SsmScanHost(Tensor state, Tensor x, Tensor dt, Tensor a, Tensor b, Tensor c, int[] ids, int keep)
+        {
+            int ns = (int)x.Sizes[0], nt = (int)x.Sizes[1], nh = (int)x.Sizes[2], hd = (int)x.Sizes[3];
+            int ng = (int)b.Sizes[2], dstate = (int)b.Sizes[3];
+            float[] sv = state.GetElementsAsFloat((int)state.ElementCount()), xv = x.GetElementsAsFloat((int)x.ElementCount());
+            float[] dv = dt.GetElementsAsFloat((int)dt.ElementCount()), av = a.GetElementsAsFloat((int)a.ElementCount());
+            float[] bv = b.GetElementsAsFloat((int)b.ElementCount()), cv = c.GetElementsAsFloat((int)c.ElementCount());
+            int slots = Math.Max(1, keep);
+            long yFloats = (long)ns * nt * nh * hd, perState = (long)nh * hd * dstate, perSlot = perState * ns;
+            var outv = new float[yFloats + perSlot * slots];
+            var s = new float[perState];
+            int headsPerGroup = nh / ng;
+            for (int seq = 0; seq < ns; seq++)
+            {
+                Array.Copy(sv, (long)ids[seq] * perState, s, 0, perState);
+                for (int t = 0; t < nt; t++)
+                {
+                    long row = (long)seq * nt + t;
+                    for (int h = 0; h < nh; h++)
+                    {
+                        float dtSoft = TensorComputePrimitives.Softplus(dv[row * nh + h]);
+                        float dA = MathF.Exp(dtSoft * av[h]);
+                        int g = h / headsPerGroup;
+                        long bc = (row * ng + g) * dstate;
+                        for (int i = 0; i < hd; i++)
+                        {
+                            long xi = (row * nh + h) * hd + i;
+                            float xdt = xv[xi] * dtSoft, sum = 0;
+                            long si = ((long)h * hd + i) * dstate;
+                            for (int k = 0; k < dstate; k++)
+                            {
+                                float v = s[si + k] * dA + bv[bc + k] * xdt;
+                                sum += v * cv[bc + k];
+                                s[si + k] = v;
+                            }
+                            outv[xi] = sum;
+                        }
+                    }
+                    int slot = nt - 1 - t;
+                    if (slot < slots)
+                        Array.Copy(s, 0, outv, yFloats + slot * perSlot + seq * perState, perState);
+                }
+            }
+            var result = new Tensor(Allocator, DType.Float32, outv.LongLength);
+            result.SetElementsAsFloat(outv);
             return result;
         }
 
@@ -1970,7 +2031,8 @@ namespace TensorSharp.Graph
                 }
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
                 case GraphOp.MoeHostExperts: return V(HostExperts(T(0), values[n.Srcs[1]], values[n.Srcs[2]], values[n.Srcs[3]],
-                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run, (int)Ip(1, 0), Ip(2, 0) != 0));
+                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run, (int)Ip(1, 0), Ip(2, 0) != 0,
+                    Ip(3, 0) != 0 ? values[n.Srcs[6]] : default));
                 case GraphOp.Reshape:
                 {
                     // A relaid row block (a packed product's column block, rows a pitch apart) reshaped within its rows stays
@@ -2116,6 +2178,14 @@ namespace TensorSharp.Graph
                     Tensor x = Contig(T(0), run), kernel = Contig(T(1), run);
                     if (x.DimensionCount == 2) x = run.Keep(x.View(1, x.Sizes[0], x.Sizes[1]));
                     return V(SsmConv(x, kernel));
+                }
+                case GraphOp.SsmScan:
+                {
+                    // ip: [K states kept]; ids name each sequence's starting state.
+                    Tensor x = Contig(T(1), run), dt = Contig(T(2), run), a = Contig(T(3), run);
+                    Tensor b = Contig(T(4), run), c = Contig(T(5), run), st = Contig(T(0), run);
+                    int[] ids = Ints(values[n.Srcs[6]]);
+                    return V(SsmScan(As4(st, run), As4(x, run), As4(dt, run), a, As4(b, run), As4(c, run), ids, (int)Math.Max(1, Ip(0, 1))));
                 }
                 case GraphOp.GatedDeltaNet:
                 {
@@ -2530,11 +2600,14 @@ namespace TensorSharp.Graph
         /// the host streams (a prompt chunk) runs every route here, the experts outside the tier read in for it and
         /// dropped after. Returns the weighted sum [rows, hidden].
         /// </summary>
-        /// <param name="activation">0: silu(gate) * up; 2: gelu_tanh(gate) * up (the op's ip[1]).</param>
+        /// <param name="activation">0: silu(gate) * up; 2: gelu_tanh(gate) * up; 3: relu(up)^2, one projection (Nemotron-H:
+        /// the gate source names the up stack, as the up source does) (the op's ip[1]).</param>
         /// <param name="fusedGateUp">The gate stack is one fused [gate | up] stack, gate the first half of each expert's rows
         /// (the op's ip[2]; its up source names the same stack).</param>
+        /// <param name="upScales">Activation 3 with the op's ip[3] set: each route's scale of its up product, applied before the
+        /// square ([1, K, rows], srcs[6]; one value an expert, the NVFP4 experts' outer scale).</param>
         protected virtual Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run, int activation = 0, bool fusedGateUp = false)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false, Value upScales = default)
         {
             if (gateValue.Weight is not IGraphHostedExperts gate || upValue.Weight is not IGraphExpertWeights up
                 || downValue.Weight is not IGraphExpertWeights down)
@@ -2547,6 +2620,9 @@ namespace TensorSharp.Graph
             int k = (int)nid[0], rows = (int)nid[1], routes = k * rows;
             Tensor xc = run.Keep(Contig(x, run).View(rows, hidden));
             float[] weights = weightValue.Floats ?? Contig(weightValue.Tensor, run).GetElementsAsFloat(routes);
+            float[] scales = upScales.Floats ?? (upScales.Tensor != null ? Contig(upScales.Tensor, run).GetElementsAsFloat(routes) : null);
+            if (scales != null && activation != 3)
+                throw new NotSupportedException("host experts take per-route up scales with the one-projection relu(up)^2 activation only");
             host.Record(layer, ids, GraphExpertAdapt.Weight(rows));
 
             bool stream = host.StreamsStep(layer, rows);
@@ -2572,7 +2648,7 @@ namespace TensorSharp.Graph
             for (int i = 0; i < routes; i++) anyHost |= skip[i] == 0 && ids[i] >= 0;
 
             // The returned tensor is the caller's to keep (V keeps it); the pieces summed into it are this run's.
-            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run, activation, fusedGateUp) : null;
+            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run, activation, fusedGateUp, scales) : null;
             if (!anyHost)
             {
                 if (device != null) return device;
@@ -2582,7 +2658,8 @@ namespace TensorSharp.Graph
             }
             float[] xs = xc.GetElementsAsFloat(rows * hidden);
             var output = new float[(long)rows * hidden];
-            if (!host.Compute(layer, xs, ids, weights, skip, rows, output))
+            if (activation == 3 ? !host.ComputeReluSquared(layer, xs, ids, weights, scales, skip, rows, output)
+                : !host.Compute(layer, xs, ids, weights, skip, rows, output))
                 throw new NotSupportedException($"layer {layer}: the host's expert kernels do not cover these experts");
             var fromHost = new Tensor(Allocator, DType.Float32, rows, hidden);
             fromHost.SetElementsAsFloat(output);
@@ -2595,7 +2672,7 @@ namespace TensorSharp.Graph
         /// weighted, then every row's routes summed (a host route reads a zero row).</summary>
         private Tensor DeviceExperts(Tensor x, int[] ids, float[] weights, byte[] onDevice, int k, IGraphExpertWeights gate,
             IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run,
-            int activation = 0, bool fusedGateUp = false)
+            int activation = 0, bool fusedGateUp = false, float[] upScales = null)
         {
             int rows = (int)x.Sizes[0], hidden = (int)x.Sizes[1], routes = ids.Length;
             var byExpert = new List<int>[gate.Ne2];
@@ -2618,8 +2695,16 @@ namespace TensorSharp.Graph
                 }
                 at += list.Count;
                 Tensor xs = run.Keep(Ops.IndexSelect(null, x, IntTensor(sourceRows, new long[] { sourceRows.Length }, run)));
-                Tensor g, u;
-                if (fusedGateUp)
+                Tensor g = null, u, act = null;
+                if (activation == 3)
+                {
+                    // relu(s u)^2 over the one projection (the gate source names the up stack), s the expert's up scale.
+                    u = run.Keep(ExpertMatMul(gate, e, xs));
+                    if (upScales != null) u = run.Keep(Ops.Mul(null, u, upScales[list[0]]));
+                    Tensor r = run.Keep(Ops.Relu(null, u));
+                    act = run.Keep(Ops.Mul(null, r, r));
+                }
+                else if (fusedGateUp)
                 {
                     // One product over the fused stack: [n, 2 ff], gate the first half.
                     Tensor gu = run.Keep(ExpertMatMul(gate, e, xs));
@@ -2632,7 +2717,7 @@ namespace TensorSharp.Graph
                     g = run.Keep(ExpertMatMul(gate, e, xs));
                     u = run.Keep(ExpertMatMul(up, e, xs));
                 }
-                Tensor act = run.Keep(activation == 2 ? Ops.GELUMul(null, g, u) : Ops.SiLUMul(null, g, u));
+                act ??= run.Keep(activation == 2 ? Ops.GELUMul(null, g, u) : Ops.SiLUMul(null, g, u));
                 Tensor d = run.Keep(ExpertMatMul(down, e, act));
                 var w = run.Keep(new Tensor(Allocator, DType.Float32, list.Count, 1));
                 w.SetElementsAsFloat(routeWeights);
@@ -2640,7 +2725,7 @@ namespace TensorSharp.Graph
                 if (stream && !host.IsResident(layer, e))
                 {
                     ReleaseStreamedExpert(gate.Expert(e));
-                    if (!fusedGateUp) ReleaseStreamedExpert(up.Expert(e));
+                    if (!fusedGateUp && activation != 3) ReleaseStreamedExpert(up.Expert(e));
                     ReleaseStreamedExpert(down.Expert(e));
                 }
             }

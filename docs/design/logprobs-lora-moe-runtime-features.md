@@ -469,7 +469,9 @@ weights an adapter leaves alone keep it. Nemotron's decode paths work this way:
 residual decline for an adapted weight, so `LinearForward` and an add run instead, and
 `LinearForwardInto` (which feeds `ssm_in` into the native Mamba2 decode and `ffn_latent_out`
 into the MoE decode) applies the delta itself through the name-keyed hook
-`ModelBase.TryApplyLoraDelta`, which `LinearForward` calls too.
+`ModelBase.TryApplyLoraDelta`, which `LinearForward` calls too. (These Nemotron paths belonged to the legacy
+`NemotronModel`, removed in 2026-11; on the shared decoder runtime Nemotron-H applies each delta inside the step's graph,
+`AppliesTextLoraInGraphs`; see [the model card](../models/nemotron.md#text-lora-adapters).)
 
 **Audit.** Defense in depth against a bypass the allow-list missed: while an adapter is
 selected, the hook stamps each weight it applies with the forward's serial, and the outermost

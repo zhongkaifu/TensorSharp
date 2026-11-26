@@ -69,8 +69,10 @@ namespace TensorSharp.Models
             }
             if (!_anyMoe) return;
             string arch = MetadataArchitecture ?? Config.Architecture;
-            _numExperts = (int)_gguf.GetUint32($"{arch}.expert_count", 0);
-            _expertsUsed = (int)_gguf.GetUint32($"{arch}.expert_used_count", 0);
+            // A per-layer array (Nemotron 3.5 Bolt's expert_used_count, 0 on its layers without experts) reads as its largest
+            // entry: the runtime sizes routes by it; a family whose layers route differently emits its own experts.
+            _numExperts = MaxMetadataCount($"{arch}.expert_count");
+            _expertsUsed = MaxMetadataCount($"{arch}.expert_used_count");
             _normalizeExpertWeights = _gguf.GetBool($"{arch}.expert_weights_norm", true);
             if (_numExperts <= 0 || _expertsUsed <= 0 || _expertsUsed > _numExperts)
                 throw new InvalidOperationException(
@@ -81,6 +83,18 @@ namespace TensorSharp.Models
                 if (_moeLayer[l] && IsExpertLayerOffloaded(l)) offloaded++;
             Console.WriteLine($"  Routed experts: {_numExperts} per layer, top-{_expertsUsed}" +
                 (offloaded > 0 ? $"; {offloaded} layer(s) keep their experts in host memory and run them there" : "") + ".");
+        }
+
+        /// <summary>A count in the metadata, a scalar or the largest entry of a per-layer array (0 when absent).</summary>
+        private int MaxMetadataCount(string key)
+        {
+            if (!_gguf.Metadata.TryGetValue(key, out object value)) return 0;
+            switch (value)
+            {
+                case uint[] u: { long max = 0; foreach (uint v in u) max = Math.Max(max, v); return (int)max; }
+                case int[] i: { int max = 0; foreach (int v in i) max = Math.Max(max, v); return max; }
+                default: return (int)_gguf.GetUint32(key, 0);
+            }
         }
 
         private bool IsExpertMember(string name) => _stackedExpertMemberNames.Contains(name);

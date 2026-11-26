@@ -15,21 +15,6 @@ using TensorSharp.Cpu;
 
 namespace TensorSharp.GGML
 {
-    // Per-sequence descriptor for the batched Nemotron Mamba2 native step.
-    // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; 32 bytes on 64-bit.
-    // No write-index field because the Mamba2 conv state is a FIFO (memmove
-    // by one row per token), not a ring buffer.
-    [StructLayout(LayoutKind.Sequential)]
-    public struct NemoMamba2BatchedSeqDesc
-    {
-        public int    SeqStart;
-        public int    SeqLen;
-        public int    Pad0;
-        public int    Pad1;
-        public IntPtr ConvState;   // float* — [(dConv-1) * xbcSize]
-        public IntPtr SsmState;    // float* — [nHead * headDim * dState]
-    }
-
     [OpsClass]
     public partial class GgmlBasicOps
     {
@@ -746,34 +731,6 @@ namespace TensorSharp.GGML
             GgmlNative.FusedRmsNormMatMulQuant(resultView, inputView, normPtr, normCount, eps,
                 weightData, ggmlType, ne0, ne1, rawBytes);
         }
-
-        /// <summary>
-        /// Fused quantized MatMul + Add in a single GPU dispatch.
-        /// residual += matmul(input, quantWeight)
-        /// </summary>
-        public static void FusedMatMulQuantAdd(Tensor residual, Tensor input,
-            IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
-        {
-            if (residual.DimensionCount != 2 || input.DimensionCount != 2)
-                throw new ArgumentException("FusedMatMulQuantAdd requires 2D tensors.");
-            if (input.ElementType != DType.Float32 || residual.ElementType != DType.Float32)
-                throw new ArgumentException("FusedMatMulQuantAdd requires Float32 tensors.");
-            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(residual))
-                throw new ArgumentException("FusedMatMulQuantAdd requires native-backed tensors.");
-
-            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
-                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
-                throw new NotSupportedException("FusedMatMulQuantAdd requires supported layouts.");
-
-            GgmlNative.FusedMatMulQuantAdd(residualView, inputView,
-                weightData, ggmlType, ne0, ne1, rawBytes, tpDegree, tpPlanOut);
-        }
-
-        /// <summary>
-        /// Release every rank's parked tensor-parallel matmul+add graph.
-        /// </summary>
-        public static void ReleaseFusedMatmulAddTpGraphs() => GgmlNative.ReleaseFusedMatmulAddTpGraphs();
 
         /// <summary>Prepare Q/K from packed [Q|K|V|gate] rows in one graph.
         /// Learned per-head RMS scales precede optional interleaved RoPE. KV storage is unchanged.</summary>
@@ -1565,44 +1522,6 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
-        /// Batched MoE expert forward: processes all selected experts in a single GGML graph.
-        /// For each expert: up_proj -> relu_squared -> down_proj -> scale(route_weight) -> accumulate.
-        /// Reduces N*2 GPU dispatches to 1 per MoE layer.
-        /// </summary>
-        public static void MoEExpertsForward(Tensor result, Tensor input,
-            int numExperts, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
-            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
-            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
-            float[] routeWeights, float[] upScales = null)
-        {
-            if (result.DimensionCount != 2 || input.DimensionCount != 2)
-                throw new ArgumentException("MoEExpertsForward requires 2D tensors.");
-            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(result))
-                throw new ArgumentException("MoEExpertsForward requires tensors backed by native CPU-accessible storage.");
-
-            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
-                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
-            {
-                throw new NotSupportedException("MoEExpertsForward requires tensors with supported row-contiguous layouts.");
-            }
-
-            // Route to the GPU that owns the result, exactly like AddmmQuant: this
-            // is a direct native entry point, so it never passes through
-            // OpRegistry.PreInvokeHook and would otherwise run on whatever rank the
-            // calling thread was last left on. The expert weight caches are per
-            // rank, so a call on the wrong rank misses every preloaded shard.
-            // Yields to an active RunPerRank pin, and is a no-op on one device.
-            if (result.Storage is GgmlStorage resultStorage)
-                GgmlNative.SetActiveRankIfUnpinned(resultStorage.DeviceId);
-
-            GgmlNative.MoEExpertsForward(resultView, inputView, numExperts,
-                upDataPtrs, downDataPtrs,
-                upGgmlType, upNe0, upNe1, upRawBytesEach,
-                downGgmlType, downNe0, downNe1, downRawBytesEach,
-                routeWeights, upScales);
-        }
-
-        /// <summary>
         /// Batched MoE expert forward with SwiGLU activation (Qwen-family / Mixtral style).
         /// For each expert: gate_proj -> silu(gate) * up_proj(input) -> down_proj -> scale(route_weight) -> accumulate.
         /// Reduces 4*N GPU dispatches to 1 per MoE layer.
@@ -1975,46 +1894,6 @@ namespace TensorSharp.GGML
             DType.Q8_0 => 8,
             _ => throw new ArgumentException($"Unsupported KV cache dtype: {dt}"),
         };
-
-        /// <summary>
-        /// Single-token flash attention decode kernel. Reads Q/K/V (post-norm, post-RoPE) for
-        /// the new query position, appends K/V to the persistent KV cache at <paramref name="position"/>,
-        /// and runs ggml_flash_attn_ext on the device against the populated portion of the cache.
-        ///
-        /// All input/output tensors must be F32 contiguous. Q, K, V, and the output are laid out
-        /// as (heads, head_dim) in row-major order (i.e. head-contiguous). The KV caches use the
-        /// usual layout (kv_heads, max_seq_len, head_dim).
-        /// </summary>
-        public static void FlashAttnDecode(Tensor q, Tensor k, Tensor v,
-            Tensor kCache, Tensor vCache, Tensor output,
-            int numHeads, int numKvHeads, int headDim,
-            int maxSeqLen, int position, float scale)
-        {
-            if (q == null || k == null || v == null || kCache == null || vCache == null || output == null)
-                throw new ArgumentNullException("Flash attention decode requires non-null Q/K/V/cache/output tensors.");
-            if (q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32 ||
-                output.ElementType != DType.Float32)
-                throw new ArgumentException("Flash attention decode requires F32 Q/K/V/output tensors.");
-            if (!IsSupportedKvCacheDType(kCache.ElementType))
-                throw new ArgumentException("Flash attention decode requires an F32, F16, Q8_0 or Q4_0 K cache tensor.");
-            if (vCache.ElementType != kCache.ElementType)
-                throw new ArgumentException("Flash attention decode requires K and V caches to share an element type.");
-
-            IntPtr qPtr = GetBufferStart(q);
-            IntPtr kPtr = GetBufferStart(k);
-            IntPtr vPtr = GetBufferStart(v);
-            IntPtr kcPtr = GetBufferStart(kCache);
-            IntPtr vcPtr = GetBufferStart(vCache);
-            IntPtr outPtr = GetBufferStart(output);
-
-            int kvGgmlType = KvCacheGgmlTypeId(kCache.ElementType);
-
-            GgmlNative.FlashAttnDecode(
-                qPtr, kPtr, vPtr,
-                kcPtr, vcPtr, outPtr,
-                numHeads, numKvHeads, headDim,
-                maxSeqLen, position, scale, kvGgmlType);
-        }
 
         /// <summary>
         /// Native batched paged-attention forward. Public wrapper around
@@ -2810,6 +2689,13 @@ namespace TensorSharp.GGML
             => GgmlNative.TSGgml_HostExpertRowsAct(gate, up, down, gateType, upType, downType, numExperts, hidden, nFf, nUsed, rows,
                 x, ids, weights, skip, output, activation) != 0;
 
+        /// <summary>The same for one-projection experts (Nemotron-H): relu(s up x)^2, then down, <paramref name="upScales"/>
+        /// each route's s ([rows, nUsed] as the weights; null for 1).</summary>
+        public static unsafe bool HostExpertRowsReluSquared(IntPtr up, IntPtr down, int upType, int downType, int numExperts, int hidden,
+            int nFf, int nUsed, int rows, float* x, int* ids, float* weights, float* upScales, byte* skip, float* output)
+            => GgmlNative.TSGgml_HostExpertRowsReluSquared(up, down, upType, downType, numExperts, hidden, nFf, nUsed, rows,
+                x, ids, weights, upScales, skip, output) != 0;
+
         public static void HostExpertIoUnregister(IntPtr baseAddress) => GgmlNative.TSGgml_HostExpertIoUnregister(baseAddress);
 
         /// <summary>True when weight uploads can read a registered file directly instead of
@@ -2880,192 +2766,6 @@ namespace TensorSharp.GGML
                 alphaView, betaView, stateView, gatedOutView,
                 dtBiasData, aLogData, ssmNormWData,
                 chunkSize, eps, gateMode);
-        }
-
-        /// <summary>
-        /// Batched per-token Nemotron Mamba2 step. Runs all (sequence, token)
-        /// pairs in the batched decode/prefill step in one native call,
-        /// indexing each sequence's persistent conv FIFO + SSM state via the
-        /// <see cref="NemoMamba2BatchedSeqDesc"/> entries.
-        /// </summary>
-        public static void NemotronMamba2BatchedStep(
-            NemoMamba2BatchedSeqDesc[] seqs,
-            int numTokens,
-            IntPtr packedBatched,
-            int dInProjTotal,
-            int dInner, int dState, int nHead, int headDim, int nGroup, int dConv,
-            IntPtr convWt, IntPtr convBias, IntPtr dtBias, IntPtr aLog,
-            IntPtr dData, IntPtr ssmNormW,
-            float eps,
-            IntPtr outBatched)
-        {
-            if (seqs == null || seqs.Length == 0)
-                throw new ArgumentException("seqs must be non-empty.", nameof(seqs));
-            if (packedBatched == IntPtr.Zero || outBatched == IntPtr.Zero)
-                throw new ArgumentException("packedBatched and outBatched must be non-null.");
-
-            GgmlNative.NemotronMamba2BatchedStep(
-                seqs, numTokens, packedBatched, dInProjTotal,
-                dInner, dState, nHead, headDim, nGroup, dConv,
-                convWt, convBias, dtBias, aLog, dData, ssmNormW,
-                eps, outBatched);
-        }
-
-        /// <summary>
-        /// Native Nemotron Mamba2 prefill core. Runs the causal conv, SSM scan, gate,
-        /// and optional group RMSNorm as one GGML graph, updating the recurrent states
-        /// in place.
-        /// </summary>
-        public static unsafe void NemotronMamba2Prefill(
-            Tensor projected,
-            Tensor hiddenOut,
-            float[] convState,
-            float[] ssmState,
-            IntPtr convWeightData,
-            IntPtr convBiasData,
-            IntPtr dtBiasData,
-            IntPtr aData,
-            IntPtr dData,
-            IntPtr ssmNormData,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            float eps)
-        {
-            if (projected == null || hiddenOut == null)
-                throw new ArgumentNullException(nameof(projected), "projected and hiddenOut must be non-null.");
-            if (convState == null || ssmState == null)
-                throw new ArgumentNullException(nameof(convState), "convState and ssmState must be non-null.");
-            if (convWeightData == IntPtr.Zero || dtBiasData == IntPtr.Zero || aData == IntPtr.Zero)
-                throw new ArgumentException("convWeightData, dtBiasData, and aData must be non-null pointers.");
-
-            if (!TryCreateStandardView(projected, out GgmlTensorView2D projectedView)
-                || !TryCreateStandardView(hiddenOut, out GgmlTensorView2D hiddenOutView))
-            {
-                throw new NotSupportedException("NemotronMamba2Prefill requires Float32 tensors with row-contiguous 2D layouts.");
-            }
-
-            fixed (float* convStatePtr = convState)
-            fixed (float* ssmStatePtr = ssmState)
-            {
-                GgmlNative.NemotronMamba2Prefill(
-                    projectedView,
-                    hiddenOutView,
-                    (IntPtr)convStatePtr,
-                    convState.Length,
-                    (IntPtr)ssmStatePtr,
-                    ssmState.Length,
-                    convWeightData,
-                    convBiasData,
-                    dtBiasData,
-                    aData,
-                    dData,
-                    ssmNormData,
-                    dInner,
-                    dState,
-                    nHead,
-                    headDim,
-                    nGroup,
-                    dConv,
-                    eps);
-            }
-        }
-
-        /// <summary>
-        /// Native Nemotron Mamba2 single-token decode core. The native side keeps
-        /// a persistent recurrent state cache keyed by <paramref name="stateKey"/>;
-        /// pass <paramref name="initializeState"/> after reset/prefill to upload
-        /// the managed state arrays once.
-        /// </summary>
-        public static unsafe void NemotronMamba2Decode(
-            ulong stateKey,
-            Tensor projected,
-            Tensor hiddenOut,
-            float[] convState,
-            float[] ssmState,
-            bool initializeState,
-            bool downloadState,
-            IntPtr convWeightData,
-            IntPtr convBiasData,
-            IntPtr dtBiasData,
-            IntPtr aData,
-            IntPtr dData,
-            IntPtr ssmNormData,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            float eps)
-        {
-            if (stateKey == 0)
-                throw new ArgumentException("stateKey must be non-zero.", nameof(stateKey));
-            if (projected == null || hiddenOut == null)
-                throw new ArgumentNullException(nameof(projected), "projected and hiddenOut must be non-null.");
-            if (convState == null || ssmState == null)
-                throw new ArgumentNullException(nameof(convState), "convState and ssmState must be non-null.");
-            if (convWeightData == IntPtr.Zero || dtBiasData == IntPtr.Zero || aData == IntPtr.Zero)
-                throw new ArgumentException("convWeightData, dtBiasData, and aData must be non-null pointers.");
-
-            if (!TryCreateStandardView(projected, out GgmlTensorView2D projectedView)
-                || !TryCreateStandardView(hiddenOut, out GgmlTensorView2D hiddenOutView))
-            {
-                throw new NotSupportedException("NemotronMamba2Decode requires Float32 tensors with row-contiguous 2D layouts.");
-            }
-
-            fixed (float* convStatePtr = convState)
-            fixed (float* ssmStatePtr = ssmState)
-            {
-                GgmlNative.NemotronMamba2Decode(
-                    stateKey,
-                    projectedView,
-                    hiddenOutView,
-                    (IntPtr)convStatePtr,
-                    convState.Length,
-                    (IntPtr)ssmStatePtr,
-                    ssmState.Length,
-                    initializeState,
-                    downloadState,
-                    convWeightData,
-                    convBiasData,
-                    dtBiasData,
-                    aData,
-                    dData,
-                    ssmNormData,
-                    dInner,
-                    dState,
-                    nHead,
-                    headDim,
-                    nGroup,
-                    dConv,
-                    eps);
-            }
-        }
-
-        public static void NemotronMamba2DecodeClear(ulong modelKey) =>
-            GgmlNative.NemotronMamba2DecodeClear(modelKey);
-
-        /// <summary>
-        /// Copy the device-resident recurrent state that <see cref="NemotronMamba2Decode"/>
-        /// keeps for <paramref name="stateKey"/> back into the host arrays. Returns false when
-        /// the native library has no entry for the key (the host arrays are authoritative).
-        /// </summary>
-        public static unsafe bool NemotronMamba2DecodeReadState(ulong stateKey, float[] convState, float[] ssmState)
-        {
-            if (stateKey == 0)
-                throw new ArgumentException("stateKey must be non-zero.", nameof(stateKey));
-            ArgumentNullException.ThrowIfNull(convState);
-            ArgumentNullException.ThrowIfNull(ssmState);
-            fixed (float* convPtr = convState)
-            fixed (float* ssmPtr = ssmState)
-            {
-                return GgmlNative.NemotronMamba2DecodeReadState(
-                    stateKey, (IntPtr)convPtr, convState.Length, (IntPtr)ssmPtr, ssmState.Length);
-            }
         }
 
         [RegisterOpStorageType("addmmbatch", typeof(GgmlStorage))]

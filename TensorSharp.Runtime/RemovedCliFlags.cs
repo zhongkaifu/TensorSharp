@@ -120,6 +120,15 @@ namespace TensorSharp.Runtime
             ("TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL", Gemma4LegacyRemoved),
             ("TS_GPTOSS_BATCHED", PerModelBatchedRemoved),
             ("TS_NEMOTRON_BATCHED", PerModelBatchedRemoved),
+            // The legacy Nemotron-H model's switches (the family now runs on the shared decoder runtime).
+            ("TS_NEMOTRON_MAMBA2_BATCHED_NATIVE", NemotronLegacyRemoved),
+            ("TS_NEMOTRON_MAMBA2_NATIVE_PREFILL_MIN_TOKENS", NemotronLegacyRemoved),
+            ("TS_MAMBA2_PREFILL_CACHE_MB", NemotronLegacyRemoved),
+            ("TS_NEMOTRON_ATTN_SCORE_BUDGET_MB", NemotronLegacyRemoved),
+            ("TS_NEMOTRON_MOE_PREFILL_BATCHED_MIN_TOKENS", NemotronLegacyRemoved),
+            ("TS_NEMOTRON_MULTIMODAL_WARMUP", NemotronLegacyRemoved),
+            ("TS_NEMOTRON_MULTIMODAL_WARMUP_TILES", NemotronLegacyRemoved),
+            ("TS_TP_SNAPSHOT_TRACE", NemotronLegacyRemoved),
             ("TS_HUNYUAN_BATCHED", PerModelBatchedRemoved),
             ("TS_WAN_VAE", "every video model reads TS_VIDEO_VAE (--video-vae)."),
             ("TS_WAN_TE", "every video model reads TS_VIDEO_TEXT_ENCODER (--video-text-encoder)."),
@@ -765,6 +774,11 @@ namespace TensorSharp.Runtime
         private const string Gemma4LegacyRemoved =
             "Gemma 4 runs on the shared decoder runtime on every backend (its batched steps, prefix cache, placements "
             + "and speculation are the runtime's); the legacy Gemma 4 model that read it was removed.";
+
+        private const string NemotronLegacyRemoved =
+            "Nemotron-H runs on the shared decoder runtime on every backend (its Mamba-2 scan, attention, routed experts, "
+            + "batched steps, prefix cache, placements and speculation are the runtime's whole-forward graphs); the legacy "
+            + "Nemotron-H model that read it was removed.";
 
         private const string MuseGlimmerLegacyRemoved =
             "Muse-Glimmer runs on the shared decoder runtime on every backend, MLX included; the legacy Muse-Glimmer model "

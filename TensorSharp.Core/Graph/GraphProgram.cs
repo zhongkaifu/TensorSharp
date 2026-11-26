@@ -73,6 +73,17 @@ namespace TensorSharp.Graph
         Log = 72,
         /// <summary>The running sum along ne0 (ggml_cumsum): y[i] = x[0] + ... + x[i] in each row.</summary>
         CumSum = 73,
+        /// <summary>
+        /// Mamba-2's selective scan (ggml_ssm_scan with a scalar decay per head): srcs the states s [d_state, head_dim, n_head,
+        /// n_seqs], x [head_dim, n_head, n_t, n_seqs], dt [n_head, n_t, n_seqs] (before its softplus), A [1, n_head], B and C
+        /// [d_state, n_group, n_t, n_seqs] (head h reads group h / (n_head / n_group)) and ids (I32 [n_seqs]: the state slot
+        /// each sequence starts from). Ip[0]: K, the states kept (1 or more). Per head and token: dt' = softplus(dt),
+        /// state = state * exp(dt' A) + B (x dt'), y = state . C. Result, F32 and one-dimensional: y [head_dim, n_head, n_t,
+        /// n_seqs], then K state slots [d_state, head_dim, n_head, n_seqs] each: slot 0 the state after the last token, slot j
+        /// the state j tokens before it (a slot older than the tokens is left as it was). The D skip and the gate are the
+        /// family's ops.
+        /// </summary>
+        SsmScan = 74,
     }
 
     /// <summary>

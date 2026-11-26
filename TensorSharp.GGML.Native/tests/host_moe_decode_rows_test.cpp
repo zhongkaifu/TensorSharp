@@ -232,6 +232,105 @@ namespace {
     }
 }
 
+namespace {
+    // Nemotron-H's one-projection experts (activation 3): relu(s up x)^2, then down, the up stack in the gate slot and no up
+    // stack, s each route's up scale. Batched rows equal solo rows bit for bit, the output matches a dequantized reference
+    // (the kernel quantizes x and h to the weights' dot types), and inconsistent inputs are declined untouched.
+    int one_projection_cases()
+    {
+        int checks = 0;
+        for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16})
+        {
+            Fixture fixture(type, 256, 256, 9, 4);
+            auto hm = fixture.hm;
+            hm.activation = 3;
+            hm.up_data = nullptr; hm.up_type = 0; hm.up_ne0 = 0; hm.up_ne1 = 0; hm.up_bytes = 0;
+            for (int threads : {1, 4})
+            {
+                tsg::test_threads = threads; tsg::host_moe_decode_release();
+                for (int iteration = 0; iteration < 2; ++iteration)
+                    for (int width : {1, 3, 8, 16})
+                    {
+                        auto h = hm; h.seq_len = width;
+                        Inputs in(h, width, iteration);
+                        std::vector<float> scales(in.route.size());
+                        for (std::size_t i = 0; i < scales.size(); ++i) scales[i] = .5f + float((i * 7 + iteration) % 13) / 8.f;
+                        std::vector<float> solo_out(std::size_t(width) * h.hidden);
+                        auto one = h; one.seq_len = 1;
+                        for (int row = 0; row < width; ++row)
+                            require(tsg::host_moe_decode_experts(one, in.x.data() + std::size_t(row) * h.hidden,
+                                in.ids.data() + std::size_t(row) * h.n_used, in.route.data() + std::size_t(row) * h.n_used,
+                                solo_out.data() + std::size_t(row) * h.hidden, nullptr, scales.data() + std::size_t(row) * h.n_used),
+                                "Solo kernel declined the one-projection experts.");
+                        std::vector<float> out(solo_out.size());
+                        require(tsg::host_moe_decode_experts_rows(h, in.x.data(), in.ids.data(), in.route.data(), out.data(), nullptr,
+                            nullptr, scales.data()), "Batched kernel declined the one-projection experts.");
+                        require(std::memcmp(out.data(), solo_out.data(), out.size() * sizeof(float)) == 0,
+                            std::string(ggml_type_name(type)) + ": one-projection batched rows differ from solo rows");
+
+                        // Reference: dequantized weights, F32 x and h, in double.
+                        const auto* traits = ggml_get_type_traits(type);
+                        const std::size_t up_row = ggml_row_size(type, h.hidden), down_row = ggml_row_size(type, h.n_ff);
+                        std::vector<float> w_row(std::max(h.hidden, h.n_ff)), hidden_h(h.n_ff);
+                        double num = 0, den = 0;
+                        for (int row = 0; row < width; ++row)
+                        {
+                            std::vector<double> ref(h.hidden, 0.0);
+                            const float* x = in.x.data() + std::size_t(row) * h.hidden;
+                            for (int slot = 0; slot < h.n_used; ++slot)
+                            {
+                                const std::size_t k = std::size_t(row) * h.n_used + slot;
+                                const int e = in.ids[k];
+                                const auto* up = fixture.weights[0].data() + std::size_t(e) * h.n_ff * up_row;
+                                const auto* down = fixture.weights[2].data() + std::size_t(e) * h.hidden * down_row;
+                                for (int r = 0; r < h.n_ff; ++r)
+                                {
+                                    traits->to_float(up + std::size_t(r) * up_row, w_row.data(), h.hidden);
+                                    double u = 0;
+                                    for (int c = 0; c < h.hidden; ++c) u += double(w_row[c]) * x[c];
+                                    const double v = std::max(u * scales[k], 0.0);
+                                    hidden_h[r] = float(v * v);
+                                }
+                                for (int r = 0; r < h.hidden; ++r)
+                                {
+                                    traits->to_float(down + std::size_t(r) * down_row, w_row.data(), h.n_ff);
+                                    double d = 0;
+                                    for (int c = 0; c < h.n_ff; ++c) d += double(w_row[c]) * hidden_h[c];
+                                    ref[r] += in.route[k] * d;
+                                }
+                            }
+                            for (int r = 0; r < h.hidden; ++r)
+                            {
+                                const double diff = out[std::size_t(row) * h.hidden + r] - ref[r];
+                                num += diff * diff; den += ref[r] * ref[r];
+                            }
+                        }
+                        const double rel = std::sqrt(num / std::max(den, 1e-30));
+                        require(rel < 3e-2, std::string(ggml_type_name(type)) + ": one-projection relL2 " + std::to_string(rel)
+                            + " against the dequantized reference");
+                        ++checks;
+                    }
+                // Inconsistent one-projection inputs are declined untouched.
+                auto base = hm; base.seq_len = 2;
+                Inputs in(base, 17, 3);
+                auto bad = base; bad.up_data = fixture.weights[1].data();
+                declines_untouched(bad, in, "One projection with an up stack accepted.");
+                bad = base; bad.gate_ne1 = 2 * base.n_ff; declines_untouched(bad, in, "One projection with a fused height accepted.");
+                std::vector<float> scales(in.route.size(), 1.f);
+                std::vector<float> out(std::size_t(17) * base.hidden + 2 * guard, sentinel);
+                const auto before = out;
+                require(!tsg::host_moe_decode_experts_rows(fixture.hm, in.x.data(), in.ids.data(), in.route.data(), out.data() + guard,
+                    nullptr, nullptr, scales.data()), "Up scales with a gated activation accepted.");
+                require(std::memcmp(before.data(), out.data(), out.size() * sizeof(float)) == 0, "Output changed before decline.");
+                tsg::host_moe_decode_release();
+            }
+            std::printf("PASS one-projection relu(s up)^2 %s: batched rows equal solo rows, dequantized reference, preflight\n",
+                ggml_type_name(type));
+        }
+        return checks;
+    }
+}
+
 int main(int argc, char** argv)
 {
     bool bench = false;
@@ -286,6 +385,7 @@ int main(int argc, char** argv)
                 fixture.name().c_str(), threads);
         }
     }
+    checks += one_projection_cases();
     if (bench) benchmark();
     std::printf("PASS %d bitwise batch cases; CPU only, no unavailable-device scenarios\n", checks);
     ggml_quantize_free();

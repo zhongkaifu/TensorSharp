@@ -2243,7 +2243,8 @@ namespace tsg
         void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_bytes,
         const float* gate_bias, const float* up_bias, const float* down_bias,
         int activation_type, float oai_alpha, float oai_limit,
-        bool allow_device_stream)
+        bool allow_device_stream,
+        const float* route_up_scales)
     {
         MoEFFNGraphParams p;
         // The graph builder takes a mutable input pointer because the
@@ -2281,6 +2282,7 @@ namespace tsg
         p.oai_limit = oai_limit;
         p.run_on_cpu = true;
         p.allow_device_stream = allow_device_stream;
+        p.route_up_scales = route_up_scales;
         return moe_ffn_prefill_graph_impl(p) != 0;
     }
 
@@ -2430,6 +2432,11 @@ namespace tsg
             {
                 const int i_v = host_moe_graph_node_index(graph, hm.verify_gpu);
                 if (i_v + 1 > cut) cut = i_v + 1;
+            }
+            if (hm.up_scales != nullptr)   // read back with the weights
+            {
+                const int i_s = host_moe_graph_node_index(graph, hm.up_scales);
+                if (i_s + 1 > cut) cut = i_s + 1;
             }
             if (hm.pred_next != nullptr)   // the read-ahead's guess is read at this seam: it precedes the cut
             {
@@ -2596,6 +2603,16 @@ namespace tsg
 
         ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
         ggml_backend_tensor_get(hm.weights, s_weights.data(), 0, route_count * sizeof(float));
+        // The one-projection relu(up)^2 experts' per-route up scales: only the general host evaluation applies them (the
+        // decode kernels take activations 0 and 2, so they decline these segments).
+        static thread_local std::vector<float> s_up_scales;
+        const float* up_scales = nullptr;
+        if (hm.up_scales != nullptr)
+        {
+            s_up_scales.resize(route_count);
+            ggml_backend_tensor_get(hm.up_scales, s_up_scales.data(), 0, route_count * sizeof(float));
+            up_scales = s_up_scales.data();
+        }
 
         if (staged != nullptr)
         {
@@ -2604,11 +2621,12 @@ namespace tsg
             staged->weights = s_weights.data();
         }
 
-        if (host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
+        if (host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data(), nullptr, up_scales))
             return true;
         if (hm.independent_decode_rows && hm.seq_len > 1)
         {
-            if (host_moe_decode_experts_rows(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
+            if (host_moe_decode_experts_rows(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data(), nullptr, nullptr,
+                    up_scales))
                 return true;
             // Concurrent decode rows have independent routing and must retain
             // the solo expert dot products. A multi-token prefill kernel can
@@ -2619,7 +2637,8 @@ namespace tsg
             for (int i = 0; i < hm.seq_len; ++i)
                 if (!host_moe_decode_experts(row, s_moe_in.data() + (size_t)i * hm.hidden,
                     s_ids.data() + (size_t)i * hm.n_used, s_weights.data() + (size_t)i * hm.n_used,
-                    out.data() + (size_t)i * hm.hidden)) { all_rows = false; break; }
+                    out.data() + (size_t)i * hm.hidden, nullptr,
+                    up_scales != nullptr ? up_scales + (size_t)i * hm.n_used : nullptr)) { all_rows = false; break; }
             if (all_rows) return true;
         }
 
@@ -2633,7 +2652,7 @@ namespace tsg
             hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
             hm.gate_bias, hm.up_bias, hm.down_bias,
             hm.activation, hm.oai_alpha, hm.oai_limit,
-            allow_device_stream);
+            allow_device_stream, up_scales);
         // A batch that took the device stream publishes its result through
         // finalize_compute_with_download, which on Metal with async compute only
         // QUEUES a blit into `out`. The seam reads `out` as soon as this returns

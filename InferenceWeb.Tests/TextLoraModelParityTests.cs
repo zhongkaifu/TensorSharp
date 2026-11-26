@@ -106,7 +106,8 @@ public sealed class TextLoraModelParityTests : IDisposable
         // A selected adapter runs the shared runtime's per-op layers (it does not lower to graphs), so the twin does
         // too: the comparison is the adapter's arithmetic, not two execution paths (direct cuda's graph executor and
         // its per-op layers differ by ~5e-4 on these logits).
-        if (twin is StandardDecoderModel shared) shared.GraphLoweringEnabled = false;
+        // A family that applies the adapter in its graphs (Nemotron-H, graph-only) keeps them on both sides.
+        if (twin is StandardDecoderModel { TextLoraRunsInGraphs: false } shared) shared.GraphLoweringEnabled = false;
         twin.ResetKVCache();
         var expected = new List<float[]> { (float[])twin.ForwardRefill(prompt).Clone() };
         var tokens = new List<int>();
@@ -301,7 +302,7 @@ public sealed class TextLoraModelParityTests : IDisposable
         else
             applied.Add("blk.2.ffn_down_shexp.weight");
         if (kind == "moe-latent")
-            applied.Add("blk.2.ffn_latent_out.weight");
+            applied.Add("blk.2.ffn_latent_up.weight");   // the GGUF name the runtime keeps
         AssertMatchesTwin(fixture.BasePath, fixture.TwinPath, fixture.Adapter, backend, tolerance, "nemotron " + kind,
             NemotronPromptLength, applied.ToArray());
     }

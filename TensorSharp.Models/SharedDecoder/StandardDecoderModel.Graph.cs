@@ -46,11 +46,31 @@ namespace TensorSharp.Models
         /// the family has none the graph can express (the step then runs per op).</summary>
         protected virtual RotarySpec GraphRotary => null;
 
+        /// <summary>The family's attention carries no positional encoding (Nemotron-H: the recurrent layers carry position), so
+        /// it lowers with no <see cref="GraphRotary"/> and the default <see cref="EmitQueryKey"/> leaves Q and K as projected.</summary>
+        protected virtual bool AttentionIsPositionless => false;
+
+        /// <summary>
+        /// The family's graphs add a selected text LoRA adapter's delta to every product of a weight it adapts
+        /// (<see cref="GraphStep.MatMul"/>: <c>W x + BT^T (AT^T x)</c>, stamped for the forward audit), so a step with an adapter
+        /// runs as graphs instead of per op. Such steps are traced every time (a kept decode step would not stamp the audit).
+        /// The family lists the weights it adapts (<see cref="ModelBase.TextLoraWeightRefusal"/>): products outside
+        /// <see cref="GraphStep.MatMul"/> (routed experts, row blocks) are not adapted.
+        /// </summary>
+        protected virtual bool AppliesTextLoraInGraphs => false;
+
+        /// <summary>Tests: whether a selected adapter's steps run as graphs (<see cref="AppliesTextLoraInGraphs"/>).</summary>
+        internal bool TextLoraRunsInGraphs => AppliesTextLoraInGraphs;
+
+        /// <summary>The family's attention lowers to the graph: it has a graph rotary, or needs none.</summary>
+        private protected bool AttentionLowers => GraphRotary != null || AttentionIsPositionless;
+
         /// <summary>Per-head transforms of Q [head_dim, heads, rows] and K [head_dim, kv_heads, rows]
         /// before attention: the rotary, plus whatever the family adds (QK-norm, a position-dependent
         /// query scale). The default rotates both with <see cref="GraphRotary"/>.</summary>
         protected virtual void EmitQueryKey(GraphStep step, int layer, ref int q, ref int k)
         {
+            if (GraphRotary == null && AttentionIsPositionless) return;
             q = step.Rope(q, GraphRotary);
             k = step.Rope(k, GraphRotary);
         }
@@ -93,16 +113,16 @@ namespace TensorSharp.Models
             if (GraphExecutor == null) return "this backend registers no graph executor";
             if (_mesh.TensorParallel > 1 && !_rankGraphs) return "tensor-parallel placement";
             if (LayerSplitGroup != null) return "multi-node pipeline";
-            if (GraphRotary == null) return "the family has no graph rotary";
+            if (!AttentionLowers) return "the family has no graph rotary";
             if (_anyRecurrent && !RecurrentMixerLowers) return "recurrent layers without a graph mixer";
-            if (StepAdapter != null) return "a request adapter is selected";
+            if (StepAdapter != null && !AppliesTextLoraInGraphs) return "a request adapter is selected";
             for (int l = 0; l < Config.NumLayers; l++)
                 if (_moeLayer[l] && IsExpertLayerOffloaded(l) && !GraphExecutor.Capabilities.HostExperts) return "host-offloaded experts";
             DType kv = _kvCacheDtype.ToDType();
             if (kv != DType.Float32 && kv != DType.Float16 && kv != DType.Q8_0 && kv != DType.Q4_0) return $"KV dtype {kv}";
             if (kv == DType.Q8_0 || kv == DType.Q4_0)
                 for (int l = 0; l < Config.NumLayers; l++)
-                    if (!_recurrentLayer[l] && !GraphExecutor.TakesKvCacheFormat(KvGgmlType(kv), KeyDimOf(l), ValueDimOf(l)))
+                    if (IsAttentionLayer(l) && !GraphExecutor.TakesKvCacheFormat(KvGgmlType(kv), KeyDimOf(l), ValueDimOf(l)))
                         return $"KV dtype {kv} on this backend's executor";
             // An executor that takes the block format in its attention kernels and row writes only (not in every view of a cache:
             // direct CUDA's q8_0) serves the families whose attention is those kernels' alone.
@@ -1481,7 +1501,7 @@ namespace TensorSharp.Models
             // position), runs as the kept step of its width advanced to its positions; each width keeps its own.
             Tensor[] advancing = advanceInputs ?? (advanceHidden != null ? new[] { advanceHidden } : null);
             bool advance = replayable && advancing != null && !deviceOutputs && DecodeStepsAdvance
-                && !DecodeAdvanceDisabled && GraphExecutor.Capabilities.Replays && counts.Length > 0 && counts[0] >= 1
+                && !DecodeAdvanceDisabled && StepAdapter == null && GraphExecutor.Capabilities.Replays && counts.Length > 0 && counts[0] >= 1
                 && counts[0] <= MaxAdvancedWindowRows && Array.TrueForAll(counts, c => c == counts[0]) && (counts[0] > 1 || !snapshots);
             string replayShape = advance && (counts[0] > 1 || snapshots) ? $"{shape}|w{counts[0]}|{(snapshots ? "s" : "")}" : shape;
             if (advance && TryAdvanceDecode(slots, starts, attentionFloor, attentionFloors, replayShape, advancing, out graph, out outputs))
@@ -1740,14 +1760,20 @@ namespace TensorSharp.Models
                 if (TapDFlashFollow(step, h, layer, targets, taps))
                     EmitDFlashFollow(step, taps, dflash);
                 h = EmitLayerPrologue(step, layer, h);
-                int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
-                int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
-                h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
+                if (_hasMixer[layer])
+                {
+                    int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
+                    int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
+                    h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
+                }
                 // The last layer's feed-forward over the rows the head reads only (PrunesLastLayerRows).
                 if (prune && layer == Config.NumLayers - 1) h = EmitLastRows(step, h, width);
-                int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
-                int ffn = EmitFeedForward(step, layer, ffnIn, ffnContext);
-                h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
+                if (_hasFfn[layer])
+                {
+                    int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
+                    int ffn = EmitFeedForward(step, layer, ffnIn, ffnContext);
+                    h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
+                }
                 step.Boundary(h);
             }
             outputs.Routes = step.Routes;
@@ -1948,25 +1974,28 @@ namespace TensorSharp.Models
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
                         outputs.Captures[c] = EmitCaptureOutput(lead, h[0], request, layer);
-                for (int r = 0; r < ranks; r++)
+                for (int r = 0; r < ranks; r++) h[r] = EmitLayerPrologue(steps[r], layer, h[r]);
+                if (_hasMixer[layer])
                 {
-                    h[r] = EmitLayerPrologue(steps[r], layer, h[r]);
-                    int normed = EmitBlockInput(steps[r], layer, h[r], BlockSite.Mixer, out context[r]);
-                    block[r] = _recurrentLayer[layer] ? EmitRecurrentMixer(steps[r], layer, normed) : EmitAttention(steps[r], layer, normed);
+                    for (int r = 0; r < ranks; r++)
+                    {
+                        int normed = EmitBlockInput(steps[r], layer, h[r], BlockSite.Mixer, out context[r]);
+                        block[r] = _recurrentLayer[layer] ? EmitRecurrentMixer(steps[r], layer, normed) : EmitAttention(steps[r], layer, normed);
+                    }
+                    for (int r = 0; r < ranks; r++) block[r] = steps[r].Op(GraphOp.AllReduce, block[r]);
+                    for (int r = 0; r < ranks; r++) h[r] = EmitBlockOutput(steps[r], layer, h[r], BlockSite.Mixer, context[r], block[r]);
                 }
-                for (int r = 0; r < ranks; r++) block[r] = steps[r].Op(GraphOp.AllReduce, block[r]);
-                for (int r = 0; r < ranks; r++)
+                if (_hasFfn[layer])
                 {
-                    h[r] = EmitBlockOutput(steps[r], layer, h[r], BlockSite.Mixer, context[r], block[r]);
-                    int ffnIn = EmitBlockInput(steps[r], layer, h[r], BlockSite.Ffn, out context[r]);
-                    block[r] = EmitFeedForward(steps[r], layer, ffnIn, context[r]);
+                    for (int r = 0; r < ranks; r++)
+                    {
+                        int ffnIn = EmitBlockInput(steps[r], layer, h[r], BlockSite.Ffn, out context[r]);
+                        block[r] = EmitFeedForward(steps[r], layer, ffnIn, context[r]);
+                    }
+                    for (int r = 0; r < ranks; r++) block[r] = steps[r].Op(GraphOp.AllReduce, block[r]);
+                    for (int r = 0; r < ranks; r++) h[r] = EmitBlockOutput(steps[r], layer, h[r], BlockSite.Ffn, context[r], block[r]);
                 }
-                for (int r = 0; r < ranks; r++) block[r] = steps[r].Op(GraphOp.AllReduce, block[r]);
-                for (int r = 0; r < ranks; r++)
-                {
-                    h[r] = EmitBlockOutput(steps[r], layer, h[r], BlockSite.Ffn, context[r], block[r]);
-                    steps[r].Boundary(h[r]);
-                }
+                for (int r = 0; r < ranks; r++) steps[r].Boundary(h[r]);
             }
             if (_vocabHeadRows != null && request.LastRowLogits && !request.AllRowLogits)
                 EmitVocabSplitHead(steps, h, request, ref outputs);
@@ -2229,7 +2258,7 @@ namespace TensorSharp.Models
             bool replayable = executor.Capabilities.Replays;
             foreach (int c in counts) replayable &= c <= SmallChunkRows;
             // A decode step one position on from the last runs as it advanced, without a trace (TryAdvanceDecode's rule).
-            bool advance = replayable && DecodeStepsAdvance && !DecodeAdvanceDisabled && request.PositionTable == null
+            bool advance = replayable && DecodeStepsAdvance && !DecodeAdvanceDisabled && StepAdapter == null && request.PositionTable == null
                 && !request.RecurrentSnapshots && Array.TrueForAll(counts, c => c == 1);
             Tensor[] inputs = RankInputs(hidden);
             var steps = new GraphStep[ranks];
@@ -4088,8 +4117,20 @@ namespace TensorSharp.Models
             public int MatMul(string weight, int x)
             {
                 int y = Op(GraphOp.MulMat, Weight(weight), x);
-                if (_m._quantWeights.TryGetValue(weight, out QuantizedWeight q) && q.Scale != 1.0f)
-                    y = Op(GraphOp.Scale, stackalloc[] { y }, default, stackalloc[] { q.Scale });
+                // A per-tensor sidecar scale (NVFP4's scale2); a rank's shard takes the one recorded when it was sharded (a
+                // column-parallel shard is a view without its own), as the per-op tensor-parallel linears do.
+                float scale = Rank >= 0 && _m._tpQuantWeights.ContainsKey(weight)
+                    ? _m._tpWeightScales.GetValueOrDefault(weight, 1.0f)
+                    : _m._quantWeights.TryGetValue(weight, out QuantizedWeight q) ? q.Scale : 1.0f;
+                if (scale != 1.0f)
+                    y = Op(GraphOp.Scale, stackalloc[] { y }, default, stackalloc[] { scale });
+                // The step's text LoRA adapter: y + BT^T (AT^T x) (AT [in, rank] and BT [rank, out] as stored, transposed here).
+                if (_m.AppliesTextLoraInGraphs && _m.StepAdapter != null && _m.TryTakeLoraFactors(weight, out (Tensor AT, Tensor BT) lora))
+                {
+                    int a = Cont(Transpose(TensorWeight(lora.AT, lora.AT.Sizes[1], lora.AT.Sizes[0])));   // [in, rank]
+                    int b = Cont(Transpose(TensorWeight(lora.BT, lora.BT.Sizes[1], lora.BT.Sizes[0])));   // [rank, out]
+                    y = Op(GraphOp.Add, y, Op(GraphOp.MulMat, b, Op(GraphOp.MulMat, a, x)));
+                }
                 return y;
             }
 
@@ -4108,7 +4149,8 @@ namespace TensorSharp.Models
                 {
                     ne0 = q.Ne0;
                     rowBytes = q.RawBytes / q.Ne1;
-                    scale = q.Scale;
+                    // A rank's shard takes the scale recorded when it was sharded (see MatMul).
+                    scale = Rank >= 0 && _m._tpQuantWeights.ContainsKey(weight) ? _m._tpWeightScales.GetValueOrDefault(weight, 1.0f) : q.Scale;
                 }
                 else
                 {

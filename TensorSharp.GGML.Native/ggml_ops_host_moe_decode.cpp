@@ -27,8 +27,8 @@
 // vec_dot_type, exactly as ggml's mul_mat does), on a team that is woken once
 // per layer and parks again as soon as the layer is done:
 //
-//   phase 1   gate and up rows of every selected expert, in 64-row chunks
-//   phase 2   per expert: h = silu(gate) * up (or gelu_tanh(gate) * up), quantized for the down rows
+//   phase 1   gate and up rows of every selected expert, in 64-row chunks (up rows only for relu(up)^2)
+//   phase 2   per expert: h = silu(gate) * up (or gelu_tanh(gate) * up, or relu(s up)^2), quantized for the down rows
 //   phase 3   output rows: sum over experts of weight * dot(down row, h)
 //
 // Work is handed out by atomic counters, and the calling thread starts on it
@@ -38,7 +38,8 @@
 // A bounded batch of independent decode rows shares one team dispatch. Each
 // row retains the solo dot products, activation quantization and expert sum
 // order. A fused [gate | up] stack (Gemma 4: up_data null, 2 n_ff rows an expert, gate
-// first) reads each half as its own matrix; activation 2 is GeGLU (gelu_tanh(gate) * up).
+// first) reads each half as its own matrix; activation 2 is GeGLU (gelu_tanh(gate) * up); activation 3 is
+// Nemotron-H's one projection, relu(s up)^2 (the up stack in the gate slot, no up stack; s each route's up scale).
 // Unsupported widths, biases, another activation or a type without CPU dot traits return
 // false without writing the output.
 // ============================================================================
@@ -96,7 +97,9 @@ namespace tsg
         struct DecodeJob
         {
             int n_rows = 0, n_used = 0, n_embd = 0, n_ff = 0;
-            int activation = 0;          // 0: silu(gate) * up; 2: gelu_tanh(gate) * up
+            int activation = 0;          // 0: silu(gate) * up; 2: gelu_tanh(gate) * up; 3: relu(s up)^2
+            int matrices = 2;            // matrices an expert's phase 1 reads: 1 for activation 3 (its up rows, in the gate slot)
+            float up_scale[kMaxRows * kMaxUsed] = {};   // activation 3: each route's s
             float swiglu_limit = 0.0f;   // HostMoeSegment::swiglu_limit
             const std::uint8_t* gate[kMaxRows * kMaxUsed] = {};
             const std::uint8_t* up[kMaxRows * kMaxUsed] = {};
@@ -145,9 +148,9 @@ namespace tsg
         {
             const int per = j.chunks_per_matrix;
             const int matrix = j.n_rows == 1 ? c / per : j.matrix_order[c / per];
-            const int e = matrix / 2;
+            const int e = matrix / j.matrices;
             if (j.skip[e]) return;
-            const bool is_up = (matrix & 1) != 0;
+            const bool is_up = j.matrices == 2 && (matrix & 1) != 0;
             const int r0 = (c % per) * kRowsPerChunk;
             const int r1 = std::min(j.n_ff, r0 + kRowsPerChunk);
             const std::uint8_t* base = is_up ? j.up[e] : j.gate[e];
@@ -167,7 +170,17 @@ namespace tsg
             const float* g = j.g + (std::size_t)e * j.n_ff;
             const float* u = j.u + (std::size_t)e * j.n_ff;
             float* h = j.h + (std::size_t)e * j.n_ff;
-            if (j.swiglu_limit > 0.0f)
+            if (j.activation == 3)
+            {
+                // The up product (in the gate slot) times the route's up scale, before the square.
+                const float sc = j.up_scale[e];
+                for (int i = 0; i < j.n_ff; ++i)
+                {
+                    const float v = std::max(g[i] * sc, 0.0f);
+                    h[i] = v * v;
+                }
+            }
+            else if (j.swiglu_limit > 0.0f)
             {
                 const float L = j.swiglu_limit;
                 for (int i = 0; i < j.n_ff; ++i)
@@ -461,8 +474,10 @@ namespace tsg
         constexpr int kMaxPrefetch = 3 * kMaxRows * kMaxUsed;
         const HostMoeSegment& hm = *a.hm;
         if (a.ids == nullptr || a.count <= 0 || hm.num_experts <= 0 || hm.hidden <= 0 || hm.n_ff <= 0) return;
-        // A fused [gate | up] stack (up_data null) holds both halves in the gate stack: one slice an expert.
-        const bool fused = hm.up_data == nullptr;
+        // A fused [gate | up] stack (up_data null) holds both halves in the gate stack: one slice an expert. The one
+        // projection (activation 3) holds the up rows in the gate slot.
+        const bool one = hm.activation == 3;
+        const bool fused = !one && hm.up_data == nullptr;
         const std::size_t gate_stride = ggml_row_size((ggml_type)hm.gate_type, hm.hidden) * (std::size_t)hm.n_ff * (fused ? 2 : 1);
         const std::size_t up_stride = fused ? 0 : ggml_row_size((ggml_type)hm.up_type, hm.hidden) * (std::size_t)hm.n_ff;
         const std::size_t down_stride = ggml_row_size((ggml_type)hm.down_type, hm.n_ff) * (std::size_t)hm.hidden;
@@ -473,7 +488,7 @@ namespace tsg
         {
             if (a.ids[k] < 0 || a.ids[k] >= hm.num_experts) continue;
             sources[n] = (const std::uint8_t*)hm.gate_data + (std::size_t)a.ids[k] * gate_stride; lengths[n++] = gate_stride;
-            if (!fused) { sources[n] = (const std::uint8_t*)hm.up_data + (std::size_t)a.ids[k] * up_stride; lengths[n++] = up_stride; }
+            if (!fused && !one) { sources[n] = (const std::uint8_t*)hm.up_data + (std::size_t)a.ids[k] * up_stride; lengths[n++] = up_stride; }
             sources[n] = (const std::uint8_t*)hm.down_data + (std::size_t)a.ids[k] * down_stride; lengths[n++] = down_stride;
         }
         host_expert_io_prefetch(sources, lengths, n);
@@ -481,11 +496,15 @@ namespace tsg
 
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                      const float* weights, float* out, const std::uint8_t* skip,
-                                     const HostMoePrefetch* ahead)
+                                     const HostMoePrefetch* ahead, const float* up_scales)
     {
+        // The one projection (activation 3, Nemotron-H): the up stack in the gate slot, no up stack.
+        const bool one = hm.activation == 3;
         // A fused [gate | up] stack (Gemma 4): no up stack, the gate stack's experts 2 n_ff rows each, gate first.
-        const bool fused = hm.up_data == nullptr;
-        if (!decode_kernel_enabled() || hm.seq_len < 1 || hm.seq_len > kMaxRows || (hm.activation != 0 && hm.activation != 2)
+        const bool fused = !one && hm.up_data == nullptr;
+        if (!decode_kernel_enabled() || hm.seq_len < 1 || hm.seq_len > kMaxRows
+            || (hm.activation != 0 && hm.activation != 2 && hm.activation != 3) || (one && hm.up_data != nullptr)
+            || (up_scales != nullptr && !one)
             || (hm.activation != 0 && hm.swiglu_limit > 0.0f) || hm.gate_bias || hm.up_bias || hm.down_bias
             || hm.n_used <= 0 || hm.n_used > kMaxUsed || hm.num_experts <= 0
             || hm.gate_data == nullptr || hm.down_data == nullptr
@@ -493,10 +512,10 @@ namespace tsg
             return false;
         const int n_rows = hm.seq_len, n_embd = hm.hidden, n_ff = hm.n_ff;
         if (hm.gate_ne0 != n_embd || hm.gate_ne1 != (fused ? 2 * (std::int64_t)n_ff : n_ff)
-            || (!fused && (hm.up_ne0 != n_embd || hm.up_ne1 != n_ff))
+            || (!fused && !one && (hm.up_ne0 != n_embd || hm.up_ne1 != n_ff))
             || hm.down_ne0 != n_ff || hm.down_ne1 != n_embd)
             return false;
-        const int up_type = fused ? hm.gate_type : hm.up_type;
+        const int up_type = fused || one ? hm.gate_type : hm.up_type;
         const ggml_type_traits_cpu* tg = dot_traits(hm.gate_type);
         const ggml_type_traits_cpu* tu = dot_traits(up_type);
         const ggml_type_traits_cpu* td = dot_traits(hm.down_type);
@@ -515,7 +534,7 @@ namespace tsg
         const std::size_t up_stride = up_row * (std::size_t)n_ff;
         const std::size_t down_stride = down_row * (std::size_t)n_embd;
         if ((std::uint64_t)hm.gate_bytes != gate_stride * (std::uint64_t)hm.num_experts
-            || (!fused && (std::uint64_t)hm.up_bytes != up_stride * (std::uint64_t)hm.num_experts)
+            || (!fused && !one && (std::uint64_t)hm.up_bytes != up_stride * (std::uint64_t)hm.num_experts)
             || (std::uint64_t)hm.down_bytes != down_stride * (std::uint64_t)hm.num_experts)
             return false;
         const int selected = n_rows * hm.n_used;
@@ -530,24 +549,30 @@ namespace tsg
         for (int k = 0; k < selected; ++k)
             if (ids[k] < 0 || ids[k] >= hm.num_experts) return false;
 
-        // Every routed slice, all three parts, resolved in one call so the
+        // Every routed slice, all its parts (two for the one projection), resolved in one call so the
         // explicitly read cache fetches all misses together.
+        const int parts = one ? 2 : 3;
         const void* sources[3 * kMaxRows * kMaxUsed];
         std::size_t lengths[3 * kMaxRows * kMaxUsed];
         const std::uint8_t* resolved[3 * kMaxRows * kMaxUsed];
         for (int k = 0; k < selected; ++k)
         {
             const std::uint8_t* gate_at = (const std::uint8_t*)hm.gate_data + (std::size_t)ids[k] * gate_stride;
-            sources[3 * k] = gate_at;
-            sources[3 * k + 1] = fused ? gate_at + half : (const std::uint8_t*)hm.up_data + (std::size_t)ids[k] * up_stride;
-            sources[3 * k + 2] = (const std::uint8_t*)hm.down_data + (std::size_t)ids[k] * down_stride;
-            lengths[3 * k] = half; lengths[3 * k + 1] = up_stride; lengths[3 * k + 2] = down_stride;
+            sources[parts * k] = gate_at;
+            lengths[parts * k] = half;
+            if (!one)
+            {
+                sources[parts * k + 1] = fused ? gate_at + half : (const std::uint8_t*)hm.up_data + (std::size_t)ids[k] * up_stride;
+                lengths[parts * k + 1] = up_stride;
+            }
+            sources[parts * k + parts - 1] = (const std::uint8_t*)hm.down_data + (std::size_t)ids[k] * down_stride;
+            lengths[parts * k + parts - 1] = down_stride;
         }
 
         std::lock_guard<std::mutex> guard(g_team_mutex);
         // Under the team lock: the slots must stay put until this call's compute
         // is done, and every caller of the resolver holds this lock.
-        host_expert_io_resolve(sources, lengths, 3 * selected, resolved);
+        host_expert_io_resolve(sources, lengths, parts * selected, resolved);
         if (ahead != nullptr && ahead->hm != nullptr) prefetch_slices_locked(*ahead);
         if (g_team == nullptr)
         {
@@ -598,20 +623,23 @@ namespace tsg
         j.n_rows = n_rows; j.n_used = hm.n_used; j.n_embd = n_embd; j.n_ff = n_ff;
         j.swiglu_limit = hm.swiglu_limit;
         j.activation = hm.activation;
+        j.matrices = one ? 1 : 2;
         for (int k = 0; k < selected; ++k)
         {
-            j.gate[k] = resolved[3 * k];
-            j.up[k] = resolved[3 * k + 1];
-            j.down[k] = resolved[3 * k + 2];
+            j.gate[k] = resolved[parts * k];
+            j.up[k] = one ? nullptr : resolved[parts * k + 1];
+            j.down[k] = resolved[parts * k + parts - 1];
             j.weight[k] = weights[k];
+            j.up_scale[k] = up_scales != nullptr ? up_scales[k] : 1.0f;
             j.skip[k] = skip != nullptr && skip[k] != 0;
         }
         if (n_rows > 1)
         {
-            for (int k = 0; k < selected * 2; ++k) j.matrix_order[k] = k;
-            std::sort(j.matrix_order, j.matrix_order + selected * 2, [&](int a, int b) {
-                const auto* pa = (a & 1) ? j.up[a / 2] : j.gate[a / 2];
-                const auto* pb = (b & 1) ? j.up[b / 2] : j.gate[b / 2];
+            const int m = j.matrices;
+            for (int k = 0; k < selected * m; ++k) j.matrix_order[k] = k;
+            std::sort(j.matrix_order, j.matrix_order + selected * m, [&](int a, int b) {
+                const auto* pa = (m == 2 && (a & 1)) ? j.up[a / m] : j.gate[a / m];
+                const auto* pb = (m == 2 && (b & 1)) ? j.up[b / m] : j.gate[b / m];
                 const auto aa = reinterpret_cast<std::uintptr_t>(pa), bb = reinterpret_cast<std::uintptr_t>(pb);
                 return aa < bb || (aa == bb && a < b);
             });
@@ -631,7 +659,7 @@ namespace tsg
         j.g = s_g.data(); j.u = s_u.data(); j.h = s_h.data(); j.hq = s_hq.data();
         j.out = out; j.projected = n_rows > 1 ? s_projected.data() : nullptr;
         j.chunks_per_matrix = (n_ff + kRowsPerChunk - 1) / kRowsPerChunk;
-        j.chunks1 = selected * 2 * j.chunks_per_matrix;
+        j.chunks1 = selected * j.matrices * j.chunks_per_matrix;
         j.chunks3_per_row = (n_embd + kRowsPerChunk - 1) / kRowsPerChunk;
         j.chunks3 = n_rows == 1 ? j.chunks3_per_row : selected * j.chunks3_per_row;
         j.chunks4 = n_rows * j.chunks3_per_row;
@@ -679,9 +707,9 @@ namespace tsg
     }
 
     bool host_moe_decode_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                 const float* weights, float* out, const std::uint8_t* skip)
+                                 const float* weights, float* out, const std::uint8_t* skip, const float* up_scales)
     {
-        return hm.seq_len == 1 && host_moe_decode_experts_rows(hm, x, ids, weights, out, skip);
+        return hm.seq_len == 1 && host_moe_decode_experts_rows(hm, x, ids, weights, out, skip, nullptr, up_scales);
     }
 
     void host_moe_decode_counters(long long* ns, long long* calls, long long* slots)
@@ -738,6 +766,37 @@ TSG_EXPORT int TSGgml_HostExpertRowsAct(const void* gate, const void* up, const 
     hm.hidden = hidden;
     hm.n_ff = n_ff;
     return tsg::host_moe_decode_experts_rows(hm, x, ids, weights, out, skip, nullptr) ? 1 : 0;
+}
+
+// The same for Nemotron-H's one-projection experts: relu(s up)^2, then down; `up` is the up stack (n_ff rows an expert),
+// `up_scales` each route's s ([rows, n_used] as weights; null for 1).
+TSG_EXPORT int TSGgml_HostExpertRowsReluSquared(const void* up, const void* down, int up_type, int down_type,
+                                                int num_experts, int hidden, int n_ff, int n_used, int rows,
+                                                const float* x, const std::int32_t* ids, const float* weights,
+                                                const float* up_scales, const std::uint8_t* skip, float* out)
+{
+    if (up == nullptr || down == nullptr || num_experts <= 0 || hidden <= 0 || n_ff <= 0 || n_used <= 0 || rows <= 0
+        || up_type < 0 || up_type >= GGML_TYPE_COUNT || down_type < 0 || down_type >= GGML_TYPE_COUNT)
+        return 0;
+    tsg::HostMoeSegment hm;
+    hm.gate_data = const_cast<void*>(up);   // the one projection sits in the gate slot
+    hm.up_data = nullptr;
+    hm.down_data = const_cast<void*>(down);
+    hm.gate_type = up_type; hm.up_type = 0; hm.down_type = down_type;
+    hm.gate_ne0 = hidden; hm.gate_ne1 = n_ff;
+    hm.up_ne0 = 0; hm.up_ne1 = 0;
+    hm.down_ne0 = n_ff; hm.down_ne1 = hidden;
+    hm.gate_bytes = (std::int64_t)(ggml_row_size((ggml_type)up_type, hidden) * (std::size_t)n_ff) * num_experts;
+    hm.up_bytes = 0;
+    hm.down_bytes = (std::int64_t)(ggml_row_size((ggml_type)down_type, n_ff) * (std::size_t)hidden) * num_experts;
+    hm.activation = 3;
+    hm.num_experts = num_experts;
+    hm.n_used = n_used;
+    hm.seq_len = rows;
+    hm.independent_decode_rows = true;
+    hm.hidden = hidden;
+    hm.n_ff = n_ff;
+    return tsg::host_moe_decode_experts_rows(hm, x, ids, weights, out, skip, nullptr, up_scales) ? 1 : 0;
 }
 
 TSG_EXPORT int TSGgml_HostExpertRows(const void* gate, const void* up, const void* down,

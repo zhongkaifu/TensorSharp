@@ -224,7 +224,7 @@ public sealed class NemotronVisionEncoderTests : IDisposable
 
         float[] Prefill(string mmproj)
         {
-            using var model = new NemotronModel(lm, BackendType.Cpu);
+            using var model = new NemotronRuntimeModel(lm, BackendType.Cpu);
             // LoadVisionEncoder directly: LoadProjectors would also consult the
             // process-wide TS_NEMOTRON_AUDIO_MMPROJ.
             model.LoadVisionEncoder(mmproj);
@@ -255,7 +255,7 @@ public sealed class NemotronVisionEncoderTests : IDisposable
         // e.g. a Nano Omni mmproj (2688) beside a Bolt or Super VL language model (4096).
         string lm = new NemotronSyntheticModelBuilder().Write(Path.Combine(_directory, "lm.gguf"));
         string mmproj = new Mmproj { ProjectionDim = 32 }.Write(Path.Combine(_directory, "narrow.gguf"));
-        using var model = new NemotronModel(lm, BackendType.Cpu);
+        using var model = new NemotronRuntimeModel(lm, BackendType.Cpu);
 
         var error = Assert.Throws<InvalidDataException>(() => model.LoadVisionEncoder(mmproj));
         Assert.Contains("narrow.gguf", error.Message);

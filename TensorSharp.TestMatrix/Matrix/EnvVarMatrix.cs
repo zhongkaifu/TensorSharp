@@ -25,14 +25,6 @@ public static class EnvVarMatrix
     {
         // Continuous batching / batched forward
         new(
-            Name: "TS_NEMOTRON_MAMBA2_BATCHED_NATIVE",
-            Category: "BatchedForward",
-            Values: BoolValues,
-            DefaultValue: "0",
-            Notes: "Native Mamba2 batched step kernel for Nemotron-H.",
-            AppliesTo: (m, b, f) => m.Family.StartsWith("nemotron", StringComparison.OrdinalIgnoreCase)),
-
-        new(
             Name: "TS_SCHED_DISABLE_BATCHED",
             Category: "BatchedForward",
             Values: BoolValues,

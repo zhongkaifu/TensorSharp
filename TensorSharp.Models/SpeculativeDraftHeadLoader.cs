@@ -88,7 +88,8 @@ namespace TensorSharp.Models
             }
             // Likewise a per-token head the constructor attached itself: Qwen3.8-Flash-Next's shared MTP block loads with
             // the model (the runtime's draft layer).
-            if (model is Qwen4ExpRuntimeModel { DraftHeadKind: DraftHeadKind.PerToken })
+            if (model is Qwen4ExpRuntimeModel { DraftHeadKind: DraftHeadKind.PerToken }
+                or NemotronRuntimeModel { DraftHeadKind: DraftHeadKind.PerToken })
                 return true;
 
             if (!File.Exists(draftPath))

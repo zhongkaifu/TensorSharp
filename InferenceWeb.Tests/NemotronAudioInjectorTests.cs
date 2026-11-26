@@ -29,10 +29,15 @@ public sealed class NemotronAudioInjectorTests
             var bMel = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(b);
             using var aExpected = encoder.Encode(aMel.mel, aMel.frames, aMel.validFrames);
             using var bExpected = encoder.Encode(bMel.mel, bMel.frames, bMel.validFrames);
-            var model = (NemotronModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronModel));
+            // The shared runtime's model with only what the injector reads: the tokenizer, the hidden size the queued rows
+            // must have, the audio tower, and the runtime's media queue (the list the test inspects).
+            var model = (NemotronRuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronRuntimeModel));
             typeof(ModelBase).GetProperty(nameof(ModelBase.Tokenizer))!.SetValue(model, new SentinelTokenizer());
-            typeof(NemotronModel).GetField("_audioEncoder", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, encoder);
-            typeof(NemotronModel).GetField("_pendingAudioEmbeddings", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, pending);
+            typeof(ModelBase).GetField("<Config>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(model, new ModelConfig { Architecture = "nemotron_h", HiddenSize = encoder.ProjectionDim });
+            typeof(NemotronRuntimeModel).GetField("<AudioEncoder>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(model, encoder);
+            typeof(StandardDecoderModel).GetField("_pendingMedia", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, pending);
             using var injector = new ModelMultimodalInjector(model);
             var history = new List<ChatMessage> { new() { Role = "user", AudioPaths = new() { aPath, bPath } } };
             var expanded = injector.ProcessPromptTokens(history, new() { 1, 27, 2, 27, 3 }, "a");

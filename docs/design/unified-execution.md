@@ -5,6 +5,8 @@
 **Note (2026-11-15):** the Qwen implementations this document measures the runtime against —
 `Qwen35Model`, `Qwen4ExpModel` and the direct-CUDA engines `Qwen35CudaModel` / `Qwen4ExpCudaModel` — have
 since been removed; the runtime is the only Qwen 3.5 / 3.8 path. Their figures below are a record.
+**Note (2026-11):** Nemotron-H has moved onto the runtime too (`NemotronRuntimeModel`) and the legacy `NemotronModel` is
+removed; its rows below record the state before the move ([model card](../models/nemotron.md#7-tensorsharp-implementation-the-shared-decoder-runtime)).
 **Scope:** how every model family gets continuous batching, tensor parallelism (TP), whole-layer
 placement (layer split / pipeline parallelism, PP), hybrid TP×PP and MoE expert offload, on every
 backend, without each family re-implementing them.

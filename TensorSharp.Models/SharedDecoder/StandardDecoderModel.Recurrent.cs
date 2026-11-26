@@ -186,7 +186,7 @@ namespace TensorSharp.Models
             _layerState = new bool[TotalLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _recurrentLayer[l] = IsRecurrentLayer(l);
+                _recurrentLayer[l] = HasMixer(l) && IsRecurrentLayer(l);
                 _layerState[l] = _recurrentLayer[l] || AttentionLayerHasState(l);
                 _anyRecurrent |= _layerState[l];
             }

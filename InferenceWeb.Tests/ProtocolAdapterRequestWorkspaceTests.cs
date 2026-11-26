@@ -202,7 +202,7 @@ public sealed class ProtocolAdapterRequestWorkspaceTests : IDisposable
         string response = await new StreamReader(context.Response.Body).ReadToEndAsync();
         using var error = System.Text.Json.JsonDocument.Parse(response);
         Assert.Equal("invalid_request_error", error.RootElement.GetProperty("error").GetProperty("type").GetString());
-        Assert.Equal(TensorSharp.Models.NemotronModel.AudioInputUnsupportedMessage,
+        Assert.Equal(TensorSharp.Models.NemotronRuntimeModel.AudioInputUnsupportedMessage,
             error.RootElement.GetProperty("error").GetProperty("message").GetString());
         Assert.Empty(Directory.EnumerateFiles(uploads));
     }
@@ -235,7 +235,7 @@ public sealed class ProtocolAdapterRequestWorkspaceTests : IDisposable
         string response = await new StreamReader(context.Response.Body).ReadToEndAsync();
         using var error = System.Text.Json.JsonDocument.Parse(response);
         Assert.Equal("invalid_request_error", error.RootElement.GetProperty("error").GetProperty("type").GetString());
-        Assert.Equal(TensorSharp.Models.NemotronModel.AudioInputUnsupportedMessage,
+        Assert.Equal(TensorSharp.Models.NemotronRuntimeModel.AudioInputUnsupportedMessage,
             error.RootElement.GetProperty("error").GetProperty("message").GetString());
         Assert.DoesNotContain("response.created", response);
         Assert.Equal(0, runner.DeclareCalls);

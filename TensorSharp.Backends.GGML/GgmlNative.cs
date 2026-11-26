@@ -1197,22 +1197,6 @@ internal enum GgmlIndexReductionOp
         // ------------------------------------------------------------------
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_FusedMatMulQuantAddF32(
-            GgmlTensorView2D residual,
-            GgmlTensorView2D input,
-            IntPtr m2Data,
-            int m2GgmlType,
-            long m2Ne0,
-            long m2Ne1,
-            long m2RawBytes,
-            int tpDegree, [In, Out] IntPtr[] tpPlanOut);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_ReleaseFusedMatmulAddTpGraphs();
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_FusedFFNSwiGLUQuantF32(
             GgmlTensorView2D residual,
             GgmlTensorView2D input,
@@ -1600,25 +1584,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_MoEExpertsForwardF32(
-            GgmlTensorView2D result,
-            GgmlTensorView2D input,
-            int numExperts,
-            IntPtr[] upDataPtrs,
-            IntPtr[] downDataPtrs,
-            int upGgmlType,
-            long upNe0,
-            long upNe1,
-            long upRawBytesEach,
-            int downGgmlType,
-            long downNe0,
-            long downNe1,
-            long downRawBytesEach,
-            float[] routeWeights,
-            float[] upScales);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_MoEExpertsSwiGLUForwardF32(
             GgmlTensorView2D result,
             GgmlTensorView2D input,
@@ -1852,16 +1817,6 @@ internal enum GgmlIndexReductionOp
             int seqLen, int kvLen, int kvCacheLen,
             int maskStartPos, int slidingWindow,
             float scale);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_FlashAttnDecodeF32(
-            IntPtr qData, IntPtr kData, IntPtr vData,
-            IntPtr kCacheData, IntPtr vCacheData,
-            IntPtr outData,
-            int numHeads, int numKvHeads, int headDim,
-            int maxSeqLen, int position,
-            float scale, int kvCacheType);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -2794,6 +2749,10 @@ internal enum GgmlIndexReductionOp
             int gateType, int upType, int downType, int numExperts, int hidden, int nFf, int nUsed, int rows,
             float* x, int* ids, float* weights, byte* skip, float* output, int activation);
         [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_HostExpertRowsReluSquared(IntPtr up, IntPtr down, int upType, int downType,
+            int numExperts, int hidden, int nFf, int nUsed, int rows, float* x, int* ids, float* weights, float* upScales,
+            byte* skip, float* output);
+        [LibraryImport(DllName)]
         internal static partial void TSGgml_HostExpertIoUnregister(IntPtr baseAddress);
         [LibraryImport(DllName)]
         internal static unsafe partial void TSGgml_HostExpertIoStats(long* stats4);
@@ -2803,93 +2762,6 @@ internal enum GgmlIndexReductionOp
         internal static partial int TSGgml_DirectReadRegister(IntPtr baseAddress, long length, string path);
         [LibraryImport(DllName)]
         internal static partial void TSGgml_DirectReadUnregister(IntPtr baseAddress);
-
-        // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; same 32-byte
-        // POD layout on 64-bit (two ints, two padding ints, two pointers).
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_NemotronMamba2BatchedStepF32(
-            int numSeqs,
-            [In, Out] NemoMamba2BatchedSeqDesc[] seqs,
-            int numTokens,
-            IntPtr packedBatched,
-            int dInProjTotal,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            IntPtr convWt,
-            IntPtr convBias,
-            IntPtr dtBias,
-            IntPtr aLog,
-            IntPtr dData,
-            IntPtr ssmNormW,
-            float eps,
-            IntPtr outBatched);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_NemotronMamba2PrefillF32(
-            GgmlTensorView2D projected,
-            GgmlTensorView2D hiddenOut,
-            IntPtr convStateData,
-            int convStateElements,
-            IntPtr ssmStateData,
-            int ssmStateElements,
-            IntPtr convWeightData,
-            IntPtr convBiasData,
-            IntPtr dtBiasData,
-            IntPtr aData,
-            IntPtr dData,
-            IntPtr ssmNormData,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            float eps);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_NemotronMamba2DecodeF32(
-            ulong stateKey,
-            GgmlTensorView2D projected,
-            GgmlTensorView2D hiddenOut,
-            IntPtr convStateData,
-            int convStateElements,
-            IntPtr ssmStateData,
-            int ssmStateElements,
-            int initializeState,
-            int downloadState,
-            IntPtr convWeightData,
-            IntPtr convBiasData,
-            IntPtr dtBiasData,
-            IntPtr aData,
-            IntPtr dData,
-            IntPtr ssmNormData,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            float eps);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_NemotronMamba2DecodeClear(ulong modelKey);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_NemotronMamba2DecodeReadState(
-            ulong stateKey,
-            IntPtr convStateData,
-            int convStateElements,
-            IntPtr ssmStateData,
-            int ssmStateElements);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -3424,19 +3296,6 @@ internal enum GgmlIndexReductionOp
                 m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "fused_rms_norm_matmul_quant");
         }
 
-        public static void FusedMatMulQuantAdd(
-            GgmlTensorView2D residual, GgmlTensorView2D input,
-            IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
-        {
-            if (tpPlanOut != null) tpPlanOut[0] = IntPtr.Zero;
-            CheckResult(TSGgml_FusedMatMulQuantAddF32(
-                residual, input, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes,
-                tpDegree, tpPlanOut), "fused_matmul_quant_add");
-        }
-
-        public static void ReleaseFusedMatmulAddTpGraphs() => TSGgml_ReleaseFusedMatmulAddTpGraphs();
-
         public static void FusedFFNSwiGLUQuant(
             GgmlTensorView2D residual,
             GgmlTensorView2D input,
@@ -3823,19 +3682,6 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_GetRowsQuantF32(result, srcData, srcGgmlType, srcNe0, srcNe1, srcRawBytes, indices), "get_rows_quant");
         }
 
-        public static void MoEExpertsForward(GgmlTensorView2D result, GgmlTensorView2D input,
-            int numExperts, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
-            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
-            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
-            float[] routeWeights, float[] upScales = null)
-        {
-            CheckResult(TSGgml_MoEExpertsForwardF32(result, input, numExperts,
-                upDataPtrs, downDataPtrs,
-                upGgmlType, upNe0, upNe1, upRawBytesEach,
-                downGgmlType, downNe0, downNe1, downRawBytesEach,
-                routeWeights, upScales), "moe_experts_forward");
-        }
-
         public static void MoEExpertsSwiGLUForward(GgmlTensorView2D result, GgmlTensorView2D input,
             int numExperts,
             IntPtr[] gateDataPtrs, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
@@ -4214,22 +4060,6 @@ internal enum GgmlIndexReductionOp
                 maskStartPos, slidingWindow, scale), "fused_prefill_attention_f16kv");
         }
 
-        public static void FlashAttnDecode(
-            IntPtr qData, IntPtr kData, IntPtr vData,
-            IntPtr kCacheData, IntPtr vCacheData,
-            IntPtr outData,
-            int numHeads, int numKvHeads, int headDim,
-            int maxSeqLen, int position,
-            float scale, int kvCacheType = 0)
-        {
-            CheckResult(TSGgml_FlashAttnDecodeF32(
-                qData, kData, vData,
-                kCacheData, vCacheData,
-                outData,
-                numHeads, numKvHeads, headDim,
-                maxSeqLen, position, scale, kvCacheType), "flash_attn_decode");
-        }
-
         /// <summary>
         /// Native batched paged attention via <c>ggml_flash_attn_ext</c>. For
         /// each sequence in the batch, the C++ side gathers K and V from the
@@ -4442,120 +4272,6 @@ internal enum GgmlIndexReductionOp
                 q, k, v, z, alpha, beta, state, gatedOut,
                 dtBiasData, aLogData, ssmNormWData,
                 chunkSize, eps, gateMode), "gated_delta_net_chunked");
-        }
-
-        // Batched per-token Nemotron Mamba2 step. Runs all (seq, token) pairs
-        // for an active decode/prefill batch in one native call, indexing each
-        // seq's persistent conv FIFO + SSM state via the seqs[] descriptors.
-        public static void NemotronMamba2BatchedStep(
-            NemoMamba2BatchedSeqDesc[] seqs,
-            int numTokens,
-            IntPtr packedBatched,
-            int dInProjTotal,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            IntPtr convWt,
-            IntPtr convBias,
-            IntPtr dtBias,
-            IntPtr aLog,
-            IntPtr dData,
-            IntPtr ssmNormW,
-            float eps,
-            IntPtr outBatched)
-        {
-            CheckResult(TSGgml_NemotronMamba2BatchedStepF32(
-                seqs?.Length ?? 0, seqs, numTokens,
-                packedBatched, dInProjTotal,
-                dInner, dState, nHead, headDim, nGroup, dConv,
-                convWt, convBias, dtBias, aLog, dData, ssmNormW,
-                eps, outBatched),
-                "nemotron_mamba2_batched_step");
-        }
-
-        public static void NemotronMamba2Prefill(
-            GgmlTensorView2D projected,
-            GgmlTensorView2D hiddenOut,
-            IntPtr convStateData,
-            int convStateElements,
-            IntPtr ssmStateData,
-            int ssmStateElements,
-            IntPtr convWeightData,
-            IntPtr convBiasData,
-            IntPtr dtBiasData,
-            IntPtr aData,
-            IntPtr dData,
-            IntPtr ssmNormData,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            float eps)
-        {
-            CheckResult(TSGgml_NemotronMamba2PrefillF32(
-                projected, hiddenOut,
-                convStateData, convStateElements,
-                ssmStateData, ssmStateElements,
-                convWeightData, convBiasData, dtBiasData, aData, dData, ssmNormData,
-                dInner, dState, nHead, headDim, nGroup, dConv, eps), "nemotron_mamba2_prefill");
-        }
-
-        public static void NemotronMamba2Decode(
-            ulong stateKey,
-            GgmlTensorView2D projected,
-            GgmlTensorView2D hiddenOut,
-            IntPtr convStateData,
-            int convStateElements,
-            IntPtr ssmStateData,
-            int ssmStateElements,
-            bool initializeState,
-            bool downloadState,
-            IntPtr convWeightData,
-            IntPtr convBiasData,
-            IntPtr dtBiasData,
-            IntPtr aData,
-            IntPtr dData,
-            IntPtr ssmNormData,
-            int dInner,
-            int dState,
-            int nHead,
-            int headDim,
-            int nGroup,
-            int dConv,
-            float eps)
-        {
-            CheckResult(TSGgml_NemotronMamba2DecodeF32(
-                stateKey, projected, hiddenOut,
-                convStateData, convStateElements,
-                ssmStateData, ssmStateElements,
-                initializeState ? 1 : 0,
-                downloadState ? 1 : 0,
-                convWeightData, convBiasData, dtBiasData, aData, dData, ssmNormData,
-                dInner, dState, nHead, headDim, nGroup, dConv, eps), "nemotron_mamba2_decode");
-        }
-
-        public static void NemotronMamba2DecodeClear(ulong modelKey)
-        {
-            TSGgml_NemotronMamba2DecodeClear(modelKey);
-        }
-
-        /// <summary>Copy a decode-cache entry's device conv/SSM state into host memory.
-        /// Returns true when copied, false when no initialized entry exists for the key;
-        /// throws on a native failure.</summary>
-        public static bool NemotronMamba2DecodeReadState(
-            ulong stateKey, IntPtr convStateData, int convStateElements, IntPtr ssmStateData, int ssmStateElements)
-        {
-            int rc = TSGgml_NemotronMamba2DecodeReadState(
-                stateKey, convStateData, convStateElements, ssmStateData, ssmStateElements);
-            if (rc < 0)
-                return false;
-            CheckResult(rc, "nemotron_mamba2_decode_read_state");
-            return true;
         }
 
         /// <summary>Allocate memory with 16 KB alignment (page-aligned for Metal host_ptr).</summary>

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+    <ProjectReference Include="../../../TensorSharp.Backends.GGML/TensorSharp.Backends.GGML.csproj" />
+  </ItemGroup>
+  <PropertyGroup>
+    <ProbeNativeDir>$(MSBuildProjectDirectory)/../../../TensorSharp.GGML.Native/build</ProbeNativeDir>
+    <ProbeNativeDir Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../../../TensorSharp.GGML.Native/build-windows</ProbeNativeDir>
+    <ProbeNativeName Condition="$([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</ProbeNativeName>
+    <ProbeNativeName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</ProbeNativeName>
+    <ProbeNativeName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</ProbeNativeName>
+  </PropertyGroup>
+  <Target Name="CopyNativeProbeBinary" AfterTargets="Build" Condition="'$(ProbeNativeName)' != ''">
+    <ItemGroup>
+      <ProbeNativeBinary Include="$(ProbeNativeDir)/$(ProbeNativeName)" Condition="Exists('$(ProbeNativeDir)/$(ProbeNativeName)')" />
+      <ProbeNativeBinary Include="$(ProbeNativeDir)/Release/$(ProbeNativeName)" Condition="Exists('$(ProbeNativeDir)/Release/$(ProbeNativeName)')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ProbeNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

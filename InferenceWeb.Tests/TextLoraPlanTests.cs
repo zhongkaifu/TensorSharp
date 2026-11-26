@@ -57,7 +57,7 @@ public sealed class TextLoraPlanTests : IDisposable
 
         var optedIn = models.Where(t => Overrides(t, "SupportsTextLora")).Select(t => t.Name).OrderBy(n => n).ToArray();
 
-        Assert.Equal(new[] { "HunyuanDenseModel", "Mistral3Model", "NemotronModel" }, optedIn);
+        Assert.Equal(new[] { "HunyuanDenseModel", "Mistral3Model", "NemotronRuntimeModel" }, optedIn);
         // Each opted-in family names the weights it applies a delta to; none relies on a default.
         Assert.All(models.Where(t => Overrides(t, "SupportsTextLora")), t => Assert.True(OverridesMethod(t, "TextLoraWeightRefusal"), t.Name));
         // The families the review tested, by name: they never call the hook on every path.
@@ -169,17 +169,17 @@ public sealed class TextLoraPlanTests : IDisposable
         Assert.False(model.TryBindAdapter(adapter, out _));
     }
 
-    /// <summary>A real Nemotron under --tp 2 (a managed group), and as one node of a two-node
-    /// layer split (a group the model never shards for, so only the plan can tell).</summary>
+    /// <summary>A real Nemotron under --tp 2 (simulated devices), and over two whole-layer stages
+    /// (--layer-split 2): the shared runtime's placements are refused alike.</summary>
     [Theory]
     [InlineData("tp")]
-    [InlineData("distributed-layer-split")]
+    [InlineData("layer-split")]
     public void NemotronOnMoreThanOneDeviceOrNode_IsRefused(string mode)
     {
         string path = new NemotronSyntheticModelBuilder().Write(Path.Combine(_dir, $"nemotron-{mode}.gguf"));
         using var model = mode == "tp"
-            ? new NemotronModel(path, BackendType.Cpu, 2, new MuseSparkTensorParallelTests.CpuGroup(2))
-            : new NemotronModel(path, BackendType.Cpu, 1, new TwoNodeLayerSplit());
+            ? new NemotronRuntimeModel(path, BackendType.Cpu, 2, new SimulatedDeviceGroup(2))
+            : new NemotronRuntimeModel(path, BackendType.Cpu, 1, null, layerSplitDegree: 2);
         var adapter = Adapter(mode, ("blk.1.attn_q.weight", 2, NemotronSyntheticModelBuilder.Hidden, NemotronSyntheticModelBuilder.NumHeads * NemotronSyntheticModelBuilder.HeadDim));
 
         var plan = model.PlanTextLora(adapter);
@@ -364,15 +364,15 @@ public sealed class TextLoraPlanTests : IDisposable
     /// <summary>
     /// An adapter on every projection Nemotron adapts (Mamba2 in/out, attention, the dense or
     /// shared-expert and latent FFN projections, the router, the LM head) of a Q8_0 hybrid: the
-    /// plan accepts all of it, and prefill and decode (the fused decode paths on GGML, the native
-    /// Mamba2 decode on ggml_cuda, the managed forward over the CUDA Q8_0 kernel on direct cuda)
-    /// apply every planned weight, or the audit throws.
+    /// plan accepts all of it, and prefill and decode (the shared runtime's whole-forward graphs,
+    /// each adapted product's delta in the graph, on every backend's executor) apply every planned
+    /// weight, or the audit throws.
     /// </summary>
     private void RunNemotronAcceptedTargets(BackendType backend, string layout, bool latent)
     {
         string path = new NemotronSyntheticModelBuilder { Layout = layout, Latent = latent }
             .Write(Path.Combine(_dir, $"nemotron-{layout}-{latent}.gguf"));
-        using var model = new NemotronModel(path, backend);
+        using var model = new NemotronRuntimeModel(path, backend);
         var adapter = NemotronAdapter(path, "accepted", AdaptableNemotronTensors(path));
 
         var plan = model.PlanTextLora(adapter);
@@ -383,8 +383,9 @@ public sealed class TextLoraPlanTests : IDisposable
         Assert.Contains(layout.Contains('F') ? "blk.2.ffn_down.weight" : "blk.2.ffn_down_shexp.weight", plan.AppliedWeights);
         if (latent)
         {
-            Assert.Contains("blk.2.ffn_latent_in.weight", plan.AppliedWeights);
-            Assert.Contains("blk.2.ffn_latent_out.weight", plan.AppliedWeights);
+            // The GGUF names the runtime keeps.
+            Assert.Contains("blk.2.ffn_latent_down.weight", plan.AppliedWeights);
+            Assert.Contains("blk.2.ffn_latent_up.weight", plan.AppliedWeights);
         }
 
         int[] prompt = NemotronPrompt();
@@ -398,8 +399,8 @@ public sealed class TextLoraPlanTests : IDisposable
             model.ResetKVCache();
             float[] logits = model.ForwardRefill(prompt);
             Assert.True(MaxAbsDiff(baseLogits, logits) > 1e-3f, "the adapter must move the logits");
-            // Decode steps take the single-token paths (the fused decode residuals on GGML);
-            // the audit throws if any planned weight was skipped.
+            // Decode steps take the single-token graphs; the audit throws if any planned weight
+            // was skipped.
             for (int step = 0; step < 4; step++)
                 logits = model.Forward(new[] { ArgMax(logits) });
         }
@@ -414,7 +415,7 @@ public sealed class TextLoraPlanTests : IDisposable
     {
         string path = new NemotronSyntheticModelBuilder { Layout = "SAMS", Latent = true }
             .Write(Path.Combine(_dir, "nemotron-refused.gguf"));
-        using var model = new NemotronModel(path, BackendType.Cpu);
+        using var model = new NemotronRuntimeModel(path, BackendType.Cpu);
         var adapter = NemotronAdapter(path, "refused", new[]
         {
             "blk.2.ffn_up_exps.weight", "blk.0.ssm_conv1d.weight", "blk.1.attn_output.weight",
@@ -427,105 +428,6 @@ public sealed class TextLoraPlanTests : IDisposable
         Assert.Contains("routed expert", reasons["blk.2.ffn_up_exps.weight"]);
         Assert.Contains("not one of the projections Nemotron applies a LoRA delta to", reasons["blk.0.ssm_conv1d.weight"]);
         Assert.False(reasons.ContainsKey("blk.1.attn_output.weight"));
-    }
-
-    /// <summary>
-    /// The audit against a real bypass: a Nemotron whose fused decode paths no longer decline for
-    /// an adapted weight (its <c>HasLoraDelta</c> gate broken) adds attn_output, ssm_out and the
-    /// FFN down projections to the residual through FusedMatMulQuantAdd on every GGML decode token,
-    /// with no delta. The decode forward must fail instead of returning partly adapted logits.
-    /// </summary>
-    [GgmlTheory(BackendType.GgmlCpu)]
-    [InlineData("SAFS", false)]
-    [InlineData("SAMS", true)]
-    public void Audit_CatchesABrokenNemotronDecodeGate(string layout, bool latent) => RunBrokenGate(BackendType.GgmlCpu, layout, latent);
-
-    [GgmlTheory(BackendType.GgmlCuda)]
-    [InlineData("SAFS", false)]
-    [InlineData("SAMS", false)]
-    [InlineData("SAMS", true)]
-    public void Audit_CatchesABrokenNemotronDecodeGate_GgmlCuda(string layout, bool latent) => RunBrokenGate(BackendType.GgmlCuda, layout, latent);
-
-    private void RunBrokenGate(BackendType backend, string layout, bool latent)
-    {
-        string path = new NemotronSyntheticModelBuilder { Layout = layout, Latent = latent }
-            .Write(Path.Combine(_dir, $"nemotron-bypass-{layout}-{latent}.gguf"));
-        using var model = new GateBreakingNemotron(path, backend);
-        var adapter = NemotronAdapter(path, "bypassed", AdaptableNemotronTensors(path));
-        Assert.True(model.TryBindAdapter(adapter, out string? error), error);
-
-        int[] prompt = NemotronPrompt();
-        model.ResetKVCache();
-        model.SelectStepAdapter(adapter);
-        try
-        {
-            float[] logits = model.ForwardRefill(prompt);      // prefill runs LinearForward: applied
-            var ex = Assert.Throws<TextLoraNotAppliedException>(() => model.Forward(new[] { ArgMax(logits) }));
-            var bypassed = new List<string> { "blk.{1}.attn_output.weight", "blk.{0,3}.ssm_out.weight" };
-            if (layout.Contains('F'))
-                bypassed.Add("blk.{2}.ffn_down.weight");
-            else
-                bypassed.Add("blk.{2}.ffn_down_shexp.weight");
-            if (latent)
-                bypassed.Add("blk.{2}.ffn_latent_out.weight");
-            foreach (string weight in bypassed)
-                Assert.Contains(weight, ex.Message);
-            // The paths that apply the delta themselves are not reported.
-            Assert.DoesNotContain("ssm_in", ex.Message);
-            Assert.DoesNotContain("attn_qkv", ex.Message);
-        }
-        finally
-        {
-            model.SelectStepAdapter(null);
-        }
-        // Base traffic is untouched by the failed step.
-        model.ResetKVCache();
-        model.Forward(new[] { ArgMax(model.ForwardRefill(prompt)) });
-    }
-
-    /// <summary>
-    /// Regression risk 6 for Nemotron: its fused decode paths ask whether a weight is adapted
-    /// only while a step runs with an adapter selected, so base traffic (with an adapter loaded
-    /// and bound or not) pays nothing; and while one is selected they decline only for the
-    /// weights it adapts, keeping FusedMatMulQuantAdd for the rest.
-    /// </summary>
-    [GgmlFact(BackendType.GgmlCpu)]
-    public void Nemotron_FusedDecodePaths_AskOnlyWhileAnAdapterIsSelected_AndKeepUnadaptedWeights()
-    {
-        string path = new NemotronSyntheticModelBuilder { Layout = "SAFS" }.Write(Path.Combine(_dir, "nemotron-gate.gguf"));
-        using var model = new GateProbeNemotron(path, BackendType.GgmlCpu);
-        var adapter = NemotronAdapter(path, "partial", new[] { "blk.0.ssm_out.weight", "blk.1.attn_q.weight" });
-        int[] prompt = Enumerable.Range(0, 9).Select(i => 40 + i * 3).ToArray();
-        void Decode()
-        {
-            model.ResetKVCache();
-            model.Forward(new[] { ArgMax(model.ForwardRefill(prompt)) });
-        }
-
-        Decode();
-        Assert.Empty(model.Asked);
-        Assert.True(model.TryBindAdapter(adapter, out string? error), error);
-        Decode();
-        Assert.Empty(model.Asked);      // bound, not selected
-
-        model.SelectStepAdapter(adapter);
-        try
-        {
-            Decode();
-        }
-        finally
-        {
-            model.SelectStepAdapter(null);
-        }
-        var answers = model.Asked.GroupBy(a => a.Weight).ToDictionary(g => g.Key, g => g.All(a => a.Adapted));
-        Assert.True(answers["blk.0.ssm_out.weight"]);           // declines: LinearForward applies the delta
-        Assert.False(answers["blk.3.ssm_out.weight"]);          // the rest keep the fused path
-        Assert.False(answers["blk.1.attn_output.weight"]);
-        Assert.False(answers["blk.2.ffn_down.weight"]);
-
-        model.Asked.Clear();
-        Decode();
-        Assert.Empty(model.Asked);
     }
 
     // ------------------------------------------------------------------ forward audit
@@ -682,46 +584,6 @@ public sealed class TextLoraPlanTests : IDisposable
     {
         using var gguf = new GgufFile(path);
         return gguf.Tensors.Keys.Where(n => s_adaptableNemotron.IsMatch(n)).OrderBy(n => n, StringComparer.Ordinal).ToArray();
-    }
-
-    /// <summary>A Nemotron whose fused decode paths never decline for an adapted weight, to give
-    /// the audit a real bypass.</summary>
-    private sealed class GateBreakingNemotron(string path, BackendType backend) : NemotronModel(path, backend)
-    {
-        internal override bool HasLoraDelta(string weightName) => false;
-    }
-
-    /// <summary>A Nemotron that records what its fused decode paths ask about LoRA, and the answer.</summary>
-    private sealed class GateProbeNemotron(string path, BackendType backend) : NemotronModel(path, backend)
-    {
-        public List<(string Weight, bool Adapted)> Asked { get; } = new();
-
-        internal override bool HasLoraDelta(string weightName)
-        {
-            bool adapted = base.HasLoraDelta(weightName);
-            Asked.Add((weightName, adapted));
-            return adapted;
-        }
-    }
-
-    /// <summary>One node of a two-node layer split, as the model sees it at construction.</summary>
-    private sealed class TwoNodeLayerSplit : ILayerSplitGroup
-    {
-        public int Degree => 1;
-        public int GlobalDegree => 2;
-        public int GlobalRankOffset => 0;
-        public int NodeCount => 2;
-        public int NodeId => 0;
-        public bool IsActive => false;
-        public IAllocator GetAllocator(int rank) => throw new NotSupportedException();
-        public void AllReduce(Tensor[] tensors) => throw new NotSupportedException();
-        public void Synchronize() => throw new NotSupportedException();
-        public void Barrier() => throw new NotSupportedException();
-        public void BroadcastControl(int op, int[] payload) => throw new NotSupportedException();
-        public (int op, int[] payload) ReceiveControl() => throw new NotSupportedException();
-        public void Send(float[] values, int count, int destination) => throw new NotSupportedException();
-        public void Receive(float[] values, int count, int source) => throw new NotSupportedException();
-        public void Dispose() { }
     }
 
     /// <summary>A Mistral 3 that reports whether its two fused dense FFN graphs would run for a layer.</summary>

@@ -940,6 +940,9 @@ namespace tsg
         const float* down_bias = nullptr;
 
         int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
+        // activation 3 only (relu(up)^2, the up projection in the gate slot): each route's scale of its up product,
+        // applied before the square (F32 [n_used, seq], read back with the weights; Nemotron-H's NVFP4 experts). Null: none.
+        ggml_tensor* up_scales = nullptr;
         float oai_alpha = 1.702f;
         float oai_limit = 7.0f;
         // activation 0 only: > 0 clamps before silu(gate) * up as DeepSeek V4.1 does
@@ -1278,7 +1281,10 @@ namespace tsg
         // experts are never left resident either way). False under tensor
         // parallelism, which needs the single host evaluation over the unsharded
         // stack. See moe_offload_stream_batch_threshold.
-        bool allow_device_stream = true);
+        bool allow_device_stream = true,
+        // activation 3 only: each route's scale of its up product before the
+        // square, F32 [seq_len, n_used] as routing_weights; null for none.
+        const float* route_up_scales = nullptr);
 
     // ------------------------------------------------------------------
     // Host page-locking for the streamed-expert path (see ggml_ops_host_pin.cu)
@@ -1553,8 +1559,11 @@ namespace tsg
     // (seq_len > 1, biases, fused gate_up, another activation, a type without
     // CPU dot traits); the caller then keeps the graph path. TS_HOST_MOE_DECODE=0
     // turns it off for A/B runs.
+    // Activation 3 (relu(s up)^2 over one projection, the up rows in the gate slot): `up_scales` holds each
+    // route's s ([seq_len, n_used] as weights), null for 1.
     bool host_moe_decode_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                 const float* weights, float* out, const std::uint8_t* skip = nullptr);
+                                 const float* weights, float* out, const std::uint8_t* skip = nullptr,
+                                 const float* up_scales = nullptr);
     // Bounded independent decode rows (1..8), one team dispatch per layer.
     // Dot products and expert summation order remain identical to solo decode.
     // Unsupported input returns false without writing any output row.
@@ -1570,7 +1579,7 @@ namespace tsg
     };
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                      const float* weights, float* out, const std::uint8_t* skip = nullptr,
-                                     const HostMoePrefetch* ahead = nullptr);
+                                     const HostMoePrefetch* ahead = nullptr, const float* up_scales = nullptr);
     void prefetch_mapped_ranges(const std::uint8_t* base,
                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges);
     void host_moe_decode_release();

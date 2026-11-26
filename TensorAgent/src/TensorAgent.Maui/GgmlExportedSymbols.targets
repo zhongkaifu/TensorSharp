@@ -110,7 +110,6 @@
     <ReferenceNativeSymbol Include="TSGgml_EmbeddingLoad" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_EmbeddingTokenRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_EnsureDeviceCopyFromHost" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_FlashAttnDecodeF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FlashAttnFallbackCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FlashAttnSupported" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedActMulF32" SymbolType="Function" />
@@ -120,7 +119,6 @@
     <ReferenceNativeSymbol Include="TSGgml_FusedGemma4VisionBlockF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedGemma4VisionBlockF32PreciseCuda" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedGemma4VisionBlockF32PreciseMetal" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_FusedMatMulQuantAddF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedOutProjFFNQuantF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedOutProjNormRouterQuantF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedPleBlockQuantF32" SymbolType="Function" />
@@ -220,6 +218,7 @@
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoUnregister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRowsAct" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertRowsReluSquared" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />
@@ -266,7 +265,6 @@
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3Ubatch" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3VisionHeadF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3VocabSize" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MoEExpertsForwardF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEExpertsSwiGLUForwardF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEExpertsSwiGLUResidualF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEFFNPrefillRouteScaledF32" SymbolType="Function" />
@@ -319,12 +317,6 @@
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkTakeReclaimedSlots" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkUbatch" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkVocabSize" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2BatchedStepF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeClear" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeReadState" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2PrefillClear" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2PrefillF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NormF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NormGradF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForward" SymbolType="Function" />
@@ -347,7 +339,6 @@
     <ReferenceNativeSymbol Include="TSGgml_RegisterOffloadable" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterPinnedHostBuffer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedFfnTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedMatmulAddTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseReuseComputeBuffers" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RoPEExF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RoPEExFreqFactorsF32" SymbolType="Function" />

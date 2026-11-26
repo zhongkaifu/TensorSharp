@@ -2029,16 +2029,6 @@ namespace TensorSharp.Models
         protected bool IsLoraActiveForStep => _stepLora != null;
 
         /// <summary>
-        /// Whether the step's adapter carries a delta for <paramref name="weightName"/> (a weight
-        /// as loaded, after fusion). A fast path that runs one weight without the hook (a fused
-        /// matmul+add, say) declines exactly then, so the weights an adapter leaves alone keep it;
-        /// callers check <see cref="IsLoraActiveForStep"/> first, so base traffic pays one null
-        /// check. Virtual only so a test can break such a gate and watch the audit catch it.
-        /// </summary>
-        internal virtual bool HasLoraDelta(string weightName)
-            => _stepLora != null && _stepLora.TryGetFactors(weightName, out _);
-
-        /// <summary>
         /// Start auditing one forward that runs with an adapter selected, so a path that
         /// bypassed the hook (and left some planned weight without its delta) fails the forward
         /// instead of returning partly adapted output. Returns true when this call opened the
@@ -2083,6 +2073,17 @@ namespace TensorSharp.Models
 
         /// <summary>End the audit <see cref="OpenLoraForwardAudit"/> opened.</summary>
         protected void CloseLoraForwardAudit() => _loraAuditOpen = false;
+
+        /// <summary>
+        /// The step's adapter's factors of <paramref name="weightName"/> (AT [in, rank], BT [rank, out]), stamped for the forward
+        /// audit as applied, for a family whose graphs add the delta in their products (StandardDecoderModel's
+        /// AppliesTextLoraInGraphs); false without a selected adapter or when it leaves the weight alone.
+        /// </summary>
+        private protected bool TryTakeLoraFactors(string weightName, out (Tensor AT, Tensor BT) factors)
+        {
+            factors = default;
+            return _stepLora != null && _stepLora.TryApplyFactors(weightName, _loraForwardSerial, out factors);
+        }
 
         /// <summary>
         /// Add the selected adapter's <c>x @ AT @ BT</c> correction to <paramref name="result"/>
@@ -2159,8 +2160,7 @@ namespace TensorSharp.Models
             // Apply the step's LoRA delta on top of the base projection (and stamp it for the
             // forward audit). The fused FFN paths skip LinearForward entirely, so they are gated
             // off while an adapter is selected (IsLoraActiveForStep: TryFusedDenseSwiGLUFFNInto,
-            // TryFusedDenseFFNProject); a fused path over one weight declines when that weight
-            // carries a delta (HasLoraDelta: Nemotron's matmul+add decode residuals).
+            // TryFusedDenseFFNProject).
             TryApplyLoraDelta(result, input, weightName);
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;

@@ -89,6 +89,13 @@ namespace TensorSharp.Graph
         bool Compute(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
             ReadOnlySpan<byte> skip, int rows, Span<float> output);
 
+        /// <summary>
+        /// <see cref="Compute"/> for one-projection experts (Nemotron-H): relu(s up x)^2, then down, s each route's up scale
+        /// (<paramref name="upScales"/> [rows, K] as the weights; empty for 1). False where the host does not run them.
+        /// </summary>
+        bool ComputeReluSquared(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
+            ReadOnlySpan<float> upScales, ReadOnlySpan<byte> skip, int rows, Span<float> output) => false;
+
         /// <summary>Where <paramref name="layer"/>'s host experts live when they are packed in page-locked host memory the
         /// device can address (<see cref="HostExpertCopies"/>), or null: each at its place in its stack's mapping.</summary>
         HostExpertCopies Copies(int layer) => null;

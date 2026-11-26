@@ -98,12 +98,18 @@ namespace TensorSharp.Models
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 h = EmitLayerPrologue(step, layer, h);
-                int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
-                int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
-                h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
-                int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
-                int ffn = EmitFeedForward(step, layer, ffnIn, ffnContext);
-                h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
+                if (HasMixer(layer))
+                {
+                    int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
+                    int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
+                    h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
+                }
+                if (HasFeedForward(layer))
+                {
+                    int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
+                    int ffn = EmitFeedForward(step, layer, ffnIn, ffnContext);
+                    h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
+                }
                 step.Boundary(h);
             }
             return h;

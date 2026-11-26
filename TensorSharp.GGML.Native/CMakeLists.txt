@@ -327,7 +327,6 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_norm_attn.cpp
     ggml_ops_training.cpp
     ggml_ops_fused.cpp
-    ggml_ops_transformer.cpp
     ggml_ops_graph_builder.cpp
     ggml_ops_cpu_graph.cpp
     ggml_ops_cpu_products.cpp
@@ -345,7 +344,6 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_dit_offload.cpp
     ggml_ops_gated_delta_net.cpp
     ggml_ops_qwen35_gdn_tp.cpp
-    ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp
     ggml_ops_host_moe_decode.cpp
     ggml_ops_moe_hot_tier.cpp

@@ -288,6 +288,36 @@ namespace TensorSharp.Models
                 return true;
             }
 
+            /// <summary>A layer of one-projection experts (Nemotron-H's <c>ffn_up_exps</c> and <c>ffn_down_exps</c>, no gate):
+            /// relu(s up x)^2, then down, s each route's up scale (empty: 1), read from the model's mapping.</summary>
+            public unsafe bool ComputeReluSquared(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
+                ReadOnlySpan<float> upScales, ReadOnlySpan<byte> skip, int rows, Span<float> output)
+            {
+                if (!_m._stackedExpertWeights.TryGetValue($"blk.{layer}.ffn_up_exps.weight", out StackedExpertWeights up)
+                    || !_m._stackedExpertWeights.TryGetValue($"blk.{layer}.ffn_down_exps.weight", out StackedExpertWeights down))
+                    return false;
+                int hidden = (int)up.PerExpertNe0, ff = (int)up.PerExpertNe1, k = ids.Length / rows;
+                if (!upScales.IsEmpty && upScales.Length != ids.Length) return false;
+                long hostRoutes = 0;
+                foreach (byte s in skip) if (s == 0) hostRoutes++;
+                System.Threading.Interlocked.Add(ref HostRoutes, hostRoutes);
+                bool scaled = !upScales.IsEmpty;
+                fixed (float* xp = x, wp = weights, op = output, up0 = upScales)
+                fixed (int* ip = ids)
+                fixed (byte* sp = skip)
+                {
+                    for (int r0 = 0; r0 < rows; r0 += HostRowsPerCall)
+                    {
+                        int n = Math.Min(HostRowsPerCall, rows - r0);
+                        if (!GgmlBasicOps.HostExpertRowsReluSquared(up.Data, down.Data, up.GgmlType, down.GgmlType, (int)up.NumExperts,
+                                hidden, ff, k, n, xp + (long)r0 * hidden, ip + (long)r0 * k, wp + (long)r0 * k,
+                                scaled ? up0 + (long)r0 * k : null, sp + (long)r0 * k, op + (long)r0 * hidden))
+                            return false;
+                    }
+                }
+                return true;
+            }
+
             /// <summary>The layer's packed host experts (<see cref="StandardDecoderModel.TryPackHostExperts"/>), or null.</summary>
             public HostExpertCopies Copies(int layer) => _m._hostCopies is { } all && (uint)layer < (uint)all.Length ? all[layer] : null;
         }

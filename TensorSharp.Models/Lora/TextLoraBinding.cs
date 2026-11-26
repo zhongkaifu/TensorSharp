@@ -428,8 +428,24 @@ namespace TensorSharp.Models.Lora
         {
             foreach (var f in factors.Values)
             {
+                ForgetDeviceCopy(f.AT);
+                ForgetDeviceCopy(f.BT);
                 f.AT.Dispose();
                 f.BT.Dispose();
+            }
+        }
+
+        /// <summary>A graph that applied the factors bound their host bytes (GGML keeps a device copy keyed by the address): drop
+        /// it, so a later tensor at the same address is not read through it. Nothing where the native library is absent.</summary>
+        private static void ForgetDeviceCopy(Tensor t)
+        {
+            if (t.Storage is not (TensorSharp.Cpu.CpuStorage or TensorSharp.GGML.GgmlStorage)) return;
+            try
+            {
+                TensorSharp.GGML.GgmlBasicOps.InvalidateTensorHostBuffer(t);
+            }
+            catch (DllNotFoundException)
+            {
             }
         }
     }

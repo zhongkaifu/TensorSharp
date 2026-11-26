@@ -2,6 +2,7 @@
 
 **Status:** G1, G2, G3 and G6 implemented. G2 and G3 work only after fixes made when the DGX Spark run found them broken (section 5). G4 was covered as claimed. G5 (vision) was **not** covered for Bolt, whose mmproj splits q/k/v; that was fixed after the PR #282 review. Super VL's `v.post_ln` is still not applied (a follow-up, see G5). Tensor parallelism now applies the NVFP4 scales and Nemotron opts in, but only synthetic tests cover it, on CPU and in a gated `ggml_cuda` `--tp 2` test; no real Super VL `--tp 2` generation has completed on GPUs (section 6).
 **Date:** 2026-10-19 / 2026-10-20; corrected 2026-10-28 after the PR #282 review
+**Note (2026-11):** this note describes the legacy per-op `NemotronModel`, which has since been removed; Nemotron-H now runs on the shared decoder runtime (`NemotronRuntimeModel`), where `--tp`, `--layer-split`, expert offload on one device and speculation work as the [model card](../models/nemotron.md#7-tensorsharp-implementation-the-shared-decoder-runtime) describes.
 **Target models:**
 - `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` (ggml-org GGUF, about 71.6 GiB / 76.919 GB)
 - `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF` (unsloth)

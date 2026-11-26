@@ -691,6 +691,85 @@ namespace TensorSharp.Models.Graph
             return dq;
         }
 
+        /// <summary>
+        /// ggml_ssm_scan (<see cref="TensorGraphExecutor.SsmScan"/>) on host memory: each (sequence, head) state updated in
+        /// place in its newest slot, a SIMD pass over the state row per (head dim, token) that decays, adds B x dt and dots C
+        /// in one read, and the pairs in parallel once the step has enough work (as the removed legacy Nemotron-H model's managed Mamba-2 step ran).
+        /// </summary>
+        protected override unsafe Tensor SsmScan(Tensor state, Tensor x, Tensor dt, Tensor a, Tensor b, Tensor c, int[] ids, int keep)
+        {
+            if (!state.IsContiguous() || !x.IsContiguous() || !dt.IsContiguous() || !a.IsContiguous() || !b.IsContiguous() || !c.IsContiguous())
+                return base.SsmScan(state, x, dt, a, b, c, ids, keep);
+            int ns = (int)x.Sizes[0], nt = (int)x.Sizes[1], nh = (int)x.Sizes[2], hd = (int)x.Sizes[3];
+            int ng = (int)b.Sizes[2], dstate = (int)b.Sizes[3];
+            int slots = Math.Max(1, keep);
+            long yFloats = (long)ns * nt * nh * hd, perHead = (long)hd * dstate, perState = perHead * nh, perSlot = perState * ns;
+            var result = new Tensor(Allocator, DType.Float32, yFloats + perSlot * slots);
+            float* outp = TensorComputePrimitives.GetFloatPointer(result);
+            // A slot older than the step's tokens stays zero, as ggml leaves it.
+            if (slots > nt)
+                new Span<float>(outp + yFloats + perSlot * nt, checked((int)(perSlot * (slots - nt)))).Clear();
+            long xa = (long)TensorComputePrimitives.GetFloatPointer(x), da = (long)TensorComputePrimitives.GetFloatPointer(dt);
+            long aa = (long)TensorComputePrimitives.GetFloatPointer(a), ba = (long)TensorComputePrimitives.GetFloatPointer(b);
+            long ca = (long)TensorComputePrimitives.GetFloatPointer(c), sa = (long)TensorComputePrimitives.GetFloatPointer(state);
+            long oa = (long)outp;
+            int headsPerGroup = nh / ng;
+
+            void Pair(int pair)
+            {
+                int seq = pair / nh, h = pair % nh, g = h / headsPerGroup;
+                float* s = (float*)oa + yFloats + (long)seq * perState + h * perHead;
+                float* from = (float*)sa + (long)ids[seq] * perState + h * perHead;
+                if (from != s)
+                    Buffer.MemoryCopy(from, s, perHead * sizeof(float), perHead * sizeof(float));
+                float A = ((float*)aa)[h];
+                for (int t = 0; t < nt; t++)
+                {
+                    long row = (long)seq * nt + t;
+                    float dtSoft = TensorComputePrimitives.Softplus(((float*)da)[row * nh + h]);
+                    float dA = MathF.Exp(dtSoft * A);
+                    float* bg = (float*)ba + (row * ng + g) * dstate, cg = (float*)ca + (row * ng + g) * dstate;
+                    float* xh = (float*)xa + (row * nh + h) * hd, y = (float*)oa + (row * nh + h) * hd;
+                    for (int i = 0; i < hd; i++)
+                        y[i] = ScanRow(s + (long)i * dstate, bg, cg, dA, xh[i] * dtSoft, dstate);
+                    int slot = nt - 1 - t;
+                    if (slot >= 1 && slot < slots)
+                        Buffer.MemoryCopy(s, (float*)oa + yFloats + slot * perSlot + (long)seq * perState + h * perHead,
+                            perHead * sizeof(float), perHead * sizeof(float));
+                }
+            }
+
+            int pairs = ns * nh;
+            if (pairs > 1 && perHead * nt * pairs >= ParallelRecurrenceWork)
+                System.Threading.Tasks.Parallel.For(0, pairs, Pair);
+            else
+                for (int pair = 0; pair < pairs; pair++) Pair(pair);
+            return result;
+        }
+
+        /// <summary>One state row of the selective scan: row = row * dA + b * xdt, returning its dot with c.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float ScanRow(float* row, float* b, float* c, float dA, float xdt, int n)
+        {
+            int w = System.Numerics.Vector<float>.Count, i = 0;
+            var acc = System.Numerics.Vector<float>.Zero;
+            var decay = new System.Numerics.Vector<float>(dA);
+            var input = new System.Numerics.Vector<float>(xdt);
+            for (; i <= n - w; i += w)
+            {
+                var r = TensorComputePrimitives.LoadVector(row + i) * decay + TensorComputePrimitives.LoadVector(b + i) * input;
+                TensorComputePrimitives.StoreVector(row + i, r);
+                acc += r * TensorComputePrimitives.LoadVector(c + i);
+            }
+            float sum = System.Numerics.Vector.Sum(acc);
+            for (; i < n; i++)
+            {
+                row[i] = row[i] * dA + b[i] * xdt;
+                sum += row[i] * c[i];
+            }
+            return sum;
+        }
+
         /// <summary>ggml_ssm_conv (<see cref="TensorGraphExecutor.SsmConv"/>) as one pass over host memory: each output is
         /// its taps summed in order, as the reference's per-tap multiply and add sum them.</summary>
         protected override unsafe Tensor SsmConv(Tensor x, Tensor kernel)

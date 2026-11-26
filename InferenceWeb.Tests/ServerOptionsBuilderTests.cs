@@ -1086,9 +1086,9 @@ public class ServerOptionsBuilderTests : IDisposable
     [Fact]
     public void SpeculationStartupValidation_ModelRefusal_SaysToDropTheFlagNotToSwapTheDraft()
     {
-        // Nemotron-H refuses every drafter: suggesting "the draft GGUF that matches
+        // A model that refuses every drafter: suggesting "the draft GGUF that matches
         // this target" would send the operator after a file that cannot exist.
-        string reason = "--draft-model 'x-DSpark.gguf' is not attached: " + NemotronModel.SpeculationRefusalReason;
+        string reason = "--draft-model 'x-DSpark.gguf' is not attached: this model does not run speculative decoding.";
         string msg = SpeculationStartupValidation.GetFatalActivationError(reason, refusedByModel: true);
         Assert.Contains(reason, msg);
         Assert.Contains("refuses it", msg);

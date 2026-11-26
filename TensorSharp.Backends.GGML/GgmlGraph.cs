@@ -47,6 +47,8 @@ namespace TensorSharp.GGML
         Log = 72,
         /// <summary>ggml_cumsum: the running sum along ne0.</summary>
         CumSum = 73,
+        /// <summary>ggml_ssm_scan (Mamba-2): s, x, dt, A, B, C, ids; ip K states kept.</summary>
+        SsmScan = 74,
     }
 
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>

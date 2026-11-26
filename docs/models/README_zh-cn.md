@@ -37,7 +37,7 @@
 | [Qwen 3.8 Flash Next](qwen38-flash-next_zh-cn.md) | 文本、图像、视频 | 文本 | 条件支持：内存放置、张量并行及独立 MTP 头取决于量化与后端。 |
 | [Bonsai2 27B](bonsai2_zh-cn.md) | 文本；图像需投影器 | 文本 | 条件支持：仅单设备 GGML。已记录的 Metal 与有限 CPU 检查不能覆盖其他设备。 |
 | [GPT OSS](gptoss_zh-cn.md) | 文本 | 文本 | 已实现：显式思考模式与工具；后端与缓存要求见卡片。 |
-| [Nemotron-H / Omni](nemotron_zh-cn.md) | 文本；Omni 图像；有条件的音频 | 文本 | 条件支持：音频需要公开 GGUF 未附带的 Parakeet 伴随文件。不支持投机解码。 |
+| [Nemotron-H / Omni](nemotron_zh-cn.md) | 文本；Omni 图像；有条件的音频 | 文本 | 条件支持：音频需要公开 GGUF 未附带的 Parakeet 伴随文件。投机解码使用 n-gram 草稿或 Nemotron 3.5 MTP 头；公开的 DFlash / DSpark 草稿器会被拒绝。 |
 | [Mistral 3](mistral3_zh-cn.md) | 文本、图像 | 文本 | 不支持：显式思考模式与工具。验证范围以具体检查点与后端为准。 |
 | [Hunyuan Dense](hunyuan-dense_zh-cn.md) | 文本 | 文本 | 已实现：单设备文本路径；不支持工具、张量并行与层切分。 |
 | [Raon-1 nano](raon_zh-cn.md) | 文本 | 文本 | 已实现：在 `cpu` 与各 GGML 后端上以单设备整模型前向图运行；Q8_0 已在 `ggml_cuda`、`ggml_cpu` 与 `cpu` 上对照 Transformers 验证。 |

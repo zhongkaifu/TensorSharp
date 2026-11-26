@@ -23,6 +23,12 @@
 //      (engine-level, also on the per-sequence path).
 //   5. Cached Mamba2 prefill graphs (GBs each at 4,096 tokens) were never evicted.
 //
+// The legacy model these were found on was removed; the scenarios that are not its internals run on the shared runtime's
+// model (NemotronRuntimeModel, which ModelBase.Create builds): continuation after decode, bounded long prefill and device
+// memory, and concurrent requests through the engine (a burst, a staggered arrival, a worker pool) against each request
+// served alone. The runtime batches concurrent requests over per-request slots, so the paged ForwardBatch cases went with
+// the legacy model (NemotronRuntimeTests.SlotBatchesMatchEachSequenceAlone covers the slots).
+//
 // Opt-in (needs the weights and a GPU backend for the state split to exist at all):
 //   TS_TEST_NEMOTRON_H_DIR=/workspace/models/nemotron-h8b TS_TEST_GGML_BACKEND=cuda
 using System;
@@ -55,7 +61,10 @@ public sealed class NemotronHModelFixture : IDisposable
             if (_model != null) return _model;
             string path = TestGates.FindGguf(Environment.GetEnvironmentVariable(EnvDir), GgufPattern);
             Assert.False(string.IsNullOrEmpty(path), $"no *{GgufPattern}* GGUF under {EnvDir}");
-            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
+            // The model keeps the context it loads with; the process-wide variable is put back after the load, so the
+            // tests that run after this lane in the same process see the context they would alone.
+            string restoreContext = Environment.GetEnvironmentVariable("MAX_CONTEXT");
+            if (string.IsNullOrEmpty(restoreContext))
                 Environment.SetEnvironmentVariable("MAX_CONTEXT", "65536");
             var backend = TestGates.PinnedGgmlBackend;
             // KV_CACHE_DTYPE (q8_0, q4_0, f16, ...) runs the lane on that K/V cache, as the
@@ -72,6 +81,7 @@ public sealed class NemotronHModelFixture : IDisposable
             finally
             {
                 KvCacheDtypeConfig.RestoreForTests(restoreDtype, restoreExplicit);
+                Environment.SetEnvironmentVariable("MAX_CONTEXT", restoreContext);
             }
             return _model;
         }
@@ -102,17 +112,6 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         "[validation short-c4-r0-i2]\nWhat is the chemical symbol for gold? Reply with only the symbol.",
         "[validation short-c4-r0-i3]\nList three prime numbers separated by commas.",
     };
-
-    [Fact]
-    public void QueryRowsPerChunk_KeepsScoresWithinBudget()
-    {
-        long budget = 1L << 30;
-        int rows = NemotronModel.PrefillQueryRowsPerChunk(32, 4096, 62561, budget);
-        Assert.InRange(rows, 1, 4096);
-        Assert.True((long)rows * 32 * 62561 * sizeof(float) <= budget);
-        Assert.Equal(512, NemotronModel.PrefillQueryRowsPerChunk(32, 512, 1024, budget));
-        Assert.Equal(1, NemotronModel.PrefillQueryRowsPerChunk(64, 4096, 1 << 20, 1));
-    }
 
     /// <summary>A multi-token forward that continues a sequence after native decode
     /// steps must see the state those steps produced. Compared against prefilling the
@@ -152,8 +151,8 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
     [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
     public Task ConcurrentGreedy_PerSequencePath_MatchesSerialExactly() => RunConcurrentGreedy(batchedPath: false);
 
-    /// <summary>The batched path runs different kernels than a request served alone
-    /// (paged F32 attention, batch-composition dependent quantized matmul), so a token
+    /// <summary>The batched path runs other batch shapes than a request served alone
+    /// (batch-composition dependent attention and quantized matmul kernels), so a token
     /// whose top two candidates are within that numeric noise may legitimately flip.
     /// Every token it chooses must still be a near-top choice when the same history is
     /// replayed through the single-sequence forward; a sequence reading another's state,
@@ -161,7 +160,7 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
     [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
     public Task ConcurrentGreedy_BatchedPath_ChoosesOnlyNearTopTokens() => RunConcurrentGreedy(batchedPath: true);
 
-    // Largest serial-forward logit gap a batched choice may have. ForwardBatch tracks the
+    // Largest serial-forward logit gap a batched choice may have. Batched steps tracked the
     // single-sequence logits to max|dlogit| 0.3-1.4 on the 8B, so a flip needs a gap
     // below about twice that.
     private const float NearTopLogitGap = 3.0f;
@@ -339,400 +338,6 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         long grownMiB = (freeBefore - freeAfter) >> 20;
         _output.WriteLine($"device free before={freeBefore >> 20} MiB after={freeAfter >> 20} MiB grown={grownMiB} MiB");
         Assert.True(grownMiB < 2048, $"six prefills of distinct chunk lengths left {grownMiB} MiB more resident on the device");
-    }
-
-    /// <summary>The fused prefill kernel and the query-chunked materialized fallback
-    /// compute the same attention.</summary>
-    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
-    public void FusedAndChunkedMaterializedPrefill_Agree()
-    {
-        var model = _fixture.Model;
-        var text = string.Join("\n", Enumerable.Range(0, 120).Select(i => $"Line {i}: the tide rises at hour {i % 24}."));
-        int[] tokens = model.Tokenizer.Encode(text, addSpecial: true).ToArray();
-
-        float[] Prefill()
-        {
-            model.ResetKVCache();
-            float[] last = null;
-            for (int start = 0; start < tokens.Length; start += 512)
-                last = (float[])model.Forward(tokens.Skip(start).Take(512).ToArray()).Clone();
-            model.ResetKVCache();
-            return last;
-        }
-
-        float[] fused = Prefill();
-        float[] chunked;
-        string previousBudget = Environment.GetEnvironmentVariable("TS_NEMOTRON_ATTN_SCORE_BUDGET_MB");
-        try
-        {
-            NemotronModel.MaterializedPrefillAttentionForTest = true;
-            Environment.SetEnvironmentVariable("TS_NEMOTRON_ATTN_SCORE_BUDGET_MB", "1");
-            chunked = Prefill();
-        }
-        finally
-        {
-            NemotronModel.MaterializedPrefillAttentionForTest = false;
-            Environment.SetEnvironmentVariable("TS_NEMOTRON_ATTN_SCORE_BUDGET_MB", previousBudget);
-        }
-
-        double maxDiff = MaxAbsDiff(fused, chunked);
-        _output.WriteLine($"tokens={tokens.Length} argmax fused={ArgMax(fused)} chunked={ArgMax(chunked)} maxAbsDiff={maxDiff:F4}");
-        Assert.Equal(ArgMax(fused), ArgMax(chunked));
-        Assert.True(maxDiff < 1.5, $"fused vs chunked-materialized prefill logits differ by {maxDiff:F3}");
-    }
-
-    /// <summary>ForwardBatch over four sequences (prefill, then decode steps) tracks the
-    /// single-sequence forward of each sequence on its own tokens. The two paths use
-    /// different kernels (paged F32 K/V against the F16 cache, batch-size dependent
-    /// quantized matmul), which measured max|dlogit| 0.3-1.4 on the 8B; a sequence reading
-    /// another's state, or state from the wrong step, is off by far more. A q4_0 lane checks
-    /// the batched choices instead (see the comment at the reference loop).</summary>
-    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
-    public void ForwardBatch_FourSequences_MatchesPerSequenceForward()
-    {
-        var model = _fixture.Model;
-        var batched = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
-        var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
-        const int blockSize = 16;
-        const int decodeSteps = 8;
-        int n = 4;
-
-        var prompts = Prompts.Take(n).Select(p => renderer.RenderToTokens(model.Tokenizer, model.Config?.ChatTemplate,
-            new List<ChatMessage> { new() { Role = "user", Content = p } },
-            model.Config?.Architecture ?? string.Empty, addGenerationPrompt: true, tools: null, enableThinking: false).ToArray()).ToArray();
-
-        model.ResetKVCache();
-        var pool = new TensorSharp.Runtime.Paged.BlockPool(numBlocks: 64, blockSize: blockSize,
-            blockByteSize: model.ComputeKVBlockByteSize(blockSize));
-        var seqs = new SequenceState[n];
-        for (int s = 0; s < n; s++)
-        {
-            seqs[s] = new SequenceState($"fb-{s}-{Guid.NewGuid():N}", prompts[s], decodeSteps + 1, blockSize, SamplingConfig.Greedy);
-            int blocks = (prompts[s].Length + decodeSteps + blockSize) / blockSize + 1;
-            foreach (var b in pool.AllocateNew(blocks)) seqs[s].BlockTable.AppendBlock(b);
-        }
-
-        // Batched: one prefill step for all four, then decode steps feeding each row's argmax.
-        var batchedLogits = new List<float[]>[n];
-        var chosen = new List<int>[n];
-        for (int s = 0; s < n; s++) { batchedLogits[s] = new List<float[]>(); chosen[s] = new List<int>(); }
-        try
-        {
-            var step = BuildContext(seqs, prompts, blockSize);
-            var outs = batched.ForwardBatch(step);
-            for (int s = 0; s < n; s++)
-            {
-                batchedLogits[s].Add((float[])outs[s].Clone());
-                seqs[s].AdvanceComputedTokens(prompts[s].Length);
-            }
-            for (int d = 0; d < decodeSteps; d++)
-            {
-                var toks = new int[n][];
-                for (int s = 0; s < n; s++)
-                {
-                    int tok = ArgMax(batchedLogits[s][^1]);
-                    chosen[s].Add(tok);
-                    toks[s] = new[] { tok };
-                }
-                outs = batched.ForwardBatch(BuildContext(seqs, toks, blockSize));
-                for (int s = 0; s < n; s++)
-                {
-                    batchedLogits[s].Add((float[])outs[s].Clone());
-                    seqs[s].AdvanceComputedTokens(1);
-                }
-            }
-        }
-        finally
-        {
-            foreach (var s in seqs) batched.OnSequenceReleased(s.RequestId);
-        }
-
-        // Reference: each sequence alone through Forward, on the tokens the batch chose.
-        // The logit bound is the batched kernels' own drift (up to 1.4 on f16 and q8_0).
-        // On a q4_0 cache the reference attends over 4-bit K/V - a step is 1/8 of its
-        // block's largest value, against 1/127 for q8_0 - while ForwardBatch reads float32
-        // paged K/V, so the reference alone sits 2-5 logits off (max|dlogit| 5.14 measured,
-        // argmax unchanged) and no logit bound tells that from a state bug. That lane
-        // checks the choice instead: each batched argmax is the reference's, or a token the
-        // reference ranks within NearTopLogitGap of its top, which a sequence attending over
-        // another's state, or the wrong step's, does not manage.
-        bool quantizationBound = model.KvCacheDtype == KvCacheDtype.Q4_0;
-        _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()}: " +
-            (quantizationBound ? "near-top choice check" : "max|dlogit| <= 4.0"));
-        var failures = new List<string>();
-        for (int s = 0; s < n; s++)
-        {
-            model.ResetKVCache();
-            var reference = new List<float[]> { (float[])model.Forward(prompts[s]).Clone() };
-            foreach (int tok in chosen[s])
-                reference.Add((float[])model.Forward(new[] { tok }).Clone());
-
-            var line = new StringBuilder($"[seq {s}] ");
-            for (int t = 0; t < reference.Count; t++)
-            {
-                double diff = MaxAbsDiff(reference[t], batchedLogits[s][t]);
-                int choice = ArgMax(batchedLogits[s][t]);
-                bool top = ArgMax(reference[t]) == choice;
-                line.Append($"{t}:{diff:F2}{(top ? "" : "!")} ");
-                if (!quantizationBound && diff > 4.0)
-                    failures.Add($"seq {s} step {t}: argmax {(top ? "same" : "differs")}, max|dlogit|={diff:F2}");
-                float gap = reference[t][ArgMax(reference[t])] - reference[t][choice];
-                if (quantizationBound && gap > NearTopLogitGap)
-                    failures.Add($"seq {s} step {t}: batched chose a token the reference ranks {gap:F2} below its top");
-            }
-            _output.WriteLine(line.ToString());
-        }
-        model.ResetKVCache();
-        Assert.True(failures.Count == 0, string.Join("; ", failures));
-    }
-
-    /// <summary>A sequence decoding in the batched step that grows the model-owned paged
-    /// K/V pool (another request's prefill brings a block id past its capacity) keeps its
-    /// attention history. The grow used to replace every layer's buffer before copying
-    /// from it, so that sequence attended over zeros: max|dlogit| 6.95 against the
-    /// single-sequence forward and a wrong greedy token, where the batched kernels
-    /// otherwise stay within about 1.</summary>
-    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
-    public void ForwardBatch_PagedPoolGrowth_KeepsLiveSequenceHistory()
-    {
-        var model = _fixture.Model;
-        var batched = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
-        var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
-        int[][] prompts = Prompts.Select(p => Render(model, renderer, p)).ToArray();
-        const int blockSize = 16;
-        // Block ids far past anything the pool has held, so the second step must grow it.
-        const int farBlockId = 1024;
-
-        model.ResetKVCache();
-        int token = ArgMax(model.Forward(prompts[0]));
-        float[] reference = (float[])model.Forward(new[] { token }).Clone();
-        model.ResetKVCache();
-
-        var seqs = prompts.Select((p, i) => new SequenceState($"grow-{i}-{Guid.NewGuid():N}", p, 4, blockSize, SamplingConfig.Greedy)).ToArray();
-        int nextId = farBlockId;
-        for (int s = 0; s < seqs.Length; s++)
-        {
-            int blocks = (prompts[s].Length + 1 + blockSize - 1) / blockSize;
-            for (int b = 0; b < blocks; b++)
-                seqs[s].BlockTable.AppendBlock(new TensorSharp.Runtime.Paged.KvBlock(s == 0 ? b : nextId++));
-        }
-
-        float[] batchedDecode;
-        try
-        {
-            batched.ForwardBatch(BuildContext(new[] { seqs[0] }, new[] { prompts[0] }, blockSize));
-            seqs[0].AdvanceComputedTokens(prompts[0].Length);
-
-            var tokens = new int[seqs.Length][];
-            tokens[0] = new[] { token };
-            for (int s = 1; s < seqs.Length; s++) tokens[s] = prompts[s];
-            batchedDecode = batched.ForwardBatch(BuildContext(seqs, tokens, blockSize))[0];
-        }
-        finally
-        {
-            foreach (var seq in seqs) batched.OnSequenceReleased(seq.RequestId);
-            model.ResetKVCache();
-        }
-
-        double diff = MaxAbsDiff(reference, batchedDecode);
-        _output.WriteLine($"decode after pool grow: max|dlogit|={diff:F2} argmax single={ArgMax(reference)} batched={ArgMax(batchedDecode)}");
-        Assert.True(diff < 3.0, $"the decoding sequence lost its K/V history when the paged pool grew (max|dlogit| {diff:F2})");
-        Assert.Equal(ArgMax(reference), ArgMax(batchedDecode));
-    }
-
-    /// <summary>Radix pages on the real weights, under whatever K/V dtype the lane loads
-    /// (KV_CACHE_DTYPE). A Nemotron-H page carries the 24 Mamba2 layers' state (~99 MiB on
-    /// the 8B) only where it is a restore point; every other page holds K/V rows alone. A
-    /// new chat sharing the first request's public prefix resumes from the restore point -
-    /// rebuilt from K/V-only pages plus the one carrying the state - and decodes exactly
-    /// what a cold prefill of its prompt decodes. The radix budget charges the real slabs.
-    /// A q8_0 / q4_0 cache used to keep every request off this path entirely (no linear
-    /// K/V migration, so no N=1 fused route and no pages).</summary>
-    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
-    public async Task SharedPrefixPages_CarryStateOnlyAtRestorePoints_AndResumeExactly()
-    {
-        var model = _fixture.Model;
-        var caps = ExecutionCapabilities.FromModel(model);
-        _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()} {caps.Describe()}");
-        if (!LaneMigratesQuantizedKv(model))
-        {
-            Assert.False(caps.SupportsLinearKvMigration, "a quantized cache migrated where the N=1 decode cannot append to it");
-            _output.WriteLine("this lane keeps a quantized cache on the batched route: no N=1 path, no pages");
-            return;
-        }
-        Assert.True(caps.SupportsLinearKvMigration, "the N=1 fused path is unavailable on this K/V dtype");
-        // And the prefix cache sees the batched route's end states, as it does for f16.
-        var prefixCaps = Assert.IsAssignableFrom<TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel>(model)
-            .GetPrefixCacheCapabilities();
-        _output.WriteLine($"prefix cache: endState={prefixCaps.EndState} pagedEndStates={prefixCaps.PagedEndStates} pages={prefixCaps.Pages}");
-        Assert.Equal(TensorSharp.Runtime.Scheduling.PrefixCache.EndStateSupport.DonateOnly, prefixCaps.EndState);
-        Assert.True(prefixCaps.PagedEndStates);
-
-        var sb = new StringBuilder();
-        for (int i = 0; i < 60; i++)
-            sb.Append("Rule ").Append(i).Append(": the archive keeps ledger ").Append(i * 7 + 3).Append(" on shelf ").Append(i % 9).Append(".\n");
-        int[] shared = model.Tokenizer.Encode(sb.ToString(), addSpecial: true).ToArray();
-        Assert.True(shared.Length > 3 * 256, $"need more than 768 shared tokens, have {shared.Length}");
-        int[] Ask(string q) => shared.Concat(model.Tokenizer.Encode("\nQuestion: " + q + "\nAnswer:", addSpecial: false)).ToArray();
-        int[] promptA = Ask("Which shelf holds ledger 52?");
-        int[] promptB = Ask("What does rule 12 keep?");
-        const int maxNew = 24;
-        SchedulerConfig Config(bool prefixCaching) => new()
-        {
-            MaxNumBatchedTokens = 4096,
-            MaxNumRunningSequences = 4,
-            NumBlocks = 64,
-            BlockSize = 256,
-            EnablePrefixCaching = prefixCaching,
-            StopRepetition = false,
-        };
-
-        long fullPage = model.ComputeKVBlockByteSize(256);
-        long kvPage = model.ComputeKVBlockByteSizeWithoutRecurrentState(256);
-        _output.WriteLine($"page bytes: full={fullPage >> 20} MiB, K/V-only={kvPage >> 10} KiB");
-        Assert.True(kvPage < fullPage / 4);
-
-        List<int> warmB;
-        int reused;
-        model.ResetKVCache();
-        using (var engine = new InferenceEngine(model, Config(prefixCaching: true), NullLogger.Instance))
-        {
-            await RunScoped(engine, "a", promptA, maxNew, "chat-a", shared.Length);
-            var tree = engine.RadixCache!.Tree;
-            int full = 0, kvOnly = 0;
-            long slabs = 0;
-            for (int id = 0; id < engine.Pool.NumBlocks; id++)
-            {
-                var block = engine.Pool.GetBlock(id);
-                if (!tree.TryGetBlockOwner(block, out _)) continue;
-                long len = engine.Pool.Storage.SlabLength(id);
-                slabs += len;
-                if (len == fullPage && block.IsRestorablePrefixEnd) full++;
-                else if (len == kvPage && !block.IsRestorablePrefixEnd) kvOnly++;
-                else Assert.Fail($"page {id}: {len} bytes, restorable={block.IsRestorablePrefixEnd}");
-            }
-            _output.WriteLine($"pages: {full} with state, {kvOnly} K/V-only; charged {tree.Cached.HostKv >> 20} MiB of {slabs >> 20} MiB slabs");
-            Assert.True(full >= 1 && kvOnly >= 1);
-            Assert.Equal(slabs, tree.Cached.HostKv);
-
-            var b = await RunScoped(engine, "b", promptB, maxNew, "chat-b", shared.Length);
-            warmB = b.OutputTokens.ToList();
-            reused = b.PrefixCacheReusedTokens;
-        }
-
-        model.ResetKVCache();
-        List<int> coldB;
-        using (var cold = new InferenceEngine(model, Config(prefixCaching: false), NullLogger.Instance))
-            coldB = (await RunScoped(cold, "b-cold", promptB, maxNew, "chat-cold", 0)).OutputTokens.ToList();
-        model.ResetKVCache();
-
-        _output.WriteLine($"B reused {reused} of {promptB.Length} prompt tokens");
-        _output.WriteLine($"warm: {Show(Decode(model, warmB))}");
-        _output.WriteLine($"cold: {Show(Decode(model, coldB))}");
-        Assert.True(reused >= 256 && reused % 256 == 0, $"B reused {reused} tokens");
-        Assert.Equal(coldB, warmB);
-    }
-
-    /// <summary>The linear-to-paged migration a second request triggers moves the solo
-    /// sequence's K/V into the batched path's float32 paged arrays. On a q8_0 / q4_0 cache
-    /// that read dequantizes (it used to decline, which kept every request of such a cache
-    /// off the N=1 fused path); a batched decode on the migrated history then tracks the
-    /// decode the linear cache itself gives, as the batched kernels do for f16.</summary>
-    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
-    public void MigratedLinearHistory_DecodesLikeTheLinearCache()
-    {
-        var model = _fixture.Model;
-        var batched = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
-        if (!LaneMigratesQuantizedKv(model))
-        {
-            Assert.False(batched.SupportsLinearKVMigration, "a quantized cache migrated where the N=1 decode cannot append to it");
-            _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()}: this lane keeps a quantized cache on the batched route");
-            return;
-        }
-        Assert.True(batched.SupportsLinearKVMigration, $"no linear migration on a {model.KvCacheDtype.ToShortString()} cache");
-        var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
-        int[] prompt = Render(model, renderer, Prompts[0] + " Explain the steps in two sentences.");
-        const int blockSize = 16;
-
-        model.ResetKVCache();
-        int token = ArgMax(model.Forward(prompt));
-        float[] linearDecode = (float[])model.Forward(new[] { token }).Clone();
-
-        model.ResetKVCache();
-        model.Forward(prompt);
-        var seq = new SequenceState($"mig-{Guid.NewGuid():N}", prompt, 4, blockSize, SamplingConfig.Greedy);
-        for (int b = 0; b < (prompt.Length + 1 + blockSize - 1) / blockSize; b++)
-            seq.BlockTable.AppendBlock(new TensorSharp.Runtime.Paged.KvBlock(b));
-        seq.AdvanceComputedTokens(prompt.Length);
-        float[] batchedDecode;
-        try
-        {
-            Assert.True(batched.TryMigrateLinearKVToPaged(seq, blockSize), "migration refused");
-            batchedDecode = batched.ForwardBatch(BuildContext(new[] { seq }, new[] { new[] { token } }, blockSize))[0];
-        }
-        finally
-        {
-            batched.OnSequenceReleased(seq.RequestId);
-            model.ResetKVCache();
-        }
-
-        double diff = MaxAbsDiff(linearDecode, batchedDecode);
-        _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()} prompt={prompt.Length} decode after migration: " +
-            $"max|dlogit|={diff:F2} argmax linear={ArgMax(linearDecode)} batched={ArgMax(batchedDecode)}");
-        Assert.True(diff < 3.0, $"the migrated history decodes differently (max|dlogit| {diff:F2})");
-        Assert.Equal(ArgMax(linearDecode), ArgMax(batchedDecode));
-    }
-
-    /// <summary>Whether this lane migrates its K/V cache to the batched route: a float cache
-    /// always does, a q8_0 / q4_0 one only where the N=1 decode is validated to append to and
-    /// read it in place (ggml-metal). ggml-cpu aborts on that append, and ggml-cuda and
-    /// ggml-vulkan have not run it with this model, so there a quantized cache keeps the
-    /// batched route, by design.</summary>
-    private static bool LaneMigratesQuantizedKv(ModelBase model)
-        => !model.KvCacheDtype.IsBlockQuantized()
-           || TestGates.PinnedGgmlBackend is BackendType.GgmlMetal;
-
-    private static async Task<SequenceState> RunScoped(InferenceEngine engine, string id, int[] prompt, int maxNew,
-        string scope, int publicTokens)
-    {
-        var seq = new SequenceState(id, prompt, maxNew, 256, SamplingConfig.Greedy,
-            sharedPrefixTokens: publicTokens, cacheScope: scope);
-        var completion = await engine.SubmitRequest(seq).Completion.WaitAsync(TimeSpan.FromMinutes(5));
-        Assert.NotEqual(SequenceStatus.FinishedError, completion.Status);
-        return seq;
-    }
-
-    private static BatchedForwardContext BuildContext(SequenceState[] seqs, int[][] tokens, int blockSize)
-    {
-        var ctx = new BatchedForwardContext
-        {
-            Sequences = seqs.ToList(),
-            NumScheduledTokens = tokens.Select(t => t.Length).ToList(),
-            QueryStartLoc = new List<int> { 0 },
-            Positions = new List<int>(),
-            SlotMapping = new List<int>(),
-            BlockTables = new int[seqs.Length][],
-            OverrideFlatTokens = tokens.SelectMany(t => t).ToArray(),
-        };
-        int total = 0;
-        for (int s = 0; s < seqs.Length; s++)
-        {
-            int start = seqs[s].NumComputedTokens;
-            var ids = new int[seqs[s].BlockTable.NumBlocks];
-            for (int b = 0; b < ids.Length; b++) ids[b] = seqs[s].BlockTable.Blocks[b].Id;
-            ctx.BlockTables[s] = ids;
-            for (int i = 0; i < tokens[s].Length; i++)
-            {
-                int pos = start + i;
-                ctx.Positions.Add(pos);
-                ctx.SlotMapping.Add(ids[pos / blockSize] * blockSize + pos % blockSize);
-            }
-            total += tokens[s].Length;
-            ctx.QueryStartLoc.Add(total);
-            ctx.MaxQueryLen = Math.Max(ctx.MaxQueryLen, tokens[s].Length);
-            ctx.MaxSeqLen = Math.Max(ctx.MaxSeqLen, start + tokens[s].Length);
-        }
-        return ctx;
     }
 
     private static async Task<List<int>> Generate(InferenceEngine engine, int[] tokens, string reqId, int maxNew, Action<int> onToken)

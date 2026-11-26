@@ -71,7 +71,7 @@ namespace TensorSharp.Models.Architecture
         /// DeepSeek V4.1 has no audio path whatever is loaded. LFM3 serves audio
         /// only with LFM3-Omni's audio tower loaded from its mmproj. Nemotron-H serves
         /// audio only when its companion GGUF contained the Parakeet/FastConformer
-        /// tower and sound projector (<see cref="NemotronModel.IsAudioEncoderLoaded"/>):
+        /// tower and sound projector (<see cref="NemotronRuntimeModel.IsAudioEncoderLoaded"/>):
         /// the public Omni mmproj carries only the vision tower, so the default is
         /// an explicit refusal, never a decoded clip that is silently dropped.
         /// </summary>
@@ -90,7 +90,7 @@ namespace TensorSharp.Models.Architecture
             if (!audioEncoderLoaded &&
                 ModelArchitectureRegistry.TryGet(architecture, out ModelArchitectureDescriptor descriptor) &&
                 string.Equals(descriptor.Id, "nemotron_h", StringComparison.OrdinalIgnoreCase))
-                return NemotronModel.AudioInputUnsupportedMessage;
+                return NemotronRuntimeModel.AudioInputUnsupportedMessage;
             if (!audioEncoderLoaded &&
                 ModelArchitectureRegistry.TryGet(architecture, out ModelArchitectureDescriptor lfm3) &&
                 string.Equals(lfm3.Id, "lfm3", StringComparison.OrdinalIgnoreCase))
@@ -108,6 +108,6 @@ namespace TensorSharp.Models.Architecture
         /// mmproj); other families answer false, which the table ignores for them.
         /// </summary>
         public static bool IsAudioEncoderLoaded(ModelBase model)
-            => model is NemotronModel { IsAudioEncoderLoaded: true } or Lfm3RuntimeModel { IsAudioEncoderLoaded: true };
+            => model is NemotronRuntimeModel { AudioEncoder: not null } or Lfm3RuntimeModel { IsAudioEncoderLoaded: true };
     }
 }

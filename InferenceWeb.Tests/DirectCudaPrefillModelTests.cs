@@ -336,7 +336,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     private static readonly int[][] Chunkings = { new[] { 1, 15, 33 }, new[] { 16, 16, 16, 16, 16 }, new[] { 31, 2 }, null, new[] { 64 } };
 
     /// <summary>Per-row tolerance of a chunked run against the single pass (0 = bit-identical, as
-    /// the base is: Nemotron except the rows its 16/24/31-row chunks route differently).</summary>
+    /// the base is: Nemotron except the chunkings whose shapes route differently).</summary>
     private static double ChunkTolerance(string family, int length, int[] chunks, int row) => family switch
     {
         "gptoss" => row == 0 ? 0.0075 : 0.0068,
@@ -350,10 +350,13 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         // decode rows up to 7.1e-4 (A40) since products of 9-32 rows run on the decode-once kernels in pieces of 8 (a decode
         // row's sums however many rows share the step) where 9-16 had taken the q8_1 multi-row kernel.
         "qwen35" => row == 0 ? 0.0025 : 0.001,
-        "nemotron_h" => chunks[0] is 1 or 64 ? 0 : row == 0 ? 0.015 : row == 1 && length == 96 ? 0.013 : 0,
-        "nemotron_h_moe" => 0,
-        "nemotron_h_q4k" => row == 0 ? 0.0036 : 0.021,
-        "nemotron_h_moe_mx" => row == 0 ? 0.0041 : 0.0035,
+        // Nemotron-H on the shared runtime (an A40, sm_86): bit-identical to the single pass except where every chunk is 16
+        // rows or fewer (96 tokens in 16s: the decode-size kernels, up to 1.15e-2 / 1.24e-2) and on the Q4_K and MXFP4/Q5_1
+        // files, whose chunk shapes pick other quantized-GEMM routes (up to 1.97e-2 / 2.82e-3; [64] stays bit-identical).
+        "nemotron_h" => length == 96 && chunks[0] == 16 ? 0.018 : 0,
+        "nemotron_h_moe" => length == 96 && chunks[0] == 16 ? 0.019 : 0,
+        "nemotron_h_q4k" => chunks[0] == 64 ? 0 : 0.03,
+        "nemotron_h_moe_mx" => 0.0043,
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
     };
 
@@ -495,15 +498,12 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     // ---- 5. snapshot restore ---------------------------------------------------------------
 
-    // Qwen 3.5 runs on the shared decoder runtime, which keeps a recurrent model's state in per-request slots and
-    // prefix checkpoints (Qwen35RuntimeTests.CheckpointsContinueExactly) rather than in extracted blocks.
+    // Qwen 3.5 and Nemotron-H run on the shared decoder runtime, which keeps a recurrent model's state in per-request
+    // slots and prefix checkpoints (Qwen35RuntimeTests / NemotronRuntimeTests.CheckpointsContinueExactly) rather than in
+    // extracted blocks.
     [CudaTheory]
     [InlineData("gptoss", "cuda")]
-    [InlineData("nemotron_h", "cuda")]
-    [InlineData("nemotron_h_moe", "cuda")]
     [InlineData("gptoss", "cpu")]
-    [InlineData("nemotron_h", "cpu")]
-    [InlineData("nemotron_h_moe", "cpu")]
     public void SnapshotRestore_ReproducesTheStraightRun(string family, string backend)
     {
         // The prefix block (K/V rows and, for the hybrids, the Mamba2/GDN state as of its end)
@@ -532,8 +532,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     [CudaTheory]
     [InlineData("gptoss", "cuda")]
-    [InlineData("nemotron_h", "cuda")]
-    [InlineData("nemotron_h_moe", "cuda")]
     public void SnapshotBlock_RoundTripsThroughInject(string family, string backend)
     {
         // Narrows D1: a block injected into an empty cache and extracted again comes back byte

@@ -38,9 +38,14 @@ results as part of the standard matrix.
 
 ## Continuous Batching / Batched Forward
 
+The legacy Nemotron-H model (`NemotronModel`) was removed in 2026-11 (Nemotron-H runs on the shared decoder runtime on
+every backend); its switches `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE`, `TS_NEMOTRON_MAMBA2_NATIVE_PREFILL_MIN_TOKENS`,
+`TS_MAMBA2_PREFILL_CACHE_MB`, `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`, `TS_NEMOTRON_MOE_PREFILL_BATCHED_MIN_TOKENS`,
+`TS_NEMOTRON_MULTIMODAL_WARMUP`, `TS_NEMOTRON_MULTIMODAL_WARMUP_TILES` and `TS_TP_SNAPSHOT_TRACE` now stop the server or
+CLI at startup with a message naming the change. `TS_NEMOTRON_IMAGE_MAX_TILES` and `TS_NEMOTRON_AUDIO_MMPROJ` still apply.
+
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | Native batched Mamba2 step | OFF | `0`, `1` | no |
 | `TS_PER_SEQ_FUSED` | fused-capable models (Gemma 4 and GPT OSS on GGML backends; Qwen 3.5/3.6/3.8 and Qwen 3.8 Flash Next on the shared decoder runtime, every backend they load on, but not a multi-node pipeline; DeepSeek V4 / V4.1 and GLM 5.x on their native executors) | Per-request fused Forward for concurrent (N>=2) sequences, each on its own device K/V holder; `0` serves them on the op-by-op batched paged path, whose K/V lives in the shared host block pool (less device memory, a lower decode rate, no retained holders) | ON | not registered | no |
 | `TS_BATCHED_FUSED_DECODE` | models with a token-batched fused decode (Gemma 4, Qwen 3.5/3.6/3.8, GPT OSS, GLM 5.x, DeepSeek V4 / V4.1) | True token-batched fused decode inside the per-seq fused path (one graph for all N). On GLM 5.x this is 1.81x aggregate decode at 4 concurrent requests; on DeepSeek V4.1 Flash at Q4_K_M it is 2.0x (24.3 → 48.9 tok/s), bounded by routing because each token picks its own 6 of 384 experts. Batching changes GEMM shapes and a 2-bit MoE can turn that into different expert picks; set `0` for a serial-path A/B. | ON | not registered | no |
 | `TS_RETAINED_FUSED_CACHE_MAX` | models with retainable request-owned fused holders (Gemma 4; Qwen 3.5/3.6/3.8; Qwen 3.8 Flash Next; DeepSeek V4.1 unless a DSpark drafter is loaded; GLM 5.x on its native executor, a donated native slot per conversation) | How many finished conversations' end states (holders, native slots) stay retained for an exact-prefix continuation on their next turn; Qwen's holder includes attention K/V and matching GatedDeltaNet recurrent state. Unset, it follows `TS_SCHED_MAX_RUNNING_SEQS` (at least 4), so every request that can run in parallel keeps its own; memory, not this count, bounds the bytes. `0` turns retention off | the running-request limit (16), at least `4` | n/a | no |
@@ -335,8 +340,8 @@ where the model declares it profitable, which is decided per model: Qwen
 3.5/3.6/3.8 and GLM 5.2 / GLM-5.3 on every backend, GLM-5.3-Flash (n-gram only)
 where its KDA rollback is available, Gemma 4 on the ggml backends and `cuda`, Qwen
 3.8 Flash Next on every backend it loads on, Muse-Glimmer on every backend, DeepSeek V4 / V4.1
-only with their drafter loaded. Nemotron-H refuses every speculator, and GPT OSS,
-Mistral 3 and Hunyuan Dense have no speculative trunk, so not even
+only with their drafter loaded, and Nemotron-H on every backend (n-gram and the Nemotron 3.5
+MTP head). GPT OSS, Mistral 3 and Hunyuan Dense have no speculative trunk, so not even
 n-gram runs there. They are not registered in `EnvVarMatrix.All` and are not
 swept by the default TestMatrix config — the matrix feature catalog has no
 speculative-decode feature today, so use explicit runs to exercise these.

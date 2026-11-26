@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 38;
+        public const int CurrentVersion = 39;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gatedDeltaNetScan4, _gatedDeltaNetScan4Kda, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32, _dflashConv, _geluErf, _q8WeightToF32;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gatedDeltaNetScan4, _gatedDeltaNetScan4Kda, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _ssmScan, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32, _dflashConv, _geluErf, _q8WeightToF32;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -119,6 +119,7 @@ namespace TensorSharp.Cuda
             _stageCopy = module.GetFunction("ts_graph_moe_stage_copy");
             CudaDriverApi.cuFuncSetAttribute(_topk, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, TopKMaxColumns * 4).ThrowOnError();
             _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
+            _ssmScan = module.GetFunction("ts_graph_ssm_scan_f32");
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
             _deltaNetPrepTiled = module.GetFunction("ts_graph_deltanet_prep_tiled_f32");
             _sigmoidGate = module.GetFunction("ts_graph_sigmoid_gate_f32");
@@ -1041,6 +1042,16 @@ namespace TensorSharp.Cuda
             long total = (long)sequences * nt * channels;
             void** args = stackalloc void*[] { &x, &w, &output, &channels, &length, &width, &nt, &sequences };
             CudaDriverApi.cuLaunchKernel(_ssmConv, (uint)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_ssm_scan for Mamba-2 over contiguous F32 buffers (see the kernel's contract): y then
+        /// <paramref name="keep"/> state slots into <paramref name="output"/>.</summary>
+        public void LaunchSsmScan(IntPtr s, IntPtr x, IntPtr dt, IntPtr a, IntPtr b, IntPtr c, IntPtr ids, IntPtr output,
+            int heads, int headDim, int groups, int stateSize, int tokens, int sequences, int keep, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &s, &x, &dt, &a, &b, &c, &ids, &output, &heads, &headDim, &groups, &stateSize, &tokens, &sequences, &keep };
+            uint rows = (uint)(((long)heads * headDim + 3) / 4);
+            CudaDriverApi.cuLaunchKernel(_ssmScan, rows, (uint)sequences, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Tokens a block of the tiled DeltaNet prep takes (TS_GRAPH_PREP_TILE).</summary>

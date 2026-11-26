@@ -218,8 +218,8 @@ public class TensorParallelSupportGateTests
     [Fact]
     public void NemotronCpuTensorParallel_IsNotUserReachable()
     {
-        // NemotronModel accepts BackendType.Cpu with a caller-supplied group as a
-        // model-free test seam (NemotronExpertScaleTests). Users must not reach it:
+        // NemotronRuntimeModel accepts BackendType.Cpu with a caller-supplied group as a
+        // test seam (NemotronExpertScaleTests, simulated devices). Users must not reach it:
         // --tp on cpu, with or without a group, is refused before any model loads.
         ITensorParallelGroup group = null;
         var ex = Assert.Throws<NotSupportedException>(() => Resolve("nemotron_h", BackendType.Cpu, 2, ref group, out _));

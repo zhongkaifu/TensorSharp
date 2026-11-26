@@ -84,8 +84,6 @@ public sealed class GgmlBackendPinGateTests
             (nameof(GlmTruncateRefusalTests), nameof(GlmTruncateRefusalTests.Glm5Next_NativeRefusesAMidSequenceRewind_AndTheTrunkIsUntouched), BackendType.GgmlCpu),
             (nameof(GlmTruncateRefusalTests), nameof(GlmTruncateRefusalTests.Glm5Next_RewindToTheHeadOrToZero_IsStillAccepted), BackendType.GgmlCpu),
             (nameof(GlmTruncateRefusalTests), nameof(GlmTruncateRefusalTests.Glm_VoidTruncate_ThrowsOnARefusal_InsteadOfReturningWithAStaleHead), BackendType.GgmlCpu),
-            (nameof(NemotronConvTests), nameof(NemotronConvTests.NativeMamba2Prefill_MatchesManagedReferenceOnCpu), BackendType.GgmlCpu),
-            (nameof(NemotronConvTests), nameof(NemotronConvTests.NativeMamba2Decode_PersistentStateMatchesManagedReferenceOnCpu), BackendType.GgmlCpu),
             (nameof(NemotronAudioEncoderTests), nameof(NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch_GgmlCpu), BackendType.GgmlCpu),
             (nameof(KvStateFingerprintNonEmptyTests), nameof(KvStateFingerprintNonEmptyTests.Glm_SyntheticCheckpoints_ReportDistinctNonEmptyFingerprints), BackendType.GgmlCpu),
         };
