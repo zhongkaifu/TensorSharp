@@ -5,11 +5,17 @@ using TensorSharp.Cuda;
 using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Runtime;
 
+// The full-depth MiniMax-H3 denoiser (MiniMaxH3Denoiser: the diffusion runtime's step program) on one backend over exact
+// saved inputs, for the independent F32 reference (minimax-h3-full-dit-reference.py). --backend cuda (the default) runs the
+// direct CUDA tensor executor; ggml_cuda, ggml_cpu and cpu run the GGML graph executor or the managed one.
 string? Value(string name) => args.SkipWhile(value=>value!=name).Skip(1).FirstOrDefault();
-if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_H3_DIT_LAYERS")))
-    throw new ArgumentException("Full-depth validation rejects TS_H3_DIT_LAYERS; clear the inherited layer override.");
-if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_H3_CUDA_BATCHED_ATTENTION")))
-    throw new ArgumentException("TS_H3_CUDA_BATCHED_ATTENTION is no longer supported: the model experiment failed whole-generation quality validation; clear the obsolete override.");
+string backendName=Value("--backend") ?? "cuda";
+BackendType backend=backendName switch
+{
+    "cuda" => BackendType.Cuda, "ggml_cuda" => BackendType.GgmlCuda, "ggml_cpu" => BackendType.GgmlCpu,
+    "ggml_metal" => BackendType.GgmlMetal, "cpu" => BackendType.Cpu,
+    _ => throw new ArgumentException($"--backend {backendName}: cuda, ggml_cuda, ggml_cpu, ggml_metal or cpu"),
+};
 string model=Value("--model") ?? throw new ArgumentException("--model is required");
 string? reference=Value("--reference"),fixtures=Value("--fixtures");
 if((reference==null)==(fixtures==null)) throw new ArgumentException("Specify exactly one of --reference or --fixtures");
@@ -25,8 +31,7 @@ string trace=Path.GetFullPath(Value("--trace-dir") ?? Path.Combine(Path.GetDirec
 if(File.Exists(output) || File.Exists(Path.Combine(trace,"packed-in.f32")) ||
    File.Exists(Path.Combine(trace,"carrier-audio-velocity.f32"))) throw new InvalidOperationException("Refusing existing trace output");
 Directory.CreateDirectory(trace);
-Environment.SetEnvironmentVariable("TS_H3_DIT_TRACE_DIR",traceEnabled ? trace : null);
-Environment.SetEnvironmentVariable("TS_H3_LINEAR_TRACE_FILE",traceEnabled ? Path.Combine(trace,"linear-calls.jsonl") : null);
+Environment.SetEnvironmentVariable("TS_H3_LINEAR_TRACE_FILE",traceEnabled && backend == BackendType.Cuda ? Path.Combine(trace,"linear-calls.jsonl") : null);
 var metadata=Directory.GetFiles(inputRoot,"*.f32.json")
     .Select(path=>JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(path))).ToArray();
 float[] Read(string file)
@@ -65,7 +70,7 @@ if(fixtures!=null)
         throw new InvalidDataException("Unsupported fixture channels or spatial patch dimensions");
     latentT=vf.Shape[0]; latentH=vf.Shape[1]; latentW=vf.Shape[2];
     audioCount=checked(2*af.Shape[1]); textCount=tf.Shape[0];
-    video=MiniMaxH3DiT.PatchifyVideo(vf.Values,latentT,latentH,latentW,24);
+    video=MiniMaxH3Latents.PatchifyVideo(vf.Values,latentT,latentH,latentW,24);
     audio=af.Values; text=tf.Values;
     inputFiles=new[]{"h3_dit_video_latent.bin","h3_dit_audio_latent.bin","h3_dit_text_hidden.bin"}
         .SelectMany(file=>new[]{file,file+".shape"}).ToArray();
@@ -96,8 +101,8 @@ double diagnosticSeconds;
 var forwardSeconds=new List<double>();
 string? velocitySha256=null;
 int blocks;
-using(var allocator=new CudaAllocator(0))
-using(var dit=new MiniMaxH3DiT(model,BackendType.Cuda,allocator))
+using(var allocator=backend == BackendType.Cuda ? new CudaAllocator(0) : null)
+using(var dit=new MiniMaxH3Denoiser(model,backend,allocator))
 {
     if(dit.Config.NumLayers!=50 || text.LongLength!=(long)textCount*dit.Config.TextDim)
         throw new InvalidDataException("Full50 checkpoint and matching text feature width are required");
@@ -105,7 +110,8 @@ using(var dit=new MiniMaxH3DiT(model,BackendType.Cuda,allocator))
     for(int iteration=0;iteration<warmup+repeats;iteration++)
     {
         var timer=Stopwatch.StartNew();
-        var(vVelocity,aVelocity)=dit.Forward(video,shape.VideoTokenCount,audio,shape.AudioTokenCount,text,textCount,layout,sigma);
+        var(videoOut,aVelocity)=dit.Forward(video,shape.VideoTokenCount,audio,shape.AudioTokenCount,text,textCount,layout,sigma);
+        float[] vVelocity=(float[])videoOut.Clone();   // the step's output buffer, rewritten by the next step
         timer.Stop();
         forwardSeconds.Add(timer.Elapsed.TotalSeconds);
         MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(audio,aVelocity,sigma);
@@ -122,7 +128,7 @@ using(var dit=new MiniMaxH3DiT(model,BackendType.Cuda,allocator))
 }
 string Sha(string path) => Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(path)));
 var inputs=inputFiles.Select(file=>new{file,sha256=Sha(Path.Combine(inputRoot,file))});
-var result=new {completed=true,backend="cuda",sigma,geometry=new[]{shape.Width,shape.Height,shape.Frames},
+var result=new {completed=true,backend=backendName,sigma,geometry=new[]{shape.Width,shape.Height,shape.Frames},
     textCount,audioCount,videoCount=shape.VideoTokenCount,blocks,inputs,inputMode,
     bf16Pedantic=Environment.GetEnvironmentVariable("TS_H3_CUDA_BF16_PEDANTIC") != "0",trace,
     quantBands=Environment.GetEnvironmentVariable("TS_H3_CUDA_F32_BANDS") != "0",

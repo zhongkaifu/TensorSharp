@@ -36,6 +36,8 @@
     <InternalsVisibleTo Include="MuseGlimmerF32Reference" />
     <InternalsVisibleTo Include="GdnDriftProbe" />
     <InternalsVisibleTo Include="MiniMaxH3ImageAB" />
+    <InternalsVisibleTo Include="MiniMaxH3DitProbe" />
+    <InternalsVisibleTo Include="MiniMaxH3DenoiserAB" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />

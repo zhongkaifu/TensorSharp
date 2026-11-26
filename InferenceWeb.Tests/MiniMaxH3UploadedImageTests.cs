@@ -24,7 +24,7 @@ public class MiniMaxH3UploadedImageTests
 
         var frames = new List<RgbImage>();
         var atEnd = new List<bool>();
-        MiniMaxH3Pipeline.ResolveKeyframes(request, MiniMaxH3Geometry.Resolve(64, 32, 22), frames, atEnd);
+        MiniMaxH3Requests.ResolveKeyframes(request, MiniMaxH3Geometry.Resolve(64, 32, 22), frames, atEnd);
 
         AssertUploadedPixels(Assert.Single(frames));
         Assert.False(Assert.Single(atEnd));
@@ -41,7 +41,7 @@ public class MiniMaxH3UploadedImageTests
 
         var frames = new List<RgbImage>();
         var atEnd = new List<bool>();
-        MiniMaxH3Pipeline.ResolveKeyframes(request, MiniMaxH3Geometry.Resolve(64, 32, 22), frames, atEnd);
+        MiniMaxH3Requests.ResolveKeyframes(request, MiniMaxH3Geometry.Resolve(64, 32, 22), frames, atEnd);
 
         Assert.Equal(2, frames.Count);
         AssertUploadedPixels(frames[0]);
@@ -53,7 +53,7 @@ public class MiniMaxH3UploadedImageTests
     public void UploadedBytesSetTheCanvasAspectWhenOnlyWidthIsSupplied()
     {
         var request = new VideoGenerationParams { Width = 640, ImageBytes = UploadedPng() };
-        Assert.Equal((640, 320), MiniMaxH3Pipeline.ResolveCanvas(request, MiniMaxH3Mode.ImageToVideo));
+        Assert.Equal((640, 320), MiniMaxH3Requests.ResolveCanvas(request, MiniMaxH3Mode.ImageToVideo));
     }
 
     [Fact]
@@ -63,7 +63,7 @@ public class MiniMaxH3UploadedImageTests
         Assert.Equal(MiniMaxH3Mode.Reference,
             MiniMaxH3ModeResolver.Resolve(request, MiniMaxH3Partition.Reference));
 
-        var references = MiniMaxH3Pipeline.LoadReferences(request, 64, 32, 22);
+        var references = MiniMaxH3Requests.LoadReferences(request, 64, 32, 22);
         var reference = Assert.Single(references);
         Assert.Equal(MiniMaxH3ReferenceKind.Image, reference.Kind);
         var frame = Assert.Single(reference.Frames);

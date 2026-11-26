@@ -67,22 +67,23 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
             "TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageModel",
             "TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageVae",
             "TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageLegacyDenoiser",
+            // The audio-video DiT whose ForwardImage the image model had used is gone too (MiniMaxH3Denoiser replaced it).
+            "TensorSharp.Models.MiniMaxH3.MiniMaxH3DiT",
         })
             Assert.Null(models.GetType(gone));
-        Assert.Null(typeof(MiniMaxH3DiT).GetMethod("ForwardImage", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public));
         Assert.Null(typeof(MiniMaxH3Config).GetMethod("IsMiniMaxH3Image"));
         Assert.True(typeof(MiniMaxH3ImageDiffusionModel).IsPublic);
         Assert.True(typeof(IImageGenerationModel).IsAssignableFrom(typeof(MiniMaxH3ImageDiffusionModel)));
     }
 
-    /// <summary>The audio-video DiT refuses an image denoiser by name instead of reading its head bank as one head.</summary>
+    /// <summary>The audio-video denoiser refuses an image denoiser by name instead of reading its head bank as one head.</summary>
     [Fact]
-    public void TheVideoDitRefusesAnImageDenoiser()
+    public void TheVideoDenoiserRefusesAnImageDenoiser()
     {
         using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16);
-        var ex = Assert.Throws<NotSupportedException>(() => new MiniMaxH3DiT(dit.DitPath, TestGates.PinnedGgmlBackend, null));
+        var ex = Assert.Throws<NotSupportedException>(() => new MiniMaxH3Denoiser(dit.DitPath, TestGates.PinnedGgmlBackend));
         Assert.Contains("MiniMax-H3-Image", ex.Message);
-        Assert.Contains("diffusion runtime", ex.Message);
+        Assert.Contains("minimax-h3-image architecture", ex.Message);
     }
 
     /// <summary>The safetensors release goes through the registry's safetensors hook (no special case in ModelBase.Create)

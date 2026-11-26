@@ -23,7 +23,6 @@ public sealed class GgufPrefaultTests : IDisposable
         Set("TS_GGUF_PREFAULT_RESIDENT", "0");
         Set("TS_GGUF_PREFAULT_THREADS", "2");
         Set("TS_H3_TEXT_PREFAULT", "1");
-        Set("TS_H3_PHASE", "0");
     }
 
     [Fact]
@@ -135,8 +134,10 @@ public sealed class GgufPrefaultTests : IDisposable
         Assert.All(file.ReadTensorData(file.Tensors["model.embed_tokens.weight"]),value => Assert.Equal((byte)19,value));
     }
 
+    /// <summary>The text warm-up writes nothing: the diffusion runtime times the conditioning phase it runs in (the
+    /// retired pipeline's TS_H3_PHASE, which made it report, is a refused switch now).</summary>
     [Fact]
-    public void H3TextWarmupReportsOnlyWhenPhaseTimingIsRequested()
+    public void H3TextWarmupWritesNothing()
     {
         using var file=new GgufFile(Write("h3-logging.gguf",false,0,"model.layers.0.mlp.up_proj.weight"));
         using var output=new StringWriter();
@@ -146,9 +147,6 @@ public sealed class GgufPrefaultTests : IDisposable
             Console.SetOut(output);
             MiniMaxH3DirectTextEncoder.PrefaultTextWeights(file,1);
             Assert.Equal(string.Empty,output.ToString());
-            Set("TS_H3_PHASE","1");
-            MiniMaxH3DirectTextEncoder.PrefaultTextWeights(file,1);
-            Assert.Contains("[h3] .. text weight prefault",output.ToString());
         }
         finally { Console.SetOut(original); }
     }

@@ -37,7 +37,7 @@ internal sealed class MiniMaxH3OracleBackend : IDisposable
         };
     }
     internal MiniMaxH3TextEncoder Text(string path,string tokenizer) => new(path,tokenizer,Backend,_allocator);
-    internal MiniMaxH3DiT Dit(string path) => new(path,Backend,_allocator);
+    internal MiniMaxH3Denoiser Dit(string path) => new(path,Backend,_allocator);
     internal MiniMaxH3VideoVae Video(string path) => new(path,Backend,_allocator);
     internal MiniMaxH3AudioVae Audio(string path) => new(path,Backend,_allocator != null,_allocator);
     public void Dispose() => (_allocator as IDisposable)?.Dispose();

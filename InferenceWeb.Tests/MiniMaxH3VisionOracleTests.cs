@@ -98,11 +98,11 @@ namespace InferenceWeb.Tests
                 .Split(',').Select(x => int.Parse(x.Trim(), CultureInfo.InvariantCulture)).ToArray();
 
             using var te = _backend.Text(TePath,Root);
-            var (prompt, images) = MiniMaxH3Pipeline.BuildReferencePrompt(
+            var (prompt, images) = MiniMaxH3Requests.BuildReferencePrompt(
                 te,
                 new[]
                 {
-                    new MiniMaxH3Pipeline.MiniMaxH3Reference
+                    new MiniMaxH3Requests.MiniMaxH3Reference
                     {
                         Kind = MiniMaxH3ReferenceKind.Image,
                         Frames = new List<RgbImage> { image },
@@ -162,7 +162,7 @@ namespace InferenceWeb.Tests
                 ReferenceImagePaths = new List<string> { source },
             };
             // The fixture was produced by the reference at a 256x256 canvas.
-            var resized = MiniMaxH3Pipeline.LoadReferenceImages(p, 256, 256);
+            var resized = MiniMaxH3Requests.LoadReferenceImages(p, 256, 256);
             Assert.Single(resized);
             Assert.Equal(expected.Width, resized[0].Width);
             Assert.Equal(expected.Height, resized[0].Height);

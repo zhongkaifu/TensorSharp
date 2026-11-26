@@ -30,7 +30,6 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
         foreach (string name in new[]
                  {
                      LoraCliFlags.EnvironmentVariable, "TS_VIDEO_TEXT_ENCODER", "TS_VIDEO_VAE", "TS_VIDEO_AUDIO_VAE",
-                     "TS_H3_DIT_LAYERS",
                  })
             _env.Set(name, null);
         _model = _fx.WriteTransformer();
@@ -83,7 +82,7 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
 
         Assert.Equal(LoraCliFlags.MiniMaxH3PluginType, model.LoraPluginType);
         Assert.NotNull(model.Loras);
-        Assert.True(model.Loras.IsDirect);
+        Assert.True(model.Loras.ForTensorExecutor);
         var spec = Assert.Single(model.LoraSpecs);
         Assert.Equal(Path.Combine(_fx.Dir, W8), spec.Path);
         Assert.Equal(manifest, spec.ConfigPath);
@@ -279,7 +278,7 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
         var model = Create(backend);
         var old = model.Loras;
         Assert.NotNull(old);
-        Assert.False(old.IsDirect);
+        Assert.False(old.ForTensorExecutor);
 
         using var loaded = new ManualResetEventSlim();
         using var proceed = new ManualResetEventSlim();
@@ -317,8 +316,8 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
 
         // Both sets were disposed (each invalidates its factors once, before freeing them) and
         // nothing kept either one.
-        Assert.Equal(IntPtr.Zero, incoming.NativeAdapter);
-        Assert.Equal(IntPtr.Zero, old.NativeAdapter);
+        Assert.True(Disposed(incoming));
+        Assert.True(Disposed(old));
         Assert.Equal(mine.Count, calls.Count);
         Assert.All(calls, c => Assert.Equal(1, c.Value));
         Assert.Null(model.Loras);
@@ -337,8 +336,8 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
         string m8 = Plugin();
         string m4 = Plugin("turbo-4step.json", W4, 4, seed: 2);
         var cfg = MiniMaxH3LoraFixtures.ConfigOf(_model);
-        using var first = MiniMaxH3LoraSet.Load(new[] { new LoraSpec(m8) }, cfg, MiniMaxH3Partition.FirstLastFrame, backend, direct: false);
-        using var second = MiniMaxH3LoraSet.Load(new[] { new LoraSpec(m4) }, cfg, MiniMaxH3Partition.FirstLastFrame, backend, direct: false);
+        using var first = MiniMaxH3LoraSet.Load(new[] { new LoraSpec(m8) }, cfg, MiniMaxH3Partition.FirstLastFrame, backend, tensorExecutor: false);
+        using var second = MiniMaxH3LoraSet.Load(new[] { new LoraSpec(m4) }, cfg, MiniMaxH3Partition.FirstLastFrame, backend, tensorExecutor: false);
         var firstPointers = TinyH3Step.FactorPointers(first);
         var secondPointers = TinyH3Step.FactorPointers(second);
         var calls = new Dictionary<IntPtr, int>();
@@ -353,7 +352,7 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
         };
         int Count(HashSet<IntPtr> pointers) => pointers.Sum(p => calls.TryGetValue(p, out int n) ? n : 0);
 
-        var dit = new MiniMaxH3DiT(_model, backend, null);
+        var dit = new MiniMaxH3Denoiser(_model, backend);
         try
         {
             TinyH3Step.Run(dit, first);
@@ -361,7 +360,7 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
             Assert.Empty(calls);
 
             // A residency release drops the bound set's copies with the weights'.
-            dit.ReleaseDeviceResidency();
+            dit.ReleaseDevice();
             Assert.Equal(firstPointers.Count, Count(firstPointers));
             Assert.All(calls, c => Assert.Equal(1, c.Value));
 
@@ -388,4 +387,7 @@ public sealed class MiniMaxH3TurboModelTests : IDisposable
             dit.Dispose();
         }
     }
+
+    private static bool Disposed(MiniMaxH3LoraSet set) =>
+        (bool)typeof(MiniMaxH3LoraSet).GetField("_disposed", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(set)!;
 }

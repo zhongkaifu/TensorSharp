@@ -13,7 +13,6 @@
 //   - Q and K are RMS-normalized per head before RoPE, not after.
 //   - the checkpoint has no final norm; the DiT consumes the raw last-layer state.
 using System;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 
@@ -283,8 +282,6 @@ namespace TensorSharp.Models.MiniMaxH3
         internal static void PrefaultTextWeights(GgufFile file,int layers)
         {
             if (layers <= 0 || Environment.GetEnvironmentVariable("TS_H3_TEXT_PREFAULT") == "0") return;
-            bool timing=Environment.GetEnvironmentVariable("TS_H3_PHASE") == "1";
-            long started=timing ? Stopwatch.GetTimestamp() : 0;
             try
             {
                 // Unknown capacity must not turn optional warming into an
@@ -296,10 +293,6 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 // Optional read-ahead may fail under storage/memory pressure;
                 // the original mapped uploads retain their strict validation.
-            }
-            finally
-            {
-                if (timing) Console.WriteLine($"  [h3] .. text weight prefault {Stopwatch.GetElapsedTime(started).TotalSeconds:F1}s");
             }
         }
 

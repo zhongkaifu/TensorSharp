@@ -235,7 +235,7 @@ namespace TensorSharp.Models.MiniMaxH3
                     using (Tensor n2 = DirectOps.RmsNorm(_ctx, h, bw.Norm2, _eps))
                     using (Tensor gv = bw.W1.Forward(n2))         // [seq, 2*inner]
                     {
-                        using Tensor act = MiniMaxH3DirectDiT.ActivateMlp(_ctx, gv, _inner, fuseAccelerated: _ctx.IsMlx);
+                        using Tensor act = ActivateMlp(_ctx, gv, _inner, fuseAccelerated: _ctx.IsMlx);
                         using Tensor ff = bw.W2.Forward(act);
                         if (bw.Scale2 != null) DirectOps.MulColsRows(_ctx, ff, bw.Scale2);
                         Ops.Add(h, h, ff);
@@ -270,6 +270,31 @@ namespace TensorSharp.Models.MiniMaxH3
         internal void ReleaseDeviceResidency()
         {
             if (!_disposed) _ctx.ReleaseDeviceResidency();
+        }
+
+        /// <summary>SwiGLU over a [gate | value] projection: silu(gate) * value. The device split kernel reads [gate | value]
+        /// directly and keeps the same SiLU-then-multiply arithmetic (no two full activation copies and no separate multiply
+        /// pass over the large FFN width).</summary>
+        internal static Tensor ActivateMlp(DirectContext context, Tensor gv, int ffn, bool fuseAccelerated = true)
+        {
+            if (fuseAccelerated && context.IsAccelerated)
+                return Ops.SiLUMulSplit(null, gv, ffn);
+
+            using Tensor gate = Columns(gv, 0, ffn);
+            using Tensor val = Columns(gv, ffn, ffn);
+            Tensor act = DirectOps.Silu(context, gate);
+            try
+            {
+                Ops.Mul(act, act, val);
+                return act;
+            }
+            catch { act.Dispose(); throw; }
+        }
+
+        private static Tensor Columns(Tensor src, int from, int count)
+        {
+            using var view = src.Narrow(1, from, count);
+            return Ops.NewContiguous(view);
         }
 
         public void Dispose()

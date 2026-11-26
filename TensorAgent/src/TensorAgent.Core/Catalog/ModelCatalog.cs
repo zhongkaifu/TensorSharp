@@ -684,7 +684,7 @@ public static partial class ModelCatalog
         18_218_065_024, "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc");
 
     // The text encoder's GGUF carries no tokenizer. tokenizer_config.json is the only place its vision markers are
-    // defined; without it a photo cannot be placed in the prompt (MiniMaxH3Pipeline.RequireVisionTokens).
+    // defined; without it a photo cannot be placed in the prompt (MiniMaxH3Requests.RequireVisionTokens).
     private static CatalogFile[] MiniMaxH3Tokenizer() =>
     [
         new(CatalogFileRole.Tokenizer, "vocab.json", MiniMaxH3ProcessorUrl("vocab.json"),

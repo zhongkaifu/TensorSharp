@@ -152,7 +152,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                         "Editing needs the Qwen3-VL vision tower, and this text-encoder checkpoint does not carry one. Point " +
                         "--video-text-encoder at the full qwen3vl_32b_minimax_h3 GGUF.");
                 BpeTokenizer tokenizer = _encoder.Tokenizer;
-                MiniMaxH3Pipeline.RequireVisionTokens(tokenizer);
+                MiniMaxH3Requests.RequireVisionTokens(tokenizer);
                 var markers = (Single(tokenizer, "<|vision_start|>"), Single(tokenizer, "<|image_pad|>"), Single(tokenizer, "<|vision_end|>"));
                 var outputs = new MiniMaxH3VisionOutput[pictures.Count];
                 var vision = Stopwatch.StartNew();

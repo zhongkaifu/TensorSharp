@@ -40,7 +40,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
     }
 
     /// <summary>
-    /// The tensors of a MiniMax-H3-Image denoiser file bound the way <see cref="MiniMaxH3DiT"/> binds them for
+    /// The tensors of a MiniMax-H3-Image denoiser file bound the way the retired MiniMaxH3DiT bound them for
     /// TSGgml_MiniMaxH3DitForward: the same host bytes for every projection (so both share one device copy), F32 norms and
     /// biases converted as MiniMaxH3DiT converts them, and no bias where its graph adds none (qkv, out, fc1, fc2).
     /// </summary>

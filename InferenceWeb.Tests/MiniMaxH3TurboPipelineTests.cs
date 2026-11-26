@@ -3,7 +3,7 @@
 //
 // The pipeline's side of a MiniMax-H3 LoRA plug-in's sampling contract, against the shipped
 // Turbo configs (config/lora/minimax-h3-fl2v-turbo-{8,4}step.json): which requests a loaded
-// plug-in refuses (MiniMaxH3Pipeline.ValidateSamplingParameters), which steps, shift and sigma
+// plug-in refuses (MiniMaxH3Requests.ValidateSamplingParameters), which steps, shift and sigma
 // grid a clip then samples with (ResolveSampling), the Reference-mode refusal and the 768p note.
 // Nothing here loads weights: the recipe comes from the configs alone.
 using TensorSharp.Models.MiniMaxH3;
@@ -55,7 +55,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     public void ARequestThatLeavesTheRecipeAloneOrRepeatsItIsAccepted(int recipeSteps, int steps, float shift, string? sampler, float cfg)
     {
         var p = new VideoGenerationParams { Steps = steps, FlowShift = shift, Sampler = sampler, CfgScale = cfg };
-        MiniMaxH3Pipeline.ValidateSamplingParameters(p, Recipe(recipeSteps));
+        MiniMaxH3Requests.ValidateSamplingParameters(p, Recipe(recipeSteps));
         // Nothing is overridden: the request still says what it said.
         Assert.Equal(steps, p.Steps);
         Assert.Equal(shift, p.FlowShift);
@@ -70,7 +70,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [InlineData(4, 20)]
     public void ADifferentStepCountIsRefusedWithTheCanonicalText(int recipeSteps, int requested)
     {
-        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Pipeline.ValidateSamplingParameters(
+        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Requests.ValidateSamplingParameters(
             new VideoGenerationParams { Steps = requested }, Recipe(recipeSteps)));
         Assert.Equal(recipeSteps == 8
             ? StepsRefusal(Name8, Weights8, 8, requested)
@@ -83,7 +83,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [InlineData(6.5f)]
     public void ADifferentFlowShiftIsRefused(float shift)
     {
-        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Pipeline.ValidateSamplingParameters(
+        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Requests.ValidateSamplingParameters(
             new VideoGenerationParams { FlowShift = shift }, Recipe(8)));
         Assert.Equal(
             $"{Name8} ({Weights8}) samples with video flow shift 6 (audio 3); flow shift " +
@@ -96,7 +96,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [InlineData("euler_ancestral")]
     public void AnotherSamplerIsRefused(string sampler)
     {
-        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Pipeline.ValidateSamplingParameters(
+        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Requests.ValidateSamplingParameters(
             new VideoGenerationParams { Sampler = sampler }, Recipe(4)));
         Assert.Equal(
             $"{Name4} ({Weights4}) samples with Euler; sampler '{sampler}' contradicts it. " +
@@ -108,7 +108,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [InlineData(float.NaN)]
     public void GuidanceOtherThanOneIsTheBaseRefusal(float cfg)
     {
-        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Pipeline.ValidateSamplingParameters(
+        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Requests.ValidateSamplingParameters(
             new VideoGenerationParams { CfgScale = cfg }, Recipe(8)));
         Assert.StartsWith(CfgRefusal, e.Message);
     }
@@ -116,7 +116,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [Fact]
     public void NegativeStepsAreTheBaseRefusalEvenUnderARecipe()
     {
-        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Pipeline.ValidateSamplingParameters(
+        var e = Assert.Throws<ArgumentException>(() => MiniMaxH3Requests.ValidateSamplingParameters(
             new VideoGenerationParams { Steps = -1 }, Recipe(8)));
         Assert.StartsWith("MiniMax-H3 steps must be positive, or 0 for the default.", e.Message);
     }
@@ -128,10 +128,10 @@ public sealed class MiniMaxH3TurboPipelineTests
     public void WithoutAPlugInTheBaseChecksAreUnchanged(int steps, float shift, string? sampler)
     {
         var p = new VideoGenerationParams { Steps = steps, FlowShift = shift, Sampler = sampler };
-        MiniMaxH3Pipeline.ValidateSamplingParameters(p, null);
-        MiniMaxH3Pipeline.ValidateSamplingParameters(p);
+        MiniMaxH3Requests.ValidateSamplingParameters(p, null);
+        MiniMaxH3Requests.ValidateSamplingParameters(p);
         var e = Assert.Throws<ArgumentException>(() =>
-            MiniMaxH3Pipeline.ValidateSamplingParameters(new VideoGenerationParams { CfgScale = 3f }, null));
+            MiniMaxH3Requests.ValidateSamplingParameters(new VideoGenerationParams { CfgScale = 3f }, null));
         Assert.StartsWith(CfgRefusal, e.Message);
     }
 
@@ -142,7 +142,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [InlineData(8, 6f)]
     public void EightStepPlugIn_SamplesItsLinspaceGridAtShift6(int requestSteps, float requestShift)
     {
-        var (steps, shift, sigmas) = MiniMaxH3Pipeline.ResolveSampling(
+        var (steps, shift, sigmas) = MiniMaxH3Requests.ResolveSampling(
             new VideoGenerationParams { Steps = requestSteps, FlowShift = requestShift }, Recipe(8));
         Assert.Equal(8, steps);
         Assert.Equal(6f, shift);
@@ -153,7 +153,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [Fact]
     public void FourStepPlugIn_SamplesItsLinspaceGridAtShift6()
     {
-        var (steps, shift, sigmas) = MiniMaxH3Pipeline.ResolveSampling(new VideoGenerationParams(), Recipe(4));
+        var (steps, shift, sigmas) = MiniMaxH3Requests.ResolveSampling(new VideoGenerationParams(), Recipe(4));
         Assert.Equal(4, steps);
         Assert.Equal(6f, shift);
         AssertGrid(new[] { 1, 18 / 19.0, 6 / 7.0, 2 / 3.0, 0 }, sigmas);
@@ -165,7 +165,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     [InlineData(30, 0f, 30, 12f)]
     public void WithoutAPlugIn_TheRequestOrTheBaseDefaultsUseSdCppsGrid(int requestSteps, float requestShift, int steps, float shift)
     {
-        var resolved = MiniMaxH3Pipeline.ResolveSampling(
+        var resolved = MiniMaxH3Requests.ResolveSampling(
             new VideoGenerationParams { Steps = requestSteps, FlowShift = requestShift }, null);
         Assert.Equal(steps, resolved.Steps);
         Assert.Equal(shift, resolved.VideoShift);
@@ -181,7 +181,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     public void AReferenceClipIsRefusedWithAPlugIn()
     {
         var e = Assert.Throws<InvalidOperationException>(() =>
-            MiniMaxH3Pipeline.RequirePluginMode(Recipe(8), MiniMaxH3Mode.Reference));
+            MiniMaxH3Requests.RequirePluginMode(Recipe(8), MiniMaxH3Mode.Reference));
         Assert.Equal(
             $"{Name8} ({Weights8}) is a MiniMax-H3 FL2VA plug-in for text, first-frame and first/last-frame clips; " +
             "reference conditioning does not take it. Drop the plug-in for a reference clip.", e.Message);
@@ -193,9 +193,9 @@ public sealed class MiniMaxH3TurboPipelineTests
     [InlineData(MiniMaxH3Mode.FirstLastFrame)]
     public void KeyframeAndTextClipsTakeThePlugIn(MiniMaxH3Mode mode)
     {
-        MiniMaxH3Pipeline.RequirePluginMode(Recipe(4), mode);
-        MiniMaxH3Pipeline.RequirePluginMode(null, MiniMaxH3Mode.Reference);
-        MiniMaxH3Pipeline.RequirePluginMode(null, mode);
+        MiniMaxH3Requests.RequirePluginMode(Recipe(4), mode);
+        MiniMaxH3Requests.RequirePluginMode(null, MiniMaxH3Mode.Reference);
+        MiniMaxH3Requests.RequirePluginMode(null, mode);
     }
 
     [Theory]
@@ -206,7 +206,7 @@ public sealed class MiniMaxH3TurboPipelineTests
     public void APlugInRunOffItsTrainingCanvasSaysSoOnce(int width, int height, string? expected)
     {
         var shape = new MiniMaxH3Shape { Width = width, Height = height };
-        Assert.Equal(expected, MiniMaxH3Pipeline.DescribePluginCanvas(Recipe(8), shape));
-        Assert.Null(MiniMaxH3Pipeline.DescribePluginCanvas(null, shape));
+        Assert.Equal(expected, MiniMaxH3Requests.DescribePluginCanvas(Recipe(8), shape));
+        Assert.Null(MiniMaxH3Requests.DescribePluginCanvas(null, shape));
     }
 }

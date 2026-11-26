@@ -11,9 +11,9 @@ namespace InferenceWeb.Tests;
 /// End-to-end tests of <see cref="MiniMaxH3LoraSet.Load"/> on synthetic files
 /// (<see cref="MiniMaxH3LoraFixtures"/>): a tiny H3 transformer GGUF with two trunk blocks
 /// and one token-refiner block, Diffusers-format adapters and their plug-in configs. The
-/// packed factors are read back through the <see cref="H3DitAdapter"/> descriptors and the
-/// reconstructed update (up · down) is compared with strength · alpha / rank · B · A in the
-/// checkpoint's row order. Packing is managed code only: no GGML backend is constructed, so
+/// packed factors are read back through the set's parts (<see cref="MiniMaxH3LoraSet.PartFor"/>, what the denoiser's
+/// LoraLinear regions bind) and the reconstructed update (up · down) is compared with strength · alpha / rank · B · A in
+/// the checkpoint's row order. Packing is managed code only: no GGML backend is constructed, so
 /// the Metal, CUDA and Vulkan packing rules are checked in any lane.
 /// </summary>
 public sealed class MiniMaxH3LoraSetTests : IDisposable
@@ -47,33 +47,18 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
 
     private MiniMaxH3LoraSet Load(LoraSpec spec, BackendType backend = BackendType.GgmlCpu, bool direct = false,
         MiniMaxH3Partition partition = MiniMaxH3Partition.FirstLastFrame) =>
-        MiniMaxH3LoraSet.Load(new[] { spec }, _cfg, partition, backend, direct);
+        MiniMaxH3LoraSet.Load(new[] { spec }, _cfg, partition, backend, tensorExecutor: direct);
 
     private MiniMaxH3LoraSet Load(string manifest, BackendType backend = BackendType.GgmlCpu, bool direct = false) =>
         Load(new LoraSpec(manifest), backend, direct);
 
     private static int Padded(int rank, int multiple) => (rank + multiple - 1) / multiple * multiple;
 
-    private static H3DitAdapter AdapterOf(MiniMaxH3LoraSet set) => Marshal.PtrToStructure<H3DitAdapter>(set.NativeAdapter);
+    private static MiniMaxH3LoraSet.Part PartOf(MiniMaxH3LoraSet set, bool refiner, int block, MiniMaxH3LoraTarget target) =>
+        set.PartFor(refiner, block, target);
 
-    private static H3BlockLora BlockOf(MiniMaxH3LoraSet set, bool refiner, int block)
-    {
-        var adapter = AdapterOf(set);
-        return Marshal.PtrToStructure<H3BlockLora>((refiner ? adapter.Refiner : adapter.Blocks) + block * Marshal.SizeOf<H3BlockLora>());
-    }
-
-    private static H3Lora PartOf(H3BlockLora b, MiniMaxH3LoraTarget target) => target switch
-    {
-        MiniMaxH3LoraTarget.Q => b.Q,
-        MiniMaxH3LoraTarget.K => b.K,
-        MiniMaxH3LoraTarget.V => b.V,
-        MiniMaxH3LoraTarget.Out => b.Out,
-        MiniMaxH3LoraTarget.Fc1 => b.Fc1,
-        _ => b.Fc2,
-    };
-
-    private static H3Lora PartOf(MiniMaxH3LoraSet set, bool refiner, int block, MiniMaxH3LoraTarget target) =>
-        PartOf(BlockOf(set, refiner, block), target);
+    private static bool Disposed(MiniMaxH3LoraSet set) =>
+        (bool)typeof(MiniMaxH3LoraSet).GetField("_disposed", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(set)!;
 
     private static float[] ReadValues(IntPtr p, long count, int type)
     {
@@ -89,13 +74,13 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
     }
 
     /// <summary>down as ggml [ne0 = in, ne1 = padded rank], read row-major [padded][in].</summary>
-    private static float[] DownOf(H3Lora l) => ReadValues(l.Down, l.Rank * l.In, l.Type);
+    private static float[] DownOf(MiniMaxH3LoraSet.Part l) => ReadValues(l.Down, l.Rank * l.In, l.Format);
 
     /// <summary>up as ggml [ne0 = padded rank, ne1 = out], read row-major [out][padded].</summary>
-    private static float[] UpOf(H3Lora l) => ReadValues(l.Up, l.Out * l.Rank, l.Type);
+    private static float[] UpOf(MiniMaxH3LoraSet.Part l) => ReadValues(l.Up, l.Out * l.Rank, l.Format);
 
-    /// <summary>up · down, as the native graph applies it, row-major [out][in].</summary>
-    private static float[] Delta(H3Lora l) =>
+    /// <summary>up · down, as the denoiser's LoraLinear region applies it, row-major [out][in].</summary>
+    private static float[] Delta(MiniMaxH3LoraSet.Part l) =>
         MiniMaxH3LoraFixtures.Product(UpOf(l), DownOf(l), (int)l.Out, l.Rank, (int)l.In);
 
     private static void AssertClose(float[] expected, float[] actual, string what, float relative)
@@ -108,12 +93,7 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
                 $"{what}[{i}]: expected {expected[i]}, got {actual[i]} (tolerance {tolerance})");
     }
 
-    private static void AssertEmpty(H3Lora l)
-    {
-        Assert.Equal(0, l.Rank);
-        Assert.Equal(IntPtr.Zero, l.Down);
-        Assert.Equal(IntPtr.Zero, l.Up);
-    }
+    private static void AssertEmpty(MiniMaxH3LoraSet.Part l) => Assert.Null(l);
 
     private static void AssertBits(float[] expected, float[] actual, string what)
     {
@@ -134,7 +114,7 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
                 foreach (var target in Targets)
                 {
                     var l = PartOf(set, refiner, b, target);
-                    if (l.Rank == 0) continue;
+                    if (l == null) continue;
                     pointers.Add(l.Down);
                     pointers.Add(l.Up);
                 }
@@ -171,7 +151,7 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
         string manifest = Plugin(adapter);
         using var set = Load(manifest);
 
-        Assert.False(set.IsDirect);
+        Assert.False(set.ForTensorExecutor);
         Assert.Equal(Path.Combine(_fx.Dir, W8), set.WeightsPath);
         Assert.Equal(MiniMaxH3Partition.FirstLastFrame, set.Partition);
         Assert.Equal(8, set.Recipe.Steps);
@@ -187,14 +167,14 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
             "rank 4, alpha 8, strength 1, scale 2; F32 factors (GgmlCpu keeps F32), rank padded to a multiple of 16, 0.00 GB",
             set.Summary);
 
-        var descriptor = AdapterOf(set);
-        Assert.Equal(Marshal.SizeOf<H3DitAdapter>(), descriptor.StructBytes);
-        Assert.Equal(32, descriptor.StructBytes);
-        Assert.Equal(2, descriptor.NumBlocks);
-        Assert.Equal(1, descriptor.NumRefinerBlocks);
-        Assert.Equal(0, descriptor.Reserved);
-        Assert.NotEqual(IntPtr.Zero, descriptor.Blocks);
-        Assert.NotEqual(IntPtr.Zero, descriptor.Refiner);
+        // What the denoiser binds: q, k and v as three slots of the qkv projection, the others one slot each.
+        MiniMaxH3LoraSet.Factors qkv = set.Get(false, 0, MiniMaxH3LoraSet.Projection.Qkv);
+        Assert.Equal(Inner, qkv.SlotRows);
+        Assert.Equal(new[] { 0, 1, 2 }, qkv.Parts.Select(p => p.Slot));
+        foreach (var projection in new[] { MiniMaxH3LoraSet.Projection.Out, MiniMaxH3LoraSet.Projection.Fc1, MiniMaxH3LoraSet.Projection.Fc2 })
+            Assert.Equal(0, set.Get(true, 0, projection).SlotRows);
+        Assert.Single(set.AdapterSet.Adapters);
+        Assert.Same(set, set.AdapterSet.Adapters[0].Payload);
     }
 
     [Fact]
@@ -433,11 +413,8 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
                           $"({bad.ToString(System.Globalization.CultureInfo.InvariantCulture)}) at element 5; the adapter file is damaged.";
 
         Assert.Equal(expected, Assert.Throws<InvalidDataException>(() => Load(manifest)).Message);
-
-        // Direct mode reads lazily: the load passes, the read of that term fails.
-        using var set = Load(manifest, BackendType.Cpu, direct: true);
-        Assert.NotNull(set.ReadFactors(false, 0, MiniMaxH3LoraTarget.Q));
-        Assert.Equal(expected, Assert.Throws<InvalidDataException>(() => set.ReadFactors(false, 1, MiniMaxH3LoraTarget.Fc2)).Message);
+        // A tensor executor's set is packed at load too, so it is refused the same way.
+        Assert.Equal(expected, Assert.Throws<InvalidDataException>(() => Load(manifest, BackendType.Cpu, direct: true)).Message);
     }
 
     // ---- the spec and its plug-in config ------------------------------------------------------
@@ -557,10 +534,10 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
         var specs = new[] { new LoraSpec(manifest), new LoraSpec(manifest) };
 
         var e = Assert.Throws<ArgumentException>(() =>
-            MiniMaxH3LoraSet.Load(specs, _cfg, MiniMaxH3Partition.FirstLastFrame, BackendType.GgmlCpu, direct: false));
+            MiniMaxH3LoraSet.Load(specs, _cfg, MiniMaxH3Partition.FirstLastFrame, BackendType.GgmlCpu, tensorExecutor: false));
         Assert.Equal($"Two MiniMax-H3 plug-ins ({Manifest}, {Manifest}) each fix the sampling schedule; use one.", e.Message);
         Assert.Throws<ArgumentException>(() =>
-            MiniMaxH3LoraSet.Load(Array.Empty<LoraSpec>(), _cfg, MiniMaxH3Partition.FirstLastFrame, BackendType.GgmlCpu, direct: false));
+            MiniMaxH3LoraSet.Load(Array.Empty<LoraSpec>(), _cfg, MiniMaxH3Partition.FirstLastFrame, BackendType.GgmlCpu, tensorExecutor: false));
     }
 
     [Fact]
@@ -575,7 +552,7 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
 
         // Same shapes as FL2VA: only the file name tells the checkpoints apart.
         var e = Assert.Throws<ArgumentException>(() => MiniMaxH3LoraSet.Load(new[] { new LoraSpec(manifest) },
-            MiniMaxH3LoraFixtures.ConfigOf(ref2va), partition, BackendType.GgmlCpu, direct: false));
+            MiniMaxH3LoraFixtures.ConfigOf(ref2va), partition, BackendType.GgmlCpu, tensorExecutor: false));
         Assert.Equal($"LoRA plug-in {Manifest} is for the MiniMax-H3 FL2VA checkpoint; the loaded model is the Ref2VA checkpoint, " +
                      "and Ref2VA Turbo is not supported. Load minimax_h3_fl2va_pruned-*.gguf or drop the plug-in.", e.Message);
     }
@@ -663,18 +640,24 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
         adapter.Term(false, 1, MiniMaxH3LoraTarget.V, 4, seed: 32);
         using var set = Load(Plugin(adapter), backend);
 
-        var b0 = BlockOf(set, false, 0);
-        Assert.Equal(b0.Q.Type, b0.K.Type);
-        Assert.Equal(b0.Q.Type, b0.V.Type);
-        Assert.Equal(b0.Q.Down + (nint)(b0.Q.Rank * b0.Q.In * elem), b0.K.Down);
-        Assert.Equal(b0.K.Down + (nint)(b0.K.Rank * b0.K.In * elem), b0.V.Down);
-        foreach (var p in new[] { b0.Q.Down, b0.Q.Up, b0.K.Up, b0.V.Up, b0.Out.Down, b0.Out.Up, b0.Fc1.Down, b0.Fc1.Up, b0.Fc2.Down, b0.Fc2.Up })
+        MiniMaxH3LoraSet.Part Q(int b) => PartOf(set, false, b, MiniMaxH3LoraTarget.Q);
+        MiniMaxH3LoraSet.Part K(int b) => PartOf(set, false, b, MiniMaxH3LoraTarget.K);
+        MiniMaxH3LoraSet.Part V(int b) => PartOf(set, false, b, MiniMaxH3LoraTarget.V);
+        MiniMaxH3LoraSet.Part Out = PartOf(set, false, 0, MiniMaxH3LoraTarget.Out),
+            Fc1 = PartOf(set, false, 0, MiniMaxH3LoraTarget.Fc1), Fc2 = PartOf(set, false, 0, MiniMaxH3LoraTarget.Fc2);
+        Assert.Equal(Q(0).Format, K(0).Format);
+        Assert.Equal(Q(0).Format, V(0).Format);
+        Assert.Equal(Q(0).Down + (nint)(Q(0).Rank * Q(0).In * elem), K(0).Down);
+        Assert.Equal(K(0).Down + (nint)(K(0).Rank * K(0).In * elem), V(0).Down);
+        foreach (var p in new[] { Q(0).Down, Q(0).Up, K(0).Up, V(0).Up, Out.Down, Out.Up, Fc1.Down, Fc1.Up, Fc2.Down, Fc2.Up })
             Assert.Equal(0L, (long)p % 16384);
 
-        var b1 = BlockOf(set, false, 1);
-        AssertEmpty(b1.Q);
-        Assert.Equal(0L, (long)b1.K.Down % 16384);
-        Assert.Equal(b1.K.Down + (nint)(b1.K.Rank * b1.K.In * elem), b1.V.Down);
+        AssertEmpty(Q(1));
+        Assert.Equal(0L, (long)K(1).Down % 16384);
+        Assert.Equal(K(1).Down + (nint)(K(1).Rank * K(1).In * elem), V(1).Down);
+        // The region binds each slot's down at its own address, and its byte counts cover the padded rank.
+        Assert.Equal(Q(0).Rank * Q(0).In * elem, Q(0).DownBytes);
+        Assert.Equal(Q(0).Out * Q(0).Rank * elem, Q(0).UpBytes);
     }
 
     [Theory]
@@ -688,7 +671,7 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
         using var set = Load(Plugin(adapter), backend);
 
         foreach (var (refiner, block, target) in adapter.Targets)
-            Assert.Equal(type, PartOf(set, refiner, block, target).Type);
+            Assert.Equal(type, PartOf(set, refiner, block, target).Format);
         Assert.Contains(summary, set.Summary);
     }
 
@@ -702,13 +685,15 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
         adapter.Term(false, 0, MiniMaxH3LoraTarget.Out, 1, seed: 34);
         using var set = Load(Plugin(adapter, alpha: 1f), BackendType.GgmlMetal);
 
-        var b0 = BlockOf(set, false, 0);
-        Assert.Equal(F32, b0.Q.Type);
-        Assert.Equal(F32, b0.K.Type);
-        Assert.Equal(F16, b0.Out.Type);
-        Assert.Equal(b0.Q.Down + (nint)(b0.Q.Rank * b0.Q.In * 4), b0.K.Down);
+        var q = PartOf(set, false, 0, MiniMaxH3LoraTarget.Q);
+        var k = PartOf(set, false, 0, MiniMaxH3LoraTarget.K);
+        var o = PartOf(set, false, 0, MiniMaxH3LoraTarget.Out);
+        Assert.Equal(F32, q.Format);
+        Assert.Equal(F32, k.Format);
+        Assert.Equal(F16, o.Format);
+        Assert.Equal(q.Down + (nint)(q.Rank * q.In * 4), k.Down);
         Assert.Contains("F16/F32 factors", set.Summary);
-        AssertClose(adapter.Delta(false, 0, MiniMaxH3LoraTarget.Q, 1f), Delta(b0.Q), "q", 1e-5f);
+        AssertClose(adapter.Delta(false, 0, MiniMaxH3LoraTarget.Q, 1f), Delta(q), "q", 1e-5f);
     }
 
     [Fact]
@@ -766,19 +751,19 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
                 return;
             }
             Interlocked.Increment(ref calls);
-            beforeFree &= set.NativeAdapter != IntPtr.Zero;
+            beforeFree &= !Disposed(set);
         };
         try
         {
             set.InvalidateDeviceCopies();
             Assert.Equal(mine.Count, calls);
-            Assert.NotEqual(IntPtr.Zero, set.NativeAdapter);
+            Assert.False(Disposed(set));
 
             calls = 0;
             set.Dispose();
             Assert.Equal(mine.Count, calls);
             Assert.True(beforeFree, "A factor was invalidated after its memory was freed.");
-            Assert.Equal(IntPtr.Zero, set.NativeAdapter);
+            Assert.True(Disposed(set));
 
             calls = 0;
             set.InvalidateDeviceCopies();
@@ -794,7 +779,7 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
     }
 
     [Fact]
-    public void DirectMode_KeepsTheFile_AndHasNoNativeFactors()
+    public void TensorExecutorMode_HoldsTheExactUnpaddedF32Factors()
     {
         var adapter = new Adapter();
         var (a, _) = adapter.Term(false, 1, MiniMaxH3LoraTarget.Out, 4, seed: 35);
@@ -802,15 +787,16 @@ public sealed class MiniMaxH3LoraSetTests : IDisposable
         var set = Load(Plugin(adapter), BackendType.Cpu, direct: true);
         try
         {
-            Assert.True(set.IsDirect);
-            Assert.Equal(IntPtr.Zero, set.NativeAdapter);
+            Assert.True(set.ForTensorExecutor);
             Assert.Equal((4L * Inner + Hidden * 4L + 4L * Hidden + 2 * Ffn * 4L) * 4, set.FactorBytes);
-            Assert.Contains("exact F32 factors read per block for the direct backend", set.Summary);
+            Assert.Contains("exact F32 factors for the tensor executor", set.Summary);
             Assert.Null(set.ReadFactors(false, 0, MiniMaxH3LoraTarget.Out));
             AssertBits(a, set.ReadFactors(false, 1, MiniMaxH3LoraTarget.Out)!.Value.Down, "down");
             Assert.Throws<ArgumentOutOfRangeException>(() => set.ReadFactors(false, 2, MiniMaxH3LoraTarget.Out));
             Assert.Throws<ArgumentOutOfRangeException>(() => set.ReadFactors(true, 1, MiniMaxH3LoraTarget.Out));
-            Assert.Throws<InvalidOperationException>(() => set.PackedUpForTest(false, 1, MiniMaxH3LoraTarget.Out));
+            Assert.Equal(set.ReadFactors(false, 1, MiniMaxH3LoraTarget.Out)!.Value.Up, set.PackedUpForTest(false, 1, MiniMaxH3LoraTarget.Out));
+            Assert.Equal(4, PartOf(set, false, 1, MiniMaxH3LoraTarget.Out).Rank);
+            Assert.Equal(F32, PartOf(set, false, 1, MiniMaxH3LoraTarget.Out).Format);
 
             int calls = 0;
             MiniMaxH3LoraSet.InvalidateHookForTest = p => Interlocked.Increment(ref calls);

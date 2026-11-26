@@ -56,7 +56,7 @@ public sealed class StudioTurboTests : IDisposable
         foreach (string name in new[]
                  {
                      LoraCliFlags.EnvironmentVariable, QwenImageVariantFlag.EnvironmentVariable, "TS_VIDEO_TEXT_ENCODER", "TS_VIDEO_VAE",
-                     "TS_VIDEO_AUDIO_VAE", "TS_H3_DIT_LAYERS", "TENSORSHARP_MODELS",
+                     "TS_VIDEO_AUDIO_VAE", "TENSORSHARP_MODELS",
                  })
             _env.Set(name, null);
     }

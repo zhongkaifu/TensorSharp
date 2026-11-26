@@ -302,7 +302,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             for (int c = 0; c < s.Channels; c++)
                 for (int i = 0; i < plane; i++)
                     hwc[(long)i * s.Channels + c] = latent.Data[(long)c * plane + i];
-            return MiniMaxH3DiT.PatchifyVideo(hwc, 1, s.Height, s.Width, s.Channels);
+            return MiniMaxH3Latents.PatchifyVideo(hwc, 1, s.Height, s.Width, s.Channels);
         }
 
         public LatentTensor FromRows(float[] rows, LatentShape shape)
@@ -310,7 +310,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             ArgumentNullException.ThrowIfNull(rows);
             LatentShape s = Check(shape);
             if (rows.LongLength != s.Count) throw new ArgumentException($"A {s} latent holds {s.Count} values, not {rows.LongLength}.", nameof(rows));
-            float[] hwc = MiniMaxH3DiT.UnpatchifyVideo(rows, 1, s.Height, s.Width, s.Channels);
+            float[] hwc = MiniMaxH3Latents.UnpatchifyVideo(rows, 1, s.Height, s.Width, s.Channels);
             int plane = s.Height * s.Width;
             var chw = new float[hwc.LongLength];
             for (int c = 0; c < s.Channels; c++)

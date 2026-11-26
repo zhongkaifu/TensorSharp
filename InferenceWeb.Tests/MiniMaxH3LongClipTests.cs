@@ -70,7 +70,7 @@ namespace InferenceWeb.Tests
                 return;
             }
 
-            using var dit = new MiniMaxH3DiT(DitPath);
+            using var dit = new MiniMaxH3Denoiser(DitPath, TestGates.PinnedGgmlBackend);
             _output.WriteLine("[h3-long] " + dit.Config);
 
             // Fixed seeds, and a fresh latent generator per clip length so what a given
@@ -158,7 +158,7 @@ namespace InferenceWeb.Tests
             string spec = Environment.GetEnvironmentVariable("TS_H3_LONG_LOOP_FRAMES") ?? "107,73";
             const int steps = 24;
 
-            using var dit = new MiniMaxH3DiT(DitPath);
+            using var dit = new MiniMaxH3Denoiser(DitPath, TestGates.PinnedGgmlBackend);
             _output.WriteLine($"[h3-long] {dit.Config}  steps={steps}");
             var textHidden = Fill(new float[(long)TextLength * dit.Config.TextDim], new Random(1234));
 

@@ -61,7 +61,7 @@ public sealed class MiniMaxH3MlpActivationTests
             Ops.Mul(previous, previous, value);
             float[] expected = DirectOps.ToArray(previous);
 
-            using var fused = MiniMaxH3DirectDiT.ActivateMlp(context, projected, width);
+            using var fused = MiniMaxH3DirectVideoVae.ActivateMlp(context, projected, width);
             float[] actual = DirectOps.ToArray(fused);
             Assert.True(MemoryMarshal.AsBytes(expected.AsSpan()).SequenceEqual(
                 MemoryMarshal.AsBytes(actual.AsSpan())),

@@ -5,15 +5,13 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// A MiniMax-H3 LoRA plug-in (the LightX2V Turbo step-distillation adapters), loaded,
-// validated and either packed for the native graph's unmerged update path
-// (TSGH3DitAdapter, ggml_h3_lora.h) or kept open for the direct backends.
+// A MiniMax-H3 LoRA plug-in (the LightX2V Turbo step-distillation adapters), loaded, validated and packed per projection
+// for the denoiser's LoraLinear regions (MiniMaxH3Denoiser), applied unmerged on every executor.
 //
-// Applied unmerged, y = W x + up (down x), as the reference applies it (inference_minimax_h3.py
-// runs the adapter through PEFT and fuses only with --fuse-lora): the Q4_K / Q8_0 base stays
-// as stored, and the update keeps its own factors. strength * alpha / rank is folded into up in
-// F32 (alpha 8 at rank 128 is 0.0625; a loader assuming alpha = rank would apply 16x), then
-// ff.net.0.proj's up halves are swapped into fc1's [gate | value] order (MiniMaxH3LoraKeys).
+// Applied unmerged, y = W x + up (down x), as the reference applies it (inference_minimax_h3.py runs the adapter through
+// PEFT and fuses only with --fuse-lora): the Q4_K / Q8_0 base stays as stored, and the update keeps its own factors.
+// strength * alpha / rank is folded into up in F32 (alpha 8 at rank 128 is 0.0625; a loader assuming alpha = rank would
+// apply 16x), then ff.net.0.proj's up halves are swapped into fc1's [gate | value] order (MiniMaxH3LoraKeys).
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -22,37 +20,62 @@ using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.GGML;
+using TensorSharp.Graph;
+using TensorSharp.Models.SharedDiffusion;
 
 namespace TensorSharp.Models.MiniMaxH3
 {
     /// <summary>
-    /// One MiniMax-H3 LoRA plug-in, selected by its <c>minimax-h3-lora</c> config.
+    /// One MiniMax-H3 LoRA plug-in, selected by its <c>minimax-h3-lora</c> config, packed per projection.
     /// </summary>
     /// <remarks>
-    /// <para><b>Accounting.</b> Every tensor in the file is used or the load fails naming it,
-    /// with every other problem found in the same pass; nothing is skipped silently.</para>
-    /// <para><b>Native packing.</b> Each rank component is balanced (down row and up column get
-    /// equal norms, the product is unchanged) and stored as F16, unless some value would reach
-    /// F16's range (then F32) or the backend is GgmlCpu, whose ARM kernels accumulate F16 dot
-    /// products in F16 (F32 always there). Ranks are zero-padded to 64 on Metal, whose
-    /// simdgroup matrix kernel needs K >= 64, and to 16 elsewhere. A block's q, k and v read one
-    /// input, so their downs sit back to back in one allocation with one element type and the
-    /// graph runs one stacked shrink; every other factor has its own 16 KiB-aligned allocation.
-    /// Blocks pack in parallel, a bounded number at a time, each dropping its F32 working set
-    /// as soon as it is stored.</para>
-    /// <para><b>Direct backends.</b> The CPU, MLX and direct CUDA paths build their own exact
-    /// F32 factors from <see cref="ReadFactors"/>, one resident copy each (<see cref="FactorBytes"/>
-    /// once every block is built; on MLX a device array with no host mirror); the file stays open
-    /// until <see cref="Dispose"/>, and each read checks its values there.</para>
+    /// <para><b>Accounting.</b> Every tensor in the file is used or the load fails naming it, with every other problem found
+    /// in the same pass; nothing is skipped silently.</para>
+    /// <para><b>The GGML graph executor.</b> Each rank component is balanced (down row and up column get equal norms, the
+    /// product is unchanged) and stored as F16, unless some value would reach F16's range (then F32) or the backend is
+    /// GgmlCpu, whose ARM kernels accumulate F16 dot products in F16 (F32 always there). Ranks are zero-padded to 64 on Metal,
+    /// whose simdgroup matrix kernel needs K >= 64, and to 16 elsewhere. A block's q, k and v read one input, so their downs
+    /// sit back to back in one allocation with one element type; every other factor has its own 16 KiB-aligned allocation.
+    /// Blocks pack in parallel, a bounded number at a time, each dropping its F32 working set as soon as it is stored.</para>
+    /// <para><b>The tensor executors</b> (cpu, cuda, mlx) take the exact F32 factors as read, unbalanced and unpadded, as the
+    /// retired direct backends built them.</para>
     /// </remarks>
     internal sealed class MiniMaxH3LoraSet : IDisposable
     {
         private const int GgmlF32 = 0, GgmlF16 = 1;
         private const int MaxPackingThreads = 8;
+        private static long s_generations;
 
-        /// <summary>Test seam: when set, <see cref="InvalidateDeviceCopies"/> hands each factor
-        /// pointer to it instead of <see cref="GgmlBasicOps.InvalidateHostBuffer"/>.</summary>
+        /// <summary>The block projections a term can update: q, k and v are the three slots of the qkv projection.</summary>
+        internal enum Projection { Qkv = 0, Out = 1, Fc1 = 2, Fc2 = 3 }
+
+        internal const int ProjectionCount = 4;
+
+        /// <summary>Test seam: when set, <see cref="InvalidateDeviceCopies"/> hands each factor pointer to it instead of
+        /// <see cref="GgmlBasicOps.InvalidateHostBuffer"/>.</summary>
         internal static Action<IntPtr>? InvalidateHookForTest;
+
+        /// <summary>One packed factor pair: a slot's rows of a projection.</summary>
+        internal sealed class Part
+        {
+            /// <summary>The slot (rows [Slot * slot rows, (Slot + 1) * slot rows) of the projection's output).</summary>
+            public int Slot;
+            /// <summary><see cref="GraphFormat.F16"/> or <see cref="GraphFormat.F32"/>, both factors.</summary>
+            public int Format;
+            /// <summary>The (padded) rank; the padding is zero.</summary>
+            public int Rank;
+            public long In, Out;
+            /// <summary>down: ggml [ne0 = in, ne1 = rank]; up: ggml [ne0 = rank, ne1 = out], the scale folded in.</summary>
+            public IntPtr Down, Up;
+            public long DownBytes, UpBytes;
+        }
+
+        /// <summary>A projection's parts: <see cref="SlotRows"/> 0 is one slot of all its rows; else equal slots (q, k, v).</summary>
+        internal sealed class Factors
+        {
+            public long SlotRows;
+            public Part[] Parts;
+        }
 
         private readonly LoraFactorBuffers _buffers = new();
         private readonly object _lock = new();
@@ -60,9 +83,8 @@ namespace TensorSharp.Models.MiniMaxH3
         // One planned term per (block, target), null where the file has none:
         // index block * TargetCount + target.
         private readonly Term[] _trunk, _refiner;
-        // The packed descriptors (native mode), mirrored into native memory for the adapter.
-        private readonly H3BlockLora[] _trunkPacked, _refinerPacked;
-        private SafetensorsFile _file;   // direct mode: open until Dispose
+        // The packed factors per (block, projection), null where the plug-in updates none.
+        private readonly Factors[] _trunkPacked, _refinerPacked;
         private string _fileName;
         private long _factorBytes;
         private int _f16Groups, _f32Groups;
@@ -84,15 +106,19 @@ namespace TensorSharp.Models.MiniMaxH3
             internal readonly float[][] Up = new float[3][];
         }
 
-        private MiniMaxH3LoraSet(MiniMaxH3Config cfg, bool direct)
+        private MiniMaxH3LoraSet(MiniMaxH3Config cfg, bool tensorExecutor)
         {
             _cfg = cfg;
-            IsDirect = direct;
+            ForTensorExecutor = tensorExecutor;
             _trunk = new Term[cfg.NumLayers * MiniMaxH3LoraKeys.TargetCount];
             _refiner = new Term[cfg.TokenRefinerLayers * MiniMaxH3LoraKeys.TargetCount];
-            _trunkPacked = new H3BlockLora[cfg.NumLayers];
-            _refinerPacked = new H3BlockLora[cfg.TokenRefinerLayers];
+            _trunkPacked = new Factors[cfg.NumLayers * ProjectionCount];
+            _refinerPacked = new Factors[cfg.TokenRefinerLayers * ProjectionCount];
+            Generation = Interlocked.Increment(ref s_generations);
         }
+
+        /// <summary>A process-unique id: a denoiser's cached plan is bound to one set, never to an address a later set reuses.</summary>
+        internal long Generation { get; }
 
         /// <summary>The sampling contract the plug-in locks.</summary>
         internal MiniMaxH3SamplingRecipe Recipe { get; private set; }
@@ -113,16 +139,11 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>The one-line load report.</summary>
         internal string Summary { get; private set; } = "";
 
-        /// <summary>Native bytes of the packed factors; in direct mode, the F32 bytes a full pass of
-        /// <see cref="ReadFactors"/> hands out, which is also what the direct backend keeps resident
-        /// once every block has run.</summary>
+        /// <summary>Host bytes of the packed factors (the device takes as many once they are bound).</summary>
         internal long FactorBytes => Interlocked.Read(ref _factorBytes);
 
-        /// <summary>The <see cref="H3DitAdapter"/> for <c>H3DitForwardArgs.Adapter</c>; zero in direct mode.</summary>
-        internal IntPtr NativeAdapter { get; private set; }
-
-        /// <summary>True when the set serves <see cref="ReadFactors"/> instead of a native adapter.</summary>
-        internal bool IsDirect { get; }
+        /// <summary>True when the factors are the tensor executors' exact F32 ones; false: the GGML graph executor's packing.</summary>
+        internal bool ForTensorExecutor { get; }
 
         /// <summary>Tensors in the file (two per term).</summary>
         internal int TensorCount { get; private set; }
@@ -136,12 +157,70 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>The distinct folded scales (strength * alpha / rank), ascending.</summary>
         internal IReadOnlyList<float> Scales { get; private set; } = Array.Empty<float>();
 
+        /// <summary>The runtime's view: one adapter carrying this set (the plug-in's recipe is the family's to apply).</summary>
+        internal AdapterSet AdapterSet { get; private set; } = AdapterSet.Empty;
+
+        /// <summary>The packed factors of a projection, or null when the plug-in does not update it.</summary>
+        internal Factors Get(bool refiner, int block, Projection projection)
+        {
+            // A disposed set's factors are freed: a step must never bind their addresses.
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            int blocks = refiner ? _cfg.TokenRefinerLayers : _cfg.NumLayers;
+            if (block < 0 || block >= blocks)
+                throw new ArgumentOutOfRangeException(nameof(block), $"{(refiner ? "Refiner block" : "Block")} {block} is outside [0, {blocks}).");
+            return (refiner ? _refinerPacked : _trunkPacked)[block * ProjectionCount + (int)projection];
+        }
+
+        /// <summary>The packed part of one term (its slot of the projection), or null when the plug-in does not update it.</summary>
+        internal Part PartFor(bool refiner, int block, MiniMaxH3LoraTarget target)
+        {
+            Projection projection = target switch
+            {
+                MiniMaxH3LoraTarget.Q or MiniMaxH3LoraTarget.K or MiniMaxH3LoraTarget.V => Projection.Qkv,
+                MiniMaxH3LoraTarget.Out => Projection.Out,
+                MiniMaxH3LoraTarget.Fc1 => Projection.Fc1,
+                _ => Projection.Fc2,
+            };
+            int slot = target switch { MiniMaxH3LoraTarget.K => 1, MiniMaxH3LoraTarget.V => 2, _ => 0 };
+            Factors f = Get(refiner, block, projection);
+            return f == null ? null : Array.Find(f.Parts, p => p.Slot == slot);
+        }
+
+        /// <summary>
+        /// The conditioned F32 factors of one term as a tensor executor's set holds them: down [rank, in], up [out, rank] with
+        /// strength * alpha / rank folded in and fc1's halves in [gate | value] order. Null when the plug-in does not update
+        /// that projection.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The set is packed for the GGML graph executor (balanced, padded).</exception>
+        internal (float[] Down, float[] Up, int Rank, long In, long Out)? ReadFactors(bool refiner, int block, MiniMaxH3LoraTarget target)
+        {
+            if (!ForTensorExecutor)
+                throw new InvalidOperationException("ReadFactors reads a tensor executor's exact factors; this set is packed for the GGML graph executor.");
+            Part p = PartFor(refiner, block, target);
+            if (p == null) return null;
+            lock (_lock)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                var down = new float[p.Rank * p.In];
+                var up = new float[p.Out * p.Rank];
+                System.Runtime.InteropServices.Marshal.Copy(p.Down, down, 0, down.Length);
+                System.Runtime.InteropServices.Marshal.Copy(p.Up, up, 0, up.Length);
+                return (down, up, p.Rank, p.In, p.Out);
+            }
+        }
+
+        /// <summary>Whether the set was loaded for a checkpoint of <paramref name="cfg"/>'s shape.</summary>
+        internal bool Fits(MiniMaxH3Config cfg) =>
+            cfg != null && cfg.NumLayers == _cfg.NumLayers && cfg.TokenRefinerLayers == _cfg.TokenRefinerLayers &&
+            cfg.HiddenSize == _cfg.HiddenSize && cfg.AttentionInnerDim == _cfg.AttentionInnerDim && cfg.FfnHiddenSize == _cfg.FfnHiddenSize;
+
         // ---- loading ----------------------------------------------------------------------
 
         /// <summary>
         /// Load the one plug-in in <paramref name="resolved"/> (a spec after
         /// <see cref="LoraCliFlags.Resolve"/>: the weights, with the plug-in config as
-        /// <see cref="LoraSpec.ConfigPath"/>) for a transformer of <paramref name="cfg"/>.
+        /// <see cref="LoraSpec.ConfigPath"/>) for a transformer of <paramref name="cfg"/> whose steps run on
+        /// <paramref name="backend"/>'s GGML graph executor, or on a tensor executor (<paramref name="tensorExecutor"/>).
         /// </summary>
         /// <exception cref="ArgumentException">The spec is refused (bare weights, a foreign plug-in
         /// type, two plug-ins, weights the config was not written for, the wrong partition, a
@@ -150,7 +229,7 @@ namespace TensorSharp.Models.MiniMaxH3
         /// not fit the transformer.</exception>
         /// <exception cref="FileNotFoundException">A named file is missing.</exception>
         internal static MiniMaxH3LoraSet Load(IReadOnlyList<LoraSpec> resolved, MiniMaxH3Config cfg, MiniMaxH3Partition partition,
-            BackendType backend, bool direct)
+            BackendType backend, bool tensorExecutor)
         {
             ArgumentNullException.ThrowIfNull(resolved);
             ArgumentNullException.ThrowIfNull(cfg);
@@ -159,10 +238,14 @@ namespace TensorSharp.Models.MiniMaxH3
             if (resolved.Count > 1)
                 throw new ArgumentException(MiniMaxH3LoraConfig.TwoPluginsRefusal(
                     Path.GetFileName(resolved[0].Path), Path.GetFileName(resolved[1].Path)));
-            var set = new MiniMaxH3LoraSet(cfg, direct);
+            var set = new MiniMaxH3LoraSet(cfg, tensorExecutor);
             try
             {
                 set.Open(resolved[0], partition, backend);
+                set.AdapterSet = new AdapterSet(new[]
+                {
+                    new DiffusionAdapter { Name = set._fileName, Scale = set.Strength, Payload = set },
+                });
                 return set;
             }
             catch
@@ -215,7 +298,6 @@ namespace TensorSharp.Models.MiniMaxH3
             _fileName = Path.GetFileName(weights);
 
             var st = new SafetensorsFile(WeightsPath);
-            bool keepOpen = false;
             try
             {
                 // ---- the file's own declarations -------------------------------------------------
@@ -246,22 +328,11 @@ namespace TensorSharp.Models.MiniMaxH3
                     "TensorSharp never assumes alpha = rank.");
 
                 Plan(st);
-
-                if (IsDirect)
-                {
-                    _file = st;
-                    keepOpen = true;
-                    foreach (var term in AllTerms())
-                        _factorBytes += ((long)term.Rank * term.In + term.Out * term.Rank) * sizeof(float);
-                }
-                else
-                {
-                    Pack(st, backend);
-                }
+                Pack(st, backend);
             }
             finally
             {
-                if (!keepOpen) st.Dispose();
+                st.Dispose();
             }
 
             Summary = Describe(manifestName, config.Name, backend);
@@ -417,36 +488,15 @@ namespace TensorSharp.Models.MiniMaxH3
                         $"at element {i}; the adapter file is damaged.");
         }
 
-        /// <summary>
-        /// The conditioned F32 factors of one term for the direct backends: down [rank, in], up
-        /// [out, rank] with strength * alpha / rank folded in and fc1's halves in [gate | value]
-        /// order. Null when the plug-in does not update that projection.
-        /// </summary>
-        /// <exception cref="InvalidOperationException">The set is packed for a native graph.</exception>
-        /// <exception cref="InvalidDataException">The factors hold a non-finite value.</exception>
-        internal (float[] Down, float[] Up, int Rank, long In, long Out)? ReadFactors(bool refiner, int block, MiniMaxH3LoraTarget t)
-        {
-            if (!IsDirect)
-                throw new InvalidOperationException("ReadFactors serves the direct backends; this LoRA set is packed for the native graph.");
-            var term = TermAt(refiner, block, t);
-            if (term == null) return null;
-            lock (_lock)
-            {
-                ObjectDisposedException.ThrowIf(_disposed, this);
-                float[] down = null, up = null;
-                Condition(_file, term, ref down, ref up);
-                return (down, up, term.Rank, term.In, term.Out);
-            }
-        }
-
-        // ---- native packing -------------------------------------------------------------------
+        // ---- packing --------------------------------------------------------------------------
 
         private static int Pad(int rank, int multiple) => (rank + multiple - 1) / multiple * multiple;
 
-        private unsafe void Pack(SafetensorsFile st, BackendType backend)
+        private void Pack(SafetensorsFile st, BackendType backend)
         {
-            int multiple = backend == BackendType.GgmlMetal ? 64 : 16;
-            bool f32Only = backend == BackendType.GgmlCpu;
+            // The tensor executors keep the exact F32 factors as read: no balancing, no padding.
+            int multiple = ForTensorExecutor ? 1 : backend == BackendType.GgmlMetal ? 64 : 16;
+            bool f32Only = ForTensorExecutor || backend == BackendType.GgmlCpu;
             // The safetensors map is created on first use, which is not thread-safe: open it here.
             foreach (var term in AllTerms())
             {
@@ -462,7 +512,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 {
                     bool refiner = u < refinerBlocks;
                     int block = refiner ? u : u - refinerBlocks;
-                    (refiner ? _refinerPacked : _trunkPacked)[block] = PackBlock(st, refiner, block, multiple, f32Only, scratch);
+                    PackBlock(st, refiner, block, multiple, f32Only, scratch);
                     return scratch;
                 }, _ => { });
             }
@@ -470,52 +520,41 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 ExceptionDispatchInfo.Capture(e.InnerExceptions[0]).Throw();
             }
-
-            IntPtr trunk = Mirror(_trunkPacked), refinerArray = Mirror(_refinerPacked);
-            IntPtr adapter = _buffers.Allocate(sizeof(H3DitAdapter));
-            *(H3DitAdapter*)adapter = new H3DitAdapter
-            {
-                StructBytes = sizeof(H3DitAdapter),
-                NumBlocks = _cfg.NumLayers,
-                NumRefinerBlocks = refinerBlocks,
-                Blocks = trunk,
-                Refiner = refinerArray,
-            };
-            NativeAdapter = adapter;
         }
 
-        /// <summary>The descriptors in native memory, or zero for none.</summary>
-        private unsafe IntPtr Mirror(H3BlockLora[] blocks)
+        private void PackBlock(SafetensorsFile st, bool refiner, int block, int multiple, bool f32Only, Scratch scratch)
         {
-            if (blocks.Length == 0) return IntPtr.Zero;
-            IntPtr p = _buffers.Allocate((long)blocks.Length * sizeof(H3BlockLora));
-            blocks.AsSpan().CopyTo(new Span<H3BlockLora>((void*)p, blocks.Length));
-            return p;
-        }
-
-        private H3BlockLora PackBlock(SafetensorsFile st, bool refiner, int block, int multiple, bool f32Only, Scratch scratch)
-        {
-            var result = new H3BlockLora();
-            // q, k and v read one input: one allocation for their downs (the stacked shrink).
-            var qkv = PackGroup(st, scratch, multiple, f32Only,
+            Factors[] packed = refiner ? _refinerPacked : _trunkPacked;
+            int at = block * ProjectionCount;
+            // q, k and v read one input: one allocation for their downs.
+            Part[] qkv = PackGroup(st, scratch, multiple, f32Only,
                 TermAt(refiner, block, MiniMaxH3LoraTarget.Q), TermAt(refiner, block, MiniMaxH3LoraTarget.K),
                 TermAt(refiner, block, MiniMaxH3LoraTarget.V));
-            result.Q = qkv[0];
-            result.K = qkv[1];
-            result.V = qkv[2];
-            result.Out = PackGroup(st, scratch, multiple, f32Only, TermAt(refiner, block, MiniMaxH3LoraTarget.Out))[0];
-            result.Fc1 = PackGroup(st, scratch, multiple, f32Only, TermAt(refiner, block, MiniMaxH3LoraTarget.Fc1))[0];
-            result.Fc2 = PackGroup(st, scratch, multiple, f32Only, TermAt(refiner, block, MiniMaxH3LoraTarget.Fc2))[0];
-            return result;
+            var slots = new List<Part>(3);
+            for (int i = 0; i < 3; i++)
+                if (qkv[i] != null)
+                {
+                    qkv[i].Slot = i;
+                    slots.Add(qkv[i]);
+                }
+            if (slots.Count > 0) packed[at + (int)Projection.Qkv] = new Factors { SlotRows = _cfg.AttentionInnerDim, Parts = slots.ToArray() };
+            Factors One(MiniMaxH3LoraTarget t)
+            {
+                Part p = PackGroup(st, scratch, multiple, f32Only, TermAt(refiner, block, t))[0];
+                return p == null ? null : new Factors { SlotRows = 0, Parts = new[] { p } };
+            }
+            packed[at + (int)Projection.Out] = One(MiniMaxH3LoraTarget.Out);
+            packed[at + (int)Projection.Fc1] = One(MiniMaxH3LoraTarget.Fc1);
+            packed[at + (int)Projection.Fc2] = One(MiniMaxH3LoraTarget.Fc2);
         }
 
         /// <summary>
-        /// Pack terms that read one input (null entries have no update): their downs back to back
-        /// in one allocation, one element type for the group, each up in its own allocation.
+        /// Pack terms that read one input (null entries have no update): their downs back to back in one allocation, one
+        /// element type for the group, each up in its own allocation.
         /// </summary>
-        private H3Lora[] PackGroup(SafetensorsFile st, Scratch s, int multiple, bool f32Only, params Term[] group)
+        private Part[] PackGroup(SafetensorsFile st, Scratch s, int multiple, bool f32Only, params Term[] group)
         {
-            var packed = new H3Lora[group.Length];
+            var packed = new Part[group.Length];
             bool f16 = !f32Only;
             long totalDown = 0;
             for (int i = 0; i < group.Length; i++)
@@ -523,7 +562,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 var t = group[i];
                 if (t == null) continue;
                 Condition(st, t, ref s.Down[i], ref s.Up[i]);
-                LoraFactorMath.Balance(s.Down[i], s.Up[i], t.Rank, t.In, t.Out);
+                if (!ForTensorExecutor) LoraFactorMath.Balance(s.Down[i], s.Up[i], t.Rank, t.In, t.Out);
                 // F16 unless some value would overflow it (then the whole group stays F32).
                 f16 = f16 && LoraFactorMath.AllBelow(s.Down[i].AsSpan(0, checked((int)(t.Rank * t.In))), LoraFactorMath.F16Limit) &&
                       LoraFactorMath.AllBelow(s.Up[i].AsSpan(0, checked((int)(t.Out * t.Rank))), LoraFactorMath.F16Limit);
@@ -545,9 +584,10 @@ namespace TensorSharp.Models.MiniMaxH3
                 IntPtr up = _buffers.Allocate(t.Out * padded * elem);
                 StoreUp(s.Up[i], t.Out, t.Rank, padded, up, f16);
                 Interlocked.Add(ref _factorBytes, ((long)padded * t.In + t.Out * padded) * elem);
-                packed[i] = new H3Lora
+                packed[i] = new Part
                 {
-                    Down = down, Up = up, Type = f16 ? GgmlF16 : GgmlF32, Rank = padded, In = t.In, Out = t.Out,
+                    Format = f16 ? GgmlF16 : GgmlF32, Rank = padded, In = t.In, Out = t.Out, Down = down, Up = up,
+                    DownBytes = (long)padded * t.In * elem, UpBytes = t.Out * padded * elem,
                 };
             }
             return packed;
@@ -589,8 +629,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (HasAny(_trunk, b)) trunkBlocks++;
             for (int b = 0; b < _cfg.TokenRefinerLayers; b++)
                 if (HasAny(_refiner, b)) refinerBlocks++;
-            string storage = IsDirect
-                ? "exact F32 factors read per block for the direct backend"
+            string storage = ForTensorExecutor
+                ? $"exact F32 factors for the tensor executor, {(FactorBytes / 1e9).ToString("0.00", CultureInfo.InvariantCulture)} GB"
                 : $"{(_f32Groups == 0 ? "F16" : _f16Groups == 0 ? "F32" : "F16/F32")} factors" +
                   (backend == BackendType.GgmlCpu ? " (GgmlCpu keeps F32)" : "") +
                   $", rank padded to a multiple of {(backend == BackendType.GgmlMetal ? 64 : 16)}, " +
@@ -616,10 +656,25 @@ namespace TensorSharp.Models.MiniMaxH3
 
         // ---- lifetime -------------------------------------------------------------------------
 
+        /// <summary>Every packed factor's host address (each a device-cache key of the GGML graph executor).</summary>
+        internal IEnumerable<IntPtr> FactorPointers()
+        {
+            var seen = new HashSet<IntPtr>();
+            foreach (Factors[] blocks in new[] { _refinerPacked, _trunkPacked })
+                foreach (Factors f in blocks)
+                {
+                    if (f == null) continue;
+                    foreach (Part p in f.Parts)
+                    {
+                        if (p.Down != IntPtr.Zero && seen.Add(p.Down)) yield return p.Down;
+                        if (p.Up != IntPtr.Zero && seen.Add(p.Up)) yield return p.Up;
+                    }
+                }
+        }
+
         /// <summary>
-        /// Drop the device copies the GGML backends cached for the packed factors (they are bound
-        /// by host pointer). The host factors stay; a later forward re-uploads them. A no-op in
-        /// direct mode and after <see cref="Dispose"/>.
+        /// Drop the device copies the GGML backends cached for the packed factors (they are bound by host pointer). The host
+        /// factors stay; a later step re-uploads them. A no-op after <see cref="Dispose"/>.
         /// </summary>
         internal void InvalidateDeviceCopies()
         {
@@ -632,49 +687,26 @@ namespace TensorSharp.Models.MiniMaxH3
 
         private void InvalidateDeviceCopiesCore()
         {
-            var pointers = new List<IntPtr>();
-            var seen = new HashSet<IntPtr>();
-            void Add(IntPtr p)
-            {
-                if (p != IntPtr.Zero && seen.Add(p)) pointers.Add(p);
-            }
-            foreach (var blocks in new[] { _refinerPacked, _trunkPacked })
-                foreach (var b in blocks)
-                    foreach (var l in new[] { b.Q, b.K, b.V, b.Out, b.Fc1, b.Fc2 })
-                    {
-                        Add(l.Down);
-                        Add(l.Up);
-                    }
+            if (ForTensorExecutor) return;
             var hook = InvalidateHookForTest;
-            foreach (var p in pointers)
+            foreach (IntPtr p in FactorPointers())
             {
                 if (hook != null) hook(p);
                 else GgmlBasicOps.InvalidateHostBuffer(p);
             }
         }
 
-        /// <summary>The packed up factor of one term read back as F32 [out, padded rank]: the
-        /// rows the native graph multiplies, after the scale fold, the fc1 swap and balancing.</summary>
+        /// <summary>The packed up factor of one term read back as F32 [out, padded rank]: the rows the program multiplies, after
+        /// the scale fold, the fc1 swap and balancing.</summary>
         internal unsafe float[] PackedUpForTest(bool refiner, int block, MiniMaxH3LoraTarget t)
         {
-            if (IsDirect) throw new InvalidOperationException("A direct-mode set has no packed factors.");
-            if (TermAt(refiner, block, t) == null) throw new InvalidOperationException("The plug-in does not update that projection.");
-            var b = (refiner ? _refinerPacked : _trunkPacked)[block];
-            var l = t switch
-            {
-                MiniMaxH3LoraTarget.Q => b.Q,
-                MiniMaxH3LoraTarget.K => b.K,
-                MiniMaxH3LoraTarget.V => b.V,
-                MiniMaxH3LoraTarget.Out => b.Out,
-                MiniMaxH3LoraTarget.Fc1 => b.Fc1,
-                _ => b.Fc2,
-            };
+            Part l = PartFor(refiner, block, t) ?? throw new InvalidOperationException("The plug-in does not update that projection.");
             lock (_lock)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 int count = checked((int)(l.Out * l.Rank));
                 var result = new float[count];
-                if (l.Type == GgmlF16)
+                if (l.Format == GgmlF16)
                 {
                     var source = new ReadOnlySpan<System.Half>((void*)l.Up, count);
                     for (int i = 0; i < count; i++) result[i] = (float)source[i];
@@ -696,10 +728,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 // address the allocator may hand out again.
                 InvalidateDeviceCopiesCore();
                 _disposed = true;
-                _file?.Dispose();
-                _file = null;
                 _buffers.Dispose();
-                NativeAdapter = IntPtr.Zero;
             }
         }
     }

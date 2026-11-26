@@ -286,7 +286,7 @@ namespace InferenceWeb.Tests
             var layout = MiniMaxH3Layout.Build(textLen, shape, sigma);
             Assert.Equal(19, layout.TokenCount);   // 5 text + 6 audio + 8 video
 
-            float[] patches = MiniMaxH3DiT.PatchifyVideo(videoLatent, latT, latH, latW, 24);
+            float[] patches = MiniMaxH3Latents.PatchifyVideo(videoLatent, latT, latH, latW, 24);
             int videoCount = latT * (latH / 2) * (latW / 2);
             Assert.Equal((long)videoCount * dit.Config.VideoPatchDim, patches.LongLength);
 
@@ -571,7 +571,7 @@ namespace InferenceWeb.Tests
             MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(audioInput, aVel, sigma);
 
             float[] expectedVideo = PackedToVideoLatent(packedOut, w, h, t);
-            float[] actualVideo = MiniMaxH3DiT.UnpatchifyVideo(vVel, t, h, w, 24);
+            float[] actualVideo = MiniMaxH3Latents.UnpatchifyVideo(vVel, t, h, w, 24);
             double vcos = Cosine(expectedVideo, actualVideo);
 
             float[] expectedAudio = PackedToAudioLatent(packedOut, w, h, t, audioLen);
@@ -612,7 +612,7 @@ namespace InferenceWeb.Tests
         }
 
         private static float[] PackedToVideoPatches(float[] packed, int w, int h, int t) =>
-            MiniMaxH3DiT.PatchifyVideo(PackedToVideoLatent(packed, w, h, t), t, h, w, 24);
+            MiniMaxH3Latents.PatchifyVideo(PackedToVideoLatent(packed, w, h, t), t, h, w, 24);
 
         // The audio latent is flat-copied straight after the 24 video channels, and is
         // shaped {audioLength, 2, 32} with audioLength fastest — the transpose of the
@@ -953,9 +953,9 @@ namespace InferenceWeb.Tests
             const int t = 3, h = 6, w = 8, c = 24;
             var latent = new float[t * h * w * c];
             for (int i = 0; i < latent.Length; i++) latent[i] = i;
-            float[] tokens = MiniMaxH3DiT.PatchifyVideo(latent, t, h, w, c);
+            float[] tokens = MiniMaxH3Latents.PatchifyVideo(latent, t, h, w, c);
             Assert.Equal((long)t * (h / 2) * (w / 2) * (c * 4), tokens.LongLength);
-            float[] back = MiniMaxH3DiT.UnpatchifyVideo(tokens, t, h, w, c);
+            float[] back = MiniMaxH3Latents.UnpatchifyVideo(tokens, t, h, w, c);
             Assert.Equal(latent.Length, back.Length);
             for (int i = 0; i < latent.Length; i++) Assert.Equal(latent[i], back[i]);
         }

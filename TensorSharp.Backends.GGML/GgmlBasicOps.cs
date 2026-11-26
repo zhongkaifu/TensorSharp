@@ -2202,12 +2202,6 @@ namespace TensorSharp.GGML
             return GgmlNative.TryMiniMaxH3TextEncode(in args);
         }
 
-        /// <summary>One MiniMax-H3 diffusion step in ONE ggml graph.</summary>
-        public static bool TryMiniMaxH3DitForward(in H3DitForwardArgs args)
-        {
-            return GgmlNative.TryMiniMaxH3DitForward(in args);
-        }
-
         /// <summary>Single-frame MiniMax-H3 video VAE encode in ONE ggml graph.</summary>
         public static bool TryMiniMaxH3VideoVaeEncode(in H3VideoVaeEncodeArgs args)
         {

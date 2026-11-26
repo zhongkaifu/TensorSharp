@@ -179,6 +179,25 @@ namespace TensorSharp.Runtime
                 "a diffusion model's int8 products on ggml_cuda are the option --diffusion-products (the config key "
                 + "diffusion-products): --diffusion-products int8 for the DiT's projections (the variable's 1), int8-all "
                 + "with the VAE decoders' too (its all); the VAE's alone (its vae) has no replacement."),
+            // MiniMax-H3 (video) runs on the diffusion runtime: its retired pipeline's and DiTs' switches.
+            ("TS_H3_DIT_LAYERS",
+                "MiniMax-H3's denoiser runs every block of its step program; the layer truncation of the retired native and "
+                + "direct DiTs was removed (a component oracle of a model slice passes its block count to the denoiser)."),
+            ("TS_H3_DIT_TRACE_DIR", H3LegacyDiagnosticRemoved),
+            ("TS_H3_TRACE", H3LegacyDiagnosticRemoved),
+            ("TS_H3_DUMP_VEL_V", H3LegacyDiagnosticRemoved),
+            ("TS_H3_DUMP_VEL_A", H3LegacyDiagnosticRemoved),
+            ("TS_H3_PHASE",
+                "MiniMax-H3 on the diffusion runtime logs every phase and step's time ([diffusion] lines) without a switch."),
+            ("TS_H3_PREFAULT",
+                "MiniMax-H3 reads its denoiser file ahead of the upload, beside it, after the text encoder runs; the other "
+                + "schedules of that read were removed with the retired pipeline."),
+            ("TS_H3_PREFAULT_THREADS",
+                "MiniMax-H3's denoiser read-ahead takes the readers every video model's does (TS_VIDEO_READAHEAD_WORKERS's default: "
+                + "16 on Linux, 1 elsewhere); its own count was removed."),
+            ("TS_H3_KEEP_RESIDENT",
+                "MiniMax-H3's components stay on the device or are released by the diffusion runtime's residency plan, which "
+                + "keeps everything that fits; the switch was removed with the retired pipeline."),
             ("DIFFUSION_CPU_LEGACY", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_MOE", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_PROJ", DiffusionCpuLegacyRemoved),
@@ -653,6 +672,10 @@ namespace TensorSharp.Runtime
         private const string Qwen21VaePathRemoved =
             "Qwen-Image-2.1's VAE runs its whole-VAE graph on ggml_cuda and ggml_metal, per convolution on the other GGML backends "
             + "and in managed code on the cpu backend; the switches between those paths were removed.";
+        private const string H3LegacyDiagnosticRemoved =
+            "it was a diagnostic of MiniMax-H3's retired pipeline or DiT; the diffusion runtime's denoiser runs one step program "
+            + "(eng/validation/MiniMaxH3DitProbe compares a whole step with the independent F32 reference).";
+
         private const string Qwen21CompanionDiagnosticRemoved =
             "Qwen-Image-2.1's VAE and text encoder no longer trace or profile themselves; the run's [diffusion] line keeps "
             + "each phase's seconds.";
