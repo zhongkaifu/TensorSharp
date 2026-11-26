@@ -102,6 +102,8 @@ namespace TensorSharp.Graph
             GraphOp.Norm, GraphOp.GeluErf, GraphOp.DepthwiseConv2d,
             // Qwen-Image-2.1's text conditioner (ggml_gelu's tanh form) and its keys padded to their masks.
             GraphOp.Gelu, GraphOp.Pad,
+            // Gemma 4's GeGLU feed-forwards (ggml_geglu / ggml_geglu_split: the tanh GELU of the gate times the up rows).
+            GraphOp.Geglu, GraphOp.GegluSplit,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -1917,6 +1919,16 @@ namespace TensorSharp.Graph
                     using Tensor up = x.Narrow(last, half, half);
                     return V(Ops.SiLUMul(null, In(gate, run), In(up, run)));
                 }
+                case GraphOp.GegluSplit: return V(Ops.GELUMul(null, In(T(0), run), In(T(1), run)));
+                case GraphOp.Geglu:
+                {
+                    Tensor x = T(0);
+                    int last = x.DimensionCount - 1;
+                    long half = x.Sizes[last] / 2;
+                    using Tensor gate = x.Narrow(last, 0, half);
+                    using Tensor up = x.Narrow(last, half, half);
+                    return V(Ops.GELUMul(null, In(gate, run), In(up, run)));
+                }
                 case GraphOp.RmsNorm: return V(RowNorm(T(0), Fp(0, 1e-6f), run));
                 case GraphOp.Norm: return V(LayerNormRows(T(0), Fp(0, 1e-6f), run));
                 case GraphOp.GeluErf: return V(GeluErf(In(T(0), run)));
@@ -2001,8 +2013,10 @@ namespace TensorSharp.Graph
                 case GraphOp.RopeExt:
                 case GraphOp.RopeMulti:
                 {
-                    if (n.Srcs.Length > 2) throw new NotSupportedException("rotary frequency factors");
-                    return V(Rope(T(0), values[n.Srcs[1]], n, n.Op == GraphOp.RopeMulti, run, n.Srcs[1]));
+                    // ggml_rope_ext's frequency factors (src 2): the plain rotary only (Gemma 4's proportional global RoPE).
+                    Tensor factors = n.Srcs.Length > 2 ? T(2) : null;
+                    if (factors != null && n.Op == GraphOp.RopeMulti) throw new NotSupportedException("multi-axis rotary with frequency factors");
+                    return V(Rope(T(0), values[n.Srcs[1]], n, n.Op == GraphOp.RopeMulti, run, n.Srcs[1], factors));
                 }
                 case GraphOp.LightningIndexer: return V(LightningIndexer(T(0), T(1), T(2), T(3), run));
                 case GraphOp.AllReduce:
@@ -2910,7 +2924,7 @@ namespace TensorSharp.Graph
         /// <summary>ggml's rotary over x [d, heads, tokens] at positions [tokens] (multi-axis: [4 * tokens],
         /// axis-major); ip = dims, mode, n_ctx_orig[, sections]; fp = base, freq_scale, ext_factor,
         /// attn_factor, beta_fast, beta_slow.</summary>
-        private Tensor Rope(Tensor x, Value positions, GraphNode n, bool multi, RunState run, int positionsNode = -1)
+        private Tensor Rope(Tensor x, Value positions, GraphNode n, bool multi, RunState run, int positionsNode = -1, Tensor factors = null)
         {
             long[] ne = Ne(x);
             int d = (int)ne[0], heads = (int)ne[1], tokens = (int)ne[2];
@@ -2955,6 +2969,14 @@ namespace TensorSharp.Graph
                         p = run.KeepLasting(NewIntTensor(perRow, new long[] { perRow.Length }));
                     }
                     if (positionsNode >= 0) run.RowPositions[(positionsNode, heads)] = p;
+                }
+                if (factors != null)
+                {
+                    // Frequency factors: the backend's factored rotary over contiguous rows (no strided shortcut).
+                    Tensor factored = Ops.NewContiguous(x);
+                    using Tensor f4 = factored.View(1, tokens, heads, d);
+                    Ops.RoPEExFactors(f4, f4, p, Contig(factors, run), dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, n.Fp[4], n.Fp[5]);
+                    return factored;
                 }
                 if (KernelsReadStridedViews)
                 {

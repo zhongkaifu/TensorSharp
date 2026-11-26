@@ -2733,6 +2733,52 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary><see cref="TryRoPEEx"/> with ggml_rope_ext's frequency factors (a contiguous F32 device vector).</summary>
+        public static bool TryRoPEExFactors(
+            Tensor result,
+            Tensor src,
+            Tensor positions,
+            Tensor freqFactors,
+            int ropeDim,
+            int mode,
+            int originalContextLength,
+            float freqBase,
+            float freqScale,
+            float extFactor,
+            float attnFactor,
+            float betaFast,
+            float betaSlow)
+        {
+            if (positions == null || freqFactors == null || freqFactors.ElementType != DType.Float32
+                || freqFactors.ElementCount() < Math.Min(ropeDim, (int)src.Sizes[src.DimensionCount - 1]) / 2)
+                return false;
+            if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
+                !TryGetContiguousRows(src, out CudaStorage srcStorage, out IntPtr srcPtr, out int srcRows, out int srcCols) ||
+                !TryGetContiguous(positions, out CudaStorage positionsStorage, out IntPtr positionsPtr, out long positionCount) ||
+                !TryGetContiguous(freqFactors, out CudaStorage factorStorage, out IntPtr factorPtr, out _) ||
+                rows != srcRows ||
+                cols != srcCols ||
+                positionCount != rows ||
+                (positions.ElementType != DType.Int32 && positions.ElementType != DType.Float32))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!ReferenceEquals(factorStorage.AllocatorImpl, allocator) || !TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            srcStorage.EnsureDeviceCurrent();
+            positionsStorage.EnsureDeviceCurrent();
+            factorStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchRoPEExFactorsF32(srcPtr, positionsPtr, resultPtr, rows, cols, ropeDim, mode,
+                positions.ElementType == DType.Int32 ? 1 : 0, originalContextLength, freqBase, freqScale, extFactor, attnFactor,
+                betaFast, betaSlow, factorPtr, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryRoPEEx(
             Tensor result,
             Tensor src,

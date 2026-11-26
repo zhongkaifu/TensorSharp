@@ -844,6 +844,27 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
+        [RegisterOpStorageType("rope_ex_ff", typeof(CpuStorage))]
+        public Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode, int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow)
+        {
+            if (positions == null) throw new ArgumentNullException(nameof(positions));
+            if (freqFactors == null) throw new ArgumentNullException(nameof(freqFactors));
+            int ndim = src.DimensionCount;
+            long storageSize = TensorDimensionHelpers.GetStorageSize(src.Sizes, src.Strides);
+            long cols = src.Sizes[ndim - 1];
+            if (storageSize % cols != 0) throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
+            long rows = storageSize / cols;
+            if (positions.ElementCount() != rows)
+                throw new InvalidOperationException("rope_ex_ff expects one explicit position value per logical row.");
+            int pairs = (int)Math.Min(ropeDim, cols) / 2;
+            if (freqFactors.ElementType != DType.Float32 || !freqFactors.IsContiguous() || freqFactors.ElementCount() < pairs)
+                throw new InvalidOperationException($"rope_ex_ff expects at least {pairs} contiguous F32 frequency factors.");
+            float[] factors = freqFactors.GetElementsAsFloat(pairs);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
+            TensorApplyCPU.RoPEEx(writeTarget, src, positions, (int)rows, (int)cols, ropeDim, mode, freqBase, freqScale, originalContextLength, extFactor, attnFactor, betaFast, betaSlow, factors);
+            return writeTarget;
+        }
+
         [RegisterOpStorageType("rope_ex", typeof(CpuStorage))]
         public Tensor RoPEEx(Tensor result, Tensor src, Tensor positions, int ropeDim, int mode, int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow, bool addToResult, bool invertPositions)
         {

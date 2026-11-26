@@ -221,6 +221,17 @@ namespace TensorSharp
             return (Tensor)OpRegistry.Invoke("rope_ex", result, src, positions, ropeDim, mode, originalContextLength, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow, addToResult, invertPositions)!;
         }
 
+        /// <summary>
+        /// <see cref="RoPEEx"/> with ggml_rope_ext's frequency factors (its <c>c</c> operand): pair i of the rotated dims turns
+        /// by <c>position * base^(-2i/ropeDim) / freqFactors[i]</c> before any YaRN mix (Gemma 4's proportional global RoPE,
+        /// whose factors leave three quarters of the pairs unrotated). <paramref name="freqFactors"/> is a contiguous F32 vector
+        /// of at least ropeDim/2 values; its contents are constant for a model (backends may cache what they derive from it).
+        /// </summary>
+        public static Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode, int originalContextLength, float freqBase, float freqScale, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f)
+        {
+            return (Tensor)OpRegistry.Invoke("rope_ex_ff", result, src, positions, freqFactors, ropeDim, mode, originalContextLength, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow)!;
+        }
+
 
 
 

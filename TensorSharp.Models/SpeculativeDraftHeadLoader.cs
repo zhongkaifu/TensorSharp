@@ -176,7 +176,7 @@ namespace TensorSharp.Models
         /// <summary>True when the file at <paramref name="path"/> declares itself a
         /// DFlash drafter. Read from the GGUF rather than inferred from the name:
         /// the same flag also names MTP-only assistant files.</summary>
-        private static bool IsDFlashDrafter(string path)
+        internal static bool IsDFlashDrafter(string path)
         {
             try
             {

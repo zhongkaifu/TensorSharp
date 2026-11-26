@@ -2339,8 +2339,10 @@ namespace TensorSharp
 			}
 		}
 
+        /// <param name="freqFactors">ggml_rope_ext's frequency factors (null: none): pair i's base frequency divided by
+        /// freqFactors[i] before any YaRN mix, as ggml-cpu's rope_cache_init does.</param>
         unsafe static public void RoPEEx(Tensor tOut, Tensor tIn, Tensor positions, int rows, int cols, int ropeDim, int mode, float freqBase, float freqScale,
-            int nCtxOrig = 0, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f)
+            int nCtxOrig = 0, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f, float[] freqFactors = null)
         {
             const int GGML_ROPE_TYPE_NEOX = 2;
 
@@ -2377,6 +2379,7 @@ namespace TensorSharp
                 for (int i = 0; i < pairCount; i++)
                 {
                     invFreqBuffer[i] = MathF.Pow(freqBase, -2.0f * i / activeRopeDim);
+                    if (freqFactors != null) invFreqBuffer[i] /= freqFactors[i];
                 }
 
                 bool useIntPositions = positions.ElementType == DType.Int32;

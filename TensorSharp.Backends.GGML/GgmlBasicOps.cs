@@ -4592,7 +4592,13 @@ namespace TensorSharp.GGML
             return writeTarget;
         }
 
-        // GGML-only helper: same as RoPEEx but additionally applies a
+        [RegisterOpStorageType("rope_ex_ff", typeof(GgmlStorage))]
+        public static Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode,
+            int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow)
+            => RoPEExWithFreqFactors(result, src, positions, freqFactors, ropeDim, mode, originalContextLength, freqBase, freqScale,
+                extFactor, attnFactor, betaFast, betaSlow);
+
+        // Same as RoPEEx but additionally applies a
         // per-dim freq_factors scaling (used by Gemma 4 global layers'
         // proportional RoPE). `freqFactors` must be a contiguous Float32
         // tensor of length ropeDim/2 (or null to skip scaling).

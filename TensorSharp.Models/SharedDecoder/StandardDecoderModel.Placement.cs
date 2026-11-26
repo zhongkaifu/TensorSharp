@@ -198,6 +198,9 @@ namespace TensorSharp.Models
             var problems = new List<string>();
             if (Config.NumHeads % degree != 0) problems.Add($"{Config.NumHeads} attention heads");
             if (Config.NumKVHeads % degree != 0) problems.Add($"{Config.NumKVHeads} KV heads");
+            // Layers of their own KV head count (Gemma 4's global layers) split them too.
+            foreach (int kv in _layerKvHeads.Distinct())
+                if (kv != Config.NumKVHeads && kv % degree != 0) problems.Add($"{kv} KV heads of some layers");
             if (Config.IntermediateSize > 0 && Config.IntermediateSize % degree != 0) problems.Add($"FFN width {Config.IntermediateSize}");
             problems.AddRange(ShardingProblems(degree));
             if (problems.Count > 0)
@@ -294,12 +297,14 @@ namespace TensorSharp.Models
                 {
                     if (!OwnsLayer(l) || _mesh.StageOf(l) != stage) continue;
                     string p = $"blk.{l}.";
-                    int qRows = Config.NumHeads * _keyDim * (GatedAttentionOutput ? 2 : 1);
+                    int qRows = Config.NumHeads * KeyDimOf(l) * (GatedAttentionOutput ? 2 : 1);
                     if (_recurrentLayer[l])
                         ShardRecurrentLayer(l);
                     else if (_qkvFused[l])
                         ShardConcatenatedColumnParallel(p + "attn_qkv.weight",
-                            qRows, Config.NumKVHeads * _keyDim, Config.NumKVHeads * _valueDim);
+                            qRows, KvHeadsOf(l) * KeyDimOf(l), KvHeadsOf(l) * ValueDimOf(l));
+                    else if (SharesKv(l))
+                        columns.Add(p + "attn_q.weight");   // a KV-shared layer projects its queries only
                     else
                         columns.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" });
                     if (!_recurrentLayer[l])

@@ -391,6 +391,18 @@ namespace TensorSharp.Cuda
             return CudaCpuFallback.InvokeTensor("rope", writeTarget, writeTarget, src, seqLen, rowOffset);
         }
 
+        [RegisterOpStorageType("rope_ex_ff", typeof(CudaStorage))]
+        public static Tensor RoPEExFactors(Tensor result, Tensor src, Tensor positions, Tensor freqFactors, int ropeDim, int mode,
+            int originalContextLength, float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow)
+        {
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
+            if (CudaKernelOps.TryRoPEExFactors(writeTarget, src, positions, freqFactors, ropeDim, mode, originalContextLength,
+                    freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow))
+                return writeTarget;
+            return CudaCpuFallback.InvokeTensor("rope_ex_ff", writeTarget, writeTarget, src, positions, freqFactors, ropeDim, mode,
+                originalContextLength, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
+        }
+
         [RegisterOpStorageType("rope_ex", typeof(CudaStorage))]
         public static Tensor RoPEEx(
             Tensor result,

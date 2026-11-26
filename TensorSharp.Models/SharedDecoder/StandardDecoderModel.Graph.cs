@@ -100,8 +100,10 @@ namespace TensorSharp.Models
                 if (_moeLayer[l] && IsExpertLayerOffloaded(l) && !GraphExecutor.Capabilities.HostExperts) return "host-offloaded experts";
             DType kv = _kvCacheDtype.ToDType();
             if (kv != DType.Float32 && kv != DType.Float16 && kv != DType.Q8_0 && kv != DType.Q4_0) return $"KV dtype {kv}";
-            if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.TakesKvCacheFormat(KvGgmlType(kv), _keyDim, _valueDim))
-                return $"KV dtype {kv} on this backend's executor";
+            if (kv == DType.Q8_0 || kv == DType.Q4_0)
+                for (int l = 0; l < Config.NumLayers; l++)
+                    if (!_recurrentLayer[l] && !GraphExecutor.TakesKvCacheFormat(KvGgmlType(kv), KeyDimOf(l), ValueDimOf(l)))
+                        return $"KV dtype {kv} on this backend's executor";
             // An executor that takes the block format in its attention kernels and row writes only (not in every view of a cache:
             // direct CUDA's q8_0) serves the families whose attention is those kernels' alone.
             if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.Capabilities.QuantizedKvCache && !AttentionRoutesTakeQuantizedKv)
@@ -1723,7 +1725,7 @@ namespace TensorSharp.Models
                 // The last layer's feed-forward over the rows the head reads only (PrunesLastLayerRows).
                 if (prune && layer == Config.NumLayers - 1) h = EmitLastRows(step, h, width);
                 int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
-                int ffn = EmitFeedForward(step, layer, ffnIn);
+                int ffn = EmitFeedForward(step, layer, ffnIn, ffnContext);
                 h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
                 step.Boundary(h);
             }
@@ -1935,7 +1937,7 @@ namespace TensorSharp.Models
                 {
                     h[r] = EmitBlockOutput(steps[r], layer, h[r], BlockSite.Mixer, context[r], block[r]);
                     int ffnIn = EmitBlockInput(steps[r], layer, h[r], BlockSite.Ffn, out context[r]);
-                    block[r] = EmitFeedForward(steps[r], layer, ffnIn);
+                    block[r] = EmitFeedForward(steps[r], layer, ffnIn, context[r]);
                 }
                 for (int r = 0; r < ranks; r++) block[r] = steps[r].Op(GraphOp.AllReduce, block[r]);
                 for (int r = 0; r < ranks; r++)
@@ -2509,11 +2511,13 @@ namespace TensorSharp.Models
         private int EmitAttention(GraphStep step, int layer, int x)
         {
             EmitAttentionInput(step, layer, x);
-            int heads = _localHeads, kvHeads = _localKvHeads, d = _keyDim, dv = _valueDim, rows = step.Rows;
+            int heads = _localHeads, kvHeads = LocalKvHeadsOf(layer), d = KeyDimOf(layer), dv = ValueDimOf(layer), rows = step.Rows;
             const long f = sizeof(float);
             long qDim = (long)heads * d, kDim = (long)kvHeads * d, vDim = (long)kvHeads * dv;
             long qWidth = GatedAttentionOutput ? 2 * qDim : qDim;
             long qStride = GatedAttentionOutput ? 2L * d : d;
+            // A KV-shared layer (KvSourceLayer) projects its queries only and attends its source's operands of this step.
+            if (SharesKv(layer)) return EmitSharedKvAttention(step, layer, x);
 
             int q, k, v, gate = -1;
             if (EmitAttentionProjections(step, layer, x, out q, out k, out v))
@@ -2553,8 +2557,8 @@ namespace TensorSharp.Models
                 Slot only = step.Slots[0];
                 int cells = CacheCells(layer, only.Capacity);
                 BeginAttentionPrep(step, layer, new AttentionPrepOperands(q, k, v,
-                    step.State(only.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cells, kvHeads),
-                    step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads),
+                    step.State(only.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cells, kvHeads),
+                    step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cells, kvHeads),
                     step.WriteRows(step.Starts[0], step.Counts[0], 0), heads, kvHeads, d, dv));
             }
             // Several sequences' verify windows written by index (a batched verify, as many rows each, none past a ring's first lap
@@ -2578,8 +2582,8 @@ namespace TensorSharp.Models
                 {
                     Slot slot = step.Slots[s];
                     int cells = CacheCells(layer, slot.Capacity);
-                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cells, kvHeads);
-                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads);
+                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cells, kvHeads);
+                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cells, kvHeads);
                     prepRows[s] = step.WriteRows(step.Starts[s], step.Counts[s], s);
                     if (s == 0) (firstK, firstV) = (ck, cv);
                     else further.AddRange(new[] { ck, cv, prepRows[s] });
@@ -2616,16 +2620,18 @@ namespace TensorSharp.Models
                     int vs = step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
                     int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Permute(ks, 0, 2, 1, 3);
                     int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Permute(vs, 0, 2, 1, 3);
-                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cells, kvHeads);
-                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads);
+                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cells, kvHeads);
+                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cells, kvHeads);
                     step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, prepRows[s]));
                     step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, prepRows[s]));
                 }
                 step.EndFused(stackalloc[] { q });
             }
 
-            float scale = 1.0f / MathF.Sqrt(d);
+            float scale = AttentionScale(layer);
             long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
+            // A source of KV-shared layers keeps each sequence's attention operands for them (KvSourceLayer).
+            bool keepForSharers = _kvSharers[layer];
             int n = step.Sequences;
             int band = SlidingWindow(layer);
             int attn = -1;
@@ -2665,8 +2671,8 @@ namespace TensorSharp.Models
                 // The layer's cells: a sliding-window layer's ring (StandardDecoderModel.SlidingRings.cs) holds at most its own.
                 int cap = CacheCells(layer, slot.Capacity);
                 int ring = RingOf(layer);
-                int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cap, kvHeads);
-                int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cap, kvHeads);
+                int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cap, kvHeads);
+                int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cap, kvHeads);
 
                 int fa;
                 if (Indexed(count) && wrapped)
@@ -2680,6 +2686,8 @@ namespace TensorSharp.Models
                     int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, ring, kvType, count, gqa });
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
                     int mask = step.RingBandMask(ring, start, count, s, band);
+                    if (keepForSharers) step.KeepSharedKv(layer, s, new SharedKvOperands(kWin, vWin, mask, ring, new AttentionKeys(-1, ring, start, count),
+                        DeviceBand(step, band, d, kvType)));
                     int m = EmitAttentionMask(step, layer, x, s, mask, ring);
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kWin, vWin, m, ring, new AttentionKeys(-1, ring, start, count), scale);
                     if (fa < 0)
@@ -2708,6 +2716,8 @@ namespace TensorSharp.Models
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { ReadRuns(cv, dv, vRow, p1, m1, p2, m2), vFresh }, stackalloc long[] { 1 });
                     }
                     int mask = step.BandCausalMask(first, start, count, s, band);
+                    if (keepForSharers) step.KeepSharedKv(layer, s, new SharedKvOperands(kAttn, vAttn, mask, start + count - first,
+                        new AttentionKeys(first, 0, start, count), 0));
                     int m = EmitAttentionMask(step, layer, x, s, mask, start + count - first);
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kAttn, vAttn, m, start + count - first, new AttentionKeys(first, 0, start, count), scale);
                     if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk);
@@ -2760,6 +2770,8 @@ namespace TensorSharp.Models
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, first, keys, kvType, count, gqa });
                     bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));
                     int mask = band > 0 ? step.BandMask(keys, first, start, count, s, band) : step.ChunkMask(window, start, count, s);
+                    if (keepForSharers) step.KeepSharedKv(layer, s, new SharedKvOperands(kWin, vWin, mask, keys, new AttentionKeys(first, 0, start, count),
+                        capacity ? DeviceBand(step, band, d, kvType) : 0));
                     int m = EmitAttentionMask(step, layer, x, s, mask, keys);
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kWin, vWin, m, keys, new AttentionKeys(first, 0, start, count), scale);
                     if (fa < 0)
@@ -2799,6 +2811,8 @@ namespace TensorSharp.Models
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { vPrev, vFresh }, stackalloc long[] { 1 });
                     }
                     int mask = band > 0 ? step.BandCausalMask(first, start, count, s, band) : step.CausalMask(start, count, s);
+                    if (keepForSharers) step.KeepSharedKv(layer, s, new SharedKvOperands(kAttn, vAttn, mask, start + count - first,
+                        new AttentionKeys(first, 0, start, count), 0));
                     int m = EmitAttentionMask(step, layer, x, s, mask, start + count - first);
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kAttn, vAttn, m, start + count - first, new AttentionKeys(first, 0, start, count), scale);
                     if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk);
@@ -2818,6 +2832,70 @@ namespace TensorSharp.Models
                 attn = step.Op(GraphOp.Mul, attn, step.Op(GraphOp.Sigmoid, g));
                 step.EndFused(stackalloc[] { attn });
             }
+            attn = EmitAttentionOutput(step, layer, x, attn);
+            return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
+        }
+
+        /// <summary>The operands a KV-shared layer's source attended for one sequence of a step: its keys and values (a cache window,
+        /// or cached and fresh rows), the mask before the family's narrowing, the keys' count and positions, and the band the
+        /// executor read on the device (0: none).</summary>
+        protected readonly record struct SharedKvOperands(int K, int V, int Mask, int Keys, AttentionKeys Layout, int DeviceBand);
+
+        /// <summary>Per layer: whether a later layer shares its cache (its operands are kept for the step's sharers).</summary>
+        private bool[] _kvSharers = Array.Empty<bool>();
+
+        private void MarkKvSharers()
+        {
+            _kvSharers = new bool[TotalLayers];
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (SharesKv(l)) _kvSharers[KvSourceOf(l)] = true;
+        }
+
+        /// <summary>
+        /// A KV-shared layer's attention (<see cref="KvSourceLayer"/>): its own queries (the family's projections with no keys,
+        /// or <c>attn_q</c>), the family's query treatment (<see cref="EmitQueryKey"/> with no keys), then, a sequence at a time,
+        /// the source layer's keys, values and mask of this step (written and attended by the source earlier in the step) under
+        /// this layer's scale. Nothing is written.
+        /// </summary>
+        private int EmitSharedKvAttention(GraphStep step, int layer, int x)
+        {
+            int src = KvSourceOf(layer);
+            int heads = _localHeads, d = KeyDimOf(layer), dv = ValueDimOf(layer), rows = step.Rows;
+            const long f = sizeof(float);
+            if (GatedAttentionOutput)
+                throw new NotSupportedException($"{Config.Architecture}: a KV-shared layer with a gated attention output is not supported.");
+            int q;
+            if (!EmitAttentionProjections(step, layer, x, out q, out int k, out int v))
+            {
+                q = step.View3(step.MatMul(LayerName(layer, "attn_q.weight"), x), d, heads, rows, d * f, heads * d * f, 0);
+                k = v = -1;
+            }
+            if (k >= 0 || v >= 0)
+                throw new InvalidOperationException($"{Config.Architecture} layer {layer} shares layer {src}'s K/V and must project no keys or values.");
+            q = step.Cont(q);
+            EmitQueryKey(step, layer, ref q, ref k);
+            q = step.Cont(q);
+            float scale = AttentionScale(layer);
+            int n = step.Sequences, attn = -1;
+            var parts = n > 1 && !LegacyBatchedJoinForTests ? new List<int>(n) : null;
+            for (int s = 0; s < n; s++)
+            {
+                int count = step.Counts[s];
+                long firstRow = step.First[s];
+                bool promptChunk = step.PromptChunks && count > SmallChunkRows;
+                SharedKvOperands kv = step.SharedKv(src, s)
+                    ?? throw new InvalidOperationException($"{Config.Architecture} layer {layer}: its source layer {src} kept no operands for sequence {s}.");
+                int qs = n == 1 ? q : step.View3(q, d, heads, count, d * f, d * heads * f, firstRow * d * heads * f);
+                int qPerm = step.Permute(qs, 0, 2, 1, 3);
+                int m = EmitAttentionMask(step, layer, x, s, kv.Mask, kv.Keys);
+                int fa = EmitAttentionCore(step, layer, x, s, qPerm, kv.K, kv.V, m, kv.Keys, kv.Layout, scale);
+                if (fa < 0)
+                    fa = step.FlashAttention(qPerm, kv.K, kv.V, m, scale, AttentionKvMax(step, layer, s), promptChunk, kv.DeviceBand);
+                int part = step.Reshape(fa, heads * dv, count);
+                if (parts != null) parts.Add(part);
+                else attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
+            }
+            if (parts != null) attn = JoinSequenceRows(step, parts);
             attn = EmitAttentionOutput(step, layer, x, attn);
             return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
         }
@@ -2848,6 +2926,13 @@ namespace TensorSharp.Models
         /// here.</summary>
         protected virtual int EmitFeedForward(GraphStep step, int layer, int x)
             => _moeLayer[layer] ? EmitMoe(step, layer, x) : EmitDenseFfn(step, layer, x);
+
+        /// <summary><see cref="EmitFeedForward(GraphStep, int, int)"/> given what the family's <see cref="EmitBlockInput"/> put in
+        /// <paramref name="context"/> for this block (-1: nothing): Gemma 4's MoE layers route from the raw residual beside the
+        /// dense branch's normed input. Its result is the block's partial the runtime reduces under tensor parallelism (several
+        /// partials concatenated along ne0 reduce as one), which <see cref="EmitBlockOutput"/> takes. Default: the overload
+        /// without the context.</summary>
+        protected virtual int EmitFeedForward(GraphStep step, int layer, int x, int context) => EmitFeedForward(step, layer, x);
 
         private int EmitDenseFfn(GraphStep step, int layer, int x)
         {
@@ -3165,9 +3250,43 @@ namespace TensorSharp.Models
                 Counts = counts;
                 Starts = starts;
                 IsDecode = decode;
+                MediaRows = model.MediaRowsOfStep(rows, slots.Length);
+            }
+
+            /// <summary>The step's media rows that attend each other in both directions (MediaAttendsBidirectionally), one
+            /// sequence's, or null.</summary>
+            internal bool[] MediaRows { get; }
+
+            /// <summary>Open, in a mask of sequence <paramref name="sequence"/>'s rows [<paramref name="width"/>, count], the cells
+            /// between two media rows of this step (<see cref="MediaRows"/>); <paramref name="column"/> maps a key position to its
+            /// column (-1: not in the mask).</summary>
+            private void OpenMediaCells(ushort[] mask, int width, int start, int count, int sequence, Func<int, int> column)
+            {
+                if (MediaRows == null || sequence > 0) return;
+                for (int q = 0; q < count; q++)
+                {
+                    if (!MediaRows[q]) continue;
+                    for (int k = 0; k < count; k++)
+                    {
+                        if (!MediaRows[k]) continue;
+                        int c = column(start + k);
+                        if (c >= 0 && c < width) mask[q * width + c] = 0;
+                    }
+                }
             }
 
             internal Slot[] Slots { get; }
+
+            private Dictionary<(int Layer, int Sequence), SharedKvOperands> _sharedKv;
+
+            /// <summary>Keep what <paramref name="layer"/> attended for sequence <paramref name="sequence"/>, for the layers that
+            /// share its cache (<see cref="KvSourceLayer"/>).</summary>
+            internal void KeepSharedKv(int layer, int sequence, SharedKvOperands operands)
+                => (_sharedKv ??= new())[(layer, sequence)] = operands;
+
+            /// <summary>What <paramref name="layer"/> attended for sequence <paramref name="sequence"/> in this step, or null.</summary>
+            internal SharedKvOperands? SharedKv(int layer, int sequence)
+                => _sharedKv != null && _sharedKv.TryGetValue((layer, sequence), out SharedKvOperands kv) ? kv : null;
 
             /// <summary>The tensor-parallel rank whose shard this step traces (its weights' shards, caches, states and
             /// device), or -1: the model's own weights (one device, a stage, or ggml's meta device).</summary>
@@ -3452,13 +3571,14 @@ namespace TensorSharp.Models
                 if (_chunkMasks.TryGetValue(key, out int cached)) return cached;
                 var pattern = new CausalMaskInput(window, start, count, FloorOf(sequence));
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
-                if (count > SmallChunkRows && _m.GraphExecutor?.Capabilities.StructuralCausalMasks == true)
+                if (count > SmallChunkRows && _m.GraphExecutor?.Capabilities.StructuralCausalMasks == true && MediaRows == null)
                 {
                     AddInput(node, IntPtr.Zero, pattern.Values * sizeof(ushort), handle: pattern);
                     return CacheMask(_chunkMasks, key, node);
                 }
                 var mask = GC.AllocateUninitializedArray<ushort>(checked((int)pattern.Values));   // the fill writes every cell
                 pattern.FillF16(mask);
+                OpenMediaCells(mask, window, start, count, sequence, p => p);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count, sequence: sequence);
                 return CacheMask(_chunkMasks, key, node);
@@ -3482,6 +3602,7 @@ namespace TensorSharp.Models
                 if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(window * count));   // the fill writes every cell
                 FillBandRows(mask, window, offset, start, count, FloorOf(sequence), band);
+                OpenMediaCells(mask, window, start, count, sequence, p => p - offset);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count, sequence: sequence, offset: offset, band: band);
@@ -3500,6 +3621,7 @@ namespace TensorSharp.Models
                 if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
                 FillBandRows(mask, kv, offset, start, count, FloorOf(sequence), band);
+                OpenMediaCells(mask, kv, start, count, sequence, p => p - offset);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
                 (_bandMasks ??= new())[key] = node;
@@ -3525,6 +3647,7 @@ namespace TensorSharp.Models
                 if (_ringMasks != null && _ringMasks.TryGetValue(key, out int cached)) return cached;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(ring * count));   // the fill writes every cell
                 FillRingBandRows(mask, ring, start, count, FloorOf(sequence), band);
+                OpenMediaCells(mask, ring, start, count, sequence, p => p % ring);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { ring, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: ring, start: start, count: count, sequence: sequence, band: band, ring: ring);
@@ -3575,6 +3698,7 @@ namespace TensorSharp.Models
                 int kv = start + count;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
                 new CausalMaskInput(kv, start, count, floor).FillF16(mask);
+                OpenMediaCells(mask, kv, start, count, sequence < 0 ? 0 : sequence, p => p);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
                 return CacheMask(_causalMasks, key, node);
@@ -3894,9 +4018,13 @@ namespace TensorSharp.Models
             /// <summary>Rotary over x [d, heads, n] at <paramref name="positions"/> (I32 [n]) rather than the step's rows'
             /// positions (keys pooled at their blocks' first cells).</summary>
             internal int RopeAt(int x, RotarySpec spec, int positions)
-                => Op(GraphOp.RopeExt, stackalloc[] { x, positions },
-                    stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
-                    stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+                => spec.FreqFactorsWeight != null
+                    ? Op(GraphOp.RopeExt, stackalloc[] { x, positions, Weight(spec.FreqFactorsWeight) },
+                        stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
+                        stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow })
+                    : Op(GraphOp.RopeExt, stackalloc[] { x, positions },
+                        stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
+                        stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
 
             /// <summary>Positions [count] of sequence <paramref name="s"/>'s rows (a view of the step's).</summary>
             internal int SequencePositions(int s)
@@ -3907,6 +4035,13 @@ namespace TensorSharp.Models
             /// rotary (ggml's interleaved M-RoPE over its sections), which equals the scalar one for text.</summary>
             public int Rope(int x, RotarySpec spec)
             {
+                if (spec.FreqFactorsWeight != null)
+                {
+                    // ggml_rope_ext's frequency factors as its third operand (Gemma 4's proportional global RoPE).
+                    if (PositionTable >= 0 && _m.RotarySections != null)
+                        throw Reject("multi-axis rotary with frequency factors");
+                    return RopeAt(x, spec, Positions);
+                }
                 if (PositionTable >= 0 && _m.RotarySections is { } sections)
                     return Op(GraphOp.RopeMulti, stackalloc[] { x, PositionTable },
                         stackalloc long[] { spec.Dims, 40 /* GGML_ROPE_TYPE_IMROPE */, spec.OriginalContext,

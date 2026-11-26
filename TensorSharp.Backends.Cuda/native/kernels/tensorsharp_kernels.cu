@@ -4793,7 +4793,9 @@ __device__ __forceinline__ void yarn_rope(float theta_extrap, float freq_scale, 
     *s = sinf(theta) * mscale;
 }
 
-extern "C" __global__ void ts_rope_ex_f32(
+// ggml_rope_ext over contiguous rows; freq_factors (null: none) divides pair i's base frequency before any YaRN mix,
+// as ggml's rope_yarn takes theta / freq_factors[i] (Gemma 4's proportional global RoPE).
+__device__ __forceinline__ void ts_rope_ex_body(
     const float* input,
     const void* positions,
     float* output,
@@ -4809,9 +4811,9 @@ extern "C" __global__ void ts_rope_ex_f32(
     float attn_factor,
     float beta_fast,
     float beta_slow,
-    int add_to_result)
+    int add_to_result,
+    const float* freq_factors)
 {
-    TS_PDL_ENTRY();
     int active_dim = rope_dim < cols ? rope_dim : cols;
     int pair_count = active_dim / 2;
     int global = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4844,6 +4846,8 @@ extern "C" __global__ void ts_rope_ex_f32(
         : (int)reinterpret_cast<const float*>(positions)[row];
 
     float theta_extrap = (float)pos * powf(freq_base, -2.0f * (float)i / (float)active_dim);
+    if (freq_factors != nullptr)
+        theta_extrap /= freq_factors[i];
     float c;
     float s;
     if (ext_factor != 0.0f)
@@ -4891,6 +4895,26 @@ extern "C" __global__ void ts_rope_ex_f32(
         dst[left_index] = out_left;
         dst[right_index] = out_right;
     }
+}
+
+extern "C" __global__ void ts_rope_ex_f32(
+    const float* input, const void* positions, float* output, int rows, int cols, int rope_dim, int mode,
+    int positions_are_int32, int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor,
+    float beta_fast, float beta_slow, int add_to_result)
+{
+    TS_PDL_ENTRY();
+    ts_rope_ex_body(input, positions, output, rows, cols, rope_dim, mode, positions_are_int32, n_ctx_orig, freq_base,
+        freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, add_to_result, nullptr);
+}
+
+extern "C" __global__ void ts_rope_ex_ff_f32(
+    const float* input, const void* positions, float* output, int rows, int cols, int rope_dim, int mode,
+    int positions_are_int32, int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor,
+    float beta_fast, float beta_slow, int add_to_result, const float* freq_factors)
+{
+    TS_PDL_ENTRY();
+    ts_rope_ex_body(input, positions, output, rows, cols, rope_dim, mode, positions_are_int32, n_ctx_orig, freq_base,
+        freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, add_to_result, freq_factors);
 }
 
 extern "C" __global__ void ts_quant_matmul_f32(

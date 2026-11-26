@@ -11,6 +11,14 @@ namespace TensorSharp.Models
     /// <summary>Gemma 4 architecture plug-in.</summary>
     internal static class Gemma4Architecture
     {
+        /// <summary>
+        /// The family on the shared decoder runtime (<see cref="Gemma4RuntimeModel"/>), built by tests and the A/B tool
+        /// (eng/validation/Gemma4RuntimeAB) beside the legacy model the descriptor builds until the switch.
+        /// </summary>
+        internal static ModelBase CreateRuntimeModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1, string draftModelPath = null)
+            => new Gemma4RuntimeModel(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
+
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
             Id = "gemma4",

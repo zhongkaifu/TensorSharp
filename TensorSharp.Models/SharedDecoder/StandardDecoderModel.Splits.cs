@@ -36,16 +36,19 @@ namespace TensorSharp.Models
             int dot = name.LastIndexOf(".weight", StringComparison.Ordinal);
             string stem = dot > 0 ? name[..dot] : name;
             string part = stem.Contains('.') ? stem[(stem.LastIndexOf('.') + 1)..] : stem;
-            int heads = Config.NumHeads, kvHeads = Config.NumKVHeads;
-            long qStride = GatedAttentionOutput ? 2L * _keyDim : _keyDim;
+            // A layer's own geometry (Gemma 4's global layers): the layer is the name's blk.N.
+            int layer = LayerSplitPlan.TryGetLayer(name, out int l) ? l : -1;
+            int heads = Config.NumHeads, kvHeads = layer >= 0 ? KvHeadsOf(layer) : Config.NumKVHeads;
+            long keyDim = layer >= 0 ? KeyDimOf(layer) : _keyDim, valueDim = layer >= 0 ? ValueDimOf(layer) : _valueDim;
+            long qStride = GatedAttentionOutput ? 2L * keyDim : keyDim;
             switch (part)
             {
                 case "attn_q": return Segments(1, (heads * qStride, heads));
-                case "attn_k": return Segments(1, ((long)kvHeads * _keyDim, kvHeads));
-                case "attn_v": return Segments(1, ((long)kvHeads * _valueDim, kvHeads));
+                case "attn_k": return Segments(1, (kvHeads * keyDim, kvHeads));
+                case "attn_v": return Segments(1, (kvHeads * valueDim, kvHeads));
                 case "attn_qkv":
-                    return Segments(1, (heads * qStride, heads), ((long)kvHeads * _keyDim, kvHeads), ((long)kvHeads * _valueDim, kvHeads));
-                case "attn_output": return Segments(0, ((long)heads * _valueDim, heads), block: BlockOf(ggmlType));
+                    return Segments(1, (heads * qStride, heads), (kvHeads * keyDim, kvHeads), (kvHeads * valueDim, kvHeads));
+                case "attn_output": return Segments(0, (heads * valueDim, heads), block: BlockOf(ggmlType));
                 case "ffn_gate":
                 case "ffn_up":
                 case "ffn_gate_shexp":
@@ -74,9 +77,13 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <summary>K/V caches [d, capacity, KV heads] split by KV heads.</summary>
-        private protected LeafSplit KvCacheSplit()
-            => _graphTpRanks == null ? null : Segments(2, (Config.NumKVHeads, Config.NumKVHeads));
+        /// <summary>K/V caches [d, capacity, KV heads] split by KV heads (a layer's own count where it has one).</summary>
+        private protected LeafSplit KvCacheSplit(int layer = -1)
+        {
+            if (_graphTpRanks == null) return null;
+            int kvHeads = layer >= 0 ? KvHeadsOf(layer) : Config.NumKVHeads;
+            return Segments(2, (kvHeads, kvHeads));
+        }
 
         /// <summary>Elements of a quantized row block (a split along axis 0 must keep whole blocks).</summary>
         private static long BlockOf(int ggmlType) => ggmlType switch

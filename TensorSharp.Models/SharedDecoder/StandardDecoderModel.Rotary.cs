@@ -26,8 +26,12 @@ namespace TensorSharp.Models
             /// <param name="freqScale">1 / the context scaling factor.</param>
             /// <param name="extFactor">YaRN extrapolation mix; 0 disables YaRN.</param>
             /// <param name="attnFactor">Magnitude scale, as llama.cpp's <c>yarn_attn_factor</c>.</param>
+            /// <param name="freqFactorsWeight">An F32 model weight of ggml_rope_ext's frequency factors (Gemma 4's
+            /// <c>rope_freqs.weight</c>): pair i's frequency divided by factor i; null for none.</param>
+            /// <param name="freqFactors">That weight's values (the host rotation's), at least dims / 2 of them.</param>
             public RotarySpec(int dims, bool neoX, float freqBase, float freqScale = 1f, int originalContext = 0,
-                float extFactor = 0f, float attnFactor = 1f, float betaFast = 0f, float betaSlow = 0f)
+                float extFactor = 0f, float attnFactor = 1f, float betaFast = 0f, float betaSlow = 0f,
+                string freqFactorsWeight = null, float[] freqFactors = null)
             {
                 if (dims <= 0 || (dims & 1) != 0)
                     throw new ArgumentOutOfRangeException(nameof(dims), dims, "Rotary dims must be positive and even.");
@@ -42,10 +46,16 @@ namespace TensorSharp.Models
                 BetaSlow = betaSlow;
 
                 int pairs = dims / 2;
+                if ((freqFactorsWeight == null) != (freqFactors == null) || (freqFactors != null && freqFactors.Length < pairs))
+                    throw new ArgumentException($"Rotary frequency factors need their weight and at least {pairs} values.", nameof(freqFactors));
+                FreqFactorsWeight = freqFactorsWeight;
                 _invFreq = new float[pairs];
                 _rampMix = new float[pairs];
                 for (int i = 0; i < pairs; i++)
+                {
                     _invFreq[i] = MathF.Pow(freqBase, -2.0f * i / dims);
+                    if (freqFactors != null) _invFreq[i] /= freqFactors[i];
+                }
 
                 // ggml_rope_yarn_corr_dims / rope_yarn_ramp / rope_yarn (ggml-cpu ops.cpp).
                 Magnitude = attnFactor;
@@ -64,6 +74,8 @@ namespace TensorSharp.Models
 
             public int Dims { get; }
             public bool NeoX { get; }
+            /// <summary>The F32 weight holding the frequency factors (a graph rotary's third operand), or null.</summary>
+            public string FreqFactorsWeight { get; }
             public float FreqBase { get; }
             public float FreqScale { get; }
             public int OriginalContext { get; }
