@@ -538,8 +538,10 @@ namespace TensorSharp.Models.Graph
             }
         }
 
-        /// <summary>Rows of an attention node from which <see cref="HostFlashAttention"/> takes over from row-by-row decodes.</summary>
-        private const int HostWindowRows = 16;
+        /// <summary>Rows of an attention node from which <see cref="HostFlashAttention"/> takes over from row-by-row decodes
+        /// (ARM64). The two sum in other orders, so a row of a step of up to this many rows rounds apart from the same row of a
+        /// wider step (DEVELOPMENT.md, "Rounding by row count").</summary>
+        internal const int HostWindowRows = 16;
 
         /// <summary>
         /// Each row of a few-row node through the decode kernel over its own run of keys - [floor, its causal end) for a

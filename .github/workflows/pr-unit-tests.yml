@@ -5,8 +5,9 @@ name: PR Unit Tests
 # and ARM64 runners: builds the test project (including the CPU-only native
 # GGML library, which TensorSharp.Backends.GGML builds automatically) and runs
 # the environment-independent test lane — no GPU, no model downloads, no
-# secrets. Lane taxonomy: InferenceWeb.Tests/TestAssemblyConfig.cs and
-# DEVELOPMENT.md "Test lanes". The engine-comparison benchmark workflow
+# secrets. The x64 job pins the AVX2 baseline so its result does not depend
+# on which runner CPU GitHub assigns (see the unit-tests job). Lane taxonomy:
+# InferenceWeb.Tests/TestAssemblyConfig.cs and DEVELOPMENT.md "Test lanes". The engine-comparison benchmark workflow
 # (test-matrix.yml) on the self-hosted CUDA runner is unaffected.
 
 on:
@@ -103,6 +104,25 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+
+      # A step's row count picks the CPU kernels that round it, and which kernels a host has depends on its ISA
+      # (DEVELOPMENT.md, "Rounding by row count"). GitHub hands this job x64 runners with and without AVX-512, so a test
+      # held to what one of them gave passed or failed by the runner drawn. Every x64 run takes the AVX2 path instead:
+      # the managed kernels and the JIT without AVX-512, ggml configured for upstream's x86-64-v3 baseline
+      # (-DGGML_NATIVE=OFF; no ggml source changes), which later builds reuse from the CMake cache. Reproduce locally
+      # with eng/cpu-lane-isa.sh --ggml-baseline avx2.
+      - name: Pin x64 runs to the AVX2 baseline (managed kernels, JIT, ggml)
+        if: runner.arch == 'X64'
+        run: |
+          echo "TS_CPU_DISABLE_AVX512=1" >> "$GITHUB_ENV"
+          echo "DOTNET_EnableAVX512=0" >> "$GITHUB_ENV"
+          bash TensorSharp.GGML.Native/build-linux.sh -DGGML_NATIVE=OFF
+          grep -E '^GGML_(NATIVE|AVX2|AVX512):' TensorSharp.GGML.Native/build/CMakeCache.txt
+
+      - name: Record the runner's CPU
+        run: |
+          grep -m1 -E '^(model name|CPU part)' /proc/cpuinfo || true
+          echo "cores: $(nproc); flags: $(grep -o -w -E 'avx512f|avx2|fma|asimd|asimddp|i8mm|sve' /proc/cpuinfo | sort -u | tr '\n' ' ')"
 
       - name: Check GB10 container gates and source context (no GPU)
         run: |

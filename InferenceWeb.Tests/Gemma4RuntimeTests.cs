@@ -155,7 +155,18 @@ public sealed class Gemma4RuntimeTests : IDisposable
         }
     }
 
-    /// <summary>A prompt in one chunk and in pieces (across the sliding windows' rings) gives the same logits.</summary>
+    /// <summary>
+    /// A prompt in one chunk and in pieces gives the same logits: in wide pieces (the last crossing the sliding windows'
+    /// rings), and with a one-token piece in the middle (a decode-shaped step).
+    /// <para>No CPU executor rounds a row the same whatever the rows beside it, and which row-count switch a step meets
+    /// depends on the host's ISA (<see cref="RowCountRounding"/>): the one-token piece rounds apart from the whole prompt by
+    /// 2.9e-3 with the managed AVX2 kernels, 3.7e-3 with the portable 128-bit ones and 4.0e-3 on the ARM64 runner, where an
+    /// AVX-512 host gave the whole prompt's bits; held to an AVX-512 host's 1e-5, this test failed on every ARM64 run and
+    /// every AVX2 x64 runner. So the managed backend's wide pieces, which run the whole prompt's kernels on every ISA, are
+    /// held to its bits; the rest to the fixtures' row-count noise (a cache row lost or written twice: 3e-2 to 7e-2), and on
+    /// the CPU executors a clear top token to the whole prompt's and the pieces to their own bits when run again (a GPU keeps
+    /// its 3e-2).</para>
+    /// </summary>
     [Theory]
     [InlineData("dense-long", "managed")]
     [InlineData("dense-long", "ggml")]
@@ -165,16 +176,44 @@ public sealed class Gemma4RuntimeTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         BackendType backend = executor == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu;
+        bool cpu = backend is BackendType.Cpu or BackendType.GgmlCpu;
         using var model = Create(Fixture(name), backend);
         int[] prompt = Gemma4LegacySynthetic.Get(name).Prompt;
         float[] whole = (float[])model.ForwardRefill(prompt).Clone();
-        model.ResetKVCache();
-        float[] pieces = null;
-        int cut1 = prompt.Length / 3, cut2 = cut1 + 1;
-        foreach (int[] chunk in new[] { prompt[..cut1], prompt[cut1..cut2], prompt[cut2..] })
-            pieces = model.Forward(chunk);
-        double tolerance = backend is BackendType.Cpu ? 1e-5 : backend == BackendType.GgmlCpu ? 5e-4 : 3e-2;
-        Assert.True(RelL2(pieces, whole) <= tolerance, $"{name} {backend} chunked: relL2 {RelL2(pieces, whole):E3}");
+        float[] Pieces(int[] cuts)
+        {
+            model.ResetKVCache();
+            float[] last = null;
+            int start = 0;
+            foreach (int end in cuts.Append(prompt.Length))
+            {
+                last = (float[])model.Forward(prompt[start..end]).Clone();
+                start = end;
+            }
+            return last;
+        }
+
+        // dense-long: 76 | 77 | 77 rows (its 208-token window wraps in the last); moe: 22 | 23 (the 32-token window in the last).
+        int wideCount = Math.Min(3, prompt.Length / RowCountRounding.ManagedWideRows);
+        int[] wide = Enumerable.Range(1, wideCount - 1).Select(i => i * prompt.Length / wideCount).ToArray();
+        int cut = prompt.Length / 3;
+        foreach ((string split, int[] cuts) in new[] { ("wide", wide), ("one-token", new[] { cut, cut + 1 }) })
+        {
+            float[] pieces = Pieces(cuts);
+            double rel = RelL2(pieces, whole);
+            string label = $"{name} {backend} {split} pieces ({string.Join(", ", cuts)})";
+            _output.WriteLine($"{label}: relL2 {rel:E3}");
+            if (split == "wide" && backend == BackendType.Cpu)
+            {
+                Assert.True(pieces.AsSpan().SequenceEqual(whole), $"{label}: relL2 {rel:E3}, not the whole prompt's bits");
+                continue;
+            }
+            double tolerance = cpu ? RowCountRounding.GemmaFixtureNoise : 3e-2;
+            Assert.True(rel <= tolerance, $"{label}: relL2 {rel:E3} > {tolerance:E1}");
+            if (!cpu) continue;
+            if (Margin(whole) > 0.5f) Assert.Equal(Argmax(whole), Argmax(pieces));
+            Assert.True(pieces.AsSpan().SequenceEqual(Pieces(cuts)), $"{label}: a second run gave other bits");
+        }
     }
 
     // ---------------------------------------------------------------- mechanisms

@@ -375,7 +375,16 @@ public sealed class GptOssRuntimeTests : IDisposable
                 Assert.True(ggml.HasWeightForTests($"blk.{l}.attn_output.bias"));
             }
             List<float[]> actual = Script(ggml, c);
-            double tolerance = TestGates.PinnedGgmlBackend == BackendType.GgmlCuda ? 10 * NoiseTolerance : NoiseTolerance;
+            // ggml-cpu and the managed backend quantize this fixture's activations each its own way, and how far apart their
+            // rows land depends on the host's kernels: 1.3e-2 at most on x64 (AVX-512 and AVX2), 2.7e-2 at its last decode row on
+            // the ARM64 runner and with the managed portable 128-bit kernels (DOTNET_EnableAVX2=0), so a CPU run takes twice the
+            // summation-order bound (held to it, this failed on every ARM64 run); a misfused layer or orphaned bias is garbage.
+            double tolerance = TestGates.PinnedGgmlBackend switch
+            {
+                BackendType.GgmlCuda => 10 * NoiseTolerance,
+                BackendType.GgmlCpu => 2 * NoiseTolerance,
+                _ => NoiseTolerance,
+            };
             for (int i = 0; i < managed.Count; i++)
             {
                 double rel = RelL2(actual[i], managed[i]);

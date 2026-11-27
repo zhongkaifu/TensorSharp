@@ -716,7 +716,26 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Benc
 
 门控测试在前提条件缺失时会报告为**已跳过**（被跳过的 `[Theory]` 只计一次，不按数据行展开），因此在没有相应硬件/权重的机器上，绿色结果会显示为"N 通过，M 跳过"，而不是静默通过从未执行的测试。少数前提条件复杂的测试类（多个环境变量、按方法选择模型）仍在测试体内做门控，并保留显式的 `[Trait("Requires", ...)]` 标注。
 
-PR CI（`.github/workflows/pr-unit-tests.yml`）在 GitHub 托管的 x64（`ubuntu-latest`）与 ARM64（`ubuntu-24.04-arm`）runner 上运行第一个分组，触发于 pull request 以及推送到 `main`。它强制关闭 GPU 原生构建（`TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=OFF`、`TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`、`TENSORSHARP_CUDNN=OFF`），固定 `TS_TEST_GGML_BACKEND=cpu`，并先运行不需要 GPU 的 GB10 容器契约检查 `eng/tests/gb10-container.py`。它不下载模型，也不需要 GPU。
+PR CI（`.github/workflows/pr-unit-tests.yml`）在 GitHub 托管的 x64（`ubuntu-latest`）与 ARM64（`ubuntu-24.04-arm`）runner 上运行第一个分组，触发于 pull request 以及推送到 `main`。它强制关闭 GPU 原生构建（`TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=OFF`、`TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`、`TENSORSHARP_CUDNN=OFF`），固定 `TS_TEST_GGML_BACKEND=cpu`，并先运行不需要 GPU 的 GB10 容器契约检查 `eng/tests/gb10-container.py`。它不下载模型，也不需要 GPU。无论 GitHub 分配哪种 runner CPU，x64 作业每次都固定走 AVX2 路径（见下文“按行数舍入”）。
+
+#### 按行数舍入（Rounding by row count）
+
+有些测试把同一个计算按不同行数的步骤运行并比较结果：分块输入的提示词对比整段提示词、续接的提示词对比全新预填充、与其他 lane 一起运行的 lane 对比单独运行的同一 lane。这些行经过的是不同的 kernel。没有任何 CPU 执行器能保证一行的结果与同一步中其他行的数量无关：
+
+- **托管 GEMM**（`CpuSgemm`）：不超过 `CpuSgemm.SkinnyMaxM`（4）行的乘积走不打包的 skinny 路径，其求和顺序与更宽乘积的打包分块或窄点积路径不同，AVX-512、AVX2 与可移植 kernel 都是如此。
+- **ARM64 上的托管注意力**：不超过 `ManagedGraphExecutor.HostWindowRows`（16）个查询行的步骤让每一行走 decode kernel，更宽的步骤走分块的 `HostFlashAttention`。
+- **ggml-cpu**：多行的 F32 乘积走 llamafile 的 tinyBLAS（x86 上 2 行及以上，ARM NEON 上 4 行及以上），更窄的走 `ggml_vec_dot`。即使两个宽步骤也可能舍入不同：dense Gemma 4 fixture 的一个 23 行分块就是如此。
+- **GPU**：ggml_cuda 的量化乘积按行数选择 MMQ 或 MMVQ，多行的 F32 乘积使用 TF32 tensor core；ggml-metal 超过 8 行的乘积使用半精度分块。
+
+一个步骤遇到哪种切换取决于主机的 ISA。AVX-512 主机上舍入相同的分块方式，在 AVX2 或 ARM64 主机上可能舍入不同。使用量化权重的合成 fixture 会放大这种差异：托管量化乘积把激活量化为 8 位，一个 ulp 的变化就可能让某个码值跳一整级。Gemma 4 的 fixture 跨越行数切换时最多相差 4.9e-3 relL2。PR 测试分组的 CPU 作业一再失败，原因正是一些测试把这类比较卡在 AVX-512 开发机给出的数值（1e-5、1e-4）上，而 GitHub 分配给 x64 作业的 runner 有的有 AVX-512、有的没有，ARM64 runner 则不走任何 x64 kernel。
+
+这类测试的规则（`InferenceWeb.Tests/RowCountRounding.cs`）：
+
+1. **只在每种 CI ISA 都已验证逐位相同的地方才要求逐位相同。** 在任何 CPU 执行器上，用相同步骤重复同一计算都满足条件（重置后的第二次运行、与自身副本并列的 lane）。跨不同步骤形状时，托管后端上每步至少 `RowCountRounding.ManagedWideRows`（17）行是必要条件，但不是充分条件：Gemma 4 runtime 的分块提示词在 x64 与 ARM64 runner 上都与整段提示词逐位相同，但 32 行的 DiffusionGemma 续接在 ARM64 上仍与全新预填充相差 3.7e-3，而 x64 上逐位相同。
+2. **跨越行数切换时使用实测的噪声上限。** 把结果限制在 fixture 实测的行数噪声内（Gemma 4 系列 fixture 用 `RowCountRounding.GemmaFixtureNoise`，即 1e-2），这个上限要远低于真实错误造成的偏差（丢失或重复写入一个缓存行：3.2e-2 到 6.9e-2），并要求明确的 top token 与参考一致。
+3. **依赖某个上限之前，在每种配置下都实测。** `eng/cpu-lane-isa.sh` 按 AVX-512（`native`）、AVX2（`avx2`）和可移植 128 位（`portable`，即 ARM64 的托管路径）主机的方式运行该分组（或用 `--filter` 运行其中一部分），日志写入 `artifacts/cpu-lane-isa/`。ARM64 专有的 kernel 只能在 ARM64 主机或 ARM64 CI 作业上运行。两个执行器之间的上限也是如此：GPT-OSS 的混合类型 fixture 上，ggml-cpu 与托管后端在 x64 上最多相差 1.3e-2，在 ARM64 runner 和 `portable` 配置下则相差 2.7e-2。
+
+x64 CI 作业每次都固定走 AVX2 路径：托管 kernel 与 JIT 使用 `TS_CPU_DISABLE_AVX512=1` 和 `DOTNET_EnableAVX512=0`，ggml 用 `-DGGML_NATIVE=OFF` 配置为上游的 x86-64-v3 基线，不改动 ggml 源码。因此它的结果不再取决于分到哪台 runner。在任意 x64 Linux 主机上用 `eng/cpu-lane-isa.sh --ggml-baseline avx2` 即可复现；之后原生库会一直保持基线配置，直到运行 `TensorSharp.GGML.Native/build-linux.sh -DGGML_NATIVE=ON`。.NET 10 会忽略 `DOTNET_EnableAVX512F`，起作用的开关是 `DOTNET_EnableAVX512=0`。
 
 基数树前缀缓存的树级性质测试（`InferenceWeb.Tests/PrefixCache/TreeTraceHarnessTests.cs`，trait 为 `Category=PrefixCacheProperty`）默认运行 1,000 个带种子的操作序列，属于可移植测试分组。三个仅供测试使用的环境变量控制它：`PREFIX_CACHE_TREE_SEEDS=20000` 运行完整的 20,000 个种子，`PREFIX_CACHE_TREE_SEED_START=<n>` 设置种子起点，`PREFIX_CACHE_SEED=<n>` 重放单个失败的种子。树操作的时延与分配门槛由 [`benchmarks/RadixTreeBench`](benchmarks/RadixTreeBench/README.md) 检查，它不需要加载模型。
 

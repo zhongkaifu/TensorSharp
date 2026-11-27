@@ -148,7 +148,13 @@ public sealed class DiffusionGemmaRuntimeTests : IDisposable
 
     /// <summary>A block's prompt extends the last one's: the cached rows are kept and only the new ones prefill, and the canvas
     /// reads what a fresh prefill of the whole prompt gives (here past the 32-token window, with the canvas on a ring's second
-    /// lap on no layer).</summary>
+    /// lap on no layer).
+    /// <para>The 16 new rows prefill as one step and the fresh prompt's 43 as another, and no executor rounds a row the same
+    /// whatever the step's rows (<see cref="RowCountRounding"/>): ARM64's managed attention runs each row of a step of up to
+    /// 16 rows through the decode kernel and a wider step through the tiled host kernel, and the ARM64 runner rounds the
+    /// continuation 3.2e-3 apart from the fresh prompt (a 32-row continuation after 11 cached rows too: 3.7e-3) where x64
+    /// gives its bits; held to 1e-4 this failed on every ARM64 run. A GPU's quantized products pick MMQ or MMVQ by the step's
+    /// rows (ggml_cuda on an A40: 1.37e-2). So the CPU executors are held to the fixture's row-count noise.</para></summary>
     [Theory]
     [InlineData("managed")]
     [InlineData("ggml")]
@@ -172,11 +178,8 @@ public sealed class DiffusionGemmaRuntimeTests : IDisposable
         }
         double rel = RelL2(continued, fresh);
         _output.WriteLine($"{executor}: continued vs fresh relL2 {rel:E3}");
-        // A GPU's quantized products pick their kernels by the step's rows (llama.cpp's MMQ against MMVQ), so a prompt
-        // prefilled in two steps rounds apart from one prefilled whole, and a near-tie route of this MoE fixture can then
-        // flip (ggml_cuda on an A40: 1.37e-2); the CPU backends' products do not depend on the step's rows.
-        double tolerance = backend is BackendType.Cpu or BackendType.GgmlCpu ? 1e-4 : 3e-2;
-        Assert.True(rel <= tolerance, $"continued block prompt: relL2 {rel:E2}");
+        double tolerance = backend is BackendType.Cpu or BackendType.GgmlCpu ? RowCountRounding.GemmaFixtureNoise : 3e-2;
+        Assert.True(rel <= tolerance, $"continued block prompt: relL2 {rel:E2} > {tolerance:E1}");
     }
 
     /// <summary>The unified call (prompt and canvas together) is the prompt-cached one.</summary>
