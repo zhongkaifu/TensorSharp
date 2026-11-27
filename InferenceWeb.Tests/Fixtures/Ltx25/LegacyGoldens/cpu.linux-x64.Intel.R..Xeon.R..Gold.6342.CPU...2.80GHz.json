@@ -1,0 +1,145 @@
+{
+  "lane": "cpu|linux-x64|Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz",
+  "implementation": "the retired direct LTX 2.5 denoiser (Ltx25Denoiser.Forward at c178bfc), ggml bb877c0c unchanged",
+  "checkpointSha256": "fe8cadbb75ac484c034ce630858b69c956fa36041f778d227cd14d83b35da1f8",
+  "adapterSha256": "513e9232150427ae8520711237676abdda5bb669676cbb1d1c240b6774861ff8",
+  "runtimeBitExact": true,
+  "cases": {
+    "case0": {
+      "video": {
+        "sha256": "2693e99b2317a1cb44b960d7761d7bfcccd802c7d8f820102b553a8cd8ad3b10",
+        "count": 12,
+        "maxAbs": 0.5365459322929382,
+        "l2": 0.9893219541699116,
+        "bits": "3ef5ff383e4fab363b871180bf095b133e4cffdebc8d3a00be0914e23e56db363dfd407abeff1be13df385bcbe49e4d4"
+      },
+      "audio": {
+        "sha256": "adf4979b7f52de3c0f8ac182e77e0292a8a1b203acb0be5aefbf6fd39f06cbe5",
+        "count": 12,
+        "maxAbs": 0.5201895236968994,
+        "l2": 0.6512652678060383,
+        "bits": "3d6426e0bdf39e28bd954a21bf052b24bae02880bdcba9573e031e5c3e34ba393d6d82e0bcac96383c027eb83e87261a"
+      },
+      "blocks": 2
+    },
+    "case0-ingredients": {
+      "video": {
+        "sha256": "abe2bb25cbdcf07f8a2b380851267ed9942b72c56f1522f5fb0b835532cd1cb9",
+        "count": 12,
+        "maxAbs": 0.5301656126976013,
+        "l2": 1.036311053142748,
+        "bits": "3ef5b5683e7bd7a4bd187136bf07b8ef3e8ec094bd95a6a2bde341dd3e82566e3dd40280bf01eae63e235d30be5d7b92"
+      },
+      "audio": {
+        "sha256": "1bb1c84d5c8a52d8f5b169680e01066bcee88fcc0aee74af2ff39d45e9e9aff4",
+        "count": 12,
+        "maxAbs": 0.5202211141586304,
+        "l2": 0.6508933989669365,
+        "bits": "3d66fcc4bdf1d100bd98074fbf052d36ba5daf00bdcb1f143e0050ac3e35a9183d6efaecbcae54f43b9e3d903e86fc66"
+      },
+      "blocks": 2
+    },
+    "case1": {
+      "video": {
+        "sha256": "7495577ba5c09422e73f39d3e6f8ab019beacaf2412f8af6ea4a347f36bfaf9e",
+        "count": 12,
+        "maxAbs": 0.707763135433197,
+        "l2": 1.3922557794711299,
+        "bits": "3e27326c3f352ff7befd84dbbf095eec3ebcef31be3e0b75bdfeb7e13e12f20e3e2e4491bed075a53ef9e44fbef9cdf9"
+      },
+      "audio": {
+        "sha256": "8db33dc8b15d3e473bb7cd9691537406974c74429a5d2a8e067b423d6713085b",
+        "count": 12,
+        "maxAbs": 0.6183418035507202,
+        "l2": 0.7807266392587693,
+        "bits": "3d62e0aabdcb0cb4bd24d726bf1e4ba6bc4aa6d0be08e7e23e0275243e8de29f3d400de0bd6ba98dbc2e21983e9ea1fe"
+      },
+      "blocks": 2
+    },
+    "case1-ingredients": {
+      "video": {
+        "sha256": "2e17e80df528eddbc5122b31413b939ad83e49ee8e8afcf3972d38e694a04bac",
+        "count": 12,
+        "maxAbs": 0.7359885573387146,
+        "l2": 1.4433870213888498,
+        "bits": "3e1cee383f3c69bfbf089c05bf0683513ed14c31be6e4e92bdee013d3e5780b43e0a8baabedb47c63efe9acdbef5291f"
+      },
+      "audio": {
+        "sha256": "7fcac5d29d45583468b5ac5f41d54f119c5d9a29c49f8509ca4dd4be1bdb46b0",
+        "count": 12,
+        "maxAbs": 0.6191025376319885,
+        "l2": 0.7797893032042317,
+        "bits": "3d64922abdc84f0fbd2a8f9ebf1e7d81bc3b8ca0be09c5083dfd36f33e8ea0b03d3ccdbcbd6a74f3bc6219783e9cb09f"
+      },
+      "blocks": 2
+    },
+    "case2": {
+      "video": {
+        "sha256": "77c42a5e97d503de84a2c2c9bf24d09ee48c1e2a028f09fa7de0ecdd73d0c6dd",
+        "count": 12,
+        "maxAbs": 0.5939319133758545,
+        "l2": 1.2413352657718095,
+        "bits": "3d79a2aa3f0137adbee3d04fbf180bec3e7f0df8be46d085be7c40763e97f0313d3809d8bf0b50543e0cb160bed0b495"
+      },
+      "audio": {
+        "sha256": "0c16d7a8025cbd4ff8a4430d5d1afe424b22d5d93c8ca84efcc046314fc9a9df",
+        "count": 12,
+        "maxAbs": 0.5209752321243286,
+        "l2": 0.6733936908498547,
+        "bits": "3d3d6562bdfff628bd9fc169bf055ea2bc70ea70bde5fa403df5467d3e50bdd53d4f1b40bd00d330ba2cb1803e961654"
+      },
+      "blocks": 2
+    },
+    "case2-ingredients": {
+      "video": {
+        "sha256": "0e2c9605438e875671cf92921d2cc45acca82a5adbb2c29571ced3da79648a1e",
+        "count": 12,
+        "maxAbs": 0.6010547876358032,
+        "l2": 1.35649646640217,
+        "bits": "3d2ee38a3f0bc16bbef716f7bf19deba3eb0db02be90caa8be7bcfec3ebd124dbb9f6fa0bf0e9e6f3e470264bee5fcc5"
+      },
+      "audio": {
+        "sha256": "c2f5871d5966abe9b6fafa801d3684becf45def135a26ee6cbcd2eff42ad627a",
+        "count": 12,
+        "maxAbs": 0.5197147727012634,
+        "l2": 0.6735153318362277,
+        "bits": "3d42f89cbe0009f3bda522cfbf050c07bc5b6ff0bde7af4e3decc9c53e5331343d5147f0bd062340bb9e19303e969c2e"
+      },
+      "blocks": 2
+    },
+    "case3": {
+      "video": {
+        "sha256": "fab96d7b9cd4a24f0b48e21bc2d059aa1957daa044519c25ab1ccae1bbd06950",
+        "count": 12,
+        "maxAbs": 0.5185806155204773,
+        "l2": 0.975795058099272,
+        "bits": "3ef395f03e2ea3043d068c80bf04c1b33e61d6d2bd3fa5fcbe0c20383e601f283de2d77cbef9b1fc3e00a250be55534b"
+      },
+      "audio": {
+        "sha256": "3ad0e6effe4a337558c5c46b6e370d185ccf2a8c1a98154961ed1f29421d3f60",
+        "count": 12,
+        "maxAbs": 0.5217180252075195,
+        "l2": 0.6501573959674504,
+        "bits": "3d4a24b6bdfb41dabd92c61fbf058f503c3e6790bdf51e223ddf55853e5125fc3d66d73cbc899ed83abfecc03e731b46"
+      },
+      "blocks": 2
+    },
+    "case3-ingredients": {
+      "video": {
+        "sha256": "cd7b39501b5d329e9afc9de83e8eff44664e43893b0ec189a66211660f3f378a",
+        "count": 12,
+        "maxAbs": 0.5089765787124634,
+        "l2": 1.0215141419508182,
+        "bits": "3ef4fb943e5b72aabc3267d0bf024c4a3e983741bdd0955abde374bd3e8280ac3dc5e494befdc8003e288e4dbe67dab4"
+      },
+      "audio": {
+        "sha256": "e313f750fecbd190ab72f055836141af07a7239e6862ba14a12784f7fc501f35",
+        "count": 12,
+        "maxAbs": 0.5208958983421326,
+        "l2": 0.6498879572573745,
+        "bits": "3d4d7db6bdfb6d77bd957013bf05596f3c3b2250bdf58a433dda10e53e530aa63d69c748bc8840a0bab00ec03e72dfe4"
+      },
+      "blocks": 2
+    }
+  }
+}

@@ -359,7 +359,7 @@ public sealed class StudioGenerationParityTests : IDisposable
         Assert.True(settings.TwoStage);
         Assert.Equal(frames, Ltx25ImageConditioning.Resolve(parameters, settings.Frames).Select(image => image.FrameIndex));
         // Only a lone first frame gets the publisher's softened first-stage strength.
-        Assert.Equal(mode == "i2v" ? .7f : null, Ltx25Pipeline.ResolveFirstStageImageStrength(parameters, twoStage: true,
+        Assert.Equal(mode == "i2v" ? .7f : null, Ltx25Family.ResolveFirstStageImageStrength(parameters, twoStage: true,
             Ltx25ImageConditioning.Resolve(parameters, settings.Frames)));
     }
 

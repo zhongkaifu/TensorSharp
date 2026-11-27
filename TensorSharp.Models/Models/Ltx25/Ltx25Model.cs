@@ -1,14 +1,24 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// Licensed under the BSD-3-Clause license in the repository root.
+//
+// LTX 2.5 Distilled: text/image-to-video with jointly generated 48 kHz stereo audio. A clip runs on the diffusion runtime's
+// video pipeline (SharedDiffusion/DiffusionVideoPipeline) with the LTX family's hooks (Ltx25Family): the denoiser's steps are
+// graph programs (Ltx25Denoiser) on a tensor executor (CUDA, MLX or the managed CPU executor), and the optional Ingredients
+// IC-LoRA (identity references) is the step's adapter set (Ltx25LoraSet).
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using TensorSharp.Cuda;
 using TensorSharp.MLX;
 using TensorSharp.Models.Media;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.Ltx25;
 
@@ -30,19 +40,22 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     /// <summary>The x2 spatial latent upscaler between the half- and full-size passes.</summary>
     internal string LatentUpscalerPath { get; }
     internal IAllocator DirectAllocator => _allocator;
+    // One clip at a time, and never across an adapter swap or an unload.
     private readonly object _generationLock = new();
-    private readonly Dictionary<string, (Ltx25PromptEncoding Encoding, LinkedListNode<string> Node)> _promptCache = new(StringComparer.Ordinal);
-    private readonly LinkedList<string> _promptOrder = new();
-    private Ltx25Denoiser _denoiser;
-    private Ltx25PromptEncoder _promptEncoder;
-    private Ltx25VideoVaeDecoder _videoDecoder;
-    private Ltx25DiffusionVideoDecoder _diffusionDecoder;
-    private Ltx25VideoVaeEncoder _videoEncoder;
-    private Ltx25AudioDecoder _audioDecoder;
-    private Ltx25LatentUpsampler _latentUpsampler;
+    private DiffusionVideoPipeline _pipeline;
+    private Ltx25LoraSet _ingredients;
     private readonly List<MappedFileReadAhead> _companionReads = new();
-    public long PromptCacheHits { get; private set; }
     private bool _disposed;
+
+    /// <summary>Prompts the conditioner answered from its cache.</summary>
+    public long PromptCacheHits => (_pipeline?.ConditionerOrNull as Ltx25Conditioner)?.CacheHits ?? 0;
+
+    /// <summary>The loaded Ingredients adapter set, or null (it is opened when the adapter is attached and applied only to
+    /// identity reference clips).</summary>
+    internal Ltx25LoraSet Ingredients => Volatile.Read(ref _ingredients);
+
+    /// <summary>The pipeline's denoiser, or null before the first clip.</summary>
+    internal IDenoiser LoadedDenoiser => _pipeline?.LoadedDenoiser;
 
     public Ltx25Model(string checkpoint, BackendType backend) : base(checkpoint, DirectBackend(backend))
     {
@@ -67,22 +80,29 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             Console.WriteLine($"  [ltx25] video decoder: {(UsesDiffusionDecoder ? "diffusion" : "convolutional")} " +
                 $"({Path.GetFileName(DiffusionVaePath ?? VideoVaePath)})");
             string configuredReference = Environment.GetEnvironmentVariable("TS_LTX25_INGREDIENTS_LORA");
+            string reference = null;
             if (!string.IsNullOrWhiteSpace(configuredReference))
             {
                 if (!File.Exists(configuredReference)) throw new FileNotFoundException("The configured LTX Ingredients adapter does not exist.", configuredReference);
-                _referenceLoraPath = Path.GetFullPath(configuredReference);
+                reference = Path.GetFullPath(configuredReference);
             }
             else
             {
-                string reference = Path.Combine(directory, "loras", "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors");
-                if (File.Exists(reference)) _referenceLoraPath = Path.GetFullPath(reference);
+                string sibling = Path.Combine(directory, "loras", IngredientsFileName);
+                if (File.Exists(sibling)) reference = Path.GetFullPath(sibling);
+            }
+            if (reference != null)
+            {
+                _ingredients = Ltx25LoraSet.Open(reference, _gguf, geometry);
+                _referenceLoraPath = reference;
             }
             Config = new ModelConfig { Architecture = ArchitectureId, VocabSize = 0 };
         }
-        catch { base.Dispose(); throw; }
+        catch { _ingredients?.Dispose(); base.Dispose(); throw; }
     }
 
     internal const string LatentUpscalerFileName = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors";
+    internal const string IngredientsFileName = "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors";
 
     /// <summary>
     /// Whether <paramref name="checkpoint"/> is named as LTX 2.5's dev (full, non-distilled)
@@ -129,8 +149,8 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         return path;
     }
 
-    // GGML option names remain usable by hosts whose device picker uses them;
-    // this family executes its owned direct CUDA/MLX kernels, not a GGML graph.
+    // The family runs on the tensor executors of the CUDA, MLX and CPU backends; the GGML option names stay usable by hosts
+    // whose device picker uses them and select the same executors.
     internal static BackendType DirectBackend(BackendType backend) => backend switch
     {
         BackendType.GgmlCuda or BackendType.Cuda => BackendType.Cuda,
@@ -152,61 +172,108 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         throw new FileNotFoundException($"LTX 2.5 requires {filename}; configure its companion path or install it beside the denoiser.", filename);
     }
 
-    public GeneratedVideo GenerateVideo(string prompt, VideoGenerationParams parameters = null)
+    public GeneratedVideo GenerateVideo(string prompt, VideoGenerationParams parameters = null) => Generate(prompt, parameters, null);
+
+    /// <summary>A clip through <paramref name="family"/> on a pipeline of its own (a validation tool's family that wraps this
+    /// model's <see cref="Ltx25Family"/> to read its state between the hooks), or, null, through the model's pipeline.</summary>
+    internal GeneratedVideo Generate(string prompt, VideoGenerationParams parameters, IVideoDiffusionFamily family)
     {
+        ArgumentNullException.ThrowIfNull(prompt);
         if (_allocator is MlxAllocator && !MlxWorker.Shared.IsOnWorkerThread)
-            return MlxWorker.Shared.Invoke(() => GenerateVideo(prompt, parameters));
+            return MlxWorker.Shared.Invoke(() => Generate(prompt, parameters, family));
         lock (_generationLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            return Ltx25Pipeline.Generate(this, prompt, parameters ?? new VideoGenerationParams());
+            parameters ??= new VideoGenerationParams();
+            DiffusionVideoPipeline own = family == null ? null : new DiffusionVideoPipeline(family, Load());
+            DiffusionVideoPipeline pipeline = own ?? (_pipeline ??= new DiffusionVideoPipeline(new Ltx25Family(this), Load()));
+            var clock = Stopwatch.StartNew();
+            Ltx25GenerationSettings settings = null;
+            try
+            {
+                DiffusionVideoResult result = pipeline.Run(new DiffusionVideoRequest
+                {
+                    Prompt = prompt,
+                    Seed = parameters.Seed,
+                    // The Ingredients adapter conditions identity references only; every other clip runs the base checkpoint.
+                    Adapters = parameters.Mode == "ref" && Ingredients is { } set ? set.AdapterSet : AdapterSet.Empty,
+                    DecodeAudio = parameters.GenerateAudio,
+                    FamilyRequest = parameters,
+                    Progress = progress => Report(parameters, progress, clock),
+                }, parameters.CancellationToken);
+                settings = ((Ltx25Job)result.Job).Settings;
+                if (StopCompanionPrefetch() is string prefetched) Console.WriteLine($"  [ltx25] companion prefetch: {prefetched}");
+                Report(parameters, "done", $"{settings.Width}x{settings.Height}, {settings.Frames} frames at {settings.Fps} fps", null, null, clock);
+                return new GeneratedVideo
+                {
+                    Frames = result.Frames,
+                    Fps = settings.Fps,
+                    Seed = settings.Seed,
+                    Audio = result.Audio == null ? null : new GeneratedVideoAudio { Channels = result.Audio, SampleRate = result.AudioSampleRate },
+                };
+            }
+            finally
+            {
+                own?.Dispose();
+                StopCompanionPrefetch();
+                if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
+                else if (_allocator is MlxAllocator) MlxBackend.ClearCache();
+            }
         }
     }
 
-    /// <summary>Whether <see cref="Conditioning"/> would answer <paramref name="prompt"/> from the
-    /// prompt cache, for telemetry. Called under the generation lock, as Conditioning is.</summary>
-    internal bool HasCachedConditioning(string prompt) => prompt != null && _promptCache.ContainsKey(prompt);
-
-    internal Ltx25PromptEncoding Conditioning(string prompt, CancellationToken cancellationToken = default)
+    /// <summary>The runtime's load: the denoiser, the text encoder and the VAE this model resolved (the upscaler, the diffusion
+    /// decoder and the audio VAE travel with the family).</summary>
+    private DiffusionLoad Load() => new()
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (_promptCache.TryGetValue(prompt, out var cached))
+        Backend = DirectBackend(_backend),
+        Files = new Dictionary<string, string>
         {
-            _promptOrder.Remove(cached.Node);
-            _promptOrder.AddLast(cached.Node);
-            ++PromptCacheHits;
-            return cached.Encoding;
-        }
-        Ltx25PromptEncoding encoding;
-        // Keep the large mapped files and tokenizer across distinct prompts, but
-        // release the connector's large device weights before denoising.
-        var encoder = _promptEncoder ??= new Ltx25PromptEncoder(TextEncoderPath, CheckpointPath, _allocator);
-        long mlxBf16 = encoder.NativeBf16Projections, cudaMapped = encoder.CudaMappedProjections,
-            cudaBf16 = encoder.CudaBf16Projections, connectorProjections = encoder.CudaConnectorProjections,
-            connectorAttentions = encoder.CudaConnectorAttentions;
-        try
+            [DiffusionLoad.Denoiser] = CheckpointPath,
+            [DiffusionLoad.TextEncoder] = TextEncoderPath,
+            [DiffusionLoad.Vae] = VideoVaePath,
+        },
+    };
+
+    // ---- progress, as the hosts' video contract has always read LTX's: text-encode, (reference-encode, image-encode), denoise
+    // with its stages and steps, vae-decode, audio-decode, done.
+
+    private Stopwatch _clipClock;
+
+    /// <summary>A family report (a phase entered, or a stage of the denoise phase), in the hosts' phase names.</summary>
+    internal void Report(VideoGenerationParams p, string phase, string detail, string stage, IReadOnlyDictionary<string, object> attributes)
+        => Report(p, phase, detail, stage, attributes, _clipClock);
+
+    private int _reportedSteps, _reportedTotal;
+
+    private void Report(VideoGenerationParams p, string phase, string detail, string stage, IReadOnlyDictionary<string, object> attributes,
+        Stopwatch clock)
+    {
+        p.CancellationToken.ThrowIfCancellationRequested();
+        Console.WriteLine($"  [ltx25] {phase}: {detail}");
+        p.OnProgress?.Invoke(new VideoGenerationProgress
         {
-            try
-            {
-                encoding = encoder.Encode(prompt, cancellationToken);
-                Console.WriteLine($"  [ltx25-conditioning] gemma={encoder.LastGemmaMilliseconds:F3}ms aggregate={encoder.LastAggregationMilliseconds:F3}ms " +
-                    $"connectors={encoder.LastConnectorMilliseconds:F3}ms mlx_bf16={encoder.NativeBf16Projections - mlxBf16} " +
-                    $"cuda_mapped={encoder.CudaMappedProjections - cudaMapped} cuda_bf16={encoder.CudaBf16Projections - cudaBf16} " +
-                    $"cuda_connector_projections={encoder.CudaConnectorProjections - connectorProjections} " +
-                    $"cuda_connector_attentions={encoder.CudaConnectorAttentions - connectorAttentions}" +
-                    (encoder.LastReadAhead == null ? "" : " " + encoder.LastReadAhead));
-            }
-            finally { encoder.ReleaseDeviceResidency(); }
-        }
-        catch { DisposeOwned(ref _promptEncoder); throw; }
-        cancellationToken.ThrowIfCancellationRequested();
-        _promptCache.Add(prompt, (encoding, _promptOrder.AddLast(prompt)));
-        if (_promptCache.Count > 4)
+            Phase = phase, Detail = detail, Step = _reportedSteps, TotalSteps = _reportedTotal,
+            ElapsedSeconds = clock?.Elapsed.TotalSeconds ?? 0, Stage = stage, Attributes = attributes,
+        });
+    }
+
+    /// <summary>The pipeline's reports: its steps as the hosts' "denoise" steps (and the step callback); the phases themselves
+    /// are the family's reports.</summary>
+    private void Report(VideoGenerationParams p, DiffusionVideoProgress progress, Stopwatch clock)
+    {
+        _clipClock = clock;
+        if (progress.Phase == DiffusionPhase.Prepare)
         {
-            _promptCache.Remove(_promptOrder.First.Value);
-            _promptOrder.RemoveFirst();
+            _reportedSteps = 0;
+            _reportedTotal = 0;
+            return;
         }
-        return encoding;
+        if (progress.Total > 0) _reportedTotal = progress.Total;
+        if (!progress.IsStep) return;
+        _reportedSteps = progress.Step;
+        p.OnStep?.Invoke(progress.Step, progress.Total);
+        Report(p, "denoise", $"step {progress.Step}/{progress.Total}", progress.Stage, null, clock);
     }
 
     internal enum CompanionFile { Upscaler, VideoDecoder, AudioDecoder }
@@ -219,12 +286,13 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     /// audio decode. Networks this process already holds are skipped.</summary>
     internal void PrefetchCompanion(CompanionFile companion)
     {
+        var video = _pipeline?.VideoCodecOrNull as Ltx25VideoCodec;
+        var audio = _pipeline?.AudioCodecOrNull as Ltx25AudioCodec;
         string path = companion switch
         {
-            CompanionFile.Upscaler when _latentUpsampler == null => LatentUpscalerPath,
-            CompanionFile.VideoDecoder when (UsesDiffusionDecoder ? _diffusionDecoder == null : _videoDecoder == null) =>
-                UsesDiffusionDecoder ? DiffusionVaePath : VideoVaePath,
-            CompanionFile.AudioDecoder when _audioDecoder == null => AudioVaePath,
+            CompanionFile.Upscaler when video?.HasUpsampler != true => LatentUpscalerPath,
+            CompanionFile.VideoDecoder when video?.HasDecoder != true => UsesDiffusionDecoder ? DiffusionVaePath : VideoVaePath,
+            CompanionFile.AudioDecoder when audio?.HasDecoder != true => AudioVaePath,
             _ => null,
         };
         if (path != null && File.Exists(path) && MappedFileReadAhead.TryStart(path, MappedFileReadAhead.WholeFile(path),
@@ -243,109 +311,6 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         return description;
     }
 
-    internal Ltx25SamplingOutput Sample(Ltx25DenoiserInput input, Ltx25GenerationSettings settings, Action<int, int> onStep,
-        CancellationToken cancellationToken = default, float[] sigmas = null,
-        long noiseSeedOffset = Ltx25GenerationSettings.AncestralNoiseSeedOffset)
-    {
-        sigmas ??= Ltx25Scheduler.DistilledSigmas();
-        ArgumentNullException.ThrowIfNull(settings);
-        // Reuse device weights across both sampling stages. Mapped checkpoint and
-        // descriptor identities survive across requests; DecodeVideo releases their
-        // device representation to leave room for full-resolution VAE activations.
-        // The serialized generation lock also protects this single device model.
-        _denoiser ??= new Ltx25Denoiser(CheckpointPath, _allocator, ReferenceLoraPath);
-        try
-        {
-            void Progress(int step, int total)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                onStep?.Invoke(step, total);
-            }
-            return settings.Ancestral
-                ? Ltx25Sampling.RunEulerAncestral(_denoiser, input, sigmas,
-                    step => settings.AncestralNoise(step, input.Video.Length, input.Audio.Length, noiseSeedOffset), Progress, cancellationToken)
-                : Ltx25Sampling.RunEuler(_denoiser, input, sigmas, Progress, cancellationToken);
-        }
-        catch { DisposeOwned(ref _denoiser); throw; }
-    }
-
-    internal float[] DecodeVideo(float[] latents, int frames, int height, int width, long seed,
-        CancellationToken cancellationToken = default)
-    {
-        // Denoising is finished. Its live quantized weights and position tables
-        // otherwise remain resident beside the VAE's full-resolution activations;
-        // ClearCache alone only frees inactive allocator buffers. Retain the mapped
-        // checkpoint and descriptors so the next request can rebind the same weights.
-        _denoiser?.ReleaseDeviceResidency();
-        if (_allocator is MlxAllocator) MlxBackend.ClearCache();
-        else if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
-        if (UsesDiffusionDecoder)
-        {
-            var diffusion = _diffusionDecoder ??= new Ltx25DiffusionVideoDecoder(DiffusionVaePath, _allocator);
-            try { return diffusion.Decode(latents, frames, height, width, seed, cancellationToken); }
-            catch { DisposeOwned(ref _diffusionDecoder); throw; }
-        }
-        var decoder = _videoDecoder ??= new Ltx25VideoVaeDecoder(VideoVaePath, _allocator);
-        try { return decoder.Decode(latents, frames, height, width, cancellationToken); }
-        catch { DisposeOwned(ref _videoDecoder); throw; }
-    }
-
-    /// <summary>Stage-1 to stage-2 spatial upsampling of channel-major normalized
-    /// [128,T,H,W] latents, normalized with the video VAE's per-channel statistics.</summary>
-    internal float[] UpsampleLatents(float[] latents, int frames, int height, int width, CancellationToken cancellationToken = default)
-    {
-        float[] mean, std;
-        using (var vae = new SafetensorsFile(VideoVaePath))
-        {
-            mean = vae.ReadFloat32("per_channel_statistics.mean-of-means");
-            std = vae.ReadFloat32("per_channel_statistics.std-of-means");
-        }
-        var upsampler = _latentUpsampler ??= new Ltx25LatentUpsampler(LatentUpscalerPath, _allocator);
-        try
-        {
-            if (upsampler.LatentChannels != 128 || mean.Length != 128 || std.Length != 128)
-                throw new InvalidDataException("The LTX 2.5 spatial upsampler and video VAE must use 128 latent channels.");
-            return upsampler.Upsample(latents, frames, height, width, mean, std, cancellationToken);
-        }
-        catch { DisposeOwned(ref _latentUpsampler); throw; }
-    }
-
-    internal float[] EncodeImage(float[] rgb, int height, int width, CancellationToken cancellationToken = default)
-    {
-        var encoder = _videoEncoder ??= new Ltx25VideoVaeEncoder(VideoVaePath, _allocator);
-        try { return encoder.EncodeImage(rgb, height, width, cancellationToken); }
-        catch { DisposeOwned(ref _videoEncoder); throw; }
-    }
-
-    internal float[] EncodeReferenceVideo(float[] rgb, int frames, int height, int width, CancellationToken cancellationToken = default)
-    {
-        var encoder = _videoEncoder ??= new Ltx25VideoVaeEncoder(VideoVaePath, _allocator);
-        try { return encoder.Encode(rgb, frames, height, width, cancellationToken); }
-        catch { DisposeOwned(ref _videoEncoder); throw; }
-    }
-
-    internal float[] EncodeStaticReferenceVideo(float[] rgbFrame, int frames, int height, int width, CancellationToken cancellationToken = default)
-    {
-        var encoder = _videoEncoder ??= new Ltx25VideoVaeEncoder(VideoVaePath, _allocator);
-        try { return encoder.EncodeStaticVideo(rgbFrame, frames, height, width, cancellationToken); }
-        catch { DisposeOwned(ref _videoEncoder); throw; }
-    }
-
-    internal GeneratedVideoAudio DecodeAudio(float[] latents, int tokens, int samples,
-        CancellationToken cancellationToken = default)
-    {
-        var decoder = _audioDecoder ??= new Ltx25AudioDecoder(AudioVaePath, _allocator);
-        try { return decoder.Decode(latents, tokens, samples, cancellationToken); }
-        catch { DisposeOwned(ref _audioDecoder); throw; }
-    }
-
-    private static void DisposeOwned<T>(ref T component) where T : class, IDisposable
-    {
-        var previous = component;
-        component = null;
-        previous?.Dispose();
-    }
-
     public override void TrimIdleMemory()
     {
         if (_allocator is MlxAllocator && !MlxWorker.Shared.IsOnWorkerThread)
@@ -355,14 +320,8 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         }
         lock (_generationLock)
         {
-            _promptCache.Clear(); _promptOrder.Clear();
-            DisposeOwned(ref _promptEncoder);
-            DisposeOwned(ref _videoDecoder);
-            DisposeOwned(ref _diffusionDecoder);
-            DisposeOwned(ref _videoEncoder);
-            DisposeOwned(ref _audioDecoder);
-            DisposeOwned(ref _latentUpsampler);
-            DisposeOwned(ref _denoiser);
+            _pipeline?.Dispose();
+            _pipeline = null;
             base.TrimIdleMemory();
             if (_allocator is MlxAllocator) MlxBackend.ClearCache();
             else if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
@@ -397,10 +356,8 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         if (_allocator is MlxAllocator && !MlxWorker.Shared.IsOnWorkerThread && ReferenceLoraPath is { } currentPath &&
             !string.Equals(currentPath, fullPath, StringComparison.Ordinal))
         {
-            // Replacing an adapter can dispose cached MLX projections. First reject a
-            // live generation without waiting behind its worker; otherwise perform the
-            // replacement on that worker. Initial attachment only reads safetensors
-            // metadata and is safe on the capability-query thread.
+            // Replacing an adapter releases its MLX copies. First reject a live generation without waiting behind its worker;
+            // otherwise perform the replacement on that worker.
             if (!Monitor.TryEnter(_generationLock)) return false;
             Monitor.Exit(_generationLock);
             return MlxWorker.Shared.Invoke(() => TryLoadIngredientsAdapter(fullPath));
@@ -410,8 +367,12 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (string.Equals(ReferenceLoraPath, fullPath, StringComparison.Ordinal)) return true;
-            _denoiser?.LoadIngredientsAdapter(fullPath);
+            Ltx25LoraSet loaded = Ltx25LoraSet.Open(fullPath, _gguf, Ltx25Config.FromGguf(_gguf));
+            Ltx25LoraSet previous = _ingredients;
+            (_pipeline?.LoadedDenoiser as Ltx25Denoiser)?.ReleaseLora();
+            Volatile.Write(ref _ingredients, loaded);
             Volatile.Write(ref _referenceLoraPath, fullPath);
+            previous?.Dispose();
             return true;
         }
         finally { Monitor.Exit(_generationLock); }
@@ -423,7 +384,7 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         string configured = Environment.GetEnvironmentVariable("TS_LTX25_INGREDIENTS_LORA");
         string path = !string.IsNullOrWhiteSpace(configured)
             ? configured
-            : Path.Combine(Path.GetDirectoryName(CheckpointPath)!, "loras", "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors");
+            : Path.Combine(Path.GetDirectoryName(CheckpointPath)!, "loras", IngredientsFileName);
         return File.Exists(path) && TryLoadIngredientsAdapter(path);
     }
 
@@ -442,15 +403,10 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         {
             if (_disposed) return;
             _disposed = true;
-            _promptCache.Clear();
-            _promptOrder.Clear();
-            DisposeOwned(ref _promptEncoder);
-            DisposeOwned(ref _videoDecoder);
-            DisposeOwned(ref _diffusionDecoder);
-            DisposeOwned(ref _videoEncoder);
-            DisposeOwned(ref _audioDecoder);
-            DisposeOwned(ref _latentUpsampler);
-            DisposeOwned(ref _denoiser);
+            _pipeline?.Dispose();
+            _pipeline = null;
+            _ingredients?.Dispose();
+            _ingredients = null;
             base.Dispose();
         }
     }

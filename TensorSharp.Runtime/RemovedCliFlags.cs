@@ -213,6 +213,33 @@ namespace TensorSharp.Runtime
             ("TS_H3_KEEP_RESIDENT",
                 "MiniMax-H3's components stay on the device or are released by the diffusion runtime's residency plan, which "
                 + "keeps everything that fits; the switch was removed with the retired pipeline."),
+            // LTX 2.5 runs on the diffusion runtime: its retired direct denoiser's and pipeline's switches, and the prompt
+            // encoder's candidate-kernel switches (each kept the default it had).
+            ("TS_LTX25_CUDA_ATTN", Ltx25KernelSwitchRemoved),
+            ("TS_LTX25_CUDA_FUSED_HEAD_GATE", Ltx25KernelSwitchRemoved),
+            ("TS_LTX25_FUSED_ROPE", Ltx25KernelSwitchRemoved),
+            ("TS_LTX25_CUDA_TILE", Ltx25KernelSwitchRemoved),
+            ("TS_LTX25_CUDA_REQUIRE_TILE", Ltx25KernelSwitchRemoved),
+            ("TS_LTX25_CUDA_F16_DEQUANT", Ltx25KernelSwitchRemoved),
+            ("TS_LTX25_STAGE_TIMING",
+                "LTX 2.5 on the diffusion runtime logs every phase's and step's time ([diffusion] and [ltx25-timing] lines) "
+                + "without a switch; the synchronized per-stage timing of the retired direct denoiser was removed."),
+            ("TS_LTX25_CUDA_PREFAULT",
+                "LTX 2.5 always reads its CUDA weights into the file cache ahead of their upload; the switch was removed."),
+            ("TS_LTX25_CUDA_PREFAULT_WORKERS",
+                "LTX 2.5's CUDA weight read-ahead uses 8 readers on Linux and 1 elsewhere; its own count was removed."),
+            ("TS_LTX25_CUDA_SOURCE_UPLOAD",
+                "LTX 2.5 uploads its CUDA weights from the mapped checkpoint after the file-cache read-ahead; the opt-in "
+                + "pinned source upload was removed."),
+            ("TS_LTX25_DEVICE_PROMPT_MATH",
+                "LTX 2.5's prompt encoder always rounds and rotates on the device where a kernel takes the tensor (bitwise "
+                + "equal to the host path); the switch was removed."),
+            ("TS_LTX25_CUDA_BF16_GEMM",
+                "LTX 2.5's prompt encoder multiplies its BF16 projections natively on CUDA devices of compute capability 8 "
+                + "or newer; the switch was removed."),
+            ("TS_LTX25_MLX_BF16_GEMM",
+                "LTX 2.5's prompt encoder accumulates every MLX projection in F32 through its bias; the BF16 candidate was "
+                + "removed."),
             ("DIFFUSION_CPU_LEGACY", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_MOE", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_PROJ", DiffusionCpuLegacyRemoved),
@@ -703,6 +730,11 @@ namespace TensorSharp.Runtime
 
         private const string CpuPreviousKernelsRemoved =
             "the pure-C# cpu backend always runs its current kernels; the switch back to the previous ones was removed.";
+
+        private const string Ltx25KernelSwitchRemoved =
+            "LTX 2.5's denoiser runs on the diffusion runtime's step programs, whose CUDA executor takes the kernels the retired "
+            + "direct denoiser defaulted to (F32 attention with fused head gates, per-head rotary tables, the K-quant tile and F16 "
+            + "prefill products); the switch between kernels was removed.";
 
         private const string Qwen21KernelSwitchRemoved =
             "Qwen-Image-2.1's transformer runs as the diffusion runtime's graph programs, which choose their kernels per backend "

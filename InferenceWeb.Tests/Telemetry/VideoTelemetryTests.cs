@@ -621,7 +621,7 @@ public sealed class VideoTelemetryTests : IDisposable
     }
 
     /// <summary>
-    /// The reports Ltx25Pipeline makes for a two-stage clip. With <paramref name="heartbeats"/>,
+    /// The reports LTX 2.5 makes for a two-stage clip (its family on the diffusion runtime). With <paramref name="heartbeats"/>,
     /// periodic ticks are interleaved, two of them from another thread; each names a phase, a
     /// stage or a step that would change the trace if it were taken for a report.
     /// </summary>

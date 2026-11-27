@@ -39,7 +39,6 @@ public sealed class Ltx25PromptEncoder : IDisposable
     public double LastConnectorMilliseconds { get; private set; }
     /// <summary>The last encode's weight read-ahead (and whether its cache is being released), or null when none ran.</summary>
     public string LastReadAhead { get; private set; }
-    public long NativeBf16Projections { get; private set; }
     public long CudaMappedProjections { get; private set; }
     public long CudaBf16Projections { get; private set; }
     public long CudaPrefaultReadBytes => _cudaPrefault?.ReadBytes ?? 0;
@@ -47,16 +46,11 @@ public sealed class Ltx25PromptEncoder : IDisposable
     public long CudaPrefaultRanges => _cudaPrefault?.Ranges ?? 0;
     public double CudaPrefaultMilliseconds => _cudaPrefault?.Milliseconds ?? 0;
     public string CudaPrefaultFailure => _cudaPrefault?.Failure;
-    public long CudaSourceUploadedBytes => _cudaPrefault?.SourceUploadedBytes ?? 0;
-    public long CudaSourceUploadedWeights => _cudaPrefault?.SourceUploadedWeights ?? 0;
-    public long CudaSourcePinnedBytes => _cudaPrefault?.SourcePinnedBytes ?? 0;
-    public double CudaSourceUploadMilliseconds => _cudaPrefault?.SourceUploadMilliseconds ?? 0;
     public string CudaModulePath => _video.CudaModulePath;
     public long CudaConnectorProjections => _video.CudaProjections + _audio.CudaProjections;
     public long CudaConnectorAttentions => _video.CudaAttentions + _audio.CudaAttentions;
     private void Count(Ltx25MappedLinear linear)
     {
-        if (linear.UsedNativeBf16) ++NativeBf16Projections;
         if (linear.UsedCudaMapping) ++CudaMappedProjections;
         if (linear.UsedCudaBf16) ++CudaBf16Projections;
     }
@@ -76,8 +70,7 @@ public sealed class Ltx25PromptEncoder : IDisposable
             // projection on older CUDA devices even when the candidate is requested.
             _cudaBf16Supported = allocator is CudaAllocator cuda &&
                 CudaDevice.GetDevice(cuda.DeviceId).ComputeCapabilityMajor >= 8;
-            if (_context.IsCuda && Environment.GetEnvironmentVariable("TS_LTX25_CUDA_PREFAULT") != "0")
-                _cudaPrefault = new(_file);
+            if (_context.IsCuda) _cudaPrefault = new(_file);
             // A text-encoder file cache left behind after encoding competes with the
             // denoiser: 22 GiB of stale Gemma pages added ~10 s to the first 1024x1024
             // denoise step on a 48 GiB M5 Pro, and in a memory-limited container they

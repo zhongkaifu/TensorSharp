@@ -13,6 +13,7 @@ using TensorSharp.MLX;
 using TensorSharp.Models;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Models.Ltx25;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
@@ -35,7 +36,6 @@ if (args is ["--help"])
         Optional: --sampler euler_ancestral|euler, --mode i2v|t2v, --prompt TEXT,
                   --image-strength 0..1 (explicit both-stage strength; omitted uses
                   production image policy), --end-image IMAGE,
-                  --first-stage-image-strength 0..1 (overrides first pass only),
                   --save-rgb 1 (default 0), --decoders none.
         Both decoder paths consume identical normalized channel-major video latents.
         MP4s are silent; joint audio latents are captured but audio is not decoded.
@@ -49,7 +49,7 @@ for (int i = 0; i < args.Length; i += 2)
     if (i + 1 >= args.Length || !args[i].StartsWith("--") || !options.TryAdd(args[i][2..], args[i + 1]))
         throw new ArgumentException("Expected unique --option value pairs; use --help for usage.");
 string[] allowed = ["operation", "model", "prompt-file", "prompt", "image", "end-image", "seed", "width", "height", "frames", "fps",
-    "backend", "output", "decoders", "convolutional-vae", "diffusion-vae", "capture", "sampler", "mode", "save-rgb", "image-strength", "first-stage-image-strength"];
+    "backend", "output", "decoders", "convolutional-vae", "diffusion-vae", "capture", "sampler", "mode", "save-rgb", "image-strength"];
 foreach (string key in options.Keys)
     if (!allowed.Contains(key)) throw new ArgumentException("Unknown option --" + key);
 string Required(string name) => options.GetValueOrDefault(name) ?? throw new ArgumentException("Missing --" + name);
@@ -65,12 +65,6 @@ if (!float.IsFinite(imageStrength) || imageStrength < 0 || imageStrength > 1)
     throw new ArgumentException("--image-strength must be finite and in [0,1].");
 if (options.ContainsKey("image-strength") && (!generatesInputs || !options.ContainsKey("image")))
     throw new ArgumentException("--image-strength requires --operation generate or forward and --image.");
-float? firstStageImageStrength = options.TryGetValue("first-stage-image-strength", out string? firstStrength)
-    ? float.Parse(firstStrength, CultureInfo.InvariantCulture) : null;
-if (firstStageImageStrength is float firstValue && (!float.IsFinite(firstValue) || firstValue < 0 || firstValue > 1))
-    throw new ArgumentException("--first-stage-image-strength must be finite and in [0,1].");
-if (firstStageImageStrength.HasValue && (!generatesInputs || !options.ContainsKey("image")))
-    throw new ArgumentException("--first-stage-image-strength requires --operation generate or forward and --image.");
 string output = Path.GetFullPath(Required("output"));
 if (Directory.Exists(output) && Directory.EnumerateFileSystemEntries(output).Any())
     throw new IOException("Refusing to replace a nonempty output directory.");
@@ -147,14 +141,8 @@ try
             parameters.ImageConditions = [new VideoImageCondition { ImagePath = firstImagePath!, FrameIndex = 0, Strength = imageStrength }];
         }
         Ltx25GenerationSettings requestedSettings = Ltx25GenerationSettings.Resolve(parameters);
-        if (firstStageImageStrength.HasValue && !requestedSettings.TwoStage)
-            throw new ArgumentException("--first-stage-image-strength requires a two-stage generation mode.");
         IReadOnlyList<VideoImageCondition> resolvedGuides = Ltx25ImageConditioning.Resolve(parameters, requestedSettings.Frames);
-        var pipelineType = typeof(Ltx25Model).Assembly.GetType("TensorSharp.Models.Ltx25.Ltx25Pipeline", throwOnError: true)!;
-        var strengthResolver = pipelineType.GetMethod("ResolveFirstStageImageStrength", BindingFlags.NonPublic | BindingFlags.Static)
-            ?? throw new MissingMethodException("Build the shared first-stage image policy before running this probe.");
-        float? resolvedFirstStageOverride = (float?)strengthResolver.Invoke(null,
-            [parameters, requestedSettings.TwoStage, resolvedGuides, firstStageImageStrength]);
+        float? resolvedFirstStageOverride = Ltx25Family.ResolveFirstStageImageStrength(parameters, requestedSettings.TwoStage, resolvedGuides);
         float? refinementStrength = resolvedGuides.FirstOrDefault(guide => guide.FrameIndex == 0)?.Strength;
         float? effectiveFirstStrength = refinementStrength.HasValue ? resolvedFirstStageOverride ?? refinementStrength : null;
         var events = new List<VideoGenerationProgress>();
@@ -174,7 +162,6 @@ try
             refinement = refinementStrength,
             image_strength_explicit = imageStrengthExplicit,
             policy_first_stage_override = resolvedFirstStageOverride,
-            diagnostic_first_stage_override = firstStageImageStrength,
         };
         capturePath = Path.Combine(output, "capture.json");
         var timer = Stopwatch.StartNew();
@@ -184,84 +171,72 @@ try
             if (loaded is not Ltx25Model model) throw new InvalidOperationException("The registered model is not LTX 2.5.");
             report["model_factory_ms"] = timer.Elapsed.TotalMilliseconds;
             report["environment"] = EnvironmentSnapshot();
-            if (operation == "forward")
+            int forwards = 0;
+            // The forward capture: the first step's actual denoiser input and velocity, before the sampler updates anything.
+            Action<DenoiseStepInputs, StepOutput>? observeForward = operation != "forward" ? null : (inputs, step) =>
             {
-                var allocator = (IAllocator)typeof(Ltx25Model).GetProperty("DirectAllocator", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(model)!;
-                var denoiserField = typeof(Ltx25Model).GetField("_denoiser", BindingFlags.Instance | BindingFlags.NonPublic)!;
-                if (denoiserField.GetValue(model) != null) throw new InvalidOperationException("Expected a fresh model before installing the diagnostic denoiser.");
-                var denoiser = new Ltx25Denoiser(modelPath, allocator);
-                try
+                var input = (Ltx25DenoiserInput)inputs.Layout.FamilyLayout;
+                var denoiser = (Ltx25Denoiser)model.LoadedDenoiser!;
+                var velocity = new Ltx25DenoiserOutput(step.Velocity, step.Streams[Ltx25Denoiser.AudioStream], denoiser.Config.Layers);
+                if (++forwards != 1 || velocity.ExecutedBlocks != 48)
+                    throw new InvalidOperationException("Expected exactly one complete 48-block Forward.");
+                if (input.UseReferenceLora) throw new NotSupportedException("Captured official replay does not support Ingredients LoRA.");
+                var config = denoiser.Config;
+                object? Buffer(string name, float[]? values, params int[] shape)
                 {
-                    int forwards = 0;
-                    Action<Ltx25DenoiserInput, Ltx25DenoiserOutput> observeForward = (input, velocity) =>
-                    {
-                        if (++forwards != 1 || velocity.ExecutedBlocks != 48 || velocity.ExecutedBlocks != denoiser.Config.Layers)
-                            throw new InvalidOperationException("Expected exactly one complete 48-block Forward.");
-                        if (input.UseReferenceLora) throw new NotSupportedException("Captured official replay does not support Ingredients LoRA.");
-                        var config = denoiser.Config;
-                        object? Buffer(string name, float[]? values, params int[] shape)
-                        {
-                            if (values == null) return null;
-                            if (shape.Aggregate(1L, (size, dim) => checked(size * dim)) != values.Length)
-                                throw new InvalidDataException("Forward buffer shape mismatch: " + name);
-                            ValidateFloats(values);
-                            string path = Path.Combine(output, name + ".f32");
-                            WriteFloats(path, values);
-                            return new { path, sha256 = HashFile(path), shape, dtype = "float32-le" };
-                        }
-                        var inputs = new Dictionary<string, object?>
-                        {
-                            ["video"] = Buffer("input-video", input.Video, input.VideoTokens, config.VideoChannels),
-                            ["audio"] = Buffer("input-audio", input.Audio, input.AudioTokens, config.AudioChannels),
-                            ["video_context"] = Buffer("input-video-context", input.VideoContext, input.VideoContextTokens, config.VideoContextDim),
-                            ["audio_context"] = Buffer("input-audio-context", input.AudioContext, input.AudioContextTokens, config.AudioContextDim),
-                            ["video_positions"] = Buffer("input-video-positions", input.VideoPositions.Boundaries, input.VideoTokens, 3, 2),
-                            ["audio_positions"] = Buffer("input-audio-positions", input.AudioPositions.Boundaries, input.AudioTokens, 1, 2),
-                            ["video_timesteps"] = Buffer("input-video-timesteps", input.VideoTimesteps, input.VideoTimesteps?.Length ?? 0),
-                            ["audio_timesteps"] = Buffer("input-audio-timesteps", input.AudioTimesteps, input.AudioTimesteps?.Length ?? 0),
-                            ["keyframe_mask"] = Buffer("input-keyframe-mask", input.KeyframeMask, input.VideoTokens),
-                            ["video_denoise_mask"] = Buffer("input-video-denoise-mask", input.VideoDenoiseMask, input.VideoTokens),
-                            ["clean_video"] = Buffer("input-clean-video", input.CleanVideo, input.VideoTokens, config.VideoChannels),
-                        };
-                        _ = Buffer("output-video", velocity.VideoVelocity, input.VideoTokens, config.VideoChannels);
-                        _ = Buffer("output-audio", velocity.AudioVelocity, input.AudioTokens, config.AudioChannels);
-                        string videoPath = Path.Combine(output, "output-video.f32"), audioPath = Path.Combine(output, "output-audio.f32");
-                        var forward = new
-                        {
-                            completed = true, created_utc = DateTimeOffset.UtcNow, backend = backend.ToString().ToUpperInvariant(),
-                            input_mode = "captured", schedule = "forward", output_kind = "velocity",
-                            model = modelPath, model_sha256 = modelHash, config, executed_blocks = velocity.ExecutedBlocks, full_depth = true,
-                            frequency_precision = input.FrequencyPrecision.ToString(), video_sigma = input.VideoSigma, audio_sigma = input.AudioSigma,
-                            use_reference_lora = input.UseReferenceLora,
-                            tokens = new { video = input.VideoTokens, audio = input.AudioTokens, video_context = input.VideoContextTokens, audio_context = input.AudioContextTokens },
-                            inputs, outputs = new { video = videoPath, audio = audioPath },
-                            output_sha256 = new { video = HashFile(videoPath), audio = HashFile(audioPath) },
-                            output_shapes = new { video = new[] { input.VideoTokens, config.VideoChannels }, audio = new[] { input.AudioTokens, config.AudioChannels } },
-                            output_dtype = "float32-le", requested_geometry = new[] { requestedSettings.Width, requestedSettings.Height, requestedSettings.Frames },
-                            stage_geometry = requestedSettings.TwoStage ? new[] { requestedSettings.Width / 2, requestedSettings.Height / 2, requestedSettings.Frames }
-                                : new[] { requestedSettings.Width, requestedSettings.Height, requestedSettings.Frames },
-                            seed = requestedSettings.Seed.ToString(CultureInfo.InvariantCulture), prompt,
-                            first_image_stage_strengths = report["first_image_stage_strengths"], reference_inputs = report["reference_inputs"],
-                            environment = report["environment"], managed_binaries = report["managed_binaries"],
-                            scope = report["scope"], sampler_steps_completed = 0, forward_count = forwards,
-                        };
-                        string manifest = Path.Combine(output, "forward.json");
-                        File.WriteAllText(manifest, JsonSerializer.Serialize(forward, jsonOptions) + "\n");
-                        report["forward_capture"] = manifest;
-                        report["capture_completed"] = true;
-                        SaveReport();
-                        throw new CaptureCompleteException();
-                    };
-                    typeof(Ltx25Denoiser).GetProperty("ForwardObserver", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(denoiser, observeForward);
-                    denoiserField.SetValue(model, denoiser); // Model owns disposal, including the sampler's failure cleanup.
+                    if (values == null) return null;
+                    if (shape.Aggregate(1L, (size, dim) => checked(size * dim)) != values.Length)
+                        throw new InvalidDataException("Forward buffer shape mismatch: " + name);
+                    ValidateFloats(values);
+                    string path = Path.Combine(output, name + ".f32");
+                    WriteFloats(path, values);
+                    return new { path, sha256 = HashFile(path), shape, dtype = "float32-le" };
                 }
-                catch { denoiser.Dispose(); throw; }
-            }
-            var pipeline = typeof(Ltx25Model).Assembly.GetType("TensorSharp.Models.Ltx25.Ltx25Pipeline", throwOnError: true)!;
-            var method = pipeline.GetMethod("Generate", BindingFlags.NonPublic | BindingFlags.Static, null,
-                [typeof(Ltx25Model), typeof(string), typeof(VideoGenerationParams), typeof(Action<Ltx25GenerationSettings, float[], float[]>), typeof(float?)], null)
-                ?? throw new MissingMethodException("Build the diagnostic final-latent overload before running this probe.");
-            Action<Ltx25GenerationSettings, float[], float[]> observer = (settings, video, audio) =>
+                var captured = new Dictionary<string, object?>
+                {
+                    ["video"] = Buffer("input-video", input.Video, input.VideoTokens, config.VideoChannels),
+                    ["audio"] = Buffer("input-audio", input.Audio, input.AudioTokens, config.AudioChannels),
+                    ["video_context"] = Buffer("input-video-context", input.VideoContext, input.VideoContextTokens, config.VideoContextDim),
+                    ["audio_context"] = Buffer("input-audio-context", input.AudioContext, input.AudioContextTokens, config.AudioContextDim),
+                    ["video_positions"] = Buffer("input-video-positions", input.VideoPositions.Boundaries, input.VideoTokens, 3, 2),
+                    ["audio_positions"] = Buffer("input-audio-positions", input.AudioPositions.Boundaries, input.AudioTokens, 1, 2),
+                    ["video_timesteps"] = Buffer("input-video-timesteps", input.VideoTimesteps, input.VideoTimesteps?.Length ?? 0),
+                    ["audio_timesteps"] = Buffer("input-audio-timesteps", input.AudioTimesteps, input.AudioTimesteps?.Length ?? 0),
+                    ["keyframe_mask"] = Buffer("input-keyframe-mask", input.KeyframeMask, input.VideoTokens),
+                    ["video_denoise_mask"] = Buffer("input-video-denoise-mask", input.VideoDenoiseMask, input.VideoTokens),
+                    ["clean_video"] = Buffer("input-clean-video", input.CleanVideo, input.VideoTokens, config.VideoChannels),
+                };
+                _ = Buffer("output-video", velocity.VideoVelocity, input.VideoTokens, config.VideoChannels);
+                _ = Buffer("output-audio", velocity.AudioVelocity, input.AudioTokens, config.AudioChannels);
+                string videoPath = Path.Combine(output, "output-video.f32"), audioPath = Path.Combine(output, "output-audio.f32");
+                var forward = new
+                {
+                    completed = true, created_utc = DateTimeOffset.UtcNow, backend = backend.ToString().ToUpperInvariant(),
+                    input_mode = "captured", schedule = "forward", output_kind = "velocity",
+                    model = modelPath, model_sha256 = modelHash, config, executed_blocks = velocity.ExecutedBlocks, full_depth = true,
+                    frequency_precision = input.FrequencyPrecision.ToString(), video_sigma = input.VideoSigma, audio_sigma = input.AudioSigma,
+                    use_reference_lora = input.UseReferenceLora,
+                    tokens = new { video = input.VideoTokens, audio = input.AudioTokens, video_context = input.VideoContextTokens, audio_context = input.AudioContextTokens },
+                    inputs = captured, outputs = new { video = videoPath, audio = audioPath },
+                    output_sha256 = new { video = HashFile(videoPath), audio = HashFile(audioPath) },
+                    output_shapes = new { video = new[] { input.VideoTokens, config.VideoChannels }, audio = new[] { input.AudioTokens, config.AudioChannels } },
+                    output_dtype = "float32-le", requested_geometry = new[] { requestedSettings.Width, requestedSettings.Height, requestedSettings.Frames },
+                    stage_geometry = requestedSettings.TwoStage ? new[] { requestedSettings.Width / 2, requestedSettings.Height / 2, requestedSettings.Frames }
+                        : new[] { requestedSettings.Width, requestedSettings.Height, requestedSettings.Frames },
+                    seed = requestedSettings.Seed.ToString(CultureInfo.InvariantCulture), prompt,
+                    first_image_stage_strengths = report["first_image_stage_strengths"], reference_inputs = report["reference_inputs"],
+                    environment = report["environment"], managed_binaries = report["managed_binaries"],
+                    scope = report["scope"], sampler_steps_completed = 0, forward_count = forwards,
+                };
+                string manifest = Path.Combine(output, "forward.json");
+                File.WriteAllText(manifest, JsonSerializer.Serialize(forward, jsonOptions) + "\n");
+                report["forward_capture"] = manifest;
+                report["capture_completed"] = true;
+                SaveReport();
+                throw new CaptureCompleteException();
+            };
+            // The final capture: the last pass's latents as its decode reads them, before any decoder runs.
+            Action<Ltx25GenerationSettings, float[], float[]>? observeFinal = operation != "generate" ? null : (settings, video, audio) =>
             {
                 ValidateFloats(video); ValidateFloats(audio);
                 string videoPath = Path.Combine(output, "video-latents.f32"), audioPath = Path.Combine(output, "audio-latents.f32");
@@ -280,15 +255,13 @@ try
                 });
                 report["capture_completed"] = true;
                 SaveReport();
-                // Stop only this diagnostic invocation before decode. The normal
-                // pipeline finally and model Dispose still release every resource.
+                // Stop only this diagnostic invocation before decode. The pipeline's failure cleanup and model Dispose still
+                // release every resource.
                 throw new CaptureCompleteException();
             };
-            try { method.Invoke(null, [model, prompt, parameters, observer, firstStageImageStrength]); }
-            catch (TargetInvocationException error) when (error.InnerException is CaptureCompleteException) { return; }
-            catch (TargetInvocationException error) when (error.InnerException != null)
-            { ExceptionDispatchInfo.Capture(error.InnerException).Throw(); }
-            throw new InvalidOperationException("The pipeline did not emit a final-latent capture.");
+            try { model.Generate(prompt, parameters, new CaptureFamily(new Ltx25Family(model), observeForward, observeFinal)); }
+            catch (CaptureCompleteException) { return; }
+            throw new InvalidOperationException("The pipeline did not emit a capture.");
         }
         if (backend == BackendType.Mlx) MlxWorker.Shared.Invoke(GenerateCapture); else GenerateCapture();
         report["capture_wall_ms"] = timer.Elapsed.TotalMilliseconds;
@@ -381,7 +354,7 @@ try
 catch (Exception error) { report["error"] = error.ToString(); throw; }
 finally { SaveReport(); }
 
-static object EnvironmentSnapshot() => new[] { "MLX_ENABLE_TF32", "TS_LTX25_MLX_BF16_GEMM", "TS_LTX25_DEVICE_PROMPT_MATH",
+static object EnvironmentSnapshot() => new[] { "MLX_ENABLE_TF32",
     "TS_VIDEO_TEXT_ENCODER", "TS_VIDEO_VAE", "TS_VIDEO_DIFFUSION_VAE", "TS_VIDEO_UPSCALER", "TS_MLX_CACHE_LIMIT_MB", "TS_MLX_WIRED_LIMIT_MB" }
     .ToDictionary(name => name, Environment.GetEnvironmentVariable);
 static string HashFile(string path) { using var stream = File.OpenRead(path); return Convert.ToHexStringLower(SHA256.HashData(stream)); }
@@ -452,4 +425,50 @@ sealed record Capture
     public required BufferFile Video { get; init; }
     public required BufferFile Audio { get; init; }
     public Ltx25GenerationSettings? Settings { get; init; }
+}
+
+/// <summary>LTX 2.5's family with two read points: <paramref name="forward"/> sees the first step's denoiser input and output
+/// before the sampler steps, <paramref name="final"/> the last pass's channel-major video latents and token-major audio latents
+/// before the decode. Every hook is the wrapped family's.</summary>
+sealed class CaptureFamily(IVideoDiffusionFamily inner, Action<DenoiseStepInputs, StepOutput>? forward,
+    Action<Ltx25GenerationSettings, float[], float[]>? final) : IVideoDiffusionFamily
+{
+    public string Id => inner.Id;
+    public string DisplayName => inner.DisplayName;
+    public IConditioner CreateConditioner(DiffusionLoad load) => inner.CreateConditioner(load);
+    public IDenoiser CreateDenoiser(DiffusionLoad load, string file) => inner.CreateDenoiser(load, file);
+    public IResidentComponent CreateVideoCodec(DiffusionLoad load) => inner.CreateVideoCodec(load);
+    public IResidentComponent CreateAudioCodec(DiffusionLoad load) => inner.CreateAudioCodec(load);
+    public DiffusionVideoJob Prepare(DiffusionVideoRequest request, DiffusionVideoComponents components) => inner.Prepare(request, components);
+    public ConditioningSet Condition(DiffusionVideoJob job, IConditioner conditioner, CancellationToken ct) => inner.Condition(job, conditioner, ct);
+    public void EncodeVideo(DiffusionVideoJob job, IResidentComponent videoCodec, Action<DiffusionVideoProgress> report, CancellationToken ct)
+        => inner.EncodeVideo(job, videoCodec, report, ct);
+    public void EncodeAudio(DiffusionVideoJob job, IResidentComponent audioCodec, CancellationToken ct) => inner.EncodeAudio(job, audioCodec, ct);
+    public DiffusionStreams InitialStreams(DiffusionVideoJob job) => inner.InitialStreams(job);
+    public DenoiseStepInputs StepInputs(DiffusionVideoJob job, ConditioningSet conditioning, DiffusionStreams state, StepState step)
+        => inner.StepInputs(job, conditioning, state, step);
+    public DiffusionStreams SamplerVelocities(DiffusionVideoJob job, DiffusionStreams state, DenoiseStepInputs inputs, StepOutput output,
+        StepState step)
+    {
+        forward?.Invoke(inputs, output);
+        return inner.SamplerVelocities(job, state, inputs, output, step);
+    }
+    public RgbImage[] DecodeVideo(DiffusionVideoJob job, DiffusionStreams state, IResidentComponent videoCodec,
+        Action<DiffusionVideoProgress> report, CancellationToken ct)
+    {
+        if (final != null)
+        {
+            Ltx25GenerationSettings settings = ((Ltx25Job)job).Settings;
+            float[] video = Ltx25Geometry.UnpackVideo(state[DiffusionStreams.Primary].AsSpan(0, checked(settings.VideoTokens * 128)),
+                settings.VideoTokens, 128);
+            final(settings, video, (float[])state[Ltx25Denoiser.AudioStream].Clone());
+        }
+        return inner.DecodeVideo(job, state, videoCodec, report, ct);
+    }
+    public (float[][] Channels, int SampleRate) DecodeAudio(DiffusionVideoJob job, DiffusionStreams state, IResidentComponent audioCodec,
+        CancellationToken ct) => inner.DecodeAudio(job, state, audioCodec, ct);
+    public DiffusionStreams NextStage(DiffusionVideoJob job, int stage, DiffusionStreams previous, DiffusionVideoComponents components,
+        Action<DiffusionVideoProgress> report, CancellationToken ct) => inner.NextStage(job, stage, previous, components, report, ct);
+    public DiffusionSamplerInputs SamplerInputs(DiffusionVideoJob job, DiffusionStreams state, StepState step)
+        => inner.SamplerInputs(job, state, step);
 }

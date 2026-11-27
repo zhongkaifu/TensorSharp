@@ -52,8 +52,6 @@ var report = new Dictionary<string, object?>
     ["completed"] = false, ["created_utc"] = DateTimeOffset.UtcNow,
     ["inner"] = inner, ["columns"] = columns, ["warmup"] = warmup, ["repeats"] = repeats,
     ["scope"] = "Synthetic resident Q4_K/Q5_K/Q6_K weight-to-F16 conversion only. Compares unchanged primary PTX generic export with the optional owned blockwise converter; exact half-byte parity is required. CUDA-event durations alternate route order and include queued conversion only; synchronized wall times include dispatch, owned validation/cache lookup and waiting. Excludes host upload, allocation, output readback, GEMM, model execution and end-to-end generation.",
-    ["environment"] = new[] { "TS_LTX25_CUDA_TILE", "TS_LTX25_CUDA_F16_DEQUANT", "TS_LTX25_CUDA_REQUIRE_TILE" }
-        .ToDictionary(name => name, Environment.GetEnvironmentVariable),
     ["managed_binaries"] = new[] { Assembly.GetExecutingAssembly(), typeof(CudaAllocator).Assembly, typeof(Tensor).Assembly }
         .Select(assembly => new { name = assembly.GetName().Name, path = assembly.Location, sha256 = HashFile(assembly.Location) }).ToArray(),
     ["cases"] = cases,

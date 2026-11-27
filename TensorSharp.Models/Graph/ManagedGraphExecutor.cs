@@ -195,6 +195,7 @@ namespace TensorSharp.Models.Graph
         }
 
         protected override bool Fuses(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.PairRotary
+            or GraphFusion.FullAttention
             || (kind == GraphFusion.LoraLinear && ServesLoraLinearInPlace) || (kind == GraphFusion.DitAttention && ServesDitAttention)
             || (kind is GraphFusion.AdaLnModulate or GraphFusion.GatedResidual && ServesDitModulation);
 
@@ -264,7 +265,8 @@ namespace TensorSharp.Models.Graph
 
         /// <summary>
         /// A diffusion transformer's full attention (<see cref="GraphFusion.DitAttention"/>, served where
-        /// <see cref="TensorGraphExecutor.ServesDitAttention"/>) as the retired direct CPU DiT ran it: the blocked F32 attention
+        /// <see cref="TensorGraphExecutor.ServesDitAttention"/>, and <see cref="GraphFusion.FullAttention"/> always: the direct CPU
+        /// engines' attention, F32 throughout) as the retired direct CPU DiT ran it: the blocked F32 attention
         /// of DirectOps (each head's query blocks against all keys in an L2-sized scratch, the output written in place). The
         /// region's ops (F16 K and V, then the generic attention) held every head's scores of the whole sequence at once.
         /// </summary>
@@ -297,6 +299,33 @@ namespace TensorSharp.Models.Graph
             return true;
         }
 
+        /// <summary>
+        /// <see cref="GraphFusion.FullAttention"/> as the direct CPU engines attended (DirectOps' blocked F32 attention, through
+        /// <see cref="TryDitAttention"/>), then its head gates where the region has them, as those engines gated each head's rows
+        /// (sigmoid, the scale, a broadcast multiply in place).
+        /// </summary>
+        private bool TryFullAttention(Tensor[] inputs, float[] fp, Tensor[] results)
+        {
+            if (inputs.Length is not (3 or 4) || fp == null || fp.Length < (inputs.Length == 4 ? 2 : 1)) return false;
+            Tensor logits = inputs.Length == 4 ? inputs[3] : null;
+            if (!TryDitAttention(inputs[..3], fp, results)) return false;
+            if (logits != null)
+            {
+                Tensor output = results[0];
+                long rows = output.Sizes[0], heads = logits.ElementCount() / Math.Max(1, rows);
+                using Tensor l2 = Contiguous2(logits, rows, heads);
+                GateHeads(output, l2, (int)heads, fp[1], contiguousGates: false);
+            }
+            return true;
+        }
+
+        private static Tensor Contiguous2(Tensor t, long rows, long cols)
+        {
+            Tensor c = t.IsContiguous() ? t.CopyRef() : Ops.NewContiguous(t);
+            try { return c.View(rows, cols); }
+            finally { c.Dispose(); }
+        }
+
         /// <summary>Tokens of a fused region below which it runs on the calling thread.</summary>
         private const int ParallelRegionRows = 8;
 
@@ -309,6 +338,7 @@ namespace TensorSharp.Models.Graph
             // A diffusion transformer's unmerged LoRA (its weights are leaves of their own, not tensors).
             if (kind == GraphFusion.LoraLinear) return TryLoraLinearInPlace(inputs, weights, ip, results);
             if (kind == GraphFusion.DitAttention) return TryDitAttention(inputs, fp, results);
+            if (kind == GraphFusion.FullAttention) return TryFullAttention(inputs, fp, results);
             if (kind == GraphFusion.AdaLnModulate) return TryAdaLnModulate(inputs, ip, fp, results);
             if (kind == GraphFusion.GatedResidual) return TryGatedResidual(inputs, ip, results);
             foreach (Tensor t in inputs)
@@ -892,6 +922,13 @@ namespace TensorSharp.Models.Graph
             int rows = (int)x.Sizes[0];
             SetStepWidth(rows);
             var result = new Tensor(Allocator, DType.Float32, rows, weight.Ne1);
+            // The direct engines' CPU linear (DirectProducts): the managed quantized product over the stored blocks, an F32
+            // weight (a LoRA factor) on the SIMD SGEMM over its values, as DirectLinear held them.
+            if (DirectProducts && (weight.ExactProducts || weight.Format == GraphFormat.F32) && weight.Ne2 <= 1)
+            {
+                TensorSharp.Models.Direct.DirectOps.CpuGemmABt(x, DirectF32(weight), result, 1f, 0f);
+                return result;
+            }
             if (FloatProducts && weight.Ne2 <= 1)
             {
                 using var values = new Tensor(Allocator, DType.Float32, weight.Ne1, weight.Ne0);
@@ -951,6 +988,30 @@ namespace TensorSharp.Models.Graph
                 return result;
             result.Dispose();
             return base.ExpertProducts(set, rows, offsets, run);
+        }
+
+        // The F32 weights of direct products as tensors (DirectLinear's own copies), by host address; Invalidate drops one.
+        private readonly System.Collections.Generic.Dictionary<IntPtr, Tensor> _directF32 = new();
+
+        private unsafe Tensor DirectF32(IGraphWeight weight)
+        {
+            lock (_directF32)
+            {
+                if (_directF32.TryGetValue(weight.Data, out Tensor cached)) return cached;
+                if (weight.Format != GraphFormat.F32 || weight.Bytes != weight.Ne0 * weight.Ne1 * sizeof(float))
+                    throw new NotSupportedException($"an exact product reads an F32 weight, not format {weight.Format}");
+                var values = new Tensor(Allocator, DType.Float32, weight.Ne1, weight.Ne0);
+                Buffer.MemoryCopy((void*)weight.Data, TensorComputePrimitives.GetFloatPointer(values), weight.Bytes, weight.Bytes);
+                return _directF32[weight.Data] = values;
+            }
+        }
+
+        /// <summary>Drops the F32 copy a direct product made of the weight at <paramref name="data"/>.</summary>
+        public override void Invalidate(IntPtr data)
+        {
+            base.Invalidate(data);
+            lock (_directF32)
+                if (_directF32.Remove(data, out Tensor t)) t.Dispose();
         }
 
         /// <summary>Rows of a weight one parallel chunk of <see cref="DequantizeValues"/> takes at least.</summary>

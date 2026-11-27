@@ -62,6 +62,13 @@ namespace TensorSharp.Models.SharedDiffusion
     {
         /// <summary>First-order Euler on the flow ODE (<see cref="EulerFlowSampler"/>).</summary>
         EulerFlow,
+
+        /// <summary>Euler through the x0 estimate, with a per-token denoise mask (<see cref="EulerDenoisedSampler"/>).</summary>
+        EulerDenoised,
+
+        /// <summary>Ancestral Euler (eta 1) with a per-token denoise mask, renoised from the family's step noise
+        /// (<see cref="EulerAncestralSampler"/>).</summary>
+        EulerAncestral,
     }
 
     /// <summary>
@@ -207,6 +214,8 @@ namespace TensorSharp.Models.SharedDiffusion
         public IDiffusionSampler CreateSampler() => Sampler switch
         {
             DiffusionSamplerKind.EulerFlow => new EulerFlowSampler(),
+            DiffusionSamplerKind.EulerDenoised => new EulerDenoisedSampler(),
+            DiffusionSamplerKind.EulerAncestral => new EulerAncestralSampler(),
             _ => throw new NotSupportedException($"Sampler {Sampler} is not implemented."),
         };
 

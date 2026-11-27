@@ -23,6 +23,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
+    <InternalsVisibleTo Include="Ltx25LatentProbe" />
     <InternalsVisibleTo Include="QwenImage21CompanionProbe" />
     <InternalsVisibleTo Include="QwenImage21DenoiserAB" />
     <InternalsVisibleTo Include="CpuQuantBench" />

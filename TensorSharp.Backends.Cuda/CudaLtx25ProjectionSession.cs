@@ -31,11 +31,6 @@ public sealed class CudaLtx25ProjectionSession : IDisposable
     {
         _allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
         ModulePath = CudaKernels.LocatePtxPath("tensorsharp_ltx25.ptx");
-        if (Environment.GetEnvironmentVariable("TS_LTX25_CUDA_TILE") == "0")
-        {
-            if (requireNative) throw new InvalidOperationException("LTX CUDA projection module was explicitly disabled.");
-            return;
-        }
         try
         {
             if (ModulePath == null) throw new NotSupportedException("tensorsharp_ltx25.ptx was not found.");
@@ -43,15 +38,9 @@ public sealed class CudaLtx25ProjectionSession : IDisposable
             _module = CudaModule.LoadFromFile(ModulePath);
             _tile8 = _module.GetFunction("ts_ltx25_quant_tile8_f32");
             _tile16 = _module.GetFunction("ts_ltx25_quant_tile16_f32");
-            string f16Setting = Environment.GetEnvironmentVariable("TS_LTX25_CUDA_F16_DEQUANT");
-            bool requireF16Export = requireNative && (enableF16 || f16Setting == "1");
-            if (enableF16 || f16Setting != "0")
-            {
-                try { _dequantF16 = _module.GetFunction("ts_ltx25_dequant_k_f16"); }
-                // Tile-only older PTX remains usable under default auto mode.
-                // Explicitly required F16 diagnostics still fail closed.
-                catch when (!requireF16Export) { _dequantF16 = IntPtr.Zero; }
-            }
+            try { _dequantF16 = _module.GetFunction("ts_ltx25_dequant_k_f16"); }
+            // A tile-only older module still serves the small-row products; a caller that requires the F16 route fails.
+            catch when (!(requireNative && enableF16)) { _dequantF16 = IntPtr.Zero; }
         }
         catch (Exception error)
         {

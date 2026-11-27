@@ -30,7 +30,7 @@ BM25 检索不需要嵌入模型。可选 GGUF 嵌入增加语义检索；聊天
 
 ### 当前媒体生成模型
 
-**LTX 2.5 Distilled** 使用发布方两阶段配方：半尺寸八步 ancestral Euler、必需的 x2 潜变量上采样，再在全尺寸执行三步细化，CFG 均为 1。支持文本、首尾/定时关键帧，以及可选 Ingredients IC-LoRA 身份参考板（独立单阶段参考配方），输出视频与 48 kHz 立体声音频。CUDA 与 MLX 使用自有执行器，包括 `ggml_cuda` / `ggml_metal` 别名；CPU 使用直接实现。Vulkan、多 GPU、参考视频/音频不支持。默认卷积视频 VAE，CPU/MLX 可另选扩散解码器。下载、质量限制、应用覆盖和修正配方见[模型卡片](models/ltx-2.5_zh-cn.md)；旧单阶段计时不代表当前默认配方。
+**LTX 2.5 Distilled** 使用发布方两阶段配方：半尺寸八步 ancestral Euler、必需的 x2 潜变量上采样，再在全尺寸执行三步细化，CFG 均为 1。支持文本、首尾/定时关键帧，以及可选 Ingredients IC-LoRA 身份参考板（独立单阶段参考配方），输出视频与 48 kHz 立体声音频。它运行在扩散运行时上：每步是后端 tensor executor 上的一个图程序（CUDA 与 MLX，包括 `ggml_cuda` / `ggml_metal` 别名，以及托管 CPU 执行器）。Vulkan、多 GPU、参考视频/音频不支持。默认卷积视频 VAE，CPU/MLX 可另选扩散解码器。下载、质量限制、应用覆盖和修正配方见[模型卡片](models/ltx-2.5_zh-cn.md)；旧单阶段计时不代表当前默认配方。
 
 **MiniMax-H3** 区分 FL2VA（文本/关键帧）和 Ref2VA（参考媒体）检查点，生成 32 kHz 立体声，CFG 1，默认 20 步。六条 CPU/MLX/CUDA 原生或直接路径均有组件覆盖，修正后的 CPU 完整配对生成仍待验证。最新四条 GPU 路径保真检查使用未修改 ggml `3612c0af93f2cfc8f048295300a61187723b12ae`。两轮完整进程 A/B 保持解码 RGB/音频精确相同，原生 Metal、MLX、同精度 Direct CUDA 延迟分别降低 5.0%、12.5%、19.0%；原生 CUDA 的 1.3% 不构成有意义提速。数据包含加载/编码且缓存未受控。CUDA BF16 权重投影现默认 pedantic F32；实验性批量注意力未通过完整生成质量门禁，模型入口已移除。独立数值门禁和基准限制见[模型卡片](models/minimax-h3_zh-cn.md)与[验证流程](../eng/validation/README-minimax-h3.md)。
 

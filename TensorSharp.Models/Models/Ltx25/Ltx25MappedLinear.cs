@@ -21,7 +21,6 @@ internal sealed class Ltx25MappedLinear : IDisposable
     private readonly Ltx25CudaFilePrefault _prefault;
     internal int Input { get; }
     internal int Output { get; }
-    internal bool UsedNativeBf16 { get; private set; }
     internal bool UsedCudaMapping { get; private set; }
     internal bool UsedCudaBf16 { get; private set; }
 
@@ -45,9 +44,9 @@ internal sealed class Ltx25MappedLinear : IDisposable
         {
             if (_context.IsCuda)
             {
-                _prefault?.Prepare(_context.CudaAllocator, _pointer, checked(_file.DataOffset + _info.Begin), _info.ByteCount,
-                    _type, Input, Output, cancellationToken);
-                bool nativeBf16 = _cudaBf16Supported && bf16 && _type == 30 && Environment.GetEnvironmentVariable("TS_LTX25_CUDA_BF16_GEMM") != "0";
+                cancellationToken.ThrowIfCancellationRequested();
+                _prefault?.Prepare(_pointer, checked(_file.DataOffset + _info.Begin), _info.ByteCount);
+                bool nativeBf16 = _cudaBf16Supported && bf16 && _type == 30;
                 bool completed = nativeBf16
                     ? CudaQuantizedOps.TryAddmmQuantizedToFloat32(result, input, _pointer, _pointer, _type, Input, Output, _info.ByteCount)
                     : CudaMiniMaxH3Ops.TryMappedDense(result, input, _pointer, _type, Input, Output, _info.ByteCount);
@@ -58,13 +57,9 @@ internal sealed class Ltx25MappedLinear : IDisposable
             }
             else if (_context.IsMlx)
             {
-                // MLX BF16 addmm can round the product before adding its bias.
-                // Keep learned aggregates on F32 accumulation through the bias.
-                bool nativeBf16 = bf16 && _type == 30 && _bias == null && Environment.GetEnvironmentVariable("TS_LTX25_MLX_BF16_GEMM") == "1";
-                if (!MlxLtx25PromptOps.TryMappedDense(result, input, _pointer, _type, Input, Output,
-                    nativeBf16))
+                // MLX BF16 addmm can round the product before adding its bias: every projection accumulates in F32.
+                if (!MlxLtx25PromptOps.TryMappedDense(result, input, _pointer, _type, Input, Output, false))
                     throw new NotSupportedException("MLX mapped LTX dense projection is unavailable.");
-                UsedNativeBf16 = nativeBf16;
             }
             else
             {

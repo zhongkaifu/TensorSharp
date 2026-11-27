@@ -4,7 +4,9 @@ Status: stages S1-S8 and S10 implemented. MiniMax-H3-Image (text to image, editi
 edits, multi-turn, LoRA plug-ins) runs only on the diffusion runtime; the legacy model was deleted in S10, after its
 outputs were frozen as golden fixtures (see "S10, as built" under section 1.6). S9 (tensor parallelism) and S11 (the
 conditioner on the shared decoder runtime) are design. Qwen-Image-2.1 (and Turbo) has since moved onto the runtime too,
-and its legacy pipeline was deleted the same way ([section 3.10](#310-qwen-image-21-on-the-runtime-as-built)).
+and its legacy pipeline was deleted the same way ([section 3.10](#310-qwen-image-21-on-the-runtime-as-built)), and so
+have MiniMax-H3 video ([section 3.11](#311-minimax-h3-video-on-the-runtime-as-built)) and LTX 2.5 with its Ingredients
+IC-LoRA ([section 3.12](#312-ltx-25-on-the-runtime-as-built)).
 Corrections made while implementing are marked "(S5)", "(S6)" and so on below. Written 2026-11-19 on `feature/h3-image-unified` (cut from `origin/main` ec702639) at ggml `cd6d2b75`; since
 the merge of `origin/main` 19bfb073 (S10) the series builds against main's and CI's pin, ggml `d9fe7bff`, unchanged
 (AGENTS.md). Every statement about upstream is from the sources listed in
@@ -491,7 +493,7 @@ flow models) at a reduced size through `IVaeCodec.Preview`, with masked previews
 | MiniMax-H3 video (`MiniMaxH3Pipeline`) | two streams (video, audio) with different shifts and a velocity scale (`ShiftSlope`); keyframes and Ref2VA references; audio VAE; video preview | `StepOutput` with several named outputs; a recipe with per-stream sigmas; `IVaeCodec` per modality; the same layout and segment machinery (H3-Image's layout is a subset) |
 | Qwen-Image-2.1 (migrated: §3.10) | CFG (two branches); a prefix K/V cache (text and reference rows are modulated at t = 0 and do not attend to the target, so their K/V are fixed across steps); Philox noise; DiT TP; PDD LoRA heads (Fun-Acc: per-step heads replacing `proj_out`) | `DiffusionGuidance.Cfg`, batched as two sequences; `DenoiserCaps.PrefixCacheable` (State leaves for the cached K/V); `INoiseSource`; §3.6; the "heads by step" policy (§5.4), the same idea as H3's PDD |
 | Wan 2.x (`WanVideoModel`) | T5 conditioner; UniPC multistep (sampler state); CFG; causal 3-D VAE in temporal chunks; A14B's two experts switched by sigma | stateful `ISampler`; a recipe with `DenoiserStage[]` selected by sigma range |
-| LTX 2.5 (`Ltx25Pipeline`) | Gemma prompt encoder plus connector; audio and video; two stages (base, then latent upsampler, then refine with a distilled LoRA); IC-LoRA references | `SamplingRecipe.Stages` with a latent transform between stages; per-stage adapter sets |
+| LTX 2.5 (migrated: §3.12) | Gemma prompt encoder plus connector; audio and video; two passes (half size, then the x2 latent upsampler, then refinement at full size); ancestral Euler with per-token guide masks; the Ingredients IC-LoRA for identity references | `DiffusionVideoJob.Stages` with `IVideoDiffusionFamily.NextStage` between passes; `IConditionedSampler` (`SamplerInputs`: noise, denoise mask, clean latents); the Ingredients set as an `AdapterSet` |
 
 ### 3.10 Qwen-Image-2.1 on the runtime (as built)
 
@@ -574,6 +576,36 @@ changed numerically, as close to two F32 references as the retired merged route 
 2-13% faster and managed `cpu` 2-6% faster. Each served region of the tensor executors replaced a measured regression
 against the retired direct DiT (the model card lists them). The model card has the timings. Not yet validated on Metal or
 MLX hardware.
+
+### 3.12 LTX 2.5 on the runtime (as built)
+
+LTX 2.5 Distilled (text, image guides at any frame, keyframes, and the Ingredients identity references) runs only on the
+diffusion runtime's video pipeline. The bespoke `Ltx25Pipeline`, its sampling loop (`Ltx25Sampling`), the direct denoiser
+that ran each op through `DirectContext`/`DirectOps` and the Ingredients adapter that added B (A x) beside each direct
+projection (`Ltx25LoraAdapter`) were deleted once their steps were frozen.
+
+| Piece | On the runtime |
+|---|---|
+| Pipeline | `DiffusionVideoPipeline` with passes: `DiffusionVideoJob.Stages` (named `first-pass` and `refinement`, or `single-pass`), each with its sigmas; between two passes the family's `NextStage` makes the next pass's state (the x2 latent upsampler, the guides encoded again at full size, fresh noise at the refinement's first sigma); progress reports the pass as its stage and numbers steps across passes |
+| Family | `Ltx25Family`: the request's settings (`Ltx25GenerationSettings`), image guides and Ingredients references, the publisher's .7 first-pass strength for a shorthand first image, Philox noise for both streams (initial and per step), the per-token timesteps of guided tokens (`StepInput`: denoise weight times sigma), the keyframe markers, companion prefetch, and the decodes |
+| Samplers | `EulerDenoisedSampler` and `EulerAncestralSampler` (`IConditionedSampler`): Euler through the x0 estimate and the distilled pipeline's euler_ancestral loop (eta 1, noise scale 1), each blending guided tokens toward their clean latents by the denoise mask before and after the step, in the reference's float32 order; the family hands each stream its noise, mask and clean latents (`SamplerInputs`) |
+| Denoiser | `Ltx25Denoiser`: the 48 AV blocks emitted as one `GraphProgram` a step in the direct denoiser's op order, on the backend's tensor executor (`cuda`, `mlx`, managed `cpu`) with direct products (`TensorGraphExecutor.DirectProducts`: each product on the kernel `DirectLinear` took on that backend; on CUDA the F16 prefill GEMM over K-quant weights, the tile kernels over 2-31 rows, pedantic F32 for exact adapter factors). New regions carry what the direct denoiser fused: `HeadRotary` (the q/k RMS norm, then per-head NeoX tables in place), `FullAttention` (the bounded pedantic F32 attention past 512 queries and keys, the streaming F32 kernel below, with the fused `2 * sigmoid` head gate) and `RowNorm`; the CUDA executor serves them with the direct engines' kernels (`CudaGraphExecutor.DirectDit`), MLX with its SDPA and fused rope, managed CPU with its blocked attention. A pass's later steps rerun the program its first step compiled, writing only the new timestep features (the sampler steps the same arrays in place); other geometries find their plan by signature |
+| LoRA | `Ltx25LoraSet` as an `AdapterSet` (the adapters' payload): the Ingredients pairs validated against the checkpoint at open, read and widened exactly to F32 on first use (preloaded in the background when a reference clip starts), applied unmerged as `y + B (A x)` products with exact F32 weights; bound to one plan generation, released before a set is replaced |
+| Components | `Ltx25Conditioner` (the Gemma 4 encoder and connectors, a four-entry prompt cache, device copies released after each new prompt), `Ltx25VideoCodec` (encoder, convolutional or diffusion decoder, upsampler) and `Ltx25AudioCodec`; the denoiser releases its device copies after its phase (`ReleaseAfterPhase`), as the direct denoiser did before the decode |
+
+Runtime pieces added for it, all family-neutral: passes (`Stages`, `NextStage`, `StepState.Stage`), conditioned samplers
+(`IConditionedSampler`, `SamplerInputs`, `DiffusionSamplerKind.EulerDenoised`/`EulerAncestral`), the `HeadRotary`,
+`FullAttention` and `RowNorm` regions with their reference ops, `IGraphWeight.ExactProducts`, and the executors'
+`DirectProducts` mode. ggml stays unpatched.
+
+The direct denoiser's and pipeline's switches went with it (`TS_LTX25_CUDA_ATTN`, `TS_LTX25_CUDA_FUSED_HEAD_GATE`,
+`TS_LTX25_FUSED_ROPE`, `TS_LTX25_CUDA_TILE`, `TS_LTX25_CUDA_REQUIRE_TILE`, `TS_LTX25_CUDA_F16_DEQUANT`,
+`TS_LTX25_STAGE_TIMING`, `TS_LTX25_CUDA_SOURCE_UPLOAD` with its upload session), and so did the prompt encoder's
+candidate-kernel switches (`TS_LTX25_CUDA_PREFAULT`, `TS_LTX25_CUDA_PREFAULT_WORKERS`, `TS_LTX25_DEVICE_PROMPT_MATH`,
+`TS_LTX25_CUDA_BF16_GEMM`, `TS_LTX25_MLX_BF16_GEMM`), each keeping the default it had; `RemovedCliFlags` refuses each at
+startup with what to do instead. `TS_LTX25_INGREDIENTS_LORA` (the adapter's path) stays.
+
+Evidence: see the [model card](../models/ltx-2.5.md#diffusion-runtime-migration-2026-11-27).
 
 ---
 

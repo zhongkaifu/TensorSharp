@@ -462,5 +462,85 @@ namespace TensorSharp.Graph
             g.EndFused(stackalloc[] { y });
             return y;
         }
+
+        /// <summary>
+        /// <see cref="GraphFusion.HeadRotary"/>: x [d * heads, rows] (contiguous), RMS-normed over each whole row times
+        /// <paramref name="normWeight"/> [d * heads] first where one is given (-1: none), then rotated half against half by
+        /// tables cos and sin [d / 2, heads, rows] that differ per head: [x1 cos - x2 sin, x2 cos + x1 sin], each product its
+        /// own op (the two halves copied out first), the halves concatenated back. Returns [d, heads, rows].
+        /// </summary>
+        public static int HeadRotary(GraphProgramBuilder g, int x, int cos, int sin, long d, long heads, long rows, int normWeight = -1,
+            float eps = 0f)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            if (d <= 0 || d % 2 != 0) throw new ArgumentOutOfRangeException(nameof(d), "a rotated head has an even, positive width");
+            if (normWeight >= 0) g.BeginFused(GraphFusion.HeadRotary, stackalloc[] { x, cos, sin, normWeight }, stackalloc long[] { 1 }, stackalloc[] { eps });
+            else g.BeginFused(GraphFusion.HeadRotary, stackalloc[] { x, cos, sin }, stackalloc long[] { 0 });
+            int normed = normWeight >= 0 ? RowNorm(g, x, normWeight, layer: false, eps) : x;
+            long half = d / 2, nb1 = d * F, nb2 = d * heads * F;
+            int first = g.Op(GraphOp.Cont, View3(g, normed, half, heads, rows, nb1, nb2, 0));
+            int second = g.Op(GraphOp.Cont, View3(g, normed, half, heads, rows, nb1, nb2, half * F));
+            int r1 = g.Op(GraphOp.Sub, g.Op(GraphOp.Mul, first, cos), g.Op(GraphOp.Mul, second, sin));
+            int r2 = g.Op(GraphOp.Add, g.Op(GraphOp.Mul, second, cos), g.Op(GraphOp.Mul, first, sin));
+            int y = Concat(g, r1, r2, 0);
+            g.EndFused(stackalloc[] { y });
+            return y;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.HeadGate"/>: attn [d * heads, rows] times <paramref name="scale"/> * sigmoid(logits) per head,
+        /// logits [heads, rows]: the sigmoid, the scale, then a multiply of attn viewed [d, heads, rows] by the gates viewed
+        /// [1, heads, rows]. Returns [d * heads, rows].
+        /// </summary>
+        public static int HeadGate(GraphProgramBuilder g, int attn, int logits, long d, long heads, long rows, float scale)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            g.BeginFused(GraphFusion.HeadGate, stackalloc[] { attn, logits }, default, stackalloc[] { scale });
+            int gates = Scale(g, g.Op(GraphOp.Sigmoid, logits), scale);
+            int g3 = g.Op(GraphOp.Reshape, stackalloc[] { gates }, stackalloc long[] { 1, heads, rows });
+            int a3 = g.Op(GraphOp.Reshape, stackalloc[] { attn }, stackalloc long[] { d, heads, rows });
+            int y = g.Op(GraphOp.Reshape, stackalloc[] { g.Op(GraphOp.Mul, a3, g3) }, stackalloc long[] { d * heads, rows });
+            g.EndFused(stackalloc[] { y });
+            return y;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.RowNorm"/>: the RMS norm (<paramref name="layer"/> false) or the layer norm of x's rows [n, rows],
+        /// times <paramref name="weight"/> [n] (-1: none). Returns [n, rows].
+        /// </summary>
+        public static int RowNorm(GraphProgramBuilder g, int x, int weight, bool layer, float eps)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            if (weight >= 0) g.BeginFused(GraphFusion.RowNorm, stackalloc[] { x, weight }, stackalloc long[] { layer ? 1 : 0, 1 }, stackalloc[] { eps });
+            else g.BeginFused(GraphFusion.RowNorm, stackalloc[] { x }, stackalloc long[] { layer ? 1 : 0, 0 }, stackalloc[] { eps });
+            int y = g.Op(layer ? GraphOp.Norm : GraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps });
+            if (weight >= 0) y = g.Op(GraphOp.Mul, y, weight);
+            g.EndFused(stackalloc[] { y });
+            return y;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.FullAttention"/>: softmax(scale q k^T) v per head in F32 over q [d, heads, rows] and k, v [d,
+        /// heads, keys] (contiguous): each permuted to [d, rows, heads] and copied, an F32 flash attention, the result [d * heads,
+        /// rows]; then, given <paramref name="gateLogits"/> [heads, rows] (-1: none), each head's rows times
+        /// <paramref name="gateScale"/> * sigmoid(logit) (a nested <see cref="GraphFusion.HeadGate"/>).
+        /// </summary>
+        public static int FullAttention(GraphProgramBuilder g, int q, int k, int v, long d, long heads, long rows, float scale,
+            int gateLogits = -1, float gateScale = 0f)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            if (gateLogits >= 0) g.BeginFused(GraphFusion.FullAttention, stackalloc[] { q, k, v, gateLogits }, default, stackalloc[] { scale, gateScale });
+            else g.BeginFused(GraphFusion.FullAttention, stackalloc[] { q, k, v }, default, stackalloc[] { scale });
+            Span<long> permute = stackalloc long[] { 0, 2, 1, 3 };
+            int qp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { q }, permute));
+            int kp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { k }, permute));
+            int vp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { v }, permute));
+            int attention = g.Op(GraphOp.FlashAttnExt, stackalloc[] { qp, kp, vp }, stackalloc long[] { PrecisionF32 },
+                stackalloc[] { scale, 0f, 0f });
+            int y = g.Op(GraphOp.Reshape, stackalloc[] { g.Op(GraphOp.Cont, attention) }, stackalloc long[] { d * heads, rows });
+            if (gateLogits >= 0) y = HeadGate(g, y, gateLogits, d, heads, rows, gateScale);
+            g.EndFused(stackalloc[] { y });
+            return y;
+        }
     }
 }

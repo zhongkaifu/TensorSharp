@@ -62,7 +62,7 @@ public sealed class Ltx25ReferenceConditioningTests
         Assert.Equal(preserved, reference); Close(Values(fixture.GetProperty("noise")), input.Video);
         var steps = fixture.GetProperty("steps").EnumerateArray().ToArray();
         int step = 0;
-        var result = Ltx25Sampling.RunEuler(current =>
+        var result = Ltx25SamplerLoop.Run(current =>
         {
             Assert.True(current.UseReferenceLora);
             Close(step == 0 ? Values(fixture.GetProperty("initial")) : Values(steps[step - 1].GetProperty("output")), current.Video);
@@ -127,7 +127,7 @@ public sealed class Ltx25ReferenceConditioningTests
         Assert.Equal(referencedVideo, referenced.Video); Assert.Equal(referencedClean, referenced.CleanVideo);
         var steps = expected.GetProperty("steps").EnumerateArray().ToArray();
         int step = 0;
-        var result = Ltx25Sampling.RunEuler(current =>
+        var result = Ltx25SamplerLoop.Run(current =>
         {
             Assert.True(current.UseReferenceLora);
             Close(differences, "step_input", step == 0 ? Values(expected.GetProperty("initial")) : Values(steps[step - 1].GetProperty("output")), current.Video);
