@@ -393,6 +393,13 @@ namespace TensorSharp.Cuda
                 base.AddAttentionMask(scores, mask);
         }
 
+        /// <summary>A sink attention (a drafter's sink layers) on the generic products, after the held cache writes it may read.</summary>
+        protected override Tensor FlashAttentionWithSinks(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale, Tensor sinks)
+        {
+            FlushHeldWrites();
+            return base.FlashAttentionWithSinks(q, k, v, mask, scale, sinks);
+        }
+
         /// <summary>
         /// Attention over cache windows with the per-op path's kernels: a decode row runs the GQA decode kernel
         /// on the head-first cache in place (F32 or F16); a prompt chunk expands the window's KV heads, runs the
@@ -2098,6 +2105,30 @@ namespace TensorSharp.Cuda
             return result;
         }
 
+        /// <summary>ggml_ssm_scan (Mamba-2) as one kernel, where every sequence starts from its own state row (the ids every
+        /// family emits); other layouts take the host reference.</summary>
+        protected override Tensor SsmScan(Tensor state, Tensor x, Tensor dt, Tensor a, Tensor b, Tensor c, int[] ids, int keep)
+        {
+            CudaGraphKernels kernels = Kernels;
+            bool identity = true;
+            for (int i = 0; i < ids.Length; i++) identity &= ids[i] == i;
+            int stateSize = (int)b.Sizes[3];
+            if (kernels == null || !identity || stateSize > 256
+                || !Array.TrueForAll(new[] { state, x, dt, a, b, c }, t => t.Storage is CudaStorage && t.IsContiguous() && t.ElementType == DType.Float32))
+                return base.SsmScan(state, x, dt, a, b, c, ids, keep);
+            int ns = (int)x.Sizes[0], nt = (int)x.Sizes[1], nh = (int)x.Sizes[2], hd = (int)x.Sizes[3], ng = (int)b.Sizes[2];
+            int slots = Math.Max(1, keep);
+            long yFloats = (long)ns * nt * nh * hd, perSlot = (long)ns * nh * hd * stateSize;
+            var result = new Tensor(Allocator, DType.Float32, yFloats + perSlot * slots);
+            // A slot older than the step's tokens stays zero, as ggml leaves it.
+            if (slots > nt)
+                using (Tensor flat = result.Narrow(0, yFloats + perSlot * nt, perSlot * (slots - nt)))
+                    Ops.Fill(flat, 0f);
+            Launch(new[] { state, x, dt, a, b, c }, result, (k, stream) => k.LaunchSsmScan(Ptr(state), Ptr(x), Ptr(dt), Ptr(a), Ptr(b), Ptr(c),
+                IntPtr.Zero, Ptr(result), nh, hd, ng, stateSize, nt, ns, slots, stream));
+            return result;
+        }
+
         /// <summary>ggml_ssm_conv as one kernel.</summary>
         protected override Tensor SsmConv(Tensor x, Tensor kernel)
         {
@@ -3550,7 +3581,7 @@ namespace TensorSharp.Cuda
         /// steps (prompt chunks, verify windows, routes read on the host) take the executor's own path.
         /// </summary>
         protected override Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run, int activation = 0, bool fusedGateUp = false)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false, Value upScales = default)
         {
             // The doorbell's and the staged paths' kernels run SwiGLU over separate gate and up stacks; a fused GeGLU layer
             // (Gemma 4) takes the executor's own path: its device routes through the generic ops, the host's through the
@@ -3575,7 +3606,7 @@ namespace TensorSharp.Cuda
             }
             FlushTrades();
             HostExpertFallbacks++;
-            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run, activation, fusedGateUp);
+            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run, activation, fusedGateUp, upScales);
         }
 
         /// <summary>Host-expert calls the doorbell served, and calls that fell to the base executor's host path (routes read

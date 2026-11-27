@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using TensorSharp.GGML;
+using TensorSharp.Graph;
 
 namespace TensorSharp.Models;
 
@@ -13,9 +14,12 @@ namespace TensorSharp.Models;
 /// NVIDIA Nemotron Omni's Parakeet FastConformer and sound projector. The audio
 /// companion retains the official sound_encoder/sound_projection tensor names.
 /// Each clip is encoded separately, so padding from a neighbouring clip cannot
-/// change its length or leak into its bidirectional attention.
+/// change its length or leak into its bidirectional attention. An F32-compute
+/// companion runs as a graph program on the model allocator's executor
+/// (NemotronAudioEncoder.Graph.cs); this file's managed path serves a
+/// BF16-emulating one, and is the graph path's reference.
 /// </summary>
-public sealed class NemotronAudioEncoder : IDisposable
+public sealed partial class NemotronAudioEncoder : IDisposable
 {
     private const string Encoder = "sound_encoder.encoder.";
     private readonly IAllocator _allocator;
@@ -34,6 +38,13 @@ public sealed class NemotronAudioEncoder : IDisposable
         : this(path, allocator, null) { }
 
     internal NemotronAudioEncoder(string path, IAllocator allocator, Action<string, float[]> trace)
+        : this(path, allocator, trace, null) { }
+
+    /// <param name="graphBackend">Where set, an F32-compute companion encodes as graph programs on
+    /// <paramref name="allocator"/>'s executor (or <paramref name="executor"/>), whose backend this is; the managed path's
+    /// arrays are then not loaded.</param>
+    internal NemotronAudioEncoder(string path, IAllocator allocator, Action<string, float[]> trace, BackendType? graphBackend,
+        IGraphExecutor executor = null)
     {
         _trace = trace;
         _allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
@@ -44,6 +55,7 @@ public sealed class NemotronAudioEncoder : IDisposable
         _kernel = Value("conv_kernel_size", 9); _ffn = Value("intermediate_size", 4096);
         MelBins = Value("num_mel_bins", 128); ProjectionDim = Value("projection_dim", 2688);
         _bf16 = gguf.GetBool("nemotron.audio.compute_bf16", false);
+        bool graph = graphBackend.HasValue && !_bf16;
         if (_hidden <= 0 || _heads <= 0 || _hidden % _heads != 0 || _hidden % 2 != 0 ||
             _layers <= 0 || _channels <= 0 || _kernel <= 0 || _kernel % 2 == 0 ||
             MelBins <= 0 || MelBins % 8 != 0 || ProjectionDim <= 0 || _ffn <= 0 ||
@@ -59,6 +71,7 @@ public sealed class NemotronAudioEncoder : IDisposable
                 if (info.Name.Contains(".feature_extractor.", StringComparison.Ordinal)) continue;
                 int[] shape = info.Shape.Reverse().Select(v => checked((int)v)).ToArray();
                 _shapes.Add(info.Name, shape);
+                if (graph) continue;
                 float[] data = new float[checked((int)info.NumElements)];
                 byte[] raw = gguf.ReadTensorData(info);
                 if (info.Type == GgmlTensorType.F32) Buffer.BlockCopy(raw, 0, data, 0, raw.Length);
@@ -77,6 +90,7 @@ public sealed class NemotronAudioEncoder : IDisposable
                 catch { tensor.Dispose(); throw; }
             }
             ValidateWeights(Value("projection_hidden_size", 4096));
+            if (graph) LoadGraphWeights(gguf, allocator, graphBackend.Value, executor);
         }
         catch { Dispose(); throw; }
     }
@@ -128,6 +142,7 @@ public sealed class NemotronAudioEncoder : IDisposable
         if (frames <= 0 || validFrames <= 0 || validFrames > frames || mel.Length != checked(frames * MelBins))
             throw new ArgumentException("Audio mel dimensions and valid frame count are inconsistent.");
         if (mel.Any(v => !float.IsFinite(v))) throw new ArgumentException("Audio features must be finite.", nameof(mel));
+        if (_graph != null) return EncodeGraph(mel, frames, validFrames);
         float[] x = (float[])mel.Clone(); Round(x);
         int time = frames, frequency = MelBins, valid = validFrames;
         // Intermediate layout is [time, frequency, channel]. Mask after every
@@ -322,5 +337,5 @@ public sealed class NemotronAudioEncoder : IDisposable
         return BitConverter.UInt32BitsToSingle((bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u);
     }
     public void Dispose()
-    { foreach (var value in _matrices.Values) value.Dispose(); _matrices.Clear(); _vectors.Clear(); _shapes.Clear(); }
+    { DisposeGraph(); foreach (var value in _matrices.Values) value.Dispose(); _matrices.Clear(); _vectors.Clear(); _shapes.Clear(); }
 }

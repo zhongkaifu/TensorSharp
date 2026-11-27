@@ -93,13 +93,13 @@ Replicated hidden state (all GPUs hold identical copy)
 | `TensorSharp.Models/Models/Qwen35/Qwen35Model.TensorParallel.cs` | **New.** TP forward pass with GatedDeltaNet SSM + full attention + MoE, block-cyclic V-head assignment, CUDA-native GDN kernels (removed with `Qwen35Model`) |
 | `TensorSharp.Models/Models/GptOss/GptOssModel.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
 | `TensorSharp.Models/Models/GptOss/GptOssModel.TensorParallel.cs` | **New.** TP forward pass with biased QKV, attention sinks, YaRN, clamped SiLU GLU MoE |
-| `TensorSharp.Models/Models/Nemotron/NemotronModel.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
-| `TensorSharp.Models/Models/Nemotron/NemotronModel.TensorParallel.cs` | **New.** TP forward pass with Mamba2 (replicated), attention (no RoPE), dense + MoE FFN |
+| `TensorSharp.Models/Models/Nemotron/NemotronModel.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active. Removed in 2026-11: Nemotron-H now runs only on the shared decoder runtime (`NemotronRuntimeModel`), which provides its TP; see [docs/models/nemotron.md](docs/models/nemotron.md#8-serving-mechanisms) |
+| `TensorSharp.Models/Models/Nemotron/NemotronModel.TensorParallel.cs` | **New.** TP forward pass with Mamba2 (replicated), attention (no RoPE), dense + MoE FFN (removed with `NemotronModel`; the runtime's per-rank graphs shard Mamba-2 by contiguous blocks of groups) |
 | `TensorSharp.Cli/Program.cs` | Added `--tp <N>` CLI argument |
 | `TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
 | `TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback); removed with `Qwen35Model` (the shared runtime keeps concurrent requests batched under TP) |
 | `TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
-| `TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
+| `TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback); removed with `NemotronModel` (the shared runtime keeps concurrent requests batched under TP) |
 
 ### Weight Sharding
 
@@ -148,7 +148,7 @@ column/row-parallel pattern:
 |-------------|----------|---------|
 | **MoE (Gemma4, Qwen3.5, GptOss, Nemotron)** | Expert slicing | Each GPU holds 1/tp slice of every expert's weights (column-parallel gate/up, row-parallel down). Router is replicated. AllReduce after weighted expert sum. |
 | **GatedDeltaNet SSM (Qwen3.5)** | Per-rank V-head ownership | Block-cyclic V-head assignment. Each rank runs its own GDN kernel on its V-head subset with independent delta/conv state — no cross-rank communication needed for the recurrent path. Requires a device-resident packed-GDN kernel: `ts_qwen35_gdn_*` on direct CUDA (removed with `Qwen35Model`), `TSGgml_Qwen35GdnLayerTP` on GGML (still used by the shared runtime's per-op TP path). |
-| **Mamba2 SSM (Nemotron)** | Replicated on rank 0 | Mamba2 layers run on rank 0 only, result broadcast to all ranks. SSM state lives in host arrays with a managed per-token loop; sharding would require a device-resident per-rank kernel. Attention + FFN/MoE layers hold the bulk of weights, so TP still delivers most memory savings. |
+| **Mamba2 SSM (Nemotron)** | Replicated on rank 0 | Mamba2 layers run on rank 0 only, result broadcast to all ranks. SSM state lives in host arrays with a managed per-token loop; sharding would require a device-resident per-rank kernel. Attention + FFN/MoE layers hold the bulk of weights, so TP still delivers most memory savings. Superseded in 2026-11: on the shared decoder runtime each rank owns a contiguous block of Mamba-2 groups with its own state, and only `ssm_out`'s partial is reduced. |
 
 ### Known Limitations / Future Work (Stage 1)
 
@@ -160,7 +160,7 @@ column/row-parallel pattern:
 - [ ] NCCL backend for Linux (higher throughput than P2P for N > 2)
 - [ ] Column-parallel LM head with AllGather (currently replicated on GPU 0)
 - [ ] GptOss: expert down-projection bias is skipped in TP mode (small correction, documented as follow-up)
-- [ ] Nemotron: Mamba2 layers are replicated on rank 0 rather than sharded (requires device-resident SSM kernel)
+- [x] Nemotron: Mamba2 layers are replicated on rank 0 rather than sharded (requires device-resident SSM kernel). Done on the shared decoder runtime (2026-11): Mamba-2 is sharded by contiguous blocks of groups
 
 ---
 
@@ -352,7 +352,7 @@ large part of what TP just saved.
 |---|---|---|
 | `TSGgml_Qwen35AttentionLayerPrefill` | Qwen 3.5/3.6 full-attention block | attn output proj |
 | `TSGgml_FusedFFNSwiGLUQuantF32` | any dense SwiGLU FFN block | FFN down proj |
-| `TSGgml_FusedMatMulQuantAddF32` | any row-parallel linear + residual | the matmul |
+| `TSGgml_FusedMatMulQuantAddF32` (removed in 2026-11 with the legacy Nemotron-H model) | any row-parallel linear + residual | the matmul |
 
 The last two are architecture-agnostic: any TP forward that ends a block with
 `row-parallel linear → AllReduce → residual add` can replace those three host
@@ -925,7 +925,7 @@ Stage 1 (Local TP)          █████████████████�
   ├── Gemma4 (dense+MoE)     ████████████████████ DONE
   ├── Qwen3.5 (SSM+MoE)     ████████████████████ DONE
   ├── GptOss (MoE)           ██████████████████░░ DONE (down-bias gap)
-  ├── Nemotron (SSM+MoE)     ████████████████████ DONE (Mamba2 replicated)
+  ├── Nemotron (SSM+MoE)     ████████████████████ DONE (Mamba2 replicated; sharded on the shared runtime since 2026-11)
   ├── DiffusionGemma         ──────────────────── N/A (diffusion model)
   ├── QwenImage              ──────────────────── N/A (image generation)
   ├── Batched forward TP     ████████████████████ DONE (Mistral3; MoE models fall back to per-seq)
@@ -957,7 +957,7 @@ Stage 3 (RDMA)              ░░░░░░░░░░░░░░░░░�
 | Gemma4 | Dense + MoE | ✅ Done | Expert slicing, dual dense+MoE FFN, per-layer head dims, shared KV layers |
 | Qwen3.5 | SSM + MoE | ✅ Done | GatedDeltaNet SSM with per-rank V-head ownership. Now on the shared decoder runtime: per-rank graphs (experts sliced by width, LM head by vocabulary) on `cuda` / `ggml_cuda`, the packed per-rank GDN block and whole-expert MoE on the per-op path |
 | GptOss | MoE | ✅ Done | Expert slicing with biased projections, attention sinks, YaRN; expert down-bias skipped in TP |
-| Nemotron | SSM + MoE | ✅ Done | Mamba2 replicated on rank 0, attention (no RoPE), MoE expert slicing |
+| Nemotron | SSM + MoE | ✅ Done | Now on the shared decoder runtime: per-rank graphs on `cuda` / `ggml_cuda` / `ggml_vulkan` with Mamba-2 sharded by contiguous blocks of groups, attention by heads and every expert by its width; batching kept. Covered on simulated devices only |
 | Muse-Glimmer | Dense + vision | ✅ Done | Interleaved SWA/NoPE layers, per-head QK norm (replicated), attention output gate (column-parallel by head), segmented fused gate_up; **tp=2 max — 2 KV heads**; vision tower replicated on rank 0; DFlash and pooled KV snapshots stay single-GPU |
 | Muse Spark | MoE + vision | ✅ Done (native + per-op path) | **Native** (`--tp N` on `ggml_cuda`): the whole-model executor runs on upstream ggml's meta backend (the mechanism behind llama.cpp's `-sm tensor`) with a TensorSharp split plan (`ggml_ops_muse_spark_tp.cpp`): attention by KV group (16 groups over N GPUs, rotating per layer), routed experts along n_ff in 256-element units, output head by vocabulary rows; norms, router and latent projections on every GPU; two all-reduces per layer; N at most 16; local only. On ten A40s it decoded 22.63 tok/s, 1.40x llama.cpp's `-sm tensor` ([report](docs/perf/muse-spark-vs-llama-cpp.md)). **Per-op** (`TS_MUSE_SPARK_NATIVE=0`, and `--tp N` on `ggml_vulkan`): Q/K/V/gate split by whole GQA head groups, attention output by input columns, routed experts partitioned whole with per-expert norm before the cross-GPU sum; uneven partitions allowed (9 GPUs for 128 query / 16 KV heads); router, latent projections and output head on rank 0; local only |
 | DiffusionGemma | Diffusion | ❌ N/A | Not autoregressive text generation |

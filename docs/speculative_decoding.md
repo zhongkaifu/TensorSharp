@@ -79,8 +79,8 @@ Shipped implementations:
 | Name | Class | Weights | Notes |
 | --- | --- | --- | --- |
 | `draft-head` | `DraftHeadSpeculator` | required | One token per pass, chaining its own hidden output: NextN/MTP embedded in the trunk (Qwen 3.6, Qwen 3.8 27B, GLM 5.2, GLM-5.3), Gemma 4's separate assistant GGUF, and Qwen 3.8 Flash Next's shared MTP head (a separate GGUF on `--draft-model`). EAGLE-shaped heads fit here unchanged. |
-| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, MiniMax-M3.1 DSpark (a `dflash` GGUF with a Markov head that its native executor loads with the target on a layer split; [card](models/minimax-m3.md#dspark-speculative-decoding)), DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8). DeepSeek V4.1 DSpark is experimental: the loader accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu`; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified. |
-| `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Needs no weights, but only runs on a model that can speculate at all (see [Adding a new model](#adding-a-new-model)): not on GPT-OSS, Mistral 3 or Hunyuan Dense, never on Nemotron-H, on MiniMax-M3.1 only on a layer split (not under `--tp`), and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is loaded. |
+| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, MiniMax-M3.1 DSpark (a `dflash` GGUF with a Markov head that its native executor loads with the target on a layer split; [card](models/minimax-m3.md#dspark-speculative-decoding)), DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8), and Nemotron 3.5 Lightning's DFlash and DSpark drafters on Nemotron-H ([card](models/nemotron.md#block-drafters-dflash--dspark)). DeepSeek V4.1 DSpark is experimental: the loader accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu`; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified. |
+| `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Needs no weights, but only runs on a model that can speculate at all (see [Adding a new model](#adding-a-new-model)): not on GPT-OSS, Mistral 3 or Hunyuan Dense, on MiniMax-M3.1 only on a layer split (not under `--tp`), and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is loaded. |
 | `auto` | — | — | Default: use whatever drafter the checkpoint carries. A checkpoint without one declines, and the reason names `--spec-type ngram`. |
 
 ### Layer 3 — the weights (`IDraftHead`)
@@ -321,8 +321,8 @@ A model can also refuse speculation outright. `ISpeculativeTarget.SpeculationRef
 is a correctness verdict, not a speed one: a non-null reason makes the planner,
 `SpeculatorRegistry.Create`, the CLI and the draft-head loader all decline, the
 engine logs the reason once, and every request decodes plainly. Use it when the
-trunk's verify cannot reproduce its own decode (see
-[Nemotron-H refuses speculation](#nemotron-h-refuses-speculation)); use
+trunk's verify cannot reproduce its own decode (the legacy Nemotron-H model did, see
+[Nemotron-H: from a refusal to the shared runtime](#nemotron-h-refuses-speculation)); use
 `SpeculationProfitable` when it only would not pay.
 
 ## Operator surface
@@ -1455,12 +1455,41 @@ expensive part was always the host round trip, not the copy.
 `BackendType.Cuda` already has that path (`MtpSnapshotRecurrentStateCudaDevice`);
 ggml_cuda does not.
 
-## Nemotron-H refuses speculation
+<a id="nemotron-h-refuses-speculation"></a>
+## Nemotron-H: from a refusal to the shared runtime
 
-The 2026-09-16 campaign ran Nemotron 3.5 Lightning (`nemotron_h_moe`, MXFP4_MOE)
-with its DSpark drafter: no draft was ever accepted, every solo greedy request
-differed from the same request without the drafter, and decode ran at 0.55x.
-Measured in-process on one A40 (`ggml_cuda`), one question at a time:
+Nemotron-H speculates on the shared decoder runtime (`NemotronRuntimeModel`) with n-gram drafts, with the Nemotron 3.5
+MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), and with Nemotron 3.5 Lightning's published
+DFlash and DSpark block drafters (`--draft-model`). One graph lowering serves its decode steps and its
+verify windows, so they run the same attention and MoE code. The Mamba-2 layers keep every verify row's scan state (the
+K snapshots of `ggml_ssm_scan`) and conv history, and committing an accepted prefix copies that row's state into the
+live one. Measured on Nemotron 3.5 Lightning (Q4_0, `ggml_cuda`, one A40):
+- The MTP head accepted 64.5-85.7 % of its 3-token drafts and decoded 1.12-1.24x as fast as plain decoding.
+- n-gram drafts ran at 0.95-1.03x.
+- Verify windows matched the plain steps' argmax on 24/24 rows, and on 24/24 and 23/24 rows with rewinds.
+
+A speculative stream follows plain greedy decoding up to the GPU batch-shape near-ties every family has: MTP streams
+parted where plain decoding's top two logits were 0.06-0.19 apart (see [what greedy parity
+delivers](#what-greedy-parity-delivers)).
+
+The DFlash and DSpark drafters run as the runtime's block-draft graph programs on every executor:
+- **DSpark.** Its Markov head is chained on the device. Its attention sinks are the attention op's fifth operand
+  (`ggml_flash_attn_ext_add_sinks` on GGML; a sink column of the softmax on the tensor executors). Its block is causal,
+  and its bonus anchor leaves 7 drafts in an 8-row block.
+- **DFlash.** It attends the whole history, which is served with a window of the trunk's context (at most 8,192
+  positions), and its rotary is YaRN-scaled.
+
+On Lightning Q4_0, the acceptance length (accepted + verifies) / verifies was:
+- DSpark: 2.8-6.2 on `ggml_cuda` and 2.8-5.6 on `cuda`, decoding at 0.85-1.52x and 1.03-1.58x of plain decoding;
+- DFlash: 1.7-3.5, at 0.74-1.22x.
+
+NVIDIA reports 3.75 and 3.16 at draft length 7. A verify of 8 rows on this MoE trunk costs about three decode steps,
+which bounds the speed-up. Details: [Nemotron-H](models/nemotron.md#block-drafters-dflash--dspark).
+
+The legacy per-op `NemotronModel` refused speculation, and the record of why follows. The 2026-09-16 campaign ran
+Nemotron 3.5 Lightning (`nemotron_h_moe`, MXFP4_MOE) with its DSpark drafter. No draft was ever accepted, every solo
+greedy request differed from the same request without the drafter, and decode ran at 0.55x. Measured in-process on one
+A40 (`ggml_cuda`), one question at a time:
 
 | Question | Result |
 | --- | --- |
@@ -1469,11 +1498,9 @@ Measured in-process on one A40 (`ggml_cuda`), one question at a time:
 | Do verify rows equal plain decoding? | No: 0.2-0.8 per row for a 4- or 8-row verify. Running the MoE row by row leaves 0.2-0.5; running MoE **and** attention row by row makes it exact (the Mamba-2 multi-row scan is already exact). |
 | What does an exact verify cost? | 116 ms for 4 rows row by row (4.1x a 28 ms plain step); the batched verify is 187 ms; one DSpark block is 70 ms per-op. |
 
-So an exact verify costs as much as decoding its rows one at a time, before the
-drafter runs, and an inexact one changes the output. `NemotronModel` therefore
-reports `SpeculationRefusal` (both `nemotron_h` and `nemotron_h_moe` share the
-attention half of the mismatch), refuses DFlash/DSpark drafters before reading
-the file, and serves plain decoding with a one-time warning.
+So in the legacy model an exact verify cost as much as decoding its rows one at a time, before the drafter ran, and an
+inexact one changed the output. It reported `SpeculationRefusal`, refused DFlash/DSpark drafters before reading the
+file, and served plain decoding with a one-time warning.
 
 The drafter had its own bug, in shared code: DFlash's attention-sink path added
 the per-head sink to the post-softmax attention weights. A sink is a logit that
@@ -1481,10 +1508,20 @@ joins the softmax denominator (`ggml_soft_max_add_sinks`, gpt-oss); adding it
 afterwards spread tens of units of attention mass evenly over a ~1000-key window.
 With teacher forcing on the trunk's own greedy tokens, the first draft matched the
 next token 0 of 47 times before the fix and 17 of 47 after it. Later block
-positions stay weak (mean accepted prefix 0.45-0.57 depending on in-block
-causality and on the bonus-anchor reading, where NVIDIA reports 3.75 of 7 on
-SPEED-Bench), so more of this drafter is still unverified; that matters again
-only if the trunk gets a bit-exact verify.
+positions stayed weak (mean accepted prefix 0.45-0.57, where NVIDIA reports 3.75
+of 7 on SPEED-Bench).
+
+The shared runtime found four more faults in how the export was read:
+- The loader probed `blk.0.attn_sinks`, but the export names the sinks
+  `blk.N.attn_sinks.weight`, so the sinks were silently dropped.
+- `dflash.sample_from_anchor` is stored as a bool, which the string read took for
+  a missing key, so it ran as true. That made row 0 a draft instead of the bonus
+  anchor.
+- The block's causal mask was not applied.
+- The encoder's last target, 52 on a 52-layer trunk, is the stream leaving the
+  stack, which the loader refused.
+
+With these fixed, the acceptance lengths above follow.
 
 ## Measuring it
 

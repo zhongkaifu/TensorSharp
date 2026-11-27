@@ -249,6 +249,10 @@ namespace TensorSharp.Models
 
             using var draft = new GgufFile(ggufPath);
             var cfg = DFlashConfig.FromGguf(draft);
+            // A full-attention drafter attends the trunk's context through its ring (at most FullAttentionWindowCap rows).
+            cfg.ServeFullAttention(MaxContextLength);
+            if (cfg.FullAttention)
+                Console.WriteLine($"  DFlash: the drafter attends the whole history; served with a window of {cfg.SlidingWindow} positions (its ring's).");
 
             if (cfg.HiddenSize != Config.HiddenSize)
             {
@@ -257,7 +261,9 @@ namespace TensorSharp.Models
             }
             foreach (int lid in cfg.TargetLayerIds)
             {
-                if (lid < 0 || lid >= Config.NumLayers)
+                // Id NumLayers is the input of the layer past the stack: the stream leaving it, before the final norm (the
+                // Nemotron-3.5 modules' last target), which a model whose steps capture it there takes.
+                if (lid < 0 || lid > Config.NumLayers || (lid == Config.NumLayers && !DFlashTapsStackOutput))
                 {
                     throw new InvalidOperationException(
                         $"DFlash target layer {lid} is outside the target's {Config.NumLayers} layers.");
@@ -295,7 +301,8 @@ namespace TensorSharp.Models
                     names[DfFfnConvBase] = p + "ffn_conv_base";
                     names[DfFfnConvProj] = p + "ffn_conv_proj.weight";
                 }
-                names[DfAttnSinks] = p + "attn_sinks";
+                // llama.cpp's name (blk.N.attn_sinks.weight), or the bare one an earlier export wrote.
+                names[DfAttnSinks] = _weights.ContainsKey(p + "attn_sinks.weight") ? p + "attn_sinks.weight" : p + "attn_sinks";
                 _dflashLayerNames[il] = names;
             }
 
@@ -321,8 +328,8 @@ namespace TensorSharp.Models
                 }
             }
 
-            _dflashCaptureSlot = new int[Config.NumLayers];
-            for (int l = 0; l < Config.NumLayers; l++)
+            _dflashCaptureSlot = new int[Config.NumLayers + 1];
+            for (int l = 0; l <= Config.NumLayers; l++)
                 _dflashCaptureSlot[l] = -1;
             for (int i = 0; i < cfg.TargetLayerIds.Length; i++)
                 _dflashCaptureSlot[cfg.TargetLayerIds[i]] = i;
@@ -362,6 +369,8 @@ namespace TensorSharp.Models
             {
                 var info = kv.Value;
                 string name = DFlashConfig.WeightPrefix + info.Name;
+                if (!dspine && TryKeepDFlashOwnEmbedding(draft, info))
+                    continue;
                 if (dspine && KeepDSpineRaw(info))
                 {
                     LoadDSpineRawTensor(draft, info, name);
@@ -422,6 +431,39 @@ namespace TensorSharp.Models
                     _weights[name] = tensor;
                 }
             }
+        }
+
+        /// <summary>
+        /// The drafter's own token embedding (its file's token_embd.weight, which llama.cpp's dflash graph reads before the
+        /// target's): kept in the file's encoding on the host, a block's few rows dequantized per draft
+        /// (<see cref="DFlashEmbedding"/>). Loaded as an F32 tensor it had put the Nemotron-3.5 drafters' BF16 [2688, 131072]
+        /// table on the device as 1.4 GB next to the target's, where nothing read it.
+        /// </summary>
+        private IntPtr _dflashOwnEmbd;
+        private int _dflashOwnEmbdType;
+        private long _dflashOwnEmbdRowBytes;
+        private int _dflashOwnEmbdRows;
+
+        private bool TryKeepDFlashOwnEmbedding(GgufFile draft, GgufTensorInfo info)
+        {
+            if (info.Name != "token_embd.weight" || info.Shape.Length != 2 || (long)info.Shape[0] != Config.HiddenSize
+                || info.Type is not (GgmlTensorType.BF16 or GgmlTensorType.F16 or GgmlTensorType.F32))
+                return false;
+            long bytes = draft.GetTensorByteCount(info);
+            FreeDFlashOwnEmbedding();
+            _dflashOwnEmbd = QuantizedWeight.AllocateBuffer(bytes);
+            draft.ReadTensorDataToNative(info, _dflashOwnEmbd, bytes);
+            _dflashOwnEmbdType = (int)info.Type;
+            _dflashOwnEmbdRows = (int)info.Shape[1];
+            _dflashOwnEmbdRowBytes = bytes / _dflashOwnEmbdRows;
+            return true;
+        }
+
+        private void FreeDFlashOwnEmbedding()
+        {
+            if (_dflashOwnEmbd == IntPtr.Zero) return;
+            QuantizedWeight.FreeBuffer(_dflashOwnEmbd);
+            _dflashOwnEmbd = IntPtr.Zero;
         }
 
         /// <summary>
@@ -578,6 +620,11 @@ namespace TensorSharp.Models
             return true;
         }
 
+        /// <summary>True when this model's steps capture a drafter's target past the stack (id Config.NumLayers: the stream
+        /// leaving the last layer), as the shared runtime's graphs and its distributed verify do. The per-op families capture
+        /// layer inputs only.</summary>
+        private protected virtual bool DFlashTapsStackOutput => false;
+
         /// <summary>The target's LM head, which the drafter borrows. A model that
         /// keeps its head somewhere other than "output.weight"/"token_embd.weight"
         /// overrides this.</summary>
@@ -589,6 +636,7 @@ namespace TensorSharp.Models
         /// <see cref="Dispose"/>; only the rings are ours.</summary>
         private protected void DisposeDFlash()
         {
+            FreeDFlashOwnEmbedding();
             DisposeDSpine();
             DisposeDFlashRingPool();
             if (_dflashSubHead != IntPtr.Zero)
@@ -785,10 +833,11 @@ namespace TensorSharp.Models
             long t1 = s_dflashTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
             // A plain DFlash block needs one extra row for the anchor (row 0 is the
-            // anchor's own prediction and is discarded). A Markov drafter is the
+            // anchor's own prediction and is discarded), and so does a Markov drafter
+            // with a bonus anchor. A Markov drafter that samples from the anchor is the
             // opposite: the anchor's row IS its first draft, so the block width
             // equals the number of drafts.
-            int b = _dflash.MarkovRank > 0
+            int b = _dflash.DraftsFromAnchorRow
                 ? Math.Min(_dflash.BlockSize, draftOut.Length)
                 : Math.Min(_dflash.BlockSize, draftOut.Length + 1);
             int drafted = DFlashDraftBlockCore(lastToken, position, b, draftOut, confOut);
@@ -1058,9 +1107,9 @@ namespace TensorSharp.Models
         /// draft per position with the Markov head (llama.cpp's
         /// build_dspark_markov_head, sglang's VanillaMarkov):
         ///
-        ///     bias_i = w2 @ w1[prev_i]      prev_0 = anchor, prev_{i+1} = argmax(col_i)
-        ///     col_i  = base_i + bias_i      (or base_i unbiased when the anchor row
-        ///                                    is a sample_from_anchor=false "bonus")
+        ///     bias_i = w2 @ w1[prev_i]      prev_first = anchor, prev_{i+1} = argmax(col_i)
+        ///     col_i  = base_i + bias_i      (first = 0; with a sample_from_anchor=false
+        ///                                    "bonus" anchor first = 1: row 0 is no draft)
         ///     draft_i = argmax(col_i)
         ///
         /// The acceptance estimate of position i is the softmax probability of its
@@ -1110,37 +1159,27 @@ namespace TensorSharp.Models
                 _dflashMarkovScratch = new float[vocab];
             float[] col = _dflashMarkovScratch;
 
+            // A bonus anchor (sample_from_anchor = false): row 0 is the anchor's own slot, neither biased nor a draft;
+            // drafting starts at row 1 with the chain seeded by the anchor (llama.cpp's i_draft_beg).
+            int first = cfg.SampleFromAnchor ? 0 : 1;
             int prev = anchorToken < 0 ? 0 : anchorToken;
             var prevEmb = new Tensor(_allocator, DType.Float32, 1, rank);
             float* pep = GetFloatPtr(prevEmb);
             try
             {
-                for (int i = 0; i < b; i++)
+                for (int i = first; i < b; i++)
                 {
                     float* row = lp + (long)i * vocab;
-                    bool biased = cfg.SampleFromAnchor || i > 0;
-                    if (biased)
-                    {
-                        // prevEmb = w1[prev] (the last draft token's embedding).
-                        Buffer.MemoryCopy(w1p + (long)prev * rank, pep, (long)rank * 4, (long)rank * 4);
-                        InvalidateTensorDeviceCache(prevEmb);
+                    // prevEmb = w1[prev] (the last draft token's embedding).
+                    Buffer.MemoryCopy(w1p + (long)prev * rank, pep, (long)rank * 4, (long)rank * 4);
+                    InvalidateTensorDeviceCache(prevEmb);
 
-                        using (Tensor biasT = LinearForward(prevEmb, w2Key))
-                        {
-                            // bias = w2 @ w1[prev] + then col = base row + bias.
-                            float* bias = GetFloatPtr(biasT);
-                            for (int c = 0; c < vocab; c++)
-                                col[c] = row[c] + bias[c];
-                        }
-                    }
-                    else
+                    using (Tensor biasT = LinearForward(prevEmb, w2Key))
                     {
-                        // sample_from_anchor=false: row 0 is the bonus anchor, its
-                        // own (unbiased) prediction, and the chain starts from the
-                        // anchor token again for row 1 (llama.cpp leaves prev alone
-                        // for the bonus row).
-                        fixed (float* colp = col)
-                            Buffer.MemoryCopy(row, colp, (long)vocab * 4, (long)vocab * 4);
+                        // bias = w2 @ w1[prev] + then col = base row + bias.
+                        float* bias = GetFloatPtr(biasT);
+                        for (int c = 0; c < vocab; c++)
+                            col[c] = row[c] + bias[c];
                     }
 
                     int best = 0;
@@ -1159,12 +1198,10 @@ namespace TensorSharp.Models
                     for (int c = 0; c < vocab; c++)
                         sum += Math.Exp(col[c] - bestVal);
 
-                    draftOut[i] = best;
-                    if (confOut != null && i < confOut.Length)
-                        confOut[i] = (float)(1.0 / sum);
-
-                    if (biased && i + 1 < b)
-                        prev = best;
+                    draftOut[i - first] = best;
+                    if (confOut != null && i - first < confOut.Length)
+                        confOut[i - first] = (float)(1.0 / sum);
+                    prev = best;
                 }
             }
             finally
@@ -1172,7 +1209,7 @@ namespace TensorSharp.Models
                 prevEmb.Dispose();
                 logits.Dispose();
             }
-            return b;
+            return b - first;
         }
 
         private static unsafe int DFlashArgmaxRow(float* row, int n, out float best)
@@ -1284,17 +1321,20 @@ namespace TensorSharp.Models
         /// <paramref name="position"/> + s; cached column c holds position
         /// <paramref name="winStart"/> + c and is masked when
         /// (position + s) - (winStart + c) &gt;= n_swa. The block's own b columns
-        /// are never masked -- attention inside the block is non-causal.
+        /// are never masked when attention inside the block is non-causal; a
+        /// block-causal drafter (<see cref="DFlashConfig.CausalBlock"/>) masks the
+        /// block columns past each query's own slot.
         /// </summary>
         private unsafe void DFlashApplyWindowMask(Tensor scores, int b, int groupSize, int kvHeads,
             int w, int total, int position, int winStart)
         {
-            if (w <= 0)
+            bool causal = _dflash.CausalBlock;
+            if (w <= 0 && !causal)
                 return;
 
             int swa = _dflash.SlidingWindow;
             Span<int> widths = stackalloc int[b];
-            bool any = false;
+            bool any = causal;
             for (int s = 0; s < b; s++)
             {
                 int width = position + s - swa - winStart + 1;
@@ -1318,6 +1358,8 @@ namespace TensorSharp.Models
                         int width = widths[j % b];
                         if (width > 0)
                             Array.Fill(mask, float.NegativeInfinity, (int)(((long)g * rowsPerGroup + j) * total), width);
+                        if (causal && j % b < b - 1)
+                            Array.Fill(mask, float.NegativeInfinity, (int)(((long)g * rowsPerGroup + j) * total + w + j % b + 1), b - 1 - j % b);
                     }
                 using Tensor maskT = new Tensor(_allocator, DType.Float32, kvHeads, rowsPerGroup, total);
                 maskT.SetElementsAsFloat(mask);
@@ -1333,6 +1375,8 @@ namespace TensorSharp.Models
                     int width = widths[j % b];
                     if (width > 0)
                         new Span<float>(groupScores + (long)j * total, width).Fill(float.NegativeInfinity);
+                    if (causal && j % b < b - 1)
+                        new Span<float>(groupScores + (long)j * total + w + j % b + 1, b - 1 - j % b).Fill(float.NegativeInfinity);
                 }
             }
             InvalidateTensorDeviceCache(scores);
@@ -1811,8 +1855,24 @@ namespace TensorSharp.Models
             return sum > 0 ? (float)(Math.Exp(row[index] - max) / sum) : 0f;
         }
 
-        private protected Tensor DFlashEmbedding(int[] ids)
+        private protected unsafe Tensor DFlashEmbedding(int[] ids)
         {
+            if (_dflashOwnEmbd != IntPtr.Zero)
+            {
+                int dim = Config.HiddenSize;
+                var values = new float[(long)ids.Length * dim];
+                fixed (float* dst = values)
+                    for (int i = 0; i < ids.Length; i++)
+                    {
+                        if ((uint)ids[i] >= (uint)_dflashOwnEmbdRows)
+                            throw new ArgumentOutOfRangeException(nameof(ids), ids[i], $"token id past the drafter's {_dflashOwnEmbdRows} embedding rows");
+                        ManagedQuantizedOps.DequantizeToFloat32Native(_dflashOwnEmbdType, _dflashOwnEmbd + (nint)(ids[i] * _dflashOwnEmbdRowBytes),
+                            (IntPtr)(dst + (long)i * dim), dim);
+                    }
+                var own = new Tensor(_allocator, DType.Float32, ids.Length, dim);
+                own.SetElementsAsFloat(values);
+                return own;
+            }
             Tensor rows = Embedding(ids);
             if (_quantWeights.TryGetValue("token_embd.weight", out var weight) && weight.Scale != 1f)
                 Ops.Mul(rows, rows, weight.Scale);
@@ -1901,10 +1961,13 @@ namespace TensorSharp.Models
             using var posTensor = CreateIntTensorOn(data.Storage.Allocator, rowPositions, totalRows);
 
             using var reshaped = data.View(1, rows, numHeads, headDim);
-            Tensor result = Ops.RoPEEx(
-                null, reshaped, posTensor, headDim, DFlashConfig.RopeTypeNeoX, 0,
-                _dflash.RopeBase, 1.0f,
-                0.0f, 1.0f, 0.0f, 0.0f);
+            // YaRN where the drafter's file scales its rotary (the Nemotron-3.5 DFlash module), as llama.cpp's build_rope.
+            DFlashConfig c = _dflash;
+            Tensor result = c.HasYarn
+                ? Ops.RoPEEx(null, reshaped, posTensor, headDim, DFlashConfig.RopeTypeNeoX, c.RopeOriginalContext,
+                    c.RopeBase, c.RopeFreqScale, c.YarnExtFactor, c.YarnAttnFactor, c.YarnBetaFast, c.YarnBetaSlow)
+                : Ops.RoPEEx(null, reshaped, posTensor, headDim, DFlashConfig.RopeTypeNeoX, 0,
+                    c.RopeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
             data.Dispose();
             Tensor flat = result.View(rows, (long)numHeads * headDim);

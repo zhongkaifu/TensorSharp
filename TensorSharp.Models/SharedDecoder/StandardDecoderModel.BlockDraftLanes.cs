@@ -49,6 +49,8 @@ namespace TensorSharp.Models
         private string BatchedBlockDraftRefusal()
         {
             if (BatchedBlockDraftDisabledForTests) return "disabled for tests";
+            // A DSpark block (a Markov chain over its rows, attention sinks) is each request's own program.
+            if (DFlashSettings is { } cfg && (cfg.MarkovRank > 0 || cfg.HasAttentionSinks)) return "a DSpark drafter drafts each request's block alone";
             return BatchedBlockDraftDeclineReason ?? GraphBlockDraftRefusal();
         }
 

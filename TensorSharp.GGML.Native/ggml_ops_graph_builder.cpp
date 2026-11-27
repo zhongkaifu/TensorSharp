@@ -133,6 +133,7 @@ namespace
         OP_GELU_ERF = 71,       // 0.5 x (1 + erf(x / sqrt 2))
         OP_LOG = 72,            // ggml_log
         OP_CUMSUM = 73,         // ggml_cumsum: the running sum along ne0
+        OP_SSM_SCAN = 74,       // srcs: s, x, dt, A, B, C, ids; ip: K states kept (ggml_ssm_scan, Mamba-2)
     };
 
     struct Leaf
@@ -675,11 +676,19 @@ namespace
                 throw std::runtime_error("graph builder: host experts need weight leaves with host data");
         const std::int64_t n = x->ne[0], T = ggml_nelements(x) / n, n_used = ids->ne[0];
         const ggml_tensor* gate = parts[0]->tensor;
-        // ip[1]: the activation (0 silu(gate) * up, 2 gelu(gate) * up: Gemma 4); ip[2] = 1: srcs[3] is one fused [gate | up]
-        // stack (gate the first half of each expert's rows) and srcs[4] names it again.
+        // ip[1]: the activation (0 silu(gate) * up, 2 gelu(gate) * up: Gemma 4; 3 relu(up)^2 over one projection: Nemotron-H,
+        // srcs[3] and srcs[4] both name the up stack); ip[2] = 1: srcs[3] is one fused [gate | up] stack (gate the first half
+        // of each expert's rows) and srcs[4] names it again; ip[3] = 1 (activation 3): srcs[6] is each route's scale of its up
+        // product, applied before the square ([1, n_used, T]), and the read-ahead's sources follow it.
         const int activation = nip > 1 ? static_cast<int>(ip[1]) : 0;
         const bool fused_gate_up = nip > 2 && ip[2] != 0;
-        if (activation != 0 && activation != 2) throw std::runtime_error("graph builder: host experts take activation 0 (SwiGLU) or 2 (GeGLU)");
+        const bool one_projection = activation == 3;
+        const bool route_up_scales = one_projection && nip > 3 && ip[3] != 0;
+        if (activation != 0 && activation != 2 && activation != 3)
+            throw std::runtime_error("graph builder: host experts take activation 0 (SwiGLU), 2 (GeGLU) or 3 (relu(up)^2)");
+        if (one_projection && fused_gate_up) throw std::runtime_error("graph builder: relu(up)^2 host experts have no fused gate|up stack");
+        if (route_up_scales && ns < 7) throw std::runtime_error("graph builder: host experts' up scales are srcs[6]");
+        const int ahead_at = route_up_scales ? 7 : 6;
         const std::int64_t n_ff = fused_gate_up ? gate->ne[1] / 2 : gate->ne[1], experts = gate->ne[2];
         auto boundary = [&](ggml_tensor* t) {
             if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
@@ -730,12 +739,26 @@ namespace
         for (int i = 0; i < 3; i++)
         {
             parts[i]->host_only = true;
-            if (fused_gate_up && i == 1) continue;   // the fused stack's second name: no up stack of its own
+            // The fused stack's second name, or the one projection's: no up stack of its own.
+            if ((fused_gate_up || one_projection) && i == 1) continue;
             *data[i] = parts[i]->data;
             *type[i] = parts[i]->tensor->type;
             *bytes[i] = static_cast<std::int64_t>(parts[i]->bytes);
         }
-        if (fused_gate_up)
+        if (one_projection)
+        {
+            // moe_ffn_host_experts' relu(up)^2 layout: the up projection in the gate slot (n_ff rows an expert), no up stack.
+            hm.gate_ne0 = n; hm.gate_ne1 = n_ff;
+            hm.up_data = nullptr; hm.up_type = 0; hm.up_ne0 = 0; hm.up_ne1 = 0; hm.up_bytes = 0;
+            if (route_up_scales)
+            {
+                ggml_tensor* scales = node_at(g, s[6]);
+                if (scales->type != GGML_TYPE_F32 || ggml_nelements(scales) != n_used * T)
+                    throw std::runtime_error("graph builder: host experts' up scales are F32 [1, n_used, T]");
+                hm.up_scales = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(scales) ? scales : ggml_cont(ctx, scales), n_used, T));
+            }
+        }
+        else if (fused_gate_up)
         {
             // HostMoeSegment's fused layout: the gate stack holds [gate | up] (2 n_ff rows an expert), no up stack.
             hm.gate_ne0 = n; hm.gate_ne1 = 2 * n_ff;
@@ -747,7 +770,7 @@ namespace
             hm.up_ne0 = n; hm.up_ne1 = n_ff;
         }
         hm.down_ne0 = n_ff; hm.down_ne1 = n;
-        hm.activation = activation;   // 0: silu(gate) * up; 2: gelu(gate) * up
+        hm.activation = activation;   // 0: silu(gate) * up; 2: gelu(gate) * up; 3: relu(up)^2
         hm.num_experts = static_cast<int>(experts);
         hm.n_used = static_cast<int>(n_used);
         hm.n_ff = static_cast<int>(n_ff);
@@ -759,7 +782,8 @@ namespace
         // overlap; the wait segment follows this pause, ending at the first group so it precedes the cut).
         tsg::HostMoeSegment overlap_wait;
         constexpr int overlap_routes = 2;
-        if (tsg::MoeHotTier* tier = tsg::moe_hot_tier_find(hm.gate_data))
+        // An accelerator tier's part runs gated products (host_moe_build_hot_part): the one-projection experts have none.
+        if (tsg::MoeHotTier* tier = one_projection ? nullptr : tsg::moe_hot_tier_find(hm.gate_data))
             if (T <= tsg::host_moe_tier_max_rows(*tier) && tier->num_experts == hm.num_experts && tier->count >= hm.n_used
                 && tier->type[0] == hm.gate_type && tier->type[1] == hm.up_type && tier->type[2] == hm.down_type)
                 hot = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, ggml_mul_mat_id,
@@ -768,10 +792,10 @@ namespace
         // to this layer's FFN input before the pause, so the seam reads the next tier's predicted misses into its
         // window while the accelerator works (moe_hot_tier_prefetch). Only where the seam computes the tier's routes
         // itself (decode and verify widths) and the next tier has a window to fill.
-        if (ns >= 8)
+        if (ns >= ahead_at + 2)
         {
-            Leaf* next_router = leaf_of(g, node_at(g, s[6]));
-            Leaf* next_gate = leaf_of(g, node_at(g, s[7]));
+            Leaf* next_router = leaf_of(g, node_at(g, s[ahead_at]));
+            Leaf* next_gate = leaf_of(g, node_at(g, s[ahead_at + 1]));
             if (next_router == nullptr || next_gate == nullptr || next_gate->data == nullptr || next_gate->role != LEAF_WEIGHT)
                 throw std::runtime_error("graph builder: the read-ahead takes the next layer's router and gate stack leaves");
             next_gate->host_only = true;   // host experts' data, never bound
@@ -1226,6 +1250,18 @@ namespace
         case OP_GELU_ERF: need(1); return ggml_gelu_erf(ctx, src(0));
         case OP_LOG: need(1); return ggml_log(ctx, src(0));
         case OP_CUMSUM: need(1); return ggml_cumsum(ctx, src(0));
+        case OP_SSM_SCAN:
+        {
+            // ggml_ssm_scan reads x, B and C with contiguous rows and s, dt and A whole: an operand laid out otherwise is
+            // copied first (the program's views of a packed projection are strided).
+            need(7);
+            auto rows = [&](ggml_tensor* t) {
+                return t->nb[0] == ggml_type_size(t->type) && t->nb[1] == t->ne[0] * t->nb[0] ? t : ggml_cont(ctx, t);
+            };
+            auto whole = [&](ggml_tensor* t) { return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t); };
+            return ggml_ssm_scan(ctx, whole(src(0)), rows(src(1)), whole(src(2)), whole(src(3)), rows(src(4)), rows(src(5)), src(6),
+                                 ipar(0, 1));
+        }
         case OP_DEPTHWISE_CONV_2D:
             need(2);
             return depthwise_conv_2d(ctx, src(0), src(1), static_cast<int>(ipar(0, 1)), static_cast<int>(ipar(1, 1)),
@@ -2539,6 +2575,7 @@ namespace
             // The route weights before the ids: their parents then come in llama.cpp's order (softmax, reshape,
             // argsort, view, get_rows, ...), the node sequence ggml-metal's top-k MoE fusion matches.
             ggml_build_forward_expand(g->graph, hm.weights);
+            if (hm.up_scales != nullptr) ggml_build_forward_expand(g->graph, hm.up_scales);
             if (keep_logits != nullptr) ggml_build_forward_expand(g->graph, keep_logits);
             ggml_build_forward_expand(g->graph, hm.sel_ids);
             if (hold_ids != nullptr) ggml_build_forward_expand(g->graph, hold_ids);

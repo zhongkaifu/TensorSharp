@@ -40,10 +40,10 @@ public sealed class NemotronAudioRefusalTests : IDisposable
     [InlineData("NEMOTRON_H_MOE")]
     public void EveryNemotronAliasGetsTheSameRefusal(string architecture)
     {
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, ChatGenerationPipeline.AudioInputErrorFor(architecture));
-        Assert.Contains("does not support audio input", NemotronModel.AudioInputUnsupportedMessage);
-        Assert.Contains("RADIO vision", NemotronModel.AudioInputUnsupportedMessage);
-        Assert.Contains("no audio tower is loaded", NemotronModel.AudioInputUnsupportedMessage);
+        Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage, ChatGenerationPipeline.AudioInputErrorFor(architecture));
+        Assert.Contains("does not support audio input", NemotronRuntimeModel.AudioInputUnsupportedMessage);
+        Assert.Contains("RADIO vision", NemotronRuntimeModel.AudioInputUnsupportedMessage);
+        Assert.Contains("no audio tower is loaded", NemotronRuntimeModel.AudioInputUnsupportedMessage);
 
         var history = new List<ChatMessage>
         {
@@ -51,7 +51,7 @@ public sealed class NemotronAudioRefusalTests : IDisposable
             new() { Role = "assistant", Content = "A photo." },
             new() { Role = "user", Content = "And this?", AudioPaths = new() { "clip.wav" } },
         };
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage,
+        Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage,
             ChatGenerationPipeline.UnsupportedAudioInputError(architecture, history));
 
         // A loaded audio tower lifts the refusal for the same history.
@@ -100,7 +100,7 @@ public sealed class NemotronAudioRefusalTests : IDisposable
         JsonException error = Assert.Throws<JsonException>(() =>
             ChatMessageParser.ParseOpenAI(messages.RootElement, uploads, architecture: "nemotron_h_moe"));
 
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, error.Message);
+        Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage, error.Message);
         Assert.Empty(Directory.EnumerateFiles(_directory));
         Assert.Equal(0, uploads.UsedBytes);
     }
@@ -120,7 +120,7 @@ public sealed class NemotronAudioRefusalTests : IDisposable
         JsonException error = Assert.Throws<JsonException>(() => ChatMessageParser.ParseResponsesInput(
             input.RootElement, null, uploads, architecture: "nemotron_h_omni"));
 
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, error.Message);
+        Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage, error.Message);
         Assert.Empty(Directory.EnumerateFiles(_directory));
         Assert.Equal(0, uploads.UsedBytes);
     }
@@ -155,15 +155,15 @@ public sealed class NemotronAudioRefusalTests : IDisposable
         using var allocatorOwner = new AllocatorModel();
         try
         {
-            NemotronModel model = allocatorOwner.Model;
+            NemotronRuntimeModel model = allocatorOwner.Model;
             Assert.False(model.IsAudioEncoderLoaded);
-            Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, AudioInputSupport.UnsupportedReasonFor(model));
+            Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage, AudioInputSupport.UnsupportedReasonFor(model));
 
             string visionOnly = Path.Combine(_directory, "vision-only.gguf");
             WriteVisionOnlyProjector(visionOnly);
             model.LoadAudioEncoder(visionOnly);
             Assert.False(model.IsAudioEncoderLoaded);
-            Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, AudioInputSupport.UnsupportedReasonFor(model));
+            Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage, AudioInputSupport.UnsupportedReasonFor(model));
 
             using var reference = NemotronAudioEncoderTests.ReadReference(128);
             JsonElement fixture = reference.RootElement.GetProperty("fixtures")[0];
@@ -171,7 +171,7 @@ public sealed class NemotronAudioRefusalTests : IDisposable
             NemotronAudioEncoderTests.WriteCompanion(incomplete, WithoutTensor(fixture, "sound_encoder.encoder.layers.1.conv.norm.running_var"), false, 128);
             Assert.Throws<InvalidDataException>(() => model.LoadAudioEncoder(incomplete));
             Assert.False(model.IsAudioEncoderLoaded);
-            Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, AudioInputSupport.UnsupportedReasonFor(model));
+            Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage, AudioInputSupport.UnsupportedReasonFor(model));
 
             string companion = Path.Combine(_directory, "audio.gguf");
             NemotronAudioEncoderTests.WriteCompanion(companion, fixture, false, 128);
@@ -196,13 +196,13 @@ public sealed class NemotronAudioRefusalTests : IDisposable
         NotSupportedException error = Assert.Throws<NotSupportedException>(() =>
             injector.ProcessNemotronHistory(owner.Model, history, new List<int> { 1, 27, 2 }));
 
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, error.Message);
+        Assert.Equal(NemotronRuntimeModel.AudioInputUnsupportedMessage, error.Message);
     }
 
-    /// <summary>An uninitialised NemotronModel with only what LoadAudioEncoder reads.</summary>
+    /// <summary>An uninitialised NemotronRuntimeModel with only what LoadAudioEncoder reads.</summary>
     private sealed class AllocatorModel : IDisposable
     {
-        public NemotronModel Model { get; } = (NemotronModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronModel));
+        public NemotronRuntimeModel Model { get; } = (NemotronRuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronRuntimeModel));
 
         public AllocatorModel()
         {
@@ -217,7 +217,7 @@ public sealed class NemotronAudioRefusalTests : IDisposable
 
         public void Dispose()
         {
-            (typeof(NemotronModel).GetField("_audioEncoder", BindingFlags.Instance | BindingFlags.NonPublic)!
+            (typeof(NemotronRuntimeModel).GetField("<AudioEncoder>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
                 .GetValue(Model) as IDisposable)?.Dispose();
             GC.SuppressFinalize(Model);
         }
@@ -304,7 +304,7 @@ public sealed class NemotronOmniMmprojContractTests
                                          n.Contains("audio", StringComparison.OrdinalIgnoreCase));
         Assert.Contains("v.blk.0.attn_qkv.weight", names);
         Assert.Contains("mm.model.mlp.3.weight", names);
-        // The tensor NemotronModel.LoadAudioEncoder looks for is absent.
+        // The tensor NemotronRuntimeModel.LoadAudioEncoder looks for is absent.
         Assert.DoesNotContain("sound_projection.linear2.weight", names);
     }
 }

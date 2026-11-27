@@ -130,7 +130,7 @@ namespace TensorSharp.Models
         protected virtual bool RanksLower => !_anyRecurrent;
 
         private bool RankGraphsServe(int tp)
-            => GraphLoweringEnabled && GraphRotary != null && RanksLower && !MoeCpuOffloadConfig.IsEnabled
+            => GraphLoweringEnabled && AttentionLowers && RanksLower && !MoeCpuOffloadConfig.IsEnabled
                && StepAdapter == null && GlobalTpDegree == tp && TpRankOffset == 0
                && ExecutorFor(_mesh.Allocator(0, 0)) switch
                {
@@ -189,7 +189,7 @@ namespace TensorSharp.Models
         /// all-reduce faults in flash attention or hangs, and --tp keeps the per-op path.
         /// </summary>
         private bool GraphTensorParallelism
-            => GraphRotary != null && !_anyRecurrent && !MoeCpuOffloadConfig.IsEnabled
+            => AttentionLowers && !_anyRecurrent && !MoeCpuOffloadConfig.IsEnabled
                && Environment.GetEnvironmentVariable("TS_GRAPH_TENSOR_PARALLEL") == "1";
 
         private void ValidateShardable(int degree)
@@ -306,7 +306,8 @@ namespace TensorSharp.Models
                     if (!OwnsLayer(l) || _mesh.StageOf(l) != stage) continue;
                     string p = $"blk.{l}.";
                     int qRows = Config.NumHeads * KeyDimOf(l) * (GatedAttentionOutput ? 2 : 1);
-                    if (_recurrentLayer[l])
+                    if (!HasMixer(l)) { }   // a feed-forward layer (LayerHasMixer)
+                    else if (_recurrentLayer[l])
                         ShardRecurrentLayer(l);
                     else if (_qkvFused[l])
                         ShardConcatenatedColumnParallel(p + "attn_qkv.weight",
@@ -315,14 +316,15 @@ namespace TensorSharp.Models
                         columns.Add(p + "attn_q.weight");   // a KV-shared layer projects its queries only
                     else
                         columns.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" });
-                    if (!_recurrentLayer[l])
+                    if (IsAttentionLayer(l))
                         columns.AddRange(HeadParallelLayerWeights(l));   // per-head rows, in the query's head blocks
+                    if (IsAttentionLayer(l))
+                        rows.Add(p + "attn_output.weight");
+                    if (!HasFeedForward(l)) continue;   // a mixer layer (LayerHasFeedForward)
                     if (_gateUpFused[l])
                         ShardFusedGateUpColumnParallel(p + "ffn_gate_up.weight");
                     else
                         columns.AddRange(new[] { p + "ffn_gate.weight", p + "ffn_up.weight" });
-                    if (!_recurrentLayer[l])
-                        rows.Add(p + "attn_output.weight");
                     rows.Add(p + "ffn_down.weight");
                     if (_rankGraphs && _moeLayer[l])
                     {
@@ -338,7 +340,9 @@ namespace TensorSharp.Models
                                 ShardStackedExperts(p + "ffn_gate_up_exps.weight", columns: true, stage, halves: true);
                             else
                             {
-                                ShardStackedExperts(p + "ffn_gate_exps.weight", columns: true, stage);
+                                // Experts without a gate (Nemotron-H's ReLU^2 experts) split their up stack alone.
+                                if (_stackedExpertWeights.ContainsKey(p + "ffn_gate_exps.weight"))
+                                    ShardStackedExperts(p + "ffn_gate_exps.weight", columns: true, stage);
                                 ShardStackedExperts(p + "ffn_up_exps.weight", columns: true, stage);
                             }
                             ShardStackedExperts(p + "ffn_down_exps.weight", columns: false, stage);
@@ -354,8 +358,10 @@ namespace TensorSharp.Models
                             }
                             else
                             {
-                                columns.AddRange(new[] { p + "ffn_gate_exps.", p + "ffn_up_exps." });
-                                rows.Add(p + "ffn_down_exps.");
+                                // The members by name: the prefixes would take the per-expert scales (ffn_up_exps.scale) too.
+                                columns.AddRange(_stackedExpertMemberNames.Where(n => n.StartsWith(p + "ffn_gate_exps.", StringComparison.Ordinal)
+                                    || n.StartsWith(p + "ffn_up_exps.", StringComparison.Ordinal)));
+                                rows.AddRange(_stackedExpertMemberNames.Where(n => n.StartsWith(p + "ffn_down_exps.", StringComparison.Ordinal)));
                             }
                         }
                         columns.AddRange(new[] { p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight" });

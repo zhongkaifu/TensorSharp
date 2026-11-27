@@ -535,13 +535,6 @@ namespace TensorSharp
             return MathF.Log(1.0f + MathF.Exp(x));
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void ApplySiLUInPlace(Span<float> data, Span<float> scratch)
-        {
-            System.Numerics.Tensors.TensorPrimitives.Sigmoid(data, scratch);
-            System.Numerics.Tensors.TensorPrimitives.Multiply(data, scratch, data);
-        }
-
         public static void ReluSquaredInPlace(float* data, long count)
         {
             int vLen = Vector<float>.Count;

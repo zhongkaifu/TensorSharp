@@ -164,6 +164,50 @@ namespace TensorSharp.Models
         /// </summary>
         protected virtual int KvSourceLayer(int layer) => layer;
 
+        /// <summary>
+        /// Whether <paramref name="layer"/> has a token mixer (attention or a recurrent block) before its feed-forward. Default:
+        /// every layer. Nemotron-H's FFN layers have none: such a layer keeps no cache and no state, and its block is its
+        /// feed-forward alone. Read once, while the decoder initializes; draft layers have both blocks. A family whose layers
+        /// lack a block runs only as graphs (<see cref="RequiresGraphs"/>).
+        /// </summary>
+        protected virtual bool LayerHasMixer(int layer) => true;
+
+        /// <summary>Whether <paramref name="layer"/> has a feed-forward after its mixer. Default: every layer. Nemotron-H's
+        /// Mamba-2 and attention layers have none (see <see cref="LayerHasMixer"/>).</summary>
+        protected virtual bool LayerHasFeedForward(int layer) => true;
+
+        private bool[] _hasMixer = Array.Empty<bool>();
+        private bool[] _hasFfn = Array.Empty<bool>();
+
+        /// <summary>Whether <paramref name="layer"/> has a token mixer (<see cref="LayerHasMixer"/>; draft layers do).</summary>
+        private protected bool HasMixer(int layer) => (uint)layer >= (uint)_hasMixer.Length || _hasMixer[layer];
+
+        /// <summary>Whether <paramref name="layer"/> has a feed-forward (<see cref="LayerHasFeedForward"/>; draft layers do).</summary>
+        private protected bool HasFeedForward(int layer) => (uint)layer >= (uint)_hasFfn.Length || _hasFfn[layer];
+
+        /// <summary>Whether <paramref name="layer"/>'s mixer is attention: it keeps a K/V cache (unless it shares another's).</summary>
+        private protected bool IsAttentionLayer(int layer) => HasMixer(layer) && !(_recurrentLayer != null && layer < _recurrentLayer.Length && _recurrentLayer[layer]);
+
+        /// <summary>Read the family's block layout once (<see cref="LayerHasMixer"/>, <see cref="LayerHasFeedForward"/>).</summary>
+        private void BuildBlockLayout()
+        {
+            _hasMixer = new bool[TotalLayers];
+            _hasFfn = new bool[TotalLayers];
+            bool partial = false;
+            for (int l = 0; l < TotalLayers; l++)
+            {
+                bool draft = l >= Config.NumLayers;
+                _hasMixer[l] = draft || LayerHasMixer(l);
+                _hasFfn[l] = draft || LayerHasFeedForward(l);
+                if (!_hasMixer[l] && !_hasFfn[l])
+                    throw new NotSupportedException($"{Config.Architecture} layer {l} has neither a token mixer nor a feed-forward.");
+                partial |= !_hasMixer[l] || !_hasFfn[l];
+            }
+            if (partial && !RequiresGraphs)
+                throw new NotSupportedException(
+                    $"{Config.Architecture}: layers with a mixer or a feed-forward alone run only as graphs; the family must declare RequiresGraphs.");
+        }
+
         private int[] _layerKeyDim = Array.Empty<int>();
         private int[] _layerValueDim = Array.Empty<int>();
         private int[] _layerKvHeads = Array.Empty<int>();
@@ -268,7 +312,7 @@ namespace TensorSharp.Models
             else
             {
                 // A KV-shared layer attends its source's cache and keeps none (KvSourceLayer).
-                if (!OwnsLayer(entry) || _recurrentLayer[entry] || SharesKv(entry)) return null;
+                if (!OwnsLayer(entry) || !IsAttentionLayer(entry) || SharesKv(entry)) return null;
                 // A draft layer is not sharded: under tensor parallelism it runs whole on rank 0, with every KV head.
                 bool draft = entry >= Config.NumLayers && _mesh.TensorParallel > 1;
                 if (draft && rank > 0) return null;
@@ -590,6 +634,7 @@ namespace TensorSharp.Models
             try
             {
                 BuildAttentionGeometry();
+                BuildBlockLayout();
                 DetectRecurrentLayers();
                 bool multiDevice = _requestedStages > 1 || _requestedTensorParallel > 1 || LayerSplitGroup != null;
                 // The model-aligned KV default must not depend on placement: a multi-device

@@ -98,8 +98,8 @@ public static class SpeculationPolicy
             // Provisionally the weight-free algorithm, because it is the one that
             // needs no draft head; ChooseAlgorithm upgrades it once a head has really
             // attached. It does not serve every model: n-gram still needs a target
-            // that can verify a draft window in one pass (not GPT-OSS or Mistral 3,
-            // and Nemotron-H refuses every speculator). On those
+            // that can verify a draft window in one pass (not GPT-OSS or Mistral 3).
+            // On those
             // the engine's capability report and execution plan log the reason and
             // every reply decodes plainly -- a no-op, not an error.
             if (string.IsNullOrWhiteSpace(LaunchType))

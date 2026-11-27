@@ -934,7 +934,7 @@ namespace TensorSharp.Models
             return inputTokens;
         }
 
-        internal List<int> ProcessNemotronHistory(NemotronModel model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessNemotronHistory(NemotronRuntimeModel model, List<ChatMessage> history, List<int> inputTokens)
         {
             if (!history.Exists(message => message.ImagePaths?.Count > 0 || message.AudioPaths?.Count > 0))
                 return inputTokens;
@@ -944,7 +944,7 @@ namespace TensorSharp.Models
             // Responses parsers, Web UI, CLI) already refuse through
             // AudioInputSupport; this is the last line for callers that bypass them.
             if (model.AudioEncoder == null && history.Exists(message => message?.AudioPaths is { Count: > 0 }))
-                throw new NotSupportedException(NemotronModel.AudioInputUnsupportedMessage);
+                throw new NotSupportedException(NemotronRuntimeModel.AudioInputUnsupportedMessage);
             int imageTokenId = _model.Tokenizer.LookupToken("<image>");
             int imageStartId = _model.Tokenizer.LookupToken("<img>");
             int imageEndId = _model.Tokenizer.LookupToken("</img>");
@@ -1013,7 +1013,7 @@ namespace TensorSharp.Models
             return result;
         }
 
-        private CachedEmbedding GetOrCreateNemotronVisionEmbedding(NemotronModel model, string imagePath)
+        private CachedEmbedding GetOrCreateNemotronVisionEmbedding(NemotronRuntimeModel model, string imagePath)
         {
             return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
             {

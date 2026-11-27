@@ -5,13 +5,13 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// The linear-to-paged K/V migration of Nemotron-H and gpt-oss reads the linear cache back
+// The linear-to-paged K/V migration of gpt-oss reads the linear cache back
 // as float32. It used to read only F32/F16, so a q8_0 / q4_0 cache (TensorAgent's default
 // K/V setting) declined the migration, the planner refused the N=1 fused path and every
 // request ran the batched route, which reuses nothing. KvCacheHostReader dequantizes the
 // block-quantized caches; these tests pin it, byte layout included, against an
 // independent scalar decoder of ggml's reference blocks. It reads only the rows a sequence
-// holds, and a quantized cache migrates only where Nemotron-H's N=1 decode reads it in place.
+// holds.
 using System.Runtime.CompilerServices;
 using TensorSharp;
 using TensorSharp.Cpu;
@@ -101,43 +101,20 @@ public class KvCacheHostReaderTests
     [Fact]
     public void UnloadedModels_StillReportNoLinearMigration()
     {
-        var nemotron = (NemotronModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronModel));
-        Assert.False(nemotron.SupportsLinearKVMigration);
         var gptOss = (GptOssModel)RuntimeHelpers.GetUninitializedObject(typeof(GptOssModel));
         Assert.False(gptOss.SupportsLinearKVMigration);
     }
 
-    /// <summary>A loaded Nemotron-H migrates a block-quantized cache (dequantized on the way)
-    /// where its N=1 decode is validated to read and append to that cache in place -
-    /// ggml-metal - and keeps it on the batched route elsewhere: ggml-cpu aborts on the
-    /// strided quantized append, ggml-cuda and ggml-vulkan have not run the path with this
-    /// model, and the host walk the N=1 decode would fall back to dequantizes the whole
-    /// window every token. A float cache
-    /// migrates everywhere, as before. (gpt-oss's gate is dtype-blind: a real gpt-oss load
-    /// turns a q8_0 / q4_0 request into f16.)</summary>
+    /// <summary>A loaded gpt-oss migrates its cache whatever the dtype: its gate is dtype-blind (a real gpt-oss load turns a
+    /// q8_0 / q4_0 request into f16).</summary>
     [Theory]
-    [InlineData(BackendType.GgmlMetal, KvCacheDtype.Q8_0, true)]
-    [InlineData(BackendType.GgmlMetal, KvCacheDtype.Q4_0, true)]
-    [InlineData(BackendType.GgmlCuda, KvCacheDtype.Q4_0, false)]
-    [InlineData(BackendType.GgmlCuda, KvCacheDtype.F16, true)]
-    [InlineData(BackendType.GgmlCpu, KvCacheDtype.Q8_0, false)]
-    [InlineData(BackendType.GgmlVulkan, KvCacheDtype.Q8_0, false)]
-    [InlineData(BackendType.GgmlVulkan, KvCacheDtype.Q4_0, false)]
-    [InlineData(BackendType.GgmlCpu, KvCacheDtype.F16, true)]
-    [InlineData(BackendType.GgmlVulkan, KvCacheDtype.F16, true)]
-    [InlineData(BackendType.GgmlMetal, KvCacheDtype.F16, true)]
-    public void LoadedNemotron_MigratesAQuantizedCacheWhereItsDecodeReadsItInPlace(
-        BackendType backend, KvCacheDtype dtype, bool migrates)
+    [InlineData(BackendType.GgmlMetal, KvCacheDtype.Q8_0)]
+    [InlineData(BackendType.GgmlCuda, KvCacheDtype.Q4_0)]
+    [InlineData(BackendType.GgmlCuda, KvCacheDtype.F16)]
+    [InlineData(BackendType.GgmlCpu, KvCacheDtype.Q8_0)]
+    [InlineData(BackendType.GgmlVulkan, KvCacheDtype.F16)]
+    public void LoadedGptOss_MigratesItsCacheWhateverTheDtype(BackendType backend, KvCacheDtype dtype)
     {
-        var nemotron = (NemotronModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronModel));
-        SetField(typeof(NemotronModel), nemotron, "_kvCacheK", new Tensor[1]);
-        SetField(typeof(NemotronModel), nemotron, "_kvCacheV", new Tensor[1]);
-        SetField(typeof(NemotronModel), nemotron, "_convState", new float[1][]);
-        SetField(typeof(NemotronModel), nemotron, "_ssmState", new float[1][]);
-        SetField(typeof(ModelBase), nemotron, "_kvCacheDtype", dtype);
-        SetField(typeof(ModelBase), nemotron, "_backend", backend);
-        Assert.Equal(migrates, nemotron.SupportsLinearKVMigration);
-
         var gptOss = (GptOssModel)RuntimeHelpers.GetUninitializedObject(typeof(GptOssModel));
         SetField(typeof(GptOssModel), gptOss, "_kvCacheK", new Tensor[1]);
         SetField(typeof(GptOssModel), gptOss, "_kvCacheV", new Tensor[1]);

@@ -87,6 +87,111 @@ public sealed class NemotronAudioEncoderTests(ITestOutputHelper output)
         finally { File.Delete(path); }
     }
 
+    // The graph program (an F32-compute companion, NemotronAudioEncoder.Graph.cs) against the official F32 reference and the
+    // managed path, on each executor. GGML's lanes construct their backend, so each runs in the lane that pins it.
+    [Theory]
+    [InlineData(8)]
+    [InlineData(128)]
+    public void GraphProgram_MatchesTheOfficialF32Reference_Managed(int melBins) => CheckGraphProgram(melBins, "managed");
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(8)]
+    [InlineData(128)]
+    public void GraphProgram_MatchesTheOfficialF32Reference_GgmlCpu(int melBins) => CheckGraphProgram(melBins, "ggml_cpu");
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(8)]
+    [InlineData(128)]
+    public void GraphProgram_MatchesTheOfficialF32Reference_GgmlCuda(int melBins) => CheckGraphProgram(melBins, "ggml_cuda");
+
+    [CudaTheory]
+    [InlineData(8)]
+    [InlineData(128)]
+    public void GraphProgram_MatchesTheOfficialF32Reference_DirectCuda(int melBins) => CheckGraphProgram(melBins, "cuda");
+
+    /// <summary>A BF16-emulating companion keeps the managed path (its rounding of every intermediate is not a graph's).</summary>
+    [Fact]
+    public void Bf16Companion_KeepsTheManagedPath()
+    {
+        using var json = ReadReference(8);
+        string path = Path.Combine(Path.GetTempPath(), "ts-nemotron-audio-" + Guid.NewGuid().ToString("N") + ".gguf");
+        WriteCompanion(path, json.RootElement.GetProperty("fixtures")[1], bf16: true, 8);
+        try
+        {
+            var cpu = new CpuAllocator(BlasEnum.DotNet);
+            using var encoder = NemotronAudioEncoder.Load(path, cpu, BackendType.Cpu, cpu);
+            Assert.False(encoder.RunsAsGraphs);
+        }
+        finally { File.Delete(path); }
+    }
+
+    private void CheckGraphProgram(int melBins, string lane)
+    {
+        using var json = ReadReference(melBins);
+        JsonElement fixture = json.RootElement.GetProperty("fixtures")[0];
+        string path = Path.Combine(Path.GetTempPath(), "ts-nemotron-audio-" + Guid.NewGuid().ToString("N") + ".gguf");
+        WriteCompanion(path, fixture, bf16: false, melBins);
+        IDisposable owner = null;
+        try
+        {
+            IAllocator allocator;
+            BackendType backend;
+            switch (lane)
+            {
+                case "managed": allocator = new CpuAllocator(BlasEnum.DotNet); backend = BackendType.Cpu; break;
+                case "cuda":
+                    var cuda = new TensorSharp.Cuda.CudaAllocator();
+                    owner = cuda;
+                    allocator = cuda;
+                    backend = BackendType.Cuda;
+                    break;
+                default:
+                    bool gpu = lane == "ggml_cuda";
+                    allocator = new GgmlAllocator(new GgmlContext(new[] { 0 }, gpu ? GgmlBackendType.Cuda : GgmlBackendType.Cpu), 0);
+                    backend = gpu ? BackendType.GgmlCuda : BackendType.GgmlCpu;
+                    break;
+            }
+            var host = new CpuAllocator(BlasEnum.DotNet);
+            using var graph = NemotronAudioEncoder.Load(path, allocator, backend, host);
+            using var managed = new NemotronAudioEncoder(path, host);
+            Assert.True(graph.RunsAsGraphs, $"{lane}: the F32 companion did not load as graph programs");
+            Assert.False(managed.RunsAsGraphs);
+            double worst = 0, worstManaged = 0;
+            foreach (var example in fixture.GetProperty("cases").EnumerateArray())
+            {
+                int frames = example.GetProperty("frames").GetInt32(), valid = example.GetProperty("valid_frames").GetInt32();
+                float[] input = Floats(example.GetProperty("input"));
+                float[] expected = Floats(example.GetProperty("expected"));
+                using var result = graph.Encode(input, frames, valid);
+                using var reference = managed.Encode(input, frames, valid);
+                Assert.Equal(new long[] { NemotronAudioEncoder.OutputLength(frames), 6 }, result.Sizes);
+                float[] actual = result.GetElementsAsFloat(expected.Length), byManaged = reference.GetElementsAsFloat(expected.Length);
+                for (int i = 0; i < actual.Length; i++)
+                {
+                    double delta = Math.Abs(actual[i] - expected[i]);
+                    worst = Math.Max(worst, delta);
+                    worstManaged = Math.Max(worstManaged, Math.Abs(actual[i] - byManaged[i]));
+                    // The managed path's F32 tolerance against the official reference.
+                    double tolerance = 2e-5 + 2e-4 * Math.Abs(expected[i]);
+                    Assert.True(double.IsFinite(delta) && delta <= tolerance,
+                        $"{lane} frames={frames} valid={valid} row={i / 6} channel={i % 6}: expected={expected[i]:R} actual={actual[i]:R} delta={delta:R} tolerance={tolerance:R}");
+                }
+            }
+            Assert.True(graph.Graph.Runs > 0, $"{lane}: no graph program ran");
+            output.WriteLine($"{lane} mel {melBins}: every official F32 clip passed; maximum absolute difference {worst:R} (managed path {worstManaged:R}).");
+        }
+        finally
+        {
+            owner?.Dispose();
+            if (lane.StartsWith("ggml", StringComparison.Ordinal))
+            {
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                GgmlBasicOps.ClearHostBufferCache();
+            }
+            File.Delete(path);
+        }
+    }
+
     internal static JsonDocument ReadReference(int melBins)
     {
         string file = melBins == 128 ? "reference128.json" : "reference.json";

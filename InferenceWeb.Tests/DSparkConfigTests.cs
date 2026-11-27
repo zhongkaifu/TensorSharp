@@ -13,8 +13,11 @@ namespace InferenceWeb.Tests
     /// detection (rank from the markov_w1.weight shape, since llama.cpp's export
     /// carries no dflash.markov_rank key), attention-sink detection, the
     /// missing-key defaults (sample_from_anchor = true like llama.cpp,
-    /// sliding_window = 1024 for DSpark files, all-sliding pattern) and the
-    /// draft-count consequence (a Markov drafter keeps the whole block width).
+    /// sliding_window = 1024 for DSpark files, all-sliding pattern), the
+    /// draft-count consequence (a Markov drafter that samples from the anchor
+    /// keeps the whole block width; a bonus anchor's does not), and the
+    /// Nemotron-3.5 exports' keys (a bool bonus anchor, sinks named .weight, a
+    /// causal block, no window, YaRN).
     /// </summary>
     public class DSparkConfigTests
     {
@@ -180,6 +183,95 @@ namespace InferenceWeb.Tests
                 using var gguf = new GgufFile(path);
                 var cfg = DFlashConfig.FromGguf(gguf);
                 Assert.False(cfg.SampleFromAnchor);
+            }
+            finally { File.Delete(path); }
+        }
+
+        /// <summary>The Nemotron-3.5 DSpark export's keys as llama.cpp writes them: sample_from_anchor as a BOOL (a bonus
+        /// anchor: B - 1 drafts a block), the sinks as blk.N.attn_sinks.weight, and a block-causal mask with no DSpine keys.</summary>
+        [Fact]
+        public void NemotronDSparkExport_BoolBonusAnchorSinksWeightAndCausalBlock()
+        {
+            var g = BaseDraft(withMarkov: true, withSinks: false, withSwa: true, withSampleAnchor: false);
+            g.AddBool("dflash.sample_from_anchor", false);
+            g.AddBool("dflash.attention.causal", true);
+            g.AddTensor("blk.0.attn_sinks.weight", 0, 8);
+            string path = g.Write();
+            try
+            {
+                using var gguf = new GgufFile(path);
+                var cfg = DFlashConfig.FromGguf(gguf);
+                Assert.False(cfg.SampleFromAnchor);
+                Assert.False(cfg.DraftsFromAnchorRow);
+                Assert.Equal(cfg.BlockSize - 1, cfg.MaxDraftTokens);
+                Assert.True(cfg.HasAttentionSinks);
+                Assert.True(cfg.CausalBlock);
+                Assert.False(cfg.IsDSpine);
+                Assert.Equal(64, cfg.SlidingWindow);
+            }
+            finally { File.Delete(path); }
+        }
+
+        /// <summary>A block-causal mask on a DFlash2 drafter (trained non-causal) is still refused.</summary>
+        [Fact]
+        public void CausalBlockOnADFlash2Drafter_IsRefused()
+        {
+            var g = BaseDraft(withMarkov: false, withSinks: false, withSwa: true, withSampleAnchor: false);
+            g.AddBool("dflash.attention.causal", true);
+            g.AddUint32("dflash.selector_rank", 8);
+            g.AddUint32("dflash.selector_top_k", 4);
+            string path = g.Write();
+            try
+            {
+                using var gguf = new GgufFile(path);
+                var ex = Assert.Throws<NotSupportedException>(() => DFlashConfig.FromGguf(gguf));
+                Assert.Contains("causal", ex.Message);
+            }
+            finally { File.Delete(path); }
+        }
+
+        /// <summary>The Nemotron-3.5 DFlash export: no sliding window (every layer attends the whole history, served through
+        /// the ring with the trunk's context, at most FullAttentionWindowCap positions) and a YaRN rotary.</summary>
+        [Fact]
+        public void FullAttentionYarnDrafter_IsServedWithTheTrunksContext()
+        {
+            var g = BaseDraft(withMarkov: false, withSinks: false, withSwa: false, withSampleAnchor: false);
+            g.AddString("dflash.rope.scaling.type", "yarn");
+            g.AddFloat32("dflash.rope.scaling.factor", 128f);
+            g.AddUint32("dflash.rope.scaling.original_context_length", 8192);
+            string path = g.Write();
+            try
+            {
+                using var gguf = new GgufFile(path);
+                var cfg = DFlashConfig.FromGguf(gguf);
+                Assert.True(cfg.FullAttention);
+                Assert.Equal(DFlashConfig.FullAttentionWindowCap, cfg.SlidingWindow);
+                Assert.True(cfg.HasYarn);
+                Assert.Equal(1f / 128f, cfg.RopeFreqScale);
+                Assert.Equal(8192, cfg.RopeOriginalContext);
+                Assert.Equal(1f, cfg.YarnExtFactor);
+                Assert.Equal(32f, cfg.YarnBetaFast);
+                Assert.Equal(1f, cfg.YarnBetaSlow);
+                cfg.ServeFullAttention(4096);
+                Assert.Equal(4096, cfg.SlidingWindow);
+                Assert.Equal(4096 + 32, cfg.RingRows);
+                cfg.ServeFullAttention(1 << 20);
+                Assert.Equal(DFlashConfig.FullAttentionWindowCap, cfg.SlidingWindow);
+            }
+            finally { File.Delete(path); }
+        }
+
+        [Fact]
+        public void UnknownRopeScaling_IsRefused()
+        {
+            var g = BaseDraft(withMarkov: false, withSinks: false, withSwa: true, withSampleAnchor: false);
+            g.AddString("dflash.rope.scaling.type", "longrope");
+            g.AddFloat32("dflash.rope.scaling.factor", 4f);
+            string path = g.Write();
+            try
+            {
+                using var gguf = new GgufFile(path);
+                Assert.Throws<NotSupportedException>(() => DFlashConfig.FromGguf(gguf));
             }
             finally { File.Delete(path); }
         }

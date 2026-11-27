@@ -18,7 +18,7 @@ namespace InferenceWeb.Tests;
 /// Several fused native kernels can either RUN their graph or, under tensor
 /// parallelism, build it and hand back a plan for the caller to execute one per
 /// rank. The native side decides which by asking whether <c>tp_plan_out</c> is a
-/// null pointer — see <c>fused_matmul_quant_add_f32_impl</c> in
+/// null pointer — see <c>fused_ffn_swiglu_quant_f32_slab</c> in
 /// ggml_ops_fused.cpp and its siblings.
 ///
 /// Declaring that parameter as <c>out IntPtr</c> silently breaks the contract:
@@ -28,8 +28,9 @@ namespace InferenceWeb.Tests;
 /// built, parked, and never executed — while the entry point still returns
 /// success. The op computes nothing and reports that it worked.
 ///
-/// That is exactly what made Nemotron's Mamba2 residual add a no-op under
-/// --tp 2: `TryLinearAddInto` called FusedMatMulQuantAdd with the default
+/// That is exactly what made the legacy Nemotron-H model's Mamba2 residual add a
+/// no-op under --tp 2 (its fused matmul+add entry point went with that model):
+/// `TryLinearAddInto` called FusedMatMulQuantAdd with the default
 /// tpDegree=1 (it is a rank-0-only, replicated computation), the native gate
 /// widened tpDegree to the process-wide TP degree, and all 23 Mamba2 layers -
 /// 43% of the model - silently contributed nothing. The output stayed fluent

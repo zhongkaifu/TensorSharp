@@ -52,6 +52,9 @@ internal sealed class NemotronSyntheticMmprojBuilder
     /// <summary>Add the video tower's temporal patch embedding v.patch_embd.weight.1.</summary>
     public bool VideoPatchEmbedding { get; init; }
 
+    /// <summary>Add the tower's final LayerNorm v.post_ln (weight and bias), as Super VL's mmproj stores it.</summary>
+    public bool PostLn { get; init; }
+
     /// <summary>Tensor names to leave out of the file.</summary>
     public IReadOnlyCollection<string> Omit { get; init; } = Array.Empty<string>();
 
@@ -77,6 +80,11 @@ internal sealed class NemotronSyntheticMmprojBuilder
         };
         if (VideoPatchEmbedding)
             tensors.Add(SyntheticGguf.Gen("v.patch_embd.weight.1", 0.05f, PatchSize, PatchSize, 2 * Channels, Hidden));
+        if (PostLn)
+        {
+            tensors.Add(SyntheticGguf.GenAround("v.post_ln.weight", 1f, 0.3f, Hidden));
+            tensors.Add(SyntheticGguf.Gen("v.post_ln.bias", 0.2f, Hidden));
+        }
 
         for (int b = 0; b < Blocks; b++)
         {

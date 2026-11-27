@@ -6,16 +6,18 @@
 |---|---|
 | Provider | NVIDIA |
 | GGUF architecture keys | `nemotron_h`, `nemotron_h_moe`, `nemotron_h_omni` |
-| Source class | [`NemotronModel`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.cs) (single-sequence) + [`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs) (`IBatchedPagedModel`) |
+| Source class | [`NemotronRuntimeModel`](../../TensorSharp.Models/Models/Nemotron/NemotronRuntimeModel.cs) on the shared decoder runtime (`StandardDecoderModel`; its Mamba-2 mixer and experts in [`NemotronRuntimeModel.Graph.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronRuntimeModel.Graph.cs), its recurrent state in [`NemotronRuntimeModel.State.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronRuntimeModel.State.cs)). The legacy per-op `NemotronModel` was removed (§7, §11). |
 | Vision encoder | [`NemotronVisionEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronVisionEncoder.cs) (RADIO / v2_vl ViT) |
 | Image processor | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
 | Audio frontend | [`NemotronAudioPreprocessor`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs) (Parakeet-style log-mel) |
 | Audio encoder | [`NemotronAudioEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioEncoder.cs) (Parakeet/FastConformer + sound projector; needs a companion GGUF that no public repository ships, see §4.7) |
 | Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K, Nemotron 3 Nano Omni, Nemotron 3.5 Bolt 74B-A9B and Super VL 120B-A12B (see [below](#nemotron-35-super-vl-and-bolt)) |
-| Modalities | Text, image (Omni-class with `mmproj` loaded). Audio only when an audio companion GGUF carrying the Parakeet tower is loaded (§4.7); otherwise audio is **refused** (HTTP 400 / CLI error with `NemotronModel.AudioInputUnsupportedMessage`): the public Omni GGUFs ship no audio tower, only the RADIO vision tower in the `mmproj` (see §4.6). |
+| Modalities | Text, image (Omni-class with `mmproj` loaded). Audio only when an audio companion GGUF carrying the Parakeet tower is loaded (§4.7); otherwise audio is **refused** (HTTP 400 / CLI error with `NemotronRuntimeModel.AudioInputUnsupportedMessage`): the public Omni GGUFs ship no audio tower, only the RADIO vision tower in the `mmproj` (see §4.6). |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes: Reasoning-128K `<TOOLCALL>[...]</TOOLCALL>` (JSON or Python-style calls), Nemotron 3 Nano / Omni `<tool_call>` with an XML `<function=...>` body (§12); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
-| Batched / paged forward | **Default ON** — `--no-continuous-batching` forces the per-sequence KV-swap path. Per-slot Mamba2 conv + SSM state pool, paged K/V for attention layers. Optional native batched Mamba2 step kernel (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). See §11. |
+| Batched / paged forward | **Default ON** (the shared runtime's batched slots: each slot's Mamba-2 conv window and SSM state, paged K/V for the attention layers) — `--no-continuous-batching` forces the per-sequence path. See §8. |
+| Speculative decoding | n-gram drafts, the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), and the published Nemotron 3.5 Lightning DFlash and DSpark block drafters (`--draft-model`), verified in windows whose Mamba-2 states rewind exactly. See §8. |
+| Expert offload | `--n-cpu-moe` / `--cpu-moe` on one device or over `--layer-split` stages, every backend; refused with `--tp`. See §10. |
 | Output parser | `NemotronOutputParser` (a `ChatMlOutputParser`) |
 
 ## Downloads
@@ -28,6 +30,7 @@ Verified GGUF pointers:
 | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf` (28.188 GB) | — (text only) |
 | Nemotron 3 Nano Omni 30B-A3B | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) | `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf` (23.927 GB) | `mmproj-BF16.gguf` (1.590 GB; same repo) — **required for image input** |
 | Nemotron 3.5 Bolt 74B-A9B | [nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF) | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (22.018 GB) | `mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (1.734 GB; same repo) |
+| Nemotron 3.5 Lightning 30B-A3B | [ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF) | `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf` (18.898 GB). Drafters in the same repo: `mtp-...-Q4_0.gguf` (1.156 GB), `dflash-...-NVFP4.gguf` (1.185 GB), `dspark-...-NVFP4.gguf` (1.357 GB) | — (text only) |
 | Nemotron 3.5 Super VL 120B-A12B | [ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) | `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf` (76.919 GB) or `-Q4_0.gguf` (71.934 GB) | `mmproj-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Q8_0.gguf` (0.967 GB) or `-BF16.gguf` (1.734 GB; same repo) |
 
 The Omni `mmproj` enables **image input only**: it carries the 32-block RADIO
@@ -81,7 +84,7 @@ support was added and what was validated.
 |---|---|---|
 | Routed experts | Per layer ("Puzzle" config): 240-496 experts, top-9, n_ff 1536-2560 | 512 experts, top-22, n_ff 2688 |
 | Language GGUF | `...-Bolt-74B-A9B-24GB.gguf`, **22.018 GB**: IQ2_XXS experts, NVFP4 Mamba2 projections with `.scale` sidecars | `...-NVFP4.gguf`, **76.919 GB** (NVFP4 experts with per-expert scales); `...-Q4_0.gguf`, **71.934 GB** (no sidecars) |
-| mmproj | 1.734 GB; q/k/v stored **split** (fused at load) | Q8_0 0.967 GB or BF16 1.734 GB; fused q/k/v, plus a `v.post_ln` this encoder does not apply |
+| mmproj | 1.734 GB; q/k/v stored **split** (fused at load) | Q8_0 0.967 GB or BF16 1.734 GB; fused q/k/v, plus a final LayerNorm `v.post_ln` (applied after the blocks) |
 
 **Memory.** The language GGUF has to fit on the device, with room for the KV cache and workspace:
 - **Super VL NVFP4** needs about 71.6 GiB (76.919 GB) of weights on one device. It ran on a 128 GB
@@ -89,63 +92,46 @@ support was added and what was validated.
   `ggml_cpu`. One 96 GB GPU should hold it, but that was not validated.
 - **Bolt-24GB** ran on `ggml_cuda` and `cuda` on the DGX Spark. In the PR #282 review it ran on a
   48 GB A40 with ECC enabled (about 45.0 GiB usable).
-- **The vision tower** adds about 3.2 GiB of F32 weights at load, plus about 3.1 GiB of F32 transposed
-  copies made on the first encode (the server's multimodal warmup, or the first image). These are
-  estimates from the tensor shapes, not measured. On
-  the GGML backends they use the language model's allocator. The direct `cuda` backend runs the tower on
-  the CPU allocator, in host RAM.
+- **The vision tower** runs as graph programs on the language model's executor (§4.5), its weights in their
+  file encoding on the model's allocator (the BF16 mmproj: about 1.7 GB). Its managed copy, about 3.2 GiB of
+  F32 on the host, lives only for the load's validation.
 
-**`--tp`.** Only `--tp 2` can apply, because the attention layers have 2 KV heads.
-- **Super VL** is accepted under `--tp 2` with either file. The NVFP4 file used to be refused because
-  TP did not apply its `.scale` sidecars; the Q4_0 file has none and never was. TP now applies the
-  NVFP4 scales: per-tensor `.scale`, the per-expert down scale folded into the routing weights, and
-  the per-expert up scale before ReLU^2.
-  - On the GGML backends its MoE should run expert-parallel: by the load-time rule each rank owns
-    256 of the 512 experts, the experts read the latent projection, and
-    `TSGgml_MoEFFNPrefillRouteScaledF32` applies each route's up scale before ReLU^2. This is read
-    from the code; no load of the real file has confirmed it, and the load banner names the path a
-    load took. A model whose experts cannot be split that way (a layer's expert count not divisible
-    by the TP degree, or fewer experts per rank than its top-k) falls back to a per-expert row split.
-  - The row split refuses an expert width that does not divide into whole quant blocks per rank. 2688 is
-    fine at `--tp 2` for NVFP4 (64-value blocks) and Q4_0.
-  - Both paths are covered by synthetic tests only (`NemotronExpertScaleTests`). Besides the CPU tests,
-    a gated `ggml_cuda` `--tp 2` test (`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`) runs
-    expert parallelism (plain and latent experts, with and without up scales) and, at a top-k larger
-    than a rank's share of the experts, the per-expert split, whose batched expert decode applies the
-    up scales through `TSGgml_MoEExpertsForwardF32`. It checks which path served each case.
-    It needs `TS_TEST_GGML_BACKEND=cuda` and either two GPUs or `GGML_CUDA_DEVICES=2`, which
-    emulates two devices on one GPU. It has passed both ways: emulated on one RTX 3080 and on two
-    A40s. No real Super VL `--tp 2` generation has completed on GPUs.
-  - The split is uneven: besides its half of the routed experts, rank 0 holds all of the Mamba2,
-    latent, shared-expert, router and LM-head weights. The NVFP4 file does not fit two A40s with ECC
-    enabled (48 GB, 46,068 MiB or about 45.0 GiB usable each): rank 0 ran out of memory while
-    preloading its weights. Estimated from the tensor shapes, rank 0's weights alone come to about
-    41.8 GiB, leaving about 3 GiB for the KV cache, workspace and everything else the load allocates;
-    rank 1's come to about 29.8 GiB. With ECC off, 48 GB cards (an A40, RTX A6000 or RTX 6000 Ada)
-    report about 49,140 MiB (about 48.0 GiB usable), which would leave rank 0 about 6 GiB. None has
-    been measured, so whether the file fits there is unknown.
-    The Q4_0 file's `--tp 2` fit has not been measured.
-- **Bolt** is no longer refused under `--tp`: each MoE block's own expert count and top-k are used.
-  It runs expert-parallel only if every block's experts divide evenly over the ranks with at least
-  that block's top-k on each rank; otherwise it takes the per-expert row split, and the load banner
-  says which. No completed Bolt `--tp` run is recorded (design note, G7).
+**`--tp`.** Only `--tp 2` can apply, because the attention layers have 2 KV heads. Tensor parallelism runs as the
+shared runtime's per-rank graphs (§8): each rank owns a contiguous block of Mamba-2 groups and the heads that read them, one
+KV head and its 16 query heads, and a slice of every expert's width; the router and the selection run on every rank. The NVFP4 scales follow
+the shards (a column shard's partial is scaled before the reduction; the per-expert down scale is folded into the routing
+weights and the per-expert up scale multiplies each route's up product before ReLU^2). Per-layer expert counts and top-k
+(Bolt) are each layer's own. This is covered on synthetic fixtures over simulated devices (`NemotronRuntimeTests`,
+`NemotronExpertScaleTests`, `NemotronPerLayerMoEConfigTests`); no multi-GPU run of either model is recorded.
 
-**On one device, `--n-cpu-moe` / `--cpu-moe` save no VRAM for either model.** Nemotron's single-device
-MoE path does not implement the offload, and nothing warns about it. The CLI and server still log "MoE
-CPU offload active".
-- On `ggml_cuda`, the selected layers' experts skip the load-time upload but are uploaded when the MoE
-  kernel first uses them.
-- On `cuda`, every quantized weight is uploaded at load.
-- Under `--tp`, only expert-parallel MoE on `ggml_cuda` keeps experts on the host: it skips uploading
-  the selected layers' expert shards and multiplies those experts on the host. Since PR #305 that
-  path also serves latent MoE, so it can now serve both models, but `--n-cpu-moe` with `--tp` has not
-  been run on either.
+**`--n-cpu-moe` / `--cpu-moe`** keep the offloaded layers' routed experts in host memory on one device (§10): on an A40,
+Bolt-24GB ran at 6.5 GB peak VRAM with every layer offloaded. The option is refused with `--tp`.
 
-So Super VL NVFP4 needs one large device. Under `--tp 2`, its rank 0 needs a GPU with more usable
-memory than an A40 with ECC enabled (about 45.0 GiB), and no such setup has been validated. The Q4_0
-file's `--tp 2` fit has not been measured. On one device offload does not help. Under `--tp 2`,
-`--n-cpu-moe` could keep some of each rank's experts on the host, but whether that brings rank 0
-within an A40 is unmeasured.
+**Super VL on one 48 GB A40** (`--cpu-moe`: every layer's routed experts in host memory; ggml `bb877c0c`). The test VM's
+cgroup quota of 7.65 CPUs (`nproc` reports 96) bounds the host experts, so these rates are this machine's:
+
+| Backend | NLL, 256 tokens after 64 | Prefill 512 | Decode | Peak VRAM |
+|---|---|---|---|---|
+| `ggml_cuda` | 2.1167 (ppl 8.30, top-1 57.0 %) | 24.2 tok/s | 3.85 tok/s | 14.3 GB |
+| `cuda` | 2.1156 (ppl 8.29, top-1 56.6 %) | 6.4 tok/s | 3.38 tok/s | 17.2 GB |
+
+What the runs showed:
+- **Greedy answers.** Five prompts (a fact, Python code, three bullets, arithmetic, a translation) were answered correctly
+  on both backends.
+- **Image.** The BF16 mmproj on the 640x480 test image was described correctly on both backends: a red square top
+  left, a blue circle top right, a green triangle bottom centre, and the text "HELLO 42".
+  - The prompt is 289 tokens with `--no-skills`. The CLI's default skill catalog adds about 2,190 more.
+  - `ggml_cuda` prefilled the 2,475 tokens with the catalog in 38.4 s and decoded at 2.9 tok/s.
+  - `cuda`, after the fix below, prefilled the 289 tokens in 117 s and decoded at 2.3 tok/s. Direct CUDA streams an
+    offloaded prompt chunk's experts to the device one at a time (§10).
+- **The route-tail skip.** The first `cuda` run scored 2.2100. Per token against the managed CPU backend (2.1195 over 32
+  tokens; `ggml_cuda` 2.1156, mean per-token |delta| 0.007), direct CUDA was off from the first token (mean |delta| 0.14).
+  - The cause: the tensor executors' expert host applied the route-tail skip (`TS_MOE_ROUTE_TAIL_SKIP`, rank 7) to
+    Nemotron's one-projection experts. That left 15 of each token's 22 routes out, while GGML, which keeps no tier for
+    these experts, computes them all.
+  - The fix: the tensor executors no longer skip Nemotron's ReLU^2 experts, and they apply the skip at decode and verify
+    widths only (8 rows), as documented. Since then `cuda` follows the CPU (mean |delta| 0.009).
+  - `NemotronBf16ProjectionTests` pins it with a synthetic top-22 model.
 
 ```bash
 hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models
@@ -182,12 +168,10 @@ The defining traits are:
   optional additive bias for expert selection, top-K, and renormalization /
   scaling.
 - **Optional latent bottleneck and shared experts** — MoE FFN can have an
-  in / out latent bottleneck (`ffn_latent_in` / `ffn_latent_out`) and a
-  shared SwiGLU branch (`ffn_up_shexp` / `ffn_down_shexp`) added in
+  in / out latent bottleneck (`ffn_latent_in` / `ffn_latent_out`, named
+  `ffn_latent_down` / `ffn_latent_up` in the Super / Bolt GGUFs) and a
+  shared ReLU² branch (`ffn_up_shexp` / `ffn_down_shexp`) added in
   parallel.
-- **Decode CPU offload threshold** — small decode ops (RMSNorm, residual
-  add, small matmuls) can be run on CPU to dodge per-dispatch GPU overhead;
-  large matmuls (SSM in/out, attention QKV/output, LM head) stay on GPU.
 
 ## 2. Model architecture
 
@@ -209,7 +193,7 @@ The defining traits are:
         │   RMSNorm(attn_norm) ─► ssm_in ─► z, xBC, dt  │
         │   conv1d(xBC) ─► SiLU                          │
         │   SSM scan(dt, A, B, C, state) ─► y            │
-        │   SiLU(z) * GroupRMSNorm(y) ─► ssm_out         │
+        │   GroupRMSNorm(y * SiLU(z)) ─► ssm_out         │
         │   residual += ssm_out                          │
         │                                                │
         │ Attention:                                     │
@@ -242,18 +226,18 @@ The defining traits are:
 
 ## 3. Forward graph
 
-For each layer L, dispatch by `_layerTypes[l]`:
+Each layer is one block (§7), lowered into the step's graph as:
 
 ```
 if Mamba2:
   hidden ─► RMSNorm(attn_norm)
          ─► ssm_in.weight matmul ─► split into z, xBC, dt
-         ─► Conv1dStep(xBC) using ssm_conv1d.weight (state in _convState[l])
+         ─► ssm_conv over [conv window | xBC] with ssm_conv1d.weight (+ bias; the window is the slot's state)
          ─► SiLU
-         ─► SSM scan step:
+         ─► selective scan over the chunk's rows (ggml_ssm_scan; the state is the slot's):
                 state ← state * exp(-softplus(dt) * A) + B * x * dt
                 y     ← state @ C  (+ x * D if D present)
-         ─► out = SiLU(z) * GroupRMSNorm(y, ssm_norm.weight)
+         ─► out = GroupRMSNorm(y * SiLU(z), ssm_norm.weight)
          ─► out matmul ssm_out.weight → o
          ─► residual = hidden + o
 
@@ -261,32 +245,32 @@ if Attention:
   hidden ─► RMSNorm(attn_norm)
          ─► attn_qkv.weight matmul ─► split Q, K, V (per-layer head counts)
          ─► append (K, V) to KV cache
-         ─► attention(Q, KCache, VCache, scale = _attentionScale or 1/sqrt(headDim))
+         ─► attention(Q, KCache, VCache, scale = attention.scale or 1/sqrt(headDim))
          ─► attn_output.weight matmul → o
          ─► residual = hidden + o
 
 if FFN (dense):
   hidden ─► RMSNorm(attn_norm)
          ─► ffn_up.weight matmul → x
-         ─► ReluSquaredInPlace(x)            # x ← max(0, x)²
+         ─► x ← max(0, x)²
          ─► ffn_down.weight × x → o
          ─► residual = hidden + o
 
 if FFN (MoE):
   hidden ─► RMSNorm(attn_norm)
-         ─► [if HasLatentIn] ffn_latent_in × hidden → latent
-         ─► logits = ffn_gate_inp × (hidden or latent)
-         ─► probs  = sigmoid(logits) + exp_probs_b      # element-wise
-         ─► weights, idx = topK(probs)
-         ─► if expert_weights_norm: weights /= sum(weights)
-         ─► weights *= expert_weights_scale
-         ─► For each selected expert e:
-                 up   = ffn_up_exps[e]   × (hidden or latent) → x
-                 ReluSquaredInPlace(x)
+         ─► logits = ffn_gate_inp × hidden
+         ─► probs  = sigmoid(logits)
+         ─► idx    = topK(probs + exp_probs_b)            # the bias steers selection only
+         ─► weights = probs[idx]; if expert_weights_norm: weights /= max(sum(weights), 2^-14)
+         ─► weights *= expert_weights_scale (and each expert's NVFP4 down scale)
+         ─► [if latent] ffn_latent_in × hidden → latent
+         ─► For each selected expert e (one ggml_mul_mat_id per projection):
+                 x    = ffn_up_exps[e] × (hidden or latent)   (× the expert's NVFP4 up scale)
+                 x   ← max(0, x)²
                  down = ffn_down_exps[e] × x
                  accum += weights[e] * down
-         ─► [if HasLatentOut] accum = ffn_latent_out × accum
-         ─► [if HasSharedExperts] accum += SiLU(...)·... using ffn_up_shexp / ffn_down_shexp
+         ─► [if latent] accum = ffn_latent_out × accum
+         ─► [if shared expert] accum += ffn_down_shexp × max(0, ffn_up_shexp × hidden)²
          ─► residual = hidden + accum
 ```
 
@@ -306,12 +290,12 @@ hidden ─► narrow(seq_len-1) if prefill
 The Mamba2 block is the most computationally specialized piece. The
 `ssm_in.weight` projection produces a concatenation of three streams:
 
-- **z** — gate, dim `_ssmDInner`.
-- **xBC** — the joint `(x, B, C)` stream, dim `_ssmDInner + 2 * _ssmNGroup * _ssmDState`.
-- **dt** — selective timestep, dim `_ssmNHead`.
+- **z** — gate, dim `d_inner` (`ssm.inner_size`).
+- **xBC** — the joint `(x, B, C)` stream, dim `d_inner + 2 * groups * d_state`.
+- **dt** — selective timestep, dim `heads` (`ssm.time_step_rank`).
 
-`xBC` is then run through a conv1d sliding window of kernel size `_ssmDConv`
-(state held in `_convState[l]`). After SiLU, the SSM scan step computes:
+`xBC` is then run through a conv1d sliding window of kernel size `ssm.conv_kernel`
+(the window is part of the sequence's recurrent state). After SiLU, the SSM scan computes, per row:
 
 ```
 ΔA   = exp( -softplus(dt + ssm_dt.bias) * A )           # A ∈ ℝ^{nHead}
@@ -321,17 +305,16 @@ y    = state · C                                         # C ∈ ℝ^{nGroup ×
 y   += x * ssm_d                                         # if `ssm_d` is present
 ```
 
-`Mamba2SSMStepSIMD` carries this in pure SIMD-vectorized C# during decode
-(one token at a time).  `GroupRMSNorm(y, ssm_norm.weight)` then normalizes
-per-group before the gate `SiLU(z) * y`. Finally `ssm_out` projects back to
-the hidden dim.
+The runtime runs it as one `GraphOp.SsmScan` over all of a chunk's rows (§7).
+`GroupRMSNorm(y, ssm_norm.weight)` then normalizes per group after the gate
+`SiLU(z) * y`. Finally `ssm_out` projects back to the hidden dim.
 
 ### 4.2 Attention layer
 
-- Standard GQA. Per-layer head counts `_layerNumHeads[l]` and KV head counts
-  `_layerNumKVHeads[l]` are read from GGUF arrays.
-- Fused QKV when `attn_qkv.weight` exists; otherwise the constructor's
-  `FuseQKVWeights()` builds it from separate `attn_q/k/v.weight` tensors.
+- Standard GQA. Per-layer head counts and KV head counts are read from the
+  GGUF arrays.
+- Fused QKV when `attn_qkv.weight` exists; otherwise the runtime fuses the
+  separate `attn_q/k/v.weight` tensors at load.
 - Attention scale is `nemotron_h.attention.scale` when set, else
   `1/sqrt(headDim)`.
 - **No RoPE** — the SSM state implicitly carries position information, so
@@ -339,37 +322,21 @@ the hidden dim.
 
 ### 4.3 FFN layer (dense)
 
-`ReluSquaredInPlace(x)` applies `x ← max(0, x)²` SIMD-vectorized in place.
-The dense FFN uses a single `ffn_up` matmul followed by ReLU² and
-`ffn_down`.
+The dense FFN uses a single `ffn_up` matmul followed by ReLU²
+(`x ← max(0, x)²`) and `ffn_down`.
 
 ### 4.4 FFN layer (MoE)
 
-- **Routing**: `sigmoid(logits) + exp_probs_b` (per-expert additive bias) →
-  TopK → optional renormalization (division by the sum) → optional global scale.
-  One router (`RouteMoEToken`) serves every path: the single-device per-token
-  loop, the batched-by-expert prefill and the `--tp` router. They pick the same
-  experts in the same order with bit-identical weights. The order matters
-  because the MoE kernels sum the routes in that order. Before, `--tp` sorted
-  its top-k by probability, and later normalised by `1/sum`. Each of those
-  changes moved the `--tp` greedy text. `NemotronTensorParallelRoutingTests`
-  checks this on the cpu backend's TP seam.
-- **Host decode attention under `--tp`**: the per-rank attention runs in C#
-  (`AttentionDecodePureCS`). Its softmax flushes terms below `exp(-50)` to
-  zero. Without the flush, a sharply peaked row leaves its tail in the
-  subnormal range, and every multiply on a subnormal takes a microcode assist.
-  That cost up to 20x on an i7-11800H, so decode speed under `--tp` depended
-  on the generated text.
-- **Latent bottleneck** (optional): `ffn_latent_in` projects hidden to a
-  smaller `latentDim`, the experts run in latent space, then
-  `ffn_latent_out` projects back to hidden.
-- **Shared experts** (optional): a SwiGLU branch using `ffn_up_shexp` and
-  `ffn_down_shexp` added in parallel.
-- **Batched MoE GPU dispatch**: on a GGML backend (Metal / CUDA), one
-  `MoEExpertsForward` call processes all selected experts in a single GGML
-  graph dispatch. Pre-cached `QuantizedWeight` references (`_expertUpQW`,
-  `_expertDownQW`) and pre-allocated `IntPtr[]` arrays (`_moeUpPtrs`,
-  `_moeDownPtrs`) avoid dictionary lookups and per-token allocations.
+- **Routing**: `sigmoid(logits) + exp_probs_b` (per-expert additive selection bias) → top-k → the selected experts'
+  unbiased probabilities as weights, renormalized by their sum (at least 2^-14) when `expert_weights_norm` is set, times
+  `expert_weights_scale`. One graph lowering serves every path (prompt chunks, decode, batched slots, verify windows,
+  every rank), so they pick the same experts in the same order.
+- **Latent bottleneck** (optional): `ffn_latent_down` (`ffn_latent_in`) projects hidden to a smaller `latentDim`, the
+  experts run in latent space, then `ffn_latent_up` (`ffn_latent_out`) projects back to hidden.
+- **Shared expert** (optional): a ReLU^2 branch using `ffn_up_shexp` and `ffn_down_shexp`, added to the routed sum; the
+  graph marks it a concurrent branch an executor may run beside the router.
+- **Experts**: `ggml_mul_mat_id` over the stacked `ffn_up_exps` / `ffn_down_exps` (one product per projection for all
+  selected experts of all rows), with the NVFP4 per-expert scales described above.
 
 ### 4.5 Vision encoder (`NemotronVisionEncoder`)
 
@@ -399,10 +366,22 @@ Mirrors NVIDIA's RADIO / CLIP-style ViT used by the v2_vl projector:
   which names the file, the tensors and the expected layout. A server started
   with `--mmproj`, or the CLI, refuses to start (exit code 2). Before this
   check, such a file loaded and then failed every image request.
+- **Final LayerNorm.** Super VL's mmproj ends the tower with `v.post_ln`
+  (weight and bias), applied to every token after the blocks, as llama.cpp's
+  `build_vit` applies it. Its bias is optional.
 - **Not used:** the video tower's `v.patch_embd.weight.1` (skipped at load,
-  with one log line), and Super VL's `v.post_ln`, which llama.cpp applies after
-  the blocks (a follow-up). Super VL image embeddings therefore differ from
-  llama.cpp's.
+  with one log line).
+- **Graph programs.** The tower and projector run as one graph program per tile
+  on the language model's executor, on every backend and direct CUDA included
+  (`NemotronVisionEncoder.Graph.cs`). The patch rows are packed on the host and
+  the resized position table is cached per grid, as before, and the embeddings
+  come back on the tower allocator. The managed per-op path loads and validates
+  the weights once at load, then frees them. It still serves an allocator that
+  has no executor. `NemotronVisionEncoderTests` holds the graph program to the
+  managed path for the fused, split (Bolt) and Super VL layouts, on the trained
+  grid and on a resized one: within 1e-5 relative L2 on the managed CPU, 1e-3
+  on direct CUDA, and 2e-3 on `ggml_cpu` and `ggml_cuda`, where GGML's
+  attention rounds K and V to F16.
 
 `NemotronImageProcessor` (mirrors `nemotronh.ImageProcessor`):
 
@@ -457,11 +436,11 @@ the model saw an unfilled `<so_embedding>` and answered the text alone). One
 table, `AudioInputSupport.UnsupportedReasonFor`, keyed on the architecture
 through the registry so every alias (`nemotron_h`, `nemotron_h_moe`,
 `nemotron_h_omni`) is covered and told whether the loaded model reports
-`NemotronModel.IsAudioEncoderLoaded`, drives every entry point:
+`NemotronRuntimeModel.IsAudioEncoderLoaded`, drives every entry point:
 
 - `/v1/chat/completions` and `/v1/responses` scan the whole request before
   writing any upload and answer **400** `invalid_request_error` with
-  `NemotronModel.AudioInputUnsupportedMessage` for any `input_audio` /
+  `NemotronRuntimeModel.AudioInputUnsupportedMessage` for any `input_audio` /
   `audio_url` part, including malformed ones and ones that follow an image;
   image-only requests still parse.
 - The Web UI answers 400 with the same message before the stream opens.
@@ -505,17 +484,48 @@ being served. Only then does `IsAudioEncoderLoaded` lift the §4.6 refusal, and
 (`PlanNemotronMedia`, per-modality attachment order), expands each
 `<so_embedding>` to `<so_start>` + N + `<so_end>`, and queues the projected rows.
 
-What is established (CPU only; see the evidence README): the Parakeet mel
-frontend matches an independent reference on six clips
-(`NemotronAudioInputTests`); the encoder and projector match the official
-Transformers modules on small 8- and 128-mel fixtures in F32 and BF16 compute,
-managed and GGML CPU (`NemotronAudioEncoderTests`); two-clip injection and
-sliced queueing keep exact rows and independent request retention
-(`NemotronAudioInjectorTests`). On the official trained companion the explicit
-F32-compute configuration matches all 8,064 output values; the original BF16
-compute configuration still **fails** (3,794/8,064 at an unchanged tolerance,
-first difference a BF16 rounding boundary in layer 0). Spoken-audio answer
-quality, GPU execution and latency are not qualified.
+**Two paths, chosen at load** (`NemotronAudioEncoder.Load`):
+- **F32-compute companion** (`nemotron.audio.compute_bf16=false`, `prepare_f32.py`'s file). The encoder runs as one
+  graph program per clip on the language model's executor, on every backend and direct CUDA included
+  (`NemotronAudioEncoder.Graph.cs`). The program is the managed path's arithmetic:
+  - **Subsampling.** `Conv2d` and `DepthwiseConv2d` stages with the rows past the valid frames zeroed, then pointwise
+    products.
+  - **Relative-position attention.** Content and position scores as per-head products, the relative shift a strided view,
+    the keys past the valid frames masked.
+  - **Conv module.** GLU, then a 'same' depthwise conv as `SsmConv` over a zero-padded window, then the inference
+    BatchNorm folded into a scale and a shift.
+
+  The matrices keep their BF16 encoding where the backend has kernels for it, and the vectors and conv kernels are F32.
+  The embeddings come back on the tower allocator (host memory on direct CUDA, as before).
+- **BF16-emulating companion** (`prepare.py`'s file). It keeps the managed path, which rounds every intermediate as the
+  official BF16 encoder does.
+
+What is established:
+- **Frontend.** The Parakeet mel frontend matches an independent reference on six clips (`NemotronAudioInputTests`).
+- **Encoder against the reference.** The encoder and projector match the official Transformers modules on small 8- and
+  128-mel fixtures (`NemotronAudioEncoderTests`): in F32 and BF16 compute on the managed path and GGML CPU; and in F32
+  for the graph program on the managed CPU, `ggml_cpu`, `ggml_cuda` and direct `cuda`, at the managed path's F32
+  tolerance.
+- **Injection.** Two-clip injection and sliced queueing keep exact rows and independent request retention
+  (`NemotronAudioInjectorTests`).
+- **Trained companion.** The explicit F32-compute configuration matches all 8,064 output values. The original BF16
+  compute configuration still **fails** (3,794/8,064 at an unchanged tolerance, first difference a BF16 rounding
+  boundary in layer 0).
+- **Real clip.** On the trained F32-compute companion and a 10.44 s LibriSpeech clip (131 rows), the graph program
+  encoded in:
+  - 24.4 ms on `ggml_cuda` and 48.1 ms on direct `cuda` (A40);
+  - 481 ms on `ggml_cpu`;
+  - against 1.8-1.9 s for the managed path, under the test VM's 7.65-CPU quota.
+
+  The rows are within 1.8e-3 relative L2 of the managed path's (the BF16 weights' products round their activations;
+  `eng/validation/NemotronRuntimeAB --scenario audio`).
+- **Speech.** Nano Omni (`UD-Q4_K_XL`, the BF16 mmproj and this companion through `TS_NEMOTRON_AUDIO_MMPROJ`) was asked
+  to transcribe the clip. It answered with the reference transcript word for word on `ggml_cuda` and on `cuda`: "He hoped
+  there would be stew for dinner, turnips and carrots and bruised potatoes and fat mutton pieces to be ladled out in
+  thick peppered flour-fattened sauce."
+  - The 155-token prompt prefilled in 245 ms on `ggml_cuda` and 617 ms on `cuda`.
+  - The CLI was run with `--no-skills`. With its default skill catalog the model answered the request with a skill tool
+    call instead of the transcript.
 
 ## 5. Parameters and settings
 
@@ -581,349 +591,237 @@ blk.{L}.ffn_up_shexp.weight       # shared expert (optional)
 blk.{L}.ffn_down_shexp.weight
 ```
 
-## 7. TensorSharp implementation walkthrough
+## 7. TensorSharp implementation: the shared decoder runtime
 
-Constructor:
+Nemotron-H runs on the shared decoder runtime (`StandardDecoderModel`), as Gemma 4, Qwen 3.5 and Mistral 3 do.
+[`NemotronRuntimeModel`](../../TensorSharp.Models/Models/Nemotron/NemotronRuntimeModel.cs) declares the family's
+blocks and weights. The runtime provides batching, the prefix cache, checkpoints, placements, speculation, expert offload
+and LoRA. The legacy per-op `NemotronModel` was removed after the validation in §11. So were its native Mamba-2 kernels
+(`ggml_ops_mamba2.cpp`), its per-token MoE expert kernel (`TSGgml_MoEExpertsForwardF32`), its fused matmul+add and
+single-layer flash-decode entry points, and its switches: `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE`,
+`TS_NEMOTRON_MAMBA2_NATIVE_PREFILL_MIN_TOKENS`, `TS_MAMBA2_PREFILL_CACHE_MB`, `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`,
+`TS_NEMOTRON_MOE_PREFILL_BATCHED_MIN_TOKENS`, `TS_NEMOTRON_MULTIMODAL_WARMUP(_TILES)` and `TS_TP_SNAPSHOT_TRACE`. Setting
+one now stops startup and names the change (`RemovedCliFlags`). `TS_NEMOTRON_IMAGE_MAX_TILES` and
+`TS_NEMOTRON_AUDIO_MMPROJ` still apply.
 
-1. `ParseBaseConfig()`.
-2. Reads SSM dims (`_ssmDConv`, `_ssmDInner`, `_ssmDState`, `_ssmNHead`,
-   `_ssmNGroup`, derives `_ssmHeadDim`).
-3. Reads MoE counts and bias / scale flags.
-4. Reads per-layer arrays (`head_count_kv`, `head_count`,
-   `feed_forward_length`) and classifies each layer into Mamba2 / Attention
-   / FFN.
-5. `ParseTokenizer()`, `LoadWeights()`.
-6. `FuseFFNWeights()` (placeholder for future dense FFN fusion),
-   `FuseQKVWeights()` (only on attention layers).
-7. `PrepareCudaQuantizedWeightsForInference()`.
-8. `InitCaches(maxSeqLen)` allocates KV caches for attention layers, conv
-   states for Mamba2 layers, and SSM states for Mamba2 layers.
-9. `InitMamba2Buffers()` pre-allocates `_mamba2ConvOutBuf` /
-   `_mamba2YBuf`.
-10. `InitLayerInfo()` precomputes layer-prefix strings and per-MoE-layer
-    flags (`HasLatentIn`, `HasSharedExperts`, `LatentDim`).
-11. `InitMoEBuffers()` pre-allocates the routing and expert pointer arrays.
+**Blocks.** Each layer is exactly one block, read from the per-layer arrays: Mamba-2 (`head_count_kv` and
+`feed_forward_length` both 0), attention (`head_count_kv` > 0) or feed-forward (`feed_forward_length` > 0). The runtime's
+block layout skips the parts a layer does not have. The family runs whole-forward graphs only
+(`RequiresGraphs`): every step, whether a prompt chunk, a decode step, batched slots or a verify window, is one graph on the
+backend's tensor executor. That is the GGML graph builder on `ggml_*`, `CudaGraphExecutor` on `cuda`, `MlxGraphExecutor`
+on `mlx`, and the managed executor on `cpu`.
 
-`Forward(int[] tokens)` runs the per-op managed loop. For each layer it
-dispatches to `Mamba2Block` / `AttentionBlock` / `FFNBlock` based on
-`_layerTypes[l]`.
+**Mamba-2 mixer** (`EmitRecurrentMixer`), per sequence of the step:
+1. `ssm_in` splits into `z | xBC | dt`.
+2. The conv window (the state's last `conv_kernel - 1` rows) is concatenated with the chunk's `xBC` rows and passed
+   through `ssm_conv`, plus the conv bias and SiLU. The window's tail is written back.
+3. `dt + dt_bias`, then the selective scan over all of the chunk's rows in one `GraphOp.SsmScan`. The legacy model
+   scanned token by token. GGML runs upstream `ggml_ssm_scan` unchanged; direct CUDA runs `ts_graph_ssm_scan_f32` (one
+   warp per state row); the managed executor runs a SIMD loop.
+4. `y + x * D`, `y * SiLU(z)`, the grouped RMSNorm, then `ssm_out`.
 
-## 8. Prefill optimization
+A verify window keeps the scan's state after every row (`ggml_ssm_scan`'s K snapshots) and the conv history. Committing
+an accepted prefix copies that row's snapshot into the live state (`CommitRecurrentPrefix`), so a rejected draft rewinds
+exactly without re-running the prefix.
 
-- **Per-layer dispatch tables** (`_layerPrefixes`, `_layerWeightNames`)
-  avoid string interpolation in hot loops.
-- **MoE prefill** still iterates per token. Each token uses the batched
-  MoE GPU kernel (`MoEExpertsForward`) so all selected experts run in a
-  single dispatch per token, but the token loop is still managed C# — see
-  the optimization opportunities below.
-- **Attention prefill** attends each prompt chunk against the resident K/V
-  in a bounded working set. On GGML backends with an F32 or F16 cache it
-  runs the fused prefill kernel (`GgmlBasicOps.FusedPrefillAttention` /
-  `FusedPrefillAttentionF16KV`), which reads the grouped cache directly and
-  switches to `ggml_flash_attn_ext` once the score tensor would be large.
-  Every other case (non-GGML backends, block-quantized caches) attends in
-  query sub-chunks sized so one `[heads, rows, context]` score tensor stays
-  under `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` (default 1024). This used to
-  materialize the whole `[heads, chunk, context]` score tensor per layer:
-  a 4,096-token chunk deep into a 32k prompt asked ggml-cuda for 37 GB on
-  the 8B (12.5 GB at 8k on the 47B) and every long request failed with
-  HTTP 500. The same code serves `nemotron_h_moe` (Nemotron 3.5, Nemotron 3
-  Nano Omni).
-- **Attention prefill on the direct `cuda` backend** changed in PR #282. The
-  single-sequence prefill path calls `CudaFusedOps.TryGqaPrefillAttention`
-  when the context is at most 8,192 tokens and the K/V cache is a contiguous
-  F32 or F16 tensor. (The batched/paged forward does not use it.) The kernel
-  reads the live `[kvHeads, cacheLen, headDim]` cache in place and broadcasts
-  each KV head to its query group. It no longer expands K/V to every query
-  head (16x for Nemotron 3.x) or materializes a `[heads, rows, context]`
-  score tensor.
-  - **Kernel choice.** Nemotron 3.x attention (32 query heads over 2 KV
-    heads, head_dim 128, full attention) uses the group-16 flash kernel
-    `ts_gqa_prefill_flash_g16d128_{f16,f32}`. A build that compiles the
-    kernels locally with nvcc has it, and so does the committed compute_75
-    baseline PTX used when nvcc is absent (refreshed with CUDA 13.0). The
-    generic GQA prefill kernel runs only when the loaded module lacks it, such
-    as a stale or custom PTX. `benchmarks/FlashAttnBench` prints the kernel it
-    ran.
-  - **Fallback.** Longer contexts and other cache layouts keep the
-    materialized sub-chunk path above.
-  - **Numerics.** Both kernels sum the softmax in a different order from the
-    materialized path, so greedy output can change at near-tie tokens compared
-    with builds before PR #282.
-  - **The review's measurements (2x A40, CUDA 12.8; not re-measured here).**
-    The group-16 kernel's max error against the CPU reference was 1.21e-4, and
-    it was 1.7-3.6x faster at 2K-8K tokens. The gain did not show end to end in
-    Nemotron 3.5 Lightning's ~6K-token prefill. On Nemotron-H 8B, 2 of 7 greedy
-    answers were reworded and both were still correct.
+**Attention** has no positional encoding (`AttentionIsPositionless`): the runtime's paged K/V and attention kernels, at
+`attention.scale` when the GGUF sets it.
 
-  `NemotronModel.MaterializedPrefillAttentionForTest` forces the old path in
-  tests.
-- **Mamba2 prefill** processes tokens **sequentially** (loop over `seqLen`)
-  through the SSM scan; chunked parallel scanning is on the optimization
-  list.
-- **Mamba2 prefill graphs** (`TSGgml_NemotronMamba2PrefillF32`) are cached
-  per chunk length, and every graph intermediate lives in the cached
-  buffer: about 2.7 GB for a 4,096-token chunk on the 8B and 5.5 GB on the
-  47B. The cache is held to a byte budget, `TS_MAMBA2_PREFILL_CACHE_MB`
-  (default 1024), least recently used first out; a graph larger than the
-  whole budget serves its call and is released. It used to keep every
-  distinct chunk length forever, so after a 32k prompt the 47B had no
-  device memory left and the next concurrent decode step failed its
-  allocations with HTTP 500.
-- **Multimodal prefill** supports chunked server prefill by slicing prepared
-  image/audio embedding spans per prompt chunk, so long image prompts no longer
-  have to run as one monolithic forward pass.
-- **Multimodal warmup** runs a tiny vision encode plus an image-token prefill
-  during server startup when a Nemotron `mmproj` is loaded. This shifts Metal
-  pipeline setup away from the first real image request; set
-  `TS_NEMOTRON_MULTIMODAL_WARMUP=0` to disable it.
+**Feed-forward** (`EmitFeedForward`): dense `down(relu(up x)^2)`, or the routed experts of §4.4 (router, selection bias,
+renormalized and scaled weights, NVFP4 scales, latent bottleneck, shared expert, per-layer expert counts and top-k).
 
-## 9. Decode optimization
+**Weights** stay in their GGUF formats on every executor. NVFP4 per-tensor `.scale` sidecars multiply their products,
+and the tensor-parallel shards keep them.
 
-### Batched GPU MoE (`MoEExpertsForward`)
+## 8. Serving mechanisms
 
-For MoE FFN layers on a GGML backend (Metal / CUDA), all selected experts
-are processed in one GGML graph dispatch:
-
-- Pre-cached `QuantizedWeight[]` arrays (`_expertUpQW[layer][e]`,
-  `_expertDownQW[layer][e]`) — populated once at init time.
-- Pre-allocated `IntPtr[] _moeUpPtrs` / `_moeDownPtrs` arrays of length
-  `_numExpertsUsed`.
-- Pre-allocated reusable result tensors (`_expertUpResult`,
-  `_expertDownResult`, `_latentAccumTensor`, `_latentOutResult`).
-
-### SIMD ReLU² and bias add
-
-`ReluSquaredInPlace` and `LinearForwardInto` are SIMD-vectorized using
-`System.Numerics.Vector<float>` so the dense FFN compute on CPU runs at
-near-peak vector throughput.
-
-### Pre-allocated decode buffers
-
-| Buffer | Size | Purpose |
+| Mechanism | Backends | Notes |
 |---|---|---|
-| `_mamba2ConvOutBuf` | `dInner + 2 * nGroup * dState` | Conv1d output + SiLU |
-| `_mamba2YBuf` | `dInner` | SSM scan output |
-| `_moeProbs` / `_moeSelectionProbs` | `numExperts` | Router probabilities |
-| `_moeTopExperts` / `_moeRouteW` | `numExpertsUsed` | Selected experts and weights |
-| `_moeLatentAccum` | `max(hiddenSize, latentDim)` | Latent-space accumulator |
-| `_expertUpResult` / `_expertDownResult` | max expert dims | Reusable expert matmul outputs |
-| `_latentAccumTensor` / `_latentOutResult` | `latentDim` / `hiddenSize` | Latent bottleneck reuse tensors |
-
-## 10. Memory and KV cache strategy
-
-- **Attention layers**: standard KV cache `[numKVHeads, maxSeqLen, headDim]`.
-- **Mamba2 layers**: `_convState[layer]` (size `(convKernel - 1) * (dInner +
-  2 * nGroup * dState)` floats) and `_ssmState[layer]` (size `dState *
-  headDim * nHead` floats).
-- `ResetKVCache()` zeroes all three (KV caches, conv states, SSM states).
-- `SupportsKVCacheTruncation` returns **false** because SSM states are
-  sequential and cannot be rewound. Prefix reuse therefore works at block
-  boundaries rather than by rewinding: each captured KV block bundles the
-  attention layers' K/V rows with every Mamba2 layer's conv and SSM state at
-  the end of that block (`RequiresPerBlockCapture`), and the Radix prefix
-  cache restores the whole blocks a new prompt shares or continues the resident
-  cache when the prompt extends it exactly (`NemotronModel.PrefixCache.cs`).
-- Concurrent requests run on the batched route, whose pages hold attention K/V
-  only: the recurrent state lives in a per-request Mamba2 slot. A finished
-  batched sequence's slot is kept beside its pool blocks as its conversation's
-  end state (`PrefixCacheCapabilities.PagedEndStates`) and donated at exact
-  length to the next turn. Before, both were freed, and every conversation that
-  ran beside another re-prefilled its whole history each turn: eight parallel
-  Nemotron 3.5 Lightning conversations reused 0 tokens; now each reuses its
-  whole previous turn, and the run finishes 12% sooner (176 s against 201 s).
-
-## 11. Batched / paged forward (continuous batching)
-
-Nemotron-H implements `IBatchedPagedModel.ForwardBatch`
-([`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs))
-that runs through the shared `InferenceEngine` continuous-batching stack
-([`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md))
-by default — concurrent requests can only be served truly in parallel
-through the batched path. `--no-continuous-batching` forces the
-per-sequence KV-swap path.
-
-Nemotron-H is the most demanding of the batched ports because it
-combines **three different layer types** — Mamba2 SSM, attention-only,
-and FFN (dense or MoE) — and Mamba2 is recurrent (per-sequence state).
-The batched path therefore needs two orthogonal caches:
-
-### Attention layers — paged K/V
-
-- Mirrors Mistral 3 layout
-  (`[numBlocks * blockSize * numKvHeads * headDim]` per layer).
-- No RoPE — Nemotron-H attention layers carry no positional encoding.
-- Per-sequence attention dispatch via `ManagedPagedAttention.Forward`
-  (the pure-C# online-softmax kernel) as the correctness reference. The
-  native paged kernel path is also wired through `GgmlBasicOps`.
-- The native host-array kernel (`TSGgml_PagedAttentionForward`) caches one
-  graph and backend buffer per shape bucket and pads K/V up to the bucket.
-  That buffer is cleared when a session is built: backend buffers are not
-  zeroed, and CUDA flash attention still reads the `-inf`-masked padded keys,
-  so stale NaN from memory a freed buffer had used (a long prompt that came
-  and went) turned every row of the next batched prefill into NaN. Nemotron
-  3.5 then failed the whole 4-sequence step with an `IndexOutOfRangeException`
-  in `TryMoEPrefillBatchedByExpert` (the router has no top-k for a NaN row).
-  The MoE router now reports a non-finite row by layer and row instead.
-
-### Mamba2 layers — per-slot conv + SSM state pool
-
-Each sequence's recurrent state lives in a slot keyed on its **primary
-block id** (matching vLLM's `state_indices_tensor`):
-
-- `_nemoSlotMamba2NativeDecodeProjected[layer][slot]` — per-slot conv
-  ring buffer.
-- `_nemoSlotMamba2NativeDecodeHidden[layer][slot]` — per-slot SSM state.
-- `_nemoSlotMamba2NativeDecodeStateInitialized[layer][slot]` —
-  initialization flag.
-
-Slots are allocated lazily on first touch and freed when the engine
-retires the sequence.
-
-**Device-resident recurrent state.** The native single-token Mamba2 decode
-kernel keeps each sequence's conv/SSM state on the device between tokens
-(downloading ~2 MB per layer per token would cost more than the kernel
-saves), so after a decode step the host arrays are stale. Every host reader
-drains first through `TSGgml_NemotronMamba2DecodeReadState`
-(`SyncMamba2HostState`): the managed/native multi-token forward that
-continues a sequence, the per-block KV snapshot, the migration of the
-single-sequence owner into the slot pool when a second request arrives, the
-native batched step, and the speculative snapshot. Before this, all of them
-read the state from before the first decoded token, so concurrent requests
-(which hand sequences between the per-sequence and batched paths) produced
-different greedy output from the same requests served alone - on the 8B at
-concurrency 4 answers such as `101`, `1000000...` and repetition loops. The
-single-sequence path uses its own decode-cache slot
-(`SoloMamba2Slot`), so a batched sequence on slot 0 can no longer overwrite
-its device state.
-
-**Concurrency hand-offs.** Three more defects made requests of a concurrent
-wave answer differently from the same request served alone (on the 8B,
-`17 + 25` came back as `18`, `35`, an empty answer, or another prompt's
-content), and none had anything to do with kernel numerics:
-
-- *Paged pool growth wiped live K/V.* `EnsureNemoPagedBuffers` reused the
-  outer per-layer array when it grew the block pool, so the new buffer
-  replaced the old one before the copy read it. Any sequence decoding in the
-  step that first brought a higher block id (a newcomer's prefill, or the
-  single-sequence owner just migrated in) attended over zeros. The grow now
-  builds fresh outer arrays, as the Qwen 3.5, Gemma 4 and Mistral 3
-  ports already did.
-- *Borrowed logits on an ownership swap.* A step that forwards one sequence
-  alone lets it borrow the model's reusable logits buffer until it samples.
-  When a newcomer took ownership first, its `Forward` rewrote that buffer
-  and the outgoing owner sampled its next token from the newcomer's logits.
-  `BatchExecutor.EnsureOwnership` now gives the outgoing owner its own copy.
-  This one is model-independent and was also what broke
-  the per-sequence path at concurrency.
-- *Uncleared paged-attention sessions.* `TSGgml_PagedAttentionForward`
-  caches one graph per query count and power-of-two K/V bucket and uploads
-  only the leading `seq_len` rows; the rest of the bucket is masked. The
-  session assumed its backend buffer started zeroed, which cudaMalloc does
-  not promise, and the CUDA flash-attention kernels compute `q.k` for masked
-  keys before adding the `-inf` mask: a leftover key that overflows gives
-  `inf + -inf = NaN` for the whole row. The session buffer is now cleared
-  when it is built (shared by every model on the native paged kernel). This
-  was fixed as the likely cause of one 47B wave after a 32k prompt decoding
-  `<unk>` forever; a synthetic reproduction could not force the allocator to
-  hand the dirty memory back, so that link is unproven.
-
-A **native batched Mamba2 step kernel** —
-`TSGgml_NemotronMamba2BatchedStepF32`
-([`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp))
-— is gated behind `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`. It uses NEON
-SIMD + GCD per-head parallelism (mirrors the Qwen 3.5 batched GDN
-kernel structure) and replaces N C# `Mamba2Block` calls with one native
-dispatch plus batched `ssm_in` / `ssm_out` projections. Exposed through
-`GgmlBasicOps.NemotronMamba`.
-
-### FFN — dense and MoE
-
-- Dense FFN runs token-parallel ReLU² (`up → ReLU² → down`) across the
-  entire batched token axis in a single matmul per projection.
-- MoE FFN runs through the existing `MoEForward` token-parallel router
-  + per-token expert dispatch (no new batched-MoE kernel for
-  Nemotron-H yet).
-
-### Multimodal in the batched path
-
-Vision and audio embeddings inject directly into the batched
-`[numTokens, hidden]` tensor via the same row-wise
-`InjectMultimodalEmbeddings` path the per-sequence forward uses, so
-`SupportsBatchedMultimodal` is true.
-
-### Verified correctness and throughput
-
-- **100% greedy match** vs legacy on text-only prompts
-  ([`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)).
-- Concurrent requests (all at once, joining while the first one is already
-  decoding, and a four-client worker pool) on the per-sequence path
-  (`--no-continuous-batching`) produce exactly the greedy tokens of each request
-  served alone: that path runs the same kernels and swaps state in and out.
-  On the batched path every token chosen is a near-top token when the same
-  history is replayed through the single-sequence forward. Exact token
-  parity is not guaranteed there: the batched step runs different kernels
-  (paged F32 attention instead of the F16 cache, batch-composition dependent
-  quantized matmul), which track the single-sequence logits only to
-  max|dlogit| 0.3-1.4 on the 8B, and a prompt whose top two candidates sit
-  inside that band can flip. A multi-token forward that continues a
-  sequence after decode matches prefilling it from scratch, and a sequence
-  decoding in a step that grows the paged pool keeps its history
-  ([`NemotronHServingRegressionTests`](../../InferenceWeb.Tests/NemotronHServingRegressionTests.cs),
-  needs `TS_TEST_NEMOTRON_H_DIR` and `TS_TEST_GGML_BACKEND=cuda|metal`).
-- Multimodal-prompt correctness is structurally validated (text-only
-  stays 100% after removing the multimodal pre-flight rejection) but
-  lacks a local audio/image fixture for end-to-end verification.
-
-**Throughput on NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ2_XXS
-(Apple M4 Pro, GgmlMetal, legacy-vs-batched in-process toggle in
-[`NemotronBatchedPerfBench`](../../InferenceWeb.Tests/NemotronBatchedPerfBench.cs))**:
-
-| Path | n=1 | n=3 | n=5 |
-|---|---|---|---|
-| Batched + managed Mamba2 step | 1.94× | 3.43× | 1.67× |
-| Batched + native Mamba2 step (`*_NATIVE=1`) | 0.75× | **3.95×** | 2.93× |
-
-`n=1` is the only regression: batched scaffolding outweighs the benefit
-for single-sequence decode. From `n=2` onward the batched path wins
-across the board. `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` extends the
-win to multi-batch decode by replacing the C# Mamba2 inner loop with the
-native NEON kernel.
-
-### Speculative decoding is refused
-
-Nemotron-H does not speculate: `--draft-model` does not attach a DSpark/DFlash
-drafter (the Nemotron 3.5 Lightning `NVFP4-DSpark` GGUF is recognized and
-reported as not attached; the server stops at startup when `--draft-model` names
-one, saying to drop the flag), and `--spec` or `--spec-type ngram` serve plain
-decoding with a one-time warning. The reason is correctness. A speculative
-stream must equal plain greedy decoding, and on this trunk the multi-token
-verify and the single-token decode use different attention kernels (host
-attention over the expanded cache against the flash-attention decode kernel)
-and different MoE kernels (batched-by-expert against the per-token kernel).
-Measured on `nemotron_h_moe` (A40, `ggml_cuda`): a one-row speculative step
-differs from `Forward` by 0.16-1.1 in the logits and verify rows by 0.2-0.8,
-enough to flip low-margin greedy picks (the 2026-09-16 campaign saw every solo
-DSpark request diverge). The Mamba-2 snapshot/rollback is exact. Running
-attention and MoE row by row makes the verify exact, but 4 rows then cost
-116 ms against a 28 ms decode step (plus 70 ms per DSpark block), so an exact
-verify cannot beat plain decoding. Details: [speculative decoding](../speculative_decoding.md#nemotron-h-refuses-speculation).
+| Continuous batching | all | Batched slots: each slot holds a Mamba-2 conv window and SSM state, and the attention layers share the paged K/V pool. Concurrent requests run in batched steps. |
+| Prefix cache, checkpoints | all | The runtime's holder adapter. A cached prefix carries the Mamba-2 states at its checkpoints, so a continuation restores K/V rows and recurrent state together. `CheckpointsContinueExactly` covers it. |
+| `--tp N` | cuda, ggml_cuda, ggml_vulkan | Per-rank graphs. Mamba-2 is sharded by contiguous blocks of groups: `ssm_in` row blocks, and one `ssm_out` column block per rank, so a quantized row never splits inside a block. Attention is sharded by heads and every expert by its width. Batching is kept. Covered on simulated devices only (§11). |
+| `--layer-split N` | cuda, ggml_cuda, ggml_vulkan | Whole-layer stages, batching kept. |
+| Hybrid (`--tp` x `--layer-split`) | none (gap) | The graph-only family has no graphs for tensor-parallel stages yet. |
+| `--n-cpu-moe` / `--cpu-moe` | all | On one device or over stages; refused with `--tp`. See §10. |
+| Speculation | all | n-gram drafts, the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), and the DFlash and DSpark block drafters (`--draft-model`, below), verified in windows that rewind the Mamba-2 states exactly. |
+| Text LoRA | cpu, ggml_cpu, ggml_cuda, cuda | One device. Each adapted product's delta is in the graph (`AppliesTextLoraInGraphs`). The targets are listed below. |
+| Media | all | The vision and audio towers' embeddings enter as queued media rows written over their placeholder rows (`QueueMedia`). |
 
 ### Text LoRA adapters
 
-Nemotron-H takes text LoRA adapters (`--lora`, `/v1/loras`, a request's `lora`)
-on one device with `cpu`, `ggml_cpu`, `ggml_cuda` or `cuda`; under `--tp` they are
-refused. Every projection outside the routed experts is adapted: Mamba2 `ssm_in`
-and `ssm_out`, `attn_q/k/v` (fused into `attn_qkv` at load) and `attn_output`, the
-dense `ffn_up` and `ffn_down`, the shared experts, the latent `ffn_latent_down` /
-`ffn_latent_up`, the router and the LM head. An adapter on a routed expert
-(`*_exps`) is refused with a 400 that names it. While a step runs with an adapter,
-the decode fast paths (the `FusedMatMulQuantAdd` residual adds and the MoE decode
-residual) decline for the weights it adapts, and the projection that feeds the native
-Mamba2 decode applies the delta itself; requests without an adapter keep every fast
-path. Validated on synthetic models against a merged-weights twin (cpu, ggml_cpu,
-ggml_cuda), not yet on a real checkpoint or on `cuda`. Details: [design
+Nemotron-H takes text LoRA adapters (`--lora`, `/v1/loras`, a request's `lora`) on one device, and refuses them under
+`--tp` or `--layer-split`. Every projection outside the routed experts is adapted:
+- Mamba2 `ssm_in` and `ssm_out`
+- `attn_q/k/v` (fused into `attn_qkv` at load) and `attn_output`
+- the dense `ffn_up` and `ffn_down`
+- the shared experts
+- the latent `ffn_latent_down` / `ffn_latent_up`
+- the router and the LM head
+
+An adapter on a routed expert (`*_exps`) is refused with a 400 that names it. The deltas are applied inside the step's
+graph, so decode, batched slots and verify windows all apply them, and the forward audit throws if a planned weight was
+skipped. This is validated on synthetic models against a merged-weights twin (`TextLoraModelParityTests` on cpu,
+ggml_cpu, ggml_cuda and cuda; `TextLoraPlanTests`), not on a real checkpoint. Details: [design
 doc](../design/logprobs-lora-moe-runtime-features.md) §2.2.
+
+### Block drafters (DFlash / DSpark)
+
+The Lightning repository ships two block drafters beside the MTP head; either attaches with `--draft-model`:
+
+```bash
+dotnet run --project TensorSharp.Cli -c Release -- --model models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf \
+  --draft-model models/dspark-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf --backend ggml_cuda
+```
+
+| | DFlash (`dflash-...-NVFP4.gguf`) | DSpark (`dspark-...-NVFP4.gguf`) |
+|---|---|---|
+| Layers | 6 (hidden 2688, 32 query heads over 2 KV heads, head_dim 128); BF16 attention, NVFP4 FFN and `fc` with `.scale` sidecars | the same, plus per-head attention sinks |
+| Context | every layer attends the whole history (no `sliding_window`); YaRN rotary, factor 128 over 8192 | a 1,024-token sliding window |
+| Block | 16 rows, non-causal; rows 1 .. 15 are drafts | 8 rows, block-causal; a bonus anchor (`sample_from_anchor = false`): rows 1 .. 7 are drafts |
+| Head | the target's LM head, top-1 of each row | the target's LM head plus a rank-512 Markov head: draft e's logits gain `w2 · w1[prev]`, `prev` the anchor, then each draft's own choice |
+| Encoder | trunk layers 2, 6, 20, 30, 42, 52 (52 is the stream leaving the last layer) | the same |
+
+Both run as the shared runtime's block-draft graph programs (`StandardDecoderModel.BlockDraft.cs`) on every executor:
+- **Markov head.** The chain runs on the device: `GetRows(w1, prev)`, `w2`'s product with its scale, and each draft's
+  top-1. Only the drafted ids and their confidences come back.
+- **Attention sinks.** Each sink is the attention op's fifth operand. The GGML builder passes it to
+  `ggml_flash_attn_ext_add_sinks`. The tensor executors attend a sink layer through their generic products, with the
+  sink as one more column of each row's softmax (`TensorGraphExecutor.FlashAttentionWithSinks`).
+- **Mask.** The block mask closes slot i to the block's queries before row i when the drafter's `attention.causal` is set.
+- **DFlash's full attention.** It is served with a window of the trunk's context, at most 8,192 positions: a ring of
+  8,224 rows, 96 MB of F32 K/V. Past that much context a draft sees the latest 8,192 positions. Drafts are verified, so
+  this can lower acceptance but never changes the output.
+- **Drafter embedding.** The drafter's own BF16 token embedding stays on the host in its file encoding. Loading it as an
+  F32 tensor would have put 1.4 GB on the device, where nothing read it.
+
+The per-op drafter follows the same rules (YaRN, the causal block, the bonus anchor's rows). The fused GGML drafter
+takes neither YaRN nor a causal block, so these two files draft through the graph programs, or per op where those
+decline.
+
+Lightning Q4_0 on one A40, greedy, 128 generated tokens a prompt. Each row reports:
+- the acceptance length τ, which is (accepted + verifies) / verifies, so a verify's bonus token counts;
+- the decode rate relative to plain decoding.
+
+NVIDIA reports τ of 3.16 (DFlash) and 3.75 (DSpark) at draft length 7.
+
+| Prompt | DSpark x7 ggml_cuda | DSpark x7 cuda | DFlash x7 ggml_cuda | DFlash x7 cuda | MTP x3 ggml_cuda / cuda |
+|---|---|---|---|---|---|
+| Fibonacci function (code) | τ 5.13, 1.29x | τ 5.64, 1.53x | τ 3.54, 1.10x | τ 3.18, 1.19x | 1.16x / 1.38x |
+| Why the sky is blue (3 bullets) | τ 2.80, 0.87x | τ 2.77, 1.03x | τ 1.73, 0.74x | τ 2.00, 0.91x | 1.13x / 1.15x |
+| Train speed (arithmetic) | τ 6.19, 1.52x | τ 5.46, 1.58x | τ 3.50, 1.11x | τ 3.33, 1.22x | 1.24x / 1.29x |
+| German translation | τ 2.76, 0.85x | τ 3.74, 1.24x | τ 2.17, 0.83x | τ 2.00, 0.91x | 1.12x / 1.17x |
+
+Plain decoding ran at 140 tok/s on `ggml_cuda` and 68-71 tok/s on `cuda`. With 3-token windows, DSpark ran the code
+prompt at 1.35x and the arithmetic prompt at 1.39x on `ggml_cuda`.
+
+**What bounds the speed-up.** On this MoE trunk an 8-row verify reads the experts of every row: about 23 ms on `ggml_cuda`
+against 7.1 ms for a decode step. A draft costs 4.4 ms (DSpark's block graph) plus 0.35 ms (the ring inject) at steady
+state.
+
+**Parity.** A speculative stream follows plain greedy decoding until a verify window's kernels flip a close pick. On
+`ggml_cuda` the streams parted where plain decoding's top two logits were 0.004-0.088 apart. On `cuda` they parted at up to
+0.21, and the MTP head parted at the same token, so this comes from the direct-CUDA verify rows' rounding (§11), not from a
+drafter.
+
+Synthetic coverage (`GraphBlockDraftTests`): a DSpark-shaped drafter (Markov head, sinks, causal block, bonus anchor, a
+target past the stack) and a full-attention YaRN drafter with its own embedding are checked as follows:
+- their graph drafts match the per-op drafter's (ids, confidences within 1e-3, ring rows within 1e-4) on the managed
+  CPU, `ggml_cpu`, `ggml_cuda` and direct `cuda`;
+- speculation with each emits plain greedy decoding's stream on the managed CPU, `ggml_cuda` and `cuda`.
+
+`DSparkConfigTests` covers the exports' keys.
+
+Limits:
+- `mlx`, `ggml_metal` and `ggml_vulkan` were not run.
+- Several requests' DSpark blocks do not share one program: each request drafts its own block (DFlash keeps the batched
+  lanes).
+- On direct CUDA, a sink layer takes the generic attention rather than the ring kernel.
+
+## 9. Memory
+
+- **Attention layers**: the runtime's paged K/V pool (F16 by default; `--kv-cache-dtype`).
+- **Mamba-2 layers**, per slot: a conv window of `(conv_kernel - 1) x (d_inner + 2 x groups x d_state)` floats and an SSM
+  state of `heads x head_dim x d_state` floats. A slot's verify buffers (each row's state snapshot and the conv history)
+  are allocated the first time it speculates, at a power-of-two window capacity of at least 4.
+- **Weights**: resident on the device, except the routed experts of offloaded layers (§10). Load is fast: Lightning
+  loaded in 0.7 s on `ggml_cuda`, against 10.7 s for the legacy model.
+
+## 10. Expert offload (`--n-cpu-moe` / `--cpu-moe`)
+
+An offloaded layer's routed experts stay in host memory, and the step's graph pauses for them. The router, the selection,
+the latent projections and the shared expert stay on the device. On the GGML backends the host MoE segment computes them
+from the GGUF mapping. On the tensor executors (`cuda`, `mlx`, `cpu`) the runtime's expert host computes them. Both use
+ggml's CPU kernels: one projection, `relu(s * up)^2`, then `down`, where `s` is each route's NVFP4 up scale. A decode or
+verify step uses the one-token decode team (`TSGgml_HostExpertRowsReluSquared`); a GGML prompt chunk uses the batched CPU
+MoE graph. On a tensor executor whose device is not the host, a prompt chunk wider than 16 rows streams its selected
+experts to the device for the step.
+
+The accelerator tiers (`--moe-hot-experts`, the CUDA doorbell's packed copies) serve gated experts only, so a Nemotron
+layer is computed entirely on the host. With `--tp`, offload is refused at load, because the per-rank graphs keep their
+experts on the devices.
+
+Measured on one A40 (ggml `bb877c0c`), every MoE layer offloaded (`TS_CPU_MOE=1`), against the same model resident:
+
+| Model, backend | NLL resident -> offloaded | Decode tok/s | Prefill 512 tok/s (warm) | Peak VRAM |
+|---|---|---|---|---|
+| Lightning Q4_0, ggml_cuda | 2.1954 -> 2.2013 | 143.2 -> 32.8 | 4633 -> 851 | 18.8 GB -> 3.7 GB |
+| Lightning Q4_0, cuda | 2.1966 -> 2.1980 | 70 -> 24.4 | 1724 -> 27.5 | 3.9 GB offloaded |
+| Bolt-24GB, ggml_cuda | 2.0317 -> 2.0328 | 70.8 -> 16.3 | 1717 -> 608 | 6.5 GB offloaded |
+
+The NLL moves by up to 0.006 because the host kernels quantize the activations to the weights' dot types. The legacy
+model offloaded only under `--tp` on GGML, which needs two GPUs, so it has no number here. On one device it saved no VRAM.
+
+## 11. Validation of the migration
+
+Dependency: ggml `bb877c0c51f38c52ee2d5e41d58e3d0c20f3fed4`, upstream and unchanged. `ggml_ssm_scan` and `ggml_ssm_conv`
+are its own ops. TensorSharp adds only its graph builder's lowering and the direct-CUDA scan kernel.
+
+**Synthetic fixtures** (`NemotronSyntheticModelBuilder`, `NemotronRuntimeTests`). The four layouts are dense; MoE with a
+shared expert; latent MoE with NVFP4-style sidecars; and per-layer expert counts and top-k. They are held to the legacy
+model's logits, frozen on the managed backend before it was deleted (`Fixtures/Nemotron/LegacySynthetic/managed.json`).
+`ggml_cpu`, `ggml_cuda` and direct `cuda` are checked against the managed backend. Also covered: chunked prefill, every
+placement over simulated devices, batched slots, concurrent requests, checkpoints, speculation, host experts, NVFP4
+scales against folded twins, and LoRA.
+
+**Real checkpoints** (one A40; teacher-forced argmax agreement with the legacy model, 512-token NLL, the CLI's benchmark):
+
+| Model, backend | Argmax vs legacy | NLL legacy -> runtime | Decode tok/s | Prefill 512 tok/s | Prefill 4K tok/s |
+|---|---|---|---|---|---|
+| Nemotron-H 8B Q4_K_M, ggml_cuda | 218/219 | 2.6113 -> 2.6078 | 45 -> 104 | ~480 -> 3600 | 441 -> 4152 |
+| Nemotron-H 8B Q4_K_M, cuda | 171/171 | 2.6107 -> 2.6091 | 33 -> 89.6 | 92.7 -> 2075 | 87.6 -> 2706 |
+| Lightning 30B-A3B Q4_0, ggml_cuda | 242/246 (near ties) | 2.2001 -> 2.1954 | 39.6 -> 143.5 | ~300 -> 4690 | 482 -> 6885 |
+| Lightning 30B-A3B Q4_0, cuda | 198/200 (near ties) | 2.1969 -> 2.1966 | 30 -> 70 | ~160 -> 1724 | 157 -> 3261 |
+| Bolt 74B-A9B 24GB, ggml_cuda | 200/200 (rel L2 ~0.6 %) | 2.0287 -> 2.0317 | 17.7 -> 70.8 | 131 -> 1717 | 142.7 -> 2215 |
+
+- **Multimodal.** Nano Omni with its BF16 mmproj gave correct image answers on both models. Its 2,466-token image
+  prefill took 8,367 -> 798 ms, and decode went from 28.4 to 116.7 tok/s.
+- **Concurrency.** On the server, 8 concurrent Lightning prompts finished in 33.3 s at 14.4 tok/s on the legacy model and
+  in 2.4 s at 181.6 tok/s on the runtime. The runtime matched each prompt served alone on 6 of 8 prompts, against 4 of 8
+  for the legacy model; the others parted at near ties.
+- **Speculation** (Lightning on `ggml_cuda`; the legacy model refused it). The DFlash and DSpark drafters are measured in
+  §8. With the MTP head over 3-token windows:
+  - acceptance was 64.5-85.7 % and decode ran 1.12-1.24x as fast as plain decoding on prompts of 46-96 generated
+    tokens;
+  - n-gram drafts ran at 0.95-1.03x.
+  - A speculative stream follows plain greedy decoding until a verify window's kernels, which run at another batch shape,
+    flip a close pick. MTP streams parted where plain decoding's top two logits were 0.06-0.19 apart, and n-gram streams
+    where they were 0.04-0.06 apart. One n-gram stream parted at a margin of 0.82.
+  - Verify windows matched the plain steps' argmax on 24/24 rows, and on 24/24 and 23/24 rows with rewinds.
+- **Coverage limits.** These were not run:
+  - `mlx`, `ggml_metal` and `ggml_vulkan`;
+  - multi-GPU `--tp` and `--layer-split`, which were covered on simulated devices only;
+  - Super VL without `--cpu-moe` (it needs a 96 GB device);
+  - an audio companion, since none is public.
+- **Known costs.**
+  - Direct-CUDA MoE decode steps are not recorded as CUDA graphs: Lightning decodes at 70 tok/s on `cuda` against 143
+    on `ggml_cuda`.
+  - Lightning's first 512-token prefill after load builds its graphs: 2,768 ms against 1,782 ms for the legacy model.
+    Later runs take 110 ms.
+  - Offloaded prompt chunks on direct CUDA stream their experts one at a time (27.5 tok/s, §10).
+  - The direct-CUDA known defect D6 ([README-direct-cuda-prefill](../../eng/validation/README-direct-cuda-prefill.md))
+    carried over: on two synthetic MoE files a single forward of more than 512 rows can end far from the references.
+    It is narrowed to the large-row F16 route of the quantized products. A 1,100-token Lightning forward on `cuda`
+    stays 1.6e-2 from `ggml_cuda`.
 
 ## 12. Output parser and chat template
 
@@ -1097,24 +995,16 @@ doc](../design/logprobs-lora-moe-runtime-features.md) §2.2.
 
 ## 13. Optimization opportunities
 
-- **Native whole-model decode** — the entire legacy forward pass runs
-  in managed C# today. A native `NemotronModelDecode` would eliminate the
-  managed loop overhead on the per-seq path.
-- **Native Mamba2 decode for the legacy path** — the SIMD-vectorized
-  scan in `Mamba2SSMStepSIMD` is already fast on CPU, but a native CUDA
-  / Metal kernel would unblock GPU-side execution of the full Mamba2
-  path on the per-seq path. The batched path already has the native
-  kernel under `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`.
-- **Chunked parallel SSM scanning** — Mamba2 prefill processes tokens
-  sequentially. A chunked parallel scan (à la Mamba's reference CUDA
-  implementation) would dramatically improve TTFT.
-- **Vectorized conv1d** — `Mamba2Conv1dStep` is a scalar loop. SIMD or
-  native vectorization would speed up Mamba2 layers further.
-- **Per-token MoE batching** — even with `MoEExpertsForward`, the per-token
-  managed loop is still the outer driver. A batched kernel that handles
-  multiple tokens in one dispatch would help long prompts.
-- **Audio tower** — `NemotronAudioEncoder` runs on the managed CPU path from
-  a companion GGUF (§4.7); the public GGUFs still carry no tower, so audio is
-  refused unless that companion is loaded. Open work: BF16-compute parity on
-  the trained weights, a GPU/native encoder graph, spoken-audio acceptance and
-  latency qualification.
+- **Recorded direct-CUDA MoE decode**: replay the MoE decode step as a CUDA graph, as `ggml_cuda` effectively does,
+  to close the 70 vs 143 tok/s gap on Lightning.
+- **Host-expert tiers for one-projection experts**: the GGML accelerator tier and the CUDA doorbell take gated experts
+  only. A ReLU^2 tier would keep each offloaded layer's hottest experts on the device.
+- **Batched expert streaming on direct CUDA**: offloaded prompt chunks stream one expert at a time.
+- **`--tp` with offload, and the tensor-parallel x layer-split hybrid**: both need per-rank graphs this family does not
+  emit yet.
+- **DSpark block cost**: the drafter's BF16 attention weights are dequantized to F32 at load (565 MB read per block
+  across its six layers); keeping them BF16 on the graph path would halve that. DSpark's blocks could also share one
+  program across requests, as DFlash's lanes do.
+- **Audio tower**: the F32-compute companion runs as graph programs on every executor (§4.7). The public GGUFs still
+  carry no tower, so audio is refused unless that companion is loaded. Open work: BF16-compute parity on the trained
+  weights (the BF16-emulating companion keeps the managed path).

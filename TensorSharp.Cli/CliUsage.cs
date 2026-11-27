@@ -476,10 +476,10 @@ namespace TensorSharp.Cli
                     "proposing what followed, so it is strong on summarizing, editing, translating, repetitive " +
                     "structured output and agentic loops, where the answer quotes the prompt. It still needs a " +
                     "model that can verify a draft window in one pass: the Qwen 3.5 family, Gemma 4, GLM-5.x, " +
-                    "Muse-Glimmer and Qwen 3.8 Flash Next take it without a drafter (Gemma 4 on the ggml_* and cuda " +
+                    "Muse-Glimmer, Nemotron-H and Qwen 3.8 Flash Next take it without a drafter (Gemma 4 on the ggml_* and cuda " +
                     "backends, Qwen 3.8 Flash Next on ggml_* only); DeepSeek V4 / V4.1 only " +
                     "with their drafter loaded; GPT-OSS, Mistral 3 and " +
-                    "Hunyuan Dense have no speculative path, and Nemotron-H refuses every speculator - those " +
+                    "Hunyuan Dense have no speculative path - those " +
                     "decode without speculation. Env: TS_SPEC_TYPE.",
                     "--spec --spec-type ngram --spec-draft 8"),
                 new OptionHelp("--spec-draft <N>",

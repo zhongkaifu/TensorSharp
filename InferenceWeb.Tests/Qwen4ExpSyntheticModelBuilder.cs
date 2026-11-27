@@ -345,13 +345,23 @@ internal static class Qwen4ExpSyntheticModelBuilder
     /// in that format. <paramref name="slidingWindow"/> short of the context makes the window slide and the ring wrap.
     /// <paramref name="kQuantProjections"/> stores the encoder and K projections as Q4_K and the V projections as Q6_K, as
     /// Qwen3.8-27B's DFlash2 Q4_K_M has them (the width must be a multiple of 256).</summary>
+    /// <param name="slidingWindow">The drafter's window; 0 writes no window key (a full-attention drafter, the Nemotron-3.5
+    /// DFlash module's layout).</param>
+    /// <param name="dspark">The Nemotron-3.5 DSpark module's layout: a Markov head (markov_w1 BF16 [rank, vocab], markov_w2
+    /// with a .scale sidecar), per-head attention sinks (blk.N.attn_sinks.weight), a block-causal mask and a bonus anchor
+    /// (dflash.sample_from_anchor = false, as a bool).</param>
+    /// <param name="yarnFactor">&gt; 1: a YaRN-scaled rotary over <paramref name="yarnOriginalContext"/> positions.</param>
+    /// <param name="targetLayers">The trunk layers the encoder reads (id = layer count: the stream leaving the stack).</param>
+    /// <param name="ownEmbedding">The drafter ships its own token embedding (BF16 [hidden, vocab]), which it reads.</param>
     public static string WriteDFlash(string path, int blockSize = 4, int hidden = Hidden, int layers = 1, int slidingWindow = 4096,
-        bool dflash2 = false, GgmlType codebookType = GgmlType.F32, bool kQuantProjections = false, int convTaps = 2)
+        bool dflash2 = false, GgmlType codebookType = GgmlType.F32, bool kQuantProjections = false, int convTaps = 2,
+        bool dspark = false, float yarnFactor = 0f, int yarnOriginalContext = 0, int[] targetLayers = null, bool ownEmbedding = false,
+        bool causal = false)
     {
         const int heads = 4, kvHeads = 2, headDim = 64, ffn = 512;
-        const int convGroup = 16, selectorRank = 32, selectorTopK = 8;
+        const int convGroup = 16, selectorRank = 32, selectorTopK = 8, markovRank = 32;
         int Hidden = hidden;
-        int[] taps = { 2, 5, 7 };
+        int[] taps = targetLayers ?? new[] { 2, 5, 7 };
         var kv = new List<Kv>
         {
             new Str { Key = "general.architecture", V = "dflash" },
@@ -369,6 +379,19 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new U32 { Key = "dflash.attention.sliding_window", V = (uint)slidingWindow },
             new U32 { Key = "tokenizer.ggml.mask_token_id", V = Vocab - 3 },
         };
+        // A full-attention drafter carries no window key (the default layout's keys keep their order: fixtures pin its bytes).
+        if (slidingWindow <= 0)
+            kv.RemoveAll(k => k.Key == "dflash.attention.sliding_window");
+        if (yarnFactor > 1f)
+        {
+            kv.Add(new Str { Key = "dflash.rope.scaling.type", V = "yarn" });
+            kv.Add(new F32 { Key = "dflash.rope.scaling.factor", V = yarnFactor });
+            kv.Add(new U32 { Key = "dflash.rope.scaling.original_context_length", V = (uint)yarnOriginalContext });
+        }
+        if (dspark || causal)
+            kv.Add(new Bool { Key = "dflash.attention.causal", V = true });
+        if (dspark)
+            kv.Add(new Bool { Key = "dflash.sample_from_anchor", V = false });
         if (dflash2)
         {
             kv.Add(new U32 { Key = "dflash.conv_kernel_size", V = (uint)convTaps });
@@ -404,6 +427,8 @@ internal static class Qwen4ExpSyntheticModelBuilder
             t.Add(Gen(p + "ffn_gate.weight", S(Hidden), Hidden, ffn));
             t.Add(Gen(p + "ffn_up.weight", S(Hidden), Hidden, ffn));
             t.Add(Gen(p + "ffn_down.weight", 0.25f * S(ffn), ffn, Hidden));
+            // Sinks near the scores' scale, so they take a visible share of each row's mass.
+            if (dspark) t.Add(GenAround(p + "attn_sinks.weight", 0.5f, 1f, heads));
             if (!dflash2) continue;
             // The static kernel near the identity's scale, each token's delta a small correction to it.
             foreach (string part in new[] { "attn", "ffn" })
@@ -411,6 +436,23 @@ internal static class Qwen4ExpSyntheticModelBuilder
                 t.Add(GenAround(p + part + "_conv_base", 0.5f, 0.2f, Hidden, convTaps, 2));
                 t.Add(Gen(p + part + "_conv_proj.weight", 0.2f * S(Hidden), Hidden, 2 * convTaps * (Hidden / convGroup)));
             }
+        }
+        if (dspark)
+        {
+            Tensor w1 = Gen("markov_w1.weight", 1f, markovRank, Vocab);
+            w1.Type = GgmlType.BF16;
+            t.Add(w1);
+            // A bias the size of the head's logits, so the chain moves the drafts; w2 quantized with a per-tensor scale.
+            Tensor w2 = Gen("markov_w2.weight", 2f * S(markovRank), markovRank, Vocab);
+            w2.Type = GgmlType.Q8_0;
+            t.Add(w2);
+            t.Add(GenAround("markov_w2.scale", 1.25f, 0f, 1));
+        }
+        if (ownEmbedding)
+        {
+            Tensor embedding = Gen("token_embd.weight", 1f, Hidden, Vocab);
+            embedding.Type = GgmlType.BF16;
+            t.Add(embedding);
         }
         if (dflash2)
         {

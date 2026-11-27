@@ -34,16 +34,17 @@ namespace TensorSharp.Models
     ///     projection (<c>attn_qkv</c>). Bolt's mmproj stores the projection split into
     ///     <c>attn_q</c> / <c>attn_k</c> / <c>attn_v</c> (weights and biases); those are
     ///     concatenated into <c>attn_qkv</c> at load, so both layouts run the same weights.
+    ///   - Optional final LayerNorm <c>v.post_ln</c> after the blocks (Super VL's mmproj ships
+    ///     it; llama.cpp's build_vit applies it to every token before the class tokens go).
     ///   - After the encoder strip the class tokens, pixel-shuffle by <c>scaleFactor</c>,
     ///     then RMSNorm → Linear → ReLU-squared → Linear projector that emits embeddings
     ///     in the LM hidden dim.
     /// Every tensor the forward reads is checked at load, so an incomplete or mismatched
     /// mmproj fails the load with <see cref="InvalidDataException"/> naming the tensors,
     /// instead of failing every image request. Not used: the video tower's temporal patch
-    /// embedding <c>v.patch_embd.weight.1</c> (skipped at load) and <c>v.post_ln</c>,
-    /// which Super VL's mmproj ships and llama.cpp applies after the blocks.
+    /// embedding <c>v.patch_embd.weight.1</c> (skipped at load).
     /// </summary>
-    public sealed class NemotronVisionEncoder : IDisposable
+    public sealed partial class NemotronVisionEncoder : IDisposable
     {
         private readonly Dictionary<string, Tensor> _weights = new();
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
@@ -390,6 +391,8 @@ namespace TensorSharp.Models
                 Expect($"{p}.ffn_down.weight", true, h, ff);
                 Expect($"{p}.ffn_down.bias", false, h);
             }
+            Expect("v.post_ln.weight", false, h);
+            Expect("v.post_ln.bias", false, h);
             Expect("mm.model.mlp.0.weight", true, merged);
             Expect("mm.model.mlp.1.weight", true, -1, merged);
             Expect("mm.model.mlp.3.weight", true, -1,
@@ -433,6 +436,7 @@ namespace TensorSharp.Models
         /// (W/patch/scale) * (H/patch/scale).</returns>
         public unsafe Tensor Encode(float[] pixelValues, int imageWidth, int imageHeight)
         {
+            if (_graph != null) return EncodeGraph(pixelValues, imageWidth, imageHeight);
             int patchesX = imageWidth / _patchSize;
             int patchesY = imageHeight / _patchSize;
             int numPatches = patchesX * patchesY;
@@ -467,6 +471,14 @@ namespace TensorSharp.Models
                 // Yield GpuComputeLock between encoder blocks (see
                 // Gemma4VisionEncoder).
                 _hostModel?.YieldGpuComputeLock();
+            }
+
+            // 4b. The tower's final LayerNorm, where the mmproj has one (Super VL's v.post_ln).
+            if (_weights.ContainsKey("v.post_ln.weight"))
+            {
+                Tensor normed = LayerNormOp(hidden, "v.post_ln");
+                hidden.Dispose();
+                hidden = normed;
             }
 
             // 5. Drop the class tokens.
@@ -783,6 +795,7 @@ namespace TensorSharp.Models
 
         public void Dispose()
         {
+            DisposeGraph();
             foreach (var w in _transposedWeights.Values)
                 w.Dispose();
             _transposedWeights.Clear();

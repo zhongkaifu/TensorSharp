@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 38
+#define TS_GRAPH_KERNELS_VERSION 39
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1916,6 +1916,80 @@ extern "C" __global__ void ts_graph_ssm_conv_f32(const float* __restrict__ x, co
     for (int k = 0; k < width; k++)
         acc += xr[k] * wr[k];
     out[i] = acc;
+}
+
+// ggml_ssm_scan for Mamba-2 (a scalar decay per head; ggml-cpu's arithmetic). s [ns', nh, hd, dstate] (sequence i starts
+// from state row ids[i]), x [ns, nt, nh, hd], dt [ns, nt, nh] (before softplus), a [nh], b and c [ns, nt, ng, dstate] (head h
+// reads group h / (nh / ng); ids null: sequence i starts from row i); out = y [ns, nt, nh, hd], then keep state slots [ns, nh, hd, dstate] (slot 0 the state after
+// the last token, slot j the state j tokens before it; a slot older than the tokens is left as it was). Per token:
+// dt' = softplus(dt), st = st * exp(dt' a) + b (x dt'), y = st . c. One warp per (head, head-dim row), its state row in
+// registers across the tokens (dstate <= 256: up to 8 values a lane). Launch: grid (ceil(nh * hd / 4), ns), block 128.
+extern "C" __global__ void __launch_bounds__(128) ts_graph_ssm_scan_f32(const float* __restrict__ s, const float* __restrict__ x,
+    const float* __restrict__ dt, const float* __restrict__ a, const float* __restrict__ b, const float* __restrict__ c,
+    const int* __restrict__ ids, float* __restrict__ out, int nh, int hd, int ng, int dstate, int nt, int ns, int keep)
+{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    const int seq = blockIdx.y;
+    if (row >= nh * hd)
+        return;
+    const int h = row / hd, i = row - h * hd, g = h / (nh / ng);
+    const long long per_state = (long long)nh * hd * dstate;
+    const long long y_floats = (long long)ns * nt * nh * hd;
+    const float* s0 = s + (long long)(ids != nullptr ? ids[seq] : seq) * per_state + (long long)row * dstate;
+    float st[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+    {
+        const int k = lane + 32 * j;
+        st[j] = k < dstate ? s0[k] : 0.0f;
+    }
+    const float av = a[h];
+    for (int t = 0; t < nt; t++)
+    {
+        const long long r = (long long)seq * nt + t;
+        const float d = dt[r * nh + h];
+        const float dt_soft = d > 20.0f ? d : (d < -20.0f ? expf(d) : logf(1.0f + expf(d)));
+        const float da = expf(dt_soft * av);
+        const float xdt = x[(r * nh + h) * hd + i] * dt_soft;
+        const float* bg = b + (r * ng + g) * dstate;
+        const float* cg = c + (r * ng + g) * dstate;
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const int k = lane + 32 * j;
+            if (k < dstate)
+            {
+                const float v = st[j] * da + bg[k] * xdt;
+                st[j] = v;
+                sum += v * cg[k];
+            }
+        }
+        sum = ts_graph_warp_sum(sum);
+        if (lane == 0)
+            out[(r * nh + h) * hd + i] = sum;
+        const int slot = nt - 1 - t;
+        if (slot >= 1 && slot < keep)
+        {
+            float* dst = out + y_floats + ((long long)slot * ns + seq) * per_state + (long long)row * dstate;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                const int k = lane + 32 * j;
+                if (k < dstate)
+                    dst[k] = st[j];
+            }
+        }
+    }
+    float* fin = out + y_floats + (long long)seq * per_state + (long long)row * dstate;
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+    {
+        const int k = lane + 32 * j;
+        if (k < dstate)
+            fin[k] = st[j];
+    }
 }
 
 // GraphFusion.DeltaNetPrep for one sequence (the gated delta rule's inputs). Launch: grid (2 * k_heads + v_heads,

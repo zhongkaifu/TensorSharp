@@ -264,7 +264,7 @@ namespace TensorSharp.Models
     /// <summary>
     /// Reads a linear K/V cache tensor back from host memory as float32, for code that
     /// moves a sequence's history out of the cache into float storage of its own (the
-    /// linear-to-paged migration of Nemotron-H and gpt-oss). Every dtype
+    /// linear-to-paged migration of gpt-oss). Every dtype
     /// <see cref="KvCacheDtypeConfig"/> can select is readable: F32 as is, F16 widened,
     /// and the block-quantized Q8_0 / Q4_0 dequantized with ggml's reference block layout
     /// (<see cref="ManagedQuantizedOps"/>, TensorSharp-owned). Both writers of a quantized

@@ -33,9 +33,14 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 
 ## 连续批处理 / 批处理前向
 
+旧的 Nemotron-H 模型（`NemotronModel`）已于 2026-11 删除（Nemotron-H 在所有后端上都运行在共享解码运行时上）；它的开关
+`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE`、`TS_NEMOTRON_MAMBA2_NATIVE_PREFILL_MIN_TOKENS`、`TS_MAMBA2_PREFILL_CACHE_MB`、
+`TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`、`TS_NEMOTRON_MOE_PREFILL_BATCHED_MIN_TOKENS`、`TS_NEMOTRON_MULTIMODAL_WARMUP`、
+`TS_NEMOTRON_MULTIMODAL_WARMUP_TILES` 与 `TS_TP_SNAPSHOT_TRACE` 现在会让服务器或 CLI 在启动时停止，并给出说明变更的消息。
+`TS_NEMOTRON_IMAGE_MAX_TILES` 与 `TS_NEMOTRON_AUDIO_MMPROJ` 仍然有效。
+
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | 原生批处理 Mamba2 step | 关闭 | `0`, `1` | 否 |
 | `TS_PER_SEQ_FUSED` | fused 能力模型（GGML 后端上的 Gemma 4 与 GPT OSS；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，凡可加载的后端均适用，多节点流水线除外；各自原生执行器上的 DeepSeek V4 / V4.1 与 GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward，每个序列有自己的设备端 K/V holder；`0` 改走逐算子批处理分页路径，其 K/V 位于共享的主机块池（设备内存更少、decode 速率更低、没有保留的 holder） | 启用 | 未注册 | 否 |
 | `TS_BATCHED_FUSED_DECODE` | 具备 token 批量融合 decode 的模型（Gemma 4、Qwen 3.5/3.6/3.8、GPT OSS、GLM 5.x、DeepSeek V4 / V4.1） | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列）。在 GLM 5.x 上 4 个并发请求可得合计 1.81× decode；在 DeepSeek V4.1 Flash 的 Q4_K_M 上为 2.0×（24.3 → 48.9 tok/s），上限来自路由——每个 token 各自从 384 个专家里挑 6 个。批处理会改变 GEMM 形状，2 bit MoE 可能把这点差别放大成不同的专家选择；设为 `0` 可做串行路径 A/B。 | 开启 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 具有可保留 request-owned fused holder 的模型（Gemma 4；Qwen 3.5/3.6/3.8；Qwen 3.8 Flash Next；未加载 DSpark 草稿器时的 DeepSeek V4.1；原生执行器上的 GLM 5.x，每个会话交出一个原生 slot） | 为下一轮的精确前缀续接保留多少个已结束会话的终态（holder、原生 slot）；Qwen holder 同时包含 attention K/V 与匹配的 GatedDeltaNet 递归状态。未设置时跟随 `TS_SCHED_MAX_RUNNING_SEQS`（至少 4），使每个可以并行运行的请求都保有自己的终态；字节数由显存而不是这个数量约束。`0` 关闭保留 | 运行中请求上限（16），至少 `4` | 不适用 | 否 |
@@ -93,7 +98,7 @@ Qwen 3.5 / 3.6 / 3.8 家族与 Qwen 3.8 Flash Next 的直连 CUDA 引擎以及 N
 | `TS_DSV4_GEMV_BLOCK` | 直接 CUDA 引擎中 256 个以上输出的 F32/BF16 GEMV（MoE router） | `0` 保持每个输出一个 warp。默认：每个输出一个 256 线程的 block，各 warp 的和按顺序相加（BF16 与 F32 形式结果逐位一致）。Flash Next 的 512 x 2560 BF16 router，4 行：RTX 5090 上 12.1 -> 4.4 us（在其已移除的直连 CUDA 引擎上测得） | 开启 | - | 否 |
 | `TS_DSV4_SELECT_KEYS` | 直接 CUDA 引擎中不超过 512 个专家的 MoE top-k 选择（DeepSeek V4/V4.1 与 GLM 的非 hash 层） | `0` 保持浮点 argmax 的 warp 选择。默认：每个排序分数变成一个 64 位键（保序的分数位在上，专家编号的补码在下），每次选取是每步两次 shuffle 的键最大值，胜出的 lane 用树形归约重取自己的最佳值，lane k 保存第 k 个选择。选择与权重逐位相同。RTX 5090，Flash Next（512 个专家，top 10）在其已移除的直连 CUDA 引擎上，graph 捕获：每层 4.83 -> 3.11 us；长生成 4 行验证窗口 10.10 -> 10.03 ms，237-238 -> 240 tok/s，输出完全一致 | 开启 | - | 否 |
 | `TS_MOE_GATEUP_HALF` | 直接 CUDA 引擎中 decode 大小的专家 gate/up 投影 | `0` 保持每个 gate/up 行一个 warp。默认：每行 16 个 lane、每个 warp 两行（Q2_0 行按 32 值单元）。Qwen3.8 Flash Next 一个 decode 步的十个 Q2_0 专家（在其已移除的直连 CUDA 引擎上）：RTX 5090 上 22.7 -> 4.4 us；4 行窗口的 40 个 slot 44 -> 23 us | 开启 | - | 否 |
-| `TS_MOE_ROUTE_TAIL_SKIP` | 带主机专家的 MoE 层：共享运行时上各模型的加速器专家分层（`ggml_metal`、`ggml_cuda`、`cuda`）；解码步与验证窗口（最多 8 行） | Strata 的 route-tail skip（`STRATA_ROUTE_TAIL_SKIP=7`，其默认值）：在 decode 步或验证窗口中，窗口每一行都以该 0 起始排名或更低排名（7：Flash Next 10 个中的第 8 到第 10 个）路由到的缺失专家（没有显存槽位）既不由 CPU 计算也不等待；它的路由不贡献任何值，权重不重新归一化，因此回答成为近似结果。所有专家都驻留、至少 `TS_MOE_TAIL_SKIP_MAX_CACHED` 百分比的专家有槽位、或处理 prompt 时不启用。`0` 计算每条路由。在已移除的 Qwen 3.8 Flash Next 直连 CUDA 引擎上（2026-11 之前的 `--backend cuda`），RTX 5090、ISTA `Q2_0`、MTP，开启对比 `0`（同一构建、同一客户端）：长生成 153-188 对 140-175 tok/s，4K 128-176 对 119-144，16K 163-183 对 150-170；4K prompt 之后每个验证窗口交给 CPU 的专家 128-140 个对 185-242 个。 在 GGML 分层上，被跳过的专家也不读入窗口槽位：Flash Next、ISTA `Q2_0`、M5 Pro、DFlash2，交替的关/开测量：每次解码的窗口读取 88-114 -> 33，短对话 22.4-24.6 -> 23.5-25.9 tok/s，长生成均值 42.1 -> 43.4 tok/s。依用户 2026-11-08 的决定默认开启。 | `7` | 未注册 | 否 |
+| `TS_MOE_ROUTE_TAIL_SKIP` | 带主机专家的 MoE 层：共享运行时上各模型的加速器专家分层（`ggml_metal`、`ggml_cuda`、`cuda`）；解码步与验证窗口（最多 8 行） | Strata 的 route-tail skip（`STRATA_ROUTE_TAIL_SKIP=7`，其默认值）：在 decode 步或验证窗口中，窗口每一行都以该 0 起始排名或更低排名（7：Flash Next 10 个中的第 8 到第 10 个）路由到的缺失专家（没有显存槽位）既不由 CPU 计算也不等待；它的路由不贡献任何值，权重不重新归一化，因此回答成为近似结果。所有专家都驻留、至少 `TS_MOE_TAIL_SKIP_MAX_CACHED` 百分比的专家有槽位、处理 prompt 时（张量执行器的专家主机也一样：只在最多 8 行的步上启用），或对 Nemotron-H 的单投影 ReLU^2 专家（GGML 不为它们保留分层）不启用（在张量执行器上它曾让 Super VL 每个 token 的 22 条路由中有 15 条被略去：NLL 2.210，精确计算为 2.116）。`0` 计算每条路由。在已移除的 Qwen 3.8 Flash Next 直连 CUDA 引擎上（2026-11 之前的 `--backend cuda`），RTX 5090、ISTA `Q2_0`、MTP，开启对比 `0`（同一构建、同一客户端）：长生成 153-188 对 140-175 tok/s，4K 128-176 对 119-144，16K 163-183 对 150-170；4K prompt 之后每个验证窗口交给 CPU 的专家 128-140 个对 185-242 个。 在 GGML 分层上，被跳过的专家也不读入窗口槽位：Flash Next、ISTA `Q2_0`、M5 Pro、DFlash2，交替的关/开测量：每次解码的窗口读取 88-114 -> 33，短对话 22.4-24.6 -> 23.5-25.9 tok/s，长生成均值 42.1 -> 43.4 tok/s。依用户 2026-11-08 的决定默认开启。 | `7` | 未注册 | 否 |
 | `TS_MOE_TAIL_SKIP_MAX_CACHED` | 同上 | 至少这个百分比的路由专家拥有显存或分层槽位时关闭 route-tail skip（Strata 的规则：缓存缺失多时跳过才划算）。32 GB RTX 5090 上的 Flash Next ISTA `Q2_0` 驻留 69% | `90` | 未注册 | 否 |
 | `TS_Q4E_HC_Q8` | GGML 后端和 `--backend cuda` 上的 Qwen 3.8 Flash Next | `1` 把超连接混合器的 BF16 down/up 矩阵按 Q8_0 读取，加载时转换一次（Strata 的默认读取方式，`STRATA_HC_Q8`）：每个 token 从 1.26 GB 降到 0.67 GB。会改变数值（Strata：相对 BF16 的平均 KL 为 0.0007）。M5 Pro、ISTA Q2_0、普通 decode：22.8/16.3/23.1 提升到 24.1/16.8/24.5 tok/s（code/prose/list），4 个 prompt 中 3 个文本完全相同；Metal 的专家规划会计入这些 Q8_0 副本，因为它们与文件页面同时驻留。RTX 5090、`--backend cuda`（已移除的直连 CUDA 引擎）：94.6/65.6/97.3 提升到 106.0/70.4/109.1 tok/s。已把这些矩阵存为 Q8_0 的文件（Unsloth 的 UD 包）不受影响 | 关闭 | - | 否 |
 | `TS_METAL_MOE` | `ggml_metal` 上的 Qwen 3.8 Flash Next，专家分层（1-8 行的 decode 步或验证窗口） | 默认开启；`0` 让一层加速器分层持有的路由仍用 ggml-metal 的 MUL_MAT_ID。开启时每个 MoE seam 用 TensorSharp 的分组专家内核（移植自 Strata 的 MIT Metal 内核，`TensorSharp.GGML.Native/tsm/`）计算这些路由：每个不同槽位的 gate/up/down 行对窗口里路由到它的所有行只读一次，在 ggml-metal 自己的命令队列上编码。与 MUL_MAT_ID 相差 1e-6（相对），与双精度参考相差 2e-7。M5 Pro、ISTA `Q2_0`：4 行验证窗口 69.9 -> 59.8 ms，文本不变 | 开启 | - | 否 |
@@ -290,8 +295,8 @@ MiniMax-H3-Image 运行在共享扩散运行时上，其驻留计划、VAE 程�
 Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1 DSpark 路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证；
 以及无需权重的 n-gram 投机器）。投机仅对单序列（无并发）请求生效，且只在模型声明有收益时启用，这由各
 模型自己决定：Qwen 3.5/3.6/3.8 与 GLM 5.2 / GLM-5.3 在所有后端上，GLM-5.3-Flash（仅 n-gram）在其 KDA
-回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其可加载的所有后端上，Muse-Glimmer 在所有后端上，DeepSeek V4 / V4.1 只在加载了各自草稿器时。Nemotron-H
-拒绝一切投机器，GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
+回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其可加载的所有后端上，Muse-Glimmer 在所有后端上，DeepSeek V4 / V4.1 只在加载了各自草稿器时，Nemotron-H
+在所有后端上（n-gram 与 Nemotron 3.5 MTP 头）。GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
 它们未注册在 `EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫描——矩阵特性目录目前
 没有投机解码特性，请用显式运行来验证这些变量。
 

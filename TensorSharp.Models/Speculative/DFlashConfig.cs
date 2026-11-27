@@ -163,20 +163,16 @@ namespace TensorSharp.Models
         /// which is why the shipped GGUF carries no dflash.markov_rank.</summary>
         public int MarkovRank { get; private set; }
 
-        /// <summary>dflash.sample_from_anchor: true when EVERY block row (the
-        /// anchor's own prediction included) is a draft and gets the Markov bias
-        /// chained from the anchor; false when the anchor row is a "bonus" that
-        /// passes through unbiased and drafting starts at row 1. llama.cpp treats a
-        /// MISSING key as true; the key itself then means "the anchor's own row is
-        /// a full draft, Markov bias included", which is how the reference runtimes
-        /// drive the Nemotron-3.5 module (the checkpoint's own config field of the
-        /// same name is about sampling, not drafting, and is not exported).</summary>
+        /// <summary>dflash.sample_from_anchor (llama.cpp's build_dspark_markov_head): true when EVERY block row is a
+        /// draft and takes the Markov bias, the chain seeded by the anchor; false (SpecForge's "bonus anchor", the
+        /// Nemotron-3.5 DSpark export) when row 0 is the anchor's own slot, which passes unbiased and is not a draft:
+        /// drafting starts at row 1 with the chain seeded by the anchor, so a block of B rows proposes B - 1. llama.cpp
+        /// treats a missing key as true; the key may be stored as a bool or as the string "true" / "false".</summary>
         public bool SampleFromAnchor { get; private set; } = true;
 
-        /// <summary>True when this drafter carries a per-head attention-sink bias
-        /// (blk.N.attn_sinks, e.g. the Nemotron-3.5 DSpark module). The sink is a
-        /// per-head constant added to the normalized attention weights, giving the
-        /// head a fixed attention-mass floor.</summary>
+        /// <summary>True when this drafter carries a per-head attention-sink logit (blk.N.attn_sinks.weight, as
+        /// llama.cpp names it, or a bare blk.N.attn_sinks; e.g. the Nemotron-3.5 DSpark module): one extra logit per head
+        /// in every query's softmax (ggml_soft_max_add_sinks), which takes part in the normalization and weighs no value.</summary>
         public bool HasAttentionSinks { get; private set; }
 
         /// <summary>
@@ -202,9 +198,51 @@ namespace TensorSharp.Models
         /// transform applied before it enters the lattice.</summary>
         public bool HasUnaryLogitTransform => LogitScale != 1f || FinalLogitSoftcap > 0f;
 
+        /// <summary>dflash.rope.scaling.*: YaRN context scaling of the drafter's rotary (the Nemotron-3.5 DFlash module:
+        /// factor 128 over an original context of 8192). <see cref="RopeFreqScale"/> is 1 / factor (1 = none); the YaRN
+        /// terms default as llama.cpp's do (extrapolation 1, attention factor 1, beta fast 32, beta slow 1), so the rotary
+        /// carries ggml's magnitude 1 + 0.1 ln(factor).</summary>
+        public float RopeFreqScale { get; private set; } = 1f;
+
+        public int RopeOriginalContext { get; private set; }
+
+        public float YarnExtFactor { get; private set; }
+
+        public float YarnAttnFactor { get; private set; } = 1f;
+
+        public float YarnBetaFast { get; private set; } = 32f;
+
+        public float YarnBetaSlow { get; private set; } = 1f;
+
+        /// <summary>True when the drafter's rotary is YaRN-scaled.</summary>
+        public bool HasYarn => YarnExtFactor != 0f;
+
+        /// <summary>
+        /// True for a drafter whose layers attend the whole history (no dflash.attention.sliding_window: the Nemotron-3.5
+        /// DFlash module). TensorSharp's drafter keeps its history in a ring, so such a drafter is served with a window of
+        /// the trunk's context, at most <see cref="FullAttentionWindowCap"/> positions (<see cref="ServeFullAttention"/>):
+        /// past that many positions of context a draft sees the latest ones. A draft is verified by the target, so the
+        /// window changes how many drafts are accepted, never the output.
+        /// </summary>
+        public bool FullAttention { get; private set; }
+
+        /// <summary>The widest window a full-attention drafter is served with (its ring holds this many positions plus a
+        /// block: 98 MB of F32 K/V for the Nemotron-3.5 DFlash module's six layers).</summary>
+        public const int FullAttentionWindowCap = 8192;
+
+        /// <summary>A full-attention drafter (<see cref="FullAttention"/>) attends the last
+        /// min(<paramref name="contextLength"/>, <see cref="FullAttentionWindowCap"/>) positions (the cap when the
+        /// trunk's context is not known); no-op for a sliding-window drafter.</summary>
+        public void ServeFullAttention(int contextLength)
+        {
+            if (!FullAttention) return;
+            SlidingWindow = contextLength > 0 ? Math.Min(contextLength, FullAttentionWindowCap) : FullAttentionWindowCap;
+        }
+
         /// <summary>dflash.attention.causal: block row i attends to block rows 0..i only.
         /// False (or absent) for DFlash / DFlash2, which draft non-causally inside the
-        /// block; true for a DSpine drafter.</summary>
+        /// block; true for a DSpine drafter and for the Nemotron-3.5 DSpark module (its
+        /// llama.cpp context keeps the causal mask over the block's keys).</summary>
         public bool CausalBlock { get; private set; }
 
         /// <summary>dflash.dspine.version: the layout of a DSpine export (eng/dspine-to-gguf.py
@@ -244,10 +282,14 @@ namespace TensorSharp.Models
 
         /// <summary>Tokens a block actually proposes. Plain DFlash / DFlash2:
         /// the block is [anchor, MASK x (BlockSize-1)] and row 0 (the anchor's own
-        /// prediction) is discarded. A DSpark (Markov-head) drafter is the
-        /// opposite: row 0 IS the anchor's own prediction through the block and
-        /// every row is a draft, so the whole block width is usable.</summary>
-        public int MaxDraftTokens => MarkovRank > 0 ? BlockSize : BlockSize - 1;
+        /// prediction) is discarded. A DSpark (Markov-head) drafter with
+        /// <see cref="SampleFromAnchor"/> drafts every row, so the whole block width is
+        /// usable; with a bonus anchor its row 0 is not a draft either.</summary>
+        public int MaxDraftTokens => DraftsFromAnchorRow ? BlockSize : BlockSize - 1;
+
+        /// <summary>True when block row 0 is a draft (a DSpark Markov head that samples from the anchor): the block's
+        /// rows are its drafts. Otherwise rows 1 .. b - 1 are.</summary>
+        public bool DraftsFromAnchorRow => MarkovRank > 0 && SampleFromAnchor;
 
         /// <summary>Rows of the drafter's KV ring: the SWA span plus one whole
         /// block plus the anchor, rounded up to 32 so a wrapped write never aliases
@@ -322,10 +364,41 @@ namespace TensorSharp.Models
             // the probes below look at the raw file, not the merged names.
             if (gguf.Tensors.TryGetValue("markov_w1.weight", out var markovW1))
                 cfg.MarkovRank = (int)markovW1.Shape[0];
-            string sampleAnchor = gguf.GetString($"{ArchName}.sample_from_anchor");
-            cfg.SampleFromAnchor = sampleAnchor == null
-                || string.Equals(sampleAnchor.Trim(), "true", StringComparison.OrdinalIgnoreCase);
-            cfg.HasAttentionSinks = gguf.Tensors.ContainsKey("blk.0.attn_sinks");
+            cfg.SampleFromAnchor = !gguf.Metadata.TryGetValue($"{ArchName}.sample_from_anchor", out object sampleAnchor) || sampleAnchor switch
+            {
+                bool b => b,
+                string text => string.Equals(text.Trim(), "true", StringComparison.OrdinalIgnoreCase),
+                _ => true,
+            };
+            cfg.HasAttentionSinks = gguf.Tensors.ContainsKey("blk.0.attn_sinks.weight") || gguf.Tensors.ContainsKey("blk.0.attn_sinks");
+
+            // YaRN (llama.cpp's LLM_KV_ROPE_SCALING_*; the extrapolation mix defaults to 1 for a YaRN file, as
+            // llama_context's yarn_ext_factor < 0 does).
+            string scaling = gguf.GetString($"{ArchName}.rope.scaling.type");
+            float factor = gguf.GetFloat32($"{ArchName}.rope.scaling.factor", 0f);
+            if (string.Equals(scaling, "yarn", StringComparison.OrdinalIgnoreCase) && factor > 1f)
+            {
+                cfg.RopeFreqScale = 1f / factor;
+                cfg.RopeOriginalContext = (int)gguf.GetUint32($"{ArchName}.rope.scaling.original_context_length", 0);
+                cfg.YarnExtFactor = gguf.GetFloat32($"{ArchName}.rope.scaling.yarn_ext_factor", 1f);
+                cfg.YarnAttnFactor = gguf.GetFloat32($"{ArchName}.rope.scaling.attn_factor", 1f);
+                cfg.YarnBetaFast = gguf.GetFloat32($"{ArchName}.rope.scaling.yarn_beta_fast", 32f);
+                cfg.YarnBetaSlow = gguf.GetFloat32($"{ArchName}.rope.scaling.yarn_beta_slow", 1f);
+                if (cfg.RopeOriginalContext <= 0)
+                    throw new InvalidOperationException($"{ArchName}.rope.scaling.type = yarn needs {ArchName}.rope.scaling.original_context_length.");
+            }
+            else if (scaling != null && !string.Equals(scaling, "none", StringComparison.OrdinalIgnoreCase)
+                && !(string.Equals(scaling, "yarn", StringComparison.OrdinalIgnoreCase) && factor <= 1f))
+            {
+                throw new NotSupportedException($"{ArchName}.rope.scaling.type '{scaling}' is not supported for a drafter (none or yarn).");
+            }
+            if (cfg.MarkovRank == 0 && cfg.SlidingWindow == 0 && !cfg.IsDSpine)
+            {
+                // No window: every layer attends the whole history (the Nemotron-3.5 DFlash module), served through the
+                // ring with the trunk's context (ServeFullAttention narrows it at attach).
+                cfg.FullAttention = true;
+                cfg.SlidingWindow = FullAttentionWindowCap;
+            }
             if (cfg.MarkovRank > 0 && cfg.SlidingWindow == 0)
             {
                 // DSpark convention: the Nemotron-3.5 module trains with a 1024-token
@@ -457,11 +530,13 @@ namespace TensorSharp.Models
         {
             if (!IsDSpine)
             {
-                if (CausalBlock)
+                // A block-causal DFlash drafter (the Nemotron-3.5 DSpark module): row i of the block sees rows 0 .. i, which
+                // the block's mask says; a DFlash2 selector or convolution was trained non-causal.
+                if (CausalBlock && (HasConv || HasSelector))
                 {
                     throw new NotSupportedException(
-                        $"{ArchName}.attention.causal = true without the {ArchName}.dspine.* keys: TensorSharp runs a "
-                        + "block-causal drafter only as DSpine (a code bridge after every layer).");
+                        $"{ArchName}.attention.causal = true on a DFlash2 drafter (a selector or convolution): TensorSharp runs a "
+                        + "block-causal drafter as DSpine or as a plain or DSpark DFlash block.");
                 }
                 return;
             }
@@ -491,10 +566,12 @@ namespace TensorSharp.Models
         public override string ToString()
             => $"{(IsDSpine ? "dspine" : MarkovRank > 0 ? "dspark" : IsDFlash2 ? "dflash2" : "dflash")}(layers={NumLayers}, hidden={HiddenSize}, " +
                $"ffn={IntermediateSize}, heads={NumHeads}/{NumKVHeads}x{HeadDim}, " +
-               $"block={BlockSize}, drafts={MaxDraftTokens}, swa={SlidingWindow}, ring={RingRows}, " +
+               $"block={BlockSize}, drafts={MaxDraftTokens}, {(FullAttention ? "full attention (window " + SlidingWindow + ")" : "swa=" + SlidingWindow)}, ring={RingRows}, " +
                $"targets=[{string.Join(",", TargetLayerIds)}], feature={FeatureSize}, mask={MaskTokenId}" +
                (MarkovRank > 0 ? $", markov=r{MarkovRank}{(SampleFromAnchor ? "" : ", bonus-anchor")}" : string.Empty) +
                (HasAttentionSinks ? ", attn-sinks" : string.Empty) +
+               (CausalBlock && !IsDSpine ? ", causal block" : string.Empty) +
+               (HasYarn ? $", yarn x{1f / RopeFreqScale:G4}/{RopeOriginalContext}" : string.Empty) +
                (HasConv ? $", conv={ConvKernelSize}x{ConvGroupSize}({ConvNumGroups}g)" : string.Empty) +
                (HasSelector ? $", selector=r{SelectorRank}/k{SelectorTopK}" : string.Empty) +
                (IsDSpine ? $", causal block, bridge=c{DSpineCodeSize}/r{DSpineRank}, refine k{DSpineTopK}" : string.Empty) +

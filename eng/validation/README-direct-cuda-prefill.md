@@ -195,7 +195,17 @@ The original descriptions follow.
   replay run (Stage 0's qwen08 `chat512`).
 - **D6** Nemotron-H MoE on direct CUDA, single forwards of more than 512 rows: the last prompt row
   can land far from both references (Q8_0 experts: 0.33 at 1100 tokens; MXFP4/Q5_1 experts: 1.05 at
-  513) while the decode rows after it are normal; in 512-row chunks the rows are fine.
+  513) while the decode rows after it are normal; in 512-row chunks the rows are fine. It survived the
+  move to the shared runtime (NemotronRuntimeModel on CudaGraphExecutor, 2026-11, A40) with the same
+  distances, and is narrowed to the large-row F16 route of the quantized products (an F16 dequant of
+  the weight and the activations, then cuBLAS): with `TS_CUDA_QMM_F16GEMM_MIN_ROWS=100000`, or with
+  `TS_CUDA_Q80_MMQ_MAX_ROWS=1024` (Q8_0 products up to 1024 rows on the int8 MMQ kernel), both rows sit
+  1e-2 from managed cpu. On the Q8_0 file the row parts once expert products of 600-1024 rows take
+  that route; on the MXFP4 file, once its 513-row dense Q8_0 products do. Its dense products at the
+  same row counts, and the other files, are unaffected. A 1100-token forward of Nemotron 3.5 Lightning
+  Q4_0, whose every prompt product takes the F16 route, stays 1.6e-2 from ggml_cuda, so no real
+  checkpoint is known to hit it. The engine prefills in 256-row chunks; a direct `ForwardPrompt` takes
+  2048-row chunks.
 
 Run them with
 `dotnet test InferenceWeb.Tests -c Release --filter "FullyQualifiedName~DirectCudaPrefillModelTests|FullyQualifiedName~CudaPrefillModuleTests|FullyQualifiedName~CudaStorage_ReadOnlyHostCheckout"`,

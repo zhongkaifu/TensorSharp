@@ -2128,11 +2128,9 @@ namespace
         float oai_limit,
         int run_on_cpu,
         const float* post_expert_norm = nullptr,
-        float post_expert_norm_eps = 1e-8f,
-        const float* route_up_scales = nullptr)
+        float post_expert_norm_eps = 1e-8f)
     {
         MoEFFNGraphParams p;
-        p.route_up_scales = route_up_scales;
         p.post_expert_norm = post_expert_norm;
         p.post_expert_norm_eps = post_expert_norm_eps;
         p.hidden_in = hidden_in;
@@ -2171,8 +2169,8 @@ namespace
         // RunPerRank, where every rank would stream its own copy of the
         // same unsharded expert layer to its own device at once. A single
         // device is the case that matters here — it is the path GPT-OSS
-        // and Nemotron-H take at prefill (no fused whole-model prefill
-        // graph, hence no seam), and leaving it host-only cost gpt-oss-20b
+        // takes at prefill (no fused whole-model prefill graph, hence no
+        // seam), and leaving it host-only cost gpt-oss-20b
         // 4-10x against llama.cpp on every offloaded prefill.
         p.allow_device_stream =
             tsg::g_device_count.load(std::memory_order_acquire) <= 1;
@@ -2243,7 +2241,8 @@ namespace tsg
         void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_bytes,
         const float* gate_bias, const float* up_bias, const float* down_bias,
         int activation_type, float oai_alpha, float oai_limit,
-        bool allow_device_stream)
+        bool allow_device_stream,
+        const float* route_up_scales)
     {
         MoEFFNGraphParams p;
         // The graph builder takes a mutable input pointer because the
@@ -2281,6 +2280,7 @@ namespace tsg
         p.oai_limit = oai_limit;
         p.run_on_cpu = true;
         p.allow_device_stream = allow_device_stream;
+        p.route_up_scales = route_up_scales;
         return moe_ffn_prefill_graph_impl(p) != 0;
     }
 
@@ -2430,6 +2430,11 @@ namespace tsg
             {
                 const int i_v = host_moe_graph_node_index(graph, hm.verify_gpu);
                 if (i_v + 1 > cut) cut = i_v + 1;
+            }
+            if (hm.up_scales != nullptr)   // read back with the weights
+            {
+                const int i_s = host_moe_graph_node_index(graph, hm.up_scales);
+                if (i_s + 1 > cut) cut = i_s + 1;
             }
             if (hm.pred_next != nullptr)   // the read-ahead's guess is read at this seam: it precedes the cut
             {
@@ -2596,6 +2601,16 @@ namespace tsg
 
         ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
         ggml_backend_tensor_get(hm.weights, s_weights.data(), 0, route_count * sizeof(float));
+        // The one-projection relu(up)^2 experts' per-route up scales: only the general host evaluation applies them (the
+        // decode kernels take activations 0 and 2, so they decline these segments).
+        static thread_local std::vector<float> s_up_scales;
+        const float* up_scales = nullptr;
+        if (hm.up_scales != nullptr)
+        {
+            s_up_scales.resize(route_count);
+            ggml_backend_tensor_get(hm.up_scales, s_up_scales.data(), 0, route_count * sizeof(float));
+            up_scales = s_up_scales.data();
+        }
 
         if (staged != nullptr)
         {
@@ -2604,11 +2619,12 @@ namespace tsg
             staged->weights = s_weights.data();
         }
 
-        if (host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
+        if (host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data(), nullptr, up_scales))
             return true;
         if (hm.independent_decode_rows && hm.seq_len > 1)
         {
-            if (host_moe_decode_experts_rows(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
+            if (host_moe_decode_experts_rows(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data(), nullptr, nullptr,
+                    up_scales))
                 return true;
             // Concurrent decode rows have independent routing and must retain
             // the solo expert dot products. A multi-token prefill kernel can
@@ -2619,7 +2635,8 @@ namespace tsg
             for (int i = 0; i < hm.seq_len; ++i)
                 if (!host_moe_decode_experts(row, s_moe_in.data() + (size_t)i * hm.hidden,
                     s_ids.data() + (size_t)i * hm.n_used, s_weights.data() + (size_t)i * hm.n_used,
-                    out.data() + (size_t)i * hm.hidden)) { all_rows = false; break; }
+                    out.data() + (size_t)i * hm.hidden, nullptr,
+                    up_scales != nullptr ? up_scales + (size_t)i * hm.n_used : nullptr)) { all_rows = false; break; }
             if (all_rows) return true;
         }
 
@@ -2633,7 +2650,7 @@ namespace tsg
             hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
             hm.gate_bias, hm.up_bias, hm.down_bias,
             hm.activation, hm.oai_alpha, hm.oai_limit,
-            allow_device_stream);
+            allow_device_stream, up_scales);
         // A batch that took the device stream publishes its result through
         // finalize_compute_with_download, which on Metal with async compute only
         // QUEUES a blit into `out`. The seam reads `out` as soon as this returns
@@ -3264,7 +3281,6 @@ extern "C"
     //                          1 = swiglu_oai (gpt-oss clamped variant). Uses
     //                              oai_alpha and oai_limit.
     //                          2 = gelu(gate) * up (Gemma 4 MoE GEGLU split).
-    //                          3 = relu(up)^2 (Nemotron-H MoE).
     TSG_EXPORT int TSGgml_MoEFFNPrefillSwiGLUQuantF32(
         float* hidden_in,
         float* hidden_out,
@@ -3338,41 +3354,6 @@ extern "C"
         }
         catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
         catch (...) { set_last_error("Unknown error in Muse Spark MoE."); return 0; }
-    }
-
-    // TSGgml_MoEFFNPrefillSwiGLUQuantF32 plus route_up_scales: f32 [seq_len, n_used],
-    // one multiplier per route on the single ReLU-squared projection, applied to the
-    // matmul output before the activation (MoEFFNGraphParams::route_up_scales).
-    // Nemotron's NVFP4 experts need it: their per-expert scale2 must be applied
-    // before the squaring. A separate ABI keeps every existing caller unchanged.
-    TSG_EXPORT int TSGgml_MoEFFNPrefillRouteScaledF32(
-        float* hidden_in, float* hidden_out, int seq_len, int hidden_dim, int n_ff,
-        int num_experts, int n_used, const std::int32_t* selected_experts, const float* routing_weights,
-        void* gate_data, int gate_type, std::int64_t gate_ne0, std::int64_t gate_ne1, std::int64_t gate_total_bytes,
-        void* up_data, int up_type, std::int64_t up_ne0, std::int64_t up_ne1, std::int64_t up_total_bytes,
-        void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_total_bytes,
-        const float* gate_bias, const float* up_bias, const float* down_bias,
-        int activation_type, float oai_alpha, float oai_limit, int run_on_cpu,
-        const float* route_up_scales)
-    {
-        try
-        {
-            if (route_up_scales == nullptr)
-            {
-                set_last_error("MoE prefill: route_up_scales is required by this entry point.");
-                return 0;
-            }
-            return moe_ffn_prefill_swiglu_quant_f32_impl(
-                hidden_in, hidden_out, seq_len, hidden_dim, n_ff,
-                num_experts, n_used, selected_experts, routing_weights,
-                gate_data, gate_type, gate_ne0, gate_ne1, gate_total_bytes,
-                up_data, up_type, up_ne0, up_ne1, up_total_bytes,
-                down_data, down_type, down_ne0, down_ne1, down_total_bytes,
-                gate_bias, up_bias, down_bias, activation_type, oai_alpha, oai_limit,
-                run_on_cpu, nullptr, 1e-8f, route_up_scales);
-        }
-        catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
-        catch (...) { set_last_error("Unknown error in route-scaled MoE prefill."); return 0; }
     }
 
 }

@@ -27,7 +27,7 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly HashSet<string> LegacyBespokeFamilies = new(StringComparer.Ordinal)
     {
-        "qwen4exp", "gptoss", "nemotron_h", "muse-spark",
+        "qwen4exp", "gptoss", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
         "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
@@ -124,18 +124,9 @@ public sealed class ServingContractConformanceTests
         "muse-spark: HybridParallel@ggml_cuda",
         "muse-spark: HybridParallel@ggml_vulkan",
         "muse-spark: TensorParallel+batching@ggml_vulkan",
-        "nemotron_h: ExpertOffload@cuda",
-        "nemotron_h: ExpertOffload@ggml_metal",
-        "nemotron_h: ExpertOffload@mlx",
         "nemotron_h: HybridParallel@cuda",
         "nemotron_h: HybridParallel@ggml_cuda",
         "nemotron_h: HybridParallel@ggml_vulkan",
-        "nemotron_h: LayerSplit@cuda",
-        "nemotron_h: LayerSplit@ggml_cuda",
-        "nemotron_h: LayerSplit@ggml_vulkan",
-        "nemotron_h: TensorParallel+batching@cuda",
-        "nemotron_h: TensorParallel+batching@ggml_cuda",
-        "nemotron_h: TensorParallel+batching@ggml_vulkan",
         "qwen4exp: HybridParallel@cuda",
         "qwen4exp: HybridParallel@ggml_cuda",
         "qwen4exp: HybridParallel@ggml_vulkan",

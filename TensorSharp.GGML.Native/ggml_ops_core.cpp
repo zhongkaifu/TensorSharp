@@ -3408,20 +3408,16 @@ extern "C" void TSGgml_WanResetForwardCache();
 extern "C" void TSGgml_GraphReleaseDeviceIo();
 extern "C" void TSGgml_Qwen35GdnDropTpGraphs();
 extern "C" void TSGgml_ReleaseFusedFfnTpGraphs();
-extern "C" void TSGgml_ReleaseFusedMatmulAddTpGraphs();
 extern "C" void TSGgml_GptOssResetDecodeCache();
 extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
 extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
 extern "C" void TSGgml_DFlashResetCaches();
 extern "C" void TSGgml_WanResetForwardCache();
-extern "C" void TSGgml_NemotronMamba2PrefillClear();
-extern "C" void TSGgml_NemotronMamba2DecodeClear(std::uint64_t model_key);
 
 // The graph caches every family keeps by shape or by host address (persistent decode and draft graphs, prefill and
 // paged-attention sessions, per-rank graphs, vendor library workspaces, the Q4_K GEMM's derived weights): dropped when a
 // model releases its memory, so none replays over a device copy that went with it or that a later model's bytes now
-// occupy. None holds state a live model needs: each rebuilds on its next call (the Mamba2 decode graphs, which carry a
-// live model's recurrent state, are each model's own to clear).
+// occupy. None holds state a live model needs: each rebuilds on its next call.
 TSG_EXPORT void TSGgml_ResetSharedGraphCaches()
 {
     host_read_barrier();
@@ -3443,9 +3439,7 @@ TSG_EXPORT void TSGgml_ResetSharedGraphCaches()
     // Per-shape graphs that hold no state between calls, so another live model
     // simply rebuilds its own. Nothing else released them before thread or
     // process teardown, where freeing a CUDA buffer aborts on Windows (see
-    // ThreadCacheRegistry in ggml_ops_internal.h). The Mamba2 decode graphs
-    // carry a live model's recurrent state; each model clears its own on Dispose.
-    TSGgml_NemotronMamba2PrefillClear();
+    // ThreadCacheRegistry in ggml_ops_internal.h).
     tsg::free_prefill_attn_sessions();
     tsg::free_paged_attn_sessions();
     TSGgml_Qwen35GdnDropTpGraphs();
@@ -3580,7 +3574,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     // the process ("CUDA error: driver shutting down").
     TSGgml_Qwen35GdnDropTpGraphs();
     TSGgml_ReleaseFusedFfnTpGraphs();
-    TSGgml_ReleaseFusedMatmulAddTpGraphs();
     // GPT-OSS keeps per-layer device-resident K/V windows (tsg_gptoss::kv_*)
     // alive for the whole session; nothing else drops them, so on Metal their
     // MTLBuffers were still registered in the device residency set when the
@@ -3595,8 +3588,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     // context + backend buffer that must be released before the backend is.
     TSGgml_DFlashResetCaches();
     TSGgml_WanResetForwardCache();
-    TSGgml_NemotronMamba2PrefillClear();
-    TSGgml_NemotronMamba2DecodeClear(0);
 #if defined(TSG_GGML_USE_METAL)
     // MPS owns a separate command queue, staging buffers and compiled graphs.
     // Its release function waits for its mutex-protected synchronous invocation

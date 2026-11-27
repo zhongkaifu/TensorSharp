@@ -181,7 +181,7 @@ namespace TensorSharp.Models
             // feeds an output or an effect, so its attention output and FFN are never computed.
             if (!wantLogits) return outputs;
             int ffnIn = EmitBlockInput(step, n, x, BlockSite.Ffn, out int ffnContext);
-            x = EmitBlockOutput(step, n, x, BlockSite.Ffn, ffnContext, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
+            x = EmitBlockOutput(step, n, x, BlockSite.Ffn, ffnContext, EmitFeedForward(step, n, ffnIn, ffnContext));
             int streamWidth = DraftChainsStream ? StreamWidth : hiddenSize;
             int last = rows == 1 ? x : step.View2(x, streamWidth, 1, streamWidth * 4L, (rows - 1) * streamWidth * 4L);
             int head = EmitDraftHead(step, n, last, 1);
@@ -507,7 +507,7 @@ namespace TensorSharp.Models
             int normed = EmitBlockInput(step, n, x, BlockSite.Mixer, out int mixContext);
             x = EmitBlockOutput(step, n, x, BlockSite.Mixer, mixContext, EmitAttention(step, n, normed));
             int ffnIn = EmitBlockInput(step, n, x, BlockSite.Ffn, out int ffnContext);
-            x = EmitBlockOutput(step, n, x, BlockSite.Ffn, ffnContext, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
+            x = EmitBlockOutput(step, n, x, BlockSite.Ffn, ffnContext, EmitFeedForward(step, n, ffnIn, ffnContext));
             // Each lane's last real row (a lane padded to the step's width has rows past it); a step run again as the kept one
             // advanced takes this run's rows.
             var selected = (int[])_draftLaneLast.Clone();

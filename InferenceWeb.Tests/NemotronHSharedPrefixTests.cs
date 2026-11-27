@@ -117,7 +117,7 @@ public sealed class NemotronHSharedPrefixTests : IDisposable
 
     private static ModelBase Model(ITokenizer tokenizer)
     {
-        var model = (NemotronModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronModel));
+        var model = (NemotronRuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(NemotronRuntimeModel));
         typeof(ModelBase).GetProperty(nameof(ModelBase.Tokenizer))!.SetValue(model, tokenizer);
         typeof(ModelBase).GetField("<Config>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(model, new ModelConfig { Architecture = Arch, ChatTemplate = ShippedTemplate });
