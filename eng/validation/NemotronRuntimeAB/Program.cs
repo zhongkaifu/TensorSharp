@@ -7,6 +7,8 @@
 //   --scenario spec    --prompts <file> --steps N [--drafter head|ngram|block] [--draft-model <MTP / DFlash / DSpark gguf>] [--draft-window 3]
 //                                                                              plain greedy against greedy speculation
 //   --scenario verify  --prompts <file> --steps N [--draft-window 4]           verify windows against the plain steps
+//   --scenario audio   --audio <clip> --audio-mmproj <companion gguf>          the audio companion's graph program on --backend
+//                                                                              against its managed path (no --model needed)
 // Common: --model <gguf> --backend ggml_cuda|cuda|ggml_cpu|cpu|... [--tp N] [--layer-split N] [--out report.json]
 // TS_N_CPU_MOE / TS_CPU_MOE and KV_CACHE_DTYPE apply as the CLI and server apply them.
 // Reports are JSON (write them under the ignored artifacts/ or docs/validation/).
@@ -44,7 +46,7 @@ string? draftModel = Option("--draft-model", null);
 int draftWindow = int.Parse(Option("--draft-window", "3"));
 string drafter = Option("--drafter", "head");
 
-if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath)) throw new ArgumentException("Pass --model <nemotron_h gguf>.");
+if (scenario != "audio" && (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))) throw new ArgumentException("Pass --model <nemotron_h gguf>.");
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
     throw new ArgumentException($"Unknown backend '{backendName}'.");
 MoeCpuOffloadConfig.ConfigureFromEnvironment();   // TS_N_CPU_MOE / TS_CPU_MOE, as the CLI and server apply them
@@ -153,17 +155,19 @@ switch (scenario)
         float[] logits = Prefill(m, all[..prefix]);
         double nll = 0;
         int top1 = 0;
+        var perToken = new double[scored];
         for (int i = 0; i < scored; i++)
         {
             int target = all[prefix + i];
-            nll -= LogProbAt(logits, vocab, target);
+            perToken[i] = -LogProbAt(logits, vocab, target);
+            nll += perToken[i];
             if (Argmax(logits, vocab) == target) top1++;
             if (i + 1 < scored) logits = m.Forward(new[] { target });
         }
         double ms = sw.Elapsed.TotalMilliseconds;
         Console.WriteLine($"[ab] nll {family}: {scored} tokens after {prefix}, mean NLL {nll / scored:F6}, ppl {Math.Exp(nll / scored):F5}, top-1 {top1 / (double)scored:P2}, {ms / 1000:F1} s");
         report = new { Scenario = scenario, Family = family, Model = modelPath, Backend = backend.ToString(), Prefix = prefix, Scored = scored,
-            MeanNll = nll / scored, Perplexity = Math.Exp(nll / scored), Top1 = top1 / (double)scored };
+            MeanNll = nll / scored, Perplexity = Math.Exp(nll / scored), Top1 = top1 / (double)scored, PerTokenNll = perToken };
         m.Dispose();
         break;
     }
@@ -336,6 +340,45 @@ switch (scenario)
         }
         report = new { Scenario = scenario };
         m.Dispose();
+        break;
+    }
+    case "audio":
+    {
+        // The companion's graph program on the backend's executor against the managed path on the host (the reference): the
+        // embeddings' relative L2 and each path's encode time after a warm-up encode.
+        string clip = Option("--audio", null) ?? throw new ArgumentException("--audio <clip>");
+        string companion = Option("--audio-mmproj", null) ?? throw new ArgumentException("--audio-mmproj <companion gguf>");
+        float[] samples = NemotronAudioPreprocessor.DecodeAudioFile(clip);
+        var (mel, frames, validFrames) = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(samples);
+        IAllocator allocator = backend switch
+        {
+            BackendType.Cuda => new TensorSharp.Cuda.CudaAllocator(0),
+            BackendType.Cpu => new TensorSharp.Cpu.CpuAllocator(BlasEnum.DotNet),
+            BackendType.GgmlCuda => new TensorSharp.GGML.GgmlAllocator(new TensorSharp.GGML.GgmlContext(new[] { 0 }, TensorSharp.GGML.GgmlBackendType.Cuda), 0),
+            BackendType.GgmlCpu => new TensorSharp.GGML.GgmlAllocator(new TensorSharp.GGML.GgmlContext(new[] { 0 }, TensorSharp.GGML.GgmlBackendType.Cpu), 0),
+            _ => throw new ArgumentException($"The audio scenario takes cuda, cpu, ggml_cuda or ggml_cpu, not {backend}."),
+        };
+        var host = new TensorSharp.Cpu.CpuAllocator(BlasEnum.DotNet);
+        (float[] Rows, double Ms, double FirstMs) Encode(NemotronAudioEncoder encoder)
+        {
+            var sw = Stopwatch.StartNew();
+            encoder.Encode(mel, frames, validFrames).Dispose();
+            double first = sw.Elapsed.TotalMilliseconds;
+            sw.Restart();
+            using Tensor t = encoder.Encode(mel, frames, validFrames);
+            double ms = sw.Elapsed.TotalMilliseconds;
+            return (t.GetElementsAsFloat((int)t.ElementCount()), ms, first);
+        }
+        using var graphEncoder = NemotronAudioEncoder.Load(companion, allocator, backend, host);
+        if (!graphEncoder.RunsAsGraphs) throw new InvalidOperationException("The companion does not encode as graph programs (a BF16-emulating companion?).");
+        var graphRun = Encode(graphEncoder);
+        using var managedEncoder = new NemotronAudioEncoder(companion, host);
+        var managedRun = Encode(managedEncoder);
+        double rel = RelL2(graphRun.Rows, managedRun.Rows);
+        Console.WriteLine($"[ab] audio {frames} mel frames ({samples.Length / 16000.0:F2} s) -> {NemotronAudioEncoder.OutputLength(frames)} rows: " +
+            $"graph on {backend} {graphRun.Ms:F1} ms (first {graphRun.FirstMs:F0} ms), managed {managedRun.Ms:F1} ms; rel L2 {rel:E3}");
+        report = new { Scenario = scenario, Backend = backend.ToString(), Frames = frames, GraphMs = graphRun.Ms, GraphFirstMs = graphRun.FirstMs,
+            ManagedMs = managedRun.Ms, RelL2 = rel };
         break;
     }
     default:

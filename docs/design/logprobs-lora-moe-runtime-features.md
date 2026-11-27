@@ -587,8 +587,8 @@ Not yet validated on a real checkpoint against llama.cpp `--lora` or
 with `TS_TEXT_LORA_FIXTURE_DIR`, are the tools for that run). Follow-ups: Qwen3.5 (key the delta
 in `LinearForwardCached` and decline its ~12 native/fused paths), device-resident factors through
 `TryGgmlF32LinearResident` (today `Ops.Addmm` re-uploads them on GGML backends), and
-tensor-parallel factor sharding. The Nemotron vision tower's `v.post_ln` is unrelated to LoRA and
-tracked in the Nemotron design doc.
+tensor-parallel factor sharding. The Nemotron vision tower's `v.post_ln` (applied since 2026-11-27) is
+unrelated to LoRA.
 
 ---
 

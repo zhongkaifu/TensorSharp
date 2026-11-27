@@ -67,7 +67,9 @@ namespace TensorSharp.Models
             // The encoder validates its own tensors at load (InvalidDataException naming them); the projector's output width
             // must also be this language model's hidden size, or another Nemotron's mmproj (Nano Omni projects to 2688, Super VL
             // and Bolt to 4096) would load and fail at the first image.
-            var encoder = new NemotronVisionEncoder(mmProjPath, TowerAllocator);
+            // The tower runs as graph programs on this model's executor (direct CUDA included); its embeddings come back on the
+            // tower allocator, as the managed path's did.
+            var encoder = NemotronVisionEncoder.Load(mmProjPath, _allocator, _backend, TowerAllocator);
             if (encoder.ProjectionDim != Config.HiddenSize)
             {
                 encoder.Dispose();
@@ -88,7 +90,9 @@ namespace TensorSharp.Models
             using (var metadata = new GgufFile(path))
                 if (!metadata.Tensors.ContainsKey("sound_projection.linear2.weight"))
                     return;
-            var encoder = new NemotronAudioEncoder(path, TowerAllocator);
+            // An F32-compute companion encodes as graph programs on this model's executor; a BF16-emulating one on the managed
+            // path over the tower allocator.
+            var encoder = NemotronAudioEncoder.Load(path, _allocator, _backend, TowerAllocator);
             if (encoder.ProjectionDim != Config.HiddenSize || encoder.MelBins != NemotronAudioPreprocessor.MelBins)
             {
                 encoder.Dispose();

@@ -169,9 +169,17 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   Nemotron 3.5 Lightning and 17.7 to 70.8 on Bolt, and 8 concurrent Lightning prompts on the server finished in 2.4 s
   instead of 33.3 s. `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE`, `TS_NEMOTRON_MAMBA2_NATIVE_PREFILL_MIN_TOKENS`,
   `TS_MAMBA2_PREFILL_CACHE_MB`, `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`, `TS_NEMOTRON_MOE_PREFILL_BATCHED_MIN_TOKENS`,
-  `TS_NEMOTRON_MULTIMODAL_WARMUP(_TILES)` and `TS_TP_SNAPSHOT_TRACE` now stop the server or CLI at startup. Not run:
-  `mlx`, `ggml_metal`, `ggml_vulkan`, multi-GPU `--tp` / `--layer-split` (simulated devices only), Super VL and an audio
-  companion. See the [model card](models/nemotron.md#11-validation-of-the-migration).
+  `TS_NEMOTRON_MULTIMODAL_WARMUP(_TILES)` and `TS_TP_SNAPSHOT_TRACE` now stop the server or CLI at startup.
+  - **Graph-program towers.** The RADIO vision tower (with Super VL's final `v.post_ln`) and the Parakeet audio tower
+    (an F32-compute companion) run as graph programs on every executor.
+  - **Super VL NVFP4 on one 48 GB A40** (`--cpu-moe`): NLL 2.117 on `ggml_cuda` and 2.116 on `cuda`, with correct greedy
+    and image answers. Nano Omni transcribes a LibriSpeech clip word for word on both backends, and its audio tower
+    encodes 10 s in 24 ms on `ggml_cuda`.
+  - **Route-tail skip.** On the tensor executors it no longer drops Nemotron's ReLU^2 experts (15 of Super VL's 22
+    routes) or applies to steps wider than 8 rows.
+
+  Not run: `mlx`, `ggml_metal`, `ggml_vulkan`, multi-GPU `--tp` / `--layer-split` (simulated devices only), and Super VL
+  without `--cpu-moe`. See the [model card](models/nemotron.md#11-validation-of-the-migration).
 - **Muse-Glimmer runs on the shared decoder runtime, and its legacy model is removed.** Every backend and placement
   serves it (`--tp 2`, `--layer-split N` and their hybrid included), with continuous batching, the prefix cache with
   checkpoint files, DFlash and n-gram speculation (n-gram needs no drafter) and the graph vision tower. The legacy

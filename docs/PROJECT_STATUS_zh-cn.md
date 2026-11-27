@@ -132,8 +132,16 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   从 45 提升到 104 tok/s，在 Nemotron 3.5 Lightning 上从 39.6 提升到 143.5，在 Bolt 上从 17.7 提升到 70.8；服务端上 8 个并发的
   Lightning 提示从 33.3 秒缩短到 2.4 秒完成。`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE`、`TS_NEMOTRON_MAMBA2_NATIVE_PREFILL_MIN_TOKENS`、
   `TS_MAMBA2_PREFILL_CACHE_MB`、`TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`、`TS_NEMOTRON_MOE_PREFILL_BATCHED_MIN_TOKENS`、
-  `TS_NEMOTRON_MULTIMODAL_WARMUP(_TILES)` 与 `TS_TP_SNAPSHOT_TRACE` 现在会让服务器或 CLI 在启动时报错。未运行：`mlx`、`ggml_metal`、
-  `ggml_vulkan`、多 GPU 的 `--tp` / `--layer-split`（仅模拟设备）、Super VL 与音频配套文件。详见[模型卡片](models/nemotron_zh-cn.md#11-迁移验证)。
+  `TS_NEMOTRON_MULTIMODAL_WARMUP(_TILES)` 与 `TS_TP_SNAPSHOT_TRACE` 现在会让服务器或 CLI 在启动时报错。
+  - **计算图程序视觉塔与音频塔。** RADIO 视觉塔（含 Super VL 的最终 `v.post_ln`）与 Parakeet 音频塔（F32 计算的配套文件）
+    在每个执行器上以计算图程序运行。
+  - **单张 48 GB A40 上的 Super VL NVFP4**（`--cpu-moe`）：`ggml_cuda` 上 NLL 2.117，`cuda` 上 2.116，贪心回答与图像回答都正确。
+    Nano Omni 在两个后端上都逐字转写了一段 LibriSpeech 音频，其音频塔在 `ggml_cuda` 上 24 ms 编码 10 秒音频。
+  - **route-tail skip。** 在张量执行器上，它不再略去 Nemotron 的 ReLU^2 专家（Super VL 22 条路由中的 15 条），也不再应用于
+    超过 8 行的步。
+
+  未运行：`mlx`、`ggml_metal`、`ggml_vulkan`、多 GPU 的 `--tp` / `--layer-split`（仅模拟设备），以及不带 `--cpu-moe` 的 Super VL。
+  详见[模型卡片](models/nemotron_zh-cn.md#11-迁移验证)。
 - **Muse-Glimmer 运行在共享解码运行时上，旧模型已移除。** 所有后端与放置方式都可服务它（包括 `--tp 2`、`--layer-split N`
   及二者的混合），并支持连续批处理、带检查点文件的前缀缓存、DFlash 与 n-gram 推测解码（n-gram 无需草稿模型）以及图形化
   视觉塔。旧的 `TS_MUSE_GLIMMER_*` 环、分块与追踪开关以及 `TS_MLX_KV_MATERIALIZE_INTERVAL` 现在会让服务器或 CLI 在启动时

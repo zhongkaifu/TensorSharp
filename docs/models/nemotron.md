@@ -84,7 +84,7 @@ support was added and what was validated.
 |---|---|---|
 | Routed experts | Per layer ("Puzzle" config): 240-496 experts, top-9, n_ff 1536-2560 | 512 experts, top-22, n_ff 2688 |
 | Language GGUF | `...-Bolt-74B-A9B-24GB.gguf`, **22.018 GB**: IQ2_XXS experts, NVFP4 Mamba2 projections with `.scale` sidecars | `...-NVFP4.gguf`, **76.919 GB** (NVFP4 experts with per-expert scales); `...-Q4_0.gguf`, **71.934 GB** (no sidecars) |
-| mmproj | 1.734 GB; q/k/v stored **split** (fused at load) | Q8_0 0.967 GB or BF16 1.734 GB; fused q/k/v, plus a `v.post_ln` this encoder does not apply |
+| mmproj | 1.734 GB; q/k/v stored **split** (fused at load) | Q8_0 0.967 GB or BF16 1.734 GB; fused q/k/v, plus a final LayerNorm `v.post_ln` (applied after the blocks) |
 
 **Memory.** The language GGUF has to fit on the device, with room for the KV cache and workspace:
 - **Super VL NVFP4** needs about 71.6 GiB (76.919 GB) of weights on one device. It ran on a 128 GB
@@ -92,11 +92,9 @@ support was added and what was validated.
   `ggml_cpu`. One 96 GB GPU should hold it, but that was not validated.
 - **Bolt-24GB** ran on `ggml_cuda` and `cuda` on the DGX Spark. In the PR #282 review it ran on a
   48 GB A40 with ECC enabled (about 45.0 GiB usable).
-- **The vision tower** adds about 3.2 GiB of F32 weights at load, plus about 3.1 GiB of F32 transposed
-  copies made on the first encode (the server's multimodal warmup, or the first image). These are
-  estimates from the tensor shapes, not measured. On
-  the GGML backends they use the language model's allocator. The direct `cuda` backend runs the tower on
-  the CPU allocator, in host RAM.
+- **The vision tower** runs as graph programs on the language model's executor (§4.5), its weights in their
+  file encoding on the model's allocator (the BF16 mmproj: about 1.7 GB). Its managed copy, about 3.2 GiB of
+  F32 on the host, lives only for the load's validation.
 
 **`--tp`.** Only `--tp 2` can apply, because the attention layers have 2 KV heads. Tensor parallelism runs as the
 shared runtime's per-rank graphs (§8): each rank owns a contiguous block of Mamba-2 groups and the heads that read them, one
@@ -107,8 +105,33 @@ weights and the per-expert up scale multiplies each route's up product before Re
 `NemotronExpertScaleTests`, `NemotronPerLayerMoEConfigTests`); no multi-GPU run of either model is recorded.
 
 **`--n-cpu-moe` / `--cpu-moe`** keep the offloaded layers' routed experts in host memory on one device (§10): on an A40,
-Bolt-24GB ran at 6.5 GB peak VRAM with every layer offloaded. With Super VL NVFP4 (about 71.6 GiB of weights, most of
-them experts) this is the way onto a single 48 GB GPU, but that file was not run here. The option is refused with `--tp`.
+Bolt-24GB ran at 6.5 GB peak VRAM with every layer offloaded. The option is refused with `--tp`.
+
+**Super VL on one 48 GB A40** (`--cpu-moe`: every layer's routed experts in host memory; ggml `bb877c0c`). The test VM's
+cgroup quota of 7.65 CPUs (`nproc` reports 96) bounds the host experts, so these rates are this machine's:
+
+| Backend | NLL, 256 tokens after 64 | Prefill 512 | Decode | Peak VRAM |
+|---|---|---|---|---|
+| `ggml_cuda` | 2.1167 (ppl 8.30, top-1 57.0 %) | 24.2 tok/s | 3.85 tok/s | 14.3 GB |
+| `cuda` | 2.1156 (ppl 8.29, top-1 56.6 %) | 6.4 tok/s | 3.38 tok/s | 17.2 GB |
+
+What the runs showed:
+- **Greedy answers.** Five prompts (a fact, Python code, three bullets, arithmetic, a translation) were answered correctly
+  on both backends.
+- **Image.** The BF16 mmproj on the 640x480 test image was described correctly on both backends: a red square top
+  left, a blue circle top right, a green triangle bottom centre, and the text "HELLO 42".
+  - The prompt is 289 tokens with `--no-skills`. The CLI's default skill catalog adds about 2,190 more.
+  - `ggml_cuda` prefilled the 2,475 tokens with the catalog in 38.4 s and decoded at 2.9 tok/s.
+  - `cuda`, after the fix below, prefilled the 289 tokens in 117 s and decoded at 2.3 tok/s. Direct CUDA streams an
+    offloaded prompt chunk's experts to the device one at a time (§10).
+- **The route-tail skip.** The first `cuda` run scored 2.2100. Per token against the managed CPU backend (2.1195 over 32
+  tokens; `ggml_cuda` 2.1156, mean per-token |delta| 0.007), direct CUDA was off from the first token (mean |delta| 0.14).
+  - The cause: the tensor executors' expert host applied the route-tail skip (`TS_MOE_ROUTE_TAIL_SKIP`, rank 7) to
+    Nemotron's one-projection experts. That left 15 of each token's 22 routes out, while GGML, which keeps no tier for
+    these experts, computes them all.
+  - The fix: the tensor executors no longer skip Nemotron's ReLU^2 experts, and they apply the skip at decode and verify
+    widths only (8 rows), as documented. Since then `cuda` follows the CPU (mean |delta| 0.009).
+  - `NemotronBf16ProjectionTests` pins it with a synthetic top-22 model.
 
 ```bash
 hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models
@@ -343,10 +366,22 @@ Mirrors NVIDIA's RADIO / CLIP-style ViT used by the v2_vl projector:
   which names the file, the tensors and the expected layout. A server started
   with `--mmproj`, or the CLI, refuses to start (exit code 2). Before this
   check, such a file loaded and then failed every image request.
+- **Final LayerNorm.** Super VL's mmproj ends the tower with `v.post_ln`
+  (weight and bias), applied to every token after the blocks, as llama.cpp's
+  `build_vit` applies it. Its bias is optional.
 - **Not used:** the video tower's `v.patch_embd.weight.1` (skipped at load,
-  with one log line), and Super VL's `v.post_ln`, which llama.cpp applies after
-  the blocks (a follow-up). Super VL image embeddings therefore differ from
-  llama.cpp's.
+  with one log line).
+- **Graph programs.** The tower and projector run as one graph program per tile
+  on the language model's executor, on every backend and direct CUDA included
+  (`NemotronVisionEncoder.Graph.cs`). The patch rows are packed on the host and
+  the resized position table is cached per grid, as before, and the embeddings
+  come back on the tower allocator. The managed per-op path loads and validates
+  the weights once at load, then frees them. It still serves an allocator that
+  has no executor. `NemotronVisionEncoderTests` holds the graph program to the
+  managed path for the fused, split (Bolt) and Super VL layouts, on the trained
+  grid and on a resized one: within 1e-5 relative L2 on the managed CPU, 1e-3
+  on direct CUDA, and 2e-3 on `ggml_cpu` and `ggml_cuda`, where GGML's
+  attention rounds K and V to F16.
 
 `NemotronImageProcessor` (mirrors `nemotronh.ImageProcessor`):
 
@@ -449,17 +484,48 @@ being served. Only then does `IsAudioEncoderLoaded` lift the §4.6 refusal, and
 (`PlanNemotronMedia`, per-modality attachment order), expands each
 `<so_embedding>` to `<so_start>` + N + `<so_end>`, and queues the projected rows.
 
-What is established (CPU only; see the evidence README): the Parakeet mel
-frontend matches an independent reference on six clips
-(`NemotronAudioInputTests`); the encoder and projector match the official
-Transformers modules on small 8- and 128-mel fixtures in F32 and BF16 compute,
-managed and GGML CPU (`NemotronAudioEncoderTests`); two-clip injection and
-sliced queueing keep exact rows and independent request retention
-(`NemotronAudioInjectorTests`). On the official trained companion the explicit
-F32-compute configuration matches all 8,064 output values; the original BF16
-compute configuration still **fails** (3,794/8,064 at an unchanged tolerance,
-first difference a BF16 rounding boundary in layer 0). Spoken-audio answer
-quality, GPU execution and latency are not qualified.
+**Two paths, chosen at load** (`NemotronAudioEncoder.Load`):
+- **F32-compute companion** (`nemotron.audio.compute_bf16=false`, `prepare_f32.py`'s file). The encoder runs as one
+  graph program per clip on the language model's executor, on every backend and direct CUDA included
+  (`NemotronAudioEncoder.Graph.cs`). The program is the managed path's arithmetic:
+  - **Subsampling.** `Conv2d` and `DepthwiseConv2d` stages with the rows past the valid frames zeroed, then pointwise
+    products.
+  - **Relative-position attention.** Content and position scores as per-head products, the relative shift a strided view,
+    the keys past the valid frames masked.
+  - **Conv module.** GLU, then a 'same' depthwise conv as `SsmConv` over a zero-padded window, then the inference
+    BatchNorm folded into a scale and a shift.
+
+  The matrices keep their BF16 encoding where the backend has kernels for it, and the vectors and conv kernels are F32.
+  The embeddings come back on the tower allocator (host memory on direct CUDA, as before).
+- **BF16-emulating companion** (`prepare.py`'s file). It keeps the managed path, which rounds every intermediate as the
+  official BF16 encoder does.
+
+What is established:
+- **Frontend.** The Parakeet mel frontend matches an independent reference on six clips (`NemotronAudioInputTests`).
+- **Encoder against the reference.** The encoder and projector match the official Transformers modules on small 8- and
+  128-mel fixtures (`NemotronAudioEncoderTests`): in F32 and BF16 compute on the managed path and GGML CPU; and in F32
+  for the graph program on the managed CPU, `ggml_cpu`, `ggml_cuda` and direct `cuda`, at the managed path's F32
+  tolerance.
+- **Injection.** Two-clip injection and sliced queueing keep exact rows and independent request retention
+  (`NemotronAudioInjectorTests`).
+- **Trained companion.** The explicit F32-compute configuration matches all 8,064 output values. The original BF16
+  compute configuration still **fails** (3,794/8,064 at an unchanged tolerance, first difference a BF16 rounding
+  boundary in layer 0).
+- **Real clip.** On the trained F32-compute companion and a 10.44 s LibriSpeech clip (131 rows), the graph program
+  encoded in:
+  - 24.4 ms on `ggml_cuda` and 48.1 ms on direct `cuda` (A40);
+  - 481 ms on `ggml_cpu`;
+  - against 1.8-1.9 s for the managed path, under the test VM's 7.65-CPU quota.
+
+  The rows are within 1.8e-3 relative L2 of the managed path's (the BF16 weights' products round their activations;
+  `eng/validation/NemotronRuntimeAB --scenario audio`).
+- **Speech.** Nano Omni (`UD-Q4_K_XL`, the BF16 mmproj and this companion through `TS_NEMOTRON_AUDIO_MMPROJ`) was asked
+  to transcribe the clip. It answered with the reference transcript word for word on `ggml_cuda` and on `cuda`: "He hoped
+  there would be stew for dinner, turnips and carrots and bruised potatoes and fat mutton pieces to be ladled out in
+  thick peppered flour-fattened sauce."
+  - The 155-token prompt prefilled in 245 ms on `ggml_cuda` and 617 ms on `cuda`.
+  - The CLI was run with `--no-skills`. With its default skill catalog the model answered the request with a skill tool
+    call instead of the transcript.
 
 ## 5. Parameters and settings
 
@@ -744,7 +810,7 @@ scales against folded twins, and LoRA.
 - **Coverage limits.** These were not run:
   - `mlx`, `ggml_metal` and `ggml_vulkan`;
   - multi-GPU `--tp` and `--layer-split`, which were covered on simulated devices only;
-  - Super VL, which was not on the test machine;
+  - Super VL without `--cpu-moe` (it needs a 96 GB device);
   - an audio companion, since none is public.
 - **Known costs.**
   - Direct-CUDA MoE decode steps are not recorded as CUDA graphs: Lightning decodes at 70 tok/s on `cuda` against 143
@@ -939,6 +1005,6 @@ scales against folded twins, and LoRA.
 - **DSpark block cost**: the drafter's BF16 attention weights are dequantized to F32 at load (565 MB read per block
   across its six layers); keeping them BF16 on the graph path would halve that. DSpark's blocks could also share one
   program across requests, as DFlash's lanes do.
-- **Audio tower**: `NemotronAudioEncoder` runs on the managed CPU path from a companion GGUF (§4.7). The public GGUFs
-  still carry no tower, so audio is refused unless that companion is loaded. Open work: BF16-compute parity on the
-  trained weights, a GPU/native encoder graph, and spoken-audio acceptance and latency qualification.
+- **Audio tower**: the F32-compute companion runs as graph programs on every executor (§4.7). The public GGUFs still
+  carry no tower, so audio is refused unless that companion is loaded. Open work: BF16-compute parity on the trained
+  weights (the BF16-emulating companion keeps the managed path).

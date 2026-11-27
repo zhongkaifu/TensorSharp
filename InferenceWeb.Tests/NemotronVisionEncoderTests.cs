@@ -28,8 +28,13 @@ namespace InferenceWeb.Tests;
 public sealed class NemotronVisionEncoderTests : IDisposable
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), "ts-nemotron-vision-" + Guid.NewGuid().ToString("N"));
+    private readonly Xunit.Abstractions.ITestOutputHelper output;
 
-    public NemotronVisionEncoderTests() => Directory.CreateDirectory(_directory);
+    public NemotronVisionEncoderTests(Xunit.Abstractions.ITestOutputHelper output)
+    {
+        this.output = output;
+        Directory.CreateDirectory(_directory);
+    }
 
     public void Dispose()
     {
@@ -108,12 +113,36 @@ public sealed class NemotronVisionEncoderTests : IDisposable
     [Fact]
     public void SuperVlLikeMmproj_StillLoadsAndEncodes()
     {
-        // Super VL's ggml-org mmproj: fused q/k/v plus the video patch embedding (and
-        // v.post_ln, which this encoder does not read). Validation must not refuse it.
-        string path = new Mmproj { VideoPatchEmbedding = true }.Write(Path.Combine(_directory, "fused-video.gguf"));
+        // Super VL's ggml-org mmproj: fused q/k/v plus the video patch embedding and the tower's final LayerNorm v.post_ln,
+        // which the encoder applies after the blocks (llama.cpp's build_vit): its output is not the twin's without it.
+        string path = new Mmproj { VideoPatchEmbedding = true, PostLn = true }.Write(Path.Combine(_directory, "fused-video.gguf"));
+        string twinPath = new Mmproj { VideoPatchEmbedding = true }.Write(Path.Combine(_directory, "fused-video-no-post-ln.gguf"));
+        var allocator = new CpuAllocator(BlasEnum.DotNet);
+        using var encoder = new NemotronVisionEncoder(path, allocator);
+        using var twin = new NemotronVisionEncoder(twinPath, allocator);
+        Assert.Equal(new long[] { Mmproj.Hidden }, Weights(encoder)["v.post_ln.weight"].Sizes.ToArray());
+        using var embeddings = encoder.Encode(Tile(), Mmproj.ImageSize, Mmproj.ImageSize);
+        using var without = twin.Encode(Tile(), Mmproj.ImageSize, Mmproj.ImageSize);
+        Assert.Equal(new long[] { Mmproj.TokensPerTile, NemotronSyntheticModelBuilder.Hidden }, embeddings.Sizes.ToArray());
+        float[] e = embeddings.GetElementsAsFloat((int)embeddings.ElementCount());
+        float[] w = without.GetElementsAsFloat((int)without.ElementCount());
+        Assert.All(e, v => Assert.True(float.IsFinite(v)));
+        double diff = 0, norm = 0;
+        for (int i = 0; i < e.Length; i++)
+        {
+            diff += (double)(e[i] - w[i]) * (e[i] - w[i]);
+            norm += (double)w[i] * w[i];
+        }
+        Assert.True(Math.Sqrt(diff / norm) > 1e-2, $"v.post_ln left the embeddings as they were (relative L2 {Math.Sqrt(diff / norm):E2})");
+    }
+
+    /// <summary>v.post_ln's bias is optional (a LayerNorm without one), as the blocks' are.</summary>
+    [Fact]
+    public void PostLnWithoutItsBias_LoadsAndEncodes()
+    {
+        string path = new Mmproj { PostLn = true, Omit = new[] { "v.post_ln.bias" } }.Write(Path.Combine(_directory, "post-ln.gguf"));
         using var encoder = new NemotronVisionEncoder(path, new CpuAllocator(BlasEnum.DotNet));
         using var embeddings = encoder.Encode(Tile(), Mmproj.ImageSize, Mmproj.ImageSize);
-        Assert.Equal(new long[] { Mmproj.TokensPerTile, NemotronSyntheticModelBuilder.Hidden }, embeddings.Sizes.ToArray());
         Assert.All(embeddings.GetElementsAsFloat((int)embeddings.ElementCount()), v => Assert.True(float.IsFinite(v)));
     }
 
@@ -265,6 +294,99 @@ public sealed class NemotronVisionEncoderTests : IDisposable
     }
 
     /// <summary>A deterministic normalized [C, H, W] tile.</summary>
+    // The graph program (NemotronVisionEncoder.Graph.cs) against the managed path, for the fused, the split (Bolt) and the
+    // Super VL layouts, on the patch grid the position table was trained at and on a wider one (its bilinear resize).
+    [Theory]
+    [InlineData("fused")]
+    [InlineData("split")]
+    [InlineData("supervl")]
+    public void GraphProgram_EncodesAsTheManagedPath_Managed(string layout) => CheckGraphProgram(layout, "managed", 1e-5);
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData("fused")]
+    [InlineData("split")]
+    [InlineData("supervl")]
+    public void GraphProgram_EncodesAsTheManagedPath_GgmlCpu(string layout) => CheckGraphProgram(layout, "ggml_cpu", 2e-3);
+
+    /// <summary>GGML's attention rounds the keys and values to F16 (as llama.cpp's encoders run it).</summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData("fused")]
+    [InlineData("split")]
+    [InlineData("supervl")]
+    public void GraphProgram_EncodesAsTheManagedPath_GgmlCuda(string layout) => CheckGraphProgram(layout, "ggml_cuda", 2e-3);
+
+    [CudaTheory]
+    [InlineData("fused")]
+    [InlineData("split")]
+    [InlineData("supervl")]
+    public void GraphProgram_EncodesAsTheManagedPath_DirectCuda(string layout) => CheckGraphProgram(layout, "cuda", 1e-3);
+
+    private void CheckGraphProgram(string layout, string lane, double tolerance)
+    {
+        var builder = layout switch
+        {
+            "split" => new Mmproj { SplitQkv = true, VideoPatchEmbedding = true },
+            "supervl" => new Mmproj { VideoPatchEmbedding = true, PostLn = true },
+            _ => new Mmproj(),
+        };
+        string path = builder.Write(Path.Combine(_directory, layout + ".gguf"));
+        IDisposable owner = null;
+        try
+        {
+            IAllocator allocator;
+            BackendType backend;
+            switch (lane)
+            {
+                case "managed": allocator = new CpuAllocator(BlasEnum.DotNet); backend = BackendType.Cpu; break;
+                case "cuda":
+                    var cuda = new TensorSharp.Cuda.CudaAllocator();
+                    owner = cuda;
+                    allocator = cuda;
+                    backend = BackendType.Cuda;
+                    break;
+                default:
+                    bool gpu = lane == "ggml_cuda";
+                    allocator = new GgmlAllocator(new GgmlContext(new[] { 0 }, gpu ? GgmlBackendType.Cuda : GgmlBackendType.Cpu), 0);
+                    backend = gpu ? BackendType.GgmlCuda : BackendType.GgmlCpu;
+                    break;
+            }
+            var host = new CpuAllocator(BlasEnum.DotNet);
+            using var graph = NemotronVisionEncoder.Load(path, allocator, backend, host);
+            using var managed = new NemotronVisionEncoder(path, host);
+            Assert.True(graph.RunsAsGraphs, $"{lane} {layout}: the tower did not load as graph programs");
+            foreach ((int width, int height) in new[] { (Mmproj.ImageSize, Mmproj.ImageSize), (Mmproj.ImageSize * 3 / 2, Mmproj.ImageSize) })
+            {
+                var pixels = new float[Mmproj.Channels * width * height];
+                for (int i = 0; i < pixels.Length; i++) pixels[i] = MathF.Sin(i * 0.37f) * 1.5f;
+                using var expected = managed.Encode(pixels, width, height);
+                using var actual = graph.Encode(pixels, width, height);
+                Assert.Equal(expected.Sizes.ToArray(), actual.Sizes.ToArray());
+                float[] e = expected.GetElementsAsFloat((int)expected.ElementCount());
+                float[] a = actual.GetElementsAsFloat((int)actual.ElementCount());
+                double diff = 0, norm = 0;
+                for (int i = 0; i < e.Length; i++)
+                {
+                    Assert.True(float.IsFinite(a[i]), $"{lane} {layout} {width}x{height}: element {i} is {a[i]}");
+                    diff += (double)(a[i] - e[i]) * (a[i] - e[i]);
+                    norm += (double)e[i] * e[i];
+                }
+                double rel = Math.Sqrt(diff / norm);
+                output.WriteLine($"{lane} {layout} {width}x{height}: relative L2 to the managed path {rel:E2}");
+                Assert.True(rel <= tolerance, $"{lane} {layout} {width}x{height}: relative L2 {rel:E2} exceeds {tolerance:E1}");
+            }
+            Assert.True(graph.Graph.Runs > 0);
+        }
+        finally
+        {
+            owner?.Dispose();
+            if (lane.StartsWith("ggml", StringComparison.Ordinal))
+            {
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                GgmlBasicOps.ClearHostBufferCache();
+            }
+        }
+    }
+
     private static float[] Tile()
     {
         var pixels = new float[Mmproj.Channels * Mmproj.ImageSize * Mmproj.ImageSize];

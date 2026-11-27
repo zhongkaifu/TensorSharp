@@ -1,6 +1,6 @@
 # Nemotron 3.5 Super VL / Bolt support - Design & gap analysis
 
-**Status:** G1, G2, G3 and G6 implemented. G2 and G3 work only after fixes made when the DGX Spark run found them broken (section 5). G4 was covered as claimed. G5 (vision) was **not** covered for Bolt, whose mmproj splits q/k/v; that was fixed after the PR #282 review. Super VL's `v.post_ln` is still not applied (a follow-up, see G5). Tensor parallelism now applies the NVFP4 scales and Nemotron opts in, but only synthetic tests cover it, on CPU and in a gated `ggml_cuda` `--tp 2` test; no real Super VL `--tp 2` generation has completed on GPUs (section 6).
+**Status:** G1, G2, G3 and G6 implemented. G2 and G3 work only after fixes made when the DGX Spark run found them broken (section 5). G4 was covered as claimed. G5 (vision) was **not** covered for Bolt, whose mmproj splits q/k/v; that was fixed after the PR #282 review. Super VL's `v.post_ln` is applied since 2026-11-27, when Super VL ran end to end on one 48 GB A40 with `--cpu-moe` (see the [model card](../models/nemotron.md#nemotron-35-super-vl-and-bolt)). Tensor parallelism now applies the NVFP4 scales and Nemotron opts in, but only synthetic tests cover it, on CPU and in a gated `ggml_cuda` `--tp 2` test; no real Super VL `--tp 2` generation has completed on GPUs (section 6).
 **Date:** 2026-10-19 / 2026-10-20; corrected 2026-10-28 after the PR #282 review
 **Note (2026-11):** this note describes the legacy per-op `NemotronModel`, which has since been removed; Nemotron-H now runs on the shared decoder runtime (`NemotronRuntimeModel`), where `--tp`, `--layer-split`, expert offload on one device and speculation work as the [model card](../models/nemotron.md#7-tensorsharp-implementation-the-shared-decoder-runtime) describes.
 **Target models:**
@@ -270,11 +270,10 @@ Evidence:
 - No real Bolt image was run for this fix.
 
 **Follow-ups (not done):**
-- **`v.post_ln`.** Super VL's mmproj ships a post-encoder LayerNorm, which llama.cpp's `build_vit`
-  (`tools/mtmd/clip.cpp`) applies when the tensor is present. This encoder does not read it, so Super
-  VL image embeddings differ from llama.cpp's. It was left out because there is no end-to-end oracle:
-  Super VL's language model does not fit one 48 GB GPU. Bolt's and Nano Omni's mmprojs have no
-  `post_ln`.
+- **`v.post_ln`** (done 2026-11-27). Super VL's mmproj ships a post-encoder LayerNorm, which llama.cpp's
+  `build_vit` (`tools/mtmd/clip.cpp`) applies when the tensor is present. The encoder now applies it after
+  the blocks. Super VL ran end to end with its experts on the host (`--cpu-moe`) and described the test image
+  correctly. Bolt's and Nano Omni's mmprojs have no `post_ln`.
 - **Dynamic resolution.** The `nemotron_omni` mmprojs declare `clip.vision.image_min_pixels` and
   `clip.vision.image_max_pixels`, which llama.cpp uses for dynamic resolution. This encoder tiles
   instead, with one tile by default.
@@ -452,8 +451,10 @@ the feature on the handle being non-zero and fall back.
   or RTX 6000 Ada) report about 49,140 MiB (about 48.0 GiB usable), which would leave rank 0 about
   6 GiB; none has been measured. The Q4_0 GGUF's `--tp 2` fit has not been measured.
 - **Vision (G5):** split q/k/v and validation are covered by the synthetic tests above. No real Bolt
-  or Super VL image has been run since the fix. `v.post_ln` is still not applied.
-- **CPU offload (`--n-cpu-moe` / `--cpu-moe`):** not implemented by Nemotron's single-device MoE path.
+  image has been run since the fix. Super VL's image was run on 2026-11-27 with `v.post_ln` applied
+  (answered correctly on `ggml_cuda` and `cuda`).
+- **CPU offload (`--n-cpu-moe` / `--cpu-moe`):** implemented on the shared runtime since 2026-11 (the legacy
+  single-device MoE path had none); Super VL ran with it on one 48 GB A40.
   The hosts still log "MoE CPU offload active", but no VRAM is saved:
   - on `ggml_cuda`, the selected layers' experts skip the load-time upload and are uploaded when the MoE
     kernel first uses them;

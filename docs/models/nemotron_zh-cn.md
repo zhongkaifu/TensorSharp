@@ -78,16 +78,14 @@ mmproj。支持的来龙去脉与验证情况见[设计说明](../design/nemotro
 |---|---|---|
 | 路由 expert | 逐层配置（"Puzzle"）：240-496 个 expert、top-9、n_ff 1536-2560 | 512 个 expert、top-22、n_ff 2688 |
 | 语言模型 GGUF | `...-Bolt-74B-A9B-24GB.gguf` **22.018 GB**（IQ2_XXS expert；Mamba2 投影为 NVFP4，带 `.scale` sidecar） | `...-NVFP4.gguf` **76.919 GB**（NVFP4 expert，带逐 expert scale）；`...-Q4_0.gguf` **71.934 GB**（无 sidecar） |
-| mmproj | 1.734 GB；q/k/v **分开存放**（加载时融合） | Q8_0 0.967 GB 或 BF16 1.734 GB；融合 q/k/v，另有本编码器不应用的 `v.post_ln` |
+| mmproj | 1.734 GB；q/k/v **分开存放**（加载时融合） | Q8_0 0.967 GB 或 BF16 1.734 GB；融合 q/k/v，另有最终 LayerNorm `v.post_ln`（在所有 block 之后应用） |
 
 **内存。** 语言模型 GGUF 必须放进设备，并给 KV cache 和工作区留出空间：
 - **Super VL NVFP4** 单设备约需 71.6 GiB（76.919 GB）权重。它在 128 GB 的 DGX Spark（GB10）上运行过，放不进
   48 GB GPU，所以 PR #282 的评审在 `ggml_cpu` 上运行它。单张 96 GB GPU 应能容纳，但未验证。
 - **Bolt-24GB** 在 DGX Spark 上以 `ggml_cuda` 和 `cuda` 运行过；PR #282 的评审在一张开启 ECC 的 48 GB A40（约 45.0 GiB 可用）上运行过它。
-- **视觉塔**在加载时另需约 3.2 GiB F32 权重，首次编码（服务端的多模态预热，或第一张图像）时再生成约 3.1 GiB 的
-  F32 转置副本。这些数字按张量
-  形状估算，未实测。在 GGML 后端上它们使用语言模型的 allocator；直接 `cuda` 后端在 CPU allocator（主机内存）上
-  运行视觉塔。
+- **视觉塔**以计算图程序在语言模型的执行器上运行（§4.5），权重以文件编码放在模型的分配器上（BF16 mmproj 约 1.7 GB）。
+  它的托管副本（主机上约 3.2 GiB 的 F32）只在加载校验期间存在。
 
 **`--tp`。** 注意力层只有 2 个 KV 头，因此只有 `--tp 2` 可用。张量并行以共享运行时的按 rank 计算图运行（§8）：每个
 rank 持有一段连续的 Mamba-2 group 及读取它们的 head、一个 KV 头及其 16 个 query 头，以及每个 expert 宽度的一个切片；
@@ -97,8 +95,31 @@ router 与专家选择在每个 rank 上运行。NVFP4 scale 跟随分片（列�
 两个模型都没有记录到多 GPU 运行。
 
 **`--n-cpu-moe` / `--cpu-moe`** 在单设备上把被卸载层的路由 expert 留在主机内存（§10）：在一张 A40 上，Bolt-24GB 卸载全部
-层后峰值显存为 6.5 GB。对 Super VL NVFP4（约 71.6 GiB 权重，大部分是 expert）而言，这是放进单张 48 GB GPU 的途径，但这里
-没有运行过该文件。`--tp` 下拒绝该选项。
+层后峰值显存为 6.5 GB。`--tp` 下拒绝该选项。
+
+**单张 48 GB A40 上的 Super VL**（`--cpu-moe`：每层的路由 expert 都在主机内存；ggml `bb877c0c`）。测试虚拟机的 cgroup 配额为
+7.65 个 CPU（`nproc` 报告 96），它限制了主机 expert 的速度，所以这些速度只代表这台机器：
+
+| 后端 | NLL（64 个之后的 256 个 token） | Prefill 512 | Decode | 峰值显存 |
+|---|---|---|---|---|
+| `ggml_cuda` | 2.1167（ppl 8.30，top-1 57.0 %） | 24.2 tok/s | 3.85 tok/s | 14.3 GB |
+| `cuda` | 2.1156（ppl 8.29，top-1 56.6 %） | 6.4 tok/s | 3.38 tok/s | 17.2 GB |
+
+运行结果：
+- **贪心回答。** 五个提示（一个事实、Python 代码、三条要点、算术、一段翻译）在两个后端上都回答正确。
+- **图像。** BF16 mmproj 对 640x480 测试图像的描述在两个后端上都正确：左上的红色正方形、右上的蓝色圆形、底部中间的绿色三角形，
+  以及文字 "HELLO 42"。
+  - 使用 `--no-skills` 时提示为 289 个 token；CLI 默认的技能目录另外增加约 2,190 个。
+  - `ggml_cuda` 在 38.4 秒内 prefill 了带技能目录的 2,475 个 token，decode 为 2.9 tok/s。
+  - `cuda`（下文修复之后）在 117 秒内 prefill 了 289 个 token，decode 为 2.3 tok/s。直接 CUDA 把被卸载提示块的 expert 一次一个地
+    流式传输到设备上（§10）。
+- **route-tail skip。** 第一次 `cuda` 运行得到 2.2100。逐 token 与托管 CPU 后端对比（32 个 token 上 2.1195；`ggml_cuda` 为
+  2.1156，逐 token 平均 |delta| 0.007），直接 CUDA 从第一个 token 起就偏离（平均 |delta| 0.14）。
+  - 原因：张量执行器的 expert host 对 Nemotron 的单投影 expert 应用了 route-tail skip（`TS_MOE_ROUTE_TAIL_SKIP`，排名 7），
+    每个 token 的 22 条路由中有 15 条被略去；而 GGML 不为这些 expert 保留分层，会计算全部路由。
+  - 修复：张量执行器不再对 Nemotron 的 ReLU^2 expert 应用该略过，并且只在 decode 与 verify 宽度（8 行）上应用它，与文档
+    一致。此后 `cuda` 与 CPU 一致（平均 |delta| 0.009）。
+  - `NemotronBf16ProjectionTests` 用一个合成的 top-22 模型锁定这一点。
 
 ```bash
 hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models
@@ -286,7 +307,14 @@ Dense FFN 单次 `ffn_up` matmul 后接 ReLU²（`x ← max(0, x)²`）与 `ffn_
 - encoder 之后 class token 被剥离，按 `scaleFactor` pixel-shuffle 降低空间分辨率。
 - projector（RMSNorm → Linear → ReLU² → Linear）输出 LM hidden 维度的 embedding。
 - **加载时检查。** forward 读取的每个张量都必须存在，且与 `clip.vision.*` 元数据一致。projector 的输出宽度必须等于语言模型的 hidden size（Nano Omni 的 mmproj 投影到 2688，Bolt 和 Super VL 投影到 4096）。否则加载以 `InvalidDataException` 失败，消息中给出文件名、出问题的张量和期望的布局。带 `--mmproj` 启动的服务端或 CLI 会拒绝启动（退出码 2）。增加这项检查之前，这样的文件能加载，但之后每个图像请求都会失败。
-- **不使用：** 视频塔的 `v.patch_embd.weight.1`（加载时跳过，打印一行日志），以及 Super VL 的 `v.post_ln`（llama.cpp 会在 block 之后应用它；后续工作）。因此 Super VL 的图像 embedding 与 llama.cpp 的不同。
+- **最终 LayerNorm。** Super VL 的 mmproj 以 `v.post_ln`（weight 与 bias）结束视觉塔，在所有 block 之后作用于每个 token，
+  与 llama.cpp 的 `build_vit` 相同；bias 可选。
+- **不使用：** 视频塔的 `v.patch_embd.weight.1`（加载时跳过，打印一行日志）。
+- **计算图程序。** 视觉塔与投影器在语言模型的执行器上以每个 tile 一个计算图程序运行，覆盖所有后端，包括直接 CUDA
+  （`NemotronVisionEncoder.Graph.cs`）。patch 行仍在主机上打包，缩放后的位置表按网格缓存，embedding 返回到视觉塔分配器上。
+  托管逐算子路径在加载时读取并校验一次权重，然后释放它们；没有执行器的分配器仍由它服务。`NemotronVisionEncoderTests`
+  在训练网格和缩放后的网格上，把融合、拆分（Bolt）与 Super VL 三种布局的计算图程序与托管路径对比：托管 CPU 上相对 L2
+  不超过 1e-5，直接 CUDA 上不超过 1e-3，`ggml_cpu` 与 `ggml_cuda` 上不超过 2e-3（GGML 的注意力把 K 和 V 舍入为 F16）。
 
 `NemotronImageProcessor`（镜像 `nemotronh.ImageProcessor`）：
 
@@ -326,7 +354,35 @@ Parakeet 风格 log-mel 频谱提取（镜像 ollama 的 `process_audio.go`）�
 
 加载看的是张量，而不是开关。`LoadProjectors` 把 `--mmproj` 路径交给两个塔：文件含 `v.*` 张量时才加载视觉编码器，含 `sound_projection.linear2.weight` 时才加载音频编码器（若 `TS_NEMOTRON_AUDIO_MMPROJ` 指定了文件，则改从该文件加载，这样视觉 mmproj 与音频配套文件可以同时使用）。编码器随后校验每个张量形状与 Parakeet 采样配置，投影宽度必须等于语言模型隐藏维度；残缺或不匹配的配套文件会以 `InvalidDataException` 使加载失败，而不是被继续使用。只有这之后 `IsAudioEncoderLoaded` 才会解除 §4.6 的拒绝，`ProcessNemotronHistory` 针对原始 prompt 规划每张图像和每段音频（`PlanNemotronMedia`，按模态保持附件顺序），把每个 `<so_embedding>` 展开为 `<so_start>` + N + `<so_end>`，并排队投影后的行。
 
-已确立的内容（仅 CPU；见证据 README）：Parakeet mel 前端在六段音频上与独立参考一致（`NemotronAudioInputTests`）；编码器与投影器在 8 与 128 mel 的小型 fixture 上、F32 与 BF16 计算、托管与 GGML CPU 路径下都与官方 Transformers 模块一致（`NemotronAudioEncoderTests`）；两段音频的注入与切片排队保持精确的行以及各请求独立的保留（`NemotronAudioInjectorTests`）。在官方训练好的配套权重上，显式 F32 计算配置 8,064 个输出值全部一致；原始 BF16 计算配置仍然**失败**（容差不变下 3,794/8,064，第一处差异是第 0 层的 BF16 舍入边界）。语音回答质量、GPU 执行与延迟均未经过验证。
+**两条路径，加载时选择**（`NemotronAudioEncoder.Load`）：
+- **F32 计算的配套文件**（`nemotron.audio.compute_bf16=false`，即 `prepare_f32.py` 生成的文件）。编码器在语言模型的执行器上
+  以每段音频一个计算图程序运行，覆盖所有后端，包括直接 CUDA（`NemotronAudioEncoder.Graph.cs`）。该程序就是托管路径的运算：
+  - **下采样。** `Conv2d` 与 `DepthwiseConv2d` 各级，有效帧之后的行置零，然后是逐点乘积。
+  - **相对位置注意力。** 内容分数与位置分数按头计算为乘积，相对位移是一个带步长的视图，有效帧之后的 key 被掩码。
+  - **卷积模块。** GLU，然后把 'same' 深度卷积实现为零填充窗口上的 `SsmConv`，推理用 BatchNorm 折叠为缩放与平移。
+
+  矩阵在后端有对应内核时保留 BF16 编码，向量与卷积核为 F32。embedding 返回到视觉塔分配器上（直接 CUDA 上为主机内存，与之前相同）。
+- **模拟 BF16 的配套文件**（`prepare.py` 生成的文件）。它保留托管路径，像官方 BF16 编码器那样舍入每个中间结果。
+
+已确立的内容：
+- **前端。** Parakeet mel 前端在六段音频上与独立参考一致（`NemotronAudioInputTests`）。
+- **编码器与参考对比。** 编码器与投影器在 8 与 128 mel 的小型 fixture 上与官方 Transformers 模块一致（`NemotronAudioEncoderTests`）：
+  托管路径与 GGML CPU 上的 F32 与 BF16 计算；以及计算图程序在托管 CPU、`ggml_cpu`、`ggml_cuda` 与直接 `cuda` 上的 F32 计算，
+  使用托管路径的 F32 容差。
+- **注入。** 两段音频的注入与切片排队保持精确的行以及各请求独立的保留（`NemotronAudioInjectorTests`）。
+- **训练好的配套权重。** 显式 F32 计算配置 8,064 个输出值全部一致。原始 BF16 计算配置仍然**失败**（容差不变下 3,794/8,064，
+  第一处差异是第 0 层的 BF16 舍入边界）。
+- **真实音频。** 在训练好的 F32 计算配套权重与一段 10.44 秒的 LibriSpeech 音频（131 行）上，计算图程序的编码耗时为：
+  - `ggml_cuda` 上 24.4 ms，直接 `cuda` 上 48.1 ms（A40）；
+  - `ggml_cpu` 上 481 ms；
+  - 托管路径为 1.8-1.9 秒（测试虚拟机的 CPU 配额为 7.65 个）。
+
+  各行与托管路径的相对 L2 在 1.8e-3 以内（BF16 权重的乘积会舍入其激活；`eng/validation/NemotronRuntimeAB --scenario audio`）。
+- **语音。** 让 Nano Omni（`UD-Q4_K_XL`、BF16 mmproj，并通过 `TS_NEMOTRON_AUDIO_MMPROJ` 加载此配套文件）转写这段音频，它在
+  `ggml_cuda` 和 `cuda` 上都逐字给出了参考转写："He hoped there would be stew for dinner, turnips and carrots and bruised
+  potatoes and fat mutton pieces to be ladled out in thick peppered flour-fattened sauce."
+  - 155 个 token 的提示在 `ggml_cuda` 上 prefill 耗时 245 ms，在 `cuda` 上耗时 617 ms。
+  - CLI 使用了 `--no-skills`。在默认的技能目录下，模型用一次技能工具调用回应了请求，而没有给出转写。
 
 ## 5. 参数与配置
 
@@ -587,7 +643,7 @@ NVFP4 风格 sidecar 的 latent MoE；以及逐层 expert 数与 top-k。它们�
 - **覆盖限制。** 以下没有运行：
   - `mlx`、`ggml_metal` 与 `ggml_vulkan`；
   - 多 GPU 的 `--tp` 与 `--layer-split`，只在模拟设备上覆盖；
-  - Super VL，测试机上没有；
+  - 不带 `--cpu-moe` 的 Super VL（需要 96 GB 的设备）；
   - 音频配套文件，因为没有公开的。
 - **已知代价。**
   - 直接 CUDA 的 MoE decode 步没有录制为 CUDA graph：Lightning 在 `cuda` 上 decode 为 70 tok/s，`ggml_cuda` 上为 143。
@@ -624,6 +680,5 @@ NVFP4 风格 sidecar 的 latent MoE；以及逐层 expert 数与 top-k。它们�
 - **`--tp` 配合卸载，以及张量并行 x 按层切分的混合** —— 两者都需要这个家族尚未生成的按 rank 计算图。
 - **DSpark 块的开销** —— 草稿器的 BF16 注意力权重在加载时反量化为 F32（每个块在六层上要读 565 MB）；在计算图路径上
   保持 BF16 可以减半。多个请求的 DSpark 块也可以像 DFlash 的 lane 那样共享一个程序。
-- **音频塔** —— `NemotronAudioEncoder` 以托管 CPU 路径运行在配套 GGUF 上（§4.7）；
-  公开 GGUF 仍然不带音频塔，所以除非加载了该配套文件，音频会被拒绝。待完成：训练权重上的
-  BF16 计算一致性、GPU/原生编码器计算图、语音输入验收与延迟验证。
+- **音频塔** —— F32 计算的配套文件在每个执行器上以计算图程序运行（§4.7）；公开 GGUF 仍然不带音频塔，所以除非加载了
+  该配套文件，音频会被拒绝。待完成：训练权重上的 BF16 计算一致性（模拟 BF16 的配套文件保留托管路径）。

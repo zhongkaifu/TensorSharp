@@ -2661,6 +2661,9 @@ namespace TensorSharp.Graph
         /// (the op's ip[2]; its up source names the same stack).</param>
         /// <param name="upScales">Activation 3 with the op's ip[3] set: each route's scale of its up product, applied before the
         /// square ([1, K, rows], srcs[6]; one value an expert, the NVFP4 experts' outer scale).</param>
+        /// <summary>The widest step the route-tail skip applies to: a decode step or a verify window (GGML's tiers' bound).</summary>
+        protected const int TailSkipMaxRows = 8;
+
         protected virtual Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
             int layer, RunState run, int activation = 0, bool fusedGateUp = false, Value upScales = default)
         {
@@ -2688,9 +2691,13 @@ namespace TensorSharp.Graph
                 here[i] = stream || host.IsResident(layer, ids[i]) ? (byte)1 : (byte)0;
                 anyDevice |= here[i] != 0;
             }
-            // The host's routes, less those the route-tail skip leaves out (an expert every row routes at the rank or lower).
+            // The host's routes, less those the route-tail skip leaves out (an expert every row routes at the rank or lower):
+            // decode steps and verify windows only (TailSkipMaxRows, as GGML's tiers apply it; never a prompt chunk), and
+            // not the one-projection relu(up)^2 experts (Nemotron-H's): GGML keeps no tier for them, so it computes every
+            // route, and Strata's rank 7 of 10 was measured on the gated models' top 8 to 10 (of Super VL's 22 routes a
+            // token it had left 15 out: NLL 2.210 on direct CUDA against 2.117 on ggml_cuda and 2.120 on the CPU).
             var skip = (byte[])here.Clone();
-            int tail = stream ? 0 : host.TailSkipRank(layer);
+            int tail = stream || rows > TailSkipMaxRows || activation == 3 ? 0 : host.TailSkipRank(layer);
             if (tail > 0)
                 for (int i = 0; i < routes; i++)
                 {
