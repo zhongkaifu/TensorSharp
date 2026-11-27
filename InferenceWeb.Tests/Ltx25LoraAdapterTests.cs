@@ -1,6 +1,8 @@
 using System.Text;
 using System.Text.Json;
-using TensorSharp.Models.Direct;
+using TensorSharp;
+using TensorSharp.Graph;
+using TensorSharp.Models.Graph;
 using TensorSharp.Models.Ltx25;
 using TensorSharp.Runtime;
 
@@ -8,6 +10,21 @@ namespace InferenceWeb.Tests;
 
 public sealed partial class Ltx25DenoiserTests
 {
+    /// <summary>y = original + B (A x) on <paramref name="executor"/>, the adapter's term of the denoiser's projections.</summary>
+    private static float[] WithAdapter(TensorGraphExecutor executor, (Ltx25Weight Down, Ltx25Weight Up) factors, float[] x, int rows,
+        float[] original)
+    {
+        using var e = new GraphEmitter(executor);
+        int Leaf(Ltx25Weight w) => e.HostWeight(w.Format, new[] { w.Ne0, w.Ne1 }, GraphIdentity.Of(w), w.Bytes, w);
+        int input = e.InputF32(x, factors.Down.Ne0, rows);
+        int y = e.Op(GraphOp.Add, e.InputF32(original, factors.Up.Ne1, rows),
+            e.Op(GraphOp.MulMat, Leaf(factors.Up), e.Op(GraphOp.MulMat, Leaf(factors.Down), input)));
+        int output = e.Output(y, (long)rows * factors.Up.Ne1);
+        using IGraphPlan plan = e.Compile(replayable: true);
+        Assert.True(e.Run(plan), plan.LastError);
+        return (float[])plan.Outputs[output].Clone();
+    }
+
     [IngredientsWeightsFact]
     public void ActualIngredientsRank128AttentionAndFeedForwardFactorsMatchIndependentDoubleOracle()
     {
@@ -15,8 +32,9 @@ public sealed partial class Ltx25DenoiserTests
         using var checkpoint = new GgufFile(Environment.GetEnvironmentVariable("TS_LTX25_TEST_DENOISER")!);
         string loraPath = Environment.GetEnvironmentVariable("TS_LTX25_TEST_LORA")!;
         using var factors = new SafetensorsFile(loraPath);
-        using var adapter = new Ltx25LoraAdapter(loraPath, checkpoint, Ltx25Config.FromGguf(checkpoint), backend.Allocator);
-        using var context = new DirectContext(backend.Allocator);
+        using var adapter = Ltx25LoraSet.Open(loraPath, checkpoint, Ltx25Config.FromGguf(checkpoint));
+        var executor = Ltx25Denoiser.CreateExecutor(backend.Allocator);
+        using var release = executor as IDisposable;
         Assert.Equal(480, adapter.ProjectionCount);
         foreach (string target in new[] { "transformer_blocks.0.attn1.to_q", "transformer_blocks.23.ff.net.0.proj", "transformer_blocks.47.ff.net.2" })
         {
@@ -29,10 +47,7 @@ public sealed partial class Ltx25DenoiserTests
             float[] a = factors.ReadFloat32(aName), b = factors.ReadFloat32(bName);
             float[] values = Enumerable.Range(0, inner * 3).Select(i => MathF.Sin(i * .12379f) * .25f + i % 7 * .000137f).ToArray();
             float[] original = Enumerable.Range(0, outer * 3).Select(i => (i % 17 - 8) * .001f).ToArray();
-            using var input = context.FromFloats(values, 3, inner);
-            using var output = context.FromFloats(original, 3, outer);
-            adapter.Add(target, input, output);
-            float[] actual = DirectOps.ToArray(output);
+            float[] actual = WithAdapter(executor, adapter.Factors(target)!.Value, values, 3, original);
             var lowRank = new double[rank * 3];
             for (int row = 0; row < 3; ++row)
                 for (int r = 0; r < rank; ++r)
@@ -52,7 +67,7 @@ public sealed partial class Ltx25DenoiserTests
                 $"Actual Ingredients {target}: relativeL2={relativeL2:G9}, maxError={maximumError:G9}, maxExpected={maximumExpected:G9}");
             Console.WriteLine($"[ltx25-ingredients-oracle] {target} shape={outer}x{inner} rank={rank} relativeL2={relativeL2:G9} maxError={maximumError:G9}");
         }
-        Assert.Equal(3, adapter.CachedProjectionCount);
+        Assert.Equal(3, adapter.LoadedProjectionCount);
     }
 
     [Theory]
@@ -66,13 +81,19 @@ public sealed partial class Ltx25DenoiserTests
         using var checkpoint = new GgufFile(fixture.Path);
         var config = Ltx25Config.FromGguf(checkpoint);
         using var factors = new LoraFixture(dtype);
-        using var adapter = new Ltx25LoraAdapter(factors.Path, checkpoint, config, backend.Allocator);
-        using var context = new DirectContext(backend.Allocator);
+        using var adapter = Ltx25LoraSet.Open(factors.Path, checkpoint, config);
+        var executor = Ltx25Denoiser.CreateExecutor(backend.Allocator);
+        using var release = executor as IDisposable;
+        Assert.Equal(1, adapter.ProjectionCount);
+        Assert.Equal(0, adapter.LoadedProjectionCount);
+        var pair = adapter.Factors(LoraFixture.Target)!.Value;
+        // Down = A [in 16, rank 2] and up = B [rank 2, out 16], widened exactly to F32 and taken as exact products.
+        Assert.Equal((16L, 2L, 2L, 16L), (pair.Down.Ne0, pair.Down.Ne1, pair.Up.Ne0, pair.Up.Ne1));
+        Assert.True(pair.Down.ExactProducts && pair.Up.ExactProducts);
+        Assert.Equal(1, adapter.LoadedProjectionCount);
+        Assert.Equal(pair, adapter.Factors(LoraFixture.Target)!.Value);
         float[] values = Enumerable.Range(0, 48).Select(i => (i % 9 - 4) * 1.17391f + i * .000137f).ToArray();
         float[] original = Enumerable.Range(0, 48).Select(i => i * .013f).ToArray();
-        using var input = context.FromFloats(values, 3, 16);
-        using var output = context.FromFloats(original, 3, 16);
-        adapter.Add(LoraFixture.Target, input, output);
         var expected = (float[])original.Clone();
         for (int row = 0; row < 3; ++row)
             for (int channel = 0; channel < 16; ++channel)
@@ -86,16 +107,12 @@ public sealed partial class Ltx25DenoiserTests
                 }
                 expected[row * 16 + channel] += (float)update;
             }
-        Equal(expected, DirectOps.ToArray(output), 2e-5, "Ingredients unscaled B@A");
-        Assert.Equal(1, adapter.ProjectionCount);
-        Assert.Equal(1, adapter.CachedProjectionCount);
+        Equal(expected, WithAdapter(executor, pair, values, 3, original), 2e-5, "Ingredients unscaled B@A");
         // No adapter update exists for gates or audio projections.
-        adapter.Add("transformer_blocks.0.audio_attn1.to_q", input, output);
-        Equal(expected, DirectOps.ToArray(output), 2e-5, "unmodified audio projection");
-        adapter.ReleaseDeviceResidency();
-        using var rebuilt = context.FromFloats(original, 3, 16);
-        adapter.Add(LoraFixture.Target, input, rebuilt);
-        Equal(expected, DirectOps.ToArray(rebuilt), 2e-5, "rebuilt adapter projection");
+        Assert.Null(adapter.Factors("transformer_blocks.0.audio_attn1.to_q"));
+        Assert.Null(adapter.Factors("transformer_blocks.0.attn1.to_gate_logits"));
+        Assert.Equal(1, adapter.LoadedProjectionCount);
+        Assert.Equal(2 * (16 + 16) * sizeof(float), adapter.FactorBytes);
     }
 
     [Fact]
@@ -112,13 +129,18 @@ public sealed partial class Ltx25DenoiserTests
         Assert.Equal(0, model.CachedReferenceLoraProjections);
         var adapted = model.Forward(Input(reference, useReferenceLora: true));
         Assert.Equal(1, model.CachedReferenceLoraProjections);
+        // The adapted projection is one LoraLinear region the CUDA and managed executors add in place (MLX runs its ops).
+        if (model.Executor is not TensorSharp.MLX.MlxGraphExecutor) Assert.Equal(1, model.Executor.LoraLinearsServedForTests);
         Assert.True(before.VideoVelocity.Zip(adapted.VideoVelocity).Any(pair => Math.Abs(pair.First - pair.Second) > 1e-6));
         var after = model.Forward(Input(reference));
         Assert.Equal(before.VideoVelocity, after.VideoVelocity);
         Assert.Equal(before.AudioVelocity, after.AudioVelocity);
-        model.ReleaseDeviceResidency();
+        model.ReleaseDevice();
         var rebuilt = model.Forward(Input(reference));
         Equal(before.VideoVelocity, rebuilt.VideoVelocity, 1e-6, "base after adapter eviction");
+        var readapted = model.Forward(Input(reference, useReferenceLora: true));
+        Assert.Equal(adapted.VideoVelocity, readapted.VideoVelocity);
+        Assert.Equal(adapted.AudioVelocity, readapted.AudioVelocity);
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
         Assert.Throws<OperationCanceledException>(() => model.Forward(Input(reference, true, cancellation.Token)));
@@ -154,34 +176,29 @@ public sealed partial class Ltx25DenoiserTests
     public void IngredientsRejectsIncompatibleMetadataTargetsAndFactorPairs(string corruption)
     {
         using var fixture = new Checkpoint();
-        using var backend = new Backend();
         using var checkpoint = new GgufFile(fixture.Path);
         using var factors = new LoraFixture(corruption: corruption);
-        Assert.Throws<InvalidDataException>(() => new Ltx25LoraAdapter(factors.Path, checkpoint,
-            Ltx25Config.FromGguf(checkpoint), backend.Allocator));
+        Assert.Throws<InvalidDataException>(() => Ltx25LoraSet.Open(factors.Path, checkpoint, Ltx25Config.FromGguf(checkpoint)));
     }
 
     [Fact]
-    public void IngredientsCancellationNonfiniteFactorsAndDisposalLeaveNoCachedProjection()
+    public void IngredientsNonfiniteFactorsAndDisposalLeaveNoLoadedProjection()
     {
         using var fixture = new Checkpoint();
         using var backend = new Backend();
         using var checkpoint = new GgufFile(fixture.Path);
         using var factors = new LoraFixture(corruption: "nonfinite");
-        using var adapter = new Ltx25LoraAdapter(factors.Path, checkpoint, Ltx25Config.FromGguf(checkpoint), backend.Allocator);
-        using var context = new DirectContext(backend.Allocator);
-        using var input = context.FromFloats(new float[16], 1, 16);
-        using var output = context.FromFloats(new float[16], 1, 16);
-        using var cancellation = new CancellationTokenSource();
-        cancellation.Cancel();
-        Assert.Throws<OperationCanceledException>(() => adapter.Add(LoraFixture.Target, input, output, cancellation.Token));
-        Assert.Equal(0, adapter.CachedProjectionCount);
-        Assert.Throws<InvalidDataException>(() => adapter.Add(LoraFixture.Target, input, output));
-        Assert.Equal(0, adapter.CachedProjectionCount);
-        Assert.Equal(new float[16], DirectOps.ToArray(output));
+        var adapter = Ltx25LoraSet.Open(factors.Path, checkpoint, Ltx25Config.FromGguf(checkpoint));
+        Assert.Throws<InvalidDataException>(() => adapter.Factors(LoraFixture.Target));
+        Assert.Equal(0, adapter.LoadedProjectionCount);
         adapter.Dispose(); adapter.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => adapter.Add(LoraFixture.Target, input, output));
-        Assert.Throws<ObjectDisposedException>(() => adapter.ReleaseDeviceResidency());
+        Assert.Throws<ObjectDisposedException>(() => adapter.Factors(LoraFixture.Target));
+        // A denoiser whose adapter cannot be read fails the adapted step and still runs the base model.
+        using var model = new Ltx25Denoiser(fixture.Path, backend.Allocator, factors.Path);
+        var reference = Oracle.GetProperty("cases")[0];
+        Assert.Throws<InvalidDataException>(() => model.Forward(Input(reference, true)));
+        Assert.Equal(0, model.CachedReferenceLoraProjections);
+        Equal(Floats(reference, "videoVelocity"), model.Forward(Input(reference)).VideoVelocity, 2e-5, "base after unreadable adapter");
     }
 
     private sealed class LoraFixture : IDisposable
@@ -212,7 +229,7 @@ public sealed partial class Ltx25DenoiserTests
                 foreach (float value in values)
                     if (dtype == "F32") writer.Write(value);
                     else if (dtype == "BF16") writer.Write((ushort)(BitConverter.SingleToUInt32Bits(value) >> 16));
-                    else writer.Write(BitConverter.HalfToUInt16Bits((Half)value));
+                    else writer.Write(BitConverter.HalfToUInt16Bits((System.Half)value));
                 header.Add(name, new { dtype = corruption == "dtype" ? "I32" : dtype, shape, data_offsets = new[] { begin, data.Position } });
             }
             if (corruption != "missing_a") Add("diffusion_model." + target + ".lora_A.weight", A,

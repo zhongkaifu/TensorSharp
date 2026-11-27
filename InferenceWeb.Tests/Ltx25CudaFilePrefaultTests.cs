@@ -1,65 +1,10 @@
 using System.IO.MemoryMappedFiles;
-using System.Runtime.InteropServices;
-using TensorSharp.Cuda;
 using TensorSharp.Models.Ltx25;
 
 namespace InferenceWeb.Tests;
 
 public sealed class Ltx25CudaFilePrefaultTests
 {
-    [Theory]
-    [InlineData(1)] [InlineData(8)]
-    public void DirectSourceReadsDisjointPinnedSlicesAndRaggedTailExactly(int workers)
-    {
-        string path = Path.GetTempFileName();
-        const int offset = 31, length = (8 << 20) + 123;
-        byte[] expected = new byte[offset + length + 17];
-        for (int i = 0; i < expected.Length; ++i) expected[i] = (byte)(i * 43 + i / 127);
-        IntPtr destination = Marshal.AllocHGlobal(length);
-        try
-        {
-            File.WriteAllBytes(path, expected);
-            using var source = new Ltx25CudaFilePrefault(path, checkResident: false, workers: workers);
-            ((ICudaWeightSource)source).Read(offset, destination, length);
-            byte[] actual = new byte[length]; Marshal.Copy(destination, actual, 0, length);
-            Assert.Equal(expected.AsSpan(offset, length).ToArray(), actual);
-            Assert.Equal(length, source.ReadBytes);
-            Assert.Null(source.Failure);
-        }
-        finally { Marshal.FreeHGlobal(destination); File.Delete(path); }
-    }
-
-    [Theory]
-    [InlineData(1)] [InlineData(8)]
-    public void DirectSourceEofJoinsAllReadersAndPreservesSuccessfulPartialCounts(int workers)
-    {
-        string path = Path.GetTempFileName();
-        const int available = (8 << 20) + 4, requested = (9 << 20) + 16;
-        IntPtr destination = Marshal.AllocHGlobal(requested);
-        try
-        {
-            using (var file = File.OpenWrite(path)) file.SetLength(available);
-            using var source = new Ltx25CudaFilePrefault(path, checkResident: false, workers: workers);
-            if (workers == 1)
-                Assert.Throws<EndOfStreamException>(() => ((ICudaWeightSource)source).Read(0, destination, requested));
-            else
-            {
-                var error = Assert.Throws<AggregateException>(() => ((ICudaWeightSource)source).Read(0, destination, requested));
-                Assert.All(error.Flatten().InnerExceptions, inner => Assert.IsType<EndOfStreamException>(inner));
-            }
-            // Parallel.For may stop scheduling the final partial slice after a
-            // sibling reaches EOF. Completed reads must still be counted, and
-            // every started worker must have joined before Read returns.
-            if (workers == 1) Assert.Equal(available, source.ReadBytes);
-            else Assert.InRange(source.ReadBytes, 8 << 20, available);
-            long joinedCount = source.ReadBytes;
-            source.Dispose();
-            Assert.Equal(joinedCount, source.ReadBytes);
-            Assert.Throws<ObjectDisposedException>(() => ((ICudaWeightSource)source).Read(0, destination, 16));
-        }
-        finally { Marshal.FreeHGlobal(destination); File.Delete(path); }
-    }
-
     [Theory]
     [InlineData(1)] [InlineData(8)]
     public unsafe void SelectedUnalignedRangeCrossesBufferBoundaryWithoutReadingTheWholeFile(int workers)

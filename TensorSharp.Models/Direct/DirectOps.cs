@@ -129,7 +129,6 @@ namespace TensorSharp.Models.Direct
         private readonly bool _h3MappedDense; // H3 keeps dense mapped weights and F32 activations
         private readonly bool _h3PreserveFloat32; // H3 quantized projections avoid q8_1/Half activation narrowing
         private readonly CudaLtx25ProjectionSession _ltxProjection;
-        private readonly bool _exactFloat32;
         private ResidentWeightLease _residentWeight;
         private bool _disposed;
 
@@ -211,15 +210,13 @@ namespace TensorSharp.Models.Direct
 
         private DirectLinear(DirectContext ctx, IntPtr host, IntPtr ownedHost, int type,
                                 long ne0, long ne1, long bytes, Tensor bias, bool prescale, bool h3MappedDense = false,
-                                bool h3PreserveFloat32 = false, CudaLtx25ProjectionSession ltxProjection = null,
-                                bool exactFloat32 = false)
+                                bool h3PreserveFloat32 = false, CudaLtx25ProjectionSession ltxProjection = null)
         {
             _ctx = ctx; _host = host; _ownedHost = ownedHost; _type = type;
             InDim = ne0; OutDim = ne1; _bytes = bytes; _bias = bias; _prescale = prescale;
             _h3MappedDense = h3MappedDense;
             _h3PreserveFloat32 = h3PreserveFloat32;
             _ltxProjection = ltxProjection;
-            _exactFloat32 = exactFloat32;
         }
 
         /// <summary>Load from a GGUF tensor (weights [ne1, ne0] in GGUF row-major).</summary>
@@ -307,7 +304,7 @@ namespace TensorSharp.Models.Direct
 
         /// <summary>Load from a managed F32 array (weight [ne1, ne0] row-major, e.g. VAE safetensors).</summary>
         public static DirectLinear FromFloats(DirectContext ctx, float[] weight, long ne0, long ne1, float[] bias,
-            bool exactFloat32 = false, bool mlxDeviceOnly = false)
+            bool mlxDeviceOnly = false)
         {
             Tensor biasT = bias != null ? ctx.Own(ctx.FromFloats(bias, bias.LongLength)) : null;
             if (ctx.IsCuda)
@@ -316,7 +313,7 @@ namespace TensorSharp.Models.Direct
                 long bytes = weight.LongLength * sizeof(float);
                 IntPtr host = Marshal.AllocHGlobal((IntPtr)bytes);
                 Marshal.Copy(weight, 0, host, weight.Length);
-                return ctx.Track(new DirectLinear(ctx, host, host, 0 /*F32*/, ne0, ne1, bytes, biasT, false, exactFloat32: exactFloat32));
+                return ctx.Track(new DirectLinear(ctx, host, host, 0 /*F32*/, ne0, ne1, bytes, biasT, false));
             }
             var lin = new DirectLinear(ctx, IntPtr.Zero, IntPtr.Zero, 0, ne0, ne1, 0, biasT, false);
             // H3's dense video decoder otherwise retains ~9.7 GB of duplicate
@@ -365,8 +362,7 @@ namespace TensorSharp.Models.Direct
                         Ops.Mul(scaled, x, 1.0f / MmScale);
                         xin = scaled;
                     }
-                    bool completed = _exactFloat32 ? CudaLtx25LoraOps.TryLinear(r, xin, _host, InDim, OutDim, _bytes) :
-                        _ltxProjection?.TryPrefillLinear(r, xin, _host, _type, InDim, OutDim, _bytes) == true ||
+                    bool completed = _ltxProjection?.TryPrefillLinear(r, xin, _host, _type, InDim, OutDim, _bytes) == true ||
                         _ltxProjection?.TryLinear(r, xin, _host, _type, InDim, OutDim, _bytes) == true || (_h3PreserveFloat32
                         ? CudaMiniMaxH3Ops.TryLinear(r, xin, _host, _type, InDim, OutDim, _bytes)
                         : _h3MappedDense

@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Text.Json;
 using TensorSharp.Chat.Studio;
 using TensorSharp.Models.Ltx25;
@@ -12,15 +11,9 @@ namespace InferenceWeb.Tests;
 
 public sealed class Ltx25ImageStrengthPolicyTests
 {
-    static readonly Type Pipeline = typeof(Ltx25Model).Assembly.GetType("TensorSharp.Models.Ltx25.Ltx25Pipeline", throwOnError: true)!;
-
     static float? FirstStageStrength(VideoGenerationParams request, bool twoStage = true,
-        float? diagnosticOverride = null, IReadOnlyList<VideoImageCondition>? resolved = null)
-    {
-        var images = resolved ?? Ltx25ImageConditioning.Resolve(request, 17);
-        var method = Pipeline.GetMethod("ResolveFirstStageImageStrength", BindingFlags.Static | BindingFlags.NonPublic)!;
-        return (float?)method.Invoke(null, [request, twoStage, images, diagnosticOverride]);
-    }
+        IReadOnlyList<VideoImageCondition>? resolved = null)
+        => Ltx25Family.ResolveFirstStageImageStrength(request, twoStage, resolved ?? Ltx25ImageConditioning.Resolve(request, 17));
 
     static VideoGenerationParams Shorthand(string source, string? mode = null) => new()
     {
@@ -50,8 +43,7 @@ public sealed class Ltx25ImageStrengthPolicyTests
         // Verify that the policy changes the actual first-frame denoising mask
         // and blend, while the independent refinement encoding stays fully pinned.
         var refinementImages = new List<Ltx25EncodedImage> { new(Enumerable.Repeat(.25f, 128).ToArray(), 0, guides[0].Strength) };
-        var firstImages = (List<Ltx25EncodedImage>)Pipeline.GetMethod("WithFirstStageImageStrength", BindingFlags.Static | BindingFlags.NonPublic)!
-            .Invoke(null, [refinementImages, strength])!;
+        var firstImages = Ltx25Family.WithFirstStageImageStrength(refinementImages, strength);
         var settings = new Ltx25GenerationSettings(32, 32, 17, 24, 1, 1, 3, 18, 42);
         Ltx25DenoiserInput Input(float value) => new()
         {
@@ -115,40 +107,6 @@ public sealed class Ltx25ImageStrengthPolicyTests
         Assert.Null(FirstStageStrength(Shorthand("path"), twoStage: false));
         Assert.Null(FirstStageStrength(Shorthand("path", "ref"), twoStage: false, resolved: []));
         Assert.Null(FirstStageStrength(Shorthand("path", "ref"), resolved: []));
-    }
-
-    [Theory]
-    [InlineData(false, 1f)]
-    [InlineData(false, .85f)]
-    [InlineData(true, 1f)]
-    [InlineData(true, .85f)]
-    public void DiagnosticOverrideWinsWithoutChangingRequestedRefinement(bool explicitGuide, float diagnosticStrength)
-    {
-        var request = explicitGuide
-            ? new VideoGenerationParams { ImageConditions = [new() { ImagePath = "first.png", Strength = .6f }] }
-            : Shorthand("path");
-        Assert.Equal(diagnosticStrength, FirstStageStrength(request, diagnosticOverride: diagnosticStrength));
-        Assert.Equal(explicitGuide ? .6f : 1f, Assert.Single(Ltx25ImageConditioning.Resolve(request, 17)).Strength);
-    }
-
-    [Theory]
-    [InlineData(-.1f)]
-    [InlineData(1.1f)]
-    [InlineData(float.NaN)]
-    [InlineData(float.PositiveInfinity)]
-    public void InvalidDiagnosticOverrideIsRejected(float strength)
-    {
-        var error = Assert.Throws<TargetInvocationException>(() => FirstStageStrength(Shorthand("path"), diagnosticOverride: strength));
-        Assert.IsType<ArgumentOutOfRangeException>(error.InnerException);
-    }
-
-    [Fact]
-    public void DiagnosticOverrideStillRequiresTwoStagesAndAFrameZeroGuide()
-    {
-        Assert.IsType<ArgumentException>(Assert.Throws<TargetInvocationException>(() =>
-            FirstStageStrength(Shorthand("path"), twoStage: false, diagnosticOverride: .7f)).InnerException);
-        Assert.IsType<ArgumentException>(Assert.Throws<TargetInvocationException>(() =>
-            FirstStageStrength(new() { EndImagePath = "end.png" }, diagnosticOverride: .7f)).InnerException);
     }
 
     [Fact]

@@ -52,9 +52,10 @@ dotnet run --project TensorSharp.Cli -- \
   --diffusion-seed 42 --output ltx25.mp4
 ```
 
-Use `--backend cuda` or `ggml_cuda` on NVIDIA GPUs. `mlx` and `ggml_metal` select
-the owned MLX executor on Apple Silicon. `cpu` and `ggml_cpu` select the direct
-CPU implementation; GPU generation measurements do not establish CPU throughput.
+Use `--backend cuda` or `ggml_cuda` on NVIDIA GPUs (the CUDA tensor executor).
+`mlx` and `ggml_metal` select the MLX tensor executor on Apple Silicon. `cpu` and
+`ggml_cpu` select the managed CPU tensor executor; GPU generation measurements do
+not establish CPU throughput.
 Vulkan and multi-GPU execution are unsupported. Desktop MP4 audio requires
 FFmpeg on `PATH` or `TS_FFMPEG`; the CLI also writes the original PCM as a WAV.
 The Mac app encodes audio/video through AVFoundation.
@@ -127,13 +128,11 @@ Explicit user overrides are respected.
 
 CUDA prompt projections use BF16 Tensor Core GEMM on compute capability 8.0 or
 newer, with Float32 accumulation and the original BF16 activation boundaries.
-Set `TS_LTX25_CUDA_BF16_GEMM=0` to select the Float32 projection path. Older GPUs
-use Float32 automatically. CUDA also reads each mapped projection range through
+Older GPUs use Float32. CUDA also reads each mapped projection range through
 one bounded 8 MiB buffer per reader before upload; Linux skips resident ranges
 and uses up to eight concurrent 1 MiB reads. This reduces
 small page faults on network-backed model storage without loading the complete
-checkpoint into host memory. `TS_LTX25_CUDA_PREFAULT=0` disables these reads.
-`TS_LTX25_CUDA_PREFAULT_WORKERS=1` selects sequential reads.
+checkpoint into host memory.
 
 Every backend also reads weights ahead of their use, in the order the layers run,
 within a 4 GiB window: the Gemma encoder, the prompt connectors and the first
@@ -506,10 +505,13 @@ positions. V2 feature normalization and learned aggregate projections feed eight
 video and eight audio connector blocks. Learned registers make the complete
 1024-token contexts valid; removing padding positions would change conditioning.
 
-[`Ltx25Pipeline`](../../TensorSharp.Models/Models/Ltx25/Ltx25Pipeline.cs) samples
-all 48 AV transformer blocks at every sigma of both passes, then runs the
-convolutional video decoder and the audio VAE, BigVGAN vocoder and learned
-bandwidth extension. [`Ltx25LatentUpsampler`](../../TensorSharp.Models/Models/Ltx25/Ltx25LatentUpsampler.cs)
+LTX 2.5 runs on the shared [diffusion runtime](../design/diffusion-runtime.md#312-ltx-25-on-the-runtime-as-built):
+[`Ltx25Family`](../../TensorSharp.Models/Models/Ltx25/Ltx25Family.cs) drives
+`DiffusionVideoPipeline` through both passes, and
+[`Ltx25Denoiser`](../../TensorSharp.Models/Models/Ltx25/Ltx25Denoiser.cs) runs
+all 48 AV transformer blocks at every sigma as one graph program a step on the
+backend's tensor executor. The pipeline then runs the convolutional video
+decoder and the audio VAE, BigVGAN vocoder and learned bandwidth extension. [`Ltx25LatentUpsampler`](../../TensorSharp.Models/Models/Ltx25/Ltx25LatentUpsampler.cs)
 is the publisher's `LatentUpsampler` (1024 mid channels, four ResBlocks before and
 after a Conv2d + PixelShuffle(2)): Conv3d layers zero-pad every axis, GroupNorm(32)
 statistics span the whole clip and accumulate in Float64, and BF16 weights widen
@@ -527,6 +529,88 @@ device allocations. This avoids repeated checkpoint opens and weight conversion
 while keeping subsequent uncached prompts bounded.
 
 ## Validation
+
+### Diffusion runtime migration (2026-11-27)
+
+LTX 2.5 and its Ingredients IC-LoRA run only on the shared diffusion runtime
+([design](../design/diffusion-runtime.md#312-ltx-25-on-the-runtime-as-built)):
+`Ltx25Family` drives the video pipeline's two passes (or the single Ingredients
+pass), `Ltx25Denoiser` runs each step as one graph program on the backend's
+tensor executor, and `Ltx25LoraSet` is the Ingredients adapter as the runtime's
+adapter set, applied unmerged in exact F32. The retired `Ltx25Pipeline`,
+`Ltx25Sampling`, the direct denoiser and `Ltx25LoraAdapter` were deleted after
+their outputs were frozen.
+
+Evidence, on an NVIDIA A40 (48 GB, driver 595.112, CUDA 13.2, .NET 10.0.404) and an Intel Xeon
+Gold 6342 in a 50 GB container, ggml `bb877c0c` unchanged, the retired path built
+from `c178bfc` with the same ggml and checkpoint (Unsloth UD-Q4_K_XL):
+
+- **Denoiser steps, frozen.** The retired denoiser's outputs on the synthetic
+  checkpoint (the official oracle's four cases, each also with a synthetic
+  rank-2 Ingredients adapter over every adapted projection) are frozen per lane
+  in `InferenceWeb.Tests/Fixtures/Ltx25/LegacyGoldens/`. The runtime gives their
+  bits on both lanes (CPU and CUDA, 16 outputs each), and
+  `Ltx25DenoiserTests.StepsGiveTheRetiredDirectDenoisersBitsOnItsLane` holds it
+  there.
+- **Real-checkpoint steps** (synthetic latents and contexts at generation
+  geometries; a synthetic rank-128 BF16 adapter with the Ingredients layout over
+  all 480 projections, because the gated adapter was not available): bit-identical
+  on CUDA for a 512×512×17 first pass, an image guide's per-token timesteps, a
+  1024×1024×17 refinement, 384×256×49 with appended keyframe guides and a
+  768×448×121 Ingredients pass. Steady-state steps: 820/825, 897/893,
+  2954/2954, 919/931 and 21838/21919 ms (retired/runtime). A clip's first step
+  after the device copies were released: 2.45–2.63 s retired, 2.37–2.49 s runtime
+  (first pass); 4.65–4.89 s and 4.51–4.72 s (refinement). On the CPU (two
+  blocks) both cases were bit-identical, at 2829/2548 and 3478/3154 ms.
+- **Whole clips** through the public model API (`Ltx25AbProbe`), raw RGB and both
+  PCM channels compared: bit-identical in every round of every case. Wall times in
+  alternating rounds with prebuilt binaries (the final code, two rounds each):
+
+  | Clip (A40, `cuda`) | Retired | Runtime | Runtime / retired |
+  |---|---:|---:|---:|
+  | t2v 1024×1024×17 | 33.86, 32.43 s | 32.39, 32.08 s | 0.973 |
+  | i2v 1024×1024×17 | 32.26, 31.87 s | 32.03, 31.96 s | 0.998 |
+  | keyframes 768×512×49 (three guides) | 34.89, 34.68 s | 34.68, 34.61 s | 0.996 |
+  | t2v 1024×576×121 | 91.32, 89.98 s | 90.39, 90.13 s | 0.996 |
+  | Ingredients 768×448×121 (two references) | 203.49 s | 204.03 s | 1.003 |
+
+  Every phase matches or is faster (text and image encodes, both passes, the
+  upsampler and the decodes). Three changes made that so: projections upload at
+  their first product, overlapping the device work queued before them, as the
+  retired denoiser did; Philox noise and the rotary tables are drawn on several
+  cores (same bits); and the Ingredients update is added into each projection in
+  place. Earlier rounds, before those changes, ran up to 1.8% slower.
+- **Memory.** Peak live device memory of a step is lower: 2,063 vs 2,345 MiB
+  (refinement), 6,192 vs 6,684 MiB (Ingredients), weights aside. The CUDA pool
+  keeps 0.3–0.4 GB more freed blocks cached at that peak, which it returns when an
+  allocation would otherwise fail. So nvidia-smi read 23.9 vs 23.4 GB during an
+  Ingredients pass, while both trees peaked at 18.2–22.9 GB elsewhere, the 121-frame
+  decode's transient. Host memory of a two-clip process: anonymous 3.56 vs 3.61 GiB,
+  file-backed 38.31 GiB both.
+- **CPU.** A 256×256×9 clip on the Xeon (7.65-core quota) was bit-identical in
+  two pairs run in opposite orders: 411.7/405.3 s retired, 415.5/403.9 s runtime
+  (1.003× over both).
+- **Tests.** The LTX, diffusion-runtime, graph and LoRA filters passed: 1,637 on
+  the CPU (34 skipped) and 1,628 on CUDA (34 skipped). The skips are MLX- and
+  Metal-only tests, GGML-backend region tests, and the oracles that need the
+  gated adapter, the tokenizer reference or the PyAV image reference.
+
+Not validated: MLX and Metal hardware (no Apple device was available; the MLX
+executor's regions run their reference ops where it has no kernel); the real
+gated Ingredients adapter (the synthetic adapter has its layout, shapes and
+dtype); other GPUs and operating systems; perceptual quality beyond bit
+identity, which makes the outputs the same clips.
+
+Removed with the direct denoiser (the server and CLI refuse each at startup,
+naming what replaced it): `TS_LTX25_CUDA_ATTN`, `TS_LTX25_CUDA_FUSED_HEAD_GATE`,
+`TS_LTX25_FUSED_ROPE`, `TS_LTX25_CUDA_TILE`, `TS_LTX25_CUDA_REQUIRE_TILE`,
+`TS_LTX25_CUDA_F16_DEQUANT`, `TS_LTX25_STAGE_TIMING`, `TS_LTX25_CUDA_SOURCE_UPLOAD`,
+and the prompt encoder's `TS_LTX25_CUDA_PREFAULT`, `TS_LTX25_CUDA_PREFAULT_WORKERS`,
+`TS_LTX25_DEVICE_PROMPT_MATH`, `TS_LTX25_CUDA_BF16_GEMM` and
+`TS_LTX25_MLX_BF16_GEMM`. Each kept the default it had, so outputs are
+unchanged. `TS_LTX25_INGREDIENTS_LORA` stays. The latent probe's
+`--first-stage-image-strength` and the prompt probe's switch-alternating round
+modes were removed with them (`Ltx25PromptProbe --rounds N` repeats an encode).
 
 ### Latest exact performance work
 
@@ -569,11 +653,12 @@ The changes:
 
 The previous exact performance work: current source runs Gemma prompt BF16 rounding and split-half RoPE on CUDA/MLX
 devices while retaining the original host-computed trigonometric values and
-arithmetic order. `TS_LTX25_DEVICE_PROMPT_MATH=0` selects the host control.
-CUDA also fuses the existing per-head `2 * sigmoid(logit)` gating without
-changing Float32 rounding boundaries (`TS_LTX25_CUDA_FUSED_HEAD_GATE=0` selects
-the separate operations). Lossless MLX Q5_K loading packs rows directly with
-bounded CPU parallelism; `TS_MLX_Q5K_REPACK=0` retains the scalar control.
+arithmetic order. CUDA also fuses the existing per-head `2 * sigmoid(logit)`
+gating without changing Float32 rounding boundaries. Lossless MLX Q5_K loading
+packs rows directly with bounded CPU parallelism; `TS_MLX_Q5K_REPACK=0` retains
+the scalar control. The switches that selected the previous kernels were
+removed with the direct denoiser (see
+[Diffusion runtime migration](#diffusion-runtime-migration-2026-11-27)).
 These changes preserve quantized weights, BF16 activation boundaries and the
 complete generation recipe. Component tests require native dispatch and exact
 outputs; older optional PTX can fall back to the host path, so generation alone
@@ -630,15 +715,10 @@ were 90.47/12.22 seconds versus SD.cpp's 56.67/43.43 seconds. These are measured
 model-generation times for one image, prompt, seed and geometry; file residency,
 media encoding and longer clips have separate costs.
 
-Linux CUDA has an explicit optional source-upload path:
-`TS_LTX25_CUDA_SOURCE_UPLOAD=1`. The default remains unchanged. It reads cold
-mapped weight ranges into two 8 MiB pinned buffers per component, retains the
-existing device cache, and preserves exact weight bytes. A reversed-order A40
-first-generation pair improved from 77.015 to 70.507 seconds (8.45%); RGB and
-both PCM channels were bitwise equal and complete H.264/AAC decoding passed.
-The earlier sequential-read candidate regressed and was rejected. This option
-still trails the measured SD.cpp fresh time, and the single-pair gain depends on
-storage and mixed page residency; it is not a universal speedup.
+An opt-in Linux CUDA source-upload path (cold mapped ranges through pinned
+buffers) improved one reversed-order A40 first-generation pair by 8.45% but was
+never made the default; it was removed with the direct denoiser. Weights are
+uploaded from the mapped checkpoint after the file-cache read-ahead.
 
 Matched 97-frame clips with an explicit English blowing-kiss prompt visibly
 perform the hand-to-mouth and outward gesture in both engines; the short Chinese

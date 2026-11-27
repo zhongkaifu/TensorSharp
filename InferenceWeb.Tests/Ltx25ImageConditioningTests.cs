@@ -42,7 +42,7 @@ public sealed class Ltx25ImageConditioningTests
         Close(Values(fixture.GetProperty("positions")), state.VideoPositions.Boundaries);
         var steps = fixture.GetProperty("steps").EnumerateArray().ToArray();
         int step = 0;
-        var result = Ltx25Sampling.RunEuler(current =>
+        var result = Ltx25SamplerLoop.Run(current =>
         {
             Close(step == 0 ? Values(fixture.GetProperty("initial")) : Values(steps[step - 1].GetProperty("output")), current.Video);
             Close(Values(steps[step].GetProperty("timesteps")), current.VideoTimesteps);
@@ -215,7 +215,7 @@ public sealed class Ltx25ImageConditioningTests
         var initial = Ltx25ImageConditioning.Apply(Input(settings), settings,
             [new(Enumerable.Repeat(2f, 128).ToArray(), 0, .5f)]);
         var before = (float[])initial.Video.Clone();
-        var result = Ltx25Sampling.RunEuler(input =>
+        var result = Ltx25SamplerLoop.Run(input =>
         {
             Assert.Equal(new[] { .5f, 1f, 1f }, input.VideoTimesteps);
             Assert.Equal(1, input.VideoSigma);
@@ -236,7 +236,7 @@ public sealed class Ltx25ImageConditioningTests
         var settings = Settings();
         float[] clean = Enumerable.Range(0, 128).Select(i => i / 128f).ToArray();
         var initial = Ltx25ImageConditioning.Apply(Input(settings), settings, [new(clean, 0)]);
-        var result = Ltx25Sampling.RunEuler(input =>
+        var result = Ltx25SamplerLoop.Run(input =>
         {
             Assert.Equal(clean, input.Video.Take(128));
             Assert.Equal(0, input.VideoTimesteps![0]);

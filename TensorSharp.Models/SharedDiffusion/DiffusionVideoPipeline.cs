@@ -69,8 +69,17 @@ namespace TensorSharp.Models.SharedDiffusion
         public required int Steps { get; init; }
 
         /// <summary>The primary stream's sigmas, <see cref="Steps"/> + 1 ending in 0; every stream is stepped on them (a family
-        /// whose further streams follow their own schedule converts them for the sampler: <see cref="IVideoDiffusionFamily.SamplerVelocities"/>).</summary>
+        /// whose further streams follow their own schedule converts them for the sampler: <see cref="IVideoDiffusionFamily.SamplerVelocities"/>).
+        /// A clip sampled in passes (<see cref="Stages"/>) gives its first pass's here.</summary>
         public required float[] Sigmas { get; init; }
+
+        /// <summary>The clip's sampling passes in order (LTX 2.5's half-size first pass, then its refinement), or null for one
+        /// pass over <see cref="Sigmas"/>. <see cref="Steps"/> is their total; between two passes the family makes the next
+        /// pass's state (<see cref="IVideoDiffusionFamily.NextStage"/>) while the denoiser stays resident.</summary>
+        public IReadOnlyList<DiffusionVideoStage> Stages { get; init; }
+
+        /// <summary>The passes the pipeline runs: <see cref="Stages"/>, or one over <see cref="Sigmas"/>.</summary>
+        public IReadOnlyList<DiffusionVideoStage> Passes => Stages ?? new[] { new DiffusionVideoStage(null, Sigmas) };
 
         /// <summary>The denoiser checkpoint the clip runs on (one of the family's files); another than the loaded one's
         /// replaces the loaded denoiser.</summary>
@@ -198,6 +207,19 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <summary>The clip's audio (channel planes and their rate) from the sampler's final state.</summary>
         (float[][] Channels, int SampleRate) DecodeAudio(DiffusionVideoJob job, DiffusionStreams state, IResidentComponent audioCodec,
             CancellationToken cancellationToken);
+
+        /// <summary>The state pass <paramref name="stage"/> (1 or later of <see cref="DiffusionVideoJob.Stages"/>) starts from, made
+        /// from the previous pass's final state <paramref name="previous"/> (LTX 2.5: the latent upscaled and mixed with fresh
+        /// noise, its guides encoded again at the pass's size). It runs inside the denoise phase, the denoiser resident; the
+        /// video codec may run (the pipeline then counts it resident). A one-pass family never sees it.</summary>
+        DiffusionStreams NextStage(DiffusionVideoJob job, int stage, DiffusionStreams previous, DiffusionVideoComponents components,
+            Action<DiffusionVideoProgress> report, CancellationToken cancellationToken) =>
+            throw new NotSupportedException($"{DisplayName} samples in one pass.");
+
+        /// <summary>What a conditioned sampler (<see cref="IConditionedSampler"/>: ancestral Euler, a guide's denoise mask) reads at
+        /// <paramref name="step"/> beside each stream's state and velocity, or null for nothing. Called once a step, after the
+        /// denoiser's prediction and before any stream is stepped.</summary>
+        DiffusionSamplerInputs SamplerInputs(DiffusionVideoJob job, DiffusionStreams state, StepState step) => null;
     }
 
     /// <summary>
@@ -335,33 +357,61 @@ namespace TensorSharp.Models.SharedDiffusion
             }
             double encodeSeconds = clock.Elapsed.TotalSeconds;
 
-            // ---- Denoise
+            // ---- Denoise (each pass in turn; between two, the family makes the next pass's state)
             clock.Restart();
+            IReadOnlyList<DiffusionVideoStage> passes = job.Passes;
+            int passSteps = 0;
+            foreach (DiffusionVideoStage pass in passes)
+            {
+                if (pass.Sigmas is not { Length: >= 2 } || pass.Sigmas[^1] != 0f)
+                    throw new InvalidOperationException($"{_family.DisplayName}'s sampling pass '{pass.Name}' needs sigmas ending in 0.");
+                passSteps += pass.Steps;
+            }
+            if (passSteps != job.Steps)
+                throw new InvalidOperationException($"{_family.DisplayName}'s sampling passes take {passSteps} steps, not the clip's {job.Steps}.");
             DiffusionStreams state = _family.InitialStreams(job);
             EnterPhase(request, DiffusionPhase.Denoise, DiffusionComponent.Denoiser, plan);
             IDiffusionSampler sampler = job.Recipe.CreateSampler();
-            sampler.Reset();
+            var conditioned = sampler as IConditionedSampler;
             var stepSeconds = new double[job.Steps];
+            int done = 0;
             try
             {
-                for (int i = 0; i < job.Steps; i++)
+                for (int s = 0; s < passes.Count; s++)
                 {
-                    ct.ThrowIfCancellationRequested();
-                    var stepClock = Stopwatch.StartNew();
-                    float sigma = job.Sigmas[i], next = job.Sigmas[i + 1];
-                    var step = new StepState(i, job.Steps, sigma, next, 0, 0);
-                    DenoiseStepInputs inputs = _family.StepInputs(job, conditioning, state, step);
-                    StepOutput output = denoiser.Step(inputs, request.Adapters, ct);
-                    DiffusionStreams velocities = _family.SamplerVelocities(job, state, inputs, output, step);
-                    foreach (var (name, x) in state.Values)
+                    DiffusionVideoStage pass = passes[s];
+                    if (s > 0)
                     {
-                        float[] v = velocities.Values.TryGetValue(name, out float[] found) ? found
-                            : throw new InvalidOperationException($"{_family.DisplayName} gave no velocity for its '{name}' stream.");
-                        sampler.Step(x, v, sigma, next);
+                        ct.ThrowIfCancellationRequested();
+                        _running = DiffusionComponent.Vae;
+                        state = _family.NextStage(job, s, state, new DiffusionVideoComponents(this), report, ct)
+                            ?? throw new InvalidOperationException($"{_family.DisplayName} made no state for its pass '{pass.Name}'.");
+                        if (_videoCodec != null) _resident.Add(DiffusionComponent.Vae);
+                        _running = DiffusionComponent.Denoiser;
                     }
-                    stepSeconds[i] = stepClock.Elapsed.TotalSeconds;
-                    _log($"  [diffusion] {_family.Id} step {i + 1}/{job.Steps} sigma {sigma:0.#####} -> {next:0.#####} {stepSeconds[i]:F2}s");
-                    Report(request, new DiffusionVideoProgress(DiffusionPhase.Denoise, i + 1, job.Steps));
+                    sampler.Reset();
+                    for (int i = 0; i < pass.Steps; i++)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var stepClock = Stopwatch.StartNew();
+                        float sigma = pass.Sigmas[i], next = pass.Sigmas[i + 1];
+                        var step = new StepState(i, pass.Steps, sigma, next, 0, 0) { Stage = s };
+                        DenoiseStepInputs inputs = _family.StepInputs(job, conditioning, state, step);
+                        StepOutput output = denoiser.Step(inputs, request.Adapters, ct);
+                        DiffusionStreams velocities = _family.SamplerVelocities(job, state, inputs, output, step);
+                        DiffusionSamplerInputs extra = conditioned != null ? _family.SamplerInputs(job, state, step) : null;
+                        foreach (var (name, x) in state.Values)
+                        {
+                            float[] v = velocities.Values.TryGetValue(name, out float[] found) ? found
+                                : throw new InvalidOperationException($"{_family.DisplayName} gave no velocity for its '{name}' stream.");
+                            if (conditioned != null) conditioned.Step(x, v, sigma, next, extra?.For(name));
+                            else sampler.Step(x, v, sigma, next);
+                        }
+                        stepSeconds[done] = stepClock.Elapsed.TotalSeconds;
+                        done++;
+                        _log($"  [diffusion] {_family.Id} step {done}/{job.Steps} sigma {sigma:0.#####} -> {next:0.#####} {stepSeconds[done - 1]:F2}s");
+                        Report(request, new DiffusionVideoProgress(DiffusionPhase.Denoise, done, job.Steps, Stage: pass.Name));
+                    }
                 }
             }
             finally
@@ -543,6 +593,12 @@ namespace TensorSharp.Models.SharedDiffusion
             request.Progress?.Invoke(progress.Total == 0 && _runSteps > 0 ? progress with { Total = _runSteps } : progress);
 
         // ---- components
+
+        /// <summary>The components made so far (null where none is), without making one: a family's host reads their state
+        /// between clips (a prompt cache's hits, whether a network is built).</summary>
+        internal IConditioner ConditionerOrNull => Volatile.Read(ref _conditioner);
+        internal IResidentComponent VideoCodecOrNull => Volatile.Read(ref _videoCodec);
+        internal IResidentComponent AudioCodecOrNull => Volatile.Read(ref _audioCodec);
 
         internal IConditioner ConditionerComponent { get { lock (_gate) return Conditioner; } }
         internal IResidentComponent VideoCodecComponent { get { lock (_gate) return VideoCodec; } }

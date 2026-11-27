@@ -61,7 +61,8 @@ namespace TensorSharp.MLX
         }
 
         protected override bool Fuses(GraphFusion kind)
-            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SwigluFfn or GraphFusion.RoutedExperts;
+            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SwigluFfn or GraphFusion.RoutedExperts
+                or GraphFusion.FullAttention or GraphFusion.HeadRotary;
 
         /// <summary>The delta rule's prep and the gated norm after it as one Metal kernel each
         /// (MlxNative.GraphKernels).</summary>
@@ -69,6 +70,8 @@ namespace TensorSharp.MLX
         {
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs[0], weights, ip, results);
             if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs[0], inputs[1], weights, ip, results);
+            if (kind == GraphFusion.FullAttention) return TryFullAttention(inputs, fp, results);
+            if (kind == GraphFusion.HeadRotary) return TryHeadRotary(inputs, ip, fp, results);
             foreach (Tensor t in inputs)
                 if (t == null || !(t.Storage is MlxStorage) || t.ElementType != DType.Float32) return false;
             float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
@@ -436,6 +439,7 @@ namespace TensorSharp.MLX
 
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
+            if (DirectProducts) return DirectProduct(weight, x);
             var result = new Tensor(Allocator, DType.Float32, x.Sizes[0], weight.Ne1);
             // Unquantized F32/F16/BF16 weights on the device as their own bytes (a matrix-vector kernel for decode rows, MLX's
             // GEMM above); MLX's quantized kernels; else (Q2_K, Q3_K) the raw weight dequantized to exact F32.
@@ -449,6 +453,140 @@ namespace TensorSharp.MLX
             result.Dispose();
             ReportHostProduct(weight);
             return HostProduct(weight, x);
+        }
+
+        // The F32 weights of direct products (DirectLinear's own MLX copies), by host address; Invalidate drops one.
+        private readonly Dictionary<IntPtr, Tensor> _directF32 = new();
+
+        /// <summary>
+        /// A product as DirectLinear runs it on MLX (<see cref="TensorGraphExecutor.DirectProducts"/>): a weight MLX holds compressed
+        /// on the direct F32 product (<see cref="MlxQuantizedOps.TryAddmmDirectFloat32"/>: F32 activations, Q2_K, Q3_K and BF16
+        /// widened exactly a slice at a time), an F32 weight (a LoRA factor) on MLX's GEMM over its values. Any other weight is an
+        /// error: another route would change the numbers without a word.
+        /// </summary>
+        private Tensor DirectProduct(IGraphWeight weight, Tensor x)
+        {
+            BeforeDirectProduct?.Invoke(weight);
+            var result = new Tensor(Allocator, DType.Float32, x.Sizes[0], weight.Ne1);
+            try
+            {
+                if (!weight.ExactProducts && weight.Format != GraphFormat.F32 && MlxQuantizedOps.CanPreloadDirectFloatType(weight.Format))
+                {
+                    MlxQuantizedOps.PreloadDirectFloatWeight((MlxAllocator)Allocator, weight.CacheKey, weight.Data, weight.Format,
+                        weight.Ne0, weight.Ne1, weight.Bytes);
+                    if (MlxQuantizedOps.TryAddmmDirectFloat32(result, x, weight.CacheKey, weight.Data, weight.Format, weight.Ne0, weight.Ne1, weight.Bytes))
+                        return result;
+                    throw new InvalidOperationException($"MLX direct F32 product failed (type {weight.Format}, [{x.Sizes[0]},{weight.Ne0}]x[{weight.Ne0},{weight.Ne1}]).");
+                }
+                if (weight.Format != GraphFormat.F32 || weight.Bytes != weight.Ne0 * weight.Ne1 * sizeof(float))
+                    throw new NotSupportedException($"MLX's direct products take compressed weights and F32 ones, not format {weight.Format}.");
+                Tensor values;
+                lock (_directF32)
+                    if (!_directF32.TryGetValue(weight.Data, out values))
+                    {
+                        var host = new float[weight.Ne0 * weight.Ne1];
+                        System.Runtime.InteropServices.Marshal.Copy(weight.Data, host, 0, host.Length);
+                        values = new Tensor(Allocator, DType.Float32, weight.Ne1, weight.Ne0);
+                        values.SetElementsAsFloat(host);
+                        _directF32[weight.Data] = values;
+                    }
+                using Tensor transposed = values.Transpose();
+                Ops.Addmm(result, 0f, result, 1f, x, transposed);
+                return result;
+            }
+            catch
+            {
+                result.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>Drops the F32 copy a direct product made of the weight at <paramref name="data"/>.</summary>
+        public override void Invalidate(IntPtr data)
+        {
+            base.Invalidate(data);
+            lock (_directF32)
+                if (_directF32.Remove(data, out Tensor t)) t.Dispose();
+        }
+
+        /// <summary><see cref="GraphFusion.FullAttention"/> on MLX's fused scaled-dot-product attention over the token-major heads,
+        /// as the direct MLX engines attended (Ops.ScaledDotProductAttention, no mask), then its head gates in place where the
+        /// region has them (sigmoid, the scale, a broadcast multiply).</summary>
+        private bool TryFullAttention(Tensor[] inputs, float[] fp, Tensor[] results)
+        {
+            if (inputs.Length is not (3 or 4) || fp == null || fp.Length < (inputs.Length == 4 ? 2 : 1) || results.Length < 1) return false;
+            Tensor q = inputs[0], k = inputs[1], v = inputs[2], logits = inputs.Length == 4 ? inputs[3] : null;
+            if (q == null || k == null || v == null || q.DimensionCount != 3 || k.DimensionCount != 3 || v.DimensionCount != 3
+                || !(q.Storage is MlxStorage && k.Storage is MlxStorage && v.Storage is MlxStorage)
+                || q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32
+                || !q.IsContiguous() || !k.IsContiguous() || !v.IsContiguous())
+                return false;
+            long sq = q.Sizes[0], sk = k.Sizes[0], heads = q.Sizes[1], hd = q.Sizes[2];
+            if (k.Sizes[1] != heads || v.Sizes[1] != heads || k.Sizes[2] != hd || v.Sizes[2] != hd || v.Sizes[0] != sk
+                || (logits != null && (logits.ElementType != DType.Float32 || logits.ElementCount() != sq * heads)))
+                return false;
+            var output = new Tensor(Allocator, DType.Float32, sq, heads * hd);
+            try
+            {
+                using (Tensor q4 = q.View(1, sq, heads, hd), k4 = k.View(1, sk, heads, hd), v4 = v.View(1, sk, heads, hd))
+                using (Tensor o4 = output.View(1, sq, heads, hd))
+                    Ops.ScaledDotProductAttention(o4, q4, k4, v4, null, fp[0]);
+                if (logits != null)
+                {
+                    using Tensor lc = logits.IsContiguous() ? logits.CopyRef() : Ops.NewContiguous(logits);
+                    using Tensor l2 = lc.View(sq, heads);
+                    GateHeads(output, l2, (int)heads, fp[1], contiguousGates: false);
+                }
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            results[0] = output;
+            return true;
+        }
+
+        /// <summary><see cref="GraphFusion.HeadRotary"/> on MLX's fused NeoX rotary kernel, each token and head a row of its own table,
+        /// as the direct MLX engines rotated per-head tables (MlxFusedOps.TryNeoXRoPEFlatInPlace), in place on the RMS norm's result
+        /// where the region norms first, else on a copy of x.</summary>
+        private bool TryHeadRotary(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            bool normed = ip is { Length: > 0 } && ip[0] == 1;
+            if (inputs.Length != (normed ? 4 : 3) || results.Length < 1 || (normed && (fp == null || fp.Length < 1))) return false;
+            Tensor x = inputs[0], cos = inputs[1], sin = inputs[2], weight = normed ? inputs[3] : null;
+            if (x == null || cos == null || sin == null || !(x.Storage is MlxStorage) || x.ElementType != DType.Float32 || !x.IsContiguous()
+                || cos.ElementType != DType.Float32 || sin.ElementType != DType.Float32 || cos.DimensionCount < 2)
+                return false;
+            long tokens = x.Sizes[0], width = x.ElementCount() / Math.Max(1, tokens);
+            long heads = cos.Sizes[^2], d = 2 * (cos.ElementCount() / Math.Max(1, tokens)) / Math.Max(1, heads);
+            if (tokens <= 0 || heads <= 0 || d % 2 != 0 || heads * d != width || sin.ElementCount() != cos.ElementCount()
+                || tokens * heads > int.MaxValue || (weight != null && weight.ElementCount() != width))
+                return false;
+            using Tensor x2 = x.View(tokens, width);
+            Tensor y;
+            if (weight != null)
+            {
+                using Tensor w = weight.View(width);
+                y = Ops.RMSNorm(null, x2, w, null, fp[0]);
+            }
+            else y = Ops.NewContiguous(x2);
+            try
+            {
+                long rows = tokens * heads, half = d / 2;
+                using Tensor flat = y.View(rows, d), c = cos.View(rows * half), s = sin.View(rows * half);
+                if (!MlxFusedOps.TryNeoXRoPEFlatInPlace(flat, c, s, 1, (int)rows, (int)d, (int)half))
+                {
+                    y.Dispose();
+                    return false;
+                }
+                results[0] = y.View(tokens, heads, d);
+            }
+            finally
+            {
+                y.Dispose();
+            }
+            return true;
         }
 
         private readonly System.Collections.Generic.HashSet<int> _hostProductFormats = new();

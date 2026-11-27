@@ -855,7 +855,7 @@ namespace TensorSharp.Graph
                     case GraphNodeKind.Fused:
                         _regionInputs.Push(e.Srcs ?? Array.Empty<int>());
                         if (InRegion) _nested++;
-                        else if (_x.Fuses((GraphFusion)e.Node) || _x.RunsConcurrently((GraphFusion)e.Node) || _x.RunsTogether((GraphFusion)e.Node)) _region = e;
+                        else if (_x.ServesRegion((GraphFusion)e.Node) || _x.RunsConcurrently((GraphFusion)e.Node) || _x.RunsTogether((GraphFusion)e.Node)) _region = e;
                         break;
                     case GraphNodeKind.FusedEnd:
                         if (InRegion && _nested > 0) _nested--;
@@ -980,7 +980,7 @@ namespace TensorSharp.Graph
                 var outs = new Tensor[results.Length];
                 bool fused;
                 (_x._regionInputInts, _x._regionInputFloats) = (hostInts, hostFloats);
-                try { fused = _x.TryFused((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs); }
+                try { fused = _x.TryServeRegion((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs); }
                 finally { (_x._regionInputInts, _x._regionInputFloats) = (null, null); }
                 if (fused)
                 {
@@ -1562,6 +1562,100 @@ namespace TensorSharp.Graph
         /// defer the region's ops).</summary>
         protected virtual bool Fuses(GraphFusion kind) => false;
 
+        /// <summary>Whether a run defers the ops of a region of <paramref name="kind"/> to a kernel: the regions every tensor
+        /// executor serves with its backend's ops (<see cref="GraphFusion.RowNorm"/>), then the executor's own
+        /// (<see cref="Fuses"/>).</summary>
+        private bool ServesRegion(GraphFusion kind) => kind == GraphFusion.RowNorm || Fuses(kind);
+
+        /// <summary>A deferred region's results: <see cref="GraphFusion.RowNorm"/> on the backend's norm kernel, every other kind
+        /// from the executor's own kernels (<see cref="TryFused"/>).</summary>
+        private bool TryServeRegion(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
+            => kind == GraphFusion.RowNorm ? TryRowNorm(inputs, ip, fp, results) : TryFused(kind, inputs, weights, ip, fp, results);
+
+        private readonly Dictionary<long, Tensor> _onesByWidth = new();
+
+        /// <summary>
+        /// <see cref="GraphFusion.RowNorm"/> as the direct engines' norms ran: the backend's RMS or layer norm kernel over the rows
+        /// (Ops.RMSNorm, Ops.LayerNorm) with the weight in the same pass, a weightless norm with a weight of ones (DirectOps'
+        /// norms pass one). The region's ops norm, then multiply by the weight as an op of its own, and ggml's layer norm is
+        /// the centred rows' RMS norm: a backend's layer-norm kernel rounds its mean and variance otherwise.
+        /// </summary>
+        private bool TryRowNorm(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            if (inputs.Length < 1 || ip == null || ip.Length < 2 || fp == null || fp.Length < 1 || results.Length < 1) return false;
+            Tensor x = inputs[0];
+            bool weighted = ip[1] == 1;
+            if (x == null || x.ElementType != DType.Float32 || !x.IsContiguous() || x.DimensionCount < 1 || (weighted && inputs.Length < 2))
+                return false;
+            long n = x.Sizes[^1];
+            Tensor w = weighted ? inputs[1] : null;
+            if (n <= 0 || (w != null && (w.ElementType != DType.Float32 || !w.IsContiguous() || w.ElementCount() != n))) return false;
+            using Tensor rows = x.View(x.ElementCount() / n, n);
+            using Tensor gain = w != null ? w.View(n) : OnesOf(n).CopyRef();
+            Tensor y = ip[0] == 1 ? Ops.LayerNorm(null, rows, gain, null, fp[0]) : Ops.RMSNorm(null, rows, gain, null, fp[0]);
+            try
+            {
+                results[0] = y.View(x.Sizes);
+            }
+            finally
+            {
+                y.Dispose();
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// The per-head output gates of a served <see cref="GraphFusion.FullAttention"/> (its fourth input), in place on the
+        /// attention [rows, heads * d]: sigmoid of the logits [rows, heads], times <paramref name="scale"/>, times each head's d
+        /// values, as the direct engines gated them (the gates broadcast over the head, materialized first where the backend's
+        /// multiply takes only contiguous operands: <paramref name="contiguousGates"/>).
+        /// </summary>
+        protected static void GateHeads(Tensor attention, Tensor logits, int heads, float scale, bool contiguousGates)
+        {
+            long rows = attention.Sizes[0], d = attention.Sizes[1] / heads;
+            using Tensor gates = Ops.Sigmoid(null, logits);
+            Ops.Mul(gates, gates, scale);
+            using Tensor headGates = gates.View(rows, heads, 1);
+            using Tensor headOutput = attention.View(rows, heads, d);
+            using Tensor expanded = headGates.Expand(headOutput.Sizes);
+            if (contiguousGates)
+            {
+                using Tensor materialized = Ops.NewContiguous(expanded);
+                Ops.Mul(headOutput, headOutput, materialized);
+            }
+            else Ops.Mul(headOutput, headOutput, expanded);
+        }
+
+        /// <summary>A weight of ones of <paramref name="n"/> values on this executor's allocator, made once a width.</summary>
+        private Tensor OnesOf(long n)
+        {
+            lock (_onesByWidth)
+            {
+                if (_onesByWidth.TryGetValue(n, out Tensor ones)) return ones;
+                ones = new Tensor(Allocator, DType.Float32, n);
+                Ops.Fill(ones, 1f);
+                return _onesByWidth[n] = ones;
+            }
+        }
+
+        /// <summary>
+        /// The executor's weight products (<see cref="QuantizedMatMul"/>) run as the direct engines' linear layers ran them on its
+        /// backend (TensorSharp.Models.Direct.DirectLinear: on CUDA the K-quant F16 and small-row F32 routes, then the resident
+        /// product; on MLX the compressed F32 product or the weight dequantized once; on the CPU the managed quantized product
+        /// or the weight dequantized once), and an F32 weight marked <see cref="IGraphWeight.ExactProducts"/> on exact F32
+        /// arithmetic. Set by a family that owns the executor and whose direct path it replaces (LTX 2.5's denoiser): the
+        /// products are then that path's bit for bit.
+        /// </summary>
+        public bool DirectProducts { get; init; }
+
+        /// <summary>
+        /// Called with each weight just before a direct product (<see cref="DirectProducts"/>) reads its host bytes, on the
+        /// executor's thread: a family whose weights upload at their first product (the direct engines' order) warms each
+        /// one's file pages and moves its file's read-ahead to the weight's block there, so the upload of a block overlaps the
+        /// device work queued for the blocks before it. Null: nothing runs.
+        /// </summary>
+        public Action<IGraphWeight> BeforeDirectProduct { get; set; }
+
         /// <summary>A fused region's results (<see cref="GraphFusion"/> documents each kind's inputs and results,
         /// in ggml's extents) from its inputs: a tensor in <paramref name="inputs"/>, or a quantized weight in
         /// <paramref name="weights"/> at the same index; false (nothing set) where the kernel does not apply,
@@ -1679,18 +1773,24 @@ namespace TensorSharp.Graph
         /// fc1's whole update beside its product): for MiniMax-H3's Turbo plug-in on direct CUDA that took 1.5 GB more device
         /// memory at 1,768 tokens and 2.2 GB at 2,250 than the retired direct DiT's in-place updates, and 8% more time a step
         /// at 2,250. The base product is the executor's own (<see cref="QuantizedMatMul"/>), without any power-of-two scale pair
-        /// the region's product may carry. The bias form (Ip[2] = 1) and any other layout run the region's ops.
+        /// the region's product may carry. The bias form (Ip[2] = 1, one slot) adds the bias into the product before the update,
+        /// as its ops add them (LTX 2.5's Ingredients projections: the direct linear's bias, then the adapter's update added
+        /// into its output); any other layout runs the region's ops.
         /// </summary>
         protected bool TryLoraLinearInPlace(Tensor[] inputs, IGraphWeight[] weights, long[] ip, Tensor[] results)
         {
-            if (ip == null || ip.Length < 2 || (ip.Length > 2 && ip[2] != 0) || inputs.Length < 4 || (inputs.Length - 2) % 2 != 0
-                || weights.Length != inputs.Length || weights[1] is not { } w || w.Ne2 > 1)
+            bool biased = ip is { Length: > 2 } && ip[2] == 1;
+            if (ip == null || ip.Length < 2 || (ip.Length > 2 && ip[2] is not (0 or 1)) || inputs.Length < (biased ? 5 : 4)
+                || (inputs.Length - (biased ? 3 : 2)) % 2 != 0 || weights.Length != inputs.Length || weights[1] is not { } w || w.Ne2 > 1)
+                return false;
+            Tensor bias = biased ? inputs[^1] : null;
+            if (biased && (bias == null || weights[^1] != null || bias.ElementType != DType.Float32 || bias.ElementCount() != w.Ne1))
                 return false;
             Tensor x = inputs[0];
             if (x == null || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() % w.Ne0 != 0) return false;
             long mask = ip[0], slotRows = ip[1] > 0 ? ip[1] : w.Ne1;
-            int parts = (inputs.Length - 2) / 2;
-            if (slotRows <= 0 || w.Ne1 % slotRows != 0 || parts > 3) return false;
+            int parts = (inputs.Length - (biased ? 3 : 2)) / 2;
+            if (slotRows <= 0 || w.Ne1 % slotRows != 0 || parts > 3 || (biased && slotRows != w.Ne1)) return false;
             var slots = new int[parts];
             for (int i = 0, slot = 0; i < parts; i++, slot++)
             {
@@ -1705,6 +1805,18 @@ namespace TensorSharp.Graph
             Tensor y = QuantizedMatMul(w, x2);   // [rows, out]
             try
             {
+                if (bias != null)
+                {
+                    // The bias over every row into the product, on the kernel the region's Add runs (Binary) where the
+                    // backend has one, else over the bias's rows expanded.
+                    using Tensor b = bias.View(w.Ne1);
+                    if (!TryBinaryBroadcast(GraphOp.Add, y, y, b, Ne(y), Ne(b)))
+                    {
+                        using Tensor row = b.View(1, w.Ne1);
+                        using Tensor rowsOfBias = row.Expand(rows, w.Ne1);
+                        Ops.Add(y, y, rowsOfBias);
+                    }
+                }
                 for (int i = 0; i < parts; i++)
                 {
                     using Tensor shrunk = QuantizedMatMul(weights[2 + 2 * i], x2);   // [rows, rank]
@@ -2027,7 +2139,8 @@ namespace TensorSharp.Graph
                 case GraphOp.Scale: return V(Ops.Mul(null, In(T(0), run), Fp(0, 1f)));
                 case GraphOp.ScaleBias:
                 {
-                    // ggml_scale_bias: x * s + b.
+                    // ggml_scale_bias: x * s + b. A unit scale is exact (x * 1 is x, its sign and NaN kept): the add alone.
+                    if (Fp(0, 1f) == 1f) return V(Ops.Add(null, In(T(0), run), Fp(1, 0f)));
                     using Tensor scaled = Ops.Mul(null, In(T(0), run), Fp(0, 1f));
                     return V(Ops.Add(null, scaled, Fp(1, 0f)));
                 }

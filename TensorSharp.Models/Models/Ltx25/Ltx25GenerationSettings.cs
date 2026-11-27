@@ -99,12 +99,12 @@ public sealed record Ltx25GenerationSettings(int Width, int Height, int Frames, 
     /// step (word 0 = step) keyed by the seed plus <see cref="AncestralNoiseSeedOffset"/>,
     /// video tokens first and audio after, as the original draws them from one
     /// generator. Bit parity with Torch's generator is not claimed.</summary>
-    public Ltx25StepNoise AncestralNoise(int step, int videoLength, int audioLength, long seedOffset = AncestralNoiseSeedOffset)
+    public (float[] Video, float[] Audio) AncestralNoise(int step, int videoLength, int audioLength, long seedOffset = AncestralNoiseSeedOffset)
     {
         if (step < 0 || videoLength <= 0 || audioLength <= 0) throw new ArgumentOutOfRangeException(nameof(step));
         float[] packed = PhiloxNoise.Draw(checked(videoLength + audioLength),
             unchecked(Seed + seedOffset), 0, (uint)step);
-        return new(packed.AsSpan(0, videoLength).ToArray(), packed.AsSpan(videoLength).ToArray());
+        return (packed.AsSpan(0, videoLength).ToArray(), packed.AsSpan(videoLength).ToArray());
     }
 
     /// <summary>CUDA Philox noise in the baseline's packed channel-major storage.

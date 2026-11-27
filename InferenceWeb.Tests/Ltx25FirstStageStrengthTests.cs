@@ -1,16 +1,13 @@
-using System.Reflection;
 using TensorSharp.Models.Ltx25;
 
 namespace InferenceWeb.Tests;
 
-public sealed class Ltx25PipelineDiagnosticsTests
+/// <summary>The first pass's frame-zero guide strength (the publisher's .7 for a shorthand first image) as the family applies it:
+/// only the first pass's frame-zero guide changes; the refinement and the other guides keep their strengths.</summary>
+public sealed class Ltx25FirstStageStrengthTests
 {
     private static List<Ltx25EncodedImage> Override(IReadOnlyList<Ltx25EncodedImage> images, float strength)
-    {
-        Type pipeline = typeof(Ltx25Model).Assembly.GetType("TensorSharp.Models.Ltx25.Ltx25Pipeline", throwOnError: true)!;
-        MethodInfo method = pipeline.GetMethod("WithFirstStageImageStrength", BindingFlags.Static | BindingFlags.NonPublic)!;
-        return (List<Ltx25EncodedImage>)method.Invoke(null, [images, strength])!;
-    }
+        => Ltx25Family.WithFirstStageImageStrength(images, strength);
 
     [Theory]
     [InlineData(1f)]
@@ -52,16 +49,10 @@ public sealed class Ltx25PipelineDiagnosticsTests
     [InlineData(1.1f)]
     [InlineData(float.NaN)]
     [InlineData(float.PositiveInfinity)]
-    public void InvalidDiagnosticStrengthIsRejected(float strength)
-    {
-        var error = Assert.Throws<TargetInvocationException>(() => Override([new(new float[128], 0)], strength));
-        Assert.IsType<ArgumentOutOfRangeException>(error.InnerException);
-    }
+    public void InvalidStrengthIsRejected(float strength)
+        => Assert.Throws<ArgumentOutOfRangeException>(() => Override([new(new float[128], 0)], strength));
 
     [Fact]
     public void OverrideRequiresFirstFrameGuide()
-    {
-        var error = Assert.Throws<TargetInvocationException>(() => Override([new(new float[128], 8)], .7f));
-        Assert.IsType<ArgumentException>(error.InnerException);
-    }
+        => Assert.Throws<ArgumentException>(() => Override([new(new float[128], 8)], .7f));
 }

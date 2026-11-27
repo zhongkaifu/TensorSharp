@@ -30,7 +30,7 @@ Independent full-model text and seven-case media checks are distinct from timing
 
 ### Current media-generation models
 
-**LTX 2.5 Distilled** uses the publisher's two-stage recipe: eight ancestral Euler steps at half output size, required x2 latent upscaling, then three full-size refinement steps, all at CFG 1. It supports text, first/last/timed image keyframes, and optional Ingredients IC-LoRA identity sheets (a separate single-pass reference recipe). Output is video with 48 kHz stereo audio. CUDA and MLX use owned executors, including the `ggml_cuda` / `ggml_metal` aliases; CPU uses the direct implementation. Vulkan, multi-GPU and reference video/audio are unsupported. The default convolutional video VAE has an optional diffusion-decoder alternative on CPU/MLX. See the [model card](models/ltx-2.5.md) for downloads, quality limits, application coverage and the corrected recipe; older single-pass timings do not benchmark today's default.
+**LTX 2.5 Distilled** uses the publisher's two-stage recipe: eight ancestral Euler steps at half output size, required x2 latent upscaling, then three full-size refinement steps, all at CFG 1. It supports text, first/last/timed image keyframes, and optional Ingredients IC-LoRA identity sheets (a separate single-pass reference recipe). Output is video with 48 kHz stereo audio. It runs on the diffusion runtime: each step is one graph program on the backend's tensor executor (CUDA and MLX, including the `ggml_cuda` / `ggml_metal` aliases, and the managed CPU executor). Vulkan, multi-GPU and reference video/audio are unsupported. The default convolutional video VAE has an optional diffusion-decoder alternative on CPU/MLX. See the [model card](models/ltx-2.5.md) for downloads, quality limits, application coverage and the corrected recipe; older single-pass timings do not benchmark today's default.
 
 **MiniMax-H3** has distinct FL2VA (text/keyframes) and Ref2VA (reference-media) checkpoints, 32 kHz stereo audio, CFG 1 and a 20-step default. All six CPU/MLX/CUDA direct/native routes have component coverage; current corrected CPU whole-generation pairs remain pending. Latest four-GPU-route preservation checks use unchanged ggml `3612c0af93f2cfc8f048295300a61187723b12ae`. Two-round full-process before/after checks preserve decoded RGB/audio exactly, with 5.0% lower native Metal latency, 12.5% lower MLX latency and 19.0% lower equal-precision direct CUDA latency; the 1.3% native CUDA difference does not establish a meaningful gain. Loading/codecs and uncontrolled caches are included. BF16-weight CUDA projections now default to pedantic F32; an experimental batched-attention model path failed full-generation quality checks and was removed. See the [model card](models/minimax-h3.md) and [validation workflow](../eng/validation/README-minimax-h3.md) for independent numerical gates and benchmark limits.
 
@@ -147,6 +147,17 @@ CUDA results are committed. See the [Bonsai2 card](models/bonsai2.md).
 
 The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse Spark, loading split GGUFs from any shard, native skill discovery and the latest MiniMax-H3 work are newer than `v2026.10.11`, as described above. Knowledge collections and active-turn steering are included in that tag; the entries below retain compatibility and measured-performance history from earlier work.
 
+- **LTX 2.5 and its Ingredients IC-LoRA run on the diffusion runtime, and the legacy pipeline and direct denoiser are
+  removed.** A clip runs on the shared video pipeline in two passes (`Ltx25Family`), the 48-block denoiser is one graph
+  program a step on the backend's tensor executor, and the Ingredients adapter is an unmerged adapter set added in place in
+  exact F32. On an A40 every clip (t2v, i2v, keyframes, 121 frames, an Ingredients reference clip) is byte-identical to the
+  retired pipeline's in RGB and both PCM channels, at 0.973× to 1.003× its wall time; a `cpu` clip is byte-identical too.
+  A step's peak live device memory is 0.3–0.5 GB lower. The retired switches (`TS_LTX25_CUDA_ATTN`,
+  `TS_LTX25_CUDA_FUSED_HEAD_GATE`, `TS_LTX25_FUSED_ROPE`, `TS_LTX25_CUDA_TILE`, `TS_LTX25_CUDA_REQUIRE_TILE`,
+  `TS_LTX25_CUDA_F16_DEQUANT`, `TS_LTX25_STAGE_TIMING`, `TS_LTX25_CUDA_SOURCE_UPLOAD`, `TS_LTX25_CUDA_PREFAULT`,
+  `TS_LTX25_CUDA_PREFAULT_WORKERS`, `TS_LTX25_DEVICE_PROMPT_MATH`, `TS_LTX25_CUDA_BF16_GEMM`, `TS_LTX25_MLX_BF16_GEMM`)
+  stop the server or CLI at startup. `mlx`/`ggml_metal` and the gated adapter itself are not yet validated on the runtime.
+  See the [model card](models/ltx-2.5.md#diffusion-runtime-migration-2026-11-27).
 - **MiniMax-H3 runs on the diffusion runtime, and its legacy pipeline and DiTs are removed.** A clip runs on the shared
   video pipeline (`DiffusionVideoPipeline`) and the denoiser is one graph program a step on every backend, its LightX2V
   Turbo plug-ins as unmerged LoRA regions. On `ggml_cuda` (A40) the clips without a plug-in are byte-identical to the

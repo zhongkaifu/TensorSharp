@@ -241,8 +241,7 @@ static object Provenance()
         .Where(a=>File.Exists(a.Location)).ToDictionary(a=>a.GetName().Name!,a=>new{path=a.Location,sha256=FileHash(a.Location)});
     string? ffmpeg=Environment.GetEnvironmentVariable("TS_FFMPEG");
     if(!File.Exists(ffmpeg))ffmpeg=(Environment.GetEnvironmentVariable("PATH")??"").Split(Path.PathSeparator).Select(p=>Path.Combine(p,OperatingSystem.IsWindows()?"ffmpeg.exe":"ffmpeg")).FirstOrDefault(File.Exists);
-    var policy=new[]{"MLX_ENABLE_TF32","TS_MLX_CACHE_LIMIT_MB","TS_MLX_WIRED_LIMIT_MB","TS_MLX_MEMORY_LIMIT_MB",
-        "TS_LTX25_MLX_BF16_GEMM","TS_LTX25_CUDA_BF16_GEMM","TS_LTX25_MLX_HALF_PROJECTION","TS_LTX25_CUDA_ATTN","TS_LTX25_CUDA_TILE"}
+    var policy=new[]{"MLX_ENABLE_TF32","TS_MLX_CACHE_LIMIT_MB","TS_MLX_WIRED_LIMIT_MB","TS_MLX_MEMORY_LIMIT_MB"}
         .ToDictionary(name=>name,Environment.GetEnvironmentVariable);
     var modules=new[]{"tensorsharp_kernels.ptx","tensorsharp_ltx25.ptx"}.Select(name=>Path.Combine(AppContext.BaseDirectory,"cuda_kernels",name))
         .Where(File.Exists).ToDictionary(path=>Path.GetFileName(path),path=>new{path,sha256=FileHash(path)});

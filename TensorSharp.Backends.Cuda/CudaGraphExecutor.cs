@@ -2158,6 +2158,7 @@ namespace TensorSharp.Cuda
             // the host, so only a layout it does not take at all leaves that attention to the region's ops).
             GraphFusion.TableRopeQkNorm => ServesDitAttention,
             GraphFusion.AdaLnModulate or GraphFusion.GatedResidual => ServesDitModulation,
+            GraphFusion.FullAttention or GraphFusion.HeadRotary => ((CudaAllocator)Allocator).Kernels != null,
             _ => false,
         };
 
@@ -2187,6 +2188,8 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.TableRopeQkNorm) return TryTableRopeQkNormAttention(inputs, ip, fp, results);
             if (kind == GraphFusion.AdaLnModulate) return TryAdaLnModulate(inputs, ip, fp, results);
             if (kind == GraphFusion.GatedResidual) return TryGatedResidual(inputs, ip, results);
+            if (kind == GraphFusion.FullAttention) return TryFullAttention(inputs, fp, results);
+            if (kind == GraphFusion.HeadRotary) return TryHeadRotary(inputs, ip, fp, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -4064,6 +4067,7 @@ namespace TensorSharp.Cuda
             _doorbell?.Dispose();
             _doorbell = null;
             DisposePrefetch();
+            DisposeDirect();
             cuda.Context.MakeCurrent();
             if (_stagingArena != IntPtr.Zero)
             {
@@ -5258,6 +5262,7 @@ namespace TensorSharp.Cuda
         {
             if (_deferredNorms.Count > 0 && DeferredNormProduct(weight, x) is { } normedProduct) return normedProduct;
             ReadNow(x);
+            if (DirectProducts) return DirectProduct(weight, x);
             if (FloatProducts && WideTokenProducts && FloatDitProduct(weight, x) is { } ditProduct) return ditProduct;
             if (FloatProducts && FloatQ8Product(weight, x) is { } floatProduct) return floatProduct;
             var cuda = (CudaAllocator)Allocator;

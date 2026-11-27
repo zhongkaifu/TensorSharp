@@ -2,10 +2,12 @@
 
 This diagnostic runs the registered native LTX model through final sampling once,
 then saves normalized video latents in `[128,T,H,W]` order and joint audio latents
-in `[tokens,128]` order. A probe-only callback stops before the production decoder;
-the pipeline cleanup and model disposal run normally. Each selected VAE then
-decodes the same saved video buffer. The production generation entry point has no
-callback and retains its existing behavior.
+in `[tokens,128]` order. The probe runs the model's own LTX family on the diffusion
+runtime, wrapped in a probe-only family (`CaptureFamily`) that reads the state
+between the runtime's hooks and stops before the production decoder; the
+pipeline cleanup and model disposal run normally. Each selected VAE then decodes
+the same saved video buffer. The production generation entry point
+(`GenerateVideo`) runs the unwrapped family.
 
 Build from the repository root (the skip switches reuse existing native builds):
 
@@ -44,15 +46,6 @@ records the first-image strength. This option is only valid for generation with
 The report also records whether the strength was explicit and obtains effective
 stage strengths from the same resolver as production, rather than duplicating
 its policy in the probe.
-
-To compare a weaker first-stage anchor while restoring the original image in
-refinement, use `--first-stage-image-strength 0.7 --image-strength 1`. This
-diagnostic overrides only the frame-zero encoded guide in the first half-size
-pass. The full-size refinement pass keeps `--image-strength`, and other temporal
-guides keep their own strengths. Both effective first-image strengths are saved
-in the report and capture. Omitting the option preserves the ordinary pipeline
-policy. The override requires a two-stage mode
-with `--image` and cannot be used when re-decoding an existing capture.
 
 For a bounded comparison with the official denoiser, use `--operation forward`
 with the same model, image, prompt, seed and output geometry. This executes the

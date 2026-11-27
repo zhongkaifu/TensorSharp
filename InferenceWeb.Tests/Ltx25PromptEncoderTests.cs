@@ -52,10 +52,8 @@ public sealed class Ltx25PromptEncoderTests
         Equal(Values(test.GetProperty("normalized")), normalized, 1e-5f);
         Equal(Values(test.GetProperty("video_aggregate")), video, 1e-5f);
         Equal(Values(test.GetProperty("audio_aggregate")), audio, 1e-5f);
-        if (backend.Allocator is MlxAllocator && Environment.GetEnvironmentVariable("TS_LTX25_MLX_BF16_GEMM") == "1")
-            Assert.Equal(13, encoder.NativeBf16Projections);
         if (backend.Allocator is CudaAllocator) Assert.Equal(15, encoder.CudaMappedProjections);
-        if (backend.Allocator is CudaAllocator && Environment.GetEnvironmentVariable("TS_LTX25_CUDA_BF16_GEMM") != "0")
+        if (backend.Allocator is CudaAllocator)
             Assert.Equal(CudaDevice.GetDevice(((CudaAllocator)backend.Allocator).DeviceId).ComputeCapabilityMajor >= 8 ? 15 : 0,
                 encoder.CudaBf16Projections);
     }

@@ -33,6 +33,57 @@ each new prompt. `TrimIdleMemory` releases all retained components. Prompt weigh
 stream per projection, and video decoder weights per convolution. Complete-generation memory
 and cache behavior must be measured separately from component measurements.
 
+## Diffusion runtime migration (2026-11-27)
+
+LTX 2.5 runs on the shared diffusion runtime; the retired direct path was frozen
+before it was deleted. Three tools compare the two implementations through
+surfaces both trees have, so the same source builds against either checkout:
+
+- `Ltx25DenoiserAB` (denoiser steps): `fixture` runs the oracle's four cases on
+  the synthetic checkpoint, each also with a synthetic rank-2 Ingredients
+  adapter over every adapted projection, and writes every output bit (the lane
+  files in `InferenceWeb.Tests/Fixtures/Ltx25/LegacyGoldens/` came from the
+  retired tree); `real` runs real-checkpoint steps at generation geometries
+  (first pass, an image guide's per-token timesteps, the refinement, appended
+  keyframe guides, an Ingredients reference pass; with `--cold N`, each case's
+  step N times as a clip's first step runs it, the device copies released and
+  the pool trimmed before each); `write-lora` writes a
+  synthetic rank-128 BF16 adapter with the Ingredients layout (the gated real
+  adapter is not needed); `compare` reports bitwise equality per case.
+- `Ltx25AbProbe` (whole clips through the public model API): raw RGB, both PCM
+  channels, timings and progress events per case and round.
+- `ltx25-ab-compare.py` (bitwise, max |a - b|, PSNR, median times) and
+  `ltx25-ab-phases.py` (each phase from the timing lines both trees log, and
+  the rest of the clip's time; the progress events are not comparable, since
+  the retired pipeline reported its encodes in another order).
+
+```sh
+# Per tree (TREE = the retired checkout or this one), CUDA and CPU lanes:
+dotnet run -c Release --project eng/validation/Ltx25DenoiserAB -- fixture --backend cuda \
+  --fixtures InferenceWeb.Tests/Fixtures/Ltx25 --out artifacts/ltx25/ab/$LABEL-cuda.json
+dotnet run -c Release --project eng/validation/Ltx25DenoiserAB -- real --backend cuda \
+  --checkpoint "$DENOISER" --lora "$SYNTHETIC_ADAPTER" --out artifacts/ltx25/ab/$LABEL-real.json
+dotnet eng/validation/Ltx25AbProbe/bin/Release/net10.0/Ltx25AbProbe.dll --model "$DENOISER" \
+  --backend Cuda --cases cases.json --output artifacts/ltx25/ab --label $LABEL --repeats 1
+# Then, alternating the trees in ABBA order:
+python3 eng/validation/ltx25-ab-compare.py artifacts/ltx25/ab --a legacy --b runtime
+python3 eng/validation/ltx25-ab-phases.py artifacts/ltx25/ab legacy runtime
+```
+
+Tests that hold the runtime to the retired path and the official references:
+
+```sh
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release \
+  --filter 'FullyQualifiedName~Ltx25|FullyQualifiedName~DiffusionPipelineTests|FullyQualifiedName~GraphDit|FullyQualifiedName~ServerStartupWarningsTests'
+TS_TEST_LTX25_BACKEND=cuda dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --no-build \
+  --filter 'FullyQualifiedName~Ltx25'
+```
+
+`Ltx25DenoiserTests.StepsGiveTheRetiredDirectDenoisersBitsOnItsLane` requires
+the frozen bits on the lane a file was frozen on and 2e-5 against every other.
+
+The results are in the [model card](../../docs/models/ltx-2.5.md#diffusion-runtime-migration-2026-11-27).
+
 ## Unsloth distilled GGUF validation (2026-10-18)
 
 Generated evidence is under ignored `docs/validation/unsloth-repoint-20261018/`.
@@ -107,7 +158,7 @@ reports cached bytes and measures cold read throughput with `read --readers N`.
 - **A40:** frozen base and final CLIs ran in two alternating rounds. The decoded
   RGB and PCM sha256 were identical in all four runs. Process time went from
   163.9 / 164.0 s to 74.5 / 71.3 s.
-- **Prompt conditioning:** `Ltx25PromptProbe --device-math-rounds 1,1` kept the
+- **Prompt conditioning:** two device-math rounds of `Ltx25PromptProbe` kept the
   video and audio context hashes `da30bda33b2ec0aa` / `8d2832ae6a1f31e9` through
   every change.
 
@@ -200,17 +251,17 @@ other TensorSharp hosts keep their existing defaults. For an app startup-default
 check, remove this variable from the launch environment and retain the startup
 log before activating a model.
 
-CUDA prompt BF16 GEMM defaults on for SM 8.0 or newer; its opt-out is
-`TS_LTX25_CUDA_BF16_GEMM=0`. Bounded mapped projection reads default on; their
-opt-out is `TS_LTX25_CUDA_PREFAULT=0`. The latter retains one file handle and an
+CUDA prompt BF16 GEMM runs on SM 8.0 or newer (F32 on older devices). Bounded
+mapped projection reads always run on CUDA. They retain one file handle and an
 8 MiB buffer per reader, checks Linux residency and records bytes/ranges/time/failures in
 component probes. Whole-checkpoint prefault probes and skipped RAM-budget checks
 are separate diagnostics. Never describe them as production coverage. Default
 CUDA video attention uses the precise owned path for query/key lengths at least
 512; the 768-video-token preset has a matched numerical/control timing gate.
 Linux warming uses at most eight concurrent 1 MiB slices of that same buffer;
-`TS_LTX25_CUDA_PREFAULT_WORKERS=1` selects the sequential control. Other operating
-systems default to one worker. Completed slice reads are joined before buffer
+other operating systems use one worker. (The opt-outs `TS_LTX25_CUDA_BF16_GEMM`,
+`TS_LTX25_CUDA_PREFAULT` and `TS_LTX25_CUDA_PREFAULT_WORKERS` were removed with the
+direct denoiser; the hosts refuse them at startup.) Completed slice reads are joined before buffer
 reuse, and partial/failed reads remain visible in the telemetry.
 
 ```sh
@@ -253,8 +304,8 @@ sum in the original order; unrotated channels remain unchanged. This does not
 lower precision, reduce prompt tokens, skip layers or change the conditioning
 cache. MLX's existing BF16 rounding path is unchanged.
 
-`TS_LTX25_DEVICE_PROMPT_MATH=0` selects the host control for Gemma RoPE and CUDA
-BF16 rounding. Unset or `1` requests the device paths. An older optional
+The device paths always run where a kernel takes the tensor (the host control
+switch `TS_LTX25_DEVICE_PROMPT_MATH` was removed). An older optional
 `tensorsharp_ltx25.ptx` that lacks either prompt export keeps the host fallback;
 successful generation alone therefore does not establish native dispatch. The
 new native tests assert that dispatch returned true, then compare every output
@@ -284,14 +335,13 @@ The offset-view tests also cover the general CPU storage correction: bulk
 Float32/Int32 reads honor nested view offsets and reject out-of-storage ranges.
 This is independent of LTX and has direct `CpuStorageBulkElementIoTests` coverage.
 
-`Ltx25PromptProbe --device-math-rounds` alternates host/device requests on one
-encoder instance. It supports `CUDA` or `MLX` with `--stage full` and cannot be
-combined with the existing `--cuda-bf16-rounds` GEMM experiment. Every round saves
-full video/audio contexts, their hashes, elapsed time and Gemma/aggregation/
-connector phases. Device-math rounds fail if either context differs bitwise
-from the first round. The report says `device_requested` rather than claiming
-native dispatch; use the strict tests and matching module hashes above to
-establish dispatch.
+`Ltx25PromptProbe --rounds N` repeats the full encode N times on one encoder
+instance (`--stage full`). Every round saves full video/audio contexts, their
+hashes, elapsed time and Gemma/aggregation/connector phases, and fails if either
+context differs bitwise from the first round. Its earlier `--device-math-rounds`
+and `--cuda-bf16-rounds` modes alternated the removed kernel switches and went
+with them. The report does not claim native dispatch; use the strict tests and
+matching module hashes above to establish dispatch.
 
 ```sh
 dotnet publish eng/validation/Ltx25PromptProbe -c Release \
@@ -302,7 +352,7 @@ MLX_ENABLE_TF32=0 TENSORSHARP_MLX_LIBRARY_DIR="$PWD/TensorSharp.Backends.MLX/Nat
 dotnet artifacts/ltx25/prompt-math-probe/Ltx25PromptProbe.dll \
   --encoder "$TEXT_ENCODER" --model "$DENOISER" --backend MLX --stage full \
   --prompt "A red ball rolls across a wooden table." \
-  --device-math-rounds 0,1,1,0,0,1 --output "$NEW_PROMPT_REPORT"
+  --rounds 6 --output "$NEW_PROMPT_REPORT"
 ```
 
 For CUDA, select `--backend CUDA` and deploy verified compatible PTX into the
@@ -319,14 +369,16 @@ and visual inspection before making any quality or overall-speed claim.
 CUDA denoiser head gating computes the existing `2 * sigmoid(logit)` once per
 token/head and multiplies its channels in place, preserving the separate Float32
 rounding boundaries. This avoids the expanded gate tensor and several launches.
-`TS_LTX25_CUDA_FUSED_HEAD_GATE=0` restores the separate operations. An older
-optional LTX PTX module without the gate export retains the original fallback;
-the `OptimizedCudaHeadGates` counter records successful native dispatches.
+On the diffusion runtime the CUDA executor applies it inside each gated
+`FullAttention` region; an older optional LTX PTX module without the gate export
+runs the separate operations, and the executor's `HeadGatesServedForTests`
+counter records native dispatches. (`TS_LTX25_CUDA_FUSED_HEAD_GATE` was removed.)
 
 `Ltx25CudaHeadGateTests` requires bitwise equality to the original device
 operations for offset views, special values and 131,072 varied finite logits.
-`Ltx25DenoiserTests.FusedHeadGatesExactlyPreserveCompleteOfficialGraph` compares
-complete tiny official graphs with fusion off/on. Run both filters on CUDA
+`Ltx25DenoiserTests.CudaServesAttentionGatesAndRotariesWithTheDirectKernels`
+requires every attention, head gate and q/k rotary of the complete tiny official
+graph to run on those kernels and the result to match the official oracle. Run both filters on CUDA
 with verified compatible PTX. Component parity must still be followed by matched
 complete-generation RGB/stereo comparisons and media validation.
 
@@ -737,7 +789,7 @@ TS_CUDA_QMM_F16GEMM_MIN_ROWS=8 TS_CUDA_QMM_F16GEMM_MAX_MB=768 \
   dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --no-build \
   --filter FullyQualifiedName~ConfiguredF16ThresholdKeepsItsProjectionRouteAndTargetUnchanged
 
-TS_LTX25_CUDA_ATTN=1 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
   --no-build --filter FullyQualifiedName~Ltx25CudaAttentionTests
 ```
 
@@ -745,17 +797,15 @@ Optional projection tests visibly skip without CUDA. On a CUDA host they require
 the owned `tensorsharp_ltx25.ptx` module, actual native execution counters, and
 parity with independently dequantized GGML weights and a double dot-product
 oracle. A missing module or fallback does not count as a passing kernel test.
-The owned projection module is optional and enabled when available; set
-`TS_LTX25_CUDA_TILE=0` to opt out or `TS_LTX25_CUDA_REQUIRE_TILE=1` to require it
-for the denoiser. It handles rows 2..31 and preserves the existing eligible F16
+The owned projection module is optional and used whenever it loads (the
+denoiser's CUDA executor takes it for every K-quant product it accepts). It handles rows 2..31 and preserves the existing eligible F16
 route configured by `TS_CUDA_QMM_F16GEMM_MIN_ROWS` and
 `TS_CUDA_QMM_F16GEMM_MAX_MB`. Those settings are process-static: run the threshold
 fact alone in a fresh process for a nondefault threshold.
 
-The bounded precise CUDA attention route is enabled by default for video
-self/prompt attention with at least 512 queries and 512 keys. Set
-`TS_LTX25_CUDA_ATTN=0` to opt out or `=1` to force supported smaller shapes in
-focused tests. It uses pedantic Float32 cuBLAS products, Float32 softmax and a
+The bounded precise CUDA attention route serves every attention with at least
+512 queries and 512 keys (or past 100 GFLOP); shorter ones take the streaming
+F32 kernel, each the other's fallback. It uses pedantic Float32 cuBLAS products, Float32 softmax and a
 bounded score workspace (at most 256 MiB). Long sequences tile queries and heads
 while every query keeps the complete key sequence. The 10,752-token Ingredients
 oracle covers query/head tails and double-precision samples, plus a second
@@ -764,26 +814,24 @@ existing route. Execution counters and observed workspace capacity are recorded
 by the denoiser and complete-generation probes; a setting alone is not evidence
 that the route executed.
 
-For the preset's 768 video tokens, compare an explicit attention opt-out with
-the unset/default policy in separate processes and fresh report paths:
+For the preset's 768 video tokens, time the complete denoiser on synthetic
+projected contexts and latents:
 
 ```sh
-TS_LTX25_CUDA_ATTN=0 dotnet "$DENOISER_PROBE/Ltx25DenoiserProbe.dll" \
+dotnet "$DENOISER_PROBE/Ltx25DenoiserProbe.dll" \
   --model "$DENOISER" --backend CUDA --frames 17 --height 512 --width 512 \
   --audio-tokens 18 --context-tokens 1024 --blocks 48 \
   --warmup 1 --repeats 3 --schedule forward --frequency-precision Float64 \
   --output "$NEW_REPORT"
 ```
 
-Repeat with `TS_LTX25_CUDA_ATTN` unset. An explicit `=1` additionally exercises
-supported smaller video shapes. Verify identical model/input/PTX hashes,
-finite outputs, zero repeat drift and positive native attention counters.
-These inputs are deterministic synthetic projected contexts and latents;
-component timings exclude prompt encoding, sampling and decoding.
+Verify identical model/input/PTX hashes, finite outputs and zero repeat drift.
+Component timings exclude prompt encoding, sampling and decoding. (The attention
+switch `TS_LTX25_CUDA_ATTN` that these runs once compared against was removed.)
 
 The owned blockwise weight converter is enabled by default when its PTX export
-is available, for the existing eligible F16 GEMM route. Set
-`TS_LTX25_CUDA_F16_DEQUANT=0` to opt out. Its operands retain that route's
+is available, for the existing eligible F16 GEMM route (the opt-out
+`TS_LTX25_CUDA_F16_DEQUANT` was removed). Its operands retain that route's
 Float16 policy; this is a conversion optimization rather than an additional
 activation-precision change. The converter's exact-half tests compare
 with unchanged GGML CPU decoding followed by nearest-even half rounding,
@@ -1327,9 +1375,9 @@ Every argv, exit status, test log and module receipt is retained. Use
 exact RGB and both raw PCM channels for data-movement changes; each side's actual
 checkpoint manifest must still prove model identity.
 
-The source-aware CUDA uploader remains an explicit opt-in:
-`TS_LTX25_CUDA_SOURCE_UPLOAD=1`; unset/`0` preserves the established mapped path.
-The first candidate's single-threaded source reads regressed fresh generation
+The source-aware CUDA uploader was an explicit opt-in
+(`TS_LTX25_CUDA_SOURCE_UPLOAD=1`), never the default; it was removed with the
+direct denoiser. Its record: the first candidate's single-threaded source reads regressed fresh generation
 79.85→95.91 seconds despite exact outputs. Matching the existing eight-worker
 1 MiB read slices within each pinned slot improved a candidate-first/control-
 second pair 77.015→70.507 seconds (8.45%), with exact RGB, both PCM channels and
@@ -1337,7 +1385,7 @@ complete H.264/AAC checks. It reserves two 8 MiB pinned buffers per used compone
 and runs only for cold Linux weight ranges; device-resident weights keep the
 existing cache. This one mixed-residency A40/storage pair does not establish a
 universal speedup, and 70.507 seconds still trails the recorded SD.cpp fresh
-56.67 seconds. The default is unchanged; no further loader trials were used.
+56.67 seconds.
 
 ### Rectangular attention experiment: rejected after full generation
 

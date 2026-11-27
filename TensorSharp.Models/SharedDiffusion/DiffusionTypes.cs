@@ -190,7 +190,12 @@ namespace TensorSharp.Models.SharedDiffusion
 
     /// <summary>One denoising step: its 0-based index of <see cref="Count"/>, its sigmas and the head interval the
     /// recipe's head policy picked ((0, 0) for a model with one head).</summary>
-    public readonly record struct StepState(int Index, int Count, float Sigma, float Next, int HeadStart, int HeadStop);
+    public readonly record struct StepState(int Index, int Count, float Sigma, float Next, int HeadStart, int HeadStop)
+    {
+        /// <summary>The sampling pass the step belongs to (0 for a one-pass recipe); <see cref="Index"/> and <see cref="Count"/>
+        /// count the steps of that pass (<see cref="DiffusionVideoJob.Stages"/>).</summary>
+        public int Stage { get; init; }
+    }
 
     /// <summary>A run of rows of the packed sequence modulated alike: a modality and the index of its timestep in
     /// <see cref="DiffusionLayout.Timesteps"/>.</summary>

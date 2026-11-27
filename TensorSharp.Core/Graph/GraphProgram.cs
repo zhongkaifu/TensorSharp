@@ -161,6 +161,11 @@ namespace TensorSharp.Graph
         /// <summary>The key a backend's resident copy is registered under.</summary>
         IntPtr CacheKey { get; }
         long Bytes { get; }
+
+        /// <summary>An F32 weight whose products keep exact F32 arithmetic on every backend (no TF32, no half operands): a LoRA
+        /// factor, whose small updates the narrowed products would lose. An executor's direct products
+        /// (<c>TensorGraphExecutor.DirectProducts</c>) honor it.</summary>
+        bool ExactProducts => false;
     }
 
     /// <summary>Stacked experts (<see cref="IGraphWeight.Ne2"/> of them) whose members a backend can
@@ -455,6 +460,29 @@ namespace TensorSharp.Graph
         /// the router logits [E, rows], the fused gate_up stack [n, 2 ff, E], the down stack [ff, n, E], then (Ip[1] = 1) the
         /// per-expert scales [E] (F32). Ip: K, scales. Result: [n, rows].</summary>
         GegluRoutedExperts = 43,
+        /// <summary>A rotary embedding with a table per head (LTX 2.5's split RoPE, every head at its own frequencies): NeoX's
+        /// half-split rotation over the whole head, of x RMS-normed over each whole row times its weight first where Ip[0] = 1.
+        /// Inputs: x [D * heads, rows] (F32, contiguous), cos and sin [D/2, heads, rows] (F32, contiguous), then the norm's weight
+        /// [D * heads]. Ip: normed. Fp: the norm's eps. Result [D, heads, rows]: out[j] = x[j] cos[j] - x[D/2 + j] sin[j] and
+        /// out[D/2 + j] = x[D/2 + j] cos[j] + x[j] sin[j], each product rounded before the sum (the region's ops: a nested
+        /// <see cref="RowNorm"/>, views of the two halves, products and a concatenation). An executor with a fused rotary kernel
+        /// serves it with that kernel, in place on the norm's result.</summary>
+        HeadRotary = 44,
+        /// <summary>Per-head output gates (LTX 2.5's to_gate_logits): attn [D * heads, rows] times scale * sigmoid(logit) of its
+        /// head and row. Inputs: attn and logits [heads, rows] (F32, contiguous). Fp: scale. Result [D * heads, rows]; the ops:
+        /// the sigmoid, the scale and a multiply broadcast over each head's D values.</summary>
+        HeadGate = 45,
+        /// <summary>A row normalization as the backend's norm kernel computes it: Ip[0] 0 is the RMS norm x / sqrt(mean(x^2) +
+        /// eps), 1 the layer norm (x - mean) / sqrt(var + eps), times a per-column weight [n] where Ip[1] = 1 (else a weight of
+        /// ones). Inputs: x [n, rows] (F32, contiguous), then the weight. Fp: eps. Result [n, rows]. The ops: ggml's rms_norm or
+        /// norm, then the weight's multiply; a tensor executor serves it with its norm kernel, the weight in the same pass.</summary>
+        RowNorm = 46,
+        /// <summary>Unmasked attention in F32 throughout (no F16 narrowing of K or V): softmax(scale q k^T) v per head over q [D,
+        /// heads, rows] and k and v [D, heads, keys] (F32, contiguous), then, with a fourth input, per-head output gates (a nested
+        /// <see cref="HeadGate"/>: the logits [heads, rows], Fp[1] its scale). Fp: scale, the gates' scale. Result [D * heads,
+        /// rows]. The ops: an F32 flash attention (and the gates' ops); a tensor executor serves it with its F32 attention over
+        /// bounded score scratch, gating the result in place.</summary>
+        FullAttention = 47,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

@@ -1,7 +1,5 @@
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using TensorSharp.Cuda;
 using TensorSharp.Models.Ltx25;
 using TensorSharp.Runtime;
 
@@ -14,19 +12,17 @@ public sealed class Ltx25MappedByteSourceTests
     [InlineData(true, false)]
     [InlineData(false, true)]
     [InlineData(true, true)]
-    public void PositionalReadsAndPrefaultSourceUseTheMappedInodeAndRejectDisposedOwner(bool safetensors, bool replaceBeforeMapping)
+    public void PositionalReadsUseTheMappedInodeAndRejectDisposedOwner(bool safetensors, bool replaceBeforeMapping)
     {
         string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + (safetensors ? ".safetensors" : ".gguf"));
         string previous = path + ".previous";
         byte[] values = Enumerable.Range(0, 4096).Select(i => (byte)(i * 43 + i / 127)).ToArray();
         IDisposable reader = null;
-        IntPtr destination = Marshal.AllocHGlobal(4096);
         try
         {
             long dataOffset = Write(path, values, safetensors);
             ReadAt read;
             Action checkDisposedMapping;
-            Ltx25CudaFilePrefault source;
             if (safetensors)
             {
                 var file = new SafetensorsFile(path); reader = file;
@@ -37,7 +33,6 @@ public sealed class Ltx25MappedByteSourceTests
                     Assert.Throws<ObjectDisposedException>(() => file.TryGetTensorDataPointer(file.GetInfo("weight"), out _));
                     Assert.Throws<ObjectDisposedException>(() => file.ReadFloat32("weight"));
                 };
-                source = new(file);
             }
             else
             {
@@ -45,9 +40,7 @@ public sealed class Ltx25MappedByteSourceTests
                 if (!replaceBeforeMapping) Assert.True(file.TryGetTensorDataPointer(file.Tensors["weight"], out _));
                 read = file.ReadMappedBytes;
                 checkDisposedMapping = () => Assert.Throws<ObjectDisposedException>(() => file.ReadMappedBytes(dataOffset, new byte[1]));
-                source = new(file);
             }
-            using (source)
             {
                 void ReplacePath()
                 {
@@ -76,24 +69,20 @@ public sealed class Ltx25MappedByteSourceTests
                 Assert.Throws<ArgumentOutOfRangeException>(() => read(-1, tail));
                 Assert.Throws<ArgumentOutOfRangeException>(() => read(long.MaxValue - 1, tail));
 
-                // A path replacement after mapping must not change upload bytes.
+                // A path replacement after mapping must not change the bytes read.
                 // Windows read-share locking rejects it while the reader lives.
                 if (!replaceBeforeMapping) ReplacePath();
-                ((ICudaWeightSource)source).Read(dataOffset, destination, values.Length);
-                byte[] actual = new byte[values.Length]; Marshal.Copy(destination, actual, 0, actual.Length);
+                byte[] actual = new byte[values.Length];
+                Assert.Equal(values.Length, read(dataOffset, actual));
                 Assert.Equal(values, actual);
-                Assert.Equal(values.Length, source.ReadBytes);
                 reader.Dispose();
                 checkDisposedMapping();
                 Assert.Throws<ObjectDisposedException>(() => read(dataOffset, tail));
-                Assert.Throws<ObjectDisposedException>(() => ((ICudaWeightSource)source).Read(dataOffset, destination, 16));
             }
-            // A disposed upload source must release its retained reader delegate.
-            Assert.Throws<ObjectDisposedException>(() => ((ICudaWeightSource)source).Read(dataOffset, destination, 16));
         }
         finally
         {
-            reader?.Dispose(); Marshal.FreeHGlobal(destination);
+            reader?.Dispose();
             File.Delete(path); File.Delete(previous);
         }
     }

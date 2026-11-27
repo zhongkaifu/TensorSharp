@@ -33,45 +33,49 @@ public sealed partial class Ltx25DenoiserTests
         Equal(Floats(reference, "audioVelocity"), output.AudioVelocity, 2e-5, "audio velocity");
     }
 
+    /// <summary>A pass's later steps run the program its first step emitted (the sampler steps the same latent arrays in place),
+    /// writing only the new step's timestep features: each matches a fresh model's step bit for bit, and no step compiles again.
+    /// Equal content in new arrays emits again but finds the compiled plan by its signature.</summary>
     [Fact]
-    public void DiagnosticObserverReceivesExactForwardInputAndFiniteOracleOutput()
+    public void APassReusesItsStepProgramAndReadsEachStepsTimesteps()
     {
         using var fixture = new Checkpoint();
-        var allocator = new CpuAllocator(BlasEnum.DotNet);
-        using var model = new Ltx25Denoiser(fixture.Path, allocator);
+        using var backend = new Backend();
+        using var model = new Ltx25Denoiser(fixture.Path, backend.Allocator);
         var reference = Oracle.GetProperty("cases")[0];
         var input = Input(reference);
-        Ltx25DenoiserOutput? observed = null;
-        int calls = 0;
-        model.ForwardObserver = (actualInput, output) =>
+        var first = model.Forward(input);
+        Assert.Equal(1, model.Compiles);
+        foreach (float factor in new[] { .5f, .25f })
         {
-            ++calls;
-            Assert.Same(input, actualInput);
-            observed = output;
-            Equal(Floats(reference, "videoVelocity"), output.VideoVelocity, 2e-5, "observed video");
-            Equal(Floats(reference, "audioVelocity"), output.AudioVelocity, 2e-5, "observed audio");
-        };
-        var result = model.Forward(input);
-        Assert.Equal(1, calls);
-        Assert.Same(result, observed);
+            var later = At(input, input.VideoSigma * factor, input.AudioSigma * factor);
+            var reused = model.Forward(later);
+            Assert.Equal(1, model.Compiles);
+            using var fresh = new Ltx25Denoiser(fixture.Path, backend.Allocator);
+            var expected = fresh.Forward(At(Input(reference), later.VideoSigma, later.AudioSigma));
+            Assert.Equal(expected.VideoVelocity, reused.VideoVelocity);
+            Assert.Equal(expected.AudioVelocity, reused.AudioVelocity);
+            Assert.True(first.VideoVelocity.Zip(reused.VideoVelocity).Any(pair => pair.First != pair.Second));
+        }
+        var again = model.Forward(Input(reference));
+        Assert.Equal(1, model.Compiles);
+        Assert.Equal(first.VideoVelocity, again.VideoVelocity);
+        Assert.Equal(first.AudioVelocity, again.AudioVelocity);
     }
 
-    [Fact]
-    public void DiagnosticObserverCanStopBeforeSamplerUpdateAndReleaseForwardTemporaries()
+    /// <summary><paramref name="input"/>'s arrays at other sigmas (its per-token timesteps rescaled), as a later step of a pass.</summary>
+    private static Ltx25DenoiserInput At(Ltx25DenoiserInput input, float videoSigma, float audioSigma) => new()
     {
-        using var fixture = new Checkpoint();
-        var allocator = new CpuAllocator(BlasEnum.DotNet);
-        using var model = new Ltx25Denoiser(fixture.Path, allocator);
-        var reference = Oracle.GetProperty("cases")[0];
-        var input = Input(reference);
-        var stopped = new InvalidOperationException("diagnostic capture complete");
-        model.ForwardObserver = (_, _) => throw stopped;
-        Assert.Same(stopped, Assert.Throws<InvalidOperationException>(() => model.Forward(input)));
-        model.ForwardObserver = null!;
-        var result = model.Forward(input);
-        Equal(Floats(reference, "videoVelocity"), result.VideoVelocity, 2e-5, "video after observer stop");
-        Equal(Floats(reference, "audioVelocity"), result.AudioVelocity, 2e-5, "audio after observer stop");
-    }
+        Video = input.Video, VideoTokens = input.VideoTokens, Audio = input.Audio, AudioTokens = input.AudioTokens,
+        VideoContext = input.VideoContext, VideoContextTokens = input.VideoContextTokens,
+        AudioContext = input.AudioContext, AudioContextTokens = input.AudioContextTokens,
+        VideoPositions = input.VideoPositions, AudioPositions = input.AudioPositions,
+        VideoSigma = videoSigma, AudioSigma = audioSigma,
+        VideoTimesteps = input.VideoTimesteps?.Select(t => t * videoSigma / input.VideoSigma).ToArray(),
+        AudioTimesteps = input.AudioTimesteps?.Select(t => t * audioSigma / input.AudioSigma).ToArray(),
+        KeyframeMask = input.KeyframeMask, FrequencyPrecision = input.FrequencyPrecision,
+        UseReferenceLora = input.UseReferenceLora, CancellationToken = input.CancellationToken,
+    };
 
     [Fact]
     public void CachedPositionTablesTrackCallerMutationsAndResidencyEviction()
@@ -91,7 +95,7 @@ public sealed partial class Ltx25DenoiserTests
         Equal(Floats(changed, "videoVelocity"), shifted.VideoVelocity, 2e-5, "changed video coordinates");
         Equal(Floats(changed, "audioVelocity"), shifted.AudioVelocity, 2e-5, "changed cross-stream coordinates");
         Assert.True(first.VideoVelocity.Zip(shifted.VideoVelocity).Any(pair => Math.Abs(pair.First - pair.Second) > 1e-5));
-        model.ReleaseDeviceResidency();
+        model.ReleaseDevice();
         var rebuilt = model.Forward(Input(original));
         Equal(first.VideoVelocity, rebuilt.VideoVelocity, 1e-6, "rebuilt video");
         Equal(first.AudioVelocity, rebuilt.AudioVelocity, 1e-6, "rebuilt audio");
@@ -119,7 +123,7 @@ public sealed partial class Ltx25DenoiserTests
         using var model = new Ltx25Denoiser(fixture.Path, allocator);
         var reference = Oracle.GetProperty("cases")[0];
         var before = model.Forward(Input(reference));
-        model.ReleaseDeviceResidency();
+        model.ReleaseDevice();
         MlxBackend.ClearCache();
         var after = model.Forward(Input(reference));
         Equal(before.VideoVelocity, after.VideoVelocity, 1e-6, "MLX video after residency reload");

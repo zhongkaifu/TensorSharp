@@ -1,0 +1,145 @@
+{
+  "lane": "cuda|linux-x64|NVIDIA A40",
+  "implementation": "the retired direct LTX 2.5 denoiser (Ltx25Denoiser.Forward at c178bfc), ggml bb877c0c unchanged",
+  "checkpointSha256": "fe8cadbb75ac484c034ce630858b69c956fa36041f778d227cd14d83b35da1f8",
+  "adapterSha256": "513e9232150427ae8520711237676abdda5bb669676cbb1d1c240b6774861ff8",
+  "runtimeBitExact": true,
+  "cases": {
+    "case0": {
+      "video": {
+        "sha256": "14ef752084118f97bcce4bde573d575385e83b9c12257445cb03a9057ffed9a8",
+        "count": 12,
+        "maxAbs": 0.536545991897583,
+        "l2": 0.9893220061151106,
+        "bits": "3ef5ff363e4fab3a3b8711f0bf095b143e4cffdabc8d39eebe0914e23e56db343dfd4088beff1be43df385bcbe49e4d3"
+      },
+      "audio": {
+        "sha256": "591a6cccc56a2da2c03676b21308bc96ffa56df1084e752d0bd33ef9bf75f4cb",
+        "count": 12,
+        "maxAbs": 0.5201895236968994,
+        "l2": 0.6512652548083944,
+        "bits": "3d6426dabdf39e27bd954a22bf052b24bae026c0bdcba9553e031e5e3e34ba363d6d82dabcac96483c027e6c3e87261a"
+      },
+      "blocks": 2
+    },
+    "case0-ingredients": {
+      "video": {
+        "sha256": "41cab66f81186b3aa1f4db85086286884047161c88f7bd8d2550700251db7cf6",
+        "count": 12,
+        "maxAbs": 0.5301656126976013,
+        "l2": 1.0363110396547037,
+        "bits": "3ef5b5683e7bd79ebd187137bf07b8ef3e8ec096bd95a6a2bde341de3e82566c3dd40280bf01eae63e235d31be5d7b93"
+      },
+      "audio": {
+        "sha256": "c8e81cda4dcf5a81c6bbcda71c864bd079a2c57948820573d39190a39fb3a101",
+        "count": 12,
+        "maxAbs": 0.5202212333679199,
+        "l2": 0.6508934844051321,
+        "bits": "3d66fcbcbdf1d0ffbd98074ebf052d38ba5daf00bdcb1f143e0050ac3e35a9173d6efae7bcae55003b9e3d803e86fc66"
+      },
+      "blocks": 2
+    },
+    "case1": {
+      "video": {
+        "sha256": "7de6acd9b74ede0d646a7b12381b325c7d48045fc5c138b16bd6f4ce50b79f0c",
+        "count": 12,
+        "maxAbs": 0.7077632546424866,
+        "l2": 1.3922558516402361,
+        "bits": "3e27326a3f352ff9befd84debf095eeb3ebcef30be3e0b72bdfeb7e33e12f2093e2e4495bed075a63ef9e44fbef9cdfa"
+      },
+      "audio": {
+        "sha256": "ca85ad7b5989613e404be0d49e1cebfc20236d36eb46c1d6fc5ab1dcbe9925c5",
+        "count": 12,
+        "maxAbs": 0.6183418035507202,
+        "l2": 0.7807265912254677,
+        "bits": "3d62e0b0bdcb0cb7bd24d71dbf1e4ba6bc4aa6c0be08e7e03e0275243e8de29d3d400de2bd6ba98abc2e21883e9ea1fc"
+      },
+      "blocks": 2
+    },
+    "case1-ingredients": {
+      "video": {
+        "sha256": "e5121f4b625f295003b3b9435e89c0bc6de134e52c16c48a02c6ef2b42192457",
+        "count": 12,
+        "maxAbs": 0.7359886169433594,
+        "l2": 1.443387070852628,
+        "bits": "3e1cee363f3c69c0bf089c06bf0683523ed14c2fbe6e4e8ebdee01323e5780b23e0a8ba8bedb47c73efe9acdbef52920"
+      },
+      "audio": {
+        "sha256": "65dcc98cd66bb77fa2fbc7c9412635abf88609a9b79bded5471435fa443b38ca",
+        "count": 12,
+        "maxAbs": 0.6191024780273438,
+        "l2": 0.7797892660184754,
+        "bits": "3d649226bdc84f12bd2a8f97bf1e7d80bc3b8c78be09c5093dfd36f13e8ea0b13d3ccdbabd6a74f2bc6219843e9cb09f"
+      },
+      "blocks": 2
+    },
+    "case2": {
+      "video": {
+        "sha256": "f21ef6d83516e64abfd4b6e6f5749230c1f7eb44941a54000e53da7106f2fd4d",
+        "count": 12,
+        "maxAbs": 0.5939319133758545,
+        "l2": 1.2413351445000556,
+        "bits": "3d79a2aa3f0137aabee3d04dbf180bec3e7f0df6be46d087be7c407a3e97f0313d3809e4bf0b50533e0cb158bed0b495"
+      },
+      "audio": {
+        "sha256": "0c00676e66576c7933d8af2a5bbbf74dbb0367e8597653ac9700d9dc757f6f06",
+        "count": 12,
+        "maxAbs": 0.5209752321243286,
+        "l2": 0.673393683727751,
+        "bits": "3d3d6565bdfff627bd9fc162bf055ea2bc70ea88bde5fa403df5467f3e50bdd43d4f1b42bd00d332ba2cb1803e961654"
+      },
+      "blocks": 2
+    },
+    "case2-ingredients": {
+      "video": {
+        "sha256": "83c3b465292c6ff3e285c1cf0537bc25890b2e3d16e260f39b119f591eb2725a",
+        "count": 12,
+        "maxAbs": 0.6010547876358032,
+        "l2": 1.3564964842894365,
+        "bits": "3d2ee38e3f0bc16bbef716fabf19deba3eb0db02be90caa9be7bcfec3ebd124bbb9f6f60bf0e9e6f3e470262bee5fcc5"
+      },
+      "audio": {
+        "sha256": "84f4cf52a630b4246d42b8a2b590ec931458959329be5366d330ef5d4500c8e1",
+        "count": 12,
+        "maxAbs": 0.5197148323059082,
+        "l2": 0.673515369736418,
+        "bits": "3d42f89cbe0009f2bda522ccbf050c08bc5b6ff8bde7af4f3decc9c33e5331343d5147ecbd06233ebb9e19303e969c2e"
+      },
+      "blocks": 2
+    },
+    "case3": {
+      "video": {
+        "sha256": "54bb85c845470599229db94d963e2def0eb52fd5bbb61bdc2abca9e9dec39958",
+        "count": 12,
+        "maxAbs": 0.5185805559158325,
+        "l2": 0.9757950211290064,
+        "bits": "3ef395f03e2ea3033d068c94bf04c1b23e61d6d0bd3fa5fabe0c203b3e601f2a3de2d77cbef9b1fb3e00a252be55534b"
+      },
+      "audio": {
+        "sha256": "29b87bd3be6a5cb0f53443e894c5317542cd3e99209ce60caeddc4f1ce7f549b",
+        "count": 12,
+        "maxAbs": 0.5217180848121643,
+        "l2": 0.6501574196266768,
+        "bits": "3d4a24b0bdfb41d7bd92c618bf058f513c3e6798bdf51e1e3ddf55873e5125fa3d66d739bc899ee83abfeb603e731b46"
+      },
+      "blocks": 2
+    },
+    "case3-ingredients": {
+      "video": {
+        "sha256": "14257b9fb8ac830e775bc0c0c4d8bcb828d2958f3f2bc17680920415c4755636",
+        "count": 12,
+        "maxAbs": 0.5089765787124634,
+        "l2": 1.0215140926330146,
+        "bits": "3ef4fb923e5b72aabc3267d8bf024c4a3e983741bdd09556bde374c13e8280a93dc5e496befdc8013e288e48be67dab3"
+      },
+      "audio": {
+        "sha256": "5d9872a624075a7624bef23f9f536977cffce85487d46fdde482189c5a58d6f5",
+        "count": 12,
+        "maxAbs": 0.5208959579467773,
+        "l2": 0.6498879813553119,
+        "bits": "3d4d7db1bdfb6d75bd957012bf0559703c3b2260bdf58a423dda10e53e530aa53d69c741bc8840acbab00c403e72dfe2"
+      },
+      "blocks": 2
+    }
+  }
+}

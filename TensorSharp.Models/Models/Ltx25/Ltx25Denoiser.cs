@@ -1,14 +1,27 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+//
+// LTX 2.5's AV denoiser on the diffusion runtime: one step is one GraphProgram (the two streams' patchify projections, the
+// nine-way AdaLN of each stream's timesteps, the 48 blocks' self, text and cross-stream attentions and feed-forwards, and the
+// output heads), run by a tensor executor this denoiser owns (CUDA, MLX or the managed CPU executor). The program is the op
+// sequence of the original Lightricks graph as the direct denoiser computed it (whole-inner Q/K RMS norms, per-head split
+// RoPE, 2 * sigmoid head gates, frozen pre-cross-attention stream states), and the executor takes that denoiser's kernels: its
+// products as DirectLinear ran them (TensorGraphExecutor.DirectProducts), its norms (GraphFusion.RowNorm), its per-head
+// rotary tables (HeadRotary), head gates (HeadGate) and F32 attention (FullAttention).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
+using TensorSharp.Cpu;
 using TensorSharp.Cuda;
+using TensorSharp.Graph;
 using TensorSharp.MLX;
 using TensorSharp.Models.Direct;
+using TensorSharp.Models.Graph;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Models.Video;
 using TensorSharp.Runtime;
 
@@ -47,196 +60,588 @@ public sealed class Ltx25DenoiserInput
 
 public sealed record Ltx25DenoiserOutput(float[] VideoVelocity, float[] AudioVelocity, int ExecutedBlocks);
 
-/// <summary>Experimental TensorSharp-owned LTX 2.5 AV transformer component.
-/// The graph follows the original Lightricks source, including whole-inner Q/K
-/// RMS normalization, head gates, per-head split RoPE, nine-way AdaLN and frozen
-/// pre-cross-attention stream states. It is not registered as a generation
-/// pipeline. Text conditioning, masks, VAEs and generation are separate gates.</summary>
-public sealed class Ltx25Denoiser : IDisposable
+/// <summary>
+/// The LTX 2.5 AV transformer as an <see cref="IDenoiser"/>. Making one maps the GGUF; the first step makes the projections
+/// resident (on CUDA reading the file ahead in the order the blocks run) and compiles the step's program, which every later
+/// step of the same geometry replays with new inputs. The Ingredients IC-LoRA arrives as the step's adapter set
+/// (<see cref="Ltx25LoraSet"/>): its unscaled B @ A updates are added to the adapted projections in exact F32.
+/// </summary>
+public sealed class Ltx25Denoiser : IDenoiser
 {
-    private readonly GgufFile _file;
-    private readonly DirectContext _ctx;
+    /// <summary>The name of the audio stream in <see cref="DenoiseStepInputs.Streams"/> and <see cref="StepOutput.Streams"/>.</summary>
+    public const string AudioStream = "audio";
+
+    /// <summary>Plans kept, by signature: a clip's two passes (and an Ingredients pass) each compile their own.</summary>
+    private const int CachedPlans = 4;
+
+    private readonly Ltx25DenoiserWeights _w;
     private readonly IAllocator _allocator;
-    private readonly CudaLtx25ProjectionSession _cudaProjection;
-    private readonly CudaLtx25AttentionSession _cudaAttention;
-    private readonly bool _forceCudaAttention;
-    private readonly bool _cudaFusedHeadGates;
-    private Ltx25CudaFilePrefault _cudaPrefault;
-    // CUDA weights are uploaded and not released since; the next forward needs no read-ahead.
-    private bool _cudaWeightsUploaded;
-    private readonly Dictionary<string, DirectLinear> _linears = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, Tensor> _weights = new(StringComparer.Ordinal);
-    private readonly object _sync = new();
-    private Ltx25LoraAdapter _referenceLora;
-    private string _referenceLoraPath;
-    private bool _useReferenceLora;
-    private CancellationToken _cancellationToken;
-    private RopeCache _ropeCache;
+    private readonly TensorGraphExecutor _executor;
+    private readonly object _gate = new();
+    private readonly List<(ulong, ulong, IGraphPlan)> _plans = new();
+    private readonly HashSet<Ltx25Weight> _warmed = new();
+    private Ltx25CudaFilePrefault _prefault;
+    private RopeCache _rope;
+    private (float[] Mask, Tensor Absolute) _keyframes;
+    private Ltx25LoraSet _ownedLora;      // the component surface's adapter (Forward with UseReferenceLora)
+    private Ltx25LoraSet _boundLora;      // the set whose factors the cached plans and device copies hold
+    private bool _resident;
+    private bool _uploading;
+    private MappedFileReadAhead _uploadRead;
     private bool _disposed;
-    public Ltx25Config Config { get; }
-    public long OptimizedCudaProjections => _cudaProjection?.ExecutedProjections ?? 0;
-    public string OptimizedCudaModulePath => _cudaProjection?.ModulePath;
-    public bool OptimizedCudaModuleAvailable => _cudaProjection?.IsAvailable == true;
-    public long OptimizedCudaAttentions => _cudaAttention?.ExecutedAttentions ?? 0;
-    public long OptimizedCudaHeadGates => _cudaAttention?.ExecutedHeadGates ?? 0;
-    public long CudaAttentionWorkspaceBytes => _cudaAttention?.ScoreCapacityBytes ?? 0;
-    public long OptimizedCudaF16Projections => _cudaProjection?.ExecutedF16Projections ?? 0;
-    public long OptimizedCudaF16Dequantizations => _cudaProjection?.ExecutedF16Dequantizations ?? 0;
-    public bool OptimizedCudaF16Available => _cudaProjection?.F16DequantAvailable == true;
-    public long CudaProjectionWorkspaceBytes => _cudaProjection?.F16ScratchBytes ?? 0;
-    public long CudaPrefaultReadBytes => _cudaPrefault?.ReadBytes ?? 0;
-    public long CudaPrefaultResidentBytes => _cudaPrefault?.ResidentBytes ?? 0;
-    public long CudaPrefaultRanges => _cudaPrefault?.Ranges ?? 0;
-    public double CudaPrefaultMilliseconds => _cudaPrefault?.Milliseconds ?? 0;
-    public string CudaPrefaultFailure => _cudaPrefault?.Failure;
-    public long CudaSourceUploadedBytes => _cudaPrefault?.SourceUploadedBytes ?? 0;
-    public long CudaSourceUploadedWeights => _cudaPrefault?.SourceUploadedWeights ?? 0;
-    public long CudaSourcePinnedBytes => _cudaPrefault?.SourcePinnedBytes ?? 0;
-    public double CudaSourceUploadMilliseconds => _cudaPrefault?.SourceUploadMilliseconds ?? 0;
-    public bool ReferenceLoraLoaded => _referenceLora != null;
-    public int ReferenceLoraProjections => _referenceLora?.ProjectionCount ?? 0;
-    internal int CachedReferenceLoraProjections => _referenceLora?.CachedProjectionCount ?? 0;
 
-    // Internal diagnostic observer, installed before execution by validation
-    // tools. Arrays are borrowed and must not be mutated. Null on normal models;
-    // called after finite output readback and before the sampler advances state.
-    internal Action<Ltx25DenoiserInput, Ltx25DenoiserOutput> ForwardObserver { get; set; }
+    public Ltx25Config Config => _w.Config;
 
-    // Synchronizing between phases changes execution overlap. This diagnostic
-    // ranks phases only; its totals must never be reported as throughput.
-    private sealed class StageTiming : IDisposable
-    {
-        private readonly DirectContext _context;
-        private readonly Dictionary<string, double> _milliseconds = new(StringComparer.Ordinal);
-        private long _previous;
-        private StageTiming(DirectContext context)
-        {
-            _context = context;
-            context.CudaAllocator.Synchronize();
-            _previous = Stopwatch.GetTimestamp();
-        }
-        public static StageTiming Start(DirectContext context) => context.IsCuda &&
-            Environment.GetEnvironmentVariable("TS_LTX25_STAGE_TIMING") == "1" ? new(context) : null;
-        public void Mark(string stage)
-        {
-            _context.CudaAllocator.Synchronize();
-            long now = Stopwatch.GetTimestamp();
-            _milliseconds[stage] = _milliseconds.GetValueOrDefault(stage) + (now - _previous) * 1000.0 / Stopwatch.Frequency;
-            _previous = now;
-        }
-        public void Dispose() => Console.WriteLine("[ltx25-profile] synchronized CUDA host phases (diagnostic only): " +
-            string.Join(" ", _milliseconds.Select(pair => pair.Key + "=" + pair.Value.ToString("F3", System.Globalization.CultureInfo.InvariantCulture) + "ms")));
-    }
+    /// <summary>The checkpoint's file.</summary>
+    public string Path => _w.Path;
 
+    /// <summary>Steps that compiled their program (the rest replayed a cached plan).</summary>
+    internal int Compiles { get; private set; }
+
+    /// <summary>The executor the steps run on (tests).</summary>
+    internal TensorGraphExecutor Executor => _executor;
+
+    public bool ReferenceLoraLoaded => _ownedLora != null;
+    public int ReferenceLoraProjections => _ownedLora?.ProjectionCount ?? 0;
+    internal int CachedReferenceLoraProjections => _ownedLora?.LoadedProjectionCount ?? 0;
+
+    /// <summary>The denoiser of <paramref name="checkpoint"/> on <paramref name="allocator"/>'s backend: CUDA, MLX or the CPU,
+    /// each on a tensor executor of its own that takes the direct engines' kernels. <paramref name="referenceLoraPath"/>, when
+    /// given, is an Ingredients adapter <see cref="Forward"/> applies to inputs that ask for it.</summary>
     public Ltx25Denoiser(string checkpoint, IAllocator allocator, string referenceLoraPath = null)
     {
-        ArgumentNullException.ThrowIfNull(allocator);
-        _allocator = allocator;
-        _file = new GgufFile(checkpoint);
+        _allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
+        _w = new Ltx25DenoiserWeights(checkpoint, allocator);
         try
         {
-            Config = Ltx25Config.FromGguf(_file);
-            _ctx = new DirectContext(allocator);
-            if (referenceLoraPath != null)
-            {
-                _referenceLoraPath = Path.GetFullPath(referenceLoraPath);
-                _referenceLora = new(_referenceLoraPath, _file, Config, allocator);
-            }
-            if (allocator is CudaAllocator cuda)
-            {
-                _cudaProjection = new(cuda, Environment.GetEnvironmentVariable("TS_LTX25_CUDA_REQUIRE_TILE") == "1");
-                string attentionPolicy = Environment.GetEnvironmentVariable("TS_LTX25_CUDA_ATTN");
-                _forceCudaAttention = attentionPolicy == "1";
-                _cudaFusedHeadGates = Environment.GetEnvironmentVariable("TS_LTX25_CUDA_FUSED_HEAD_GATE") != "0";
-                if (attentionPolicy != "0")
-                    _cudaAttention = new(cuda);
-            }
+            _executor = CreateExecutor(allocator);
+            if (referenceLoraPath != null) _ownedLora = Ltx25LoraSet.Open(referenceLoraPath, _w.File, _w.Config);
         }
-        catch { _cudaAttention?.Dispose(); _cudaProjection?.Dispose(); _referenceLora?.Dispose(); _ctx?.Dispose(); _file.Dispose(); throw; }
+        catch
+        {
+            (_executor as IDisposable)?.Dispose();
+            _w.Dispose();
+            throw;
+        }
     }
 
-    /// <summary>Attach or replace the Ingredients adapter between denoiser forwards.</summary>
-    internal void LoadIngredientsAdapter(string path)
+    /// <summary>The executor a denoiser on <paramref name="allocator"/>'s backend runs its steps on, with direct products and
+    /// a wide DiT step's in-place regions (the adapter's LoraLinear updates).</summary>
+    internal static TensorGraphExecutor CreateExecutor(IAllocator allocator) => allocator switch
     {
-        string fullPath = Path.GetFullPath(path);
-        lock (_sync)
+        CudaAllocator cuda => new CudaGraphExecutor(cuda) { DirectProducts = true, ServesWideDitRegions = true },
+        MlxAllocator mlx => new MlxGraphExecutor(mlx) { DirectProducts = true, ServesWideDitRegions = true },
+        CpuAllocator => new ManagedGraphExecutor(allocator) { DirectProducts = true, ServesWideDitRegions = true },
+        _ => throw new NotSupportedException($"LTX 2.5's denoiser runs on CUDA, MLX or the CPU, not {allocator.GetType().Name}."),
+    };
+
+    // ---- IDenoiser
+
+    public DenoiserCaps Caps { get; } = new() { Streams = new[] { AudioStream } };
+
+    public long WeightBytes => _w.Bytes + (AdapterBytes?.Invoke() ?? 0);
+
+    /// <summary>The device bytes of the Ingredients factors the next steps may bind, for residency.</summary>
+    internal Func<long> AdapterBytes { get; set; }
+
+    /// <summary>A step's activations for <paramref name="workload"/>'s target (its latent cells are the video tokens) and
+    /// references (appended tokens): <see cref="WorkingBytesFor"/>.</summary>
+    public long WorkingBytes(DiffusionWorkload workload)
+    {
+        long tokens = workload.Target.Count / Math.Max(1, workload.Target.Channels);
+        if (workload.References != null)
+            foreach (LatentShape r in workload.References) tokens += r.Count / Math.Max(1, r.Channels);
+        return WorkingBytesFor(tokens);
+    }
+
+    /// <summary>
+    /// A step's working memory at <paramref name="videoTokens"/> video tokens: the widest intermediates a block holds at once
+    /// (the feed-forward's 4x-wide F32 rows and its F16 prefill copies, the q, k, v and attention rows of the video stream), the
+    /// per-token AdaLN coefficients of a guided clip, the bounded attention score workspace and the F16 weight scratch of the
+    /// direct products.
+    /// </summary>
+    public long WorkingBytesFor(long videoTokens)
+    {
+        long dim = _w.Config.VideoDim;
+        long rows = Math.Max(1, videoTokens);
+        long perToken = dim * sizeof(float) * (4 + 6) + dim * 4 * sizeof(ushort) + 9L * dim * sizeof(float) * 2;
+        return rows * perToken + (256L << 20) + 4L * dim * dim * 4 * sizeof(ushort);
+    }
+
+    /// <summary>The direct denoiser released its device copies before every decode (the VAE's activations need the room), and
+    /// re-uploaded them from the mapping at the next clip's first step: so does this one.</summary>
+    public bool ReleaseAfterPhase => true;
+
+    public StepOutput Step(DenoiseStepInputs inputs, AdapterSet adapters, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(inputs);
+        cancellationToken.ThrowIfCancellationRequested();
+        var input = inputs.Layout.FamilyLayout as Ltx25DenoiserInput
+            ?? throw new ArgumentException("the layout was not packed by LTX 2.5's family", nameof(inputs));
+        Ltx25DenoiserOutput output = Run(input, LoraOf(adapters), blockLimit: null, cancellationToken);
+        return new StepOutput(output.VideoVelocity, new Dictionary<string, float[]> { [AudioStream] = output.AudioVelocity });
+    }
+
+    /// <summary>The Ingredients set a request's adapters carry (each adapter's payload is the one set the model loaded), or
+    /// null.</summary>
+    private static Ltx25LoraSet LoraOf(AdapterSet adapters)
+    {
+        if (adapters is null or { IsEmpty: true }) return null;
+        var set = adapters.Adapters[0].Payload as Ltx25LoraSet
+            ?? throw new ArgumentException($"LoRA {adapters.Adapters[0].Name} was not loaded by LTX 2.5's Ingredients loader.", nameof(adapters));
+        foreach (DiffusionAdapter a in adapters.Adapters)
+            if (!ReferenceEquals(a.Payload, set))
+                throw new ArgumentException("A clip's LoRA adapters are one loaded set: the adapters carry different sets.", nameof(adapters));
+        return set;
+    }
+
+    /// <summary>One step on the component surface (tests and the A/B tools): the input's own adapter request
+    /// (<see cref="Ltx25DenoiserInput.UseReferenceLora"/> applies the adapter given at construction).</summary>
+    /// <param name="blockLimit">A diagnostic partial-checkpoint limit. Output
+    /// records the actual count. Omit it to execute the complete denoiser.</param>
+    public Ltx25DenoiserOutput Forward(Ltx25DenoiserInput input, int? blockLimit = null)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        if (input.UseReferenceLora && _ownedLora == null)
+            throw new InvalidOperationException("Ingredients reference generation requires the LTX 2.5 Ingredients IC-LoRA adapter.");
+        return Run(input, input.UseReferenceLora ? _ownedLora : null, blockLimit, input.CancellationToken);
+    }
+
+    private Ltx25DenoiserOutput Run(Ltx25DenoiserInput input, Ltx25LoraSet lora, int? blockLimit, CancellationToken ct)
+    {
+        lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_referenceLora != null && string.Equals(_referenceLoraPath, fullPath, StringComparison.Ordinal))
-                return;
-            var loaded = new Ltx25LoraAdapter(fullPath, _file, Config, _allocator);
-            Ltx25LoraAdapter previous = _referenceLora;
-            _referenceLora = loaded;
-            _referenceLoraPath = fullPath;
-            previous?.Dispose();
-        }
-    }
-
-    private DirectLinear Linear(string name)
-    {
-        if (_linears.TryGetValue(name, out var value)) return value;
-        string p = Config.Prefix + name;
-        value = DirectLinear.FromGguf(_ctx, _file, p + ".weight",
-            _file.Tensors.ContainsKey(p + ".bias") ? p + ".bias" : null, ltxProjection: _cudaProjection);
-        try
-        {
-            if (_ctx.IsCuda && !_file.IsSplit && Environment.GetEnvironmentVariable("TS_LTX25_CUDA_PREFAULT") != "0")
+            Validate(input);
+            ct.ThrowIfCancellationRequested();
+            int blocks = blockLimit ?? Config.Layers;
+            if (blocks <= 0 || blocks > Config.Layers) throw new ArgumentOutOfRangeException(nameof(blockLimit));
+            if (lora != null && !lora.Fits(Config))
+                throw new ArgumentException("The Ingredients adapter was loaded for an LTX checkpoint of another shape.", nameof(lora));
+            Bind(lora);
+            MakeResident();
+            bool ran = false;
+            try
             {
-                var info = _file.Tensors[p + ".weight"];
-                _cudaPrefault ??= new(_file);
-                _cudaPrefault.Prepare(_ctx.CudaAllocator, value.CacheKey, checked(_file.DataOffset + (long)info.Offset),
-                    _file.GetTensorByteCount(info), (int)info.Type, value.InDim, value.OutDim, _cancellationToken);
+                Ltx25DenoiserOutput output = RunStep(input, lora, blocks);
+                ran = true;
+                return output;
+            }
+            finally
+            {
+                EndUpload(ran && blocks == Config.Layers);
             }
         }
-        catch { value.Dispose(); throw; }
-        _linears.Add(name, value);
-        return value;
     }
 
-    private Tensor Project(string name, Tensor input)
+    private Ltx25DenoiserOutput RunStep(Ltx25DenoiserInput input, Ltx25LoraSet lora, int blocks)
     {
-        _cancellationToken.ThrowIfCancellationRequested();
-        var output = Linear(name).Forward(input);
-        try
+        RopeCache rope = Rope(input);
+        Tensor keyframes = Keyframes(input);
+        float[][] features = StepFeatures(input);
+        // A pass's later steps run the program its first step emitted: the latents, contexts, tables and adapter are the
+        // same objects (the sampler steps its state in place), so only the timestep features are written again, into the
+        // arrays the live trace binds. Anything else new (another pass, a request, a caller's fresh arrays) emits again.
+        var key = new LiveKey(input.Video, input.Audio, input.VideoContext, input.AudioContext, rope, keyframes, lora, blocks,
+            features.Select(f => f.Length).ToArray());
+        if (_live == null || !_live.Key.Equals(key))
         {
-            if (_useReferenceLora) _referenceLora.Add(name, input, output, _cancellationToken);
-            return output;
+            _live?.Dispose();
+            _live = null;
+            var step = new StepValues(input, blocks, lora, rope, keyframes, features);
+            var trace = new GraphEmitter(_executor, record: false);
+            try { Emit(trace, step); }
+            catch { trace.Dispose(); throw; }
+            IGraphPlan plan = PlanFor(trace.Signature);
+            GraphEmitter runner = trace;
+            if (plan == null)
+            {
+                trace.Dispose();
+                var clock = Stopwatch.StartNew();
+                var recorded = new GraphEmitter(_executor, record: true);
+                try
+                {
+                    Emit(recorded, step);
+                }
+                catch
+                {
+                    recorded.Dispose();
+                    throw;
+                }
+                runner = recorded;
+                double emitted = clock.Elapsed.TotalSeconds;
+                plan = recorded.Compile(replayable: true);
+                Keep(recorded.Signature, plan);
+                Compiles++;
+                Console.WriteLine($"  [ltx25] step program for {input.VideoTokens} video + {input.AudioTokens} audio tokens: " +
+                    $"emitted in {emitted:F2}s, compiled in {clock.Elapsed.TotalSeconds - emitted:F2}s");
+            }
+            _live = new LiveStep(key, runner, plan, features);
         }
-        catch { output.Dispose(); throw; }
+        else
+            for (int i = 0; i < features.Length; i++) Array.Copy(features[i], _live.Features[i], features[i].Length);
+        if (!_live.Emitter.Run(_live.Plan))
+        {
+            string error = _live.Plan.LastError;
+            _live.Dispose();
+            _live = null;
+            throw new InvalidOperationException("LTX denoiser step failed: " + error);
+        }
+        float[] video = (float[])_live.Plan.Outputs[0].Clone(), audio = (float[])_live.Plan.Outputs[1].Clone();
+        foreach (float v in video) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        foreach (float v in audio) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        return new Ltx25DenoiserOutput(video, audio, blocks);
     }
 
-    private Tensor Weight(string name)
+    /// <summary>What makes a step's program and bindings the previous step's: the very arrays and tables it binds and its shape.</summary>
+    private sealed record LiveKey(float[] Video, float[] Audio, float[] VideoContext, float[] AudioContext, RopeCache Rope, Tensor Keyframes,
+        Ltx25LoraSet Lora, int Blocks, int[] FeatureLengths)
     {
-        if (_weights.TryGetValue(name, out var value)) return value;
-        string full = Config.Prefix + name;
-        value = _ctx.Own(_ctx.FromFloats(DirectOps.DequantTensor(_file, full),
-            _file.Tensors[full].Shape.Reverse().Select(dimension => checked((long)dimension)).ToArray()));
-        _weights.Add(name, value);
-        return value;
+        public bool Equals(LiveKey other) => other != null && ReferenceEquals(Video, other.Video) && ReferenceEquals(Audio, other.Audio)
+            && ReferenceEquals(VideoContext, other.VideoContext) && ReferenceEquals(AudioContext, other.AudioContext)
+            && ReferenceEquals(Rope, other.Rope) && ReferenceEquals(Keyframes, other.Keyframes) && ReferenceEquals(Lora, other.Lora)
+            && Blocks == other.Blocks && FeatureLengths.AsSpan().SequenceEqual(other.FeatureLengths);
+
+        public override int GetHashCode() => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Video);
     }
 
-    private sealed class TimeState : IDisposable
+    /// <summary>The last step's trace (its inputs pinned), plan and timestep-feature arrays.</summary>
+    private sealed class LiveStep : IDisposable
     {
-        public Tensor Main, Embedded, Prompt, CrossScaleShift, CrossGate;
+        public LiveStep(LiveKey key, GraphEmitter emitter, IGraphPlan plan, float[][] features)
+        {
+            Key = key; Emitter = emitter; Plan = plan; Features = features;
+        }
+
+        public LiveKey Key { get; }
+        public GraphEmitter Emitter { get; }
+        public IGraphPlan Plan { get; }
+        public float[][] Features { get; }
+
+        public void Dispose() => Emitter.Dispose();
+    }
+
+    private LiveStep _live;
+
+    /// <summary>The step's six timestep-feature rows: each stream's main (and cross scale/shift) timesteps, its prompt sigma and the
+    /// other stream's sigma for its cross gate, each through <see cref="TimestepFeatures"/> at its multiplier.</summary>
+    private float[][] StepFeatures(Ltx25DenoiserInput input)
+    {
+        Ltx25Config c = Config;
+        return new[]
+        {
+            TimestepFeatures(input.VideoTimesteps ?? new[] { input.VideoSigma }, c.TimestepScale),
+            TimestepFeatures(new[] { input.VideoSigma }, c.TimestepScale),
+            TimestepFeatures(new[] { input.AudioSigma }, c.CrossGateTimestepScale),
+            TimestepFeatures(input.AudioTimesteps ?? new[] { input.AudioSigma }, c.TimestepScale),
+            TimestepFeatures(new[] { input.AudioSigma }, c.TimestepScale),
+            TimestepFeatures(new[] { input.VideoSigma }, c.CrossGateTimestepScale),
+        };
+    }
+
+    private IGraphPlan PlanFor((ulong, ulong) signature)
+    {
+        for (int i = 0; i < _plans.Count; i++)
+        {
+            var (a, b, plan) = _plans[i];
+            if ((a, b) != signature) continue;
+            // Most recently used last.
+            _plans.RemoveAt(i);
+            _plans.Add((a, b, plan));
+            return plan;
+        }
+        return null;
+    }
+
+    private void Keep((ulong, ulong) signature, IGraphPlan plan)
+    {
+        if (_plans.Count >= CachedPlans)
+        {
+            _plans[0].Item3.Dispose();
+            _plans.RemoveAt(0);
+        }
+        _plans.Add((signature.Item1, signature.Item2, plan));
+    }
+
+    private void DropPlans()
+    {
+        _live?.Dispose();
+        _live = null;
+        foreach (var (_, _, plan) in _plans) plan.Dispose();
+        _plans.Clear();
+    }
+
+    /// <summary>Unpin the last step's inputs (a request's state arrays) and forget its trace; the plans stay.</summary>
+    private void DropLive()
+    {
+        _live?.Dispose();
+        _live = null;
+    }
+
+    /// <summary>Bind <paramref name="lora"/> for the step: another set than the one bound before drops the old set's device
+    /// copies (the plans that bound it differ in signature and age out).</summary>
+    private void Bind(Ltx25LoraSet lora)
+    {
+        if (lora == null || ReferenceEquals(lora, _boundLora)) return;
+        if (_boundLora != null) ReleaseFactors(_boundLora);
+        _boundLora = lora;
+    }
+
+    /// <summary>Forget the bound adapter set (its factors' device copies and the plans that bind them): the model calls it under
+    /// its generation lock before it disposes a set it replaces.</summary>
+    internal void ReleaseLora()
+    {
+        lock (_gate)
+        {
+            if (_disposed || _boundLora == null) return;
+            DropPlans();
+            ReleaseFactors(_boundLora);
+            _boundLora = null;
+        }
+    }
+
+    // ---- residency
+
+    /// <summary>
+    /// Make the projections resident for the step about to run. On CUDA each one uploads at its first product (the routes cache
+    /// it by its host address), as the direct denoiser uploaded each at its first use, so a block's upload overlaps the device
+    /// work queued for the blocks before it; just before, its file pages are warmed (<see cref="Ltx25CudaFilePrefault"/>)
+    /// and the file's read-ahead moves to its block (the prelude and output tensors first, then one stage per block: the
+    /// file stores tensors alphabetically). The step's end (<see cref="EndUpload"/>) stops the read-ahead. On MLX every
+    /// projection is converted to its device form before the step.
+    /// </summary>
+    private void MakeResident()
+    {
+        if (_resident || _uploading) return;
+        if (_allocator is CudaAllocator)
+        {
+            var stages = new List<Ltx25Weight>[Config.Layers + 1];
+            for (int i = 0; i < stages.Length; i++) stages[i] = new();
+            foreach (Ltx25Weight w in _w.Projections)
+            {
+                int block = _w.BlockOf(w.Name);
+                stages[block < 0 ? 0 : block + 1].Add(w);
+            }
+            foreach (List<Ltx25Weight> s in stages) s.Sort((a, b) => a.FileOffset.CompareTo(b.FileOffset));
+            _uploadRead = _w.File.IsSplit ? null : MappedFileReadAhead.TryStart(_w.File.FilePaths[0],
+                stages.Select(s => s.Select(w => (w.FileOffset, w.Bytes))),
+                message => Console.WriteLine("  [ltx25] warning: denoiser " + message));
+            _prefault ??= _w.File.IsSplit ? null : new Ltx25CudaFilePrefault(_w.File);
+            _executor.BeforeDirectProduct = weight =>
+            {
+                // The adapter's factors are host copies, not the checkpoint's pages.
+                if (weight is not Ltx25Weight w || w.FileOffset < 0) return;
+                int block = _w.BlockOf(w.Name);
+                if (block >= 0) _uploadRead?.Enter(block + 1);
+                if (_prefault != null && _warmed.Add(w)) _prefault.Warm(w.Data, w.FileOffset, w.Bytes);
+            };
+            _uploading = true;
+            return;
+        }
+        if (_allocator is MlxAllocator mlx)
+            foreach (Ltx25Weight w in _w.Projections)
+                if (MlxQuantizedOps.CanPreloadDirectFloatType(w.Format))
+                    MlxQuantizedOps.PreloadDirectFloatWeight(mlx, w.Data, w.Data, w.Format, w.Ne0, w.Ne1, w.Bytes);
+        _resident = true;
+    }
+
+    /// <summary>The end of a step that uploaded its projections: the hook goes, the read-ahead stops (its summary logged), and
+    /// the projections count as resident once a complete step ran (a partial one uploaded only its blocks).</summary>
+    private void EndUpload(bool complete)
+    {
+        if (!_uploading) return;
+        _executor.BeforeDirectProduct = null;
+        _uploading = false;
+        if (_uploadRead != null)
+        {
+            _uploadRead.Stop();
+            Console.WriteLine($"  [ltx25] denoiser upload {_uploadRead.Describe()}");
+            _uploadRead.Dispose();
+            _uploadRead = null;
+        }
+        _resident = complete;
+    }
+
+    /// <summary>Drop the device copy of the host bytes at <paramref name="data"/>: the CUDA and MLX resident-weight caches key
+    /// them by that address (a copy left there outlives the denoiser, and a file mapped later at that address would compute
+    /// with the old values); the managed executor's F32 copies by the same address.</summary>
+    private void ReleaseCopy(IntPtr data)
+    {
+        if (data == IntPtr.Zero) return;
+        switch (_allocator)
+        {
+            case CudaAllocator cuda: CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data); break;
+            case MlxAllocator mlx: MlxQuantizedOps.ReleaseQuantizedWeight(mlx, data); _executor.Invalidate(data); break;
+            default: _executor.Invalidate(data); break;
+        }
+    }
+
+    private void ReleaseFactors(Ltx25LoraSet set)
+    {
+        foreach (IntPtr factor in set.FactorAddresses) ReleaseCopy(factor);
+    }
+
+    /// <summary>A clip's denoising ended: the direct kernels' scratch goes back to the device before the decode.</summary>
+    public void FinishRequest()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            DropLive();
+            if (_executor is CudaGraphExecutor cuda) cuda.ReleaseDirectWorkspaces();
+        }
+    }
+
+    public void ReleaseWorkspace()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            DropPlans();
+            if (_executor is CudaGraphExecutor cuda) cuda.ReleaseDirectWorkspaces();
+        }
+    }
+
+    /// <summary>Drops the projections' and factors' device copies, the position tables and the plans; the mapping and the
+    /// small tensors stay, so the next step uploads from memory again.</summary>
+    public void ReleaseDevice()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            DropPlans();
+            _rope?.Dispose();
+            _rope = null;
+            _keyframes.Absolute?.Dispose();
+            _keyframes = default;
+            if (_executor is CudaGraphExecutor cuda) cuda.ReleaseDirectWorkspaces();
+            foreach (Ltx25Weight w in _w.Projections) ReleaseCopy(w.Data);
+            if (_boundLora != null) ReleaseFactors(_boundLora);
+            _resident = false;
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            DropPlans();
+            _rope?.Dispose();
+            _rope = null;
+            _keyframes.Absolute?.Dispose();
+            _keyframes = default;
+            foreach (Ltx25Weight w in _w.Projections) ReleaseCopy(w.Data);
+            if (_boundLora != null) ReleaseFactors(_boundLora);
+            _boundLora = null;
+            _ownedLora?.Dispose();
+            _ownedLora = null;
+            _prefault?.Dispose();
+            (_executor as IDisposable)?.Dispose();
+            _w.Dispose();
+            _disposed = true;
+        }
+    }
+
+    // ---- per-request tables
+
+    /// <summary>The rotary tables of a geometry (video, audio and the video's temporal positions at the audio width), on the
+    /// executor's allocator: they do not depend on sigma, so one request's steps share them. The caller's coordinates are
+    /// snapshotted, so edits to a reused grid rebuild them.</summary>
+    private sealed class RopeCache : IDisposable
+    {
+        private readonly float[] _video, _audio;
+        private readonly Ltx25FrequencyPrecision _precision;
+        public readonly (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim) Video, Audio, CrossVideo;
+
+        public RopeCache(IAllocator allocator, Ltx25Config c, Ltx25DenoiserInput input)
+        {
+            _video = (float[])input.VideoPositions.Boundaries.Clone();
+            _audio = (float[])input.AudioPositions.Boundaries.Clone();
+            _precision = input.FrequencyPrecision;
+            try
+            {
+                Video = Device(allocator, Ltx25Geometry.BuildRope(input.VideoPositions, c.VideoDim, c.VideoHeads, _precision));
+                Audio = Device(allocator, Ltx25Geometry.BuildRope(input.AudioPositions, c.AudioDim, c.AudioHeads, _precision));
+                CrossVideo = Device(allocator, Ltx25Geometry.BuildRope(Ltx25Geometry.TemporalPositions(input.VideoPositions),
+                    c.AudioDim, c.AudioHeads, _precision));
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        private static (Tensor, Tensor, int, int, int) Device(IAllocator allocator, Ltx25Rope rope)
+        {
+            var cos = new Tensor(allocator, DType.Float32, rope.Tokens, rope.Heads, rope.HeadDim / 2);
+            var sin = new Tensor(allocator, DType.Float32, rope.Tokens, rope.Heads, rope.HeadDim / 2);
+            cos.SetElementsAsFloat(rope.Cosine);
+            sin.SetElementsAsFloat(rope.Sine);
+            return (cos, sin, rope.Tokens, rope.Heads, rope.HeadDim);
+        }
+
+        public bool Matches(Ltx25DenoiserInput input) => _precision == input.FrequencyPrecision &&
+            _video.AsSpan().SequenceEqual(input.VideoPositions.Boundaries) && _audio.AsSpan().SequenceEqual(input.AudioPositions.Boundaries);
+
         public void Dispose()
         {
-            Main?.Dispose(); Embedded?.Dispose(); Prompt?.Dispose(); CrossScaleShift?.Dispose(); CrossGate?.Dispose();
+            Video.Cos?.Dispose(); Video.Sin?.Dispose();
+            Audio.Cos?.Dispose(); Audio.Sin?.Dispose();
+            CrossVideo.Cos?.Dispose(); CrossVideo.Sin?.Dispose();
         }
     }
 
-    private (Tensor Coefficients, Tensor Embedded) Ada(string name, float[] timesteps, float multiplier)
+    private RopeCache Rope(Ltx25DenoiserInput input)
     {
-        var features = TimestepFeatures(timesteps, multiplier);
-        using var input = _ctx.FromFloats(features, timesteps.Length, Ltx25Config.TimestepDimension);
-        using var first = Project(name + ".emb.timestep_embedder.linear_1", input);
-        using var act = DirectOps.Silu(_ctx, first);
-        var embedded = Project(name + ".emb.timestep_embedder.linear_2", act);
-        try
+        if (_rope?.Matches(input) == true) return _rope;
+        // Release the old geometry's tables before making potentially large new ones.
+        _rope?.Dispose();
+        _rope = null;
+        return _rope = new RopeCache(_allocator, Config, input);
+    }
+
+    /// <summary>The keyframe embedding the marked tokens add ([tokens, dim]: 0 or 1 times the embedding, the products the
+    /// direct denoiser took), made once a mask: the same for every step of a pass.</summary>
+    private Tensor Keyframes(Ltx25DenoiserInput input)
+    {
+        if (input.KeyframeMask == null) return null;
+        if (!Config.KeyframeEmbedding) throw new ArgumentException("Checkpoint has no keyframe embedding.");
+        if (_keyframes.Mask != null && _keyframes.Mask.AsSpan().SequenceEqual(input.KeyframeMask)) return _keyframes.Absolute;
+        _keyframes.Absolute?.Dispose();
+        _keyframes = default;
+        float[] embedding = DirectOps.DequantTensor(_w.File, Config.Prefix + "keyframes_abs_pos_embedding");
+        int dim = Config.VideoDim;
+        var values = new float[(long)input.VideoTokens * dim];
+        for (int t = 0; t < input.VideoTokens; t++)
         {
-            using var hidden = DirectOps.Silu(_ctx, embedded);
-            return (Project(name + ".linear", hidden), embedded);
+            float marked = input.KeyframeMask[t] > 0 ? 1f : 0f;
+            for (int c = 0; c < dim; c++) values[(long)t * dim + c] = marked * embedding[c];
         }
-        catch { embedded.Dispose(); throw; }
+        var absolute = new Tensor(_allocator, DType.Float32, input.VideoTokens, dim);
+        absolute.SetElementsAsFloat(values);
+        _keyframes = ((float[])input.KeyframeMask.Clone(), absolute);
+        return absolute;
+    }
+
+    // ---- emission
+
+    private sealed class StepValues
+    {
+        public StepValues(Ltx25DenoiserInput input, int blocks, Ltx25LoraSet lora, RopeCache rope, Tensor keyframes, float[][] features)
+        {
+            Input = input; Blocks = blocks; Lora = lora; Rope = rope; Keyframes = keyframes; Features = features;
+        }
+
+        /// <summary><see cref="StepFeatures"/>' six rows, bound as the program's inputs.</summary>
+        public float[][] Features { get; }
+
+        public Ltx25DenoiserInput Input { get; }
+        public int Blocks { get; }
+        public Ltx25LoraSet Lora { get; }
+        public RopeCache Rope { get; }
+        public Tensor Keyframes { get; }
     }
 
     /// <summary>Original cosine-first 256-feature timestep encoding, before
@@ -259,390 +664,206 @@ public sealed class Ltx25Denoiser : IDisposable
         return output;
     }
 
-    private TimeState PrepareTime(bool video, float sigma, float crossSigma, float[] timesteps)
+    /// <summary>
+    /// One step's program in the direct denoiser's op order: patchify (and the keyframe embedding), each stream's four AdaLN
+    /// MLPs (main, prompt, cross-stream scale/shift and gate), then every block's video and audio self and text attention, the
+    /// cross-stream attentions over both streams' norms frozen before either residual moves, and the feed-forwards, then each
+    /// stream's layer-normed, modulated output head. The latents, contexts and timestep features are inputs; the rotary
+    /// tables and the keyframe embedding are fixed for a request (tensors), so a geometry's steps share one plan.
+    /// </summary>
+    private void Emit(GraphEmitter e, StepValues s)
     {
-        var state = new TimeState();
-        try
+        Ltx25Config c = Config;
+        GraphProgramBuilder b = e.Builder;
+        Ltx25DenoiserInput input = s.Input;
+        float eps = Ltx25Config.NormEpsilon;
+        var leaves = new Dictionary<object, int>();
+        e.MarkWideTokenProducts();
+        // A plan binds one adapter set's factors.
+        if (s.Lora != null) e.Mix(s.Lora.Generation);
+
+        int Projection(Ltx25Weight w)
         {
-            string p = video ? "" : "audio_";
-            (state.Main, state.Embedded) = Ada(p + "adaln_single", timesteps, Config.TimestepScale);
-            (state.Prompt, var promptEmbedded) = Ada(p + "prompt_adaln_single", [sigma], Config.TimestepScale);
-            promptEmbedded.Dispose();
-            (state.CrossScaleShift, var crossEmbedded) = Ada("av_ca_" + (video ? "video" : "audio") + "_scale_shift_adaln_single",
-                timesteps, Config.TimestepScale);
-            crossEmbedded.Dispose();
-            (state.CrossGate, var gateEmbedded) = Ada("av_ca_" + (video ? "a2v" : "v2a") + "_gate_adaln_single",
-                [crossSigma], Config.CrossGateTimestepScale);
-            gateEmbedded.Dispose();
-            return state;
+            if (leaves.TryGetValue(w, out int node)) return node;
+            node = e.HostWeight(w.Format, stackalloc long[] { w.Ne0, w.Ne1 }, GraphIdentity.Of(w), w.Bytes, w);
+            leaves[w] = node;
+            return node;
         }
-        catch { state.Dispose(); throw; }
-    }
-
-    private static Tensor ModulationRow(Tensor dynamic, Tensor table, int index, int coefficients, int dim)
-    {
-        using var matrix = dynamic.View(dynamic.Sizes[0], coefficients, dim);
-        using var column = matrix.Narrow(1, index, 1);
-        using var contiguous = Ops.NewContiguous(column);
-        using var row = contiguous.View(dynamic.Sizes[0], dim);
-        using var staticRow = table.Narrow(0, index, 1);
-        return Ops.Add(null, row, staticRow);
-    }
-
-    private static Tensor Modulate(Tensor input, Tensor shift, Tensor scale)
-    {
-        using var scalePlusOne = Ops.Add(null, scale, 1f);
-        using var scaled = Ops.Mul(null, input, scalePlusOne);
-        return Ops.Add(null, scaled, shift);
-    }
-
-    private static void Residual(Tensor target, Tensor update, Tensor gate)
-    {
-        using var gated = Ops.Mul(null, update, gate);
-        Ops.Add(target, target, gated);
-    }
-
-    private Tensor Norm(Tensor input) => DirectOps.RmsNorm(_ctx, input, _ctx.Ones(input.Sizes[1]), Ltx25Config.NormEpsilon);
-
-    private sealed class DeviceRope : IDisposable
-    {
-        public readonly Tensor Cos, Sin;
-        public readonly int Tokens, Heads, HeadDim;
-        public DeviceRope(DirectContext ctx, Ltx25Rope rope)
+        // A small tensor as a leaf in its ggml extents.
+        int Vector(string name)
         {
-            Tokens = rope.Tokens; Heads = rope.Heads; HeadDim = rope.HeadDim;
-            Cos = ctx.FromFloats(rope.Cosine, Tokens, Heads, 1, HeadDim / 2);
-            try { Sin = ctx.FromFloats(rope.Sine, Tokens, Heads, 1, HeadDim / 2); }
-            catch { Cos.Dispose(); throw; }
+            if (leaves.TryGetValue(name, out int node)) return node;
+            Tensor t = _w.Vector(name);
+            node = e.TensorWeight(t, _w.Extents(name));
+            leaves[name] = node;
+            return node;
         }
-        public void Dispose() { Cos.Dispose(); Sin.Dispose(); }
-    }
-
-    // Position tables do not depend on sigma. Retain one generation's tables
-    // across Euler steps instead of repeating millions of trig evaluations and
-    // host-to-device transfers. Snapshot the caller-owned coordinates so edits
-    // to a reused input grid cannot silently reuse stale tables.
-    private sealed class RopeCache : IDisposable
-    {
-        private readonly float[] _videoBoundaries, _audioBoundaries;
-        private readonly Ltx25FrequencyPrecision _precision;
-        public readonly DeviceRope Video, Audio, CrossVideo;
-        public RopeCache(DirectContext ctx, Ltx25Config config, Ltx25DenoiserInput input)
+        int Constant(Tensor t, params long[] ne)
         {
-            _videoBoundaries = (float[])input.VideoPositions.Boundaries.Clone();
-            _audioBoundaries = (float[])input.AudioPositions.Boundaries.Clone();
-            _precision = input.FrequencyPrecision;
-            try
+            if (leaves.TryGetValue(t, out int node)) return node;
+            node = e.TensorWeight(t, ne);
+            leaves[t] = node;
+            return node;
+        }
+        // The direct denoiser's Project: w x, its bias, then the adapter's B (A x) where the adapter updates the projection,
+        // added into the projection's output (a LoraLinear region the executors serve in place: an Ingredients step at 10,752
+        // tokens held 2.4 GB more as separate ops).
+        int Linear(string name, int x)
+        {
+            Ltx25Weight w = _w.Projection(name);
+            bool biased = _w.HasBias(name);
+            if (s.Lora?.Factors(name) is { } f)
+                return GraphDitRegions.LoraLinear(b, x, Projection(w), new[] { new GraphDitRegions.LoraPart(0, Projection(f.Down), Projection(f.Up)) },
+                    w.Ne1, slotRows: 0, rows: 0 /* one slot: no row views */, bias: biased ? Vector(name + ".bias") : -1);
+            int y = b.Op(GraphOp.MulMat, Projection(w), x);
+            if (biased) y = b.Op(GraphOp.Add, y, Vector(name + ".bias"));
+            return y;
+        }
+        int Silu(int x) => b.Op(GraphOp.Silu, x);
+        (int Coefficients, int Embedded) Ada(string name, int features)
+        {
+            int embedded = Linear(name + ".emb.timestep_embedder.linear_2", Silu(Linear(name + ".emb.timestep_embedder.linear_1", features)));
+            return (Linear(name + ".linear", Silu(embedded)), embedded);
+        }
+        // A column of a [coefficients * dim, rows] modulation plus a row of a table [dim, table rows].
+        int ModulationRow(int dynamic, int coefficients, int index, long rows, string table, int tableRow, long dim)
+        {
+            int column = b.Op(GraphOp.Cont, e.View2(dynamic, dim, rows, coefficients * dim * 4L, index * dim * 4L));
+            int row = e.View2(Vector(table), dim, 1, dim * 4L, tableRow * dim * 4L);
+            return b.Op(GraphOp.Add, column, row);
+        }
+        int Modulate(int x, int shift, int scale)
+        {
+            int scalePlusOne = b.Op(GraphOp.ScaleBias, stackalloc[] { scale }, default, stackalloc[] { 1f, 1f });
+            return b.Op(GraphOp.Add, b.Op(GraphOp.Mul, x, scalePlusOne), shift);
+        }
+        int Residual(int target, int update, int gate) => b.Op(GraphOp.Add, target, b.Op(GraphOp.Mul, update, gate));
+        int Norm(int x) => GraphDitRegions.RowNorm(b, x, -1, layer: false, eps);
+        int Reshape3(int x, long d, long heads, long rows) => b.Op(GraphOp.Reshape, stackalloc[] { x }, stackalloc long[] { d, heads, rows });
+
+        int Attention(string name, int query, long queryRows, int context, long contextRows, int heads, int headDim,
+            (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? queryRope = null,
+            (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? keyRope = null)
+        {
+            // q and k RMS-normed over the whole inner width, then (self and cross-stream attention) rotated per head, as the
+            // direct denoiser normed and rotated them in place; the attention gated per head in place before to_out.
+            int Prep(int raw, string norm, long rows, (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? rope) => rope is { } r
+                ? GraphDitRegions.HeadRotary(b, raw, Constant(r.Cos, headDim / 2, heads, rows), Constant(r.Sin, headDim / 2, heads, rows),
+                    headDim, heads, rows, Vector(norm), eps)
+                : Reshape3(GraphDitRegions.RowNorm(b, raw, Vector(norm), layer: false, eps), headDim, heads, rows);
+            int q3 = Prep(Linear(name + ".to_q", query), name + ".q_norm.weight", queryRows, queryRope);
+            int k3 = Prep(Linear(name + ".to_k", context), name + ".k_norm.weight", contextRows, keyRope);
+            int v = Linear(name + ".to_v", context);
+            int logits = Linear(name + ".to_gate_logits", query);
+            int gated = GraphDitRegions.FullAttention(b, q3, k3, Reshape3(v, headDim, heads, contextRows), headDim, heads, queryRows,
+                1f / MathF.Sqrt(headDim), logits, 2f);
+            return Linear(name + ".to_out.0", gated);
+        }
+
+        long nv = input.VideoTokens, na = input.AudioTokens, nvc = input.VideoContextTokens, nac = input.AudioContextTokens;
+        long vdim = c.VideoDim, adim = c.AudioDim;
+        float[] videoTimes = input.VideoTimesteps ?? new[] { input.VideoSigma }, audioTimes = input.AudioTimesteps ?? new[] { input.AudioSigma };
+        long tv = videoTimes.Length, ta = audioTimes.Length;
+
+        // ---- inputs
+        int video = Linear("patchify_proj", e.InputF32(input.Video, c.VideoChannels, nv));
+        int audio = Linear("audio_patchify_proj", e.InputF32(input.Audio, c.AudioChannels, na));
+        if (s.Keyframes != null) video = b.Op(GraphOp.Add, video, Constant(s.Keyframes, vdim, nv));
+        int videoContext = e.InputF32(input.VideoContext, c.VideoContextDim, nvc);
+        int audioContext = e.InputF32(input.AudioContext, c.AudioContextDim, nac);
+
+        // ---- time: per stream its main (per-token where the pass has guides), prompt, cross scale/shift and cross gate AdaLN
+        int Features(int i) => e.InputF32(s.Features[i], Ltx25Config.TimestepDimension, s.Features[i].Length / Ltx25Config.TimestepDimension);
+        int videoFeatures = Features(0), audioFeatures = Features(3);
+        var (videoMain, videoEmbedded) = Ada("adaln_single", videoFeatures);
+        int videoPrompt = Ada("prompt_adaln_single", Features(1)).Coefficients;
+        int videoCross = Ada("av_ca_video_scale_shift_adaln_single", videoFeatures).Coefficients;
+        int videoCrossGate = Ada("av_ca_a2v_gate_adaln_single", Features(2)).Coefficients;
+        var (audioMain, audioEmbedded) = Ada("audio_adaln_single", audioFeatures);
+        int audioPrompt = Ada("audio_prompt_adaln_single", Features(4)).Coefficients;
+        int audioCross = Ada("av_ca_audio_scale_shift_adaln_single", audioFeatures).Coefficients;
+        int audioCrossGate = Ada("av_ca_v2a_gate_adaln_single", Features(5)).Coefficients;
+
+        RopeCache rope = s.Rope;
+        for (int i = 0; i < s.Blocks; i++)
+        {
+            string block = $"transformer_blocks.{i}.";
+            // Self and text attention of each stream.
+            int SelfAndText(bool isVideo, int state, int context, long rows, long contextRows)
             {
-                Video = new(ctx, Ltx25Geometry.BuildRope(input.VideoPositions, config.VideoDim, config.VideoHeads, _precision));
-                Audio = new(ctx, Ltx25Geometry.BuildRope(input.AudioPositions, config.AudioDim, config.AudioHeads, _precision));
-                CrossVideo = new(ctx, Ltx25Geometry.BuildRope(Ltx25Geometry.TemporalPositions(input.VideoPositions),
-                    config.AudioDim, config.AudioHeads, _precision));
+                string p = isVideo ? "" : "audio_";
+                long dim = isVideo ? vdim : adim, times = isVideo ? tv : ta;
+                int heads = isVideo ? c.VideoHeads : c.AudioHeads, headDim = (int)(dim / heads);
+                int main = isVideo ? videoMain : audioMain, prompt = isVideo ? videoPrompt : audioPrompt;
+                string table = block + p + "scale_shift_table";
+                var streamRope = isVideo ? rope.Video : rope.Audio;
+                int shift = ModulationRow(main, 9, 0, times, table, 0, dim), scale = ModulationRow(main, 9, 1, times, table, 1, dim);
+                int gate = ModulationRow(main, 9, 2, times, table, 2, dim);
+                int modulated = Modulate(Norm(state), shift, scale);
+                state = Residual(state, Attention(block + p + "attn1", modulated, rows, modulated, rows, heads, headDim, streamRope, streamRope), gate);
+                shift = ModulationRow(main, 9, 6, times, table, 6, dim);
+                scale = ModulationRow(main, 9, 7, times, table, 7, dim);
+                gate = ModulationRow(main, 9, 8, times, table, 8, dim);
+                int query = Modulate(Norm(state), shift, scale);
+                string promptTable = block + p + "prompt_scale_shift_table";
+                int contextShift = ModulationRow(prompt, 2, 0, 1, promptTable, 0, dim), contextScale = ModulationRow(prompt, 2, 1, 1, promptTable, 1, dim);
+                int projectedContext = Modulate(context, contextShift, contextScale);
+                return Residual(state, Attention(block + p + "attn2", query, rows, projectedContext, contextRows, heads, headDim), gate);
             }
-            catch { Dispose(); throw; }
-        }
-        public bool Matches(Ltx25DenoiserInput input) => _precision == input.FrequencyPrecision &&
-            _videoBoundaries.AsSpan().SequenceEqual(input.VideoPositions.Boundaries) &&
-            _audioBoundaries.AsSpan().SequenceEqual(input.AudioPositions.Boundaries);
-        public void Dispose() { Video?.Dispose(); Audio?.Dispose(); CrossVideo?.Dispose(); }
-    }
+            video = SelfAndText(true, video, videoContext, nv, nvc);
+            audio = SelfAndText(false, audio, audioContext, na, nac);
 
-    private RopeCache PrepareRope(Ltx25DenoiserInput input)
-    {
-        if (_ropeCache?.Matches(input) == true) return _ropeCache;
-        // Release the old generation before constructing potentially large
-        // replacement tables, keeping peak residency bounded to one geometry.
-        _ropeCache?.Dispose();
-        _ropeCache = null;
-        return _ropeCache = new RopeCache(_ctx, Config, input);
-    }
-
-    private void ApplyRope(Tensor input, DeviceRope rope)
-    {
-        if (input.Sizes[0] != rope.Tokens || input.Sizes[1] != rope.Heads * rope.HeadDim)
-            throw new ArgumentException("LTX per-head rotary dimensions differ.");
-        if (_ctx.IsAccelerated && Environment.GetEnvironmentVariable("TS_LTX25_FUSED_ROPE") != "0")
-        {
-            // Each LTX head has its own frequencies. Treat token/head pairs as
-            // independent rows for the existing split-half fused rotary kernel.
-            int rows = checked(rope.Tokens * rope.Heads), half = rope.HeadDim / 2;
-            using var flat = input.View(rows, rope.HeadDim);
-            using var cos = rope.Cos.View(checked(rows * half));
-            using var sin = rope.Sin.View(checked(rows * half));
-            if (_ctx.IsCuda && CudaFusedOps.TryNeoXRoPEFlatInPlace(flat, cos, sin, 1, rows, rope.HeadDim, half) ||
-                _ctx.IsMlx && MlxFusedOps.TryNeoXRoPEFlatInPlace(flat, cos, sin, 1, rows, rope.HeadDim, half)) return;
-        }
-        using var view = input.View(rope.Tokens, rope.Heads, 2, rope.HeadDim / 2);
-        using var first = view.Narrow(2, 0, 1);
-        using var second = view.Narrow(2, 1, 1);
-        using var oldFirst = Ops.NewContiguous(first);
-        using var oldSecond = Ops.NewContiguous(second);
-        using var firstCos = Ops.Mul(null, oldFirst, rope.Cos);
-        using var secondSin = Ops.Mul(null, oldSecond, rope.Sin);
-        using var firstResult = Ops.Sub(null, firstCos, secondSin);
-        using var secondCos = Ops.Mul(null, oldSecond, rope.Cos);
-        using var firstSin = Ops.Mul(null, oldFirst, rope.Sin);
-        using var secondResult = Ops.Add(null, secondCos, firstSin);
-        Ops.Copy(first, firstResult);
-        Ops.Copy(second, secondResult);
-    }
-
-    private Tensor Attention(string name, Tensor query, Tensor context, int heads, int headDim,
-        DeviceRope queryRope = null, DeviceRope keyRope = null)
-    {
-        using var qRaw = Project(name + ".to_q", query);
-        using var kRaw = Project(name + ".to_k", context);
-        using var value = Project(name + ".to_v", context);
-        // LTX RMS normalizes all heads together before splitting them.
-        using var q = DirectOps.RmsNorm(_ctx, qRaw, Weight(name + ".q_norm.weight"), Ltx25Config.NormEpsilon);
-        using var k = DirectOps.RmsNorm(_ctx, kRaw, Weight(name + ".k_norm.weight"), Ltx25Config.NormEpsilon);
-        if (queryRope != null) ApplyRope(q, queryRope);
-        if (keyRope != null) ApplyRope(k, keyRope);
-        using var attention = Attend(name, q, k, value, heads, headDim);
-        using var logits = Project(name + ".to_gate_logits", query);
-        if (_cudaFusedHeadGates && _cudaAttention?.TryApplyHeadGates(attention, logits, heads, headDim) == true)
-            return Project(name + ".to_out.0", attention);
-        using var gates = Ops.Sigmoid(null, logits);
-        Ops.Mul(gates, gates, 2f);
-        using var headGates = gates.View(query.Sizes[0], heads, 1);
-        using var headOutput = attention.View(query.Sizes[0], heads, headDim);
-        // CPU's generic iterator requires explicitly broadcast strides; passing
-        // the smaller tensor directly may truncate the multiply or fail SIMD
-        // alignment when token*head count is not a vector-width multiple.
-        using var expandedGates = headGates.Expand(headOutput.Sizes);
-        if (_ctx.IsCuda)
-        {
-            // CUDA binary kernels accept contiguous operands or row vectors.
-            // Materialize this column broadcast with the device strided-copy
-            // kernel so every attention avoids a CPU fallback/readback.
-            using var contiguousGates = Ops.NewContiguous(expandedGates);
-            Ops.Mul(headOutput, headOutput, contiguousGates);
-        }
-        else Ops.Mul(headOutput, headOutput, expandedGates);
-        return Project(name + ".to_out.0", attention);
-    }
-
-    private Tensor Attend(string name, Tensor query, Tensor key, Tensor value, int heads, int headDim)
-    {
-        float scale = 1f / MathF.Sqrt(headDim);
-        // At representative video sizes, batched pedantic F32 products avoid
-        // the scalar streaming kernel's compute bottleneck. Short attention
-        // keeps its launch-lean route; env1 also exercises small numerical tests.
-        if (_cudaAttention != null && (_forceCudaAttention || query.Sizes[0] >= 512 && key.Sizes[0] >= 512) &&
-            (name.EndsWith(".attn1", StringComparison.Ordinal) ||
-            name.EndsWith(".attn2", StringComparison.Ordinal)))
-        {
-            var output = _ctx.NewF32(query.Sizes);
-            try
+            // Cross-stream attention: both streams normed BEFORE either residual moves (V2A never sees the updated video).
+            int videoNorm = Norm(video), audioNorm = Norm(audio);
+            string videoTable = block + "scale_shift_table_a2v_ca_video", audioTable = block + "scale_shift_table_a2v_ca_audio";
+            // CrossInput: the scale at row `from`, the shift at `from + 1` of the cross scale/shift modulation.
+            int CrossInput(int normed, bool isVideo, int from)
             {
-                if (_cudaAttention.TryAttention(output, query, key, value, heads, headDim, scale)) return output;
+                long dim = isVideo ? vdim : adim, times = isVideo ? tv : ta;
+                int cross = isVideo ? videoCross : audioCross;
+                string table = isVideo ? videoTable : audioTable;
+                int scale = ModulationRow(cross, 4, from, times, table, from, dim);
+                int shift = ModulationRow(cross, 4, from + 1, times, table, from + 1, dim);
+                return Modulate(normed, shift, scale);
             }
-            catch { output.Dispose(); throw; }
-            output.Dispose();
+            int a2vGate = ModulationRow(videoCrossGate, 1, 0, 1, videoTable, 4, vdim);
+            int a2v = Attention(block + "audio_to_video_attn", CrossInput(videoNorm, true, 0), nv, CrossInput(audioNorm, false, 0), na,
+                c.AudioHeads, c.AudioHeadDim, rope.CrossVideo, rope.Audio);
+            int v2aGate = ModulationRow(audioCrossGate, 1, 0, 1, audioTable, 4, adim);
+            int v2a = Attention(block + "video_to_audio_attn", CrossInput(audioNorm, false, 2), na, CrossInput(videoNorm, true, 2), nv,
+                c.AudioHeads, c.AudioHeadDim, rope.Audio, rope.CrossVideo);
+            video = Residual(video, a2v, a2vGate);
+            audio = Residual(audio, v2a, v2aGate);
+
+            // Feed-forwards.
+            int FeedForward(bool isVideo, int state)
+            {
+                string p = isVideo ? "" : "audio_";
+                long dim = isVideo ? vdim : adim, times = isVideo ? tv : ta;
+                int main = isVideo ? videoMain : audioMain;
+                string table = block + p + "scale_shift_table";
+                int shift = ModulationRow(main, 9, 3, times, table, 3, dim), scale = ModulationRow(main, 9, 4, times, table, 4, dim);
+                int gate = ModulationRow(main, 9, 5, times, table, 5, dim);
+                int modulated = Modulate(Norm(state), shift, scale);
+                int update = Linear(block + p + "ff.net.2", b.Op(GraphOp.Gelu, Linear(block + p + "ff.net.0.proj", modulated)));
+                return Residual(state, update, gate);
+            }
+            video = FeedForward(true, video);
+            audio = FeedForward(false, audio);
         }
-        return DirectOps.Attention(_ctx, query, key, value, heads, headDim, scale);
-    }
 
-    private void SelfAndText(string block, bool video, Tensor state, Tensor context, TimeState time, DeviceRope rope)
-    {
-        string p = video ? "" : "audio_";
-        int dim = video ? Config.VideoDim : Config.AudioDim;
-        int heads = video ? Config.VideoHeads : Config.AudioHeads;
-        int headDim = dim / heads;
-        Tensor table = Weight(block + p + "scale_shift_table");
-        using (var shift = ModulationRow(time.Main, table, 0, 9, dim))
-        using (var scale = ModulationRow(time.Main, table, 1, 9, dim))
-        using (var gate = ModulationRow(time.Main, table, 2, 9, dim))
-        using (var norm = Norm(state))
-        using (var input = Modulate(norm, shift, scale))
-        using (var update = Attention(block + p + "attn1", input, input, heads, headDim, rope, rope))
-            Residual(state, update, gate);
-        using (var shift = ModulationRow(time.Main, table, 6, 9, dim))
-        using (var scale = ModulationRow(time.Main, table, 7, 9, dim))
-        using (var gate = ModulationRow(time.Main, table, 8, 9, dim))
-        using (var norm = Norm(state))
-        using (var query = Modulate(norm, shift, scale))
-        using (var shiftContext = ModulationRow(time.Prompt, Weight(block + p + "prompt_scale_shift_table"), 0, 2, dim))
-        using (var scaleContext = ModulationRow(time.Prompt, Weight(block + p + "prompt_scale_shift_table"), 1, 2, dim))
-        using (var projectedContext = Modulate(context, shiftContext, scaleContext))
-        using (var update = Attention(block + p + "attn2", query, projectedContext, heads, headDim))
-            Residual(state, update, gate);
-    }
-
-    private Tensor CrossInput(string block, bool video, Tensor norm, TimeState time, int from)
-    {
-        int dim = video ? Config.VideoDim : Config.AudioDim;
-        using var table = Weight(block + "scale_shift_table_a2v_ca_" + (video ? "video" : "audio")).Narrow(0, 0, 4);
-        using var scale = ModulationRow(time.CrossScaleShift, table, from, 4, dim);
-        using var shift = ModulationRow(time.CrossScaleShift, table, from + 1, 4, dim);
-        return Modulate(norm, shift, scale);
-    }
-
-    private Tensor CrossGate(string block, bool video, TimeState time)
-    {
-        using var table = Weight(block + "scale_shift_table_a2v_ca_" + (video ? "video" : "audio")).Narrow(0, 4, 1);
-        return ModulationRow(time.CrossGate, table, 0, 1, video ? Config.VideoDim : Config.AudioDim);
-    }
-
-    private void CrossStreams(string block, Tensor video, Tensor audio, TimeState vt, TimeState at,
-        DeviceRope videoRope, DeviceRope audioRope)
-    {
-        // Freeze BOTH normalized streams before mutating either residual.
-        // V2A must never see the already-updated A2V video state.
-        using var videoNorm = Norm(video);
-        using var audioNorm = Norm(audio);
-        using (var query = CrossInput(block, true, videoNorm, vt, 0))
-        using (var context = CrossInput(block, false, audioNorm, at, 0))
-        using (var gate = CrossGate(block, true, vt))
-        using (var update = Attention(block + "audio_to_video_attn", query, context,
-            Config.AudioHeads, Config.AudioHeadDim, videoRope, audioRope))
-            Residual(video, update, gate);
-        using (var query = CrossInput(block, false, audioNorm, at, 2))
-        using (var context = CrossInput(block, true, videoNorm, vt, 2))
-        using (var gate = CrossGate(block, false, at))
-        using (var update = Attention(block + "video_to_audio_attn", query, context,
-            Config.AudioHeads, Config.AudioHeadDim, audioRope, videoRope))
-            Residual(audio, update, gate);
-    }
-
-    private void FeedForward(string block, bool video, Tensor state, TimeState time)
-    {
-        string p = video ? "" : "audio_";
-        int dim = video ? Config.VideoDim : Config.AudioDim;
-        Tensor table = Weight(block + p + "scale_shift_table");
-        using var shift = ModulationRow(time.Main, table, 3, 9, dim);
-        using var scale = ModulationRow(time.Main, table, 4, 9, dim);
-        using var gate = ModulationRow(time.Main, table, 5, 9, dim);
-        using var norm = Norm(state);
-        using var input = Modulate(norm, shift, scale);
-        using var wide = Project(block + p + "ff.net.0.proj", input);
-        using var activation = DirectOps.Gelu(_ctx, wide);
-        using var update = Project(block + p + "ff.net.2", activation);
-        Residual(state, update, gate);
-    }
-
-    private Tensor Output(bool video, Tensor state, Tensor embedded)
-    {
-        string p = video ? "" : "audio_";
-        Tensor table = Weight(p + "scale_shift_table");
-        using var shiftRow = table.Narrow(0, 0, 1);
-        using var scaleRow = table.Narrow(0, 1, 1);
-        using var shift = Ops.Add(null, embedded, shiftRow);
-        using var scale = Ops.Add(null, embedded, scaleRow);
-        using var norm = DirectOps.LayerNorm(_ctx, state, null, null, Ltx25Config.NormEpsilon);
-        using var input = Modulate(norm, shift, scale);
-        return Project(p + "proj_out", input);
-    }
-
-    /// <param name="blockLimit">A diagnostic partial-checkpoint limit. Output
-    /// records the actual count. Omit it to execute the complete denoiser.</param>
-    public Ltx25DenoiserOutput Forward(Ltx25DenoiserInput input, int? blockLimit = null)
-    {
-        lock (_sync)
+        // ---- output heads: the embedded timestep plus the table's two rows, the layer-normed state modulated, then proj_out
+        int Output(bool isVideo, int state, int embedded)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            Validate(input);
-            input.CancellationToken.ThrowIfCancellationRequested();
-            if (input.UseReferenceLora && _referenceLora == null)
-                throw new InvalidOperationException("Ingredients reference generation requires the LTX 2.5 Ingredients IC-LoRA adapter.");
-            _useReferenceLora = input.UseReferenceLora;
-            _cancellationToken = input.CancellationToken;
-            int blocks = blockLimit ?? Config.Layers;
-            if (blocks <= 0 || blocks > Config.Layers) throw new ArgumentOutOfRangeException(nameof(blockLimit));
-            using var timing = StageTiming.Start(_ctx);
-            using var videoInput = _ctx.FromFloats(input.Video, input.VideoTokens, Config.VideoChannels);
-            using var audioInput = _ctx.FromFloats(input.Audio, input.AudioTokens, Config.AudioChannels);
-            using var video = Project("patchify_proj", videoInput);
-            using var audio = Project("audio_patchify_proj", audioInput);
-            if (input.KeyframeMask != null)
-            {
-                if (!Config.KeyframeEmbedding) throw new ArgumentException("Checkpoint has no keyframe embedding.");
-                using var mask = _ctx.FromFloats(input.KeyframeMask.Select(value => value > 0 ? 1f : 0f).ToArray(), input.VideoTokens, 1);
-                using var expandedMask = mask.Expand(input.VideoTokens, Config.VideoDim);
-                using var embedding = Weight("keyframes_abs_pos_embedding").Expand(input.VideoTokens, Config.VideoDim);
-                if (_ctx.IsCuda)
-                {
-                    using var contiguousMask = Ops.NewContiguous(expandedMask);
-                    using var contiguousEmbedding = Ops.NewContiguous(embedding);
-                    using var absolute = Ops.Mul(null, contiguousMask, contiguousEmbedding);
-                    Ops.Add(video, video, absolute);
-                }
-                else
-                {
-                    using var absolute = Ops.Mul(null, expandedMask, embedding);
-                    Ops.Add(video, video, absolute);
-                }
-            }
-            using var videoContext = _ctx.FromFloats(input.VideoContext, input.VideoContextTokens, Config.VideoContextDim);
-            using var audioContext = _ctx.FromFloats(input.AudioContext, input.AudioContextTokens, Config.AudioContextDim);
-            using var vt = PrepareTime(true, input.VideoSigma, input.AudioSigma, input.VideoTimesteps ?? [input.VideoSigma]);
-            using var at = PrepareTime(false, input.AudioSigma, input.VideoSigma, input.AudioTimesteps ?? [input.AudioSigma]);
-            using var readAhead = StartUploadReadAhead();
-            var rope = PrepareRope(input);
-            timing?.Mark("prelude");
-            for (int i = 0; i < blocks; ++i)
-            {
-                readAhead?.Enter(i + 1);
-                string block = $"transformer_blocks.{i}.";
-                SelfAndText(block, true, video, videoContext, vt, rope.Video);
-                timing?.Mark("video_self_text");
-                SelfAndText(block, false, audio, audioContext, at, rope.Audio);
-                timing?.Mark("audio_self_text");
-                CrossStreams(block, video, audio, vt, at, rope.CrossVideo, rope.Audio);
-                timing?.Mark("cross_streams");
-                FeedForward(block, true, video, vt);
-                timing?.Mark("video_ffn");
-                FeedForward(block, false, audio, at);
-                timing?.Mark("audio_ffn");
-            }
-            using var videoOutput = Output(true, video, vt.Embedded);
-            using var audioOutput = Output(false, audio, at.Embedded);
-            var videoValues = DirectOps.ToArray(videoOutput);
-            var audioValues = DirectOps.ToArray(audioOutput);
-            timing?.Mark("output_readback");
-            if (readAhead != null)
-            {
-                readAhead.Stop();
-                Console.WriteLine($"  [ltx25] denoiser upload {readAhead.Describe()}");
-            }
-            _cudaWeightsUploaded = _ctx.IsCuda && blocks == Config.Layers;
-            if (videoValues.Any(value => !float.IsFinite(value)) || audioValues.Any(value => !float.IsFinite(value)))
-                throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
-            var result = new Ltx25DenoiserOutput(videoValues, audioValues, blocks);
-            ForwardObserver?.Invoke(input, result);
-            return result;
+            string p = isVideo ? "" : "audio_";
+            long dim = isVideo ? vdim : adim;
+            string table = p + "scale_shift_table";
+            int shift = b.Op(GraphOp.Add, embedded, e.View2(Vector(table), dim, 1, dim * 4L, 0));
+            int scale = b.Op(GraphOp.Add, embedded, e.View2(Vector(table), dim, 1, dim * 4L, dim * 4L));
+            return Linear(p + "proj_out", Modulate(GraphDitRegions.RowNorm(b, state, -1, layer: true, eps), shift, scale));
         }
-    }
-
-    // A first CUDA forward uploads every matrix from the mapped checkpoint, each
-    // warmed synchronously by Ltx25CudaFilePrefault with at most 8 MiB in flight.
-    // On a network volume that read ran at ~0.4 GiB/s and made the first stage-1
-    // pass ~40 s of a 46 s denoise; reading ahead in block order with concurrent
-    // readers lets each upload find its pages cached. The file stores tensors
-    // alphabetically (blocks 0, 1, 10, ...), so the plan follows the forward:
-    // the prelude and output tensors first, then one stage per block.
-    private MappedFileReadAhead StartUploadReadAhead()
-    {
-        if (!_ctx.IsCuda || _cudaWeightsUploaded || _file.IsSplit) return null;
-        var stages = new List<(long Offset, long Length)>[Config.Layers + 1];
-        for (int i = 0; i < stages.Length; ++i) stages[i] = new();
-        string blocks = Config.Prefix + "transformer_blocks.";
-        foreach (var (name, info) in _file.Tensors)
-        {
-            if (!name.StartsWith(Config.Prefix, StringComparison.Ordinal) ||
-                name.Contains("_embeddings_connector.", StringComparison.Ordinal)) continue; // the prompt encoder's
-            int stage = 0;
-            if (name.StartsWith(blocks, StringComparison.Ordinal))
-            {
-                int end = name.IndexOf('.', blocks.Length);
-                if (end < 0 || !int.TryParse(name.AsSpan(blocks.Length, end - blocks.Length), out int block) ||
-                    (uint)block >= (uint)Config.Layers) continue;
-                stage = block + 1;
-            }
-            stages[stage].Add((checked(_file.DataOffset + (long)info.Offset), _file.GetTensorByteCount(info)));
-        }
-        return MappedFileReadAhead.TryStart(_file.FilePaths[0], stages.Select(stage => stage.OrderBy(range => range.Offset)),
-            message => Console.WriteLine("  [ltx25] warning: denoiser " + message));
+        e.Output(Output(true, video, videoEmbedded), nv * c.VideoChannels);
+        e.Output(Output(false, audio, audioEmbedded), na * c.AudioChannels);
     }
 
     private void Validate(Ltx25DenoiserInput input)
@@ -667,38 +888,5 @@ public sealed class Ltx25Denoiser : IDisposable
             !Enum.IsDefined(input.FrequencyPrecision)) throw new ArgumentException("LTX latent position grids differ.");
         if (input.KeyframeMask != null && (input.KeyframeMask.Length != input.VideoTokens || input.KeyframeMask.Any(value => !float.IsFinite(value))))
             throw new ArgumentException("Invalid LTX keyframe mask.");
-    }
-
-    /// <summary>Evict only unshared direct linear cache entries. Host GGUF
-    /// descriptors and small model tensors remain valid for the next forward.</summary>
-    public void ReleaseDeviceResidency()
-    {
-        lock (_sync)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            _ropeCache?.Dispose(); _ropeCache = null;
-            _cudaWeightsUploaded = false;
-            _cudaAttention?.ReleaseWorkspace();
-            _cudaProjection?.ReleaseWorkspace();
-            _ctx.ReleaseDeviceResidency();
-            _referenceLora?.ReleaseDeviceResidency();
-        }
-    }
-
-    public void Dispose()
-    {
-        lock (_sync)
-        {
-            if (_disposed) return;
-            _disposed = true;
-            _ropeCache?.Dispose(); _ropeCache = null;
-            _cudaAttention?.Dispose();
-            _cudaProjection?.Dispose();
-            _cudaPrefault?.Dispose();
-            _referenceLora?.Dispose();
-            _ctx.Dispose();
-            _file.Dispose();
-            _linears.Clear(); _weights.Clear();
-        }
     }
 }

@@ -45,9 +45,9 @@ dotnet run --project TensorSharp.Cli -- \
 
 | 后端名称 | 实际执行路径 |
 |---|---|
-| `cuda` / `ggml_cuda` | TensorSharp 自有 CUDA 执行器 |
-| `mlx` / `ggml_metal` | TensorSharp 自有 MLX 执行器 |
-| `cpu` / `ggml_cpu` | Direct CPU 实现 |
+| `cuda` / `ggml_cuda` | 扩散运行时的 CUDA tensor executor |
+| `mlx` / `ggml_metal` | 扩散运行时的 MLX tensor executor |
+| `cpu` / `ggml_cpu` | 扩散运行时的托管 CPU tensor executor |
 
 不支持 Vulkan 或多 GPU。GPU 测量不证明 CPU 吞吐。
 桌面 MP4 音轨需要 `PATH` 上的 FFmpeg 或 `TS_FFMPEG`，CLI 另写原始 PCM WAV；
@@ -100,11 +100,9 @@ Apple 进程建议启动时设置 `MLX_ENABLE_TF32=0`。LTX 在首次 MLX 操作
 但 MLX 会在进程首次 GEMM 时缓存选项，已初始化的进程需要启动环境设置。
 TensorAgent Mac 应用在启动宿主前设置该默认，显式用户覆盖仍优先。
 
-CUDA 的 SM 8.0+ 提示词投影默认用 BF16 Tensor Core、F32 累加并保留 BF16 激活边界；
-`TS_LTX25_CUDA_BF16_GEMM=0` 选择 F32 投影，较旧设备自动 F32。
-CUDA 对映射投影做有界预读，每个 reader 一个 8 MiB 缓冲；Linux 检查驻留页，
-至多八路读取 1 MiB 切片。`TS_LTX25_CUDA_PREFAULT=0` 关闭，
-`TS_LTX25_CUDA_PREFAULT_WORKERS=1` 选择顺序读取。
+CUDA 的 SM 8.0+ 提示词投影用 BF16 Tensor Core、F32 累加并保留 BF16 激活边界，
+较旧设备用 F32。CUDA 对映射投影做有界预读，每个 reader 一个 8 MiB 缓冲；Linux 检查驻留页，
+至多八路读取 1 MiB 切片。
 
 所有后端还会在 4 GiB 窗口内按层的运行顺序提前读取权重：Gemma 编码器、提示词
 connector 以及第一次 CUDA 去噪器上传。upscaler、视频解码器和音频 VAE 则在首次
@@ -244,7 +242,9 @@ M5 Pro MLX 的同图检查中，两阶段 1024×1024×121 的手掌能遮挡面�
 运行真实 48 层 Gemma 4 Unified，收集 49 个隐藏状态，
 保留 BF16 边界、局部 global RoPE 和 padding 位置。V2 特征归一化与投影进入八个视频和
 八个音频 connector；学习的 register 让完整 1024-token 上下文有效，不能直接丢掉 padding。
-[`Ltx25Pipeline`](../../TensorSharp.Models/Models/Ltx25/Ltx25Pipeline.cs) 负责两阶段采样；
+LTX 2.5 运行在共享的[扩散运行时](../design/diffusion-runtime.md#312-ltx-25-on-the-runtime-as-built)上：
+[`Ltx25Family`](../../TensorSharp.Models/Models/Ltx25/Ltx25Family.cs) 通过 `DiffusionVideoPipeline` 完成两阶段采样，
+[`Ltx25Denoiser`](../../TensorSharp.Models/Models/Ltx25/Ltx25Denoiser.cs) 每步把 48 个 AV 块作为一个图程序在后端的 tensor executor 上运行；
 [`潜变量上采样器`](../../TensorSharp.Models/Models/Ltx25/Ltx25LatentUpsampler.cs)
 有 1024 个中间通道、前后各四个 ResBlock、Conv2d + PixelShuffle(2)，
 GroupNorm(32) 在整段片上以 Float64 累积统计。解码使用精确扩宽的 BF16 权重与 F32 激活。
@@ -254,9 +254,8 @@ GroupNorm(32) 在整段片上以 Float64 累积统计。解码使用精确扩宽
 `TrimIdleMemory` 释放所有保留组件。组件内存数据不代表完整生成峰值。
 
 最新源码把保持原顺序的 BF16 舍入与 Gemma split-half RoPE 放在 CUDA/MLX 设备执行，
-三角函数仍按原 `MathF` 和 BF16 舍入产生；`TS_LTX25_DEVICE_PROMPT_MATH=0` 选择主机控制。
-CUDA 融合 `2 * sigmoid(logit)` head gating，保留独立 F32 舍入边界，
-`TS_LTX25_CUDA_FUSED_HEAD_GATE=0` 恢复分立操作。
+三角函数仍按原 `MathF` 和 BF16 舍入产生。CUDA 融合 `2 * sigmoid(logit)` head gating，
+保留独立 F32 舍入边界。选择旧内核的开关已随直接去噪器删除（见[扩散运行时迁移](#扩散运行时迁移2026-11-27)）。
 MLX Q5_K 以有界 CPU 并行直接打包，保留所有量化值和缩放字节；
 `TS_MLX_Q5K_REPACK=0` 选择旧转换。旧可选 PTX 缺少导出时会回退，
 所以成功生成本身不证明实际用了新内核，严格测试还要求 native dispatch。
@@ -267,6 +266,64 @@ MLX Q5_K 以有界 CPU 并行直接打包，保留所有量化值和缩放字节
 组件微基准与打包耗时不能换算成模型整体提速。
 
 ## 验证与复现
+
+### 扩散运行时迁移（2026-11-27）
+
+LTX 2.5 及其 Ingredients IC-LoRA 只运行在共享的扩散运行时上
+（[设计](../design/diffusion-runtime.md#312-ltx-25-on-the-runtime-as-built)）：`Ltx25Family`
+驱动视频管线的两个阶段（Ingredients 为单阶段），`Ltx25Denoiser` 每步在后端的 tensor executor 上
+运行一个图程序，`Ltx25LoraSet` 作为运行时的 adapter set，以精确 F32 未合并地应用。退役的
+`Ltx25Pipeline`、`Ltx25Sampling`、直接去噪器与 `Ltx25LoraAdapter` 在冻结其输出后已删除。
+
+证据（NVIDIA A40 48 GB，驱动 595.112，CUDA 13.2，.NET 10.0.404；Intel Xeon Gold 6342，
+50 GB 容器；ggml `bb877c0c` 未修改；退役路径由 `c178bfc` 以相同 ggml 与检查点构建）：
+
+- **冻结的去噪步。** 退役去噪器在合成检查点上的输出（官方 oracle 的四个用例，各再加一个覆盖全部
+  适配投影的合成 rank-2 Ingredients 适配器）按通道冻结在
+  `InferenceWeb.Tests/Fixtures/Ltx25/LegacyGoldens/`。运行时在 CPU 与 CUDA 两个通道上逐位相同
+  （各 16 个输出），由 `Ltx25DenoiserTests.StepsGiveTheRetiredDirectDenoisersBitsOnItsLane` 保持。
+- **真实检查点单步**（生成几何下的合成潜变量与上下文；因无法获得受限适配器，使用 480 个投影、
+  rank-128 BF16 的合成 Ingredients 布局适配器）：CUDA 上 512×512×17 首阶段、图像引导的逐 token
+  时间步、1024×1024×17 细化、带追加关键帧引导的 384×256×49 以及 768×448×121 Ingredients 阶段全部
+  逐位相同。稳态单步：820/825、897/893、2954/2954、919/931 与 21838/21919 ms（退役/运行时）。
+  释放设备副本后的首步：首阶段 2.45–2.63 s 对 2.37–2.49 s，细化 4.65–4.89 s 对 4.51–4.72 s。
+  CPU（两个块）两个用例逐位相同，2829/2548 与 3478/3154 ms。
+- **完整片段**（`Ltx25AbProbe` 走公开模型 API，比较原始 RGB 与两个 PCM 声道）：每个用例的每一轮都
+  逐位相同。用预构建二进制交替运行的墙钟时间（最终代码，各两轮）：
+
+  | 片段（A40，`cuda`） | 退役 | 运行时 | 运行时/退役 |
+  |---|---:|---:|---:|
+  | t2v 1024×1024×17 | 33.86、32.43 s | 32.39、32.08 s | 0.973 |
+  | i2v 1024×1024×17 | 32.26、31.87 s | 32.03、31.96 s | 0.998 |
+  | 关键帧 768×512×49（三个引导） | 34.89、34.68 s | 34.68、34.61 s | 0.996 |
+  | t2v 1024×576×121 | 91.32、89.98 s | 90.39、90.13 s | 0.996 |
+  | Ingredients 768×448×121（两张参考） | 203.49 s | 204.03 s | 1.003 |
+
+  各阶段（文本与图像编码、两个阶段、上采样器与解码）持平或更快。做到这一点靠三处改动：投影在首次
+  乘积时上传，与此前排队的设备工作重叠，与退役去噪器一致；Philox 噪声与旋转表在多核上生成
+  （位相同）；Ingredients 更新原地加到每个投影上。在这些改动之前的轮次最多慢 1.8%。
+- **内存。** 单步峰值活动设备内存更低：2,063 对 2,345 MiB（细化）、6,192 对 6,684 MiB
+  （Ingredients），不含权重。CUDA 内存池在该峰值处多缓存 0.3–0.4 GB 已释放的块，分配失败前会先归还，
+  因此 Ingredients 阶段 nvidia-smi 读数为 23.9 对 23.4 GB；其它片段两棵树的峰值都是 18.2–22.9 GB
+  （121 帧解码的瞬时峰值）。两片段进程的主机内存：匿名 3.56 对 3.61 GiB，文件映射均为 38.31 GiB。
+- **CPU。** Xeon（7.65 核配额）上一个 256×256×9 片段在顺序相反的两组中都逐位相同：退役 411.7/405.3 s，
+  运行时 415.5/403.9 s（两组合计 1.003×）。
+- **测试。** LTX、扩散运行时、图与 LoRA 过滤集通过：CPU 1,637 个（跳过 34），CUDA 1,628 个
+  （跳过 34）。跳过的是仅 MLX/Metal 的测试、GGML 后端区域测试，以及需要受限适配器、分词器参考或
+  PyAV 图像参考的 oracle。
+
+已移除（服务端与 CLI 启动时拒绝并说明替代）：`TS_LTX25_CUDA_ATTN`、`TS_LTX25_CUDA_FUSED_HEAD_GATE`、
+`TS_LTX25_FUSED_ROPE`、`TS_LTX25_CUDA_TILE`、`TS_LTX25_CUDA_REQUIRE_TILE`、`TS_LTX25_CUDA_F16_DEQUANT`、
+`TS_LTX25_STAGE_TIMING`、`TS_LTX25_CUDA_SOURCE_UPLOAD`，以及提示词编码器的 `TS_LTX25_CUDA_PREFAULT`、
+`TS_LTX25_CUDA_PREFAULT_WORKERS`、`TS_LTX25_DEVICE_PROMPT_MATH`、`TS_LTX25_CUDA_BF16_GEMM` 与
+`TS_LTX25_MLX_BF16_GEMM`。各自保留原默认行为，因此输出不变。`TS_LTX25_INGREDIENTS_LORA` 保留。
+潜变量探针的 `--first-stage-image-strength` 与提示词探针按开关交替的轮次模式一并移除
+（`Ltx25PromptProbe --rounds N` 重复编码）。
+
+未验证：MLX 与 Metal 硬件（无可用 Apple 设备）；真实的受限 Ingredients 适配器（合成适配器具有相同
+布局、形状与数据类型）；其它 GPU 与操作系统；逐位相同之外的感知质量（输出即同一片段）。
+
+### 2026-10-17 的工作
 
 2026-10-17 的工作为默认 1024×1024×17 配方（seed 42）去掉了权重加载与主机开销，
 所有输出都没有改变。M5 Pro 各行使用端到端探针，用
@@ -317,9 +374,8 @@ Ingredients 在两 GPU 上覆盖一图和同主体双视图的训练配方，包
 全部 480 组 LoRA factor 与真实 rank-128 更新另有严格数值检查，
 不消除已观察到的参考板复制问题。
 
-Linux 可选 `TS_LTX25_CUDA_SOURCE_UPLOAD=1` 对冷映射页使用每组件两个 8 MiB pinned
-缓冲；默认关闭。单组反序 A40 对比 77.015 → 70.507 秒，RGB/PCM 精确相同，
-仍慢于记录的 SD.cpp 首次时间，且依赖存储/页驻留，不是通用提速结论。
+曾有的 Linux CUDA 可选 pinned 源上传路径（单组 A40 对比快 8.45%，但从未成为默认）已随直接去噪器删除；
+权重在文件缓存预读之后从映射的 checkpoint 上传。
 
 独立夹具保存在 `InferenceWeb.Tests/Fixtures/Ltx25/`；工具在 `eng/validation/`。
 生成证据在被忽略的 `docs/validation/ltx25/` 或 `artifacts/ltx25/`，不提交到 Git。

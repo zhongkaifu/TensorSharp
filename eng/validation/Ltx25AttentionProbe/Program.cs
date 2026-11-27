@@ -33,7 +33,7 @@ var report = new Dictionary<string, object?>
     ["warmup"] = warmup, ["repeats"] = repeats,
     ["scope"] = "Resident synthetic Float32 unbiased attention only: previous DirectOps.Attention dispatch versus CudaLtx25AttentionSession. Both routes allocate their output inside each measured call. Alternating synchronized samples include managed dispatch, output allocation, and GPU execution; exclude input upload, first JIT/module initialization, output readback, projection, sampling, decoding, and media export. This is not end-to-end generation or perceptual validation.",
     ["baseline_invocation"] = "A compiled expression calls the existing internal DirectOps.Attention method; reflection is used only once outside measurements to bind the method, without changing library visibility.",
-    ["environment"] = new[] { "TS_WAN_DIRECT_FUSED_ATTN", "TS_WAN_DIRECT_TIMING", "TS_LTX25_CUDA_ATTN" }
+    ["environment"] = new[] { "TS_WAN_DIRECT_FUSED_ATTN", "TS_WAN_DIRECT_TIMING" }
         .ToDictionary(name => name, Environment.GetEnvironmentVariable),
     ["managed_binaries"] = new[] { Assembly.GetExecutingAssembly(), typeof(Ltx25Denoiser).Assembly, typeof(CudaAllocator).Assembly, typeof(Tensor).Assembly }
         .Select(assembly => new { name = assembly.GetName().Name, path = assembly.Location, sha256 = HashFile(assembly.Location) }).ToArray(),

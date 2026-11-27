@@ -30,7 +30,7 @@ BM25 检索不需要嵌入模型。可选 GGUF 嵌入增加语义检索；聊天
 
 ### 当前媒体生成模型
 
-**LTX 2.5 Distilled** 使用发布方两阶段配方：半尺寸八步 ancestral Euler、必需的 x2 潜变量上采样，再在全尺寸执行三步细化，CFG 均为 1。支持文本、首尾/定时关键帧，以及可选 Ingredients IC-LoRA 身份参考板（独立单阶段参考配方），输出视频与 48 kHz 立体声音频。CUDA 与 MLX 使用自有执行器，包括 `ggml_cuda` / `ggml_metal` 别名；CPU 使用直接实现。Vulkan、多 GPU、参考视频/音频不支持。默认卷积视频 VAE，CPU/MLX 可另选扩散解码器。下载、质量限制、应用覆盖和修正配方见[模型卡片](models/ltx-2.5_zh-cn.md)；旧单阶段计时不代表当前默认配方。
+**LTX 2.5 Distilled** 使用发布方两阶段配方：半尺寸八步 ancestral Euler、必需的 x2 潜变量上采样，再在全尺寸执行三步细化，CFG 均为 1。支持文本、首尾/定时关键帧，以及可选 Ingredients IC-LoRA 身份参考板（独立单阶段参考配方），输出视频与 48 kHz 立体声音频。它运行在扩散运行时上：每步是后端 tensor executor 上的一个图程序（CUDA 与 MLX，包括 `ggml_cuda` / `ggml_metal` 别名，以及托管 CPU 执行器）。Vulkan、多 GPU、参考视频/音频不支持。默认卷积视频 VAE，CPU/MLX 可另选扩散解码器。下载、质量限制、应用覆盖和修正配方见[模型卡片](models/ltx-2.5_zh-cn.md)；旧单阶段计时不代表当前默认配方。
 
 **MiniMax-H3** 区分 FL2VA（文本/关键帧）和 Ref2VA（参考媒体）检查点，生成 32 kHz 立体声，CFG 1，默认 20 步。六条 CPU/MLX/CUDA 原生或直接路径均有组件覆盖，修正后的 CPU 完整配对生成仍待验证。最新四条 GPU 路径保真检查使用未修改 ggml `3612c0af93f2cfc8f048295300a61187723b12ae`。两轮完整进程 A/B 保持解码 RGB/音频精确相同，原生 Metal、MLX、同精度 Direct CUDA 延迟分别降低 5.0%、12.5%、19.0%；原生 CUDA 的 1.3% 不构成有意义提速。数据包含加载/编码且缓存未受控。CUDA BF16 权重投影现默认 pedantic F32；实验性批量注意力未通过完整生成质量门禁，模型入口已移除。独立数值门禁和基准限制见[模型卡片](models/minimax-h3_zh-cn.md)与[验证流程](../eng/validation/README-minimax-h3.md)。
 
@@ -115,6 +115,15 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 
 以下变化跨越多个发布标签。上文的 LTX 2.5、EmbeddingGemma 2、Muse Spark、从任意分片加载分片 GGUF、原生技能发现和最新 MiniMax-H3 改动晚于 `v2026.10.11`；知识集合与生成中引导已包含于该标签。下面保留早期工作的兼容性说明和性能实测记录。
 
+- **LTX 2.5 及其 Ingredients IC-LoRA 运行在扩散运行时上，旧管线与直接去噪器已移除。** 片段在共享视频管线上分两个阶段运行
+  （`Ltx25Family`），48 块去噪器每步是后端 tensor executor 上的一个图程序，Ingredients 适配器作为未合并的 adapter set
+  以精确 F32 原地相加。A40 上每个片段（t2v、i2v、关键帧、121 帧、Ingredients 参考片段）的 RGB 与两个 PCM 声道都与
+  退役管线逐字节相同，墙钟时间为其 0.973×–1.003×；`cpu` 片段同样逐字节相同。单步峰值活动设备内存低 0.3–0.5 GB。
+  已退役的 `TS_LTX25_CUDA_ATTN`、`TS_LTX25_CUDA_FUSED_HEAD_GATE`、`TS_LTX25_FUSED_ROPE`、`TS_LTX25_CUDA_TILE`、
+  `TS_LTX25_CUDA_REQUIRE_TILE`、`TS_LTX25_CUDA_F16_DEQUANT`、`TS_LTX25_STAGE_TIMING`、`TS_LTX25_CUDA_SOURCE_UPLOAD`、
+  `TS_LTX25_CUDA_PREFAULT`、`TS_LTX25_CUDA_PREFAULT_WORKERS`、`TS_LTX25_DEVICE_PROMPT_MATH`、`TS_LTX25_CUDA_BF16_GEMM`、
+  `TS_LTX25_MLX_BF16_GEMM` 会让服务端或 CLI 在启动时拒绝运行。`mlx`/`ggml_metal` 与受限适配器本身尚未在运行时上验证。
+  见[模型卡片](models/ltx-2.5_zh-cn.md#扩散运行时迁移2026-11-27)。
 - **MiniMax-H3 运行在扩散运行时上，旧管线与 DiT 已移除。** 片段运行在共享视频管线（`DiffusionVideoPipeline`）上，
   去噪器在每个后端上每步是一个图程序，LightX2V Turbo 插件以未合并的 LoRA 区域应用。在 `ggml_cuda`（A40）上，不带插件的
   片段与退役管线逐字节相同，中位墙钟时间为其 0.989×–1.015×（在运行间噪声之内，稳定步相同）；Turbo 插件改走运行时的未合并

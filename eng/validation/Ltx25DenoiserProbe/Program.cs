@@ -8,6 +8,7 @@ using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.MLX;
 using TensorSharp.Models.Ltx25;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -38,11 +39,8 @@ var report = new Dictionary<string, object?>
     ["template_sigma"] = sigma,
     ["warmup"] = warmup, ["repeats"] = repeats,
     ["schedule"] = schedule,
-    ["timing_kind"] = Environment.GetEnvironmentVariable("TS_LTX25_STAGE_TIMING") == "1"
-        ? "diagnostic_synchronized_phases" : "synchronized_output_readbacks",
-    ["environment"] = new[] { "MLX_ENABLE_TF32", "TS_LTX25_FUSED_ROPE", "TS_WAN_DIRECT_FUSED_ATTN",
-        "TS_LTX25_STAGE_TIMING", "TS_CUDA_QMM_F16GEMM_MIN_ROWS", "TS_LTX25_CUDA_TILE", "TS_LTX25_CUDA_REQUIRE_TILE", "TS_LTX25_CUDA_ATTN",
-        "TS_LTX25_CUDA_F16_DEQUANT", "TS_LTX25_CUDA_PREFAULT", "TS_LTX25_CUDA_FUSED_HEAD_GATE", "TS_MLX_Q5K_REPACK" }
+    ["timing_kind"] = "synchronized_output_readbacks",
+    ["environment"] = new[] { "MLX_ENABLE_TF32", "TS_WAN_DIRECT_FUSED_ATTN", "TS_CUDA_QMM_F16GEMM_MIN_ROWS", "TS_MLX_Q5K_REPACK" }
         .ToDictionary(name => name, Environment.GetEnvironmentVariable),
     ["scope"] = schedule == "forward"
         ? "AV denoiser Forward with deterministic synthetic projected contexts/latents, synchronized by both output readbacks. Excludes tokenizer, Gemma4, connectors, sampler, VAEs, codecs, HTTP and TensorAgent. This is not end-to-end generation or a quality proof."
@@ -109,9 +107,6 @@ try
     try
     {
         using var denoiser = new Ltx25Denoiser(model, allocator);
-        report["optimized_cuda_module"] = denoiser.OptimizedCudaModulePath is string modulePath
-            ? new { path = modulePath, available = denoiser.OptimizedCudaModuleAvailable, sha256 = HashFile(modulePath) }
-            : null;
         var samples = new List<double>();
         Ltx25DenoiserOutput? result = null;
         double? firstMilliseconds = null;
@@ -124,9 +119,26 @@ try
             if (schedule == "forward") result = denoiser.Forward(input, blocks);
             else
             {
-                var sampled = Ltx25Sampling.RunEuler(step => denoiser.Forward(step, blocks), input,
-                    Ltx25Scheduler.DistilledSigmas());
-                result = new(sampled.Video, sampled.Audio, sampled.BlocksPerStep);
+                // The distilled schedule on the runtime's x0 Euler sampler, as a clip's Euler pass steps it.
+                float[] sigmas = Ltx25Scheduler.DistilledSigmas();
+                float[] video = (float[])input.Video.Clone(), audio = (float[])input.Audio.Clone();
+                var sampler = new EulerDenoisedSampler();
+                int executed = 0;
+                for (int step = 0; step + 1 < sigmas.Length; ++step)
+                {
+                    var prediction = denoiser.Forward(new Ltx25DenoiserInput
+                    {
+                        Video = video, VideoTokens = input.VideoTokens, Audio = audio, AudioTokens = input.AudioTokens,
+                        VideoContext = input.VideoContext, VideoContextTokens = input.VideoContextTokens,
+                        AudioContext = input.AudioContext, AudioContextTokens = input.AudioContextTokens,
+                        VideoPositions = input.VideoPositions, AudioPositions = input.AudioPositions,
+                        FrequencyPrecision = input.FrequencyPrecision, VideoSigma = sigmas[step], AudioSigma = sigmas[step],
+                    }, blocks);
+                    sampler.Step(video, prediction.VideoVelocity, sigmas[step], sigmas[step + 1]);
+                    sampler.Step(audio, prediction.AudioVelocity, sigmas[step], sigmas[step + 1]);
+                    executed = prediction.ExecutedBlocks;
+                }
+                result = new(video, audio, executed);
             }
             timer.Stop();
             firstMilliseconds ??= timer.Elapsed.TotalMilliseconds;
@@ -155,22 +167,10 @@ try
         report["output_sha256"] = new { video = Hash(Bytes(result.VideoVelocity)), audio = Hash(Bytes(result.AudioVelocity)) };
         report["outputs"] = new { video = videoPath, audio = audioPath };
         report["maximum_repeat_difference"] = maximumRepeatDifference;
-        report["optimized_cuda_projections"] = denoiser.OptimizedCudaProjections;
-        report["optimized_cuda_attentions"] = denoiser.OptimizedCudaAttentions;
-        report["optimized_cuda_head_gates"] = denoiser.OptimizedCudaHeadGates;
-        report["cuda_attention_workspace_bytes"] = denoiser.CudaAttentionWorkspaceBytes;
-        report["optimized_cuda_f16_projections"] = denoiser.OptimizedCudaF16Projections;
-        report["optimized_cuda_f16_dequantizations"] = denoiser.OptimizedCudaF16Dequantizations;
-        report["optimized_cuda_f16_available"] = denoiser.OptimizedCudaF16Available;
-        report["cuda_projection_workspace_bytes"] = denoiser.CudaProjectionWorkspaceBytes;
-        report["cuda_mapped_prefault"] = new { read_bytes = denoiser.CudaPrefaultReadBytes,
-            resident_bytes = denoiser.CudaPrefaultResidentBytes, ranges = denoiser.CudaPrefaultRanges,
-            elapsed_ms = denoiser.CudaPrefaultMilliseconds, failure = denoiser.CudaPrefaultFailure };
         report["first_forward_ms_including_weight_upload"] = firstMilliseconds;
         var sorted = samples.Order().ToArray();
-        bool diagnosticTiming = Environment.GetEnvironmentVariable("TS_LTX25_STAGE_TIMING") == "1";
-        report[diagnosticTiming ? "diagnostic_forward_samples_ms" : "forward_samples_ms"] = samples;
-        report[diagnosticTiming ? "diagnostic_median_ms" : "median_ms"] = (sorted[(sorted.Length - 1) / 2] + sorted[sorted.Length / 2]) / 2;
+        report["forward_samples_ms"] = samples;
+        report["median_ms"] = (sorted[(sorted.Length - 1) / 2] + sorted[sorted.Length / 2]) / 2;
         report["peak_working_set_bytes"] = Process.GetCurrentProcess().PeakWorkingSet64;
         if (allocator is MlxAllocator mlx) report["mlx_memory"] = mlx.GetMemorySnapshot();
         if (allocator is CudaAllocator cuda)

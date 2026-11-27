@@ -90,8 +90,9 @@ public sealed class Ltx25GenerationSettingsTests
     {
         var settings = Ltx25GenerationSettings.Resolve(new VideoGenerationParams { Width = 256, Height = 256, Frames = 17, Seed = 42 });
         int video = settings.VideoTokens * 128, audio = settings.AudioTokens * 128;
-        Ltx25StepNoise first = settings.AncestralNoise(0, video, audio), again = settings.AncestralNoise(0, video, audio);
-        Ltx25StepNoise second = settings.AncestralNoise(1, video, audio);
+        var first = settings.AncestralNoise(0, video, audio);
+        var again = settings.AncestralNoise(0, video, audio);
+        var second = settings.AncestralNoise(1, video, audio);
         Assert.Equal(first.Video, again.Video);
         Assert.Equal(first.Audio, again.Audio);
         Assert.Equal((video, audio), (first.Video.Length, first.Audio.Length));

@@ -17,8 +17,7 @@ internal static class Ltx25PromptMath
     internal static void RoundBf16(Tensor tensor)
     {
         if (MlxLtx25PromptOps.TryRoundBf16(tensor)) return;
-        if (Environment.GetEnvironmentVariable("TS_LTX25_DEVICE_PROMPT_MATH") != "0" &&
-            CudaLtx25PromptOps.TryRoundBf16(tensor)) return;
+        if (CudaLtx25PromptOps.TryRoundBf16(tensor)) return;
         float[] data = tensor.GetElementsAsFloat(checked((int)tensor.ElementCount()));
         for (int i = 0; i < data.Length; ++i) data[i] = Bf16(data[i]);
         tensor.SetElementsAsFloat(data);
@@ -54,8 +53,7 @@ internal static class Ltx25PromptMath
             cosine[token * rotated + i] = Bf16(MathF.Cos(angle));
             sine[token * rotated + i] = Bf16(MathF.Sin(angle));
         }
-        if (Environment.GetEnvironmentVariable("TS_LTX25_DEVICE_PROMPT_MATH") != "0" &&
-            input.Allocator is CudaAllocator or MlxAllocator)
+        if (input.Allocator is CudaAllocator or MlxAllocator)
         {
             using var cos = Tensor.FromArray(input.Allocator, cosine);
             using var sin = Tensor.FromArray(input.Allocator, sine);

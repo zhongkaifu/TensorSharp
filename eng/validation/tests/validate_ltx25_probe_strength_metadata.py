@@ -33,9 +33,6 @@ def main():
         ("omitted", [], .7, 1., False),
         ("explicit-one", ["--image-strength", "1"], 1., 1., True),
         ("explicit-partial", ["--image-strength", ".85"], .85, .85, True),
-        ("override-explicit-one", ["--image-strength", "1", "--first-stage-image-strength", ".7"], .7, 1., True),
-        ("override-explicit-partial", ["--image-strength", ".85", "--first-stage-image-strength", ".7"], .7, .85, True),
-        ("override-shorthand", ["--first-stage-image-strength", ".9"], .9, 1., False),
         ("end-image-preserves-one", ["--end-image", str(image)], 1., 1., False),
     ]
     results = []

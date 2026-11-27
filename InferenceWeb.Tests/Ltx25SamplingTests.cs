@@ -1,8 +1,11 @@
 using System.Text.Json;
 using TensorSharp.Models.Ltx25;
+using TensorSharp.Models.SharedDiffusion;
 
 namespace InferenceWeb.Tests;
 
+/// <summary>LTX 2.5's samplers on the diffusion runtime (<see cref="EulerDenoisedSampler"/>, <see cref="EulerAncestralSampler"/>)
+/// against the unchanged official Euler and euler_ancestral loops, through the family's step inputs.</summary>
 public sealed class Ltx25SamplingTests
 {
     private static Ltx25DenoiserInput Input(float[]? video = null, float[]? audio = null,
@@ -42,7 +45,7 @@ public sealed class Ltx25SamplingTests
         var initial = Input(initialVideo, initialAudio);
         var progress = new List<(int Step, int Total)>();
         int called = 0;
-        Ltx25SamplingOutput output = Ltx25Sampling.RunEuler(input =>
+        var output = Ltx25SamplerLoop.Run(input =>
         {
             JsonElement[] expected = root.GetProperty("steps").EnumerateArray().ToArray();
             Close(called == 0 ? initialVideo : Values(expected[called - 1].GetProperty("video")), input.Video);
@@ -56,15 +59,15 @@ public sealed class Ltx25SamplingTests
             Assert.Equal(initial.FrequencyPrecision, input.FrequencyPrecision);
             Assert.Equal(root.GetProperty("sigmas")[called].GetSingle(), input.VideoSigma);
             Assert.Equal(input.VideoSigma, input.AudioSigma);
+            Assert.Null(input.VideoTimesteps);
             JsonElement step = expected[called++];
             return new(Values(step.GetProperty("video_velocity")), Values(step.GetProperty("audio_velocity")), 2);
-        }, initial, Values(root.GetProperty("sigmas")), (step, total) => progress.Add((step, total)));
+        }, initial, Values(root.GetProperty("sigmas")), onStep: (step, total) => progress.Add((step, total)));
 
         JsonElement last = root.GetProperty("steps")[2];
         Close(Values(last.GetProperty("video")), output.Video);
         Close(Values(last.GetProperty("audio")), output.Audio);
         Assert.Equal(3, output.Steps);
-        Assert.Equal(2, output.BlocksPerStep);
         Assert.Equal(3, called);
         Assert.Equal(new[] { (1, 3), (2, 3), (3, 3) }, progress);
         Close(Values(root.GetProperty("initial_video")), initialVideo);
@@ -79,8 +82,8 @@ public sealed class Ltx25SamplingTests
         using JsonDocument fixture = JsonDocument.Parse(stream);
         JsonElement root = fixture.RootElement;
         Assert.Equal("be6d6d0a69d11a0a399c462ed92606692e5f8697", root.GetProperty("source_revision").GetString());
-        Assert.Equal(Ltx25Sampling.AncestralEta, root.GetProperty("eta").GetSingle());
-        Assert.Equal(Ltx25Sampling.AncestralNoiseScale, root.GetProperty("s_noise").GetSingle());
+        Assert.Equal(EulerAncestralSampler.Eta, root.GetProperty("eta").GetSingle());
+        Assert.Equal(EulerAncestralSampler.NoiseScale, root.GetProperty("s_noise").GetSingle());
         JsonElement[] steps = root.GetProperty("steps").EnumerateArray().ToArray();
         float[] sigmas = Values(root.GetProperty("sigmas"));
         Assert.Equal(Ltx25Scheduler.DistilledSigmas(), sigmas);
@@ -95,7 +98,7 @@ public sealed class Ltx25SamplingTests
         };
         int called = 0;
         var drawn = new List<int>();
-        Ltx25SamplingOutput output = Ltx25Sampling.RunEulerAncestral(input =>
+        var output = Ltx25SamplerLoop.Run(input =>
         {
             JsonElement step = steps[called];
             // Each prediction sees exactly the original loop's latents, so every step is checked.
@@ -109,7 +112,7 @@ public sealed class Ltx25SamplingTests
         }, initial, sigmas, step =>
         {
             drawn.Add(step);
-            return new(Values(steps[step].GetProperty("video_noise")), Values(steps[step].GetProperty("audio_noise")));
+            return (Values(steps[step].GetProperty("video_noise")), Values(steps[step].GetProperty("audio_noise")));
         });
         Close(Values(root.GetProperty("final_video")), output.Video);
         Close(Values(root.GetProperty("final_audio")), output.Audio);
@@ -121,39 +124,30 @@ public sealed class Ltx25SamplingTests
     }
 
     [Fact]
-    public void AncestralNoiseMustCoverBothStreams()
+    public void TheRecipesSamplersAreTheConditionedEulerSamplers()
     {
-        Assert.Throws<InvalidOperationException>(() => Ltx25Sampling.RunEulerAncestral(
-            _ => new([0f, 0f], [0f, 0f], 1), Input(), [1f, .5f, 0f], _ => new([0f], [0f, 0f])));
-        Assert.Throws<InvalidOperationException>(() => Ltx25Sampling.RunEulerAncestral(
-            _ => new([0f, 0f], [0f, 0f], 1), Input(), [1f, .5f, 0f], _ => new([0f, 0f], [0f, float.NaN])));
-        Assert.Throws<InvalidOperationException>(() => Ltx25Sampling.RunEulerAncestral(
-            _ => new([0f, 0f], [0f, 0f], 1), Input(), [1f, .5f, 0f], _ => null!));
+        SamplingRecipe Recipe(DiffusionSamplerKind kind) => new()
+        {
+            Schedule = DiffusionSchedule.Explicit, Steps = 8, Sigmas = Ltx25Scheduler.DistilledSigmas(), Sampler = kind,
+        };
+        Assert.IsType<EulerAncestralSampler>(Recipe(DiffusionSamplerKind.EulerAncestral).CreateSampler());
+        Assert.IsType<EulerDenoisedSampler>(Recipe(DiffusionSamplerKind.EulerDenoised).CreateSampler());
+        Assert.True(new EulerAncestralSampler().NeedsNoise);
+        Assert.False(new EulerDenoisedSampler().NeedsNoise);
     }
 
-    public static TheoryData<float[]> InvalidSchedules => new()
+    [Fact]
+    public void AncestralNoiseMustCoverTheStream()
     {
-        Array.Empty<float>(), new[] { 1f }, new[] { 1f, .5f }, new[] { 1f, .5f, .75f, 0f }, new[] { 1f, 0f, 0f },
-        new[] { float.NaN, 0f }, new[] { float.PositiveInfinity, 0f }, new[] { 1.1f, 0f }, new[] { 1f, -.1f, 0f },
-    };
-
-    [Theory]
-    [MemberData(nameof(InvalidSchedules))]
-    public void InvalidScheduleFailsBeforePrediction(float[] sigmas)
-    {
-        Assert.Throws<ArgumentException>(() => Ltx25Sampling.RunEuler(
-            _ => throw new Xunit.Sdk.XunitException("Must validate before invoking the predictor."), Input(), sigmas));
-    }
-
-    [Theory]
-    [InlineData("video")]
-    [InlineData("audio")]
-    public void ConditioningIsRejectedInsteadOfBeingSilentlyDropped(string kind)
-    {
-        var input = Input(videoTimesteps: kind == "video" ? [.5f] : null,
-            audioTimesteps: kind == "audio" ? [.5f] : null);
-        Assert.Throws<NotSupportedException>(() => Ltx25Sampling.RunEuler(
-            _ => throw new Xunit.Sdk.XunitException("Conditioning is outside this sampler's scope."), input, [1f, 0f]));
+        var sampler = new EulerAncestralSampler();
+        Assert.Throws<ArgumentException>(() => sampler.Step(new float[2], new float[2], 1f, .5f, null));
+        Assert.Throws<ArgumentException>(() => sampler.Step(new float[2], new float[2], 1f, .5f, new SamplerStreamInputs { Noise = [0f] }));
+        Assert.Throws<InvalidOperationException>(() => sampler.Step(new float[2], new float[2], 1f, .5f,
+            new SamplerStreamInputs { Noise = [0f, float.NaN] }));
+        // The terminal step returns the x0 estimate and reads no noise.
+        float[] x = [1f, 2f];
+        sampler.Step(x, [.5f, .25f], .5f, 0f, null);
+        Assert.Equal(new[] { 1f - .5f * .5f, 2f - .25f * .5f }, x);
     }
 
     [Theory]
@@ -161,38 +155,25 @@ public sealed class Ltx25SamplingTests
     [InlineData(false)]
     public void InvalidVelocityCannotProduceSuccessfulSampling(bool dimensions)
     {
-        Assert.Throws<InvalidOperationException>(() => Ltx25Sampling.RunEuler(
-            _ => new([0f, 0f], dimensions ? [0f] : [float.NaN, 0f], 1), Input(), [1f, 0f]));
-    }
-
-    [Fact]
-    public void ChangingDiagnosticBlockCountCannotLookLikeACompleteSchedule()
-    {
-        int calls = 0;
-        Assert.Throws<InvalidOperationException>(() => Ltx25Sampling.RunEuler(
-            _ => new([0f, 0f], [0f, 0f], ++calls), Input(), [1f, .5f, 0f]));
-    }
-
-    [Fact]
-    public void CancellationBeforePredictionDoesNotRunTheModel()
-    {
-        using var cancellation = new CancellationTokenSource();
-        cancellation.Cancel();
-        Assert.Throws<OperationCanceledException>(() => Ltx25Sampling.RunEuler(
-            _ => throw new Xunit.Sdk.XunitException("Cancelled sampling must not run."), Input(), [1f, 0f],
-            cancellationToken: cancellation.Token));
-    }
-
-    [Fact]
-    public void CancellationDuringPredictionDoesNotReportACompletedStep()
-    {
-        using var cancellation = new CancellationTokenSource();
-        int progress = 0;
-        Assert.Throws<OperationCanceledException>(() => Ltx25Sampling.RunEuler(_ =>
+        foreach (IConditionedSampler sampler in new IConditionedSampler[] { new EulerDenoisedSampler(), new EulerAncestralSampler() })
         {
-            cancellation.Cancel();
-            return new([0f, 0f], [0f, 0f], 1);
-        }, Input(), [1f, 0f], (_, _) => ++progress, cancellation.Token));
-        Assert.Equal(0, progress);
+            float[] velocity = dimensions ? [0f] : [float.NaN, 0f];
+            if (dimensions) Assert.Throws<ArgumentException>(() => sampler.Step(new float[2], velocity, 1f, 0f, null));
+            else Assert.Throws<InvalidOperationException>(() => sampler.Step(new float[2], velocity, 1f, 0f, null));
+        }
+    }
+
+    [Fact]
+    public void MaskAndCleanLatentsComeTogetherAndCoverTheStream()
+    {
+        var sampler = new EulerDenoisedSampler();
+        Assert.Throws<ArgumentException>(() => sampler.Step(new float[4], new float[4], 1f, 0f,
+            new SamplerStreamInputs { DenoiseMask = [1f, 1f] }));
+        Assert.Throws<ArgumentException>(() => sampler.Step(new float[4], new float[4], 1f, 0f,
+            new SamplerStreamInputs { Clean = new float[4] }));
+        Assert.Throws<ArgumentException>(() => sampler.Step(new float[4], new float[4], 1f, 0f,
+            new SamplerStreamInputs { DenoiseMask = [1f, 1f, 1f], Clean = new float[4] }));
+        Assert.Throws<ArgumentException>(() => sampler.Step(new float[4], new float[4], 1f, 0f,
+            new SamplerStreamInputs { DenoiseMask = [1f, 1f], Clean = new float[2] }));
     }
 }
