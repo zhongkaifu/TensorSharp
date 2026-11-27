@@ -120,10 +120,12 @@ public sealed class DSpineDraftTests
         // A version this TensorSharp does not read.
         var ex = Assert.Throws<NotSupportedException>(() => Parse(DraftKv(version: 2)));
         Assert.Contains("dflash.dspine.version 2", ex.Message);
-        // A bridge without the causal block, and a causal block without a bridge.
+        // A bridge without the causal block, and a causal block with a DFlash2 selector but no bridge (a plain or DSpark
+        // block-causal drafter, the Nemotron-3.5 DSpark module, is served: DSparkConfigTests).
         Assert.Throws<NotSupportedException>(() => Parse(DraftKv(causal: false)));
-        ex = Assert.Throws<NotSupportedException>(() => Parse(DraftKv(dspine: false)));
+        ex = Assert.Throws<NotSupportedException>(() => Parse(DraftKv(dspine: false, selector: true)));
         Assert.Contains("block-causal", ex.Message);
+        Assert.True(Parse(DraftKv(dspine: false)).CausalBlock);
         // A bridge next to a DFlash2 selector.
         Assert.Throws<NotSupportedException>(() => Parse(DraftKv(selector: true)));
         // A refinement width that is not a power of two.

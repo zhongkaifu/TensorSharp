@@ -286,6 +286,58 @@ namespace TensorSharp.Graph
             return Ops.NewContiguous(p);
         }
 
+        /// <summary>
+        /// ggml's flash attention with per-head sinks (ggml_flash_attn_ext_add_sinks): q [heads, nq, d], k/v [kvHeads, nkv, d]
+        /// (views), the mask [nq, nkv], <paramref name="sinks"/> one logit a query head that joins every row's softmax and weighs
+        /// no value, so w_c = exp(s_c) / (exp(sink) + sum_k exp(s_k)). Returns ggml's layout [nq, heads, dv]. Default:
+        /// <see cref="Attention"/>'s products with the sink as one more column of the scores; an executor with its own
+        /// attention kernels takes this path for a drafter's sink layers (the DSpark module's), whose few rows it does not time.
+        /// </summary>
+        protected virtual Tensor FlashAttentionWithSinks(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale, Tensor sinks)
+        {
+            var owned = new List<Tensor>();
+            try
+            {
+                q = Contig(F32(q, owned), owned);
+                k = Contig(F32(k, owned), owned);
+                v = Contig(F32(v, owned), owned);
+                int heads = (int)q.Sizes[0], kvHeads = (int)k.Sizes[0], group = heads / kvHeads;
+                long nq = q.Sizes[1], nkv = k.Sizes[1], dv = v.Sizes[2];
+                Tensor sink = Contig(F32(sinks, owned), owned);
+                if (sink.ElementCount() != heads)
+                    throw new NotSupportedException($"attention sinks of {sink.ElementCount()} values for {heads} heads");
+                Tensor kh = group == 1 ? k : RepeatHeads(k, group, owned);
+                Tensor vh = group == 1 ? v : RepeatHeads(v, group, owned);
+                using Tensor kt = kh.Transpose(1, 2);
+                var scores = new Tensor(Allocator, DType.Float32, heads, nq, nkv);
+                owned.Add(scores);
+                Ops.AddmmBatch(scores, 0, scores, scale, q, kt);
+                if (!(mask.Pattern == MaskPattern.None && mask.Floor == 0) && mask.Tensor is { } m)
+                    AddAttentionMask(scores, Contig(F32(m, owned), owned));
+                // [scores | sink] per row, its softmax, the scores' columns back.
+                var joined = new Tensor(Allocator, DType.Float32, heads, nq, nkv + 1);
+                owned.Add(joined);
+                using (Tensor head = joined.Narrow(2, 0, nkv))
+                    Ops.Copy(head, scores);
+                using (Tensor s3 = sink.View(heads, 1, 1))
+                using (Tensor spread = s3.Expand(heads, nq, 1))
+                using (Tensor tail = joined.Narrow(2, nkv, 1))
+                    Ops.Copy(tail, spread);
+                Ops.Softmax(joined, joined);
+                using (Tensor head = joined.Narrow(2, 0, nkv))
+                    Ops.Copy(scores, head);
+                var result = new Tensor(Allocator, DType.Float32, heads, nq, dv);
+                owned.Add(result);
+                Ops.AddmmBatch(result, 0, result, 1.0f, scores, vh);
+                using Tensor p = result.Permute(1, 0, 2);
+                return Ops.NewContiguous(p);
+            }
+            finally
+            {
+                foreach (Tensor t in owned) t.Dispose();
+            }
+        }
+
         private Tensor RepeatHeads(Tensor t, int group, List<Tensor> owned)
         {
             // [h, n, d] -> [h * group, n, d], each head repeated group times (block mapping).
@@ -2121,7 +2173,7 @@ namespace TensorSharp.Graph
                 }
                 case GraphOp.FlashAttnExt:
                 {
-                    if (n.Srcs.Length > 4) throw new NotSupportedException("attention sinks");
+                    if (n.Srcs.Length > 5) throw new NotSupportedException("a flash attention operand past the sinks");
                     if (Fp(1, 0f) != 0f || Fp(2, 0f) != 0f) throw new NotSupportedException("ALiBi or a logit softcap in flash attention");
                     // ggml: q [d, nq, H], k [d, nkv, Hkv], v [dv, nkv, Hkv], mask [nkv, nq_pad]; the
                     // result [dv, H, nq] is sizes [nq, H, dv].
@@ -2153,6 +2205,9 @@ namespace TensorSharp.Graph
                     bool promptChunk = Ip(2, GraphAttentionRows.Unsaid) == GraphAttentionRows.PromptChunk;
                     if (promptChunk) PromptChunkAttentions++;
                     else if (nq > 1) OtherMultiRowAttentions++;
+                    // srcs[4]: per-head attention sinks (F32 [heads]), one more logit in each query's softmax.
+                    if (n.Srcs.Length > 4)
+                        return V(FlashAttentionWithSinks(q, k, v, mask, Fp(0, 1f), T(4)));
                     return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window, promptChunk));
                 }
                 case GraphOp.SoftMaxExt:

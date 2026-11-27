@@ -16,7 +16,7 @@
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes: Reasoning-128K `<TOOLCALL>[...]</TOOLCALL>` (JSON or Python-style calls), Nemotron 3 Nano / Omni `<tool_call>` with an XML `<function=...>` body (§12); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
 | Batched / paged forward | **Default ON** (the shared runtime's batched slots: each slot's Mamba-2 conv window and SSM state, paged K/V for the attention layers) — `--no-continuous-batching` forces the per-sequence path. See §8. |
-| Speculative decoding | n-gram drafts and the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), verified in windows whose Mamba-2 states rewind exactly. See §8. |
+| Speculative decoding | n-gram drafts, the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), and the published Nemotron 3.5 Lightning DFlash and DSpark block drafters (`--draft-model`), verified in windows whose Mamba-2 states rewind exactly. See §8. |
 | Expert offload | `--n-cpu-moe` / `--cpu-moe` on one device or over `--layer-split` stages, every backend; refused with `--tp`. See §10. |
 | Output parser | `NemotronOutputParser` (a `ChatMlOutputParser`) |
 
@@ -30,6 +30,7 @@ Verified GGUF pointers:
 | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf` (28.188 GB) | — (text only) |
 | Nemotron 3 Nano Omni 30B-A3B | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) | `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf` (23.927 GB) | `mmproj-BF16.gguf` (1.590 GB; same repo) — **required for image input** |
 | Nemotron 3.5 Bolt 74B-A9B | [nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF) | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (22.018 GB) | `mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (1.734 GB; same repo) |
+| Nemotron 3.5 Lightning 30B-A3B | [ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF) | `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf` (18.898 GB). Drafters in the same repo: `mtp-...-Q4_0.gguf` (1.156 GB), `dflash-...-NVFP4.gguf` (1.185 GB), `dspark-...-NVFP4.gguf` (1.357 GB) | — (text only) |
 | Nemotron 3.5 Super VL 120B-A12B | [ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) | `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf` (76.919 GB) or `-Q4_0.gguf` (71.934 GB) | `mmproj-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Q8_0.gguf` (0.967 GB) or `-BF16.gguf` (1.734 GB; same repo) |
 
 The Omni `mmproj` enables **image input only**: it carries the 32-block RADIO
@@ -576,7 +577,7 @@ and the tensor-parallel shards keep them.
 | `--layer-split N` | cuda, ggml_cuda, ggml_vulkan | Whole-layer stages, batching kept. |
 | Hybrid (`--tp` x `--layer-split`) | none (gap) | The graph-only family has no graphs for tensor-parallel stages yet. |
 | `--n-cpu-moe` / `--cpu-moe` | all | On one device or over stages; refused with `--tp`. See §10. |
-| Speculation | all | n-gram drafts, and the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), verified in windows that rewind the Mamba-2 states exactly. The shared drafter loader refuses the published Nemotron 3.5 DFlash and DSpark files (`sliding_window` 0 on the DFlash export; a causal DSpark export without the `dspine` keys), as the legacy model refused every drafter. |
+| Speculation | all | n-gram drafts, the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), and the DFlash and DSpark block drafters (`--draft-model`, below), verified in windows that rewind the Mamba-2 states exactly. |
 | Text LoRA | cpu, ggml_cpu, ggml_cuda, cuda | One device. Each adapted product's delta is in the graph (`AppliesTextLoraInGraphs`). The targets are listed below. |
 | Media | all | The vision and audio towers' embeddings enter as queued media rows written over their placeholder rows (`QueueMedia`). |
 
@@ -596,6 +597,79 @@ graph, so decode, batched slots and verify windows all apply them, and the forwa
 skipped. This is validated on synthetic models against a merged-weights twin (`TextLoraModelParityTests` on cpu,
 ggml_cpu, ggml_cuda and cuda; `TextLoraPlanTests`), not on a real checkpoint. Details: [design
 doc](../design/logprobs-lora-moe-runtime-features.md) §2.2.
+
+### Block drafters (DFlash / DSpark)
+
+The Lightning repository ships two block drafters beside the MTP head; either attaches with `--draft-model`:
+
+```bash
+dotnet run --project TensorSharp.Cli -c Release -- --model models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf \
+  --draft-model models/dspark-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf --backend ggml_cuda
+```
+
+| | DFlash (`dflash-...-NVFP4.gguf`) | DSpark (`dspark-...-NVFP4.gguf`) |
+|---|---|---|
+| Layers | 6 (hidden 2688, 32 query heads over 2 KV heads, head_dim 128); BF16 attention, NVFP4 FFN and `fc` with `.scale` sidecars | the same, plus per-head attention sinks |
+| Context | every layer attends the whole history (no `sliding_window`); YaRN rotary, factor 128 over 8192 | a 1,024-token sliding window |
+| Block | 16 rows, non-causal; rows 1 .. 15 are drafts | 8 rows, block-causal; a bonus anchor (`sample_from_anchor = false`): rows 1 .. 7 are drafts |
+| Head | the target's LM head, top-1 of each row | the target's LM head plus a rank-512 Markov head: draft e's logits gain `w2 · w1[prev]`, `prev` the anchor, then each draft's own choice |
+| Encoder | trunk layers 2, 6, 20, 30, 42, 52 (52 is the stream leaving the last layer) | the same |
+
+Both run as the shared runtime's block-draft graph programs (`StandardDecoderModel.BlockDraft.cs`) on every executor:
+- **Markov head.** The chain runs on the device: `GetRows(w1, prev)`, `w2`'s product with its scale, and each draft's
+  top-1. Only the drafted ids and their confidences come back.
+- **Attention sinks.** Each sink is the attention op's fifth operand. The GGML builder passes it to
+  `ggml_flash_attn_ext_add_sinks`. The tensor executors attend a sink layer through their generic products, with the
+  sink as one more column of each row's softmax (`TensorGraphExecutor.FlashAttentionWithSinks`).
+- **Mask.** The block mask closes slot i to the block's queries before row i when the drafter's `attention.causal` is set.
+- **DFlash's full attention.** It is served with a window of the trunk's context, at most 8,192 positions: a ring of
+  8,224 rows, 96 MB of F32 K/V. Past that much context a draft sees the latest 8,192 positions. Drafts are verified, so
+  this can lower acceptance but never changes the output.
+- **Drafter embedding.** The drafter's own BF16 token embedding stays on the host in its file encoding. Loading it as an
+  F32 tensor would have put 1.4 GB on the device, where nothing read it.
+
+The per-op drafter follows the same rules (YaRN, the causal block, the bonus anchor's rows). The fused GGML drafter
+takes neither YaRN nor a causal block, so these two files draft through the graph programs, or per op where those
+decline.
+
+Lightning Q4_0 on one A40, greedy, 128 generated tokens a prompt. Each row reports:
+- the acceptance length τ, which is (accepted + verifies) / verifies, so a verify's bonus token counts;
+- the decode rate relative to plain decoding.
+
+NVIDIA reports τ of 3.16 (DFlash) and 3.75 (DSpark) at draft length 7.
+
+| Prompt | DSpark x7 ggml_cuda | DSpark x7 cuda | DFlash x7 ggml_cuda | DFlash x7 cuda | MTP x3 ggml_cuda / cuda |
+|---|---|---|---|---|---|
+| Fibonacci function (code) | τ 5.13, 1.29x | τ 5.64, 1.53x | τ 3.54, 1.10x | τ 3.18, 1.19x | 1.16x / 1.38x |
+| Why the sky is blue (3 bullets) | τ 2.80, 0.87x | τ 2.77, 1.03x | τ 1.73, 0.74x | τ 2.00, 0.91x | 1.13x / 1.15x |
+| Train speed (arithmetic) | τ 6.19, 1.52x | τ 5.46, 1.58x | τ 3.50, 1.11x | τ 3.33, 1.22x | 1.24x / 1.29x |
+| German translation | τ 2.76, 0.85x | τ 3.74, 1.24x | τ 2.17, 0.83x | τ 2.00, 0.91x | 1.12x / 1.17x |
+
+Plain decoding ran at 140 tok/s on `ggml_cuda` and 68-71 tok/s on `cuda`. With 3-token windows, DSpark ran the code
+prompt at 1.35x and the arithmetic prompt at 1.39x on `ggml_cuda`.
+
+**What bounds the speed-up.** On this MoE trunk an 8-row verify reads the experts of every row: about 23 ms on `ggml_cuda`
+against 7.1 ms for a decode step. A draft costs 4.4 ms (DSpark's block graph) plus 0.35 ms (the ring inject) at steady
+state.
+
+**Parity.** A speculative stream follows plain greedy decoding until a verify window's kernels flip a close pick. On
+`ggml_cuda` the streams parted where plain decoding's top two logits were 0.004-0.088 apart. On `cuda` they parted at up to
+0.21, and the MTP head parted at the same token, so this comes from the direct-CUDA verify rows' rounding (§11), not from a
+drafter.
+
+Synthetic coverage (`GraphBlockDraftTests`): a DSpark-shaped drafter (Markov head, sinks, causal block, bonus anchor, a
+target past the stack) and a full-attention YaRN drafter with its own embedding are checked as follows:
+- their graph drafts match the per-op drafter's (ids, confidences within 1e-3, ring rows within 1e-4) on the managed
+  CPU, `ggml_cpu`, `ggml_cuda` and direct `cuda`;
+- speculation with each emits plain greedy decoding's stream on the managed CPU, `ggml_cuda` and `cuda`.
+
+`DSparkConfigTests` covers the exports' keys.
+
+Limits:
+- `mlx`, `ggml_metal` and `ggml_vulkan` were not run.
+- Several requests' DSpark blocks do not share one program: each request drafts its own block (DFlash keeps the batched
+  lanes).
+- On direct CUDA, a sink layer takes the generic attention rather than the ring kernel.
 
 ## 9. Memory
 
@@ -658,7 +732,8 @@ scales against folded twins, and LoRA.
 - **Concurrency.** On the server, 8 concurrent Lightning prompts finished in 33.3 s at 14.4 tok/s on the legacy model and
   in 2.4 s at 181.6 tok/s on the runtime. The runtime matched each prompt served alone on 6 of 8 prompts, against 4 of 8
   for the legacy model; the others parted at near ties.
-- **Speculation** (Lightning on `ggml_cuda`; the legacy model refused it). With the MTP head over 3-token windows:
+- **Speculation** (Lightning on `ggml_cuda`; the legacy model refused it). The DFlash and DSpark drafters are measured in
+  §8. With the MTP head over 3-token windows:
   - acceptance was 64.5-85.7 % and decode ran 1.12-1.24x as fast as plain decoding on prompts of 46-96 generated
     tokens;
   - n-gram drafts ran at 0.95-1.03x.
@@ -670,8 +745,7 @@ scales against folded twins, and LoRA.
   - `mlx`, `ggml_metal` and `ggml_vulkan`;
   - multi-GPU `--tp` and `--layer-split`, which were covered on simulated devices only;
   - Super VL, which was not on the test machine;
-  - an audio companion, since none is public;
-  - the DFlash and DSpark drafters, which the loader refuses.
+  - an audio companion, since none is public.
 - **Known costs.**
   - Direct-CUDA MoE decode steps are not recorded as CUDA graphs: Lightning decodes at 70 tok/s on `cuda` against 143
     on `ggml_cuda`.
@@ -862,7 +936,9 @@ scales against folded twins, and LoRA.
 - **Batched expert streaming on direct CUDA**: offloaded prompt chunks stream one expert at a time.
 - **`--tp` with offload, and the tensor-parallel x layer-split hybrid**: both need per-rank graphs this family does not
   emit yet.
-- **DFlash / DSpark drafters**: teach the shared drafter loader the published Nemotron 3.5 drafter files.
+- **DSpark block cost**: the drafter's BF16 attention weights are dequantized to F32 at load (565 MB read per block
+  across its six layers); keeping them BF16 on the graph path would halve that. DSpark's blocks could also share one
+  program across requests, as DFlash's lanes do.
 - **Audio tower**: `NemotronAudioEncoder` runs on the managed CPU path from a companion GGUF (§4.7). The public GGUFs
   still carry no tower, so audio is refused unless that companion is loaded. Open work: BF16-compute parity on the
   trained weights, a GPU/native encoder graph, and spoken-audio acceptance and latency qualification.

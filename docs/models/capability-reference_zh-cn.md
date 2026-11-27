@@ -88,7 +88,7 @@ Zhongkai Fu 的 [《From Tensors to Tokens》书籍指南](../BOOK_zh-cn.md)，�
 
 DeepSeek V4 把一个**块级**草稿器接入了同一套核心：它的 DSpark 支持模块作为独立 GGUF 通过 `--draft-model` 加载（CLI 与服务端都支持），每步提议一整块 token 而不是逐个。由于草稿器的权重必须计入层切分，它在加载阶段就传给 `ModelBase.Create()`，而不是事后附加。详见 [DeepSeek V4 卡片](deepseek4_zh-cn.md#dspark-投机解码)。DeepSeek V4.1 只接受 `deepseek41-dspark` 草稿器，且仅限 `ggml_cuda` 或 `ggml_cpu`；这条路径属于实验性功能，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。Muse-Glimmer（DFlash / DFlash2）与 Qwen 3.8-27B（DFlash2）同样通过 `--draft-model` 加载块级草稿器。MiniMax-M3.1 也以同样方式加载其 DSpark 草稿器（带 Markov 头的 `dflash` GGUF）；原生执行器在按层切分时把它与目标模型一起加载，`--tp` 下拒绝（见 [MiniMax-M3.1 卡片](minimax-m3_zh-cn.md#dspark-投机解码)）。
 
-不需要任何草稿权重的 n-gram（prompt-lookup）投机器用 `--spec-type ngram` 选择，适用于 Qwen 3.5 家族、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、Muse Spark（它唯一的投机器）与 MiniMax-M3.1（仅按层切分）；DeepSeek V4 / V4.1 只有在加载了各自草稿器时才能使用，Muse-Glimmer 与 Nemotron-H 无需草稿器。GPT OSS、Mistral 3 与 Hunyuan Dense 无法使用它。共享草稿器加载器会拒绝公开的 Nemotron 3.5 DFlash / DSpark 草稿器；见[投机解码](../speculative_decoding.md#nemotron-h-refuses-speculation)。
+不需要任何草稿权重的 n-gram（prompt-lookup）投机器用 `--spec-type ngram` 选择，适用于 Qwen 3.5 家族、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、Muse Spark（它唯一的投机器）与 MiniMax-M3.1（仅按层切分）；DeepSeek V4 / V4.1 只有在加载了各自草稿器时才能使用，Muse-Glimmer 与 Nemotron-H 无需草稿器。GPT OSS、Mistral 3 与 Hunyuan Dense 无法使用它。Nemotron-H 通过 `--draft-model` 加载公开的 Nemotron 3.5 Lightning DFlash / DSpark 块级草稿器；见[投机解码](../speculative_decoding.md#nemotron-h-refuses-speculation)。
 
 ## 架构对比
 
@@ -115,7 +115,7 @@ DeepSeek V4 把一个**块级**草稿器接入了同一套核心：它的 DSpark
 | 视频 | 否 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 思维链 | 是 | 是 | 否（不提示） | 是 | 是（始终启用） | 是 | 否 | 是（`assistant to=self` 通道） |
 | 工具调用 | 是（DSML 标记） | 是 | 否（拒绝） | 是 | 是 | 是 | 否 | 是（ATEM XML 标记） |
-| MTP / NextN 投机解码 | DSpark 块级草稿器（独立 GGUF，`--draft-model`） | 是（独立 `gemma4-assistant` 草稿 GGUF） | 否 | 是：Qwen 3.6 与 Qwen 3.8-27B 内嵌 NextN（`--spec`）；Qwen 3.8-27B 还可通过 `--draft-model` 加载 DFlash2 块级草稿器 | 否 | 是：Nemotron 3.5 MTP 头（主干内的 NextN 块，或通过 `--draft-model` 加载的 MTP GGUF）；公开的 DFlash / DSpark 草稿器会被拒绝 | 否 | DFlash 块级草稿器（独立 5 层 GGUF，`--draft-model`，无损） |
+| MTP / NextN 投机解码 | DSpark 块级草稿器（独立 GGUF，`--draft-model`） | 是（独立 `gemma4-assistant` 草稿 GGUF） | 否 | 是：Qwen 3.6 与 Qwen 3.8-27B 内嵌 NextN（`--spec`）；Qwen 3.8-27B 还可通过 `--draft-model` 加载 DFlash2 块级草稿器 | 否 | 是：Nemotron 3.5 MTP 头（主干内的 NextN 块，或通过 `--draft-model` 加载的 MTP GGUF）与 Lightning 的 DFlash / DSpark 块级草稿器（`--draft-model`） | 否 | DFlash 块级草稿器（独立 5 层 GGUF，`--draft-model`，无损） |
 | 融合 QKV | n/a（LoRA 分解的 Q，单个共享 K=V 头） | 是 | 是 | 混合（门控 `attn_q`；递归层输入投影在各部分类型一致时打包为一次乘积） | 是 | 是 | 是 | 否 |
 | 融合单调用 decode | 是（整模型执行器，每个 ubatch 一张图，重放 CUDA 图） | 是（Gemma4ModelDecode） | 是（DiffusionModelDecode + lm-head tail） | 是（共享运行时每步一张图；GGML 后端重放上一步的图） | per-layer | 是（共享运行时每步一张图） | 否 | 是（GGML CUDA / Vulkan / Metal / CPU 上的常驻整模型 decode 图） |
 | 融合单调用 prefill | 是（同一整模型执行器，分块 ubatch） | 是（整模型 NativeGemma4ModelVerify + 逐层 Gemma4LayerPrefill 回退） | prompt-KV prefill cache | 是（共享运行时每个提示块一张图） | 是（MoE prefill via mul_mat_id） | 是（共享运行时每个提示块一张图） | 否 | 是（同一融合内核，分块并在设备端生成 causal+SWA 带状掩码） |

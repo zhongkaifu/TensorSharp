@@ -147,6 +147,9 @@ namespace TensorSharp.Models
         /// </summary>
         private bool CanUseFusedDFlash =>
             _hasDFlash && !IsTensorParallel &&
+            // The fused graphs rotate without YaRN and attend the block non-causally (DSpine's are its own): a YaRN-scaled
+            // or block-causal DFlash drafter (the Nemotron-3.5 modules) runs on the graph programs or per op.
+            (_dflash.IsDSpine || (!_dflash.HasYarn && !_dflash.CausalBlock)) &&
             (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan ||
              _backend == BackendType.GgmlMetal ||
              // DSpine has no per-op draft; its inject runs fused on ggml_cpu too.

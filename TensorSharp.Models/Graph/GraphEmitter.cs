@@ -285,9 +285,12 @@ namespace TensorSharp.Models.Graph
         /// <param name="band">A sliding-window layer's window (ip[3]; ip[2] is then the rows' kind, see
         /// <see cref="GraphAttentionRows"/>) where the executor reads such masks on the device
         /// (<see cref="GraphCapabilities.BandMasksOnDevice"/>), 0 elsewhere.</param>
-        public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, bool promptChunk = false, int band = 0)
+        /// <param name="sinks">An F32 [heads] node of per-head attention sinks (one extra logit in each query's softmax,
+        /// ggml_flash_attn_ext_add_sinks), or -1; it needs a mask.</param>
+        public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, bool promptChunk = false, int band = 0, int sinks = -1)
         {
-            Span<int> srcs = stackalloc[] { q, k, v, mask };
+            if (sinks >= 0 && mask < 0) throw new ArgumentException("Attention sinks ride after the mask operand.", nameof(sinks));
+            Span<int> srcs = sinks >= 0 ? stackalloc[] { q, k, v, mask, sinks } : stackalloc[] { q, k, v, mask };
             // ip[2] only on a prompt chunk's op or a device band's (GraphAttentionRows), ip[3] only on a device band's: every
             // other op keeps the ip, bytes and signature it had.
             long rows = promptChunk ? GraphAttentionRows.PromptChunk : GraphAttentionRows.Unsaid;

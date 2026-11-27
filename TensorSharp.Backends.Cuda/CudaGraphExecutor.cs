@@ -393,6 +393,13 @@ namespace TensorSharp.Cuda
                 base.AddAttentionMask(scores, mask);
         }
 
+        /// <summary>A sink attention (a drafter's sink layers) on the generic products, after the held cache writes it may read.</summary>
+        protected override Tensor FlashAttentionWithSinks(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale, Tensor sinks)
+        {
+            FlushHeldWrites();
+            return base.FlashAttentionWithSinks(q, k, v, mask, scale, sinks);
+        }
+
         /// <summary>
         /// Attention over cache windows with the per-op path's kernels: a decode row runs the GQA decode kernel
         /// on the head-first cache in place (F32 or F16); a prompt chunk expands the window's KV heads, runs the

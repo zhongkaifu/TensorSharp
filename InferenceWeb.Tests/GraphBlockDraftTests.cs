@@ -47,16 +47,23 @@ public sealed class GraphBlockDraftTests : IDisposable
     private const int Cycles = 24;
     private const double ConfidenceTolerance = 1e-3, RingTolerance = 1e-4;
 
+    /// <remarks>"dspark" is the Nemotron-3.5 DSpark module's layout (a Markov head chained on the device, per-head attention
+    /// sinks, a block-causal mask, a bonus anchor, a target past the trunk's stack); "dflash-yarn" the DFlash module's (no
+    /// sliding window, served with the trunk's context, a YaRN rotary, the drafter's own token embedding).</remarks>
     [Theory]
     [InlineData("dflash")]
     [InlineData("dflash2")]
     [InlineData("dflash2-q8")]
+    [InlineData("dspark")]
+    [InlineData("dflash-yarn")]
     public void GraphDraftsMatchThePerOpDrafterOnTheManagedCpu(string variant) => DraftsMatch(BackendType.Cpu, variant);
 
     [GgmlTheory(BackendType.GgmlCpu)]
     [InlineData("dflash")]
     [InlineData("dflash2")]
     [InlineData("dflash2-q8")]
+    [InlineData("dspark")]
+    [InlineData("dflash-yarn")]
     public void GraphDraftsMatchThePerOpDrafterOnGgmlCpu(string variant) => DraftsMatch(BackendType.GgmlCpu, variant);
 
     [GgmlTheory(BackendType.GgmlMetal)]
@@ -80,6 +87,8 @@ public sealed class GraphBlockDraftTests : IDisposable
     [InlineData("dflash")]
     [InlineData("dflash2")]
     [InlineData("dflash2-q8")]
+    [InlineData("dspark")]
+    [InlineData("dflash-yarn")]
     public void GraphDraftsMatchTheManagedPerOpDrafterOnDirectCuda(string variant)
         => DraftsMatch(BackendType.Cuda, variant, BackendType.Cpu, ringKernel: false);
 
@@ -337,12 +346,40 @@ public sealed class GraphBlockDraftTests : IDisposable
         return mismatches;
     }
 
+    /// <summary>Speculation with the DSpark and YaRN full-attention graph drafters emits plain greedy decoding's stream on the
+    /// GPU executors (ggml_cuda's graph builder: the sinks through ggml_flash_attn_ext_add_sinks; direct CUDA: the sink layers
+    /// on the executor's generic attention), and the graphs served every block.</summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData("dspark")]
+    [InlineData("dflash-yarn")]
+    public void DSparkAndYarnSpeculationMatchesPlainGreedyOnGgmlCuda(string variant) => GpuSpeculationMatchesPlainGreedy(BackendType.GgmlCuda, variant);
+
+    [CudaTheory]
+    [InlineData("dspark")]
+    [InlineData("dflash-yarn")]
+    public void DSparkAndYarnSpeculationMatchesPlainGreedyOnDirectCuda(string variant) => GpuSpeculationMatchesPlainGreedy(BackendType.Cuda, variant);
+
+    private void GpuSpeculationMatchesPlainGreedy(BackendType backend, string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Fixtures(variant);
+        StandardDecoderModel created = null;
+        SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() => created = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft),
+            $"qwen35 {backend} {variant} graph drafter");
+        Assert.Null(created.GraphBlockDraftDeclineReason);
+        Assert.True(created.GraphBlockDrafts > 0, $"{backend} {variant}: no block ran as a graph");
+    }
+
     /// <summary>The same on ggml_cuda, where the old path is the fused native drafter (where it takes the drafter's weights:
     /// these fixtures' F32 projections keep the per-op drafter).</summary>
+    /// <remarks>The fused graph takes no YaRN rotary and no causal block: "dspark" and "dflash-yarn" are checked against the
+    /// per-op drafter on ggml_cuda.</remarks>
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData("dflash")]
     [InlineData("dflash2")]
     [InlineData("dflash2-q8")]
+    [InlineData("dspark")]
+    [InlineData("dflash-yarn")]
     public void GraphDraftsMatchTheFusedDrafterOnGgmlCuda(string variant) => DraftsMatch(BackendType.GgmlCuda, variant);
 
     /// <summary>Speculation with the graph drafter emits plain greedy decoding's stream, on the Qwen 3.5 trunk and on Qwen 3.8
@@ -351,6 +388,8 @@ public sealed class GraphBlockDraftTests : IDisposable
     [InlineData("qwen35", "dflash")]
     [InlineData("qwen35", "dflash2")]
     [InlineData("qwen4exp", "dflash2")]
+    [InlineData("qwen35", "dspark")]
+    [InlineData("qwen35", "dflash-yarn")]
     public void GraphDraftSpeculationMatchesPlainGreedyOnTheManagedCpu(string family, string variant)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
@@ -1026,6 +1065,11 @@ public sealed class GraphBlockDraftTests : IDisposable
                 codebookType: SyntheticGguf.GgmlType.Q8_0),
             "dflash2-kquant" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 5, hidden: hidden, layers: 2, slidingWindow: 16,
                 dflash2: true, kQuantProjections: true),
+            // The Nemotron-3.5 modules' layouts; target 8 is the stream leaving the trunk's 8 layers.
+            "dspark" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 5, hidden: hidden, layers: 2, slidingWindow: 16, dspark: true,
+                targetLayers: new[] { 2, 5, 8 }),
+            "dflash-yarn" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 4, hidden: hidden, slidingWindow: 0, yarnFactor: 8f,
+                yarnOriginalContext: 64, targetLayers: new[] { 2, 5, 8 }, ownEmbedding: true),
             // dflash2-k{taps}b{block}: DFlash2 with a convolution of that many taps over blocks of that width.
             _ when variant.StartsWith("dflash2-k", StringComparison.Ordinal) && variant.IndexOf('b', 9) is int at and > 9
                 => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: int.Parse(variant[(at + 1)..]), hidden: hidden, layers: 2,
@@ -1048,7 +1092,8 @@ public sealed class GraphBlockDraftTests : IDisposable
         graph.DFlashTraceForTests = perOp.DFlashTraceForTests = true;
         string label = $"{backend} {variant}";
         Assert.True(graph.HasDFlash && perOp.HasDFlash, $"{label}: the drafter did not attach");
-        Assert.Equal(32, graph.DFlashRingRowsForTests);
+        // A full-attention drafter's ring holds the trunk's context (no wrap in these cycles); the others' 32 rows wrap.
+        Assert.Equal(graph.DFlashSettings.FullAttention ? graph.DFlashSettings.RingRows : 32, graph.DFlashRingRowsForTests);
 
         var trunk = (ISpeculativeModel)graph;
         var drafters = new IDraftHead[] { graph, perOp };

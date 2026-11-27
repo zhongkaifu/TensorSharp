@@ -16,7 +16,7 @@
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是：Reasoning-128K 用 `<TOOLCALL>[...]</TOOLCALL>`（JSON 或 Python 风格的调用），Nemotron 3 Nano / Omni 用调用体为 XML `<function=...>` 的 `<tool_call>`（§12）；可使用 skills、代码工具以及服务端的[子智能体委派](../multi_agent.md) |
 | 批处理 / 分页前向 | **默认启用**（共享运行时的批处理槽位：每个槽位的 Mamba-2 conv 窗口与 SSM 状态，注意力层使用分页 K/V）—— `--no-continuous-batching` 会强制走按序列路径。详见 §8。 |
-| 投机解码 | n-gram 草稿与 Nemotron 3.5 MTP 头（主干内的 NextN 块，或通过 `--draft-model` 加载的 MTP GGUF），在 Mamba-2 状态可精确回退的窗口中验证。详见 §8。 |
+| 投机解码 | n-gram 草稿、Nemotron 3.5 MTP 头（主干内的 NextN 块，或通过 `--draft-model` 加载的 MTP GGUF），以及公开的 Nemotron 3.5 Lightning DFlash 与 DSpark 块级草稿器（`--draft-model`），在 Mamba-2 状态可精确回退的窗口中验证。详见 §8。 |
 | 专家卸载 | `--n-cpu-moe` / `--cpu-moe` 可用于单设备或 `--layer-split` 各阶段，所有后端都支持；`--tp` 下拒绝。详见 §10。 |
 | 输出解析器 | `NemotronOutputParser`（一种 `ChatMlOutputParser`） |
 
@@ -30,6 +30,7 @@
 | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf`（28.188 GB） | —（仅文本） |
 | Nemotron 3 Nano Omni 30B-A3B | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) | `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf`（23.927 GB） | `mmproj-BF16.gguf`（1.590 GB；同仓库）—— **图像输入必需** |
 | Nemotron 3.5 Bolt 74B-A9B | [nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF) | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`（22.018 GB） | `mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`（1.734 GB；同仓库） |
+| Nemotron 3.5 Lightning 30B-A3B | [ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF) | `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf`（18.898 GB）。同仓库的草稿器：`mtp-...-Q4_0.gguf`（1.156 GB）、`dflash-...-NVFP4.gguf`（1.185 GB）、`dspark-...-NVFP4.gguf`（1.357 GB） | —（仅文本） |
 | Nemotron 3.5 Super VL 120B-A12B | [ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) | `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf`（76.919 GB）或 `-Q4_0.gguf`（71.934 GB） | `mmproj-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Q8_0.gguf`（0.967 GB）或 `-BF16.gguf`（1.734 GB；同仓库） |
 
 Omni 的 `mmproj` 只启用**图像输入**：它只包含 32 层 RADIO 视觉塔
@@ -432,7 +433,7 @@ NVFP4 scale、latent bottleneck、共享 expert、逐层 expert 数与 top-k）�
 | `--layer-split N` | cuda、ggml_cuda、ggml_vulkan | 整层阶段，保持批处理。 |
 | 混合（`--tp` x `--layer-split`） | 无（缺口） | 这个只用计算图的家族还没有张量并行阶段的计算图。 |
 | `--n-cpu-moe` / `--cpu-moe` | 全部 | 单设备或各阶段上可用；`--tp` 下拒绝。见 §10。 |
-| 投机解码 | 全部 | n-gram 草稿，以及 Nemotron 3.5 MTP 头（主干内的 NextN 块，或通过 `--draft-model` 加载的 MTP GGUF），在能精确回退 Mamba-2 状态的窗口中验证。共享草稿器加载器会拒绝公开的 Nemotron 3.5 DFlash 与 DSpark 文件（DFlash 导出的 `sliding_window` 为 0；因果 DSpark 导出缺少 `dspine` 键），正如旧模型拒绝一切草稿器。 |
+| 投机解码 | 全部 | n-gram 草稿、Nemotron 3.5 MTP 头（主干内的 NextN 块，或通过 `--draft-model` 加载的 MTP GGUF），以及 DFlash 与 DSpark 块级草稿器（`--draft-model`，见下文），在能精确回退 Mamba-2 状态的窗口中验证。 |
 | 文本 LoRA | cpu、ggml_cpu、ggml_cuda、cuda | 单设备。每个被适配乘积的增量都在计算图中（`AppliesTextLoraInGraphs`）。适配目标与以前相同（见下文"文本 LoRA 适配器"）。 |
 | 媒体 | 全部 | 视觉塔与音频塔的 embedding 作为排队的媒体行，写在其占位符行上（`QueueMedia`）。 |
 
@@ -451,6 +452,74 @@ Nemotron-H 在单设备上接受文本 LoRA 适配器（`--lora`、`/v1/loras`�
 verify 窗口都会应用它们；若计划中的某个权重被跳过，前向审计会抛出异常。已在合成模型上与合并权重的孪生模型对比验证
 （cpu、ggml_cpu、ggml_cuda 与 cuda 上的 `TextLoraModelParityTests`；`TextLoraPlanTests`），尚未在真实 checkpoint 上验证。
 详见[设计文档](../design/logprobs-lora-moe-runtime-features.md) §2.2。
+
+### 块级草稿器（DFlash / DSpark）
+
+Lightning 仓库在 MTP 头之外还发布了两个块级草稿器，任一个都通过 `--draft-model` 加载：
+
+```bash
+dotnet run --project TensorSharp.Cli -c Release -- --model models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf \
+  --draft-model models/dspark-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf --backend ggml_cuda
+```
+
+| | DFlash（`dflash-...-NVFP4.gguf`） | DSpark（`dspark-...-NVFP4.gguf`） |
+|---|---|---|
+| 层 | 6 层（hidden 2688，32 个查询头对 2 个 KV 头，head_dim 128）；注意力为 BF16，FFN 与 `fc` 为带 `.scale` 旁路的 NVFP4 | 同左，另有逐头 attention sink |
+| 上下文 | 每层都关注全部历史（没有 `sliding_window`）；YaRN 旋转，系数 128、原始长度 8192 | 1,024 token 的滑动窗口 |
+| 块 | 16 行，块内非因果；第 1 .. 15 行是草稿 | 8 行，块内因果；奖励锚点（`sample_from_anchor = false`）：第 1 .. 7 行是草稿 |
+| 头 | 目标模型的 LM head，每行取 top-1 | 目标模型的 LM head 加一个秩 512 的 Markov 头：第 e 个草稿的 logits 加上 `w2 · w1[prev]`，`prev` 先是锚点，之后是上一个草稿的选择 |
+| 编码器 | 主干第 2、6、20、30、42、52 层（52 是离开最后一层的流） | 同左 |
+
+两者都以共享运行时的块级草稿计算图程序（`StandardDecoderModel.BlockDraft.cs`）在每个执行器上运行：
+- **Markov 头。** 链条在设备上运行：`GetRows(w1, prev)`、`w2` 的乘积及其 scale、每个草稿的 top-1。只有草稿 id 与置信度
+  会传回主机。
+- **Attention sink。** 每个 sink 是注意力算子的第五个操作数。GGML 构建器把它交给 `ggml_flash_attn_ext_add_sinks`。
+  张量执行器用通用乘积处理带 sink 的层，把 sink 作为每行 softmax 中的额外一列
+  （`TensorGraphExecutor.FlashAttentionWithSinks`）。
+- **掩码。** 当草稿器的 `attention.causal` 为真时，块掩码对块内第 i 行之前的查询关闭第 i 个槽位。
+- **DFlash 的全注意力。** 它以主干上下文作为窗口，最多 8,192 个位置：环形缓冲为 8,224 行，96 MB 的 F32 K/V。上下文超过
+  这个长度时，草稿只看到最近的 8,192 个位置。草稿都会被验证，所以这只可能降低接受率，不会改变输出。
+- **草稿器嵌入。** 草稿器自带的 BF16 token embedding 以文件编码留在主机上。若加载为 F32 张量，会在设备上占 1.4 GB，
+  却没有任何地方读取。
+
+逐算子草稿器遵循同样的规则（YaRN、块内因果、奖励锚点的行）。融合的 GGML 草稿器既不支持 YaRN 也不支持块内因果，因此这两个
+文件通过计算图程序起草，计算图不可用时逐算子起草。
+
+在一张 A40 上运行 Lightning Q4_0，贪心解码，每个提示生成 128 个 token。每一行报告：
+- 接受长度 τ，即（接受数 + verify 次数）/ verify 次数，因此每次 verify 的奖励 token 也计入；
+- 相对普通解码的 decode 速度。
+
+NVIDIA 报告的草稿长度 7 时的 τ 为 3.16（DFlash）与 3.75（DSpark）。
+
+| 提示 | DSpark x7 ggml_cuda | DSpark x7 cuda | DFlash x7 ggml_cuda | DFlash x7 cuda | MTP x3 ggml_cuda / cuda |
+|---|---|---|---|---|---|
+| Fibonacci 函数（代码） | τ 5.13，1.29 倍 | τ 5.64，1.53 倍 | τ 3.54，1.10 倍 | τ 3.18，1.19 倍 | 1.16 / 1.38 倍 |
+| 天空为什么是蓝色（3 条要点） | τ 2.80，0.87 倍 | τ 2.77，1.03 倍 | τ 1.73，0.74 倍 | τ 2.00，0.91 倍 | 1.13 / 1.15 倍 |
+| 火车速度（算术） | τ 6.19，1.52 倍 | τ 5.46，1.58 倍 | τ 3.50，1.11 倍 | τ 3.33，1.22 倍 | 1.24 / 1.29 倍 |
+| 德语翻译 | τ 2.76，0.85 倍 | τ 3.74，1.24 倍 | τ 2.17，0.83 倍 | τ 2.00，0.91 倍 | 1.12 / 1.17 倍 |
+
+普通解码在 `ggml_cuda` 上为 140 tok/s，在 `cuda` 上为 68-71 tok/s。用 3 token 窗口时，DSpark 在 `ggml_cuda` 上把代码提示
+跑到 1.35 倍、算术提示跑到 1.39 倍。
+
+**加速的上限。** 在这个 MoE 主干上，8 行的 verify 要读取每一行的 expert：`ggml_cuda` 上约 23 ms，而一个 decode 步为
+7.1 ms。稳态下一次起草耗时 4.4 ms（DSpark 的块计算图）加 0.35 ms（环形缓冲注入）。
+
+**一致性。** 投机流会一直跟随普通贪心解码，直到 verify 窗口的内核翻转一个接近的选择。在 `ggml_cuda` 上，各流在普通
+解码前两名 logits 相差 0.004-0.088 处分叉。在 `cuda` 上分叉处的差距最大为 0.21，而 MTP 头在同一个 token 处分叉，所以这
+来自直接 CUDA verify 行的舍入（§11），而不是草稿器。
+
+合成覆盖（`GraphBlockDraftTests`）：一个 DSpark 形态的草稿器（Markov 头、sink、块内因果、奖励锚点、一个位于堆栈之外的
+目标层）与一个带自有 embedding 的全注意力 YaRN 草稿器，检查如下：
+- 它们的计算图草稿与逐算子草稿器一致（id 相同，置信度相差不超过 1e-3，环形缓冲行相差不超过 1e-4），覆盖托管 CPU、
+  `ggml_cpu`、`ggml_cuda` 与直接 `cuda`；
+- 使用它们的投机解码在托管 CPU、`ggml_cuda` 与 `cuda` 上输出普通贪心解码的流。
+
+`DSparkConfigTests` 覆盖这些导出文件的键。
+
+限制：
+- 没有运行 `mlx`、`ggml_metal` 与 `ggml_vulkan`。
+- 多个请求的 DSpark 块不共享一个计算图程序：每个请求单独起草自己的块（DFlash 保留批量 lane）。
+- 在直接 CUDA 上，带 sink 的层走通用注意力，而不是环形缓冲内核。
 
 ## 9. 内存
 
@@ -508,7 +577,8 @@ NVFP4 风格 sidecar 的 latent MoE；以及逐层 expert 数与 top-k。它们�
   从 8,367 ms 降到 798 ms，decode 从 28.4 提升到 116.7 tok/s。
 - **并发。** 在服务端上，8 个并发的 Lightning 提示在旧模型上 33.3 秒完成（14.4 tok/s），在运行时上 2.4 秒完成
   （181.6 tok/s）。运行时在 8 个提示中有 6 个与单独服务时一致，旧模型为 8 个中 4 个；其余的在接近平局处分叉。
-- **投机解码**（`ggml_cuda` 上的 Lightning；旧模型拒绝投机）。使用 MTP 头、3 token 窗口时：
+- **投机解码**（`ggml_cuda` 上的 Lightning；旧模型拒绝投机）。DFlash 与 DSpark 草稿器的测量见 §8。使用 MTP 头、3 token
+  窗口时：
   - 在生成 46-96 个 token 的提示上，接受率为 64.5-85.7%，decode 为普通解码的 1.12-1.24 倍；
   - n-gram 草稿为 0.95-1.03 倍。
   - 投机流会一直跟随普通贪心解码，直到 verify 窗口的内核（以另一种批形状运行）翻转一个接近的选择。MTP 流在普通解码
@@ -518,8 +588,7 @@ NVFP4 风格 sidecar 的 latent MoE；以及逐层 expert 数与 top-k。它们�
   - `mlx`、`ggml_metal` 与 `ggml_vulkan`；
   - 多 GPU 的 `--tp` 与 `--layer-split`，只在模拟设备上覆盖；
   - Super VL，测试机上没有；
-  - 音频配套文件，因为没有公开的；
-  - DFlash 与 DSpark 草稿器，加载器会拒绝它们。
+  - 音频配套文件，因为没有公开的。
 - **已知代价。**
   - 直接 CUDA 的 MoE decode 步没有录制为 CUDA graph：Lightning 在 `cuda` 上 decode 为 70 tok/s，`ggml_cuda` 上为 143。
   - Lightning 加载后第一次 512 token prefill 要构建计算图：2,768 ms，旧模型为 1,782 ms。之后的运行为 110 ms。
@@ -553,7 +622,8 @@ NVFP4 风格 sidecar 的 latent MoE；以及逐层 expert 数与 top-k。它们�
   卸载层最热的 expert 留在设备上。
 - **直接 CUDA 上的批量 expert 流式传输** —— 被卸载的提示块一次只流式传输一个 expert。
 - **`--tp` 配合卸载，以及张量并行 x 按层切分的混合** —— 两者都需要这个家族尚未生成的按 rank 计算图。
-- **DFlash / DSpark 草稿器** —— 让共享草稿器加载器支持公开的 Nemotron 3.5 草稿器文件。
+- **DSpark 块的开销** —— 草稿器的 BF16 注意力权重在加载时反量化为 F32（每个块在六层上要读 565 MB）；在计算图路径上
+  保持 BF16 可以减半。多个请求的 DSpark 块也可以像 DFlash 的 lane 那样共享一个程序。
 - **音频塔** —— `NemotronAudioEncoder` 以托管 CPU 路径运行在配套 GGUF 上（§4.7）；
   公开 GGUF 仍然不带音频塔，所以除非加载了该配套文件，音频会被拒绝。待完成：训练权重上的
   BF16 计算一致性、GPU/原生编码器计算图、语音输入验收与延迟验证。

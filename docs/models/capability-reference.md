@@ -166,8 +166,8 @@ its native executor loads it with the target on a layer split and refuses it und
 A weight-free n-gram (prompt-lookup) speculator, selected with `--spec-type ngram`,
 needs no drafter and runs on the Qwen 3.5 family, Gemma 4, GLM 5.x, Qwen 3.8
 Flash Next, Muse-Glimmer, Nemotron-H, Muse Spark (its only speculator) and MiniMax-M3.1 (layer split only), and on DeepSeek V4 / V4.1 only while their drafter is
-loaded. It does not run on GPT OSS, Mistral 3 or Hunyuan Dense. The
-shared drafter loader refuses the published Nemotron 3.5 DFlash / DSpark drafters; see
+loaded. It does not run on GPT OSS, Mistral 3 or Hunyuan Dense. Nemotron-H takes the published Nemotron 3.5
+Lightning DFlash / DSpark block drafters through `--draft-model`; see
 [speculative decoding](../speculative_decoding.md#nemotron-h-refuses-speculation).
 
 ## Architecture comparison
@@ -195,7 +195,7 @@ shared drafter loader refuses the published Nemotron 3.5 DFlash / DSpark drafter
 | Video | No | Yes | No | No | No | No | No | No |
 | Thinking | Yes | Yes | No (not prompted) | Yes | Yes (always) | Yes | No | Yes (`assistant to=self` channel) |
 | Tool calling | Yes (DSML markup) | Yes | No (refused) | Yes | Yes | Yes | No | Yes (ATEM XML markup) |
-| MTP / NextN speculative decoding | DSpark block drafter (separate GGUF via `--draft-model`) | Yes (separate `gemma4-assistant` draft GGUF) | No | Yes: embedded NextN on Qwen 3.6 and Qwen 3.8-27B (`--spec`); a DFlash2 block drafter via `--draft-model` on Qwen 3.8-27B | No | Yes: the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`); the published DFlash / DSpark drafters are refused | No | DFlash block drafter (separate 5-layer GGUF via `--draft-model`, lossless) |
+| MTP / NextN speculative decoding | DSpark block drafter (separate GGUF via `--draft-model`) | Yes (separate `gemma4-assistant` draft GGUF) | No | Yes: embedded NextN on Qwen 3.6 and Qwen 3.8-27B (`--spec`); a DFlash2 block drafter via `--draft-model` on Qwen 3.8-27B | No | Yes: the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`) and the Lightning DFlash / DSpark block drafters (`--draft-model`) | No | DFlash block drafter (separate 5-layer GGUF via `--draft-model`, lossless) |
 | Fused QKV | n/a (LoRA-factored Q, single shared K=V head) | Yes | Yes | Mixed (gated `attn_q`; the recurrent in-projection packed into one product where its parts share a type) | Yes | Yes | Yes | No |
 | Fused single-graph decode | Yes (whole-model executor, one graph per ubatch, CUDA-graph replayed) | Yes (Gemma4ModelDecode) | Yes (DiffusionModelDecode + lm-head tail) | Yes (one graph a step on the shared runtime; GGML backends replay the previous step's graph) | Per-layer | Yes (one graph a step on the shared runtime) | No | Yes (persistent whole-model decode graph on GGML CUDA / Vulkan / Metal / CPU) |
 | Fused single-graph prefill | Yes (same whole-model executor, chunked ubatches) | Yes (whole-model NativeGemma4ModelVerify + per-layer Gemma4LayerPrefill fallback) | Prompt-KV prefill cache | Yes (one graph a prompt chunk on the shared runtime) | Yes (MoE prefill via mul_mat_id) | Yes (one graph a prompt chunk on the shared runtime) | No | Yes (same fused kernel, chunked with on-device causal+SWA band masks) |

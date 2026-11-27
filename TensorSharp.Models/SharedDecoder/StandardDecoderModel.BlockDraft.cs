@@ -36,6 +36,10 @@ namespace TensorSharp.Models
     /// </summary>
     public abstract partial class StandardDecoderModel
     {
+        /// <summary>The runtime's steps capture a target past the stack in their head (EmitHead), its follows tap the stream
+        /// leaving it, and its distributed verify gathers it from the last stage.</summary>
+        private protected override bool DFlashTapsStackOutput => true;
+
         /// <summary>Test seam: true keeps the drafter on its fused or per-op path.</summary>
         internal bool GraphBlockDraftDisabledForTests { get; set; }
 
@@ -73,8 +77,9 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Why the drafter does not run as graph programs here, or null. Whole graphs on one device (not per-rank graphs,
-        /// not a multi-node pipeline), and a plain DFlash or DFlash2 drafter: a DSpark Markov head chains every row on the
-        /// host, attention sinks join the softmax as extra logits, and DSpine has its own graphs; each keeps its path.
+        /// not a multi-node pipeline), and a DFlash, DFlash2 or DSpark drafter (DSpine has its own graphs). A DSpark Markov
+        /// head chains its rows on the device (<see cref="EmitDFlashMarkov"/>), attention sinks are the attention op's fifth
+        /// operand, and a block-causal drafter's mask closes the block's later slots (<see cref="FillDFlashBlockMask"/>).
         /// </summary>
         private string GraphBlockDraftRefusal()
         {
@@ -85,8 +90,6 @@ namespace TensorSharp.Models
             if (GraphUnsupportedReason() is { } reason) return reason;
             if (_rankGraphs || IsMultiNodePipeline || !_mesh.IsSingleDevice) return "the drafter runs as graphs on one device";
             if (cfg.IsDSpine) return "a DSpine drafter";
-            if (cfg.MarkovRank > 0) return "a DSpark Markov head";
-            if (cfg.HasAttentionSinks) return "attention sinks";
             if (DFlashRingRows < cfg.SlidingWindow + cfg.BlockSize) return "a ring narrower than the window and a block";
             if (DFlashDraftVocabSubsetRequested) return "a draft vocabulary subset (fused graph only)";
             // ggml_metal's fused drafter runs DFlash2's head, top-k and selector walk on TensorSharp's own Metal kernels after
@@ -163,8 +166,12 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The drafter's rotary: NeoX over the whole head at its own base (llama.cpp maps LLM_ARCH_DFLASH to
-        /// LLAMA_ROPE_TYPE_NEOX), the per-op <c>DFlashRoPE</c>'s parameters.</summary>
-        private RotarySpec DFlashRotary => _dflashRotary ??= new RotarySpec(DFlashSettings.HeadDim, neoX: true, DFlashSettings.RopeBase);
+        /// LLAMA_ROPE_TYPE_NEOX), YaRN-scaled where its file says so (the Nemotron-3.5 DFlash module), the per-op
+        /// <c>DFlashRoPE</c>'s parameters.</summary>
+        private RotarySpec DFlashRotary => _dflashRotary ??= DFlashSettings is { HasYarn: true } c
+            ? new RotarySpec(c.HeadDim, neoX: true, c.RopeBase, c.RopeFreqScale, c.RopeOriginalContext, c.YarnExtFactor, c.YarnAttnFactor,
+                c.YarnBetaFast, c.YarnBetaSlow)
+            : new RotarySpec(DFlashSettings.HeadDim, neoX: true, DFlashSettings.RopeBase);
 
         // ---------------------------------------------------------------- PASS A + B: the ring inject
 
@@ -516,7 +523,8 @@ namespace TensorSharp.Models
         {
             if (b < 2 || GraphBlockDraftRefusal() != null) return -1;
             DFlashConfig cfg = DFlashSettings;
-            int gamma = b - 1;
+            // The block's drafts: rows 1 .. b - 1, or every row for a Markov head that samples from the anchor.
+            int gamma = cfg.DraftsFromAnchorRow ? b : b - 1;
             var ids = new int[b];
             ids[0] = anchorToken;
             for (int i = 1; i < b; i++) ids[i] = cfg.MaskTokenId;
@@ -582,8 +590,8 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// The block's program: the draft layers over [anchor, MASK x (b-1)] at positions p .. p + b - 1, then the head over
-        /// rows 1 .. b - 1. Its outputs (<see cref="StepOutputs.Draft"/>) are the drafted ids as F32 values, then their
-        /// confidences, in block order.
+        /// rows 1 .. b - 1 (every row for a Markov head that samples from the anchor). Its outputs
+        /// (<see cref="StepOutputs.Draft"/>) are the drafted ids as F32 values, then their confidences, in block order.
         /// </summary>
         private StepOutputs EmitDFlashBlock(GraphStep step, Tensor embedded, int b)
         {
@@ -615,7 +623,9 @@ namespace TensorSharp.Models
                 int k = EmitDFlashHeads(step, names[DfAttnK], h, kvHeads, b, names[DfAttnKNorm]);
                 int v = step.Reshape(step.MatMul(names[DfAttnV], h), hd, kvHeads, b);
                 EmitDFlashRingWrite(step, il, k, v, b, ringRows, out int ringK, out int ringV);
-                int fa = step.FlashAttention(step.Permute(q, 0, 2, 1, 3), ringK, ringV, mask, scale);
+                // Attention sinks (the DSpark module's): one logit per head in each query's softmax, the op's fifth operand.
+                int sinks = cfg.HasAttentionSinks ? step.Weight(names[DfAttnSinks]) : -1;
+                int fa = step.FlashAttention(step.Permute(q, 0, 2, 1, 3), ringK, ringV, mask, scale, sinks: sinks);
                 int attn = step.MatMul(names[DfAttnOutput], step.Reshape(fa, (long)heads * hd, b));
                 if (cfg.HasConv) attn = EmitDFlashConv(step, attn, attnTaps, names[DfAttnConvBase], side: 1, b, zeros);
                 x = step.Op(GraphOp.Add, attn, x);
@@ -633,9 +643,16 @@ namespace TensorSharp.Models
                 x = step.Op(GraphOp.Add, f, x);
             }
             int cur = step.RmsNorm(x, step.Weight(DFlashConfig.WeightPrefix + "output_norm.weight"), cfg.Eps);
+            var trace = DFlashTraceForTests ? new List<int>() : null;
+            if (cfg.MarkovRank > 0)
+            {
+                // DSpark: every draft row's logits take the Markov bias chained from the one before.
+                int first = cfg.DraftsFromAnchorRow ? 0 : 1, drafts = b - first;
+                int markovRows = first == 0 ? cur : step.View2(cur, hidden, drafts, hidden * 4L, hidden * 4L);
+                return new StepOutputs { Logits = -1, Final = -1, Hidden = -1, Draft = EmitDFlashMarkov(step, markovRows, drafts, trace), Trace = trace?.ToArray() };
+            }
             // Row 0 is the anchor's own prediction, which neither head reads.
             int rows = step.View2(cur, hidden, gamma, hidden * 4L, hidden * 4L);
-            var trace = DFlashTraceForTests ? new List<int>() : null;
             int[] draft = cfg.HasSelector ? EmitDFlashSelector(step, rows, gamma, trace: trace) : EmitDFlashTop1(step, rows, gamma, trace);
             return new StepOutputs { Logits = -1, Final = -1, Hidden = -1, Draft = draft, Trace = trace?.ToArray() };
         }
@@ -661,13 +678,15 @@ namespace TensorSharp.Models
         /// Query p + s sees the ring slot of a position q of the ring's valid run (<paramref name="held"/>: BuildRingSlotPositions'
         /// map) with q &lt; p and
         /// (p + s) - q &lt; sliding_window, as the per-op drafter's window mask does, and every slot of the block itself
-        /// (rows (p + i) % ringRows: attention inside the block is non-causal). Built from the ring's bookkeeping alone, so
-        /// nothing is read back.
+        /// (rows (p + i) % ringRows: attention inside the block is non-causal), or, for a block-causal drafter
+        /// (<see cref="DFlashConfig.CausalBlock"/>, the DSpark module), the block's slots 0 .. s. Built from the ring's
+        /// bookkeeping alone, so nothing is read back.
         /// </summary>
         private void FillDFlashBlockMask(ushort[] mask, int[] held, int p, int b)
         {
             const ushort open = 0, closed = 0xFC00;   // F16 0 and -inf
             int ringRows = DFlashRingRows, swa = DFlashSettings.SlidingWindow;
+            bool causal = DFlashSettings.CausalBlock;
             for (int s = 0; s < b; s++)
             {
                 Span<ushort> row = mask.AsSpan(s * ringRows, ringRows);
@@ -677,7 +696,7 @@ namespace TensorSharp.Models
                     int q = held[slot];
                     row[slot] = q >= 0 && q < p && query - q < swa ? open : closed;
                 }
-                for (int i = 0; i < b; i++) row[(p + i) % ringRows] = open;
+                for (int i = 0; i < b; i++) row[(p + i) % ringRows] = !causal || i <= s ? open : closed;
             }
         }
 
@@ -753,6 +772,43 @@ namespace TensorSharp.Models
             int conf = step.Op(GraphOp.GetRows, step.Reshape(probs, 1, vocab, gamma), best);                                // [1, 1, gamma]
             int ids = EmitDFlashTokenIds(step, step.Reshape(best, gamma));
             return new[] { step.Output(ids, gamma), step.Output(conf, gamma) };
+        }
+
+        /// <summary>
+        /// DSpark's Markov head on the device (llama.cpp's build_dspark_markov_head, greedy): the target head's raw logits of
+        /// the draft rows, and for draft e the column col_e = logits_e + w2 · w1[prev_e] (+ w2's bias), prev_0 the anchor and
+        /// prev_e the id draft e - 1 chose (its top-1, gathered by index on the device). Outputs: each draft's id (F32 [1]) in
+        /// order, then each draft's confidence (the softmax of its column at the choice, as the per-op head's).
+        /// </summary>
+        private int[] EmitDFlashMarkov(GraphStep step, int rows, int drafts, List<int> trace = null)
+        {
+            int vocab = Config.VocabSize;
+            string prefix = DFlashConfig.WeightPrefix;
+            const long f = sizeof(float);
+            int logits = step.MatMul(DFlashTargetOutputWeightName, rows);                                                  // [vocab, drafts]
+            trace?.Add(step.Output(logits, (long)vocab * drafts));
+            var anchor = new[] { _graphDraftAnchor };
+            int prev = step.InputI32(anchor, 1);
+            step.RefillOnAdvance(prev, () =>
+            {
+                anchor[0] = _graphDraftAnchor;
+                return true;
+            });
+            int w2Bias = _weights.ContainsKey(prefix + "markov_w2.bias") ? step.Weight(prefix + "markov_w2.bias") : -1;
+            var outputs = new int[2 * drafts];
+            for (int e = 0; e < drafts; e++)
+            {
+                int embedded = EmitDFlashCodebookRows(step, prefix + "markov_w1.weight", prev);                            // [rank, 1]
+                int bias = step.MatMul(prefix + "markov_w2.weight", embedded);                                            // [vocab, 1]
+                if (w2Bias >= 0) bias = step.Op(GraphOp.Add, bias, w2Bias);
+                int col = step.Op(GraphOp.Add, step.View2(logits, vocab, 1, vocab * f, e * vocab * f), bias);
+                int probs = step.Op(GraphOp.SoftMaxExt, stackalloc[] { col }, default, stackalloc[] { 1f, 0f });
+                int best = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { col }, stackalloc long[] { 1 }));       // I32 [1, 1]
+                outputs[e] = step.Output(EmitDFlashTokenIds(step, step.Reshape(best, 1)), 1);
+                outputs[drafts + e] = step.Output(step.Op(GraphOp.GetRows, step.Reshape(probs, 1, vocab), best), 1);
+                prev = step.Reshape(best, 1);
+            }
+            return outputs;
         }
 
         /// <summary>
