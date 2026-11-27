@@ -587,8 +587,9 @@ from `c178bfc` with the same ggml and checkpoint (Unsloth UD-Q4_K_XL):
   Ingredients pass, while both trees peaked at 18.2–22.9 GB elsewhere, the 121-frame
   decode's transient. Host memory of a two-clip process: anonymous 3.56 vs 3.61 GiB,
   file-backed 38.31 GiB both.
-- **CPU.** A 256×256×9 clip on the Xeon (7.65-core quota) was bit-identical, at
-  411.7 s retired and 415.5 s runtime in one pair.
+- **CPU.** A 256×256×9 clip on the Xeon (7.65-core quota) was bit-identical in
+  two pairs run in opposite orders: 411.7/405.3 s retired, 415.5/403.9 s runtime
+  (1.003× over both).
 - **Tests.** The LTX, diffusion-runtime, graph and LoRA filters passed: 1,637 on
   the CPU (34 skipped) and 1,628 on CUDA (34 skipped). The skips are MLX- and
   Metal-only tests, GGML-backend region tests, and the oracles that need the
