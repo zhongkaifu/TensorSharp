@@ -606,7 +606,18 @@ candidate-kernel switches (`TS_LTX25_CUDA_PREFAULT`, `TS_LTX25_CUDA_PREFAULT_WOR
 `TS_LTX25_CUDA_BF16_GEMM`, `TS_LTX25_MLX_BF16_GEMM`), each keeping the default it had; `RemovedCliFlags` refuses each at
 startup with what to do instead. `TS_LTX25_INGREDIENTS_LORA` (the adapter's path) stays.
 
-Evidence: see the [model card](../models/ltx-2.5.md#diffusion-runtime-migration-2026-11-27).
+Evidence (NVIDIA A40, Intel Xeon Gold 6342, ggml `bb877c0c` unchanged; the retired path built from `c178bfc` with the same
+ggml and checkpoint): the retired denoiser's steps on the synthetic checkpoint (the oracle's four cases, each with and
+without a synthetic rank-2 Ingredients adapter over every adapted projection) are frozen per lane in
+`InferenceWeb.Tests/Fixtures/Ltx25/LegacyGoldens/`, and the runtime gives their bits on `cpu` and `cuda`. Real-checkpoint
+steps at five generation geometries (a synthetic rank-128 adapter with the Ingredients layout standing in for the gated
+one) are bit-identical on `cuda`, two of them on `cpu` too. Whole clips (t2v, i2v, three keyframes, 121 frames, and an
+Ingredients reference clip) gave the retired pipeline's RGB and both PCM channels byte for byte in every alternating round,
+at 0.973x to 1.003x its wall time on the final code; a 256x256x9 clip on `cpu` was bit-identical too. A step's peak live
+device memory is 0.3-0.5 GB lower, while the pool caches 0.3-0.4 GB more freed blocks at that peak (returned before an
+allocation would fail). Three changes made that so: the first step's uploads at first product, parallel host draws, and
+the Ingredients update added in place (without them the runtime ran up to 1.8% slower and an Ingredients pass held 2.4 GB
+more). The model card has the tables. Not validated on Metal or MLX hardware, nor with the gated adapter itself.
 
 ---
 

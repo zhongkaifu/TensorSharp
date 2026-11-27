@@ -545,7 +545,60 @@ Evidence, on an NVIDIA A40 (48 GB, driver 595.112, CUDA 13.2, .NET 10.0.404) and
 Gold 6342 in a 50 GB container, ggml `bb877c0c` unchanged, the retired path built
 from `c178bfc` with the same ggml and checkpoint (Unsloth UD-Q4_K_XL):
 
-The measured results are recorded below as they complete.
+- **Denoiser steps, frozen.** The retired denoiser's outputs on the synthetic
+  checkpoint (the official oracle's four cases, each also with a synthetic
+  rank-2 Ingredients adapter over every adapted projection) are frozen per lane
+  in `InferenceWeb.Tests/Fixtures/Ltx25/LegacyGoldens/`. The runtime gives their
+  bits on both lanes (CPU and CUDA, 16 outputs each), and
+  `Ltx25DenoiserTests.StepsGiveTheRetiredDirectDenoisersBitsOnItsLane` holds it
+  there.
+- **Real-checkpoint steps** (synthetic latents and contexts at generation
+  geometries; a synthetic rank-128 BF16 adapter with the Ingredients layout over
+  all 480 projections, because the gated adapter was not available): bit-identical
+  on CUDA for a 512×512×17 first pass, an image guide's per-token timesteps, a
+  1024×1024×17 refinement, 384×256×49 with appended keyframe guides and a
+  768×448×121 Ingredients pass. Steady-state steps: 820/825, 897/893,
+  2954/2954, 919/931 and 21838/21919 ms (retired/runtime). A clip's first step
+  after the device copies were released: 2.45–2.63 s retired, 2.37–2.49 s runtime
+  (first pass); 4.65–4.89 s and 4.51–4.72 s (refinement). On the CPU (two
+  blocks) both cases were bit-identical, at 2829/2548 and 3478/3154 ms.
+- **Whole clips** through the public model API (`Ltx25AbProbe`), raw RGB and both
+  PCM channels compared: bit-identical in every round of every case. Wall times in
+  alternating rounds with prebuilt binaries (the final code, two rounds each):
+
+  | Clip (A40, `cuda`) | Retired | Runtime | Runtime / retired |
+  |---|---:|---:|---:|
+  | t2v 1024×1024×17 | 33.86, 32.43 s | 32.39, 32.08 s | 0.973 |
+  | i2v 1024×1024×17 | 32.26, 31.87 s | 32.03, 31.96 s | 0.998 |
+  | keyframes 768×512×49 (three guides) | 34.89, 34.68 s | 34.68, 34.61 s | 0.996 |
+  | t2v 1024×576×121 | 91.32, 89.98 s | 90.39, 90.13 s | 0.996 |
+  | Ingredients 768×448×121 (two references) | 203.49 s | 204.03 s | 1.003 |
+
+  Every phase matches or is faster (text and image encodes, both passes, the
+  upsampler and the decodes). Three changes made that so: projections upload at
+  their first product, overlapping the device work queued before them, as the
+  retired denoiser did; Philox noise and the rotary tables are drawn on several
+  cores (same bits); and the Ingredients update is added into each projection in
+  place. Earlier rounds, before those changes, ran up to 1.8% slower.
+- **Memory.** Peak live device memory of a step is lower: 2,063 vs 2,345 MiB
+  (refinement), 6,192 vs 6,684 MiB (Ingredients), weights aside. The CUDA pool
+  keeps 0.3–0.4 GB more freed blocks cached at that peak, which it returns when an
+  allocation would otherwise fail. So nvidia-smi read 23.9 vs 23.4 GB during an
+  Ingredients pass, while both trees peaked at 18.2–22.9 GB elsewhere, the 121-frame
+  decode's transient. Host memory of a two-clip process: anonymous 3.56 vs 3.61 GiB,
+  file-backed 38.31 GiB both.
+- **CPU.** A 256×256×9 clip on the Xeon (7.65-core quota) was bit-identical, at
+  411.7 s retired and 415.5 s runtime in one pair.
+- **Tests.** The LTX, diffusion-runtime, graph and LoRA filters passed: 1,637 on
+  the CPU (34 skipped) and 1,628 on CUDA (34 skipped). The skips are MLX- and
+  Metal-only tests, GGML-backend region tests, and the oracles that need the
+  gated adapter, the tokenizer reference or the PyAV image reference.
+
+Not validated: MLX and Metal hardware (no Apple device was available; the MLX
+executor's regions run their reference ops where it has no kernel); the real
+gated Ingredients adapter (the synthetic adapter has its layout, shapes and
+dtype); other GPUs and operating systems; perceptual quality beyond bit
+identity, which makes the outputs the same clips.
 
 Removed with the direct denoiser (the server and CLI refuse each at startup,
 naming what replaced it): `TS_LTX25_CUDA_ATTN`, `TS_LTX25_CUDA_FUSED_HEAD_GATE`,

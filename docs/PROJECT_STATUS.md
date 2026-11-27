@@ -147,6 +147,17 @@ CUDA results are committed. See the [Bonsai2 card](models/bonsai2.md).
 
 The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse Spark, loading split GGUFs from any shard, native skill discovery and the latest MiniMax-H3 work are newer than `v2026.10.11`, as described above. Knowledge collections and active-turn steering are included in that tag; the entries below retain compatibility and measured-performance history from earlier work.
 
+- **LTX 2.5 and its Ingredients IC-LoRA run on the diffusion runtime, and the legacy pipeline and direct denoiser are
+  removed.** A clip runs on the shared video pipeline in two passes (`Ltx25Family`), the 48-block denoiser is one graph
+  program a step on the backend's tensor executor, and the Ingredients adapter is an unmerged adapter set added in place in
+  exact F32. On an A40 every clip (t2v, i2v, keyframes, 121 frames, an Ingredients reference clip) is byte-identical to the
+  retired pipeline's in RGB and both PCM channels, at 0.973× to 1.003× its wall time; a `cpu` clip is byte-identical too.
+  A step's peak live device memory is 0.3–0.5 GB lower. The retired switches (`TS_LTX25_CUDA_ATTN`,
+  `TS_LTX25_CUDA_FUSED_HEAD_GATE`, `TS_LTX25_FUSED_ROPE`, `TS_LTX25_CUDA_TILE`, `TS_LTX25_CUDA_REQUIRE_TILE`,
+  `TS_LTX25_CUDA_F16_DEQUANT`, `TS_LTX25_STAGE_TIMING`, `TS_LTX25_CUDA_SOURCE_UPLOAD`, `TS_LTX25_CUDA_PREFAULT`,
+  `TS_LTX25_CUDA_PREFAULT_WORKERS`, `TS_LTX25_DEVICE_PROMPT_MATH`, `TS_LTX25_CUDA_BF16_GEMM`, `TS_LTX25_MLX_BF16_GEMM`)
+  stop the server or CLI at startup. `mlx`/`ggml_metal` and the gated adapter itself are not yet validated on the runtime.
+  See the [model card](models/ltx-2.5.md#diffusion-runtime-migration-2026-11-27).
 - **MiniMax-H3 runs on the diffusion runtime, and its legacy pipeline and DiTs are removed.** A clip runs on the shared
   video pipeline (`DiffusionVideoPipeline`) and the denoiser is one graph program a step on every backend, its LightX2V
   Turbo plug-ins as unmerged LoRA regions. On `ggml_cuda` (A40) the clips without a plug-in are byte-identical to the

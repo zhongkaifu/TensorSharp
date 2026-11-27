@@ -115,6 +115,15 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 
 以下变化跨越多个发布标签。上文的 LTX 2.5、EmbeddingGemma 2、Muse Spark、从任意分片加载分片 GGUF、原生技能发现和最新 MiniMax-H3 改动晚于 `v2026.10.11`；知识集合与生成中引导已包含于该标签。下面保留早期工作的兼容性说明和性能实测记录。
 
+- **LTX 2.5 及其 Ingredients IC-LoRA 运行在扩散运行时上，旧管线与直接去噪器已移除。** 片段在共享视频管线上分两个阶段运行
+  （`Ltx25Family`），48 块去噪器每步是后端 tensor executor 上的一个图程序，Ingredients 适配器作为未合并的 adapter set
+  以精确 F32 原地相加。A40 上每个片段（t2v、i2v、关键帧、121 帧、Ingredients 参考片段）的 RGB 与两个 PCM 声道都与
+  退役管线逐字节相同，墙钟时间为其 0.973×–1.003×；`cpu` 片段同样逐字节相同。单步峰值活动设备内存低 0.3–0.5 GB。
+  已退役的 `TS_LTX25_CUDA_ATTN`、`TS_LTX25_CUDA_FUSED_HEAD_GATE`、`TS_LTX25_FUSED_ROPE`、`TS_LTX25_CUDA_TILE`、
+  `TS_LTX25_CUDA_REQUIRE_TILE`、`TS_LTX25_CUDA_F16_DEQUANT`、`TS_LTX25_STAGE_TIMING`、`TS_LTX25_CUDA_SOURCE_UPLOAD`、
+  `TS_LTX25_CUDA_PREFAULT`、`TS_LTX25_CUDA_PREFAULT_WORKERS`、`TS_LTX25_DEVICE_PROMPT_MATH`、`TS_LTX25_CUDA_BF16_GEMM`、
+  `TS_LTX25_MLX_BF16_GEMM` 会让服务端或 CLI 在启动时拒绝运行。`mlx`/`ggml_metal` 与受限适配器本身尚未在运行时上验证。
+  见[模型卡片](models/ltx-2.5_zh-cn.md#扩散运行时迁移2026-11-27)。
 - **MiniMax-H3 运行在扩散运行时上，旧管线与 DiT 已移除。** 片段运行在共享视频管线（`DiffusionVideoPipeline`）上，
   去噪器在每个后端上每步是一个图程序，LightX2V Turbo 插件以未合并的 LoRA 区域应用。在 `ggml_cuda`（A40）上，不带插件的
   片段与退役管线逐字节相同，中位墙钟时间为其 0.989×–1.015×（在运行间噪声之内，稳定步相同）；Turbo 插件改走运行时的未合并
