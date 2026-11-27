@@ -27,6 +27,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr siluMulSplitF32;
         private readonly IntPtr geluMulSplitF32;
         private readonly IntPtr swigluOaiSplitF32;
+        private readonly IntPtr moeOaiGluBiasF32;
+        private readonly IntPtr moeExpertBiasAddF32;
         private readonly IntPtr layerNormF32;
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr rmsNormResidualAddF32;
@@ -232,6 +234,8 @@ namespace TensorSharp.Cuda
                 try { wanAttentionF32[headDim] = module.GetFunction($"ts_wan_attention_d{headDim}_f32"); }
                 catch { missingOptional.Add($"ts_wan_attention_d{headDim}_f32"); }
             }
+            moeOaiGluBiasF32 = GetOptionalFunction(module, "ts_moe_oai_glu_bias_f32", missingOptional);
+            moeExpertBiasAddF32 = GetOptionalFunction(module, "ts_moe_expert_bias_add_f32", missingOptional);
             wanRopeF32 = GetOptionalFunction(module, "ts_wan_rope_f32", missingOptional);
             wanModulateF32 = GetOptionalFunction(module, "ts_wan_modulate_f32", missingOptional);
             wanGateAddF32 = GetOptionalFunction(module, "ts_wan_gate_add_f32", missingOptional);
@@ -2520,6 +2524,31 @@ namespace TensorSharp.Cuda
         /// dst[i] = clamp(b[i], ±limit) * silu(min(a[i], limit)); limit &lt;= 0
         /// disables the clamp. In-place safe when dst == a.
         /// </summary>
+        /// <summary>Whether the module has GPT-OSS's MoE-engine kernels (<see cref="LaunchMoeOaiGluBiasF32"/>,
+        /// <see cref="LaunchMoeExpertBiasAddF32"/>); an older PTX has neither.</summary>
+        public bool HasMoeOaiKernels => moeOaiGluBiasF32 != IntPtr.Zero && moeExpertBiasAddF32 != IntPtr.Zero;
+
+        /// <summary>GPT-OSS's experts: each slot's gate and up rows [rows, ff] plus its expert's biases ([experts, ff]), the clamped
+        /// SwiGLU written over the gate rows; a slot's row is <paramref name="rowOfSlot"/>[slot] (zero: the slot).</summary>
+        public void LaunchMoeOaiGluBiasF32(IntPtr gate, IntPtr up, IntPtr sel, IntPtr rowOfSlot, IntPtr gateBias, IntPtr upBias,
+            int ff, int slots, float alpha, float limit, IntPtr stream)
+        {
+            if (slots <= 0) return;
+            void** args = stackalloc void*[] { &gate, &up, &sel, &rowOfSlot, &gateBias, &upBias, &ff, &slots, &alpha, &limit };
+            uint blocks = checked((uint)(((long)slots * ff + BlockSize - 1) / BlockSize));
+            Launch(moeOaiGluBiasF32, blocks, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>Each slot's row [width] of <paramref name="rows"/> plus its expert's row of <paramref name="bias"/>
+        /// ([experts, width]); rows as <see cref="LaunchMoeOaiGluBiasF32"/>'s.</summary>
+        public void LaunchMoeExpertBiasAddF32(IntPtr rows, IntPtr sel, IntPtr rowOfSlot, IntPtr bias, int width, int slots, IntPtr stream)
+        {
+            if (slots <= 0) return;
+            void** args = stackalloc void*[] { &rows, &sel, &rowOfSlot, &bias, &width, &slots };
+            uint blocks = checked((uint)(((long)slots * width + BlockSize - 1) / BlockSize));
+            Launch(moeExpertBiasAddF32, blocks, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchSiluMulClampF32(IntPtr dst, IntPtr a, IntPtr b, long n, float limit, IntPtr stream)
         {
             IntPtr dstArg = dst;

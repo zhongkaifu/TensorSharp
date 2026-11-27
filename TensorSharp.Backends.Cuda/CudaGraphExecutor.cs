@@ -2147,6 +2147,7 @@ namespace TensorSharp.Cuda
             GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn or GraphFusion.GegluRoutedExperts => ((CudaAllocator)Allocator).Kernels != null,
+            GraphFusion.OaiRoutedExperts => ((CudaAllocator)Allocator).Kernels is { HasMoeOaiKernels: true },
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
             GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep or GraphFusion.DFlashConv => Kernels != null,
             GraphFusion.DeltaNetScans => Kernels is { TakesGdnScanSequences: true },
@@ -2170,6 +2171,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.SharedExpertGate) return TrySharedExpertGate(inputs, weights, results);
             if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs, weights, ip, results);
             if (kind == GraphFusion.GegluRoutedExperts) return TryGegluRoutedExperts(inputs, weights, ip, results);
+            if (kind == GraphFusion.OaiRoutedExperts) return TryOaiRoutedExperts(inputs, weights, ip, fp, results);
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs, weights, ip, results);
             if (kind == GraphFusion.HcRead) return TryHcRead(inputs, weights, ip, fp, results);
             if (kind == GraphFusion.HcScatter) return TryHcScatter(inputs, ip, results);
@@ -3584,19 +3586,20 @@ namespace TensorSharp.Cuda
         /// steps (prompt chunks, verify windows, routes read on the host) take the executor's own path.
         /// </summary>
         protected override Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run, int activation = 0, bool fusedGateUp = false, Value upScales = default)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false, Value upScales = default, ExpertBiases biases = null)
         {
-            // The doorbell's and the staged paths' kernels run SwiGLU over separate gate and up stacks; a fused GeGLU layer
-            // (Gemma 4) takes the executor's own path: its device routes through the generic ops, the host's through the
-            // host kernel at that activation.
-            if (activation == 0 && !fusedGateUp && gateValue.Weight is IGraphHostedExperts gate && upValue.Weight is IGraphExpertWeights up
-                && downValue.Weight is IGraphExpertWeights down)
+            // The doorbell's and the staged paths' kernels run SwiGLU over separate gate and up stacks, or GPT-OSS's biased
+            // clamped SwiGLU on the MoE engine (CudaMoe's oai); a fused GeGLU layer (Gemma 4) takes the executor's own path: its
+            // device routes through the generic ops, the host's through the host kernel at that activation.
+            CudaOaiExperts oai = activation == 1 && !fusedGateUp ? OaiExpertsOf(biases) : null;
+            if ((activation == 0 || oai != null) && !fusedGateUp && gateValue.Weight is IGraphHostedExperts gate
+                && upValue.Weight is IGraphExpertWeights up && downValue.Weight is IGraphExpertWeights down)
             {
                 // Every MoE layer the executor meets is remembered, so a long prompt chunk stages each next layer ahead.
                 if (!_moeLayers.ContainsKey(layer) && gate.Format == up.Format)
                     _moeLayers[layer] = Tables(gate, up, down, layer);
                 SizeStagingArenas(gate, up, down);
-                if (TryDoorbellExperts(x, selected, weightValue, gate, up, down, layer, out Tensor result))
+                if (TryDoorbellExperts(x, selected, weightValue, gate, up, down, layer, oai, out Tensor result))
                 {
                     DoorbellCalls++;
                     return result;
@@ -3604,12 +3607,25 @@ namespace TensorSharp.Cuda
                 // The other paths stage experts through the arenas an adaptive round borrows, or read the tier by its
                 // resident copies: a round in flight finishes first.
                 FlushTrades();
-                if (TryStagedExperts(x, selected, weightValue, gate, up, down, layer, out result))
+                if (TryStagedExperts(x, selected, weightValue, gate, up, down, layer, oai, out result))
                     return result;
             }
             FlushTrades();
             HostExpertFallbacks++;
-            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run, activation, fusedGateUp, upScales);
+            return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run, activation, fusedGateUp, upScales, biases);
+        }
+
+        /// <summary>GPT-OSS's expert biases as the MoE engine reads them (device F32 rows, [ff, E], [ff, E], [hidden, E]), or
+        /// null: no biases, or biases the device does not hold as such (the executor's own path then runs the layer).</summary>
+        private CudaOaiExperts OaiExpertsOf(ExpertBiases biases)
+        {
+            if (biases == null || ((CudaAllocator)Allocator).Kernels is not { HasMoeOaiKernels: true }) return null;
+            foreach (Tensor t in new[] { biases.Gate, biases.Up, biases.Down })
+            {
+                if (t?.Storage is not CudaStorage storage || t.ElementType != DType.Float32 || !t.IsContiguous()) return null;
+                storage.EnsureDeviceCurrent();
+            }
+            return new CudaOaiExperts(Ptr(biases.Gate), Ptr(biases.Up), Ptr(biases.Down), biases.Alpha, biases.Limit);
         }
 
         /// <summary>Host-expert calls the doorbell served, and calls that fell to the base executor's host path (routes read
@@ -3632,7 +3648,7 @@ namespace TensorSharp.Cuda
         /// staged experts do not fit runs in batches. Every route is computed (the route-tail skip is for decode rows).
         /// </summary>
         private bool TryStagedExperts(Tensor x, Value selected, Value weightValue, IGraphHostedExperts gate, IGraphExpertWeights up,
-            IGraphExpertWeights down, int layer, out Tensor result)
+            IGraphExpertWeights down, int layer, CudaOaiExperts oai, out Tensor result)
         {
             result = null;
             var cuda = (CudaAllocator)Allocator;
@@ -3647,9 +3663,12 @@ namespace TensorSharp.Cuda
                 return false;
             // A prompt's routes teach the tiers what its answer will route: a round after it (BeginDueRound).
             _afterPrompt = true;
-            if (TryPrefetchedExperts(x, selected, weightValue, gate, up, down, layer, rows, k, out result)
-                || TryDeviceStagedExperts(x, selected, weightValue, gate, up, down, layer, rows, k, out result))
+            if (TryPrefetchedExperts(x, selected, weightValue, gate, up, down, layer, rows, k, oai, out result)
+                || TryDeviceStagedExperts(x, selected, weightValue, gate, up, down, layer, rows, k, oai, out result))
                 return true;
+            // GPT-OSS's experts run on the grouped kernels only (below; the per-row and per-expert routes run plain SwiGLU).
+            if (oai != null && !GroupedTakes(new IGraphExpertWeights[] { gate, up, down }, rows, (int)gate.Ne0, (int)gate.Ne1, warp: true))
+                return false;
             HostPlannedLayers++;
             int[] ids = Ints(selected);
             float[] weights = weightValue.Floats ?? weightValue.Tensor.GetElementsAsFloat(rows * k);
@@ -3737,12 +3756,18 @@ namespace TensorSharp.Cuda
             if ((long)staged.Count * perExpert <= _stagingBytes
                 && TryStagedTables(selected, weightValue, sets, resident, staged, memberBytes, perExpert, Source, experts, layer))
             {
-                if (TryGroupedMoe(x2, output, selected.Tensor, weightValue.Tensor, sets, _stepTables, rows, k, hidden, ff, experts)
-                    || (rows <= StagedPerRowMaxRows && TryStagedPerRow(x2, output, selected, weightValue, sets, rows, k, hidden, ff, experts)))
+                if (TryGroupedMoe(x2, output, selected.Tensor, weightValue.Tensor, sets, _stepTables, rows, k, hidden, ff, experts, oai: oai)
+                    || (oai == null && rows <= StagedPerRowMaxRows
+                        && TryStagedPerRow(x2, output, selected, weightValue, sets, rows, k, hidden, ff, experts)))
                 {
                     result = output;
                     return true;
                 }
+            }
+            if (oai != null)
+            {
+                output.Dispose();
+                return false;
             }
             try
             {
@@ -3896,12 +3921,13 @@ namespace TensorSharp.Cuda
         /// False, with nothing launched, for a layout or width the kernels do not take.
         /// </summary>
         private bool TryGroupedMoe(Tensor x2, Tensor output, Tensor sel, Tensor w, IGraphExpertWeights[] sets, Tensor[] tables, int rows,
-            int k, int hidden, int ff, int experts, CudaExpertStage stage = null, CudaExpertStageLayer stageLayer = default)
+            int k, int hidden, int ff, int experts, CudaExpertStage stage = null, CudaExpertStageLayer stageLayer = default,
+            CudaOaiExperts oai = null)
         {
             var cuda = (CudaAllocator)Allocator;
             Dsv4Kernels dk = MoeKernels;
             int gateType = sets[0].Format, upType = sets[1].Format, downType = sets[2].Format;
-            if (!GroupedTakes(sets, rows, hidden, ff))
+            if (!GroupedTakes(sets, rows, hidden, ff, warp: oai != null))
                 return false;
             var owned = new List<Tensor>();
             try
@@ -3926,7 +3952,7 @@ namespace TensorSharp.Cuda
                 foreach (Tensor t in new[] { x2, output }) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
                 cuda.Context.MakeCurrent();
                 CudaMoe.Experts(dk, cuda.Kernels, scratch, gate, up, down, x2, null, output, rows, k, experts, hidden, ff, 0f,
-                    GroupedPerSlotMaxRows, cuda.Stream.Handle, stage: stage, stageLayer: stageLayer);
+                    GroupedPerSlotMaxRows, cuda.Stream.Handle, stage: stage, stageLayer: stageLayer, oai: oai);
                 ((CudaStorage)output.Storage).MarkDeviceModified();
                 return true;
             }
@@ -3937,16 +3963,19 @@ namespace TensorSharp.Cuda
             }
         }
 
-        /// <summary>Whether the grouped MoE kernels take a chunk of <paramref name="rows"/> rows of these experts.</summary>
-        private bool GroupedTakes(IGraphExpertWeights[] sets, int rows, int hidden, int ff)
+        /// <summary>Whether the grouped MoE kernels take a chunk of <paramref name="rows"/> rows of these experts. The
+        /// warp-per-row grouped kernels (widths the tensor-core and staged kernels do not take) serve only where
+        /// <paramref name="warp"/>: GPT-OSS's biased experts, which no other kernel of the executor runs (gpt-oss-20b's 2880
+        /// is neither a multiple of 128 nor of 256).</summary>
+        private bool GroupedTakes(IGraphExpertWeights[] sets, int rows, int hidden, int ff, bool warp = false)
         {
             Dsv4Kernels dk = MoeKernels;
             int gateType = sets[0].Format, downType = sets[2].Format;
             return dk != null && ((CudaAllocator)Allocator).Kernels != null && gateType == sets[1].Format
                 && CudaMoe.GroupedSupportsType(gateType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
                 && CudaMoe.GroupedSupportsType(downType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
-                && CudaMoe.SelectRoute(rows, GroupedPerSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, gateType, downType, hidden, ff,
-                    dk.DecodesLegacyQuants) != CudaMoe.ExpertRoute.Warp;
+                && (warp || CudaMoe.SelectRoute(rows, GroupedPerSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, gateType, downType,
+                    hidden, ff, dk.DecodesLegacyQuants) != CudaMoe.ExpertRoute.Warp);
         }
 
         /// <summary>Rows the grouped MoE path runs on its per-slot kernels (the engines' decode-window bound).</summary>
@@ -4115,7 +4144,7 @@ namespace TensorSharp.Cuda
         }
 
         private bool TryDoorbellExperts(Tensor x, Value selected, Value weightValue, IGraphHostedExperts gate, IGraphExpertWeights up,
-            IGraphExpertWeights down, int layer, out Tensor result)
+            IGraphExpertWeights down, int layer, CudaOaiExperts oai, out Tensor result)
         {
             result = null;
             var cuda = (CudaAllocator)Allocator;
@@ -4135,6 +4164,11 @@ namespace TensorSharp.Cuda
             HostedTables tables = Tables(gate, up, down, layer);
             if (_doorbell != null && (_doorbell.Hidden != hidden || _doorbell.RoutesPerRow != k))
                 return false;   // another shape already has the executor's mailbox
+            // GPT-OSS's experts: the device's routes on the grouped kernels with the host's at the zeroed expert, whose rows
+            // then carry each route's down bias alone (the device adds it for every route; the host leaves it out).
+            bool grouped = tables.Zero != 0 && GroupedTakes(tables.Sets, rows, hidden, ff, warp: oai != null);
+            if (oai != null && !grouped)
+                return false;
             // The mailbox holds one request: the previous layer's host sum is added before this layer rings.
             FinishJoins();
             if (_doorbell == null)
@@ -4161,7 +4195,7 @@ namespace TensorSharp.Cuda
             }
             // A decode-size step run as it comes: a due round begins beside it (the run's start counted it, BeginRun).
             if (!CudaGraphCapture.IsCapturing(cuda) && BeginDueRound()) StepsBesideTrades++;
-            _doorbell.Register(layer, gate.Host);
+            _doorbell.Register(layer, gate.Host, oai);
             _doorbell.Arm();
 
             bool gateUpDp4a = CudaQuantizedOps.IsMoeDp4aEnabledForType(gate.Format) && CudaFusedOps.IsMoeDp4aDimensionSupported(gate.Format, hidden);
@@ -4177,7 +4211,7 @@ namespace TensorSharp.Cuda
             var output = new Tensor(Allocator, DType.Float32, rows, hidden);
             CudaExpertDoorbell bell = _doorbell;
             int tailRank = gate.Host.TailSkipRank(layer);
-            CudaGraphKernels.MoeStaging staging = Staging(tables);
+            CudaGraphKernels.MoeStaging staging = Staging(tables, oai != null);
             Launch(new[] { x, sel, w, tables.OnDevice }, new[] { devSel, tables.Counts, tables.Gate, tables.Up, tables.Down },
                 (kn, stream) => kn.LaunchMoeRouteSplit(Ptr(x), Ptr(sel), Ptr(w), Ptr(tables.OnDevice), hidden, rows, k, layer, tailRank,
                     Ptr(devSel), Ptr(tables.Counts), bell.Box, bell.MissDev, stream, staging));
@@ -4186,8 +4220,8 @@ namespace TensorSharp.Cuda
             // The device's routes: on the decode kernels the router's ids as they are (the host's rest at the zeroed expert, so
             // they add nothing), as the direct engines run them (UD-Q2_K_XL on an A40: 3.16 -> 2.77 ms a step's experts);
             // else on the fused kernels, the host's ids read -1. The router's weights; a decode row, or a verify window's rows.
-            bool grouped = tables.Zero != 0 && GroupedTakes(tables.Sets, rows, hidden, ff);
-            bool ran = grouped ? TryGroupedMoe(x2, output, sel, w, tables.Sets, new[] { tables.Gate, tables.Up, tables.Down }, rows, k, hidden, ff, experts)
+            bool ran = grouped ? TryGroupedMoe(x2, output, sel, w, tables.Sets, new[] { tables.Gate, tables.Up, tables.Down }, rows, k, hidden, ff,
+                    experts, oai: oai)
                 : rows == 1
                 ? CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(null, x2, output, devSel, w1, gateOut, upOut, IntPtr.Zero, Ptr(tables.Gate),
                     Ptr(tables.Up), Ptr(tables.Down), gate.Format, down.Format, experts, k, hidden, ff, null, IntPtr.Zero, inputQ8, gateQ8,
@@ -4506,12 +4540,13 @@ namespace TensorSharp.Cuda
         /// before the next layer splits), grown on an unrecorded step; older slot buffers stay allocated (a recording binds
         /// them).
         /// </summary>
-        private CudaGraphKernels.MoeStaging Staging(HostedTables t)
+        private CudaGraphKernels.MoeStaging Staging(HostedTables t, bool oai = false)
         {
-            if (GpuMisses <= 0 || t.ExpertBytes == null) return default;
+            int misses = oai ? Math.Min(GpuMisses, OaiGpuMisses) : GpuMisses;
+            if (misses <= 0 || t.ExpertBytes == null) return default;
             static long Align(long b) => (b + 255) / 256 * 256;
             long offUp = Align(t.ExpertBytes[0]), offDown = offUp + Align(t.ExpertBytes[1]), stride = offDown + Align(t.ExpertBytes[2]);
-            int capacity = Math.Min(GpuMisses, 16);
+            int capacity = Math.Min(misses, 16);
             var cuda = (CudaAllocator)Allocator;
             if (_missSlots == null || _missStride < stride || _missCapacity < capacity)
             {
@@ -4549,6 +4584,12 @@ namespace TensorSharp.Cuda
         /// for 287 routes of a 4-request run against 1,870, and decoded 54.4 / 50.5 tok/s (short, after a 4K prompt) against
         /// 52.5-52.6 / 49.5-49.6 with the host computing every miss.</summary>
         internal const int DefaultGpuMisses = 4;
+
+        /// <summary>The misses a GPT-OSS layer's call stages (its biased experts, CudaOaiExperts): an expert of gpt-oss-20b is
+        /// 13.2 MB of MXFP4, ten times a Qwen3.8 Flash Next expert, and its four routes over the link cost more than the host
+        /// computing them. A40, 12 of 24 layers offloaded, a 7.6-CPU container (5 host-expert threads), decode tok/s: 14.0 at
+        /// four misses (every route staged, the host idle), 28.7 at two, 31.6 at one, 29.7 at none.</summary>
+        internal const int OaiGpuMisses = 1;
 
         private int _gpuMisses = DefaultGpuMisses;
 
@@ -4605,6 +4646,110 @@ namespace TensorSharp.Cuda
             results[0] = output;
             return true;
         }
+
+        /// <summary>
+        /// GPT-OSS's routed experts (<see cref="GraphFusion.OaiRoutedExperts"/>) on the MoE engine (CudaMoe): the router's top-K of
+        /// the logits with the softmax over them, then the experts with their biases and the clamped SwiGLU, every row on the
+        /// device (decode rows and verify windows on the per-slot kernels through a scratch kept per geometry, so a recorded step
+        /// replays them; prompt chunks grouped by expert). False (the region's ops run) for members that are not resident, a
+        /// format or geometry the engine's kernels do not take, or a module without the kernels.
+        /// </summary>
+        private bool TryOaiRoutedExperts(Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            if (ip == null || ip.Length < 2 || fp == null || fp.Length < 2 || cuda.Kernels is not { HasMoeOaiKernels: true }) return false;
+            if (weights[2] is not IGraphExpertWeights gate || weights[3] is not IGraphExpertWeights up
+                || weights[4] is not IGraphExpertWeights down) return false;
+            Tensor x = inputs[0], logits = inputs[1], gateBias = inputs[5], upBias = inputs[6], downBias = ip[1] != 0 ? inputs[7] : null;
+            foreach (Tensor t in new[] { x, logits, gateBias, upBias, ip[1] != 0 ? downBias : x })
+                if (t?.Storage is not CudaStorage || t.ElementType != DType.Float32 || !t.IsContiguous()) return false;
+            int experts = (int)gate.Ne2, k = (int)ip[0], hidden = (int)gate.Ne0, ff = (int)gate.Ne1;
+            if (up.Ne0 != hidden || up.Ne1 != ff || up.Ne2 != experts || down.Ne0 != ff || down.Ne1 != hidden || down.Ne2 != experts
+                || gate.Format != up.Format || hidden % 32 != 0 || ff % 32 != 0 || k > 32 || experts > 512
+                || gateBias.ElementCount() != (long)experts * ff || upBias.ElementCount() != (long)experts * ff
+                || (downBias != null && downBias.ElementCount() != (long)experts * hidden)
+                || !CudaFusedOps.IsMoERouterConfigurationSupported(experts, k)) return false;
+            long count = x.ElementCount() / hidden;
+            if (count < 1 || count > 65535 || x.ElementCount() != count * hidden || logits.ElementCount() != count * experts) return false;
+            int rows = (int)count;
+            // The scratch is made on an uncaptured step: a recording binds the scratch the unrecorded steps already use.
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing(cuda))) return false;
+            Dsv4Kernels dk = MoeKernels;
+            if (dk == null || !ChunkKernelsRead(dk, gate.Format) || !ChunkKernelsRead(dk, down.Format)) return false;
+            bool decode = rows <= DecodeExpertRows;
+            if (decode && (!DecodeKernelsAsExact(gate.Format) || !DecodeKernelsAsExact(down.Format))) return false;
+            if (!decode && (CudaGraphCapture.IsCapturing(cuda) || !GroupedTakes(new[] { gate, up, down }, rows, hidden, ff))) return false;
+            Tensor gateTable = ExpertTable(gate), upTable = ExpertTable(up), downTable = ExpertTable(down);
+            if (gateTable == null || upTable == null || downTable == null) return false;
+            if (!TryExpertRowBytes(gate, out long gateRow) || !TryExpertRowBytes(up, out long upRow) || !TryExpertRowBytes(down, out long downRow))
+                return false;
+            RequireDevice(x, cuda.DeviceId, "input", 0);
+            RequireDevice(logits, cuda.DeviceId, "input", 1);
+            var owned = new List<Tensor>();
+            try
+            {
+                CudaMoeScratch s;
+                int slotRows;
+                if (decode)
+                {
+                    var shape = (experts, k, hidden, ff);
+                    if (!_decodeScratch.TryGetValue(shape, out s))
+                    {
+                        if (CudaGraphCapture.IsCapturing(cuda)) return false;
+                        s = new CudaMoeScratch((type, sizes) =>
+                        {
+                            var t = new Tensor(Allocator, type, sizes);
+                            ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+                            _decodeScratchTensors.Add(t);
+                            return t;
+                        }, GroupedPerSlotMaxRows, experts, k, hidden, ff);
+                        _decodeScratch[shape] = s;
+                    }
+                    slotRows = GroupedPerSlotMaxRows;
+                }
+                else
+                {
+                    s = new CudaMoeScratch((type, sizes) =>
+                    {
+                        var t = new Tensor(Allocator, type, sizes);
+                        owned.Add(t);
+                        return t;
+                    }, rows, experts, k, hidden, ff);
+                    slotRows = rows;
+                }
+                using Tensor x2 = x.View(rows, hidden);
+                using Tensor logits2 = logits.View(rows, experts);
+                var output = new Tensor(Allocator, DType.Float32, rows, hidden);
+                foreach (Tensor t in new[] { x, logits, output, gateBias, upBias, downBias })
+                    if (t != null) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+                cuda.Context.MakeCurrent();
+                IntPtr stream = cuda.Stream.Handle;
+                var gw = new DeviceWeight { Type = gate.Format, Ne0 = hidden, Ne1 = ff, RowBytes = gateRow, Table = Ptr(gateTable) };
+                var uw = new DeviceWeight { Type = up.Format, Ne0 = hidden, Ne1 = ff, RowBytes = upRow, Table = Ptr(upTable) };
+                var dw = new DeviceWeight { Type = down.Format, Ne0 = ff, Ne1 = hidden, RowBytes = downRow, Table = Ptr(downTable) };
+                var oai = new CudaOaiExperts(Ptr(gateBias), Ptr(upBias), downBias != null ? Ptr(downBias) : IntPtr.Zero, fp[0], fp[1]);
+                for (int first = 0; first < rows; first += slotRows)
+                {
+                    int n = Math.Min(slotRows, rows - first);
+                    using Tensor xs = x2.Narrow(0, first, n), ls = logits2.Narrow(0, first, n), outs = output.Narrow(0, first, n);
+                    dk.MoeSelect(ls, IntPtr.Zero, IntPtr.Zero, null, s.Sel, s.SelW, experts, k, 1, 1f, n, stream, Dsv4Kernels.RouterSoftmax, keys: true);
+                    CudaMoe.Experts(dk, cuda.Kernels, s, gw, uw, dw, xs, null, outs, n, k, experts, hidden, ff, 0f,
+                        decode ? GroupedPerSlotMaxRows : GroupedPerSlotMaxRows, stream, q80VecDecode: decode, oai: oai);
+                }
+                ((CudaStorage)output.Storage).MarkDeviceModified();
+                results[0] = output;
+                OaiRoutedExpertCalls++;
+                return true;
+            }
+            finally
+            {
+                // The kernels are queued on the allocator's stream: the scratch returns to its pool for later work there.
+                foreach (Tensor t in owned) t.Dispose();
+            }
+        }
+
+        /// <summary>GPT-OSS routed-expert regions the MoE engine served (tests, probes).</summary>
+        internal long OaiRoutedExpertCalls { get; private set; }
 
         /// <summary>The Gemma 4 MoE decode kernels' scratch for each expert geometry (never freed while recorded steps may bind it):
         /// the selected ids and weights, the gate|up products, the GeGLU rows and their q8_1 forms.</summary>

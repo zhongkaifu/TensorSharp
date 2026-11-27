@@ -36,6 +36,7 @@
     <EmbeddedResource Include="Fixtures/MuseGlimmer/LegacySynthetic/*.json" />
     <EmbeddedResource Include="Fixtures/Gemma4/LegacySynthetic/*.json" />
     <EmbeddedResource Include="Fixtures/Nemotron/LegacySynthetic/*.json" />
+    <EmbeddedResource Include="Fixtures/GptOss/LegacySynthetic/*.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/Vision/*.json" />
     <EmbeddedResource Include="Fixtures/MuseSpark/chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/Qwen35/chat_template.jinja" />

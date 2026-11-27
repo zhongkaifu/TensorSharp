@@ -5317,7 +5317,7 @@ namespace TensorSharp.Runtime.Scheduling
 
     /// <summary>Opt-in contract for true batched paged attention: models with
     /// a native paged forward kernel taking a batch metadata struct (Gemma 4,
-    /// Qwen 3.5, Nemotron-H, GptOss, Mistral 3). Path selection against this
+    /// Qwen 3.5, Nemotron-H, GPT-OSS, Mistral 3). Path selection against this
     /// contract is centralised in <see cref="ExecutionPlanner"/>, which reads
     /// the declared capability getters below (via
     /// <see cref="ExecutionCapabilities.FromModel"/>) instead of probing

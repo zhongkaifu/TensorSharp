@@ -33,6 +33,15 @@ namespace TensorSharp.Cuda
         /// fixture).</summary>
         internal int PrefetchMinRows { get; set; } = DefaultPrefetchMinRows;
 
+        /// <summary>
+        /// Rows from which a GPT-OSS layer's chunk (CudaOaiExperts) takes the staged-ahead path: where its routes are four times
+        /// the layer's experts, it selects about 98% of them (1 - e^-4), so copying every host expert ahead moves the bytes
+        /// copying the selected ones would, by DMA and while the previous layer runs. gpt-oss-20b (32 experts, top 4) from 32
+        /// rows; on an A40 with 12 of 24 layers offloaded, prompts of 512 and 2048 tokens (512-row chunks) went from 456 and
+        /// 460 tok/s to 557 and 545.
+        /// </summary>
+        private static int OaiPrefetchMinRows(int k, int experts) => Math.Max(1, 4 * experts / Math.Max(1, k));
+
         /// <summary>Layers that ran the staged-ahead path, and of those, layers whose experts were copied while the previous
         /// layer ran (tests check that the path engaged).</summary>
         internal long PrefetchedLayers { get; private set; }
@@ -52,19 +61,20 @@ namespace TensorSharp.Cuda
         private readonly Dictionary<HostedTables, int> _promptCounted = new(ReferenceEqualityComparer.Instance);
 
         private bool TryPrefetchedExperts(Tensor x, Value selected, Value weightValue, IGraphHostedExperts gate, IGraphExpertWeights up,
-            IGraphExpertWeights down, int layer, int rows, int k, out Tensor result)
+            IGraphExpertWeights down, int layer, int rows, int k, CudaOaiExperts oai, out Tensor result)
         {
             result = null;
             var cuda = (CudaAllocator)Allocator;
             Tensor sel = selected.Tensor, w = weightValue.Tensor;
-            if (rows < PrefetchMinRows || Kernels == null || CudaGraphCapture.IsCapturing(cuda) || x.Storage is not CudaStorage
+            int minRows = oai != null ? Math.Min(PrefetchMinRows, OaiPrefetchMinRows(k, (int)gate.Ne2)) : PrefetchMinRows;
+            if (rows < minRows || Kernels == null || CudaGraphCapture.IsCapturing(cuda) || x.Storage is not CudaStorage
                 || x.ElementType != DType.Float32 || !x.IsContiguous() || sel?.Storage is not CudaStorage || w?.Storage is not CudaStorage
                 || sel.ElementType != DType.Int32 || w.ElementType != DType.Float32 || !sel.IsContiguous() || !w.IsContiguous()
                 || gate.Format != up.Format)
                 return false;
             int hidden = (int)gate.Ne0, ff = (int)gate.Ne1, experts = (int)gate.Ne2;
             HostedTables t = Tables(gate, up, down, layer);
-            if (t.Sets == null || !GroupedTakes(t.Sets, rows, hidden, ff) || !PrepareHostList(t)
+            if (t.Sets == null || !GroupedTakes(t.Sets, rows, hidden, ff, warp: oai != null) || !PrepareHostList(t)
                 || !EnsurePrefetchArena(t.HostList.Length * t.PerExpert))
                 return false;
 
@@ -84,7 +94,7 @@ namespace TensorSharp.Cuda
             using Tensor x2 = x.View(rows, hidden);
             var output = new Tensor(Allocator, DType.Float32, rows, hidden);
             Ops.Fill(output, 0f);
-            if (!TryGroupedMoe(x2, output, sel, w, t.Sets, tables, rows, k, hidden, ff, experts))
+            if (!TryGroupedMoe(x2, output, sel, w, t.Sets, tables, rows, k, hidden, ff, experts, oai: oai))
             {
                 output.Dispose();
                 return false;

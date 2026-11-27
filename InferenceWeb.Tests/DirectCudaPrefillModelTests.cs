@@ -223,7 +223,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     {
         // 17: below the 32-row expert and F16-GEMM thresholds (scalar quantized matmuls);
         // 97: past every sliding window, not a multiple of 3/8/16/32; 160: two flash-style KV tiles;
-        // 257: past gpt-oss's 256-row ForwardRefill chunk; 513: past the 512-token prefill-graph
+        // 257: past the legacy gpt-oss's 256-row ForwardRefill chunk; 513: past the 512-row ring step and prefill-graph
         // limit; 1100: past 1024 rows.
         string path = WriteModel(family);
         int[] prompt = Prompt(length, PrefillSalt(family, length));
@@ -339,7 +339,11 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     /// the base is: Nemotron except the chunkings whose shapes route differently).</summary>
     private static double ChunkTolerance(string family, int length, int[] chunks, int row) => family switch
     {
-        "gptoss" => row == 0 ? 0.0075 : 0.0068,
+        // GPT-OSS on the shared runtime (an A40, sm_86): row 0 up to 3.02e-2 ([16,16,16,16,16] and [24,24,24] at 97 tokens:
+        // chunks of decode-size rows run the decode-once kernels, wider ones the prompt GEMMs), the decode rows up to 2.18e-2;
+        // the legacy model's single prompt kernel had kept them within 7.5e-3. Against ggml_cpu the runtime's rows stay inside
+        // the bounds the legacy model was held to (DecodeVsGgml), and its chunked managed rows are exact (GptOssRuntimeTests).
+        "gptoss" => row == 0 ? 0.045 : 0.033,
         // Row 0 up to 1.58e-2 ([64]: RTX PRO 6000 slice and RTX 2000 Ada; [1,15,33] 8.1e-3 on an A40) since decode-size
         // products run on the decode-once kernels (q8_1 activations where some went F32): this random router's near-ties.
         "qwen35moe" => row == 0 ? 0.02 : 0.015,
@@ -405,7 +409,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     /// tolerance for (prompt row, decode rows); 0 = bit-identical, as the base is.</summary>
     private static readonly Dictionary<string, (double Prefill, double Decode)> RefillTolerance = new()
     {
-        ["gptoss"] = (0.056, 0.032),     // 256-row chunks: 3.7e-2 / 1.1e-2..2.1e-2
+        ["gptoss"] = (0.056, 0.032),     // calibrated on the legacy model's 256-row chunks (3.7e-2 / 1.1e-2..2.1e-2); the runtime's 512-row ring steps pass
         ["qwen35moe"] = (0, 0),
         ["qwen35"] = (0, 0),
         ["nemotron_h"] = (0, 0),
@@ -424,8 +428,8 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     [InlineData("nemotron_h_moe_mx")]
     public void ForwardRefill_TracksSinglePass(string family)
     {
-        // ForwardRefill is what the server runs to (re)build a sequence's cache: gpt-oss splits
-        // it into 256-row chunks (TS_GPTOSS_PREFILL_CHUNK), Nemotron feeds the last prompt token
+        // ForwardRefill is what the server runs to (re)build a sequence's cache: gpt-oss's rings
+        // split it into steps of at most 512 rows, Nemotron feeds the last prompt token
         // through the decode path. 600 tokens cross 256, 512 and both sliding windows; the decode
         // rows after it read the state it left.
         string path = WriteModel(family);
@@ -498,71 +502,16 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     // ---- 5. snapshot restore ---------------------------------------------------------------
 
-    // Qwen 3.5 and Nemotron-H run on the shared decoder runtime, which keeps a recurrent model's state in per-request
-    // slots and prefix checkpoints (Qwen35RuntimeTests / NemotronRuntimeTests.CheckpointsContinueExactly) rather than in
-    // extracted blocks.
-    [CudaTheory]
-    [InlineData("gptoss", "cuda")]
-    [InlineData("gptoss", "cpu")]
-    public void SnapshotRestore_ReproducesTheStraightRun(string family, string backend)
-    {
-        // The prefix block (K/V rows and, for the hybrids, the Mamba2/GDN state as of its end)
-        // is extracted after a prefill and injected into an empty cache: the next forwards then
-        // attend over and continue from exactly the same bytes, so the rows must be
-        // bit-identical. Gemma-4 restores a pooled snapshot only within one sliding window
-        // (MaxReusablePrefixTokens), so its prefix is 24 rows. The managed cpu rows are the
-        // control. On direct CUDA this was D1: the inject writes the host mirror of the caches,
-        // and the next forward's K/V append treated the cache as write-only, so the injected
-        // rows never reached the device and attention ran over a zero prefix.
-        string path = WriteModel(family);
-        int prefixLength = 48;
-        int[] prompt = Prompt(prefixLength + 16);
-        int[] forced = Forced(4);
-        using var model = Load(path, backend == "cpu" ? BackendType.Cpu : BackendType.Cuda);
-        // Warm-up: a model's first decode step runs per-op and later ones replay the captured
-        // decode graph, which rounds differently (1.3e-7 on the dense Qwen3.5 file); without it
-        // the straight run's first decode row would be per-op and the restored run's a replay.
-        Trajectory(model, prompt, forced);
-        SnapshotResult result = SnapshotRestore(model, prompt[..prefixLength], prompt[prefixLength..], forced);
-        Assert.True(result != null, $"{family} on {backend}: the model refused to snapshot a {prefixLength}-token prefix");
-        var rel = result.Restored.Select((row, i) => RelL2(row, result.Straight[i])).ToList();
-        Report($"{family} restored vs straight ({result.BlockBytes} B block)", rel);
-        AssertRows($"{family} on {backend}, after restoring the snapshot", result.Restored, result.Straight, _ => 0);
-    }
-
-    [CudaTheory]
-    [InlineData("gptoss", "cuda")]
-    public void SnapshotBlock_RoundTripsThroughInject(string family, string backend)
-    {
-        // Narrows D1: a block injected into an empty cache and extracted again comes back byte
-        // for byte on direct CUDA too, so what the cache STORES is right and D1 lives in what the
-        // continuation reads after an inject (the device copies / host mirror the next forward
-        // attends over), not in the block format or the copy into the cache.
-        string path = WriteModel(family);
-        int prefixLength = 48;
-        using var model = Load(path, backend == "cpu" ? BackendType.Cpu : BackendType.Cuda);
-        model.ResetKVCache();
-        model.ForwardPrompt(Prompt(prefixLength));
-        Assert.True(model.SupportsKVStateSnapshot, $"{family} on {backend} does not snapshot");
-        long size = model.ComputeKVBlockByteSize(prefixLength);
-        var block = new byte[size];
-        Assert.True(model.TryExtractKVBlock(0, prefixLength, block));
-        Assert.Contains(block, b => b != 0);
-        model.ResetKVCache();
-        Assert.True(model.TryInjectKVBlock(0, prefixLength, block));
-        var again = new byte[size];
-        Assert.True(model.TryExtractKVBlock(0, prefixLength, again));
-        int differing = block.Zip(again, (a, b) => a != b).Count(d => d);
-        _output.WriteLine($"{family} on {backend}: {size} B block, {differing} bytes differ after inject + extract");
-        Assert.Equal(0, differing);
-    }
+    // Qwen 3.5, Nemotron-H and GPT-OSS run on the shared decoder runtime, which keeps a recurrent model's state and a
+    // sliding-window layer's ring in per-request slots and prefix checkpoints (Qwen35RuntimeTests / NemotronRuntimeTests /
+    // GptOssRuntimeTests.CheckpointsContinueExactly) rather than in extracted blocks: no family here snapshots blocks.
 
     // ---- 5b. host reads of the K/V cache ----------------------------------------------------
 
     /// <summary>Families whose direct-CUDA decode attention runs on the host over the K/V cache
     /// (AttentionDecodePureCS and its relatives: Nemotron-H, Mistral 3, Hunyuan dense,
-    /// Muse-Glimmer), and gpt-oss, whose prefix-cache block capture (TryExtractKVBlock) reads the
-    /// cache on the host.</summary>
+    /// Muse-Glimmer), and gpt-oss, which the legacy model's prefix-cache block capture (TryExtractKVBlock) read on the host;
+    /// on the shared runtime its rings take no block capture, and its decode steps are checked.</summary>
     private static readonly Dictionary<string, Func<string, string>> HostReadFiles = new()
     {
         ["gptoss"] = p => GptOssSyntheticModelBuilder.SensitiveSinks().Write(p),
@@ -664,6 +613,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     /// <summary>Verify row vs the same token decoded alone (0 = bit-identical, as the base is).</summary>
     private static readonly Dictionary<string, double> VerifyTolerance = new()
     {
+        ["gptoss"] = 0,                  // bit-identical: a verify row runs a decode row's kernels (A40)
         ["qwen35moe"] = 0.010,          // measured 4.5e-3..6.7e-3
         ["qwen35"] = 0.0037,            // 1.9e-3..2.4e-3 (BF16 GEMM rows vs BF16 matvec rows)
         ["nemotron_h"] = 1e-6,          // 7e-8..9.5e-8: the same arithmetic per row
@@ -695,6 +645,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     private const double ExpertSwapBound = 0.06;
 
     [CudaTheory]
+    [InlineData("gptoss")]
     [InlineData("qwen35moe")]
     [InlineData("qwen35")]
     [InlineData("nemotron_h")]
@@ -728,23 +679,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         foreach (int i in swapped)
             _output.WriteLine($"{family} verify row {i}: {rel[i]:E3}, at a router near-tie (margin {margins[i]:E3}); bound {ExpertSwapBound:E2}");
         AssertRows($"{family} verify", result.Window, result.Sequential, i => swapped.Contains(i) ? ExpertSwapBound : tolerance);
-    }
-
-    [CudaFact]
-    public void GptOss_LastRowOf16TokenForward_MatchesSequentialDecode()
-    {
-        // gpt-oss has no speculative path, so this is not a verify window: after a 48-token
-        // prefill, the logits row a 16-token Forward returns (prefill-shaped attention over the
-        // sliding window and the sinks) against the 16 tokens decoded one at a time. The base is
-        // bit-identical, which makes this the most sensitive gpt-oss attention check (the P0
-        // review's off-by-one window and dropped-sink mutations both failed it).
-        string path = WriteModel("gptoss");
-        int[] prompt = Prompt(64);
-        using var cuda = Load(path, BackendType.Cuda);
-        VerifyResult result = VerifyWindow(cuda, prompt[..48], prompt[48..64]);
-        Assert.False(result.AllRows);
-        _output.WriteLine($"gptoss last row of a 16-token forward vs decode: {RelL2(result.Window[0], result.Sequential[0]):E3}");
-        AssertRows("gptoss 16-token forward", result.Window, result.Sequential, _ => 0);
     }
 
     // ---- 7. continuous batching: concurrent against solo -----------------------------------

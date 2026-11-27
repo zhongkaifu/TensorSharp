@@ -347,9 +347,8 @@ Notes:
   needed beside it. Qwen3.6, Qwen3.8-27B, GLM 5.2 and GLM-5.3 embed theirs in the
   trunk, so `"spec": true` is all they need. `"spec-type"`, `"spec-draft"` and
   `"spec-pmin"` only tune speculation and never turn it on. `"spec-type": "ngram"` needs no drafter at
-  all, but it still needs a model that can act as a speculative target: it does
-  not run on `gpt-oss-20b.json` (GPT-OSS is not one), and the diffusion, image,
-  video and embedding configs do not decode token by token at all.
+  all, but it still needs a model that can act as a speculative target; the
+  diffusion, image, video and embedding configs do not decode token by token at all.
 - **The three `gemma-4-*.json` files speculate by default, on both hosts.**
   Naming their MTP `"draft-model"` turns speculation on, with no `"spec"` key
   beside it. Pass `--no-spec` (or add `"no-spec": true`) to decode without it;

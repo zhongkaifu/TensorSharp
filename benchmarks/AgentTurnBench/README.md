@@ -227,7 +227,7 @@ three forwards of ~1,006 tokens.
 | Gemma 4 E2B Q8_0 | 4,207 in 5; 3,031 in 3 | 3,200-3,600 | 81 | n-gram 81.5 → 80.9 on prose (24% acceptance): break-even |
 | Gemma 4 E4B Q8_0 + draft head | 3,019 in 3 | 1,500-1,900 | 46 | draft head 46 → 92 (2.0x); n-gram 63 |
 | Qwen 3.5-9B Q8_0 | 4,166 in 5; 3,020 in 3 | 1,000-1,200 | 31 | n-gram 31 → 86 (2.8x) quoting a file; JSON-mode valid both ways |
-| gpt-oss-20b Q8_0 | 4,167 in 5; 3,069 in 3 | 1,460-1,760 | 81 | no speculative trunk (harmony model decodes plainly) |
+| gpt-oss-20b Q8_0 | 4,167 in 5; 3,069 in 3 | 1,460-1,760 | 81 | no speculative trunk on the legacy model measured here (GPT-OSS speculates on the shared decoder runtime since 2026-11) |
 
 The `tool` turn 2 rows are the agent's every tool round: the previous turn's
 tokens come back from the cache (822 / 790 / 768 reused) and only the result is

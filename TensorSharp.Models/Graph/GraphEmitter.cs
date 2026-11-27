@@ -317,6 +317,9 @@ namespace TensorSharp.Models.Graph
         /// (<see cref="GraphProgramBuilder.MarkQ8Nvfp4Activations"/>). Call it before the first entry.</summary>
         public void MarkQ8Nvfp4Activations() => _b.MarkQ8Nvfp4Activations();
 
+        /// <summary>The program carries <see cref="GraphProgram.BackendFusions"/>; before the first entry.</summary>
+        public void MarkBackendFusions() => _b.MarkBackendFusions();
+
         /// <summary>The recorded program (see <see cref="GraphProgramBuilder.ToProgram"/>).</summary>
         public GraphProgram ToProgram(bool replayable, bool reorder = false, int[] tensorParallelRanks = null)
         {

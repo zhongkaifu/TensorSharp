@@ -10,6 +10,11 @@ long chat history actually arrives at. **Peak VRAM** is the per-process figure i
 MiB (lower is better); **pp4096** / **pp8192** are prefill and **tg128** decode
 throughput in tokens/second (higher is better).
 
+> **GPT-OSS figures are historical.** They were measured on the legacy GPT-OSS model and its
+> whole-model prefill graph (`TSGgml_GptOssModelPrefill`, `ggml_ops_gptoss_prefill.cpp`), both
+> removed when GPT-OSS moved to the shared decoder runtime. Current GPT-OSS offload behavior and
+> measurements are in [the GPT OSS card, §10](models/gptoss.md#10-expert-offload---n-cpu-moe----cpu-moe).
+
 ## Headline
 
 Offload trades VRAM for throughput, and on long prompts TensorSharp trades it far
@@ -237,6 +242,8 @@ the benchmark moved to 8,192-token prompts.
 
 ### 1. GPT-OSS had no whole-model prefill graph
 
+(The graph this section adds was removed with the legacy model; see the note at the top.)
+
 GPT-OSS was the one MoE architecture still prefilling **layer by layer**, and per
 layer that cost:
 
@@ -272,7 +279,8 @@ position `p` reads keys `[p-127, p]`, so the graph views only
 `[start_pos-127, totalSeqLen)` for those layers.
 
 With the O(seqLen²) score tensor gone, the prefill chunk is no longer capped at
-256 tokens — it is sized for GEMM efficiency instead (2048, `TS_GPTOSS_PREFILL_CHUNK`).
+256 tokens — it is sized for GEMM efficiency instead (2048, `TS_GPTOSS_PREFILL_CHUNK`; that switch
+is now refused at startup, and GPT-OSS prompt steps follow `TS_PREFILL_CHUNK`).
 
 ### 2. GPT-OSS held every expert byte in VRAM twice
 

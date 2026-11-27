@@ -176,16 +176,6 @@
     <ReferenceNativeSymbol Include="TSGgml_GlmTakeReclaimedSlots" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmVisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmVocabSize" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssAttentionLayerPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssInvalidateKvCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssModelDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssModelDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssModelDecodeTP" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssModelPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssModelPrefillTP" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssResetBatchedDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssResetDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphAlias" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCensus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCreate" SymbolType="Function" />
@@ -218,6 +208,8 @@
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoUnregister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRowsAct" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertRowsOai" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphBackendFusions" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRowsReluSquared" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadRows" SymbolType="Function" />
@@ -321,7 +313,6 @@
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForward" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardDevice" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardDeviceWithSinks" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardWithSinks" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PrefaultHostSpans" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PreloadQuantizedWeight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen21VisionEncoderF32" SymbolType="Function" />

@@ -134,6 +134,7 @@ namespace
         OP_LOG = 72,            // ggml_log
         OP_CUMSUM = 73,         // ggml_cumsum: the running sum along ne0
         OP_SSM_SCAN = 74,       // srcs: s, x, dt, A, B, C, ids; ip: K states kept (ggml_ssm_scan, Mamba-2)
+        OP_SWIGLU_OAI = 75,     // srcs: gate, up; fp: alpha, limit (ggml_swiglu_oai, GPT-OSS)
     };
 
     struct Leaf
@@ -463,6 +464,7 @@ namespace
         bool built = false;
         bool replayable = false;   // owns its allocator (else it may run once)
         bool reorder = false;      // let the backend reorder for concurrency (Metal), opted in per family
+        bool backend_fusions = false;   // ggml-cuda's fusion allocation dependencies (GraphProgram.BackendFusions)
         int runs = 0;
         std::vector<ggml_tensor*> nodes;
         std::vector<Leaf> leaves;
@@ -662,7 +664,7 @@ namespace
     /// Routed experts from host memory (tsg::HostMoeSegment): the graph pauses after the router's outputs, the
     /// host computes the experts into moe_out, and an accelerator tier registered for the gate stack
     /// (ggml_ops_moe_hot_tier.cpp) runs the routes it holds in the next segment.
-    ggml_tensor* build_host_experts(TsgGraph* g, const int* s, int ns, const std::int64_t* ip, int nip)
+    ggml_tensor* build_host_experts(TsgGraph* g, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
         if (ns < 6) throw std::runtime_error("graph builder: host experts take x, ids, weights and three expert stacks");
         if (g->tp != nullptr) throw std::runtime_error("graph builder: host experts under tensor parallelism are not supported");
@@ -677,18 +679,23 @@ namespace
         const std::int64_t n = x->ne[0], T = ggml_nelements(x) / n, n_used = ids->ne[0];
         const ggml_tensor* gate = parts[0]->tensor;
         // ip[1]: the activation (0 silu(gate) * up, 2 gelu(gate) * up: Gemma 4; 3 relu(up)^2 over one projection: Nemotron-H,
-        // srcs[3] and srcs[4] both name the up stack); ip[2] = 1: srcs[3] is one fused [gate | up] stack (gate the first half
-        // of each expert's rows) and srcs[4] names it again; ip[3] = 1 (activation 3): srcs[6] is each route's scale of its up
-        // product, applied before the square ([1, n_used, T]), and the read-ahead's sources follow it.
+        // srcs[3] and srcs[4] both name the up stack; 1 GPT-OSS's clamped SwiGLU, ggml_swiglu_oai at fp alpha and limit);
+        // ip[2] = 1: srcs[3] is one fused [gate | up] stack (gate the first half of each expert's rows) and srcs[4] names it
+        // again; ip[3] = 1 (activation 3): srcs[6] is each route's scale of its up product, applied before the square
+        // ([1, n_used, T]); ip[4] = 1: srcs[6..8] are the experts' gate, up and down biases (F32 weight leaves [n_ff, E],
+        // [n_ff, E], [n, E]; GPT-OSS). The read-ahead's sources follow them.
         const int activation = nip > 1 ? static_cast<int>(ip[1]) : 0;
         const bool fused_gate_up = nip > 2 && ip[2] != 0;
         const bool one_projection = activation == 3;
         const bool route_up_scales = one_projection && nip > 3 && ip[3] != 0;
-        if (activation != 0 && activation != 2 && activation != 3)
-            throw std::runtime_error("graph builder: host experts take activation 0 (SwiGLU), 2 (GeGLU) or 3 (relu(up)^2)");
+        const bool expert_biases = nip > 4 && ip[4] != 0;
+        if (activation != 0 && activation != 1 && activation != 2 && activation != 3)
+            throw std::runtime_error("graph builder: host experts take activation 0 (SwiGLU), 1 (clamped SwiGLU), 2 (GeGLU) or 3 (relu(up)^2)");
         if (one_projection && fused_gate_up) throw std::runtime_error("graph builder: relu(up)^2 host experts have no fused gate|up stack");
         if (route_up_scales && ns < 7) throw std::runtime_error("graph builder: host experts' up scales are srcs[6]");
-        const int ahead_at = route_up_scales ? 7 : 6;
+        if (expert_biases && (route_up_scales || fused_gate_up || ns < 9))
+            throw std::runtime_error("graph builder: host experts' biases are srcs[6..8], beside separate gate and up stacks");
+        const int ahead_at = route_up_scales ? 7 : expert_biases ? 9 : 6;
         const std::int64_t n_ff = fused_gate_up ? gate->ne[1] / 2 : gate->ne[1], experts = gate->ne[2];
         auto boundary = [&](ggml_tensor* t) {
             if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
@@ -770,7 +777,26 @@ namespace
             hm.up_ne0 = n; hm.up_ne1 = n_ff;
         }
         hm.down_ne0 = n_ff; hm.down_ne1 = n;
-        hm.activation = activation;   // 0: silu(gate) * up; 2: gelu(gate) * up; 3: relu(up)^2
+        if (expert_biases)
+        {
+            // The biases from their leaves' host bytes (the host adds them; no device copy is needed).
+            const std::int64_t rows[3] = { n_ff, n_ff, n };
+            const float** bias[3] = { &hm.gate_bias, &hm.up_bias, &hm.down_bias };
+            for (int i = 0; i < 3; i++)
+            {
+                Leaf* leaf = leaf_of(g, node_at(g, s[6 + i]));
+                if (leaf == nullptr || leaf->data == nullptr || leaf->role != LEAF_WEIGHT || leaf->tensor->type != GGML_TYPE_F32
+                    || leaf->tensor->ne[0] != rows[i] || leaf->tensor->ne[1] != gate->ne[2] || !ggml_is_contiguous(leaf->tensor))
+                    throw std::runtime_error("graph builder: host experts' biases are F32 weight leaves [rows, experts] with host data");
+                *bias[i] = static_cast<const float*>(leaf->data);
+            }
+        }
+        hm.activation = activation;   // 0: silu(gate) * up; 1: ggml_swiglu_oai; 2: gelu(gate) * up; 3: relu(up)^2
+        if (activation == 1)
+        {
+            hm.oai_alpha = fp != nullptr && nfp > 0 ? fp[0] : 1.702f;
+            hm.oai_limit = fp != nullptr && nfp > 1 ? fp[1] : 7.0f;
+        }
         hm.num_experts = static_cast<int>(experts);
         hm.n_used = static_cast<int>(n_used);
         hm.n_ff = static_cast<int>(n_ff);
@@ -782,8 +808,9 @@ namespace
         // overlap; the wait segment follows this pause, ending at the first group so it precedes the cut).
         tsg::HostMoeSegment overlap_wait;
         constexpr int overlap_routes = 2;
-        // An accelerator tier's part runs gated products (host_moe_build_hot_part): the one-projection experts have none.
-        if (tsg::MoeHotTier* tier = one_projection ? nullptr : tsg::moe_hot_tier_find(hm.gate_data))
+        // An accelerator tier's part runs gated products (host_moe_build_hot_part): the one-projection experts have none, and
+        // it has neither the experts' biases nor the clamped SwiGLU (the host computes every route of such a layer).
+        if (tsg::MoeHotTier* tier = one_projection || expert_biases || activation == 1 ? nullptr : tsg::moe_hot_tier_find(hm.gate_data))
             if (T <= tsg::host_moe_tier_max_rows(*tier) && tier->num_experts == hm.num_experts && tier->count >= hm.n_used
                 && tier->type[0] == hm.gate_type && tier->type[1] == hm.up_type && tier->type[2] == hm.down_type)
                 hot = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, ggml_mul_mat_id,
@@ -1117,7 +1144,7 @@ namespace
             return ggml_rope_ext(ctx, src(0), src(1), src(2),
                                  static_cast<int>(ipar(0, 0)), static_cast<int>(ipar(1, 0)), static_cast<int>(ipar(2, 0)),
                                  fpar(0, 10000.0f), fpar(1, 1.0f), fpar(2, 0.0f), fpar(3, 1.0f), fpar(4, 32.0f), fpar(5, 1.0f));
-        case OP_MOE_HOST: return build_host_experts(g, s, ns, ip, nip);
+        case OP_MOE_HOST: return build_host_experts(g, s, ns, ip, nip, fp, nfp);
         case OP_ALLREDUCE:
         {
             // The node is its (contiguous F32) partial: the reduction happens between graph segments, in place.
@@ -1250,6 +1277,7 @@ namespace
         case OP_GELU_ERF: need(1); return ggml_gelu_erf(ctx, src(0));
         case OP_LOG: need(1); return ggml_log(ctx, src(0));
         case OP_CUMSUM: need(1); return ggml_cumsum(ctx, src(0));
+        case OP_SWIGLU_OAI: need(2); return ggml_swiglu_oai(ctx, src(0), src(1), fpar(0, 1.702f), fpar(1, 7.0f));
         case OP_SSM_SCAN:
         {
             // ggml_ssm_scan reads x, B and C with contiguous rows and s, dt and A whole: an operand laid out otherwise is
@@ -2607,6 +2635,13 @@ namespace
         // Before allocation: reordering after lifetime planning would invalidate the alias plan (and a
         // reorder would move nodes across a pause).
         if (g->reorder && g->host_moe.empty()) optimize_graph_for_metal(g->ctx, g->graph);
+        // ggml-cuda's fusions (the routed experts' weighted sum, its top-k MoE and GLU products) on a family's request
+        // (GraphProgram.BackendFusions): the backend's optimizer hook asks for the allocation dependencies that keep a fused
+        // kernel's inputs apart from its output; without them a prompt step's allocator reused the route weights' memory for
+        // the sum and the fusion declined (its memory-range check). It reorders nothing unless GGML_CUDA_GRAPH_OPT=1.
+        else if (g->backend_fusions && g_backend_type == BACKEND_TYPE_CUDA && g->tp == nullptr && g->host_moe.empty()
+                 && graph_backend(g) != nullptr)
+            tsg_optimize_graph_with_alloc_dependencies(graph_backend(g), g->ctx, g->graph);
         // Otherwise ggml-metal still fuses the graph's chains when it encodes them, and runs independent neighbours
         // concurrently: without the fusions' allocation dependencies the allocator hands a fused kernel's input to a
         // concurrent node (Qwen3.6-35B-A3B decoded two different texts in alternate runs on an M5 Pro).
@@ -3051,6 +3086,20 @@ TSG_EXPORT int TSGgml_FlashAttnSupported(std::int64_t head_dim, std::int64_t q_r
     const int supported = ggml_backend_supports_op(g_backend, fa) ? 1 : 0;
     ggml_free(ctx);
     return supported;
+}
+
+// The backend's fusions get their allocation dependencies (GraphProgram.BackendFusions), set before the graph's first node:
+// build() runs ggml-cuda's graph optimizer hook before allocating.
+TSG_EXPORT int TSGgml_GraphBackendFusions(void* handle, int on)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    if (g == nullptr || g->built || !g->nodes.empty())
+    {
+        set_last_error("graph builder: BackendFusions is set on a graph before its first node.");
+        return 0;
+    }
+    g->backend_fusions = on != 0;
+    return 1;
 }
 
 // The program's NVFP4 products quantize their activations to 8 bits (GraphProgram.Q8Nvfp4Activations), set before its first

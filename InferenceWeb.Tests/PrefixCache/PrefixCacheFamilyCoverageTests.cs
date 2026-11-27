@@ -30,7 +30,7 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(DeepSeek4Model))]
     [InlineData(typeof(Gemma4RuntimeModel))]
     [InlineData(typeof(GlmDsaModel))]
-    [InlineData(typeof(GptOssModel))]
+    [InlineData(typeof(GptOssRuntimeModel))]
     [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(Mistral3Model))]
     public void EveryEngineServedFamily_EnablesTreeWithoutAdvertisingUnavailableEndStates(Type family)
@@ -76,7 +76,7 @@ public sealed class PrefixCacheFamilyCoverageTests
             Assert.True(typeof(IPrefixCacheModelDiagnostics).IsAssignableFrom(family), $"{family.Name} does not implement IPrefixCacheModelDiagnostics");
         }
         Assert.Equal(
-            new[] { "DeepSeek41Model", "DeepSeek4Model", "DiffusionGemmaModel", "Gemma4RuntimeModel", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
+            new[] { "DeepSeek41Model", "DeepSeek4Model", "DiffusionGemmaModel", "Gemma4RuntimeModel", "GlmDsaModel", "GptOssRuntimeModel", "HunyuanDenseModel",
                     "Inkling2RuntimeModel", "Lfm3RuntimeModel", "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerRuntimeModel",
                     "MuseSparkModel", "NemotronRuntimeModel", "Qwen35RuntimeModel", "Qwen3VLModel", "Qwen4ExpRuntimeModel", "RaonRuntimeModel" },
             engineServed.Select(t => t.Name).ToArray());
@@ -85,7 +85,7 @@ public sealed class PrefixCacheFamilyCoverageTests
     [Theory]
     [InlineData(typeof(Gemma4RuntimeModel))]
     [InlineData(typeof(DeepSeek4Model))]
-    [InlineData(typeof(GptOssModel))]
+    [InlineData(typeof(GptOssRuntimeModel))]
     [InlineData(typeof(Mistral3Model))]
     [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(Qwen35RuntimeModel))]

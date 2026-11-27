@@ -70,7 +70,7 @@ namespace TensorSharp.Cuda
         /// layer's host experts: the plan cannot run out of slots), or a layout the grouped kernels do not take.
         /// </summary>
         private bool TryDeviceStagedExperts(Tensor x, Value selected, Value weightValue, IGraphHostedExperts gate, IGraphExpertWeights up,
-            IGraphExpertWeights down, int layer, int rows, int k, out Tensor result)
+            IGraphExpertWeights down, int layer, int rows, int k, CudaOaiExperts oai, out Tensor result)
         {
             result = null;
             var cuda = (CudaAllocator)Allocator;
@@ -84,7 +84,7 @@ namespace TensorSharp.Cuda
                 return false;
             int hidden = (int)gate.Ne0, ff = (int)gate.Ne1, experts = (int)gate.Ne2;
             HostedTables t = Tables(gate, up, down, layer);
-            if (t.Sets == null || t.ExpertBytes == null || t.IsHost == null || !GroupedTakes(t.Sets, rows, hidden, ff))
+            if (t.Sets == null || t.ExpertBytes == null || t.IsHost == null || !GroupedTakes(t.Sets, rows, hidden, ff, warp: oai != null))
                 return false;
             int host = MappedHostExperts(t);
             if (host < 0)
@@ -133,7 +133,7 @@ namespace TensorSharp.Cuda
             Tensor[] tables = { t.Gate, t.Up, t.Down };
             if (halves)
                 HalvesTaken();
-            bool ran = TryGroupedMoe(x2, output, sel, w, t.Sets, tables, rows, k, hidden, ff, experts, stage, stageLayer);
+            bool ran = TryGroupedMoe(x2, output, sel, w, t.Sets, tables, rows, k, hidden, ff, experts, stage, stageLayer, oai);
             if (halves)
                 HalvesReleased();
             if (!ran)

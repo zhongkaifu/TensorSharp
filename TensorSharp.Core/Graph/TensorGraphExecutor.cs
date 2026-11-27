@@ -108,6 +108,8 @@ namespace TensorSharp.Graph
             GraphOp.Geglu, GraphOp.GegluSplit,
             // Nemotron-H's Mamba-2 layers (ggml_ssm_scan).
             GraphOp.SsmScan,
+            // GPT-OSS's routed experts: their biases by route (ggml_add_id) and the clamped SwiGLU (ggml_swiglu_oai).
+            GraphOp.AddId, GraphOp.SwigluOai,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -306,12 +308,16 @@ namespace TensorSharp.Graph
                 Tensor sink = Contig(F32(sinks, owned), owned);
                 if (sink.ElementCount() != heads)
                     throw new NotSupportedException($"attention sinks of {sink.ElementCount()} values for {heads} heads");
-                Tensor kh = group == 1 ? k : RepeatHeads(k, group, owned);
-                Tensor vh = group == 1 ? v : RepeatHeads(v, group, owned);
-                using Tensor kt = kh.Transpose(1, 2);
+                if (heads % kvHeads != 0) throw new NotSupportedException($"{heads} query heads over {kvHeads} KV heads");
+                // The query heads of a group share their KV head: q [heads, nq, d] is [kvHeads, group * nq, d], so each product is
+                // one batch per KV head, with no copies of the keys and values per query head (8 of every cache window a step at
+                // GPT-OSS's group of 8).
+                using Tensor kt = k.Transpose(1, 2);
                 var scores = new Tensor(Allocator, DType.Float32, heads, nq, nkv);
                 owned.Add(scores);
-                Ops.AddmmBatch(scores, 0, scores, scale, q, kt);
+                using (Tensor qg = q.View(kvHeads, group * nq, q.Sizes[2]))
+                using (Tensor sg = scores.View(kvHeads, group * nq, nkv))
+                    Ops.AddmmBatch(sg, 0, sg, scale, qg, kt);
                 if (!(mask.Pattern == MaskPattern.None && mask.Floor == 0) && mask.Tensor is { } m)
                     AddAttentionMask(scores, Contig(F32(m, owned), owned));
                 // [scores | sink] per row, its softmax, the scores' columns back.
@@ -328,7 +334,9 @@ namespace TensorSharp.Graph
                     Ops.Copy(scores, head);
                 var result = new Tensor(Allocator, DType.Float32, heads, nq, dv);
                 owned.Add(result);
-                Ops.AddmmBatch(result, 0, result, 1.0f, scores, vh);
+                using (Tensor pg = scores.View(kvHeads, group * nq, nkv))
+                using (Tensor rg = result.View(kvHeads, group * nq, dv))
+                    Ops.AddmmBatch(rg, 0, rg, 1.0f, pg, v);
                 using Tensor p = result.Permute(1, 0, 2);
                 return Ops.NewContiguous(p);
             }
@@ -2163,6 +2171,8 @@ namespace TensorSharp.Graph
                     using Tensor up = x.Narrow(last, half, half);
                     return V(Ops.SiLUMul(null, In(gate, run), In(up, run)));
                 }
+                case GraphOp.SwigluOai: return V(SwigluOai(In(T(0), run), In(T(1), run), Fp(0, 1.702f), Fp(1, 7f), run));
+                case GraphOp.AddId: return V(AddId(T(0), T(1), values[n.Srcs[2]], run));
                 case GraphOp.GegluSplit: return V(Ops.GELUMul(null, In(T(0), run), In(T(1), run)));
                 case GraphOp.Geglu:
                 {
@@ -2197,7 +2207,8 @@ namespace TensorSharp.Graph
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
                 case GraphOp.MoeHostExperts: return V(HostExperts(T(0), values[n.Srcs[1]], values[n.Srcs[2]], values[n.Srcs[3]],
                     values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run, (int)Ip(1, 0), Ip(2, 0) != 0,
-                    Ip(3, 0) != 0 ? values[n.Srcs[6]] : default));
+                    Ip(3, 0) != 0 ? values[n.Srcs[6]] : default,
+                    Ip(4, 0) != 0 ? new ExpertBiases(T(6), T(7), T(8), Fp(0, 1.702f), Fp(1, 7f)) : null));
                 case GraphOp.Reshape:
                 {
                     // A relaid row block (a packed product's column block, rows a pitch apart) reshaped within its rows stays
@@ -2777,9 +2788,16 @@ namespace TensorSharp.Graph
         /// <summary>The widest step the route-tail skip applies to: a decode step or a verify window (GGML's tiers' bound).</summary>
         protected const int TailSkipMaxRows = 8;
 
+        /// <summary>GPT-OSS's experts (<see cref="GraphOp.MoeHostExperts"/> at activation 1 with Ip[4] set): the gate, up and down
+        /// stacks' per-expert biases (F32 sizes [experts, n_ff], [experts, n_ff], [experts, hidden]) and the clamped SwiGLU's
+        /// alpha and limit (<see cref="GraphOp.SwigluOai"/>).</summary>
+        protected sealed record ExpertBiases(Tensor Gate, Tensor Up, Tensor Down, float Alpha, float Limit);
+
         protected virtual Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
-            int layer, RunState run, int activation = 0, bool fusedGateUp = false, Value upScales = default)
+            int layer, RunState run, int activation = 0, bool fusedGateUp = false, Value upScales = default, ExpertBiases biases = null)
         {
+            if ((activation == 1) != (biases != null))
+                throw new NotSupportedException("host experts take the clamped SwiGLU (activation 1) with the experts' biases only");
             if (gateValue.Weight is not IGraphHostedExperts gate || upValue.Weight is not IGraphExpertWeights up
                 || downValue.Weight is not IGraphExpertWeights down)
                 throw new NotSupportedException("host experts need the model's expert host on their stacks");
@@ -2823,7 +2841,7 @@ namespace TensorSharp.Graph
             for (int i = 0; i < routes; i++) anyHost |= skip[i] == 0 && ids[i] >= 0;
 
             // The returned tensor is the caller's to keep (V keeps it); the pieces summed into it are this run's.
-            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run, activation, fusedGateUp, scales) : null;
+            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run, activation, fusedGateUp, scales, biases) : null;
             if (!anyHost)
             {
                 if (device != null) return device;
@@ -2834,6 +2852,7 @@ namespace TensorSharp.Graph
             float[] xs = xc.GetElementsAsFloat(rows * hidden);
             var output = new float[(long)rows * hidden];
             if (activation == 3 ? !host.ComputeReluSquared(layer, xs, ids, weights, scales, skip, rows, output)
+                : activation == 1 ? !host.ComputeOai(layer, xs, ids, weights, skip, rows, output, biases.Alpha, biases.Limit)
                 : !host.Compute(layer, xs, ids, weights, skip, rows, output))
                 throw new NotSupportedException($"layer {layer}: the host's expert kernels do not cover these experts");
             var fromHost = new Tensor(Allocator, DType.Float32, rows, hidden);
@@ -2847,8 +2866,15 @@ namespace TensorSharp.Graph
         /// weighted, then every row's routes summed (a host route reads a zero row).</summary>
         private Tensor DeviceExperts(Tensor x, int[] ids, float[] weights, byte[] onDevice, int k, IGraphExpertWeights gate,
             IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run,
-            int activation = 0, bool fusedGateUp = false, float[] upScales = null)
+            int activation = 0, bool fusedGateUp = false, float[] upScales = null, ExpertBiases biases = null)
         {
+            // Expert e's bias row of a stack's biases ([experts, width]) added to its rows' products [n, width].
+            Tensor Biased(Tensor product, Tensor table, int e)
+            {
+                if (table == null) return product;
+                Tensor row = run.Keep(table.Narrow(0, e, 1));
+                return run.Keep(Binary(product, row, run, (r, a, b) => Ops.Add(r, a, b), GraphOp.Add));
+            }
             int rows = (int)x.Sizes[0], hidden = (int)x.Sizes[1], routes = ids.Length;
             var byExpert = new List<int>[gate.Ne2];
             for (int i = 0; i < routes; i++)
@@ -2889,11 +2915,12 @@ namespace TensorSharp.Graph
                 }
                 else
                 {
-                    g = run.Keep(ExpertMatMul(gate, e, xs));
-                    u = run.Keep(ExpertMatMul(up, e, xs));
+                    g = Biased(run.Keep(ExpertMatMul(gate, e, xs)), biases?.Gate, e);
+                    u = Biased(run.Keep(ExpertMatMul(up, e, xs)), biases?.Up, e);
                 }
-                act ??= run.Keep(activation == 2 ? Ops.GELUMul(null, g, u) : Ops.SiLUMul(null, g, u));
-                Tensor d = run.Keep(ExpertMatMul(down, e, act));
+                act ??= run.Keep(activation == 1 ? SwigluOai(g, u, biases.Alpha, biases.Limit, run)
+                    : activation == 2 ? Ops.GELUMul(null, g, u) : Ops.SiLUMul(null, g, u));
+                Tensor d = Biased(run.Keep(ExpertMatMul(down, e, act)), biases?.Down, e);
                 var w = run.Keep(new Tensor(Allocator, DType.Float32, list.Count, 1));
                 w.SetElementsAsFloat(routeWeights);
                 pieces.Add(run.Keep(Binary(d, w, run, (r, a, b) => Ops.Mul(r, a, b), GraphOp.Mul)));
@@ -3064,6 +3091,45 @@ namespace TensorSharp.Graph
             Tensor idx = IntTensor(flat, new long[] { flat.Length }, run);
             using Tensor r = Ops.IndexSelect(null, s2, idx);
             return r.View(Sizes(stackalloc long[] { na[0], n, ni[1], ni[2] }));
+        }
+
+        /// <summary>
+        /// ggml_swiglu_oai (GPT-OSS's experts): with g = min(gate, limit) and u = clamp(up, -limit, limit), g * sigmoid(alpha g)
+        /// * (u + 1), elementwise over operands of one shape. Default: the backend's elementwise ops; an executor with a kernel
+        /// overrides it.
+        /// </summary>
+        protected virtual Tensor SwigluOai(Tensor gate, Tensor up, float alpha, float limit, RunState run)
+        {
+            if (!gate.Sizes.SequenceEqual(up.Sizes)) throw new NotSupportedException("swiglu_oai over operands of different shapes");
+            Tensor g = run.Keep(Ops.Clamp(null, gate, float.MinValue, limit));
+            Tensor u = run.Keep(Ops.Clamp(null, up, -limit, limit));
+            Ops.Add(u, u, 1f);
+            Tensor s = run.Keep(Ops.Mul(null, g, alpha));
+            Ops.Sigmoid(s, s);
+            Ops.Mul(s, s, g);
+            return Ops.Mul(null, s, u);
+        }
+
+        /// <summary>
+        /// ggml_add_id(a, b, ids): a [ne0, ne1, ne2] plus, at each (i1, i2), row ids[i1, i2] of b [ne0, rows] (an expert's bias
+        /// for each route of each row). Default: b's rows gathered by the ids (<see cref="GetRows"/>, on the device where the
+        /// executor gathers there), then the add.
+        /// </summary>
+        protected virtual Tensor AddId(Tensor a, Tensor b, Value ids, RunState run)
+        {
+            long[] na = Ne(a), nb = Ne(b);
+            long[] ni = ids.Tensor != null ? Ne(ids.Tensor) : null;
+            long routes = na[1] * na[2];
+            if (nb[0] != na[0] || nb[2] != 1 || nb[3] != 1 || na[3] != 1 || (ni != null && ni[0] * ni[1] * ni[2] * ni[3] != routes)
+                || (ids.Ints != null && ids.Ints.Length != routes))
+                throw new NotSupportedException($"add_id of [{string.Join(",", nb)}] rows over [{string.Join(",", na)}]");
+            // The ids as one batch of row indices (get_rows' batches must match the table's, which has one).
+            Value flat = ids.Ints != null
+                ? new Value { Ints = ids.Ints, Tensor = ids.Tensor != null ? run.Keep(Contig(ids.Tensor, run).View(routes)) : null }
+                : new Value { Tensor = run.Keep(Contig(ids.Tensor, run).View(routes)) };
+            Tensor rows = run.Keep(GetRows(b, flat, run));
+            Tensor gathered = run.Keep(rows.View(a.Sizes));
+            return Binary(a, gathered, run, (r, x, y) => Ops.Add(r, x, y), GraphOp.Add);
         }
 
         /// <summary>Each source copied into its slice of the result as it is: a strided view (a fused projection's column block)

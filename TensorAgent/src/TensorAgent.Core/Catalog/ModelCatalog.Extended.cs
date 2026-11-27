@@ -203,9 +203,11 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 24,
             ContextLength = 8192,
-            // 24 layers with eight KV heads of 64. Half are 128-token sliding layers, but the
-            // engine sizes every layer's cache to the whole context (GptOssModel.InitKVCache),
-            // so all count: 24 x 8 x 64 x 2 x 2 bytes = 48 KiB. Desktop window 32,768.
+            // 24 layers with eight KV heads of 64. Half are 128-token sliding layers, which the
+            // shared runtime keeps in 768-cell rings (window plus a 512-row step, 9.4 MB in all), so
+            // a token costs the 12 full layers' 24 KiB. The figure stays at every layer's
+            // 24 x 8 x 64 x 2 x 2 bytes = 48 KiB, the legacy engine's whole-context caches: a margin
+            // the desktop window (32,768) was sized with.
             KvBytesPerToken = 24 * 8 * 64 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,

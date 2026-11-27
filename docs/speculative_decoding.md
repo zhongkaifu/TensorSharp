@@ -79,8 +79,8 @@ Shipped implementations:
 | Name | Class | Weights | Notes |
 | --- | --- | --- | --- |
 | `draft-head` | `DraftHeadSpeculator` | required | One token per pass, chaining its own hidden output: NextN/MTP embedded in the trunk (Qwen 3.6, Qwen 3.8 27B, GLM 5.2, GLM-5.3), Gemma 4's separate assistant GGUF, and Qwen 3.8 Flash Next's shared MTP head (a separate GGUF on `--draft-model`). EAGLE-shaped heads fit here unchanged. |
-| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, MiniMax-M3.1 DSpark (a `dflash` GGUF with a Markov head that its native executor loads with the target on a layer split; [card](models/minimax-m3.md#dspark-speculative-decoding)), DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8), and Nemotron 3.5 Lightning's DFlash and DSpark drafters on Nemotron-H ([card](models/nemotron.md#block-drafters-dflash--dspark)). DeepSeek V4.1 DSpark is experimental: the loader accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu`; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified. |
-| `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Needs no weights, but only runs on a model that can speculate at all (see [Adding a new model](#adding-a-new-model)): not on GPT-OSS, Mistral 3 or Hunyuan Dense, on MiniMax-M3.1 only on a layer split (not under `--tp`), and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is loaded. |
+| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, MiniMax-M3.1 DSpark (a `dflash` GGUF with a Markov head that its native executor loads with the target on a layer split; [card](models/minimax-m3.md#dspark-speculative-decoding)), DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8), Nemotron 3.5 Lightning's DFlash and DSpark drafters on Nemotron-H ([card](models/nemotron.md#block-drafters-dflash--dspark)), and the gpt-oss-20b DFlash drafter on GPT-OSS ([card](models/gptoss.md#8-serving-mechanisms)). DeepSeek V4.1 DSpark is experimental: the loader accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu`; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified. |
+| `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Needs no weights, but only runs on a model that can speculate at all (see [Adding a new model](#adding-a-new-model)): not on Mistral 3 or Hunyuan Dense, on MiniMax-M3.1 only on a layer split (not under `--tp`), and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is loaded. |
 | `auto` | — | — | Default: use whatever drafter the checkpoint carries. A checkpoint without one declines, and the reason names `--spec-type ngram`. |
 
 ### Layer 3 — the weights (`IDraftHead`)
@@ -300,10 +300,11 @@ One caveat worth stating: some models' `SpecForward` is not drafter-independent
 — DeepSeek V4 / V4.1 share the fused verify kernel with their drafter
 and refuse to run without it. Those report `SpeculationProfitable` as false when
 no drafter is loaded, so weight-free speculation is declined rather than
-crashed. Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash, Qwen 3.8 Flash Next and Gemma 4 have
+crashed. Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash, Qwen 3.8 Flash Next, Gemma 4 and GPT-OSS have
 drafter-independent trunks and accept `--spec-type ngram` on any checkpoint,
 within each trunk's own backend gate: Gemma 4 on the ggml backends (`ggml_cpu`
-included) and on `cuda`, Qwen 3.8 Flash Next on every backend it loads on, and
+included) and on `cuda`, Qwen 3.8 Flash Next on every backend it loads on, GPT-OSS
+on every backend, and
 GLM-5.3-Flash where its recurrent-state rollback is available (for
 GLM-5.3-Flash it is the only drafter: its NextN block is not built, and its KDA
 recurrent state is snapshotted and restored the way Qwen's GDN state is - see
@@ -314,7 +315,7 @@ filled when a speculator asks for it. TensorAgent ships the assistant GGUF as an
 optional download, so this is what makes speculation reachable there at all.)
 
 Families that do not implement `ISpeculativeTarget` have no speculative trunk
-for any algorithm, n-gram included: GPT-OSS, Mistral 3 and Hunyuan Dense
+for any algorithm, n-gram included: Mistral 3 and Hunyuan Dense
 decode plainly whatever `--spec` or `--spec-type` says.
 
 A model can also refuse speculation outright. `ISpeculativeTarget.SpeculationRefusal`

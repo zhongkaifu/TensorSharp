@@ -36,8 +36,8 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>TRUE token-batched fused decode inside the per-sequence
         /// fused path: decode one token for each of N sequences in a single
-        /// fused graph (slot-stable arena KV + captured CUDA graph + on-device
-        /// greedy sampling — see ggml_ops_gptoss_batched.cpp). This is what
+        /// fused graph (the shared runtime's batched slot steps, and the bespoke
+        /// families' own batched graphs). This is what
         /// lifts concurrent decode from the round-robin ~1x ceiling to the
         /// vLLM-class batched rate, so it is ON by default; models that cannot
         /// batch a step decline per call and fall back per-sequence. Env:

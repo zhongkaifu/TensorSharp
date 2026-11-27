@@ -96,6 +96,15 @@ namespace TensorSharp.Graph
         bool ComputeReluSquared(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
             ReadOnlySpan<float> upScales, ReadOnlySpan<byte> skip, int rows, Span<float> output) => false;
 
+        /// <summary>
+        /// <see cref="Compute"/> for GPT-OSS's experts: (gate x + gate bias) and (up x + up bias), the clamped SwiGLU at
+        /// <paramref name="alpha"/> and <paramref name="limit"/> (ggml_swiglu_oai), then down plus its bias, the layer's biases
+        /// the model's. Without <paramref name="downBias"/> the down bias is left out (an executor whose device adds it for
+        /// every route, the host's included). False where the host does not run them.
+        /// </summary>
+        bool ComputeOai(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
+            ReadOnlySpan<byte> skip, int rows, Span<float> output, float alpha, float limit, bool downBias = true) => false;
+
         /// <summary>Where <paramref name="layer"/>'s host experts live when they are packed in page-locked host memory the
         /// device can address (<see cref="HostExpertCopies"/>), or null: each at its place in its stack's mapping.</summary>
         HostExpertCopies Copies(int layer) => null;

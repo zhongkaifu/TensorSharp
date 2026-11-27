@@ -246,9 +246,6 @@ public sealed class DirectCudaRealModelTests : IDisposable
                 $"row {i} after the restore is {RelL2(result.Restored[i], result.Straight[i]):E3} from the straight run");
     }
 
-    [CudaFact(ModelDir, "gpt-oss-20b")]
-    public void GptOss_20B_SnapshotRestore_IsExact() => SnapshotRestoreIsExact("gpt-oss-20b");
-
     // ---- Qwen3.5-0.8B (qwen35 dense, the qwen08 gate model's architecture) ----
 
     [CudaFact(ModelDir, "qwen3.5-0.8b", GgmlBackend = BackendType.GgmlCpu)]

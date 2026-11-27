@@ -253,8 +253,8 @@ namespace TensorSharp.Models
             {
                 string[] names = _dflashLayerNames[il];
                 // PASS B on the carried rows: their K (head-normed, rotated at their positions) and V, [head_dim, kv_heads, mc].
-                int carryK = mc == 0 ? -1 : EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, mc, names[DfAttnKNorm], carryAt);
-                int carryV = mc == 0 ? -1 : step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, mc);
+                int carryK = mc == 0 ? -1 : EmitDFlashHeads(step, names[DfAttnK], names[DfAttnKBias], g, kvHeads, mc, names[DfAttnKNorm], carryAt);
+                int carryV = mc == 0 ? -1 : step.Reshape(DFlashProjection(step, names[DfAttnV], names[DfAttnVBias], g), hd, kvHeads, mc);
                 int h = step.RmsNorm(x, step.Weight(names[DfAttnNorm]), cfg.Eps);
                 int attnTaps = -1;
                 if (cfg.HasConv)
@@ -262,9 +262,9 @@ namespace TensorSharp.Models
                     attnTaps = step.MatMul(names[DfAttnConvProj], h);
                     h = EmitDFlashConv(step, h, attnTaps, names[DfAttnConvBase], side: 0, b, zeros, m);
                 }
-                int q = EmitDFlashHeads(step, names[DfAttnQ], h, heads, rows, names[DfAttnQNorm]);
-                int k = EmitDFlashHeads(step, names[DfAttnK], h, kvHeads, rows, names[DfAttnKNorm]);
-                int v = step.Reshape(step.MatMul(names[DfAttnV], h), hd, kvHeads, rows);
+                int q = EmitDFlashHeads(step, names[DfAttnQ], names[DfAttnQBias], h, heads, rows, names[DfAttnQNorm]);
+                int k = EmitDFlashHeads(step, names[DfAttnK], names[DfAttnKBias], h, kvHeads, rows, names[DfAttnKNorm]);
+                int v = step.Reshape(DFlashProjection(step, names[DfAttnV], names[DfAttnVBias], h), hd, kvHeads, rows);
                 var laneRings = new int[2 * m];
                 for (int j = 0; j < m; j++)
                 {
@@ -308,7 +308,7 @@ namespace TensorSharp.Models
                     fa = fa < 0 ? attended : step.Op(GraphOp.Concat, stackalloc[] { fa, attended }, stackalloc long[] { 2 });
                 }
                 if (attendRegion) step.EndFused(stackalloc[] { fa });
-                int attn = step.MatMul(names[DfAttnOutput], step.Reshape(fa, (long)heads * hd, rows));
+                int attn = DFlashProjection(step, names[DfAttnOutput], names[DfAttnOutputBias], step.Reshape(fa, (long)heads * hd, rows));
                 if (cfg.HasConv) attn = EmitDFlashConv(step, attn, attnTaps, names[DfAttnConvBase], side: 1, b, zeros, m);
                 x = step.Op(GraphOp.Add, attn, x);
 
@@ -477,8 +477,8 @@ namespace TensorSharp.Models
             for (int il = 0; il < cfg.NumLayers; il++)
             {
                 string[] names = _dflashLayerNames[il];
-                int k = EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, rows, names[DfAttnKNorm], positionsAt);
-                int v = step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, rows);
+                int k = EmitDFlashHeads(step, names[DfAttnK], names[DfAttnKBias], g, kvHeads, rows, names[DfAttnKNorm], positionsAt);
+                int v = step.Reshape(DFlashProjection(step, names[DfAttnV], names[DfAttnVBias], g), hd, kvHeads, rows);
                 long kRow = (long)hd * kvHeads * f;
                 for (int j = 0; j < m; j++)
                 {

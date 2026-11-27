@@ -43,7 +43,7 @@ The radix prefix cache enforces the boundaries:
 * A marked request neither stores nor adopts cached state past its last breakpoint
   (`SequenceState.CacheBreakpointLimit`). A policy with no usable breakpoint (an
   empty list, or a single breakpoint at 0) disables prefix reuse for that request.
-* **Page families** (GPT-OSS, Mistral 3, Hunyuan Dense, Muse-Glimmer, Nemotron-H)
+* **Page families** (Mistral 3, Hunyuan Dense, Muse-Glimmer, Nemotron-H)
   store whole KV blocks only, so a marker at token `M` makes `floor(M / block size)`
   blocks reusable; the tail of the segment is recomputed.
 * **Checkpoint families** (the models that restore from state checkpoints) end a

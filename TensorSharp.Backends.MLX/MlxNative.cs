@@ -88,13 +88,10 @@ namespace TensorSharp.MLX
         private static MlxFastMetalKernel flatToHeadFirstKernel;
         private static MlxFastMetalKernel neoXRopeKernel;
         private static MlxFastMetalKernel circularDecodeAttentionKernel;
-        private static MlxFastMetalKernel decodeAttentionWithSinksKernel;
         private static MlxFastMetalKernel q8AddmmAddKernel;
         private static MlxFastMetalKernel q8RmsNormMatmulKernel;
         private static MlxFastMetalKernel q8MatmulKernel;
         private static MlxFastMetalKernel q8MatmulGeluMulKernel;
-        private static MlxFastMetalKernel swigluOaiGatherBiasKernel;
-        private static MlxFastMetalKernel moeBiasWeightedSumKernel;
         private static bool iq4XsMatmulKernelDisabled;
         private static bool iq4XsMatmulSimdgroupKernelDisabled;
         private static bool iq4XsMatmul4KernelDisabled;
@@ -140,13 +137,10 @@ namespace TensorSharp.MLX
         private static bool flatToHeadFirstKernelDisabled;
         private static bool neoXRopeKernelDisabled;
         private static bool circularDecodeAttentionKernelDisabled;
-        private static bool decodeAttentionWithSinksKernelDisabled;
         private static bool q8AddmmAddKernelDisabled;
         private static bool q8RmsNormMatmulKernelDisabled;
         private static bool q8MatmulKernelDisabled;
         private static bool q8MatmulGeluMulKernelDisabled;
-        private static bool swigluOaiGatherBiasKernelDisabled;
-        private static bool moeBiasWeightedSumKernelDisabled;
 
         private const string Iq4NlLookupHeader = @"
 constexpr constant float kIq4NlValues[16] = {
@@ -1605,8 +1599,8 @@ for (int col = static_cast<int>(tid); col < HiddenDim; col += 256) {
 ";
 
         // Fused (residual += input; normed = RmsNorm(residual, norm_weight)).
-        // Used by pre-norm transformer blocks (Mistral3 / Qwen35 / Nemotron /
-        // GptOss): folds the residual-add + post-add rmsnorm into one
+        // Used by pre-norm transformer blocks (Mistral3 / Qwen35 / Nemotron):
+        // folds the residual-add + post-add rmsnorm into one
         // dispatch, eliminating one MLX kernel launch per residual stage
         // (2 stages per layer × 40 layers = 80 saved dispatches/token on
         // 40-layer models).
@@ -1661,58 +1655,6 @@ float gate3 = gate * gate * gate;
 float inner = clamp(0.7978845608f * (gate + 0.044715f * gate3), -15.0f, 15.0f);
 float gelu = 0.5f * gate * (1.0f + tanh(inner));
 out_y[row * HalfDim + col] = gelu * up;
-";
-
-        // Clamped SwiGLU (the GPT-OSS / OpenAI-MoE "swiglu_oai" variant) over
-        // separate gate / up matrices with a fused per-expert bias gather:
-        //   g = gate[row] + gate_bias[experts[row]]
-        //   u = up[row]   + up_bias[experts[row]]
-        //   x = min(g, limit); y = clamp(u, -limit, limit)
-        //   out = (x * sigmoid(alpha * x)) * (y + 1)
-        // Mirrors GptOssModel.ApplySwiGluOaiInPlace / ggml's swiglu_oai.
-        // alpha_v / limit_v are 0-d scalar inputs (passed by value by MLX).
-        private const string SwigluOaiGatherBiasSource = @"
-auto col = thread_position_in_grid.x;
-auto row = thread_position_in_grid.y;
-if (col >= Dim || row >= Rows) {
-    return;
-}
-
-int e = experts[row];
-float g = gate_in[row * Dim + col] + gate_bias[e * Dim + col];
-float u = up_in[row * Dim + col] + up_bias[e * Dim + col];
-float x = min(g, limit_v);
-float y = clamp(u, -limit_v, limit_v);
-float glu = x / (1.0f + exp(-alpha_v * x));
-out_y[row * Dim + col] = glu * (y + 1.0f);
-";
-
-        // Routing-weighted MoE combine with a fused per-expert down-bias
-        // gather and unsort. The K down-projection rows of token n live at
-        // sorted positions inv_order[n*K+k] of down_rows (the caller sorted
-        // the (token, expert) pairs by expert for gather_qmm's grouped-GEMM
-        // mode). Computes, per token n and output column d:
-        //   out[n, d] = sum_k w[n*K+k] * (down_rows[inv_order[n*K+k], d]
-        //                                 + down_bias[experts_sorted[inv_order[n*K+k]], d])
-        // HasBias=0 skips the bias term (down_bias may then be any array).
-        private const string MoeBiasWeightedSumSource = @"
-auto col = thread_position_in_grid.x;
-auto n = thread_position_in_grid.y;
-if (col >= Dim || n >= Rows) {
-    return;
-}
-
-float acc = 0.0f;
-for (int k = 0; k < K; ++k) {
-    int p = n * K + k;
-    int srow = inv_order[p];
-    float v = down_rows[srow * Dim + col];
-    if (HasBias != 0) {
-        v += down_bias[experts_sorted[srow] * Dim + col];
-    }
-    acc += route_weights[p] * v;
-}
-out_y[n * Dim + col] = acc;
 ";
 
         private const string FlatToHeadFirstSource = @"
@@ -2741,79 +2683,6 @@ int block_in_row = col >> 8;
 int within_block = col & 255;
 auto block = w + (weight_row * BlocksPerRow + block_in_row) * 98;
 y[out_row * InDim + col] = tensorsharp_dequant_iq3_xxs(block, within_block);
-";
-
-        // Decode attention with optional attention sinks and sliding-window
-        // mask. Used by GPT-OSS-style models where each query head has a
-        // learned "sink" logit that participates in the softmax denominator
-        // but contributes V=0. Same online-softmax structure as
-        // CircularDecodeAttention but:
-        //   - max_score initialised to sinks[head] (the sink's logit)
-        //   - normalizer initialised to 1.0 (= exp(sink - sink))
-        //   - sink contributes only to the denominator (V=0 implicit)
-        // Sliding-window: positions before MaskStart are skipped (clamp the
-        // effective attention window to the last SlidingWindow tokens). When
-        // MaskStart=0 and SlidingWindow=0, this is full causal decode.
-        //
-        // Inputs:
-        //   q [1, NumHeads*HeadDim] f32
-        //   k_cache [NumKVHeads, CacheLen, HeadDim] f16 or f32
-        //   v_cache [NumKVHeads, CacheLen, HeadDim] f16 or f32
-        //   sinks  [NumHeads] f32
-        //   scale_value  scalar f32
-        // Output:
-        //   y [1, NumHeads*HeadDim] f32
-        private const string DecodeAttentionWithSinksSource = @"
-auto tid = thread_position_in_threadgroup.x;
-auto head = thread_position_in_grid.y;
-threadgroup float partial[256];
-
-const int group_size = NumHeads / NumKVHeads;
-const int kv_head = head / group_size;
-const int attend_start = MaskStart;
-const int attend_end   = AttendLen;
-
-float max_score = sinks[head];
-float normalizer = 1.0f;
-float acc = 0.0f;
-
-for (int t = attend_start; t < attend_end; t++) {
-    float dot_part = 0.0f;
-    if (tid < HeadDim) {
-        float qv = static_cast<float>(q[head * HeadDim + tid]);
-        float kv = static_cast<float>(k_cache[(kv_head * CacheLen + t) * HeadDim + tid]);
-        dot_part = qv * kv;
-    }
-
-    partial[tid] = dot_part;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float score = partial[0] * scale_value;
-    const float new_max = score > max_score ? score : max_score;
-    const float old_scale = metal::fast::exp(max_score - new_max);
-    const float score_scale = metal::fast::exp(score - new_max);
-    if (tid < HeadDim) {
-        acc = acc * old_scale + score_scale *
-            static_cast<float>(v_cache[(kv_head * CacheLen + t) * HeadDim + tid]);
-    } else {
-        acc = acc * old_scale;
-    }
-    normalizer = normalizer * old_scale + score_scale;
-    max_score = new_max;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
-if (tid < HeadDim) {
-    y[head * HeadDim + tid] = acc / normalizer;
-}
 ";
 
         private const string CircularDecodeAttentionSource = @"
@@ -4073,84 +3942,6 @@ if (simd_id == 0) {
             });
         }
 
-        // Decode attention with per-head attention sinks (and optional
-        // sliding-window mask). Used by GPT-OSS-style models. Reuses the
-        // same caller convention as CircularDecodeAttention but adds a
-        // sinks input and a MaskStart template parameter.
-        //
-        // attendStart: first cache position to attend to (max(0, kvLen -
-        //              slidingWindow) for SWA layers, else 0).
-        // attendEnd:   one past last cache position to attend to (=kvLen).
-        internal static MlxArray DecodeAttentionWithSinks(
-            MlxArray qFlat,
-            MlxArray kCache,
-            MlxArray vCache,
-            MlxArray sinks,
-            int numHeads,
-            int numKVHeads,
-            int headDim,
-            int cacheLen,
-            int attendStart,
-            int attendEnd,
-            float scale)
-        {
-            if (!qFlat.IsValid || !kCache.IsValid || !vCache.IsValid || !sinks.IsValid)
-                throw new ArgumentException("MLX decode attention with sinks inputs must be valid arrays.");
-            if (numHeads <= 0 || numKVHeads <= 0 || numHeads % numKVHeads != 0 ||
-                headDim <= 0 || headDim > 256 || cacheLen <= 0 || attendEnd <= attendStart || attendEnd > cacheLen)
-            {
-                throw new ArgumentOutOfRangeException(nameof(headDim), "Invalid MLX decode attention with sinks dimensions.");
-            }
-
-            return MlxWorker.Shared.Invoke(() =>
-            {
-                MlxFastMetalKernel kernel = EnsureDecodeAttentionWithSinksKernel();
-                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
-                MlxVectorArray inputs = default;
-                MlxVectorArray outputs = default;
-                MlxArray scaleArray = default; MlxArray maskStartArray = default; MlxArray attendLenArray = default;
-                try
-                {
-                    AddTemplateInt(config, "NumHeads", numHeads);
-                    AddTemplateInt(config, "NumKVHeads", numKVHeads);
-                    AddTemplateInt(config, "HeadDim", headDim);
-                    AddTemplateInt(config, "CacheLen", cacheLen);
-
-                    int[] shape = { 1, numHeads * headDim };
-                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring decode attention with sinks output");
-                    Check(mlx_fast_metal_kernel_config_set_grid(config, 256, numHeads, 1), "configuring decode attention with sinks grid");
-                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring decode attention with sinks threadgroup");
-
-                    scaleArray = mlx_array_new_float32(scale);
-                    maskStartArray = mlx_array_new_int(attendStart);
-                    attendLenArray = mlx_array_new_int(attendEnd);
-                    inputs = CreateVectorArray(qFlat, kCache, vCache, sinks, scaleArray, maskStartArray, attendLenArray);
-                    outputs = mlx_vector_array_new();
-                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running decode attention with sinks");
-                    if (mlx_vector_array_size(outputs) < 1)
-                        throw new InvalidOperationException("decode attention with sinks kernel produced no output.");
-
-                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading decode attention with sinks output");
-                    return result;
-                }
-                finally
-                {
-                    if (scaleArray.IsValid)
-                        _ = mlx_array_free(scaleArray);
-                    if (maskStartArray.IsValid)
-                        _ = mlx_array_free(maskStartArray);
-                    if (attendLenArray.IsValid)
-                        _ = mlx_array_free(attendLenArray);
-                    if (inputs.IsValid)
-                        _ = mlx_vector_array_free(inputs);
-                    if (outputs.IsValid)
-                        _ = mlx_vector_array_free(outputs);
-                    if (config.IsValid)
-                        _ = mlx_fast_metal_kernel_config_free(config);
-                }
-            });
-        }
-
         internal static MlxArray CircularDecodeAttention(
             MlxArray qFlat,
             MlxArray kCache,
@@ -4517,130 +4308,6 @@ if (simd_id == 0) {
                         throw new InvalidOperationException("GELU-mul split kernel produced no output.");
 
                     Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading GELU-mul split output");
-                    return result;
-                }
-                finally
-                {
-                    if (inputs.IsValid)
-                        _ = mlx_vector_array_free(inputs);
-                    if (outputs.IsValid)
-                        _ = mlx_vector_array_free(outputs);
-                    if (config.IsValid)
-                        _ = mlx_fast_metal_kernel_config_free(config);
-                }
-            });
-        }
-
-        // Fused clamped-SwiGLU (swiglu_oai) + per-expert gate/up bias gather.
-        // gate/up: [rows, dim] f32. gateBias/upBias: [E, dim] f32. experts:
-        // [rows] int32 (expert id of each row). Returns [rows, dim] f32.
-        internal static MlxArray SwigluOaiGatherBias(
-            MlxArray gate,
-            MlxArray up,
-            MlxArray gateBias,
-            MlxArray upBias,
-            MlxArray experts,
-            float alpha,
-            float limit,
-            int rows,
-            int dim)
-        {
-            if (!gate.IsValid || !up.IsValid || !gateBias.IsValid || !upBias.IsValid || !experts.IsValid)
-                throw new ArgumentException("MLX swiglu-oai gather-bias requires valid arrays.");
-            if (rows <= 0 || dim <= 0)
-                throw new ArgumentOutOfRangeException(nameof(rows));
-
-            return MlxWorker.Shared.Invoke(() =>
-            {
-                MlxFastMetalKernel kernel = EnsureSwigluOaiGatherBiasKernel();
-                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
-                MlxVectorArray inputs = default;
-                MlxVectorArray outputs = default;
-                MlxArray alphaArray = default;
-                MlxArray limitArray = default;
-                try
-                {
-                    AddTemplateInt(config, "Rows", rows);
-                    AddTemplateInt(config, "Dim", dim);
-
-                    int[] shape = { rows, dim };
-                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring swiglu-oai output");
-                    Check(mlx_fast_metal_kernel_config_set_grid(config, dim, rows, 1), "configuring swiglu-oai grid");
-                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring swiglu-oai threadgroup");
-
-                    alphaArray = mlx_array_new_float32(alpha);
-                    limitArray = mlx_array_new_float32(limit);
-                    inputs = CreateVectorArray(gate, up, gateBias, upBias, experts, alphaArray, limitArray);
-                    outputs = mlx_vector_array_new();
-                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running swiglu-oai gather-bias");
-                    if (mlx_vector_array_size(outputs) < 1)
-                        throw new InvalidOperationException("swiglu-oai gather-bias kernel produced no output.");
-
-                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading swiglu-oai output");
-                    return result;
-                }
-                finally
-                {
-                    if (alphaArray.IsValid)
-                        _ = mlx_array_free(alphaArray);
-                    if (limitArray.IsValid)
-                        _ = mlx_array_free(limitArray);
-                    if (inputs.IsValid)
-                        _ = mlx_vector_array_free(inputs);
-                    if (outputs.IsValid)
-                        _ = mlx_vector_array_free(outputs);
-                    if (config.IsValid)
-                        _ = mlx_fast_metal_kernel_config_free(config);
-                }
-            });
-        }
-
-        // Routing-weighted MoE combine + per-expert down-bias gather + unsort.
-        // downRows: [n*k, dim] f32 in expert-sorted pair order. downBias:
-        // [E, dim] f32 (pass any valid array with hasBias=false to skip).
-        // expertsSorted / invOrder: [n*k] int32. routeWeights: [n*k] f32 in
-        // ORIGINAL (token-major) pair order. Returns [n, dim] f32.
-        internal static MlxArray MoeBiasWeightedSum(
-            MlxArray downRows,
-            MlxArray downBias,
-            bool hasBias,
-            MlxArray expertsSorted,
-            MlxArray invOrder,
-            MlxArray routeWeights,
-            int n,
-            int k,
-            int dim)
-        {
-            if (!downRows.IsValid || !downBias.IsValid || !expertsSorted.IsValid || !invOrder.IsValid || !routeWeights.IsValid)
-                throw new ArgumentException("MLX MoE bias-weighted-sum requires valid arrays.");
-            if (n <= 0 || k <= 0 || dim <= 0)
-                throw new ArgumentOutOfRangeException(nameof(n));
-
-            return MlxWorker.Shared.Invoke(() =>
-            {
-                MlxFastMetalKernel kernel = EnsureMoeBiasWeightedSumKernel();
-                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
-                MlxVectorArray inputs = default;
-                MlxVectorArray outputs = default;
-                try
-                {
-                    AddTemplateInt(config, "Rows", n);
-                    AddTemplateInt(config, "K", k);
-                    AddTemplateInt(config, "Dim", dim);
-                    AddTemplateInt(config, "HasBias", hasBias ? 1 : 0);
-
-                    int[] shape = { n, dim };
-                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring MoE bias-weighted-sum output");
-                    Check(mlx_fast_metal_kernel_config_set_grid(config, dim, n, 1), "configuring MoE bias-weighted-sum grid");
-                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring MoE bias-weighted-sum threadgroup");
-
-                    inputs = CreateVectorArray(downRows, downBias, expertsSorted, invOrder, routeWeights);
-                    outputs = mlx_vector_array_new();
-                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running MoE bias-weighted-sum");
-                    if (mlx_vector_array_size(outputs) < 1)
-                        throw new InvalidOperationException("MoE bias-weighted-sum kernel produced no output.");
-
-                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading MoE bias-weighted-sum output");
                     return result;
                 }
                 finally
@@ -7833,31 +7500,6 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             }
         }
 
-        private static MlxFastMetalKernel EnsureDecodeAttentionWithSinksKernel()
-        {
-            lock (fastKernelSync)
-            {
-                if (decodeAttentionWithSinksKernel.IsValid)
-                    return decodeAttentionWithSinksKernel;
-                if (decodeAttentionWithSinksKernelDisabled)
-                    throw new NotSupportedException("MLX decode attention with sinks kernel was disabled after initialization failed.");
-
-                decodeAttentionWithSinksKernel = CreateFastMetalKernel(
-                    "tensorsharp_decode_attention_with_sinks",
-                    new[] { "q", "k_cache", "v_cache", "sinks", "scale_value", "MaskStart", "AttendLen" },
-                    new[] { "y" },
-                    DecodeAttentionWithSinksSource,
-                    string.Empty);
-                if (!decodeAttentionWithSinksKernel.IsValid)
-                {
-                    decodeAttentionWithSinksKernelDisabled = true;
-                    throw new NotSupportedException("Unable to initialize MLX decode attention with sinks kernel.");
-                }
-
-                return decodeAttentionWithSinksKernel;
-            }
-        }
-
         private static MlxFastMetalKernel EnsureQ8AddmmAddKernel()
         {
             lock (fastKernelSync)
@@ -8262,56 +7904,6 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 }
 
                 return geluMulSplitKernel;
-            }
-        }
-
-        private static MlxFastMetalKernel EnsureSwigluOaiGatherBiasKernel()
-        {
-            lock (fastKernelSync)
-            {
-                if (swigluOaiGatherBiasKernel.IsValid)
-                    return swigluOaiGatherBiasKernel;
-                if (swigluOaiGatherBiasKernelDisabled)
-                    throw new NotSupportedException("MLX swiglu-oai gather-bias kernel was disabled after initialization failed.");
-
-                swigluOaiGatherBiasKernel = CreateFastMetalKernel(
-                    "tensorsharp_swiglu_oai_gather_bias",
-                    new[] { "gate_in", "up_in", "gate_bias", "up_bias", "experts", "alpha_v", "limit_v" },
-                    new[] { "out_y" },
-                    SwigluOaiGatherBiasSource,
-                    string.Empty);
-                if (!swigluOaiGatherBiasKernel.IsValid)
-                {
-                    swigluOaiGatherBiasKernelDisabled = true;
-                    throw new NotSupportedException("Unable to initialize MLX swiglu-oai gather-bias kernel.");
-                }
-
-                return swigluOaiGatherBiasKernel;
-            }
-        }
-
-        private static MlxFastMetalKernel EnsureMoeBiasWeightedSumKernel()
-        {
-            lock (fastKernelSync)
-            {
-                if (moeBiasWeightedSumKernel.IsValid)
-                    return moeBiasWeightedSumKernel;
-                if (moeBiasWeightedSumKernelDisabled)
-                    throw new NotSupportedException("MLX MoE bias-weighted-sum kernel was disabled after initialization failed.");
-
-                moeBiasWeightedSumKernel = CreateFastMetalKernel(
-                    "tensorsharp_moe_bias_weighted_sum",
-                    new[] { "down_rows", "down_bias", "experts_sorted", "inv_order", "route_weights" },
-                    new[] { "out_y" },
-                    MoeBiasWeightedSumSource,
-                    string.Empty);
-                if (!moeBiasWeightedSumKernel.IsValid)
-                {
-                    moeBiasWeightedSumKernelDisabled = true;
-                    throw new NotSupportedException("Unable to initialize MLX MoE bias-weighted-sum kernel.");
-                }
-
-                return moeBiasWeightedSumKernel;
             }
         }
 

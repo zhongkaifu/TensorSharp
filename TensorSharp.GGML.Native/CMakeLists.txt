@@ -330,10 +330,6 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_graph_builder.cpp
     ggml_ops_cpu_graph.cpp
     ggml_ops_cpu_products.cpp
-    ggml_ops_transformer_prefill.cpp
-    ggml_ops_gptoss_decode.cpp
-    ggml_ops_gptoss_batched.cpp
-    ggml_ops_gptoss_prefill.cpp
     ggml_ops_muse_spark.cpp
     ggml_ops_minimax_m3_vision.cpp
     ggml_ops_dflash.cpp

@@ -39,15 +39,20 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 `TS_NEMOTRON_MULTIMODAL_WARMUP_TILES` 与 `TS_TP_SNAPSHOT_TRACE` 现在会让服务器或 CLI 在启动时停止，并给出说明变更的消息。
 `TS_NEMOTRON_IMAGE_MAX_TILES` 与 `TS_NEMOTRON_AUDIO_MMPROJ` 仍然有效。
 
+旧的 GPT-OSS 模型（`GptOssModel`）已于 2026-11 删除（GPT-OSS 在所有后端上都运行在共享解码运行时上）；它的开关
+`TS_GPTOSS_FUSED_DECODE_MAX_CTX`、`TS_GPTOSS_FUSED_ATTN_MAX_SEQ`、`TS_GPTOSS_PREFILL_F16` 与 `TS_GPTOSS_PREFILL_CHUNK`
+现在会让服务器或 CLI 在启动时停止，并给出说明变更的消息。GPT-OSS 的提示步遵循 `TS_PREFILL_CHUNK`，其滑动窗口环把一步
+限制在 512 行以内。
+
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_PER_SEQ_FUSED` | fused 能力模型（GGML 后端上的 Gemma 4 与 GPT OSS；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，凡可加载的后端均适用，多节点流水线除外；各自原生执行器上的 DeepSeek V4 / V4.1 与 GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward，每个序列有自己的设备端 K/V holder；`0` 改走逐算子批处理分页路径，其 K/V 位于共享的主机块池（设备内存更少、decode 速率更低、没有保留的 holder） | 启用 | 未注册 | 否 |
-| `TS_BATCHED_FUSED_DECODE` | 具备 token 批量融合 decode 的模型（Gemma 4、Qwen 3.5/3.6/3.8、GPT OSS、GLM 5.x、DeepSeek V4 / V4.1） | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列）。在 GLM 5.x 上 4 个并发请求可得合计 1.81× decode；在 DeepSeek V4.1 Flash 的 Q4_K_M 上为 2.0×（24.3 → 48.9 tok/s），上限来自路由——每个 token 各自从 384 个专家里挑 6 个。批处理会改变 GEMM 形状，2 bit MoE 可能把这点差别放大成不同的专家选择；设为 `0` 可做串行路径 A/B。 | 开启 | 未注册 | 否 |
+| `TS_PER_SEQ_FUSED` | fused 能力模型（GGML 后端上的 Gemma 4；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，凡可加载的后端均适用，多节点流水线除外；各自原生执行器上的 DeepSeek V4 / V4.1 与 GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward，每个序列有自己的设备端 K/V holder；`0` 改走逐算子批处理分页路径，其 K/V 位于共享的主机块池（设备内存更少、decode 速率更低、没有保留的 holder） | 启用 | 未注册 | 否 |
+| `TS_BATCHED_FUSED_DECODE` | 具备 token 批量融合 decode 的模型（Gemma 4、Qwen 3.5/3.6/3.8、GLM 5.x、DeepSeek V4 / V4.1） | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列）。在 GLM 5.x 上 4 个并发请求可得合计 1.81× decode；在 DeepSeek V4.1 Flash 的 Q4_K_M 上为 2.0×（24.3 → 48.9 tok/s），上限来自路由——每个 token 各自从 384 个专家里挑 6 个。批处理会改变 GEMM 形状，2 bit MoE 可能把这点差别放大成不同的专家选择；设为 `0` 可做串行路径 A/B。 | 开启 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 具有可保留 request-owned fused holder 的模型（Gemma 4；Qwen 3.5/3.6/3.8；Qwen 3.8 Flash Next；未加载 DSpark 草稿器时的 DeepSeek V4.1；原生执行器上的 GLM 5.x，每个会话交出一个原生 slot） | 为下一轮的精确前缀续接保留多少个已结束会话的终态（holder、原生 slot）；Qwen holder 同时包含 attention K/V 与匹配的 GatedDeltaNet 递归状态。未设置时跟随 `TS_SCHED_MAX_RUNNING_SEQS`（至少 4），使每个可以并行运行的请求都保有自己的终态；字节数由显存而不是这个数量约束。`0` 关闭保留 | 运行中请求上限（16），至少 `4` | 不适用 | 否 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | GGML 后端上的 Gemma 4；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，只要其按请求 slot 在运行且递归状态可复制（多节点流水线除外）。需要开启 `TS_PER_SEQ_FUSED` | 在每个会话共享的提示前缀（系统提示、工具、技能）结束处对模型完整状态做检查点，新会话从其副本继续，只需重新预填自己的消息。取值是同时保留多少个不同共享前缀的检查点（每个占用一份前缀的 K/V，Qwen 还包含递归状态）；`0` 关闭检查点。它是 Radix 前缀缓存保留的公共检查点预算；一个提示在每个边界（系统指令、完整共享前缀）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机 | `4` | 不适用 | 否 |
-| `TS_KV_INITIAL_TOKENS` | 通过 `ModelBase.ResolveInitialCacheAllocationLength` 确定缓存大小的模型家族（Qwen 3.5/3.6、Gemma 4、GPT-OSS 等 ModelBase 家族；不含自行确定大小的 DeepSeek V4 / GLM 5.x） | 缓存创建时（加载时的主缓存、每个 per-request holder）在任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口，否则为后端默认值）。在共享解码运行时上（Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next、Mistral 3、Hunyuan Dense）它只决定主缓存的大小：请求自己的 slot 按其预留量创建（提示、生成预算与验证窗口，取 256 单元的整数倍，至少 512 个单元，`--backend cuda` 上至少 1,024 个；在单 GPU 的 `--backend cuda` 上，设备有空间时取预留量所在的容量档，否则取放得下的最大 slot，并一次扩容一个缓存张量），超出后按需增长；在单个 `ggml_metal` 或 `ggml_cuda` 设备上，或在单 GPU 的 `--backend cuda` 上，设备放不下新 slot 时新的并发请求会等待（在 `--backend cuda` 上，独自运行而 slot 放不下的请求会在提示运行前被拒绝）。在 `--backend cuda` 上取 `0` 时，主缓存无论 `MAX_CONTEXT` 是多少都从一个新 slot 的大小（1,024 个单元）起步：每个请求都在自己的 slot 里运行，所以那里的 `MAX_CONTEXT` 只限定窗口上限。缓存仍按需增长。内存受限设备把它设小，因为每个保留的 holder 都按此大小付费，主机副本与设备镜像各一份 | `0` | 不适用 | 否 |
+| `TS_KV_INITIAL_TOKENS` | 通过 `ModelBase.ResolveInitialCacheAllocationLength` 确定缓存大小的模型家族（Qwen 3.5/3.6、Gemma 4、GPT-OSS 等 ModelBase 家族；不含自行确定大小的 DeepSeek V4 / GLM 5.x） | 缓存创建时（加载时的主缓存、每个 per-request holder）在任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口，否则为后端默认值）。在共享解码运行时上（Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next、Mistral 3、Hunyuan Dense、GPT-OSS）它只决定主缓存的大小：请求自己的 slot 按其预留量创建（提示、生成预算与验证窗口，取 256 单元的整数倍，至少 512 个单元，`--backend cuda` 上至少 1,024 个；在单 GPU 的 `--backend cuda` 上，设备有空间时取预留量所在的容量档，否则取放得下的最大 slot，并一次扩容一个缓存张量），超出后按需增长；在单个 `ggml_metal` 或 `ggml_cuda` 设备上，或在单 GPU 的 `--backend cuda` 上，设备放不下新 slot 时新的并发请求会等待（在 `--backend cuda` 上，独自运行而 slot 放不下的请求会在提示运行前被拒绝）。在 `--backend cuda` 上取 `0` 时，主缓存无论 `MAX_CONTEXT` 是多少都从一个新 slot 的大小（1,024 个单元）起步：每个请求都在自己的 slot 里运行，所以那里的 `MAX_CONTEXT` 只限定窗口上限。缓存仍按需增长。内存受限设备把它设小，因为每个保留的 holder 都按此大小付费，主机副本与设备镜像各一份 | `0` | 不适用 | 否 |
 | `TS_KV_GENERATION_RESERVE_MAX` | 全部 | 请求预先保留的 K/V 中生成部分的上限（prompt + max_new_tokens）；回复上限不小于窗口时否则每个请求都会保留整个窗口。超过上限后缓存按需增长。`0` = 不限制 | `0` | 不适用 | 否 |
-| `TS_KV_HOLDER_POOL_MAX` | 具有 per-request fused holder 的模型（共享运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next、Gemma 4、GPT-OSS） | 已释放的 holder 最多可停放多少个以待复用而不是释放；每个停放的 holder 都占用其完整 K/V 分配。共享运行时无论取值如何最多停放 4 个 slot；`0` 不停放 | `64` | 不适用 | 否 |
+| `TS_KV_HOLDER_POOL_MAX` | 具有 per-request fused holder 的模型（共享运行时上的 Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next 与 GPT-OSS，以及 Gemma 4） | 已释放的 holder 最多可停放多少个以待复用而不是释放；每个停放的 holder 都占用其完整 K/V 分配。共享运行时无论取值如何最多停放 4 个 slot；`0` 不停放 | `64` | 不适用 | 否 |
 | `TS_SCHED_DISABLE_BATCHED` | 全部 | `1` 让所有模型都走按序列 KV-swap 路径，投机解码也一样（`--no-continuous-batching`） | 关闭 | `0`, `1` | 是 |
 | `TS_SCHED_PREFIX_CACHE` | 全部自回归模型 | `0` 关闭准入时的全部提示复用（Radix 前缀缓存：页面、保留的终态与公共检查点在同一个索引里）。`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享提示的启动预热，以及服务端的检查点文件 | 启用（`1`） | 未注册 | 否 |
 | `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。有自己单请求步长的模型——启用流水化 prefill 的 Muse Spark：8192——在未设置 `TS_SCHED_SOLO_PREFILL_CHUNK` 时自行决定步长；设置了该变量则按文档生效并关闭模型自己的步长，只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
@@ -146,7 +151,7 @@ Qwen 3.5 / 3.6 / 3.8 家族与 Qwen 3.8 Flash Next 的直连 CUDA 引擎以及 N
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_PREFILL_CHUNK` | 在 GPT OSS、Qwen 3.5 / 3.6 family 长上下文功能上 sweep；运行时 Gemma 4、Nemotron-H 以及所有共享解码运行时家族（Mistral 3、Hunyuan Dense）也会读取 | 分块 prefill 大小 | 架构默认值 | `256`, `512`, `1024` | 是 |
+| `TS_PREFILL_CHUNK` | 在 GPT OSS、Qwen 3.5 / 3.6 family 长上下文功能上 sweep；运行时 Gemma 4、Nemotron-H 以及所有共享解码运行时家族（Mistral 3、Hunyuan Dense、GPT OSS，其滑动窗口环把一步限制在 512 行以内）也会读取 | 分块 prefill 大小 | 架构默认值 | `256`, `512`, `1024` | 是 |
 | `TS_GGML_ASYNC_COMPUTE` | GGML 后端 | 异步 compute 提交 | `ggml_metal` 上启用（`0` 关闭），其他 GGML 后端关闭 | `0`, `1` | 是 |
 
 ## 多模态
@@ -292,11 +297,11 @@ MiniMax-H3-Image 运行在共享扩散运行时上，其驻留计划、VAE 程�
 这些变量控制 `TensorSharp.Cli` 与 `TensorSharp.Server` 中可选的投机解码路径
 （Qwen 3.6、Qwen 3.8 27B、GLM 5.2 与 GLM-5.3 内嵌的 NextN 块；Gemma 4 独立的 `gemma4-assistant`
 草稿 GGUF；Qwen 3.8 Flash Next 的共享 MTP 头 GGUF；DeepSeek V4 DSpark，以及用于 Muse-Glimmer 与
-Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1 DSpark 路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证；
+Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；gpt-oss-20b DFlash 草稿器；实验性的 DeepSeek V4.1 DSpark 路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证；
 以及无需权重的 n-gram 投机器）。投机仅对单序列（无并发）请求生效，且只在模型声明有收益时启用，这由各
 模型自己决定：Qwen 3.5/3.6/3.8 与 GLM 5.2 / GLM-5.3 在所有后端上，GLM-5.3-Flash（仅 n-gram）在其 KDA
 回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其可加载的所有后端上，Muse-Glimmer 在所有后端上，DeepSeek V4 / V4.1 只在加载了各自草稿器时，Nemotron-H
-在所有后端上（n-gram 与 Nemotron 3.5 MTP 头）。GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
+在所有后端上（n-gram 与 Nemotron 3.5 MTP 头），GPT OSS 在所有后端上（n-gram 与 gpt-oss-20b DFlash 草稿器）。Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
 它们未注册在 `EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫描——矩阵特性目录目前
 没有投机解码特性，请用显式运行来验证这些变量。
 
@@ -312,7 +317,7 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 | `TS_SPEC_TYPE` | 同上全部 | 投机算法：`auto` \| `draft-head` \| `block` \| `ngram` | `auto` | 未注册 | 否 |
 | `TS_SPEC_DRAFT` | 同上全部 | 每个投机步最多起草的 token 数（1-64） | `8` | 未注册 | 否 |
 | `TS_SPEC_PMIN` | 同上全部 | 草稿置信度门限；含义随算法而定 | 按算法（`0.15` / `0.35` / `0`） | 未注册 | 否 |
-| `TS_SPEC_DRAFT_MODEL` | 草稿器以独立 GGUF 发布的模型（CLI + 服务端） | 独立草稿器的路径，按文件的架构识别：Gemma 4 的 `gemma4-assistant`、Qwen 3.8 Flash Next 的共享 MTP 头、DeepSeek V4 DSpark（或实验性的 V4.1 `deepseek41-dspark`）草稿器，DFlash / DFlash2 草稿器（Muse-Glimmer、Qwen 3.5 家族），或 MiniMax-M3.1 的 DSpark `dflash` 草稿器（只由其原生执行器在按层切分时加载）。由 `--draft-model` 设置，且除非给出 `--no-spec`，它本身就会启用投机 | 无 | 未注册 | 否 |
+| `TS_SPEC_DRAFT_MODEL` | 草稿器以独立 GGUF 发布的模型（CLI + 服务端） | 独立草稿器的路径，按文件的架构识别：Gemma 4 的 `gemma4-assistant`、Qwen 3.8 Flash Next 的共享 MTP 头、DeepSeek V4 DSpark（或实验性的 V4.1 `deepseek41-dspark`）草稿器，DFlash / DFlash2 草稿器（Muse-Glimmer、Qwen 3.5 家族、GPT-OSS），或 MiniMax-M3.1 的 DSpark `dflash` 草稿器（只由其原生执行器在按层切分时加载）。由 `--draft-model` 设置，且除非给出 `--no-spec`，它本身就会启用投机 | 无 | 未注册 | 否 |
 
 这些开关背后的设计——把模型架构、投机算法与投机器权重拆成三层——记录在
 [Speculative Decoding in TensorSharp](speculative_decoding.md)（英文）。

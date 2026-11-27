@@ -22,7 +22,7 @@ Throughput therefore depends on the selected and accepted execution path. See
 | Prefix cache | The Radix tree (`PrefixTree`, driven by `PrefixCacheCoordinator`) is the default in the server, CLI generation and TensorAgent: one index for reusable pages, retained conversation states and shared-prefix checkpoints. `TS_SCHED_PREFIX_CACHE=0` or `--no-prefix-cache` turns reuse off. See [Radix prefix cache](#radix-prefix-cache). |
 | Batched execution | Models that implement `IBatchedPagedModel.ForwardBatch` pack all scheduled sequences into one model call with explicit `positions`, `slotMapping`, `queryStartLoc`, and per-sequence block tables. |
 | Fallback execution | Path selection is centralized in `ExecutionPlanner`: model+backend capabilities (`ExecutionCapabilities`), operator overrides (`ExecutionOptions`), and per-step request features produce an `ExecutionPlan` (selected path, fallback chain, rejection reasons). A model may still decline a specific batch with `NotSupportedException`; the step then falls to the plan's next candidate, ending in the per-sequence KV-swap path. |
-| Native attention | `TSGgml_PagedAttentionForward` gathers paged K/V in C++ and dispatches `ggml_flash_attn_ext`; GPT OSS uses `TSGgml_PagedAttentionForwardWithSinks`. |
+| Native attention | `TSGgml_PagedAttentionForward` gathers paged K/V in C++ and dispatches `ggml_flash_attn_ext`. |
 | Speculative decoding | Optional speculation for solo (non-concurrent) sequences, and for concurrent ones on the shared decoder runtime (Qwen 3.5 family, Qwen 3.8 Flash Next and the other families it serves): learned draft heads (embedded NextN / MTP, Gemma 4's separate `gemma4-assistant` GGUF, Qwen 3.8 Flash Next's shared MTP head), block drafters (DSpark, DFlash) and the weight-free n-gram speculator. `BatchExecutor` drives the shared `SpeculativeExecution` draft / verify / rollback core for models that implement `ISpeculativeTarget`. Off by default; `--spec` (CLI and server) or `--draft-model`. See [Speculative decoding (MTP / NextN)](#speculative-decoding-mtp--nextn). |
 | Throughput under concurrency | The generic host-resident `BatchedPaged` route does not itself scale aggregate decode; one Gemma 4 measurement saturated near **69 tok/s**. On a model that implements `TryForwardBatchedFusedDecode`, the per-sequence-fused route first attempts one device graph for the active decode subset and falls back per request only when that batch is ineligible or declined. See [Measured Concurrency Behavior](#measured-concurrency-behavior). |
 | Queue API | `/api/queue/status` reports the engine's live load: requests processing, requests waiting for a batch slot, and requests completed. Nothing serializes requests outside the engine. |
@@ -241,11 +241,11 @@ for GGML backends:
 | Kernel | Scope | Notes |
 |---|---|---|
 | `TSGgml_PagedAttentionForward` | Standard causal / sliding-window attention | C++ K/V gather plus `ggml_flash_attn_ext`. Default for Mistral 3 and most paged attention layers on GGML backends. A head size the backend has no flash kernel for (ggml-cuda: anything outside 40/64/72/80/96/112/128/256 and the grouped-query 192/320/512/576) runs as explicit attention with a one-time warning instead of aborting in `fattn.cu`. |
-| `TSGgml_PagedAttentionForwardWithSinks` | GPT OSS attention sinks | Adds the learned per-head sink logits to the softmax denominator. |
 | `ManagedPagedAttention.Forward` | Pure C# fallback | Online-softmax implementation used for correctness and unsupported backend fallback. |
 
 Mistral 3 and Hunyuan Dense run the native kernel on GGML backends and the managed one elsewhere.
-GPT OSS runs the native sinks kernel on GGML backends and the managed one elsewhere.
+GPT OSS does not use these kernels: on the shared decoder runtime its sinks are an operand of each
+step graph's attention (see [the GPT OSS card](models/gptoss.md#41-attention)).
 
 ### Output identity under concurrency
 
@@ -281,8 +281,8 @@ one process; in those runs eight did not. The step trace showed the same batches
 at the first decode step, logits several units apart (41.28 against 38.84 for the
 same token) with every margin still wide. That was a defect, not a near-tie. The
 standalone MoE kernel (`TSGgml_MoEFFNPrefillSwiGLUQuantF32`, which the batched paged
-path uses for GPT OSS's experts) uploaded its per-expert biases as graph leafs in the
-reusable compute buffer. The allocator freed the gate bias after its `add_id` and
+path of the since-removed legacy GPT OSS model used for its experts) uploaded its
+per-expert biases as graph leafs in the reusable compute buffer. The allocator freed the gate bias after its `add_id` and
 placed the SwiGLU activation on top of it. ggml-cuda fuses `{mul_mat_id, add_id,
 mul_mat_id, add_id, swiglu_oai}` into one MMVQ kernel for 1-7 tokens. That kernel
 reads the biases while it writes the activation, and its overlap check skips leafs
@@ -369,8 +369,7 @@ Speculation engages only where the model declares it profitable
 GLM-5.3 on every backend; Gemma 4 on the ggml backends (`ggml_cpu` included) and
 the pure-C# `cuda` backend; Qwen 3.8 Flash Next on every backend it loads on;
 GLM-5.3-Flash where its KDA rollback is available; Muse Spark on the GGML
-backends (n-gram only), except under its native `--tp`; Muse-Glimmer on every backend; DeepSeek V4 / V4.1 only with their drafter loaded; Nemotron-H on every backend (n-gram drafts or the Nemotron 3.5 MTP head). GPT OSS,
-Mistral 3 and Hunyuan Dense implement no speculative trunk and
+backends (n-gram only), except under its native `--tp`; Muse-Glimmer on every backend; DeepSeek V4 / V4.1 only with their drafter loaded; Nemotron-H on every backend (n-gram drafts or the Nemotron 3.5 MTP head); GPT OSS on every backend (n-gram drafts or the gpt-oss-20b DFlash drafter). Mistral 3 and Hunyuan Dense implement no speculative trunk and
 serve standard decode for every algorithm, n-gram included. Outside the shared
 decoder runtime, concurrent batches never speculate — when more than one sequence
 is running, every sequence uses the normal batched/fallback step; the runtime's
@@ -391,7 +390,7 @@ the per-sequence path.
 | Mistral 3 | Default `ForwardBatch` path. Uses paged K/V, YaRN-aware positions, native paged attention, and vision embedding injection after prompt preparation. Validated on Ministral-3-14B; long-context native paged attention is about 21% faster than the per-sequence GGML path. | `TS_PAGED_ATTN_KERNEL` selects `native`, `tensor`, or `managed`. |
 | Gemma 4 | The shared decoder runtime's batched steps (`Gemma4RuntimeModel`): every checkpoint (E2B/E4B with per-layer embeddings and KV-shared layers, 12B/31B, the 26B-A4B MoE), media prompts, block-quantized caches and speculation (the `gemma4-assistant` head via `--draft-model`, n-gram, DFlash). | `--no-continuous-batching` and the runtime's own switches. |
 | Qwen 3.5 / 3.6 / 3.8 family | The shared decoder runtime (`Qwen35RuntimeModel`). Every request has its own slot: attention K/V plus the GatedDeltaNet recurrent states. The running requests' decode and verify steps run as one graph (the paged batched forward on GGML, per-slot programs elsewhere). Finished conversations and shared-prefix checkpoints are retained by the radix prefix cache, exact prefix only, because the recurrence cannot rewind. Speculation uses the embedded NextN/MTP block, DFlash / DFlash2 drafters or n-gram. Every backend, dense NVFP4 checkpoints on `--backend cuda` included, runs this runtime. | `TS_RETAINED_FUSED_CACHE_MAX=0` turns retention off; `--spec` enables speculation. |
-| GPT OSS | Default batched path. Handles Q/K/V/O bias, YaRN RoPE, sliding-window layers, attention sinks, MXFP4 MoE experts, and native sinks attention. Greedy correctness has been validated against the per-sequence path; performance remains limited by per-layer graph construction. On GGML backends (not under TP), concurrent decode instead takes the per-request fused holders and a token-batched fused decode, on a slot-stable arena on `ggml_cuda` / `ggml_vulkan`. Each finished request's holder is kept as its conversation's end state and donated to the next turn, so parallel conversations each continue their own (before, one that ran beside another reused nothing on its next turn). Off the arena (Metal), the token-batched decode's graph context was larger than the native context pool's buffers and every concurrent step fell back to one sequence at a time; eight parallel conversations now finish in 26.8 s instead of 45.2 s. | — |
+| GPT OSS | The shared decoder runtime (`GptOssRuntimeModel`). Every request has its own slot of device-resident K/V; each even layer's 128-token sliding window lives in a 768-cell ring. The running requests' prompt chunks and decode rows run as one graph on every backend, also under `--tp` and `--layer-split`. Finished conversations and checkpoints are retained through the runtime's holder adapter (captures, clones, donated holders, export/import); K/V block snapshots are not offered, because a ring is not position-addressed. Speculation uses n-gram drafts or the gpt-oss-20b DFlash drafter (`--draft-model`). On one A40 the server's aggregate decode for 8 concurrent requests on `ggml_cuda` is 230.4 tok/s, against 151.0 tok/s on the removed legacy model ([card](models/gptoss.md#11-validation-of-the-migration)). | `--no-continuous-batching` / `TS_SCHED_DISABLE_BATCHED` as for every runtime family. |
 | Nemotron-H | The shared decoder runtime (`NemotronRuntimeModel`). Every request has its own slot: its Mamba-2 conv window and SSM state, plus paged K/V for the attention layers. The running requests' steps run as one graph on every backend, also under `--tp` and `--layer-split`. Finished conversations and checkpoints are retained through the runtime's holder adapter; a cached prefix carries the Mamba-2 states at its checkpoints, so a continuation restores K/V rows and recurrent state together. Image and audio embeddings enter as queued media rows. Speculation uses n-gram drafts or the Nemotron 3.5 MTP head. On one A40 the server finished 8 concurrent Nemotron 3.5 Lightning prompts in 2.4 s, against 33.3 s on the removed legacy model ([card](models/nemotron.md#11-validation-of-the-migration)). | `--no-continuous-batching` / `TS_SCHED_DISABLE_BATCHED` as for every runtime family. |
 | GLM 5.x | No `ForwardBatch`: MLA keeps one compressed row per token and the DSA indexer scores against that same contiguous history, so there is no paged-KV layout to batch over. Concurrency runs on native **sequence slots** instead (`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`) — binding a request switches the active slot without moving KV bytes, and each slot's graphs are cached and captured independently. A default-on batched fused decode (one graph, one token per sequence, weights read once for the batch) is implemented on top: 1.81x aggregate decode at 4 concurrent requests. Batching changes GEMM shapes, and a 2-bit MoE can amplify that into different expert picks. | `TS_BATCHED_FUSED_DECODE=0` disables the batched decode. |
 | Hunyuan Dense | Default `ForwardBatch` path on F32 paged buffers. A block-quantized (`q8_0` / `q4_0`) KV cache keeps the KV-snapshot swap path, which serves those dtypes exactly. | — |
@@ -410,16 +409,17 @@ each media span keyed by its content identity, and each node records what state 
 request can resume from there:
 
 - **Pages**: host-slab KV snapshots or the model's own paged blocks, for the
-  families without continuation holders (GPT OSS, Mistral 3,
+  families without continuation holders (Mistral 3,
   Hunyuan Dense, Muse-Glimmer).
 - **End states**: a model-owned continuation state. Gemma 4, the Qwen 3.5 / 3.6 / 3.8
-  family (`qwen35`, `qwen35moe`, `qwen3next`), Qwen 3.8 Flash Next and Nemotron-H
-  (whose states include the Mamba-2 conv and SSM states) can copy theirs, so a finished conversation is retained for its next turn and the state at
+  family (`qwen35`, `qwen35moe`, `qwen3next`), Qwen 3.8 Flash Next, Nemotron-H
+  (whose states include the Mamba-2 conv and SSM states) and GPT OSS can copy theirs, so a finished conversation is retained for its next turn and the state at
   the end of the shared public prefix is checkpointed and cloned into each new chat.
   They do so only where they run per-request state: Gemma 4 on the GGML backends
   with its fused holders, and the Qwen 3.5 family, Flash Next and Nemotron-H on the shared
   decoder runtime's slots wherever their recurrent state can be copied (not a
-  multi-node pipeline); none of them with `TS_PER_SEQ_FUSED=0`. Elsewhere only the
+  multi-node pipeline); none of them with `TS_PER_SEQ_FUSED=0`. GPT OSS does so on the
+  runtime's slots on every backend. Elsewhere only the
   primary cache is continued.
   GLM 5.x (native executor) and DeepSeek V4.1 cannot copy a native slot: they can
   only hand one over whole to the turn that continues it (unless
@@ -621,10 +621,10 @@ request reused nothing, the first specific reason a source declined.
 | Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing; `InjectShortfallAccountingTests` (a page inject that stops early is a miss, never a partial state) |
 | Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `ContentAddressedMediaTests`; `Gemma4MediaAfterReusedPrefixExactnessTests` (model-gated: an image or audio turn after a reused prefix against a cold prefill) and `Gemma4SoftTokenMaskTests` |
 | Reuse past media (Qwen 3.5 M-RoPE) | `Qwen35MRopeReferencePositionTests` (positions against an SGLang `get_rope_index` fixture), opt-in `Qwen35ImageFollowUpExactnessTests` (reuse vs cold after an image with real weights, solo and concurrent, checkpoint file round trip) |
-| Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`, `NemotronRuntimeTests` |
+| Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `NemotronBatchedCorrectnessTests`, `NemotronRuntimeTests`, `GptOssRuntimeTests` |
 | Batched MoE kernel under backend fusion | Native CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` / `moe-fused-bias-alias-metal` (`GgmlOpsMoeFusedBiasAliasTest`): the standalone MoE FFN kernel with per-expert biases against an exact host evaluation, 1, 4 and 7 tokens, repeated |
-| Speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), `SpeculatorRegistryTests`, `NGramSpeculatorTests`, `SpeculationCostGovernorTests`, `NemotronRuntimeTests` (`SpeculativeDecodingMatchesPlainGreedy`), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_TEST_QWEN36_SPEC=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
-| Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
+| Speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), `SpeculatorRegistryTests`, `NGramSpeculatorTests`, `SpeculationCostGovernorTests`, `NemotronRuntimeTests` and `GptOssRuntimeTests` (`SpeculativeDecodingMatchesPlainGreedy`), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_TEST_QWEN36_SPEC=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
+| Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `NemotronBatchedPerfBench` |
 | DiffusionGemma path | `DiffusionGemmaTests` for denoising, prompt-KV caching, and batched generation probes |
 | End-to-end engine behavior | `EngineParallelInferenceTests` with opt-in real GGUFs via `TS_TEST_MODEL_DIR` |
 | Server option translation | `ServerOptionsBuilderTests` for `--continuous-batching`, `--no-continuous-batching` and `--no-prefix-cache` (and `--spec` keeping Radix on) |

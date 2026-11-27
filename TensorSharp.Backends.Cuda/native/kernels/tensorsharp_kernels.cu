@@ -1308,6 +1308,49 @@ extern "C" __global__ void ts_swiglu_oai_split_f32(const float* gate_up, float* 
     output[idx] = x * sig * (y + 1.0f);
 }
 
+// GPT-OSS's routed experts on the MoE engine (CudaMoe): each slot's gate and up product rows plus its expert's biases
+// (gate_bias / up_bias [experts, ff]), then the clamped SwiGLU g * sigmoid(alpha g) * (u + 1) with g = min(gate, limit) and
+// u = clamp(up, -limit, limit), written over the gate rows. A slot's rows are row_of_slot[slot] (null: the slot itself, the
+// per-slot route's layout); a slot whose expert is negative (a row the router could not rank) is zeroed.
+extern "C" __global__ void ts_moe_oai_glu_bias_f32(float* gate, const float* up, const int* sel, const int* row_of_slot,
+    const float* gate_bias, const float* up_bias, int ff, int slots, float alpha, float limit)
+{
+    TS_PDL_ENTRY();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)slots * ff)
+        return;
+    int slot = (int)(i / ff), col = (int)(i - (long long)slot * ff);
+    int row = row_of_slot != nullptr ? row_of_slot[slot] : slot;
+    size_t at = (size_t)row * ff + col;
+    int e = sel[slot];
+    if (e < 0)
+    {
+        gate[at] = 0.0f;
+        return;
+    }
+    float x = fminf(gate[at] + gate_bias[(size_t)e * ff + col], limit);
+    float y = fminf(fmaxf(up[at] + up_bias[(size_t)e * ff + col], -limit), limit);
+    float sig = 1.0f / (1.0f + expf(-alpha * x));
+    gate[at] = x * sig * (y + 1.0f);
+}
+
+// Each slot's down product row plus its expert's bias (bias [experts, width]), before the routes' weighted sum; rows as
+// ts_moe_oai_glu_bias_f32's.
+extern "C" __global__ void ts_moe_expert_bias_add_f32(float* rows, const int* sel, const int* row_of_slot, const float* bias,
+    int width, int slots)
+{
+    TS_PDL_ENTRY();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)slots * width)
+        return;
+    int slot = (int)(i / width), col = (int)(i - (long long)slot * width);
+    int e = sel[slot];
+    if (e < 0)
+        return;
+    int row = row_of_slot != nullptr ? row_of_slot[slot] : slot;
+    rows[(size_t)row * width + col] += bias[(size_t)e * width + col];
+}
+
 // Row-wise LayerNorm: y = (x - mean) / sqrt(var + eps) * alpha + beta.
 // Matches TensorApplyCPU.LayerNorm (sigma = sqrt(eps + sumsq/cols)) so the
 // direct-CUDA path is numerically equivalent to the CPU/GGML reference. One

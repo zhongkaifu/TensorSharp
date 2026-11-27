@@ -65,11 +65,13 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["diffusion-gemma"] = typeof(DiffusionGemmaRuntimeTests),
         // Nemotron-H's Mamba-2 layers rewind only to their length or to zero; its fixtures mix Mamba-2, attention and FFN blocks.
         ["nemotron_h"] = typeof(NemotronRuntimeTests),
+        // GPT-OSS's fixtures are its own (sinks, biased projections, MXFP4 experts with biases, alternating sliding windows).
+        ["gptoss"] = typeof(GptOssRuntimeTests),
     };
 
     /// <summary>Shared-runtime families that run whole-forward graphs only (StandardDecoderModel.RequiresGraphs): their
     /// dedicated suite has no per-op path to compare the graphs with. A family leaves the list when it gains one.</summary>
-    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano", "gemma4", "diffusion-gemma", "nemotron_h" };
+    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano", "gemma4", "diffusion-gemma", "nemotron_h", "gptoss" };
 
     /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)
     /// does not declare.</summary>

@@ -119,6 +119,13 @@ namespace TensorSharp.Runtime
             ("TS_GMTP_PROFILE", Gemma4LegacyRemoved),
             ("TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL", Gemma4LegacyRemoved),
             ("TS_GPTOSS_BATCHED", PerModelBatchedRemoved),
+            // The legacy GPT-OSS model's switches (the family now runs on the shared decoder runtime).
+            ("TS_GPTOSS_FUSED_DECODE_MAX_CTX", GptOssLegacyRemoved),
+            ("TS_GPTOSS_FUSED_ATTN_MAX_SEQ", GptOssLegacyRemoved),
+            ("TS_GPTOSS_PREFILL_F16", GptOssLegacyRemoved),
+            ("TS_GPTOSS_PREFILL_CHUNK",
+                "GPT-OSS runs on the shared decoder runtime, whose prompt steps every family sizes with TS_PREFILL_CHUNK "
+                + "(the sliding-window layers' rings cap a step at 512 rows); the legacy GPT-OSS model that read it was removed."),
             ("TS_NEMOTRON_BATCHED", PerModelBatchedRemoved),
             // The legacy Nemotron-H model's switches (the family now runs on the shared decoder runtime).
             ("TS_NEMOTRON_MAMBA2_BATCHED_NATIVE", NemotronLegacyRemoved),
@@ -801,7 +808,14 @@ namespace TensorSharp.Runtime
             "the experimental path it selected (never the default) was removed.";
 
         private const string GptOssSwitchRemoved =
-            "GPT-OSS always takes its fused and batched paths where the backend supports them; the switch was removed.";
+            "GPT-OSS runs on the shared decoder runtime on every backend (whole-forward graphs: its batched steps, prefix "
+            + "cache, placements and speculation are the runtime's); the switch selected a path of the legacy GPT-OSS model, "
+            + "which was removed.";
+
+        private const string GptOssLegacyRemoved =
+            "GPT-OSS runs on the shared decoder runtime on every backend (its sliding-window rings, attention sinks, routed "
+            + "experts, batched steps, prefix cache, placements and speculation are the runtime's whole-forward graphs); the "
+            + "legacy GPT-OSS model that read it was removed.";
 
         private const string Gemma4LegacyRemoved =
             "Gemma 4 runs on the shared decoder runtime on every backend (its batched steps, prefix cache, placements "

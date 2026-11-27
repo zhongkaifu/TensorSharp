@@ -1930,37 +1930,6 @@ namespace TensorSharp.GGML
                 blockSize, scale, slidingWindow);
         }
 
-        /// <summary>Native paged-attention forward with per-head attention
-        /// sinks (gpt-oss style). Pass null for <paramref name="sinksData"/>
-        /// to degenerate to the regular paged attention.</summary>
-        public static void PagedAttentionForwardWithSinks(
-            float[] qData,
-            float[] pagedKData,
-            float[] pagedVData,
-            float[] outData,
-            int[] queryStartLoc,
-            int[] seqLens,
-            int[] positions,
-            int[] blockTableFlat,
-            int[] blockTableOffsets,
-            int numSeqs,
-            int numTokens,
-            int numHeads,
-            int numKvHeads,
-            int headDim,
-            int blockSize,
-            float scale,
-            int slidingWindow,
-            float[] sinksData)
-        {
-            GgmlNative.PagedAttentionForwardWithSinks(
-                qData, pagedKData, pagedVData, outData,
-                queryStartLoc, seqLens, positions,
-                blockTableFlat, blockTableOffsets,
-                numSeqs, numTokens, numHeads, numKvHeads, headDim,
-                blockSize, scale, slidingWindow, sinksData);
-        }
-
         /// <summary>GPU-resident paged-attention forward. Q and OUT are
         /// passed as <see cref="IntPtr"/> into existing backend storage
         /// (typically <c>tensor.Storage.PtrAtElement(tensor.StorageOffset)</c>
@@ -1995,37 +1964,6 @@ namespace TensorSharp.GGML
                 blockTableFlat, blockTableOffsets,
                 numSeqs, numTokens, numHeads, numKvHeads, headDim,
                 blockSize, scale, slidingWindow);
-        }
-
-        /// <summary>GPU-resident paged-attention forward with per-head
-        /// attention sinks. Pass <c>null</c> for <paramref name="sinksData"/>
-        /// to match <see cref="PagedAttentionForwardDevice"/>.</summary>
-        public static void PagedAttentionForwardDeviceWithSinks(
-            IntPtr qData,
-            float[] pagedKData,
-            float[] pagedVData,
-            IntPtr outData,
-            int[] queryStartLoc,
-            int[] seqLens,
-            int[] positions,
-            int[] blockTableFlat,
-            int[] blockTableOffsets,
-            int numSeqs,
-            int numTokens,
-            int numHeads,
-            int numKvHeads,
-            int headDim,
-            int blockSize,
-            float scale,
-            int slidingWindow,
-            float[] sinksData)
-        {
-            GgmlNative.PagedAttentionForwardDeviceWithSinks(
-                qData, pagedKData, pagedVData, outData,
-                queryStartLoc, seqLens, positions,
-                blockTableFlat, blockTableOffsets,
-                numSeqs, numTokens, numHeads, numKvHeads, headDim,
-                blockSize, scale, slidingWindow, sinksData);
         }
 
         /// <summary>Whole UMT5-XXL text-encoder forward (24 layers, per-layer relative attention
@@ -2126,82 +2064,11 @@ namespace TensorSharp.GGML
             return GgmlNative.TryQwenVaeRun(in args);
         }
 
-        /// <summary>Whole GPT-OSS transformer for one token as a single graph
-        /// dispatch (all layers + MoE + folded final norm/LM head). Returns false
-        /// when the kernel refuses the shape so the caller falls back to the
-        /// per-layer path.</summary>
-        public static bool TryGptOssModelDecode(
-            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
-            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
-            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm)
-            => GgmlNative.TryGptOssModelDecode(layers, numLayers, hidden, hiddenSize, position,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm);
-
-        /// <summary>Whole GPT-OSS prefill in tensor-parallel plan mode.</summary>
-        public static bool TryGptOssModelPrefillTP(
-            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize,
-            int numTokens, int startPos, IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
-            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm,
-            int tpDegree, IntPtr[] tpPlanOut)
-            => GgmlNative.TryGptOssModelPrefillTP(layers, numLayers, hidden, hiddenSize, numTokens,
-                startPos, logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, tpDegree, tpPlanOut);
-
         /// <summary>Publish the whole group's tensor-parallel geometry (total rank
         /// count, this process's global rank offset) so the kernels shard experts
         /// by the cluster rather than by the local device count.</summary>
         public static void TensorParallelSetGlobalGeometry(int globalDegree, int rankOffset)
             => GgmlNative.TensorParallelSetGlobalGeometry(globalDegree, rankOffset);
-
-        /// <summary>Same graph in tensor-parallel plan mode: returns this rank's
-        /// plan instead of executing, for TensorParallelExecutePlans to drive.</summary>
-        public static bool TryGptOssModelDecodeTP(
-            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
-            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
-            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm,
-            int tpDegree, IntPtr[] tpPlanOut)
-            => GgmlNative.TryGptOssModelDecodeTP(layers, numLayers, hidden, hiddenSize, position,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm,
-                tpDegree, tpPlanOut);
-
-        /// <summary>TRUE token-batched GPT-OSS decode: one token for each of N
-        /// concurrent sequences in one fused graph, each sequence against its own
-        /// per-request KV cache (see ggml_ops_gptoss_batched.cpp).</summary>
-        public static bool TryGptOssModelDecodeBatched(
-            GptOssLayerDecodeArgs[] layers, int numLayers, int nSeqs, IntPtr hidden,
-            IntPtr[] kCaches, IntPtr[] vCaches, int[] cacheSizes, int[] positions,
-            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
-            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm,
-            IntPtr sampled, bool wantLogits)
-            => GgmlNative.TryGptOssModelDecodeBatched(layers, numLayers, nSeqs, hidden,
-                kCaches, vCaches, cacheSizes, positions,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm,
-                sampled, wantLogits);
-
-        /// <summary>Whole GPT-OSS transformer over a prompt chunk as a single
-        /// graph dispatch (all layers + MoE + folded final norm/LM head over the
-        /// last token). Returns false when the kernel refuses the shape so the
-        /// caller falls back to the per-layer path.</summary>
-        public static bool TryGptOssModelPrefill(
-            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize,
-            int numTokens, int startPos,
-            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
-            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm)
-            => GgmlNative.TryGptOssModelPrefill(layers, numLayers, hidden, hiddenSize, numTokens, startPos,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm);
-
-        /// <summary>Drop the persistent GPT-OSS whole-model decode-graph cache.
-        /// Call before any prefill and on KV reset/grow.</summary>
-        public static void GptOssResetDecodeCache() => GgmlNative.GptOssResetDecodeCache();
-
-        /// <summary>Drop the token-batched GPT-OSS decode state (arena + slot
-        /// graphs). Survives prefills by design; call on model teardown.</summary>
-        public static void GptOssResetBatchedDecodeCache() => GgmlNative.GptOssResetBatchedDecodeCache();
-
-        /// <summary>Copy the device-resident GPT-OSS KV rows back into the host
-        /// mirror (the fused decode graph never does so per token).</summary>
-        public static void GptOssSyncKvCacheToHost(IntPtr kCache, IntPtr vCache, int cacheSize, int rows)
-            => GgmlNative.GptOssSyncKvCacheToHost(kCache, vCache, cacheSize, rows);
 
         /// <summary>
         /// One tensor-parallel rank's GatedDeltaNet block over N tokens: input
@@ -2317,54 +2184,6 @@ namespace TensorSharp.GGML
                 numHeads, numKvHeads, headDim,
                 seqLen, kvLen, kvCacheLen,
                 maskStartPos, slidingWindow, scale, museSpark2DUploads);
-        }
-
-        /// <summary>
-        /// Fused GPT-OSS attention layer prefill: full attention block (input
-        /// RMSNorm + fused QKV (+bias) + RoPE + KV-cache append +
-        /// causal/SWA mask + softmax-with-sinks + attention + output projection
-        /// (+bias) + residual add) as a single GGML graph dispatch per layer.
-        ///
-        /// Replaces the ~10 separate per-op submissions on the per-op GPT-OSS
-        /// prefill path (each its own Metal command buffer). Mirrors the
-        /// llama.cpp graph in src/models/openai-moe-iswa.cpp.
-        /// </summary>
-        public static void GptOssAttentionLayerPrefill(
-            IntPtr hiddenData, int hiddenSize, int seqLen,
-            IntPtr attnNormW,
-            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qkvB,
-            int isQkvFused,
-            IntPtr kW, int kType, long kNe0, long kNe1, long kBytes,
-            IntPtr kB,
-            IntPtr vW, int vType, long vNe0, long vNe1, long vBytes,
-            IntPtr vB,
-            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr oB,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int kvHeads, int headDim,
-            int cacheSize, int startPos,
-            int isSwa, int slidingWindow,
-            IntPtr sinksData,
-            float ropeBase, float ropeFreqScale, int ropeDims,
-            int originalContextLength,
-            int kvCacheType, float eps)
-        {
-            GgmlNative.GptOssAttentionLayerPrefill(
-                hiddenData, hiddenSize, seqLen,
-                attnNormW,
-                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes, qkvB, isQkvFused,
-                kW, kType, kNe0, kNe1, kBytes, kB,
-                vW, vType, vNe0, vNe1, vBytes, vB,
-                oW, oType, oNe0, oNe1, oBytes, oB,
-                kCacheData, vCacheData,
-                numHeads, kvHeads, headDim,
-                cacheSize, startPos,
-                isSwa, slidingWindow,
-                sinksData,
-                ropeBase, ropeFreqScale, ropeDims,
-                originalContextLength,
-                kvCacheType, eps);
         }
 
         /// <summary>Test probe of the TensorSharp Metal grouped expert kernels (tsm/tsm_moe.mm): one layer's held routes
@@ -2688,6 +2507,15 @@ namespace TensorSharp.GGML
             int activation)
             => GgmlNative.TSGgml_HostExpertRowsAct(gate, up, down, gateType, upType, downType, numExperts, hidden, nFf, nUsed, rows,
                 x, ids, weights, skip, output, activation) != 0;
+
+        /// <summary>GPT-OSS's biased experts on the host: (gate x + gate bias) and (up x + up bias), ggml_swiglu_oai at
+        /// <paramref name="alpha"/> and <paramref name="limit"/>, then down plus its bias, weighted (ggml's CPU evaluation of an
+        /// offloaded layer). Biases F32 [experts, nFf] (gate, up) and [experts, hidden] (down); a skipped slot adds nothing.</summary>
+        public static unsafe bool HostExpertRowsOai(IntPtr gate, IntPtr up, IntPtr down, int gateType, int upType, int downType,
+            int numExperts, int hidden, int nFf, int nUsed, int rows, float* x, int* ids, float* weights, byte* skip, float* output,
+            float* gateBias, float* upBias, float* downBias, float alpha, float limit)
+            => GgmlNative.TSGgml_HostExpertRowsOai(gate, up, down, gateType, upType, downType, numExperts, hidden, nFf, nUsed, rows,
+                x, ids, weights, skip, output, gateBias, upBias, downBias, alpha, limit) != 0;
 
         /// <summary>The same for one-projection experts (Nemotron-H): relu(s up x)^2, then down, <paramref name="upScales"/>
         /// each route's s ([rows, nUsed] as the weights; null for 1).</summary>

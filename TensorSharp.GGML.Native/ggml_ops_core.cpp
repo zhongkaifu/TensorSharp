@@ -3408,9 +3408,6 @@ extern "C" void TSGgml_WanResetForwardCache();
 extern "C" void TSGgml_GraphReleaseDeviceIo();
 extern "C" void TSGgml_Qwen35GdnDropTpGraphs();
 extern "C" void TSGgml_ReleaseFusedFfnTpGraphs();
-extern "C" void TSGgml_GptOssResetDecodeCache();
-extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
-extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
 extern "C" void TSGgml_DFlashResetCaches();
 extern "C" void TSGgml_WanResetForwardCache();
 
@@ -3421,9 +3418,6 @@ extern "C" void TSGgml_WanResetForwardCache();
 TSG_EXPORT void TSGgml_ResetSharedGraphCaches()
 {
     host_read_barrier();
-    // The slot-stable arena pools bind resident weight buffers this wipe is
-    // about to free; their captured graphs must not survive it.
-    TSGgml_GptOssResetBatchedDecodeCache();
     // Drop any persistent whole-model graphs first: they bind weights resident by
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
     // their captured graphs pointing at freed device memory.
@@ -3435,7 +3429,6 @@ TSG_EXPORT void TSGgml_ResetSharedGraphCaches()
     // loaded afterwards whose allocations landed on the old addresses replayed a graph
     // bound to freed MTLBuffers. Each rebuilds on its next call.
     TSGgml_DFlashResetCaches();
-    TSGgml_GptOssResetDecodeCache();
     // Per-shape graphs that hold no state between calls, so another live model
     // simply rebuilds its own. Nothing else released them before thread or
     // process teardown, where freeing a CUDA buffer aborts on Windows (see
@@ -3574,18 +3567,8 @@ TSG_EXPORT void TSGgml_Shutdown()
     // the process ("CUDA error: driver shutting down").
     TSGgml_Qwen35GdnDropTpGraphs();
     TSGgml_ReleaseFusedFfnTpGraphs();
-    // GPT-OSS keeps per-layer device-resident K/V windows (tsg_gptoss::kv_*)
-    // alive for the whole session; nothing else drops them, so on Metal their
-    // MTLBuffers were still registered in the device residency set when the
-    // ggml_metal_device static destructor ran, tripping
-    // GGML_ASSERT([rsets->data count] == 0) and aborting the process at exit
-    // (SIGABRT / exit code 134) after a perfectly good generation. Passing
-    // (null, null) drops every window.
-    TSGgml_GptOssResetDecodeCache();
-    TSGgml_GptOssResetBatchedDecodeCache();
-    TSGgml_GptOssInvalidateKvCache(nullptr, nullptr);
-    // Same contract for the other whole-model graph caches: each parks a ggml
-    // context + backend buffer that must be released before the backend is.
+    // The whole-model graph caches: each parks a ggml context + backend buffer that must be released before the
+    // backend is.
     TSGgml_DFlashResetCaches();
     TSGgml_WanResetForwardCache();
 #if defined(TSG_GGML_USE_METAL)
@@ -3996,47 +3979,15 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
     // The same host pointer can be resident on several ranks (a replicated
     // weight, or an activation the TP forward round-robins); drop all of them.
-    bool freedDeviceCopy = false;
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {
         tsg::ScopedRank rank(r);
-        freedDeviceCopy |= invalidate_cached_buffer(ptr);
+        invalidate_cached_buffer(ptr);
     }
-
-    // The GPT-OSS attention kernel keeps its own device-resident copy of the KV
-    // cache keyed by the same host pointer. Every caller that invalidates a
-    // tensor's device copy (KV truncate, snapshot inject, cache reset) means
-    // "the host bytes changed underneath you", which is exactly when that copy
-    // has to go too — hooking it here keeps the two caches from disagreeing
-    // without every call site having to know about both.
-    TSGgml_GptOssInvalidateKvCache(ptr, nullptr);
 
     tsg_graphtp::on_drop(ptr);
     tsg::moe_hot_tier_on_drop(ptr);
     tsg::host_expert_io_on_drop(ptr);
-
-    // Same argument, one level up: the persistent whole-model graphs bake the
-    // buffer we just freed into their nodes, so replaying one after this point is
-    // a use-after-free. ggml-vulkan catches it as
-    // "GGML_ASSERT(buffer != nullptr)" inside ggml_vk_tensor_subbuffer (the freed
-    // ggml_backend_vk_buffer_context reads back a null dev_buffer) and aborts;
-    // ggml-cuda reads the stale allocation instead and silently computes on
-    // freed memory. Reproduced by any multi-turn chat: turn 2 truncates the KV
-    // cache, which invalidates its host buffers, and the very next decode
-    // replays the turn-1 graph.
-    //
-    // Gated on freedDeviceCopy: hot paths call this for pointers that have no
-    // device copy at all (Qwen3.5's gated-delta-net invalidates its conv/delta
-    // state every decode step), and dropping every graph there would rebuild the
-    // whole model graph per token — measured -13% to -48% decode before this
-    // guard. When a buffer really was freed, invalidation happens at most once per
-    // turn (KV truncate / reset / snapshot inject) and each cache simply rebuilds
-    // on its next call.
-    if (!freedDeviceCopy)
-        return;
-
-    TSGgml_GptOssResetDecodeCache();
-    TSGgml_GptOssResetBatchedDecodeCache();
 }
 
 

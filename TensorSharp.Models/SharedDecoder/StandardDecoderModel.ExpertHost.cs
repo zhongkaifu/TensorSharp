@@ -318,6 +318,42 @@ namespace TensorSharp.Models
                 return true;
             }
 
+            /// <summary>Each layer's expert biases as host values (gate, up, down), read once.</summary>
+            private readonly System.Collections.Concurrent.ConcurrentDictionary<int, float[][]> _oaiBiases = new();
+
+            /// <summary>GPT-OSS's biased experts with the clamped SwiGLU, read from the model's mapping (the packed copies index
+            /// places, the biases experts).</summary>
+            public unsafe bool ComputeOai(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
+                ReadOnlySpan<byte> skip, int rows, Span<float> output, float alpha, float limit, bool downBias = true)
+            {
+                if (!_m.TryGetLayerExperts(layer, out StackedExpertWeights gate, out StackedExpertWeights up, out StackedExpertWeights down))
+                    return false;
+                float[][] b = _oaiBiases.GetOrAdd(layer, l => new[]
+                {
+                    _m.HostFloatsOf($"blk.{l}.ffn_gate_exps.bias"), _m.HostFloatsOf($"blk.{l}.ffn_up_exps.bias"), _m.HostFloatsOf($"blk.{l}.ffn_down_exps.bias"),
+                });
+                if (b[0] == null || b[1] == null || b[2] == null) return false;
+                int hidden = (int)gate.PerExpertNe0, ff = (int)gate.PerExpertNe1, k = ids.Length / rows;
+                long hostRoutes = 0;
+                foreach (byte s in skip) if (s == 0) hostRoutes++;
+                System.Threading.Interlocked.Add(ref HostRoutes, hostRoutes);
+                fixed (float* xp = x, wp = weights, op = output, gb = b[0], ub = b[1], db = b[2])
+                fixed (int* ip = ids)
+                fixed (byte* sp = skip)
+                {
+                    // Rows the one-token decode kernel takes a call (no ggml backend is needed for them).
+                    for (int r0 = 0; r0 < rows; r0 += HostRowsPerCall)
+                    {
+                        int n = Math.Min(HostRowsPerCall, rows - r0);
+                        if (!GgmlBasicOps.HostExpertRowsOai(gate.Data, up.Data, down.Data, gate.GgmlType, up.GgmlType, down.GgmlType,
+                                (int)gate.NumExperts, hidden, ff, k, n, xp + (long)r0 * hidden, ip + (long)r0 * k, wp + (long)r0 * k,
+                                sp + (long)r0 * k, op + (long)r0 * hidden, gb, ub, downBias ? db : null, alpha, limit))
+                            return false;
+                    }
+                }
+                return true;
+            }
+
             /// <summary>The layer's packed host experts (<see cref="StandardDecoderModel.TryPackHostExperts"/>), or null.</summary>
             public HostExpertCopies Copies(int layer) => _m._hostCopies is { } all && (uint)layer < (uint)all.Length ? all[layer] : null;
         }
@@ -341,6 +377,10 @@ namespace TensorSharp.Models
 
         /// <summary>The executor the model's graphs run on (a test sets a backend executor's own thresholds).</summary>
         internal TensorSharp.Graph.IGraphExecutor GraphExecutorForTests => GraphExecutor;
+
+        /// <summary>An F32 weight's values on the host (null when the model holds none of that name).</summary>
+        private float[] HostFloatsOf(string name)
+            => _weights.TryGetValue(name, out Tensor t) ? t.GetElementsAsFloat(checked((int)t.ElementCount())) : null;
 
         /// <summary>The routed experts' activation where the host computes them: 0 silu(gate) * up (the default), 2
         /// gelu_tanh(gate) * up (Gemma 4).</summary>

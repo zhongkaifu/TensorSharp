@@ -238,8 +238,8 @@ namespace TensorSharp.Models
             for (int il = 0; il < cfg.NumLayers; il++)
             {
                 string[] names = _dflashLayerNames[il];
-                int k = EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, n, names[DfAttnKNorm]);
-                int v = step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, n);
+                int k = EmitDFlashHeads(step, names[DfAttnK], names[DfAttnKBias], g, kvHeads, n, names[DfAttnKNorm]);
+                int v = step.Reshape(DFlashProjection(step, names[DfAttnV], names[DfAttnVBias], g), hd, kvHeads, n);
                 EmitDFlashRingWrite(step, il, k, v, n, ringRows, out _, out _);
             }
             return new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
@@ -268,12 +268,19 @@ namespace TensorSharp.Models
 
         /// <summary>weight · x as heads [head_dim, heads, rows], each RMS-normed with <paramref name="norm"/> (the drafter's
         /// epsilon) and rotated at the step's positions, or at <paramref name="positions"/> (I32 [rows]) when given.</summary>
-        private int EmitDFlashHeads(GraphStep step, string weight, int x, int heads, int rows, string norm, int positions = -1)
+        private int EmitDFlashHeads(GraphStep step, string weight, string bias, int x, int heads, int rows, string norm, int positions = -1)
         {
             DFlashConfig cfg = DFlashSettings;
-            int y = step.Reshape(step.MatMul(weight, x), cfg.HeadDim, heads, rows);
+            int y = step.Reshape(DFlashProjection(step, weight, bias, x), cfg.HeadDim, heads, rows);
             int normed = step.RmsNorm(y, step.Weight(norm), cfg.Eps);
             return positions >= 0 ? step.RopeAt(normed, DFlashRotary, positions) : step.Rope(normed, DFlashRotary);
+        }
+
+        /// <summary>A drafter projection, plus its bias where the file has one (the gpt-oss-20b DFlash drafter's).</summary>
+        private static int DFlashProjection(GraphStep step, string weight, string bias, int x)
+        {
+            int y = step.MatMul(weight, x);
+            return bias == null ? y : step.Op(GraphOp.Add, y, step.Weight(bias));
         }
 
         /// <summary>K and V [head_dim, kv_heads, n] into draft layer <paramref name="layer"/>'s ring at the rows
@@ -510,8 +517,8 @@ namespace TensorSharp.Models
                 for (int il = 0; il < cfg.NumLayers; il++)
                 {
                     string[] names = _dflashLayerNames[il];
-                    int k = EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, written, names[DfAttnKNorm], positionsNode);
-                    int v = step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, written);
+                    int k = EmitDFlashHeads(step, names[DfAttnK], names[DfAttnKBias], g, kvHeads, written, names[DfAttnKNorm], positionsNode);
+                    int v = step.Reshape(DFlashProjection(step, names[DfAttnV], names[DfAttnVBias], g), hd, kvHeads, written);
                     EmitDFlashRingWrite(step, il, k, v, written, slotsNode, out _, out _, plan.RingK[s][il], plan.RingV[s][il]);
                 }
             }
@@ -619,14 +626,14 @@ namespace TensorSharp.Models
                     attnTaps = step.MatMul(names[DfAttnConvProj], h);
                     h = EmitDFlashConv(step, h, attnTaps, names[DfAttnConvBase], side: 0, b, zeros);
                 }
-                int q = EmitDFlashHeads(step, names[DfAttnQ], h, heads, b, names[DfAttnQNorm]);
-                int k = EmitDFlashHeads(step, names[DfAttnK], h, kvHeads, b, names[DfAttnKNorm]);
-                int v = step.Reshape(step.MatMul(names[DfAttnV], h), hd, kvHeads, b);
+                int q = EmitDFlashHeads(step, names[DfAttnQ], names[DfAttnQBias], h, heads, b, names[DfAttnQNorm]);
+                int k = EmitDFlashHeads(step, names[DfAttnK], names[DfAttnKBias], h, kvHeads, b, names[DfAttnKNorm]);
+                int v = step.Reshape(DFlashProjection(step, names[DfAttnV], names[DfAttnVBias], h), hd, kvHeads, b);
                 EmitDFlashRingWrite(step, il, k, v, b, ringRows, out int ringK, out int ringV);
                 // Attention sinks (the DSpark module's): one logit per head in each query's softmax, the op's fifth operand.
                 int sinks = cfg.HasAttentionSinks ? step.Weight(names[DfAttnSinks]) : -1;
                 int fa = step.FlashAttention(step.Permute(q, 0, 2, 1, 3), ringK, ringV, mask, scale, sinks: sinks);
-                int attn = step.MatMul(names[DfAttnOutput], step.Reshape(fa, (long)heads * hd, b));
+                int attn = DFlashProjection(step, names[DfAttnOutput], names[DfAttnOutputBias], step.Reshape(fa, (long)heads * hd, b));
                 if (cfg.HasConv) attn = EmitDFlashConv(step, attn, attnTaps, names[DfAttnConvBase], side: 1, b, zeros);
                 x = step.Op(GraphOp.Add, attn, x);
 

@@ -27,7 +27,7 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly HashSet<string> LegacyBespokeFamilies = new(StringComparer.Ordinal)
     {
-        "qwen4exp", "gptoss", "muse-spark",
+        "qwen4exp", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
         "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
@@ -83,17 +83,9 @@ public sealed class ServingContractConformanceTests
         "glm5next: HybridParallel@ggml_cuda",
         "glm5next: HybridParallel@ggml_vulkan",
         "glm5next: TensorParallel@cuda",
-        "gptoss: ExpertOffload@cuda",
-        "gptoss: ExpertOffload@mlx",
         "gptoss: HybridParallel@cuda",
         "gptoss: HybridParallel@ggml_cuda",
         "gptoss: HybridParallel@ggml_vulkan",
-        "gptoss: LayerSplit@cuda",
-        "gptoss: LayerSplit@ggml_cuda",
-        "gptoss: LayerSplit@ggml_vulkan",
-        "gptoss: TensorParallel+batching@cuda",
-        "gptoss: TensorParallel+batching@ggml_cuda",
-        "gptoss: TensorParallel+batching@ggml_vulkan",
         // Inkling 2 (milestone 1) runs on one device with its experts resident: its loop, depth-mixed stream and own expert
         // path have no placement or host-expert route yet (docs/design/inkling2-on-shared-runtime.md).
         "inkling2: ExpertOffload@ggml_cuda",
