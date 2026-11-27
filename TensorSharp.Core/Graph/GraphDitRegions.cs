@@ -391,18 +391,21 @@ namespace TensorSharp.Graph
         /// <summary>
         /// <see cref="GraphFusion.LoraLinear"/>: w · x [out, rows] with up · (down · x) added to each part's slot (the
         /// unmerged products in F32). <paramref name="slotRows"/> 0 is one slot of all <paramref name="outRows"/>; parts are
-        /// in slot order, one a slot. <paramref name="product"/> makes w · x (null: a plain product).
+        /// in slot order, one a slot. <paramref name="product"/> makes w · x (null: a plain product). <paramref name="bias"/>
+        /// [out] (-1: none) makes the biased form (Ip[2] = 1, the bias the last input, one slot): (w · x + bias) + up · (down ·
+        /// x), the bias added before the update, as a direct linear layer with an adapter beside it computes it.
         /// </summary>
         public static int LoraLinear(GraphProgramBuilder g, int x, int weight, IReadOnlyList<LoraPart> parts, long outRows, long slotRows,
-            long rows, Product? product = null)
+            long rows, Product? product = null, int bias = -1)
         {
             ArgumentNullException.ThrowIfNull(g);
             ArgumentNullException.ThrowIfNull(parts);
             long slot = slotRows > 0 ? slotRows : outRows;
             if (outRows % slot != 0 || outRows / slot > 3) throw new ArgumentOutOfRangeException(nameof(slotRows), "one to three equal slots of the output rows");
+            if (bias >= 0 && slot != outRows) throw new ArgumentException("the biased form has one slot", nameof(bias));
             long mask = 0;
             int last = -1;
-            Span<int> inputs = stackalloc int[2 + 2 * 3];
+            Span<int> inputs = stackalloc int[2 + 2 * 3 + 1];
             int n = 0;
             inputs[n++] = x;
             inputs[n++] = weight;
@@ -414,14 +417,24 @@ namespace TensorSharp.Graph
                 inputs[n++] = p.Down;
                 inputs[n++] = p.Up;
             }
-            g.BeginFused(GraphFusion.LoraLinear, inputs[..n], stackalloc long[] { mask, slotRows });
+            if (bias >= 0)
+            {
+                inputs[n++] = bias;
+                g.BeginFused(GraphFusion.LoraLinear, inputs[..n], stackalloc long[] { mask, slotRows, 1 });
+            }
+            else g.BeginFused(GraphFusion.LoraLinear, inputs[..n], stackalloc long[] { mask, slotRows });
             int y = (product ?? MulMat)(g, weight, x);
             int Delta(LoraPart p)
             {
                 int shrunk = g.Op(GraphOp.MulMat, stackalloc[] { p.Down, x }, stackalloc long[] { PrecisionF32 });
                 return g.Op(GraphOp.MulMat, stackalloc[] { p.Up, shrunk }, stackalloc long[] { PrecisionF32 });
             }
-            if (slot == outRows)
+            if (bias >= 0)
+            {
+                y = g.Op(GraphOp.Add, y, bias);
+                if (parts.Count > 0) y = g.Op(GraphOp.Add, y, Delta(parts[0]));
+            }
+            else if (slot == outRows)
             {
                 if (parts.Count > 0) y = g.Op(GraphOp.Add, Delta(parts[0]), y);
             }

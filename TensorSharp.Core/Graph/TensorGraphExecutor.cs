@@ -1773,18 +1773,24 @@ namespace TensorSharp.Graph
         /// fc1's whole update beside its product): for MiniMax-H3's Turbo plug-in on direct CUDA that took 1.5 GB more device
         /// memory at 1,768 tokens and 2.2 GB at 2,250 than the retired direct DiT's in-place updates, and 8% more time a step
         /// at 2,250. The base product is the executor's own (<see cref="QuantizedMatMul"/>), without any power-of-two scale pair
-        /// the region's product may carry. The bias form (Ip[2] = 1) and any other layout run the region's ops.
+        /// the region's product may carry. The bias form (Ip[2] = 1, one slot) adds the bias into the product before the update,
+        /// as its ops add them (LTX 2.5's Ingredients projections: the direct linear's bias, then the adapter's update added
+        /// into its output); any other layout runs the region's ops.
         /// </summary>
         protected bool TryLoraLinearInPlace(Tensor[] inputs, IGraphWeight[] weights, long[] ip, Tensor[] results)
         {
-            if (ip == null || ip.Length < 2 || (ip.Length > 2 && ip[2] != 0) || inputs.Length < 4 || (inputs.Length - 2) % 2 != 0
-                || weights.Length != inputs.Length || weights[1] is not { } w || w.Ne2 > 1)
+            bool biased = ip is { Length: > 2 } && ip[2] == 1;
+            if (ip == null || ip.Length < 2 || (ip.Length > 2 && ip[2] is not (0 or 1)) || inputs.Length < (biased ? 5 : 4)
+                || (inputs.Length - (biased ? 3 : 2)) % 2 != 0 || weights.Length != inputs.Length || weights[1] is not { } w || w.Ne2 > 1)
+                return false;
+            Tensor bias = biased ? inputs[^1] : null;
+            if (biased && (bias == null || weights[^1] != null || bias.ElementType != DType.Float32 || bias.ElementCount() != w.Ne1))
                 return false;
             Tensor x = inputs[0];
             if (x == null || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() % w.Ne0 != 0) return false;
             long mask = ip[0], slotRows = ip[1] > 0 ? ip[1] : w.Ne1;
-            int parts = (inputs.Length - 2) / 2;
-            if (slotRows <= 0 || w.Ne1 % slotRows != 0 || parts > 3) return false;
+            int parts = (inputs.Length - (biased ? 3 : 2)) / 2;
+            if (slotRows <= 0 || w.Ne1 % slotRows != 0 || parts > 3 || (biased && slotRows != w.Ne1)) return false;
             var slots = new int[parts];
             for (int i = 0, slot = 0; i < parts; i++, slot++)
             {
@@ -1799,6 +1805,18 @@ namespace TensorSharp.Graph
             Tensor y = QuantizedMatMul(w, x2);   // [rows, out]
             try
             {
+                if (bias != null)
+                {
+                    // The bias over every row into the product, on the kernel the region's Add runs (Binary) where the
+                    // backend has one, else over the bias's rows expanded.
+                    using Tensor b = bias.View(w.Ne1);
+                    if (!TryBinaryBroadcast(GraphOp.Add, y, y, b, Ne(y), Ne(b)))
+                    {
+                        using Tensor row = b.View(1, w.Ne1);
+                        using Tensor rowsOfBias = row.Expand(rows, w.Ne1);
+                        Ops.Add(y, y, rowsOfBias);
+                    }
+                }
                 for (int i = 0; i < parts; i++)
                 {
                     using Tensor shrunk = QuantizedMatMul(weights[2 + 2 * i], x2);   // [rows, rank]

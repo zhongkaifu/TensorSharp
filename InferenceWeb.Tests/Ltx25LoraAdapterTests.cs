@@ -129,6 +129,8 @@ public sealed partial class Ltx25DenoiserTests
         Assert.Equal(0, model.CachedReferenceLoraProjections);
         var adapted = model.Forward(Input(reference, useReferenceLora: true));
         Assert.Equal(1, model.CachedReferenceLoraProjections);
+        // The adapted projection is one LoraLinear region the CUDA and managed executors add in place (MLX runs its ops).
+        if (model.Executor is not TensorSharp.MLX.MlxGraphExecutor) Assert.Equal(1, model.Executor.LoraLinearsServedForTests);
         Assert.True(before.VideoVelocity.Zip(adapted.VideoVelocity).Any(pair => Math.Abs(pair.First - pair.Second) > 1e-6));
         var after = model.Forward(Input(reference));
         Assert.Equal(before.VideoVelocity, after.VideoVelocity);

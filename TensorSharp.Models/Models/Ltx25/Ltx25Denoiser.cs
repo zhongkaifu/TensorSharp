@@ -125,12 +125,13 @@ public sealed class Ltx25Denoiser : IDenoiser
         }
     }
 
-    /// <summary>The executor a denoiser on <paramref name="allocator"/>'s backend runs its steps on, with direct products.</summary>
+    /// <summary>The executor a denoiser on <paramref name="allocator"/>'s backend runs its steps on, with direct products and
+    /// a wide DiT step's in-place regions (the adapter's LoraLinear updates).</summary>
     internal static TensorGraphExecutor CreateExecutor(IAllocator allocator) => allocator switch
     {
-        CudaAllocator cuda => new CudaGraphExecutor(cuda) { DirectProducts = true },
-        MlxAllocator mlx => new MlxGraphExecutor(mlx) { DirectProducts = true },
-        CpuAllocator => new ManagedGraphExecutor(allocator) { DirectProducts = true },
+        CudaAllocator cuda => new CudaGraphExecutor(cuda) { DirectProducts = true, ServesWideDitRegions = true },
+        MlxAllocator mlx => new MlxGraphExecutor(mlx) { DirectProducts = true, ServesWideDitRegions = true },
+        CpuAllocator => new ManagedGraphExecutor(allocator) { DirectProducts = true, ServesWideDitRegions = true },
         _ => throw new NotSupportedException($"LTX 2.5's denoiser runs on CUDA, MLX or the CPU, not {allocator.GetType().Name}."),
     };
 
@@ -704,14 +705,18 @@ public sealed class Ltx25Denoiser : IDenoiser
             leaves[t] = node;
             return node;
         }
-        // The direct denoiser's Project: w x, its bias, then the adapter's B (A x) where the adapter updates the projection.
+        // The direct denoiser's Project: w x, its bias, then the adapter's B (A x) where the adapter updates the projection,
+        // added into the projection's output (a LoraLinear region the executors serve in place: an Ingredients step at 10,752
+        // tokens held 2.4 GB more as separate ops).
         int Linear(string name, int x)
         {
             Ltx25Weight w = _w.Projection(name);
-            int y = b.Op(GraphOp.MulMat, Projection(w), x);
-            if (_w.HasBias(name)) y = b.Op(GraphOp.Add, y, Vector(name + ".bias"));
+            bool biased = _w.HasBias(name);
             if (s.Lora?.Factors(name) is { } f)
-                y = b.Op(GraphOp.Add, y, b.Op(GraphOp.MulMat, Projection(f.Up), b.Op(GraphOp.MulMat, Projection(f.Down), x)));
+                return GraphDitRegions.LoraLinear(b, x, Projection(w), new[] { new GraphDitRegions.LoraPart(0, Projection(f.Down), Projection(f.Up)) },
+                    w.Ne1, slotRows: 0, rows: 0 /* one slot: no row views */, bias: biased ? Vector(name + ".bias") : -1);
+            int y = b.Op(GraphOp.MulMat, Projection(w), x);
+            if (biased) y = b.Op(GraphOp.Add, y, Vector(name + ".bias"));
             return y;
         }
         int Silu(int x) => b.Op(GraphOp.Silu, x);
