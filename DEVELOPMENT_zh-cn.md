@@ -731,9 +731,9 @@ PR CI（`.github/workflows/pr-unit-tests.yml`）在 GitHub 托管的 x64（`ubun
 
 这类测试的规则（`InferenceWeb.Tests/RowCountRounding.cs`）：
 
-1. **只在所有 ISA 上 kernel 都一致的地方要求逐位相同。** 在托管后端上，这指每步至少 `RowCountRounding.ManagedWideRows`（17）行；在任何 CPU 执行器上，用相同步骤重复同一计算也算（重置后的第二次运行、与自身副本并列的 lane）。
+1. **只在每种 CI ISA 都已验证逐位相同的地方才要求逐位相同。** 在任何 CPU 执行器上，用相同步骤重复同一计算都满足条件（重置后的第二次运行、与自身副本并列的 lane）。跨不同步骤形状时，托管后端上每步至少 `RowCountRounding.ManagedWideRows`（17）行是必要条件，但不是充分条件：Gemma 4 runtime 的分块提示词在 x64 与 ARM64 runner 上都与整段提示词逐位相同，但 32 行的 DiffusionGemma 续接在 ARM64 上仍与全新预填充相差 3.7e-3，而 x64 上逐位相同。
 2. **跨越行数切换时使用实测的噪声上限。** 把结果限制在 fixture 实测的行数噪声内（Gemma 4 系列 fixture 用 `RowCountRounding.GemmaFixtureNoise`，即 1e-2），这个上限要远低于真实错误造成的偏差（丢失或重复写入一个缓存行：3.2e-2 到 6.9e-2），并要求明确的 top token 与参考一致。
-3. **依赖某个上限之前，在每种配置下都实测。** `eng/cpu-lane-isa.sh` 按 AVX-512（`native`）、AVX2（`avx2`）和可移植 128 位（`portable`，即 ARM64 的托管路径）主机的方式运行该分组（或用 `--filter` 运行其中一部分），日志写入 `artifacts/cpu-lane-isa/`。ARM64 专有的 kernel 只能在 ARM64 主机或 ARM64 CI 作业上运行。
+3. **依赖某个上限之前，在每种配置下都实测。** `eng/cpu-lane-isa.sh` 按 AVX-512（`native`）、AVX2（`avx2`）和可移植 128 位（`portable`，即 ARM64 的托管路径）主机的方式运行该分组（或用 `--filter` 运行其中一部分），日志写入 `artifacts/cpu-lane-isa/`。ARM64 专有的 kernel 只能在 ARM64 主机或 ARM64 CI 作业上运行。两个执行器之间的上限也是如此：GPT-OSS 的混合类型 fixture 上，ggml-cpu 与托管后端在 x64 上最多相差 1.3e-2，在 ARM64 runner 和 `portable` 配置下则相差 2.7e-2。
 
 x64 CI 作业每次都固定走 AVX2 路径：托管 kernel 与 JIT 使用 `TS_CPU_DISABLE_AVX512=1` 和 `DOTNET_EnableAVX512=0`，ggml 用 `-DGGML_NATIVE=OFF` 配置为上游的 x86-64-v3 基线，不改动 ggml 源码。因此它的结果不再取决于分到哪台 runner。在任意 x64 Linux 主机上用 `eng/cpu-lane-isa.sh --ggml-baseline avx2` 即可复现；之后原生库会一直保持基线配置，直到运行 `TensorSharp.GGML.Native/build-linux.sh -DGGML_NATIVE=ON`。.NET 10 会忽略 `DOTNET_EnableAVX512F`，起作用的开关是 `DOTNET_EnableAVX512=0`。
 

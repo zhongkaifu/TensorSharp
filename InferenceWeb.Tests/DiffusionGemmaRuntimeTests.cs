@@ -148,24 +148,20 @@ public sealed class DiffusionGemmaRuntimeTests : IDisposable
 
     /// <summary>A block's prompt extends the last one's: the cached rows are kept and only the new ones prefill, and the canvas
     /// reads what a fresh prefill of the whole prompt gives (here past the 32-token window, with the canvas on a ring's second
-    /// lap on no layer). The whole prompt is 43 tokens either way: one block's 16 new rows after 27 cached ones, or two
-    /// blocks' 32 after 11.
-    /// <para>The new rows prefill as one step and the fresh prompt's 43 as another, and no executor rounds a row the same
+    /// lap on no layer).
+    /// <para>The 16 new rows prefill as one step and the fresh prompt's 43 as another, and no executor rounds a row the same
     /// whatever the step's rows (<see cref="RowCountRounding"/>): ARM64's managed attention runs each row of a step of up to
-    /// 16 rows through the decode kernel and a wider step through the tiled host kernel (one block's continuation: 3.2e-3 on
-    /// the ARM64 runner, where x64 gave the fresh prompt's bits; held to 1e-4 this failed on every ARM64 run), and a GPU's
-    /// quantized products pick MMQ or MMVQ by the step's rows (ggml_cuda on an A40: 1.37e-2). So two blocks' continuation,
-    /// wide on every ISA, is held to the fresh prompt's bits on the managed backend; the rest to the fixture's row-count
-    /// noise.</para></summary>
+    /// 16 rows through the decode kernel and a wider step through the tiled host kernel, and the ARM64 runner rounds the
+    /// continuation 3.2e-3 apart from the fresh prompt (a 32-row continuation after 11 cached rows too: 3.7e-3) where x64
+    /// gives its bits; held to 1e-4 this failed on every ARM64 run. A GPU's quantized products pick MMQ or MMVQ by the step's
+    /// rows (ggml_cuda on an A40: 1.37e-2). So the CPU executors are held to the fixture's row-count noise.</para></summary>
     [Theory]
-    [InlineData("managed", 1)]
-    [InlineData("managed", 2)]
-    [InlineData("ggml", 1)]
-    [InlineData("ggml", 2)]
-    public void CheckpointsContinueExactly(string executor, int blocks)
+    [InlineData("managed")]
+    [InlineData("ggml")]
+    public void CheckpointsContinueExactly(string executor)
     {
         BackendType backend = Executor(executor);
-        int[] first = Tokens(43 - blocks * C, 5), whole = first.Concat(Tokens(blocks * C, 11)).ToArray();
+        int[] first = Tokens(27, 5), whole = first.Concat(Tokens(C, 11)).ToArray();
         int[] canvas = Tokens(C, 2);
         float[] continued, fresh;
         using (var model = Create(Fixture(), backend))
@@ -181,15 +177,9 @@ public sealed class DiffusionGemmaRuntimeTests : IDisposable
             fresh = (float[])model.DecodeCanvas(canvas, null, 0f, 1f).Clone();
         }
         double rel = RelL2(continued, fresh);
-        string label = $"{backend} {blocks} block(s) continued vs fresh";
-        _output.WriteLine($"{label}: relL2 {rel:E3}");
-        if (backend == BackendType.Cpu && blocks * C >= RowCountRounding.ManagedWideRows)
-        {
-            Assert.True(continued.AsSpan().SequenceEqual(fresh), $"{label}: relL2 {rel:E3}, not the fresh prompt's bits");
-            return;
-        }
+        _output.WriteLine($"{executor}: continued vs fresh relL2 {rel:E3}");
         double tolerance = backend is BackendType.Cpu or BackendType.GgmlCpu ? RowCountRounding.GemmaFixtureNoise : 3e-2;
-        Assert.True(rel <= tolerance, $"{label}: relL2 {rel:E3} > {tolerance:E1}");
+        Assert.True(rel <= tolerance, $"continued block prompt: relL2 {rel:E2} > {tolerance:E1}");
     }
 
     /// <summary>The unified call (prompt and canvas together) is the prompt-cached one.</summary>
