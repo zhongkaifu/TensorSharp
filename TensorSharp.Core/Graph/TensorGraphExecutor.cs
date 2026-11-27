@@ -1648,6 +1648,14 @@ namespace TensorSharp.Graph
         /// </summary>
         public bool DirectProducts { get; init; }
 
+        /// <summary>
+        /// Called with each weight just before a direct product (<see cref="DirectProducts"/>) reads its host bytes, on the
+        /// executor's thread: a family whose weights upload at their first product (the direct engines' order) warms each
+        /// one's file pages and moves its file's read-ahead to the weight's block there, so the upload of a block overlaps the
+        /// device work queued for the blocks before it. Null: nothing runs.
+        /// </summary>
+        public Action<IGraphWeight> BeforeDirectProduct { get; set; }
+
         /// <summary>A fused region's results (<see cref="GraphFusion"/> documents each kind's inputs and results,
         /// in ggml's extents) from its inputs: a tensor in <paramref name="inputs"/>, or a quantized weight in
         /// <paramref name="weights"/> at the same index; false (nothing set) where the kernel does not apply,

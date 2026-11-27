@@ -42,6 +42,7 @@ namespace TensorSharp.Cuda
             if (weight.Ne2 > 1 || weight.Data == IntPtr.Zero || x.Storage is not CudaStorage || x.ElementType != DType.Float32
                 || !x.IsContiguous() || x.DimensionCount != 2)
                 throw new NotSupportedException($"a direct product takes a 2-D weight over contiguous F32 rows ([{weight.Ne1} x {weight.Ne0}]).");
+            BeforeDirectProduct?.Invoke(weight);
             var result = new Tensor(Allocator, DType.Float32, x.Sizes[0], weight.Ne1);
             try
             {

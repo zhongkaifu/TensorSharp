@@ -919,6 +919,7 @@ namespace TensorSharp.Models.Graph
         {
             if (weight.Data == IntPtr.Zero)
                 throw new InvalidOperationException("a quantized weight's host bytes were released");
+            if (DirectProducts) BeforeDirectProduct?.Invoke(weight);
             int rows = (int)x.Sizes[0];
             SetStepWidth(rows);
             var result = new Tensor(Allocator, DType.Float32, rows, weight.Ne1);

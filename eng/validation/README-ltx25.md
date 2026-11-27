@@ -45,14 +45,17 @@ surfaces both trees have, so the same source builds against either checkout:
   files in `InferenceWeb.Tests/Fixtures/Ltx25/LegacyGoldens/` came from the
   retired tree); `real` runs real-checkpoint steps at generation geometries
   (first pass, an image guide's per-token timesteps, the refinement, appended
-  keyframe guides, an Ingredients reference pass); `write-lora` writes a
+  keyframe guides, an Ingredients reference pass; with `--cold N`, each case's
+  step N times as a clip's first step runs it, the device copies released and
+  the pool trimmed before each); `write-lora` writes a
   synthetic rank-128 BF16 adapter with the Ingredients layout (the gated real
   adapter is not needed); `compare` reports bitwise equality per case.
 - `Ltx25AbProbe` (whole clips through the public model API): raw RGB, both PCM
   channels, timings and progress events per case and round.
 - `ltx25-ab-compare.py` (bitwise, max |a - b|, PSNR, median times) and
-  `ltx25-ab-phases.py` (encodes, first step with the upload, the rest of each
-  pass, decodes, peak working set).
+  `ltx25-ab-phases.py` (each phase from the timing lines both trees log, and
+  the rest of the clip's time; the progress events are not comparable, since
+  the retired pipeline reported its encodes in another order).
 
 ```sh
 # Per tree (TREE = the retired checkout or this one), CUDA and CPU lanes:

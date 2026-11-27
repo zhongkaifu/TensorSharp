@@ -11,7 +11,7 @@
 //   compare  two reports: per case bitwise equality, max |a - b| and relative L2.
 //
 //   dotnet run -c Release --project eng/validation/Ltx25DenoiserAB -- fixture --backend cpu --fixtures InferenceWeb.Tests/Fixtures/Ltx25 --out lane.json
-//   dotnet run -c Release --project eng/validation/Ltx25DenoiserAB -- real --backend cuda --checkpoint <gguf> [--lora <ingredients>] --out real.json
+//   dotnet run -c Release --project eng/validation/Ltx25DenoiserAB -- real --backend cuda --checkpoint <gguf> [--lora <ingredients>] [--cold N] --out real.json
 //   dotnet run -c Release --project eng/validation/Ltx25DenoiserAB -- write-lora --checkpoint <gguf> --out synthetic-ingredients.safetensors
 //   dotnet run -c Release --project eng/validation/Ltx25DenoiserAB -- compare <a.json> <b.json>
 using System.Diagnostics;
@@ -48,7 +48,7 @@ string outPath = Path.GetFullPath(Opt("out"));
 Directory.CreateDirectory(Path.GetDirectoryName(outPath));
 if (mode == "fixture") Fixture(Opt("fixtures"));
 else if (mode == "real") Real(Opt("checkpoint"), options.GetValueOrDefault("lora"), options.TryGetValue("blocks", out string bl) ? int.Parse(bl) : null,
-    options.GetValueOrDefault("only"));
+    options.GetValueOrDefault("only"), options.TryGetValue("cold", out string cl) ? int.Parse(cl) : 0);
 else throw new ArgumentException(mode);
 File.WriteAllText(outPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
 Console.WriteLine($"[ltx25-ab] {lane}: {((JsonObject)report["cases"]).Count} cases -> {outPath}");
@@ -197,8 +197,12 @@ static void WriteSafetensors(string path, List<(string Name, int[] Shape, float[
             if (t.Dtype == "F32") output.Write(v); else output.Write((ushort)((BitConverter.SingleToUInt32Bits(v) + 0x7FFF + ((BitConverter.SingleToUInt32Bits(v) >> 16) & 1)) >> 16));
 }
 
-void Real(string checkpoint, string lora, int? blocks, string only)
+void Real(string checkpoint, string lora, int? blocks, string only, int cold)
 {
+    // --cold N: each case's step N times as a clip's first step runs it (the device copies released and the pool trimmed
+    // before each, as after a clip's decode), recording every time; the median is the case's ms.
+    var release = typeof(Ltx25Denoiser).GetMethod("ReleaseDevice", Type.EmptyTypes)
+        ?? typeof(Ltx25Denoiser).GetMethod("ReleaseDeviceResidency", Type.EmptyTypes);
     using var model = new Ltx25Denoiser(checkpoint, allocator, lora);
     ulong state = 0x2545F4914F6CDD1DUL;
     float[] Normal(long n, float scale = 1f)
@@ -269,13 +273,22 @@ void Real(string checkpoint, string lora, int? blocks, string only)
         if (only != null && !only.Split(',').Contains(name)) return;
         Ltx25DenoiserOutput o = null;
         double best = double.MaxValue;
-        for (int r = 0; r < repeat; r++)
+        var times = new List<double>();
+        for (int r = 0; r < (cold > 0 ? cold : repeat); r++)
         {
+            if (cold > 0)
+            {
+                release.Invoke(model, null);
+                if (allocator is CudaAllocator c) { c.Synchronize(); c.TrimPool(); }
+            }
             var clock = Stopwatch.StartNew();
             o = model.Forward(input, blocks);
-            best = Math.Min(best, clock.Elapsed.TotalMilliseconds);
+            times.Add(clock.Elapsed.TotalMilliseconds);
+            best = Math.Min(best, times[^1]);
         }
+        if (cold > 0) best = times.Order().ElementAt(times.Count / 2);
         Record(name, o, full: false, best);
+        ((JsonObject)((JsonObject)report["cases"])[name])["times"] = new JsonArray(times.Select(t => (JsonNode)Math.Round(t, 1)).ToArray());
     }
     Run("first-pass-512x512x17", Plain(17, 512, 512, 1f));
     Run("i2v-first-pass-512x512x17", Guided(17, 512, 512, .9875f, new[] { (0, .7f) }));

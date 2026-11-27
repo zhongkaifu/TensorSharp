@@ -1,42 +1,35 @@
 #!/usr/bin/env python3
-"""Per-phase wall times of LTX 2.5 A/B probe runs (eng/validation/Ltx25AbProbe), from each run's progress events:
-encodes (text and images, in either order), the first step (with the denoiser upload), the rest of each pass, the
-decodes, the total and the process's peak working set.
+"""Per-phase wall times of LTX 2.5 A/B probe runs (eng/validation/Ltx25AbProbe), from the phase lines both the retired
+pipeline and the diffusion runtime log ([ltx25-timing] text-encode, image-encode, upsample, refine-image-encode, vae-decode,
+audio-decode; the retired pipeline's denoise and refine, the runtime's [diffusion] step lines), and "other": the clip's
+total less those phases.
 
   python3 eng/validation/ltx25-ab-phases.py <dir> <label>...
+
+Reads <dir>/<label>.json and <dir>/<label>.log (the probe's stdout).
 """
-import json, sys
+import json, re, sys
 d = sys.argv[1]
-rows = {}
+table = {}
 for lab in sys.argv[2:]:
-    for r in json.load(open(f"{d}/{lab}.json"))["runs"]:
-        ev = r["events"]
-        t = lambda pred: next((e["elapsed"] for e in ev if pred(e)), None)
-        steps = [e for e in ev if e["phase"] == "denoise" and e["detail"].startswith("step ")]
-        starts = [e for e in ev if e["phase"] == "denoise" and not e["detail"].startswith("step ")]
-        st = [s["elapsed"] for s in steps]
-        first_pass_start = starts[0]["elapsed"]
-        # Text and image encodes, whichever order the pipeline ran them in.
-        enc0 = min(e["elapsed"] for e in ev if e["phase"] in ("text-encode", "image-encode", "reference-encode"))
-        ph = {"encodes": first_pass_start - enc0}
-        ph["step1"] = st[0] - first_pass_start
-        if len(starts) > 1:
-            k = next(i for i, s in enumerate(steps) if s["stage"] != steps[0]["stage"])
-            ph["pass1 steps2+"] = st[k - 1] - st[0]
-            ph["upscale"] = starts[1]["elapsed"] - st[k - 1]
-            ph["pass2 step1"] = st[k] - starts[1]["elapsed"]
-            ph["pass2 rest"] = st[-1] - st[k]
-        else:
-            ph["steps2+"] = st[-1] - st[0]
-        vd = t(lambda e: e["phase"] == "vae-decode"); ad = t(lambda e: e["phase"] == "audio-decode"); dn = t(lambda e: e["phase"] == "done")
-        ph["video-decode"] = (ad or dn) - vd
-        if ad: ph["audio-decode"] = dn - ad
-        ph["total"] = r["generation_ms"] / 1000
-        ph["peakWS GB"] = r["process_peak_working_set"] / 1e9
-        rows.setdefault(r["case"], {})[lab] = ph
-for case, labs in rows.items():
+    log = open(f"{d}/{lab}.log").read()
+    runs = {r["case"]: r["generation_ms"] / 1000 for r in json.load(open(f"{d}/{lab}.json"))["runs"]}
+    for chunk in re.split(r"\[ab\] \S+ ", log)[1:]:
+        case = chunk.split(" ")[0]
+        if case not in runs or " mode=" not in chunk.split("\n")[0]: continue
+        t = {}
+        for name, ms in re.findall(r"\[ltx25-timing\] ([\w-]+): ([\d.]+)ms", chunk):
+            t[name] = t.get(name, 0) + float(ms) / 1000
+        steps = [float(x) for x in re.findall(r"\[diffusion\] \S+ step \d+/\d+ .*? ([\d.]+)s", chunk)]
+        if steps:  # the runtime: per-step lines; the first pass is the steps before the upsample
+            n1 = 8 if "upsample" in t else len(steps)
+            t["denoise"] = sum(steps[:n1]); t["refine"] = sum(steps[n1:])
+        ph = {k: t.get(k, 0) for k in ("text-encode", "image-encode", "denoise", "upsample", "refine-image-encode", "refine", "vae-decode", "audio-decode")}
+        ph["other"] = runs[case] - sum(ph.values())
+        ph["total"] = runs[case]
+        table.setdefault(case, {})[lab] = ph
+for case, labs in table.items():
     print(case)
-    keys = list(next(iter(labs.values())).keys())
-    print("  " + "phase".ljust(16) + "".join(l.rjust(13) for l in labs))
-    for k in keys:
-        print("  " + k.ljust(16) + "".join((f"{labs[l].get(k, float('nan')):.2f}").rjust(13) for l in labs))
+    print("  " + "phase".ljust(20) + "".join(l.rjust(12) for l in labs))
+    for k in next(iter(labs.values())):
+        print("  " + k.ljust(20) + "".join(f"{labs[l][k]:.2f}".rjust(12) for l in labs))

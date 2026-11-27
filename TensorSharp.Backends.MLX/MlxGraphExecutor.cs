@@ -466,6 +466,7 @@ namespace TensorSharp.MLX
         /// </summary>
         private Tensor DirectProduct(IGraphWeight weight, Tensor x)
         {
+            BeforeDirectProduct?.Invoke(weight);
             var result = new Tensor(Allocator, DType.Float32, x.Sizes[0], weight.Ne1);
             try
             {

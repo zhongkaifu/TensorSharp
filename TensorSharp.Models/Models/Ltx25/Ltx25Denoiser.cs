@@ -86,6 +86,8 @@ public sealed class Ltx25Denoiser : IDenoiser
     private Ltx25LoraSet _ownedLora;      // the component surface's adapter (Forward with UseReferenceLora)
     private Ltx25LoraSet _boundLora;      // the set whose factors the cached plans and device copies hold
     private bool _resident;
+    private bool _uploading;
+    private MappedFileReadAhead _uploadRead;
     private bool _disposed;
 
     public Ltx25Config Config => _w.Config;
@@ -216,63 +218,78 @@ public sealed class Ltx25Denoiser : IDenoiser
             if (lora != null && !lora.Fits(Config))
                 throw new ArgumentException("The Ingredients adapter was loaded for an LTX checkpoint of another shape.", nameof(lora));
             Bind(lora);
-            MakeResident(ct);
-            RopeCache rope = Rope(input);
-            Tensor keyframes = Keyframes(input);
-            float[][] features = StepFeatures(input);
-            // A pass's later steps run the program its first step emitted: the latents, contexts, tables and adapter are the
-            // same objects (the sampler steps its state in place), so only the timestep features are written again, into the
-            // arrays the live trace binds. Anything else new (another pass, a request, a caller's fresh arrays) emits again.
-            var key = new LiveKey(input.Video, input.Audio, input.VideoContext, input.AudioContext, rope, keyframes, lora, blocks,
-                features.Select(f => f.Length).ToArray());
-            if (_live == null || !_live.Key.Equals(key))
+            MakeResident();
+            bool ran = false;
+            try
             {
-                _live?.Dispose();
-                _live = null;
-                var step = new StepValues(input, blocks, lora, rope, keyframes, features);
-                var trace = new GraphEmitter(_executor, record: false);
-                try { Emit(trace, step); }
-                catch { trace.Dispose(); throw; }
-                IGraphPlan plan = PlanFor(trace.Signature);
-                GraphEmitter runner = trace;
-                if (plan == null)
-                {
-                    trace.Dispose();
-                    var clock = Stopwatch.StartNew();
-                    var recorded = new GraphEmitter(_executor, record: true);
-                    try
-                    {
-                        Emit(recorded, step);
-                    }
-                    catch
-                    {
-                        recorded.Dispose();
-                        throw;
-                    }
-                    runner = recorded;
-                    double emitted = clock.Elapsed.TotalSeconds;
-                    plan = recorded.Compile(replayable: true);
-                    Keep(recorded.Signature, plan);
-                    Compiles++;
-                    Console.WriteLine($"  [ltx25] step program for {input.VideoTokens} video + {input.AudioTokens} audio tokens: " +
-                        $"emitted in {emitted:F2}s, compiled in {clock.Elapsed.TotalSeconds - emitted:F2}s");
-                }
-                _live = new LiveStep(key, runner, plan, features);
+                Ltx25DenoiserOutput output = RunStep(input, lora, blocks);
+                ran = true;
+                return output;
             }
-            else
-                for (int i = 0; i < features.Length; i++) Array.Copy(features[i], _live.Features[i], features[i].Length);
-            if (!_live.Emitter.Run(_live.Plan))
+            finally
             {
-                string error = _live.Plan.LastError;
-                _live.Dispose();
-                _live = null;
-                throw new InvalidOperationException("LTX denoiser step failed: " + error);
+                EndUpload(ran && blocks == Config.Layers);
             }
-            float[] video = (float[])_live.Plan.Outputs[0].Clone(), audio = (float[])_live.Plan.Outputs[1].Clone();
-            foreach (float v in video) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
-            foreach (float v in audio) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
-            return new Ltx25DenoiserOutput(video, audio, blocks);
         }
+    }
+
+    private Ltx25DenoiserOutput RunStep(Ltx25DenoiserInput input, Ltx25LoraSet lora, int blocks)
+    {
+        RopeCache rope = Rope(input);
+        Tensor keyframes = Keyframes(input);
+        float[][] features = StepFeatures(input);
+        // A pass's later steps run the program its first step emitted: the latents, contexts, tables and adapter are the
+        // same objects (the sampler steps its state in place), so only the timestep features are written again, into the
+        // arrays the live trace binds. Anything else new (another pass, a request, a caller's fresh arrays) emits again.
+        var key = new LiveKey(input.Video, input.Audio, input.VideoContext, input.AudioContext, rope, keyframes, lora, blocks,
+            features.Select(f => f.Length).ToArray());
+        if (_live == null || !_live.Key.Equals(key))
+        {
+            _live?.Dispose();
+            _live = null;
+            var step = new StepValues(input, blocks, lora, rope, keyframes, features);
+            var trace = new GraphEmitter(_executor, record: false);
+            try { Emit(trace, step); }
+            catch { trace.Dispose(); throw; }
+            IGraphPlan plan = PlanFor(trace.Signature);
+            GraphEmitter runner = trace;
+            if (plan == null)
+            {
+                trace.Dispose();
+                var clock = Stopwatch.StartNew();
+                var recorded = new GraphEmitter(_executor, record: true);
+                try
+                {
+                    Emit(recorded, step);
+                }
+                catch
+                {
+                    recorded.Dispose();
+                    throw;
+                }
+                runner = recorded;
+                double emitted = clock.Elapsed.TotalSeconds;
+                plan = recorded.Compile(replayable: true);
+                Keep(recorded.Signature, plan);
+                Compiles++;
+                Console.WriteLine($"  [ltx25] step program for {input.VideoTokens} video + {input.AudioTokens} audio tokens: " +
+                    $"emitted in {emitted:F2}s, compiled in {clock.Elapsed.TotalSeconds - emitted:F2}s");
+            }
+            _live = new LiveStep(key, runner, plan, features);
+        }
+        else
+            for (int i = 0; i < features.Length; i++) Array.Copy(features[i], _live.Features[i], features[i].Length);
+        if (!_live.Emitter.Run(_live.Plan))
+        {
+            string error = _live.Plan.LastError;
+            _live.Dispose();
+            _live = null;
+            throw new InvalidOperationException("LTX denoiser step failed: " + error);
+        }
+        float[] video = (float[])_live.Plan.Outputs[0].Clone(), audio = (float[])_live.Plan.Outputs[1].Clone();
+        foreach (float v in video) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        foreach (float v in audio) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        return new Ltx25DenoiserOutput(video, audio, blocks);
     }
 
     /// <summary>What makes a step's program and bindings the previous step's: the very arrays and tables it binds and its shape.</summary>
@@ -385,15 +402,17 @@ public sealed class Ltx25Denoiser : IDenoiser
     // ---- residency
 
     /// <summary>
-    /// Make the projections resident before a step needs them (the direct denoiser uploaded each at its first product): on CUDA
-    /// the mapped checkpoint read ahead in the order the blocks run, within the read-ahead's window, and each projection's
-    /// range warmed through a bounded buffer the first time it is uploaded, then copied to the device; on MLX the compressed
-    /// copies made. A first step on a cold network volume otherwise faults the 14 GB in page by page inside the uploads.
+    /// Make the projections resident for the step about to run. On CUDA each one uploads at its first product (the routes cache
+    /// it by its host address), as the direct denoiser uploaded each at its first use, so a block's upload overlaps the device
+    /// work queued for the blocks before it; just before, its file pages are warmed (<see cref="Ltx25CudaFilePrefault"/>)
+    /// and the file's read-ahead moves to its block (the prelude and output tensors first, then one stage per block: the
+    /// file stores tensors alphabetically). The step's end (<see cref="EndUpload"/>) stops the read-ahead. On MLX every
+    /// projection is converted to its device form before the step.
     /// </summary>
-    private void MakeResident(CancellationToken ct)
+    private void MakeResident()
     {
-        if (_resident) return;
-        if (_allocator is CudaAllocator cuda)
+        if (_resident || _uploading) return;
+        if (_allocator is CudaAllocator)
         {
             var stages = new List<Ltx25Weight>[Config.Layers + 1];
             for (int i = 0; i < stages.Length; i++) stages[i] = new();
@@ -403,33 +422,43 @@ public sealed class Ltx25Denoiser : IDenoiser
                 stages[block < 0 ? 0 : block + 1].Add(w);
             }
             foreach (List<Ltx25Weight> s in stages) s.Sort((a, b) => a.FileOffset.CompareTo(b.FileOffset));
-            using MappedFileReadAhead read = _w.File.IsSplit ? null : MappedFileReadAhead.TryStart(_w.File.FilePaths[0],
+            _uploadRead = _w.File.IsSplit ? null : MappedFileReadAhead.TryStart(_w.File.FilePaths[0],
                 stages.Select(s => s.Select(w => (w.FileOffset, w.Bytes))),
                 message => Console.WriteLine("  [ltx25] warning: denoiser " + message));
             _prefault ??= _w.File.IsSplit ? null : new Ltx25CudaFilePrefault(_w.File);
-            for (int i = 0; i < stages.Length; i++)
+            _executor.BeforeDirectProduct = weight =>
             {
-                read?.Enter(i);
-                foreach (Ltx25Weight w in stages[i])
-                {
-                    ct.ThrowIfCancellationRequested();
-                    if (_prefault != null && _warmed.Add(w)) _prefault.Warm(w.Data, w.FileOffset, w.Bytes);
-                    CudaQuantizedOps.PreloadQuantizedWeight(cuda, w.Data, w.Data, w.Format, w.Ne0, w.Ne1, w.Bytes);
-                }
-            }
-            if (read != null)
-            {
-                read.Stop();
-                Console.WriteLine($"  [ltx25] denoiser upload {read.Describe()}");
-            }
+                // The adapter's factors are host copies, not the checkpoint's pages.
+                if (weight is not Ltx25Weight w || w.FileOffset < 0) return;
+                int block = _w.BlockOf(w.Name);
+                if (block >= 0) _uploadRead?.Enter(block + 1);
+                if (_prefault != null && _warmed.Add(w)) _prefault.Warm(w.Data, w.FileOffset, w.Bytes);
+            };
+            _uploading = true;
+            return;
         }
-        else if (_allocator is MlxAllocator mlx)
-        {
+        if (_allocator is MlxAllocator mlx)
             foreach (Ltx25Weight w in _w.Projections)
                 if (MlxQuantizedOps.CanPreloadDirectFloatType(w.Format))
                     MlxQuantizedOps.PreloadDirectFloatWeight(mlx, w.Data, w.Data, w.Format, w.Ne0, w.Ne1, w.Bytes);
-        }
         _resident = true;
+    }
+
+    /// <summary>The end of a step that uploaded its projections: the hook goes, the read-ahead stops (its summary logged), and
+    /// the projections count as resident once a complete step ran (a partial one uploaded only its blocks).</summary>
+    private void EndUpload(bool complete)
+    {
+        if (!_uploading) return;
+        _executor.BeforeDirectProduct = null;
+        _uploading = false;
+        if (_uploadRead != null)
+        {
+            _uploadRead.Stop();
+            Console.WriteLine($"  [ltx25] denoiser upload {_uploadRead.Describe()}");
+            _uploadRead.Dispose();
+            _uploadRead = null;
+        }
+        _resident = complete;
     }
 
     /// <summary>Drop the device copy of the host bytes at <paramref name="data"/>: the CUDA and MLX resident-weight caches key
