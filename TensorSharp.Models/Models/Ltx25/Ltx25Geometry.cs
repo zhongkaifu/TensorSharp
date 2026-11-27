@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
+using System.Threading;
 
 namespace TensorSharp.Models.Ltx25;
 
@@ -83,27 +84,38 @@ public static class Ltx25Geometry
         }
         var cos = new float[checked(positions.Tokens * half)];
         var sin = new float[cos.Length];
-        Span<float> coordinates = stackalloc float[3];
-        for (int token = 0; token < positions.Tokens; ++token)
+        int nonfinite = 0;
+        // Every token's row depends only on its own coordinates, so blocks of tokens run on several cores with the same bits.
+        void Rows(int begin, int end)
         {
-            for (int axis = 0; axis < positions.Axes; ++axis)
+            Span<float> coordinates = stackalloc float[3];
+            for (int token = begin; token < end; ++token)
             {
-                int coordinateOffset = (token * positions.Axes + axis) * 2;
-                float coordinate = middle ? (positions.Boundaries[coordinateOffset] + positions.Boundaries[coordinateOffset + 1]) * .5f
-                    : positions.Boundaries[coordinateOffset];
-                float maximum = axis == 0 ? 20f : 2048f;
-                coordinates[axis] = coordinate / maximum * 2f - 1f;
-            }
-            for (int d = 0; d < pad; ++d) cos[token * half + d] = 1;
-            for (int index = 0; index < count; ++index)
-            for (int axis = 0; axis < positions.Axes; ++axis)
-            {
-                float angle = frequencies[index] * coordinates[axis];
-                if (!float.IsFinite(angle)) throw new ArgumentException("LTX rotary phase exceeds Float32 range.");
-                int offset = token * half + pad + index * positions.Axes + axis;
-                (sin[offset], cos[offset]) = MathF.SinCos(angle);
+                for (int axis = 0; axis < positions.Axes; ++axis)
+                {
+                    int coordinateOffset = (token * positions.Axes + axis) * 2;
+                    float coordinate = middle ? (positions.Boundaries[coordinateOffset] + positions.Boundaries[coordinateOffset + 1]) * .5f
+                        : positions.Boundaries[coordinateOffset];
+                    float maximum = axis == 0 ? 20f : 2048f;
+                    coordinates[axis] = coordinate / maximum * 2f - 1f;
+                }
+                for (int d = 0; d < pad; ++d) cos[token * half + d] = 1;
+                for (int index = 0; index < count; ++index)
+                for (int axis = 0; axis < positions.Axes; ++axis)
+                {
+                    float angle = frequencies[index] * coordinates[axis];
+                    if (!float.IsFinite(angle)) { Volatile.Write(ref nonfinite, 1); return; }
+                    int offset = token * half + pad + index * positions.Axes + axis;
+                    (sin[offset], cos[offset]) = MathF.SinCos(angle);
+                }
             }
         }
+        const int TokensPerBlock = 64;
+        if ((long)positions.Tokens * half <= 1 << 16) Rows(0, positions.Tokens);
+        else
+            System.Threading.Tasks.Parallel.For(0, (positions.Tokens + TokensPerBlock - 1) / TokensPerBlock,
+                block => Rows(block * TokensPerBlock, Math.Min(positions.Tokens, (block + 1) * TokensPerBlock)));
+        if (nonfinite != 0) throw new ArgumentException("LTX rotary phase exceeds Float32 range.");
         return new(positions.Tokens, heads, innerDim / heads, cos, sin);
     }
     private static void Validate(Ltx25PositionGrid positions)

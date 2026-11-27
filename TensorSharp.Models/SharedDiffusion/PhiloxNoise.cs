@@ -26,10 +26,21 @@ namespace TensorSharp.Models.SharedDiffusion
         {
             ArgumentOutOfRangeException.ThrowIfNegative(count);
             var result = new float[count];
+            // Every value depends only on its counter, so chunks of a large draw run on several cores with the same bits.
+            const int Chunk = 1 << 15;
+            if (count <= Chunk) Fill(result, 0, count, seed, stream, draw, first);
+            else
+                System.Threading.Tasks.Parallel.For(0, (count + Chunk - 1) / Chunk, chunk =>
+                    Fill(result, chunk * Chunk, Math.Min(Chunk, count - chunk * Chunk), seed, stream, draw, first));
+            return result;
+        }
+
+        private static void Fill(float[] result, int start, int length, long seed, ulong stream, uint draw, uint first)
+        {
             const float inv32 = 2.3283064e-10f;
             const float inv32Tau = inv32 * 6.2831855f;
             uint streamLow = (uint)stream, streamHigh = (uint)(stream >> 32);
-            for (int i = 0; i < count; i++)
+            for (int i = start; i < start + length; i++)
             {
                 uint a = draw, b = streamLow, c = first + (uint)i, d = streamHigh;
                 uint k0 = (uint)seed, k1 = (uint)((ulong)seed >> 32);
@@ -44,7 +55,6 @@ namespace TensorSharp.Models.SharedDiffusion
                 float v = (float)b * inv32Tau + inv32Tau / 2;
                 result[i] = (float)(Math.Sqrt(-2f * Math.Log(u)) * Math.Sin(v));
             }
-            return result;
         }
     }
 }
