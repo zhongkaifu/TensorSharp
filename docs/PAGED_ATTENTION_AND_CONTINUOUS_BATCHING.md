@@ -199,8 +199,7 @@ Key points:
 
 - **Declared capabilities, not exception probing.** Models declare what they
   can run via `IBatchedPagedModel` getters (`BatchedForwardAvailable`,
-  `SupportsBatchedMultimodal`, `SupportsPerSequenceFusedForward`,
-  `SupportsLinearKVMigration`, …) and the speculative-decoding interfaces
+  `SupportsBatchedMultimodal`, `SupportsPerSequenceFusedForward`, …) and the speculative-decoding interfaces
   (`HasDraftHead`, `SpeculationProfitable`, `SupportsBatchedSpecTrunk`).
   `ExecutionCapabilities.FromModel` snapshots them per step. A model's static
   limitation (Gemma 4 with MoE layers or a block-quantized KV cache, tensor
@@ -210,7 +209,8 @@ Key points:
   mechanism. `--no-continuous-batching` (`TS_SCHED_DISABLE_BATCHED=1`) switches
   every batched route off.
 - **Plan candidates are ordered and safe.** Declinable candidates
-  (`BatchedPaged` migration/refusal)
+  (`BatchedPaged`, which hands a sequence whose K/V lives only in its linear
+  cache to the per-sequence route, and which the model may refuse for a batch)
   fall through to the next entry; every plan ends in a path that cannot
   decline. `ExecutionPlannerTests` sweeps the capability/feature space to
   assert this invariant.
@@ -220,8 +220,10 @@ Key points:
   reasons — whenever the decision changes (e.g. a concurrency transition),
   so "why did this request not take the fast path?" is a logged fact.
 - **Path kinds** (`ExecutionPathKind`): `SpeculativePerSequence`,
-  `PerSequenceFused`, `MixedMultimodalSplit`, `SingleSequenceFused` (the N=1
-  fast path), `BatchedPaged`, `PerSequence`.
+  `PerSequenceFused`, `MixedMultimodalSplit`, `BatchedPaged`, `PerSequence`.
+  There is no separate N=1 path: a solo sequence takes `BatchedPaged` (or
+  `PerSequenceFused` when it already lives in a per-request cache or must take
+  ownership from another live sequence), with `PerSequence` behind it.
 
 ## Execution Paths
 
@@ -254,7 +256,7 @@ Which requests share a step, and how many tokens each forwards, decides which
 kernels run: ggml-cuda serves a quantized MXFP4 `mul_mat_id` with MMVQ for up to 7
 tokens on Turing and Ampere (8 on Volta, Ada and Blackwell) and with MMQ above that,
 and a sequence that arrives
-alone takes the solo fused path first. Those kernels agree only up to floating-point
+alone runs its first steps in a batch of one. Those kernels agree only up to floating-point
 near-ties, and greedy decoding turns a near-tie into a different continuation. A
 concurrent round whose arrival order is not fixed can therefore produce different
 tokens from run to run without any defect. Two runs that schedule the same batches
@@ -300,8 +302,8 @@ chain and passed before the fix too.
 
 After the fix, with `--conc-gate`, three passes gave bit-identical logits at every
 step of the 1-, 4- and 8-request rounds. Without the gate, one pass in three still
-changed the 8-request round. Its first request had been scheduled alone on the solo
-fused path before the other seven arrived. The first logits already differed at
+changed the 8-request round. Its first request had been scheduled alone on the legacy
+model's N=1 fused path (since removed) before the other seven arrived. The first logits already differed at
 that step (42.94 against 42.86), and the argmax flips came later, at margins of
 0.011-0.11. That is the near-tie class, and `compare.py` reports it without failing.
 

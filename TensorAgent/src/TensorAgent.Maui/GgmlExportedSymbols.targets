@@ -311,8 +311,6 @@
     <ReferenceNativeSymbol Include="TSGgml_NormF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NormGradF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForward" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardDevice" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardDeviceWithSinks" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PrefaultHostSpans" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PreloadQuantizedWeight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen21VisionEncoderF32" SymbolType="Function" />

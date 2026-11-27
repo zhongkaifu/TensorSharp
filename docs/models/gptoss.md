@@ -260,7 +260,15 @@ The legacy `GptOssModel` was removed after the validation in §11, with everythi
 - the paged attention with sinks (`TSGgml_PagedAttentionForwardWithSinks`, `ManagedPagedAttention.ForwardWithSinks`);
 - the MLX `gather_qmm` stacked-expert path and the MLX sink-decode, `swiglu_oai` bias-gather and biased weighted-sum
   kernels;
-- the K/V host reader of its linear-to-paged migration.
+- the K/V host reader of its linear-to-paged migration;
+- the direct-CUDA sink attention kernels (`TryAttentionSoftmaxWithSinks`, `TryGqaDecodeAttentionWithSinks`,
+  `TryGqaPrefillAttentionWithSinks`), the split `swiglu_oai` kernel (`TrySwiGluOaiSplit`) and the unused
+  `TryGqaDecodeAttentionRaw` / `TryGqaDecodeAttentionGgmlCuda` entries;
+- the GGML device paged attention (`TSGgml_PagedAttentionForwardDevice`, `TSGgml_PagedAttentionForwardDeviceWithSinks`;
+  the host `TSGgml_PagedAttentionForward` stays) and the MLX `gather_mm` / `gather_qmm` bindings;
+- in the scheduler, the linear-to-paged K/V migration (`SupportsLinearKVMigration`, `TryMigrateLinearKVToPaged`) and
+  what only it made reachable: the N=1 `SingleSequenceFused` path and the lone-page-producer hold. A solo sequence now
+  takes `BatchedPaged`, or `PerSequenceFused` on a per-request cache, as concurrent ones do.
 
 Its switches went too: `TS_GPTOSS_FUSED_DECODE_MAX_CTX`, `TS_GPTOSS_FUSED_ATTN_MAX_SEQ`, `TS_GPTOSS_PREFILL_F16` and
 `TS_GPTOSS_PREFILL_CHUNK` (prompt steps follow `TS_PREFILL_CHUNK`, and the rings cap a step at 512 rows). Setting one
@@ -475,8 +483,9 @@ the CLI's benchmark, ABBA-ordered:
 ## 13. Optimization opportunities
 
 - **Direct-CUDA prompt attention with sinks.** A sink layer's prompt attention runs on the generic products. A flash
-  kernel with the sink in its softmax would close most of the gap to ggml_cuda's prefill. The CUDA kernels
-  `TryGqaPrefillAttentionWithSinks` / `TryGqaDecodeAttentionWithSinks` exist but are not wired to the executor's rings.
+  kernel with the sink in its softmax would close most of the gap to ggml_cuda's prefill. The legacy model's sink
+  kernels were never wired to the executor's rings and were removed with it, so this needs a sink operand on the
+  ring-aware flash kernels.
 - **Recorded decode past the window on direct CUDA.** Recording the ring's floor as an input would let those steps replay.
 - **Direct-CUDA offloaded prompts.** gpt-oss-20b's 2880-wide experts take the grouped MoE engine's warp-per-row route
   (2880 is neither a multiple of 128 nor of 256). A tensor-core route for that width would serve the offloaded and

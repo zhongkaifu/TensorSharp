@@ -244,8 +244,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// <see cref="ExecutionPlan"/> — an ordered candidate chain plus the
         /// reasons rejected paths were rejected. The executor then runs the
         /// first candidate that accepts the step; declinable candidates
-        /// (MTP arming/continuity, linear→paged migration, a model refusing a
-        /// specific batch) fall through to the next entry in the chain, whose
+        /// (MTP arming/continuity, a sequence whose K/V lives only in the linear
+        /// cache, a model refusing a specific batch) fall through to the next entry in the chain, whose
         /// last entry (<see cref="ExecutionPathKind.PerSequence"/>) never
         /// declines.
         ///
@@ -290,15 +290,11 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     // The scheduler freed the previous owner's blocks during
                     // FinishSequence / PreemptSequence, but our _currentOwner
-                    // reference outlives that. Without this reset, the next
-                    // step's TryPrepareSequencesForPagedIfNeeded would call into
-                    // TryMigrateLinearKVToPaged with NumBlocks==0 (it returns
-                    // false and the executor logs a misleading "linear→paged
-                    // migration failed" warning), and EnsureOwnership on the
-                    // new sequence would try to extract state out of the dead
-                    // owner. Treat anything that's not Running as "no owner";
-                    // the model's linear cache will be reset cleanly when the
-                    // new sequence claims ownership.
+                    // reference outlives that. Without this reset,
+                    // EnsureOwnership on the new sequence would try to extract
+                    // state out of the dead owner. Treat anything that's not
+                    // Running as "no owner"; the model's linear cache will be
+                    // reset cleanly when the new sequence claims ownership.
                     if (_currentOwner != null && _currentOwner.Status != SequenceStatus.Running)
                     {
                         _currentOwner = null;
@@ -604,11 +600,8 @@ namespace TensorSharp.Runtime.Scheduling
             switch (path)
             {
                 case ExecutionPathKind.SpeculativePerSequence:
-                case ExecutionPathKind.SingleSequenceFused:
-                    // Both run the per-sequence executor; the plan kinds
-                    // differ only in WHY the route was chosen (linear-trunk
-                    // speculation, N=1 fused fast path, universal fallback),
-                    // which the plan log already records.
+                    // The per-sequence executor; linear-trunk speculation
+                    // runs on it.
                     return ExecuteStepPerSequence(output);
 
                 case ExecutionPathKind.PerSequence:
@@ -646,11 +639,9 @@ namespace TensorSharp.Runtime.Scheduling
             var textOutput = MakeSubOutput(textWork);
 
             // Run the declinable text batch before committing any multimodal
-            // per-sequence work. If the current linear owner participates in
-            // that text batch, copy it to paged storage but keep the linear
-            // owner authoritative until ForwardBatch accepts. A decline can
-            // then fall back on the complete linear tail; a failed migration
-            // likewise falls back before either subset advances.
+            // per-sequence work. A text sequence whose K/V lives only in the
+            // linear cache sends the subset to the linear/paged split before
+            // either subset advances.
             if (!TryPrepareSequencesForPagedIfNeeded(
                     batched,
                     textOutput,
@@ -671,7 +662,6 @@ namespace TensorSharp.Runtime.Scheduling
                 results.AddRange(ExecuteStepBatched(batched, textOutput));
                 foreach (var work in textWork)
                     work.Sequence.KvStateInPagedStorage = true;
-                CommitPreparedSequencesToPaged(linearFallbackSequences);
             }
             catch (NotSupportedException ex)
             {
@@ -690,36 +680,23 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         /// <summary>Batched paged dispatch (vLLM-style ForwardBatch). Returns
-        /// null (declining the step to the plan's next candidate) when the
-        /// owner's linear-to-paged migration fails or the model refuses this
-        /// specific batch with NotSupportedException.</summary>
+        /// null (declining the step to the plan's next candidate) when every
+        /// sequence can take the per-sequence route after a sequence's
+        /// linear-only K/V or the model's NotSupportedException kept the step
+        /// off ForwardBatch.</summary>
         private List<SequenceStepResult>? TryExecuteStepBatchedPaged(
             IBatchedPagedModel batched, SchedulerOutput output)
         {
-            // Before dispatching through ForwardBatch, make sure any sequence
-            // whose K/V history only lives in the linear cache (because it was
-            // being served by the N=1 fast path, or by a previous step that
-            // fell back to per-seq) is migrated into paged storage. Without
-            // this the batched paged-attention kernel would read zeros for the
-            // owner's prior positions and the sequence would emit a
-            // token-repeat loop.
+            // A sequence whose K/V history lives only in the linear cache (a
+            // previous step served it per sequence) cannot join ForwardBatch:
+            // the batched paged-attention kernel would read zeros for its
+            // prior positions and the sequence would emit a token-repeat loop.
+            // It is served where the linear cache is authoritative.
             if (!TryPrepareSequencesForPagedIfNeeded(
                     batched,
                     output,
                     out var linearFallbackSequences))
             {
-                // Migration was needed but couldn't proceed: either the model
-                // supports migration and it failed for this owner (worth
-                // flagging so we can diagnose), or the model never exposed
-                // migration and the owner accumulated linear-only state
-                // (expected, not a failure; serve via per-seq where the linear
-                // cache is still authoritative).
-                if (batched.SupportsLinearKVMigration)
-                {
-                    _logger.LogWarning(
-                        "BatchExecutor: linear-to-paged migration failed for {EngineRequestId}; falling back to per-seq path.",
-                        _currentOwner?.RequestId);
-                }
                 return ExecuteLinearAndPagedSplit(
                     batched, output, linearFallbackSequences);
             }
@@ -729,11 +706,9 @@ namespace TensorSharp.Runtime.Scheduling
                 var results = ExecuteStepBatched(batched, output);
                 // Any sequence that just ran through the batched path now has
                 // its K/V in paged storage; sticky-mark it so future steps
-                // don't try to send it back through the linear-cache-only N=1
-                // fast path.
+                // keep it off the linear-cache-only routes.
                 foreach (var work in output.ScheduledWork)
                     work.Sequence.KvStateInPagedStorage = true;
-                CommitPreparedSequencesToPaged(linearFallbackSequences);
                 return results;
             }
             catch (NotSupportedException ex)
@@ -770,19 +745,12 @@ namespace TensorSharp.Runtime.Scheduling
             _logger.LogInformation("BatchExecutor execution plan: {Plan}", desc);
         }
 
-        /// <summary>Prepare every scheduled sequence whose authoritative K/V is
-        /// linear-only for an upcoming paged batch. This includes the current
-        /// live owner even when its sticky paged flag is still true: a prior
-        /// per-sequence step may have appended a partial tail only to linear K/V.
-        ///
-        /// A non-current linear sequence is first restored from its pooled
-        /// snapshot and then migrated. Migrations are copy-only; no sticky flag
-        /// or ownership state is committed until ForwardBatch accepts, so a
-        /// decline can still restore/swap the complete linear histories.
-        /// <paramref name="linearFallbackSequences"/> records exactly those
-        /// sequences whose state is safe to serve through Forward after a
-        /// decline. Already-paged sequences are deliberately absent because
-        /// model-owned paged arrays are not the same storage as BlockPool.</summary>
+        /// <summary>Whether every scheduled sequence can join a paged batch: false where one's authoritative K/V is
+        /// linear-only, the current live owner included even when its sticky paged flag is still true (a prior
+        /// per-sequence step may have appended a partial tail only to linear K/V). The first such sequence, the live
+        /// owner only when no other is, is recorded in <paramref name="linearFallbackSequences"/>: its state is safe to
+        /// serve through Forward. Already-paged sequences are deliberately absent because model-owned paged arrays are
+        /// not the same storage as BlockPool.</summary>
         private bool TryPrepareSequencesForPagedIfNeeded(
             IBatchedPagedModel batched,
             SchedulerOutput output,
@@ -792,55 +760,19 @@ namespace TensorSharp.Runtime.Scheduling
             if (output == null || output.ScheduledWork.Count == 0)
                 return true;
 
-            SequenceState? initialOwner = _currentOwner;
-            var candidates = new List<SequenceState>();
+            SequenceState? owner = _currentOwner, linearOnly = null;
             foreach (var work in output.ScheduledWork)
             {
                 var seq = work.Sequence;
-                if (seq.NumComputedTokens <= 0)
+                if (seq.NumComputedTokens <= 0 || (seq.KvStateInPagedStorage && !ReferenceEquals(seq, owner)))
                     continue;
-                if (seq.KvStateInPagedStorage && !ReferenceEquals(seq, initialOwner))
-                    continue;
-                if (!candidates.Contains(seq))
-                    candidates.Add(seq);
+                if (linearOnly == null || ReferenceEquals(linearOnly, owner))
+                    linearOnly = seq;
             }
-
-            // Restore/migrate the original owner last. That leaves its live
-            // linear tail resident if the declinable batch refuses the step.
-            candidates.Sort((left, right) =>
-            {
-                bool leftIsOwner = ReferenceEquals(left, initialOwner);
-                bool rightIsOwner = ReferenceEquals(right, initialOwner);
-                return leftIsOwner == rightIsOwner ? 0 : leftIsOwner ? 1 : -1;
-            });
-
-            foreach (var seq in candidates)
-            {
-                linearFallbackSequences.Add(seq);
-                if (!batched.SupportsLinearKVMigration)
-                    return false;
-
-                if (!ReferenceEquals(_currentOwner, seq))
-                {
-                    // Without a portable snapshot there is no way to make a
-                    // non-current linear history resident for migration.
-                    if (!_model.SupportsKVStateSnapshot
-                        || !_model.SupportsCrossSequenceKvReuse)
-                    {
-                        return false;
-                    }
-                    EnsureOwnership(seq);
-                }
-
-                if (!ReferenceEquals(_currentOwner, seq)
-                    || _ownerTokensInModel < seq.NumComputedTokens
-                    || !batched.TryMigrateLinearKVToPaged(seq, _blockSize))
-                {
-                    return false;
-                }
-            }
-
-            return true;
+            if (linearOnly == null)
+                return true;
+            linearFallbackSequences.Add(linearOnly);
+            return false;
         }
 
         /// <summary>After a multi-sequence ForwardBatch decline, serve only
@@ -938,30 +870,12 @@ namespace TensorSharp.Runtime.Scheduling
             return ExecuteStepPerSequence(output);
         }
 
-        /// <summary>Commit a successful linear-to-paged handoff after the model
-        /// accepts the batched step. Before this point the live linear owner
-        /// remains authoritative for a runtime decline.</summary>
-        private void CommitPreparedSequencesToPaged(
-            HashSet<SequenceState> linearFallbackSequences)
-        {
-            if (_currentOwner != null && linearFallbackSequences.Contains(_currentOwner))
-                ClearLinearOwner();
-        }
-
         /// <summary>Give <paramref name="seq"/> its own copy of logits it may be
         /// borrowing from the model's reusable output buffer.</summary>
         private static void DetachBorrowedLogits(SequenceState? seq)
         {
             if (seq?.LastLogits != null)
                 seq.LastLogits = (float[])seq.LastLogits.Clone();
-        }
-
-        private void ClearLinearOwner()
-        {
-            _currentOwner = null;
-            _ownerTokensInModel = 0;
-            _ownerForwardedTokens = 0;
-            _liveCacheValid = false;
         }
 
         private bool _speculationRefusedWarned;
@@ -5346,29 +5260,6 @@ namespace TensorSharp.Runtime.Scheduling
         /// the model's batched kernels never see them. Set true once the
         /// per-batch position-table + embedding-inject plumbing is in place.</summary>
         bool SupportsBatchedMultimodal => false;
-
-        /// <summary>True iff the model implements
-        /// <see cref="TryMigrateLinearKVToPaged"/> for transitioning a
-        /// sequence that has run through the N=1 fast path (which writes
-        /// only to the linear KV cache) over to the paged storage
-        /// that <see cref="ForwardBatch"/> reads from. When false, the
-        /// executor must not use the N=1 fast path for this model — a
-        /// later second-sequence arrival would corrupt the first
-        /// sequence's attention.</summary>
-        bool SupportsLinearKVMigration => false;
-
-        /// <summary>Copy the given sequence's K/V history out of the
-        /// linear KV cache (whatever per-model layout <c>Forward</c> writes)
-        /// and into paged storage at slots derived from
-        /// <c>owner.BlockTable</c> with the given block size. The model
-        /// must be the one holding the linear state right now (i.e. this
-        /// is called when the executor's <c>_currentOwner == owner</c>).
-        ///
-        /// Returns true on success. Returning false (or returning false
-        /// from <see cref="SupportsLinearKVMigration"/>) tells the
-        /// executor to keep the sequence on the per-seq path instead of
-        /// dispatching it through <see cref="ForwardBatch"/>.</summary>
-        bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => false;
 
         /// <summary>Notify the model that a sequence has been released by
         /// the scheduler (finished, aborted, errored, or preempted) so any

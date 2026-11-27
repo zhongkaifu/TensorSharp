@@ -4805,6 +4805,19 @@ TSG_EXPORT int TSGgml_TestUndrainedCacheReleases()
     return g_test_undrained_cache_releases.load(std::memory_order_relaxed);
 }
 
+// Diagnostic only: marks GPU work pending for the barrier, as an op whose result
+// is still queued (a graph's on Metal with async compute) leaves it, so a test can
+// drive the releases that must wait for the barrier on a backend that queues
+// nothing itself. Returns 0 when no backend is available.
+TSG_EXPORT int TSGgml_TestMarkPendingGpuWork()
+{
+    clear_last_error();
+    if (!ensure_backend())
+        return 0;
+    mark_pending_gpu_work();
+    return 1;
+}
+
 // Diagnostic only: places a two-node graph of `elements` floats per tensor with
 // one of the shared allocators every op draws on, the retained compute buffer
 // (gallocr == 0) or the retained gallocr (gallocr != 0). A graph larger than any

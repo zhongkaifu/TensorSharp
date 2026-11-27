@@ -343,8 +343,7 @@ TensorSharp/
 ├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
 │   ├── Models/<Family>/         # 每个架构一个目录（DeepSeek4、DiffusionGemma、Gemma4、GlmDsa、GptOss、HunyuanDense、Ltx25、MiniMaxH3、Mistral3、MuseGlimmer、MuseSpark、Nemotron、Qwen35、Qwen4Exp、QwenImage、QwenImage21、WanVideo）
 │   │   ├── <Family>Architecture.cs         # 在 Architecture/BuiltInArchitectures.cs 中登记的插件描述符
-│   │   ├── <Family>Model.cs                # 旧的单序列 ModelBase 实现
-│   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch —— 批处理/分页路径（Mistral3、Gemma4、HunyuanDense、Qwen35）
+│   │   └── <Family>Model.cs / <Family>RuntimeModel.cs # ModelBase 实现：Gemma4、GptOss、HunyuanDense、Inkling2、Lfm3、Mistral3、MuseGlimmer、Nemotron、Qwen35、Qwen3VL、Raon 运行在共享解码运行时上（`SharedDecoder/StandardDecoderModel`，在每个执行器上每步一个图程序，含批处理与每请求路径）；其余家族使用自己的执行器
 │   ├── Models/DeepSeek4/        # DeepSeek V4 Flash 与 V4.1 Flash（DeepSeek41Architecture / DeepSeek41Model，含其视觉伴随模块）：使用整模型执行器而非逐算子前向
 │   │   ├── DeepSeek4Model.cs               # GGUF 元数据、分词器、聊天模板、执行器选择
 │   │   ├── DeepSeek4CudaExecutor.cs        # 对接 Direct CUDA 整模型引擎
@@ -385,14 +384,10 @@ TensorSharp/
 │   ├── ggml_ops_cuda_vmm_peer_guard.cpp   # Linux `--wrap=cuMemSetAccess` 保护层：CUDA 的 8 个 peer 上限拒绝授权时，让 ggml-cuda 的 VMM 临时内存池只归其所属 GPU（ctest `cuda-vmm-peer-guard`）
 │   ├── ggml_ops_muse_spark{,_attention}.cpp # Muse Spark 逐算子路径：Q/K 预处理、norm/gate 与 post-norm 残差图、显式 F32 的 CUDA 注意力
 │   ├── ggml_ops_dsv4_fused.cu / _cpu.cpp  # DeepSeek V4 在 ggml-cuda 流上的融合自定义算子（及其 CPU 版本）
-│   ├── ggml_ops_gemma4_decode.cpp         # Gemma 4 稠密整模型 decode（CUDA graph 持久化）
-│   ├── ggml_ops_gemma4_batched.cpp        # Gemma 4 稠密 + MoE 按 token 批量 decode
-│   ├── ggml_ops_gemma4_verify.cpp         # Gemma 4 稠密 verify + MTP 草稿步
-│   ├── ggml_ops_gemma4_moe.cpp            # Gemma 4 MoE 层/整模型 decode 与 verify
 │   ├── ggml_ops_moe.cpp                   # 专家混合前向 / 融合路由
 │   ├── ggml_ops_gated_delta_net.cpp       # Qwen 3.5/3.6 GatedDeltaNet 内核（按序列 + 批处理）
 │   ├── ggml_ops_bonsai.cpp                # Bonsai2 PRISM 带符号 Hadamard（FWHT）变换，包裹其 matmul 与按行取数
-│   ├── ggml_ops_paged_attention.cpp       # 分页注意力原生内核（驱动 ggml_flash_attn_ext + sinks 变体）
+│   ├── ggml_ops_paged_attention.cpp       # 分页注意力原生内核（主机端 block table，驱动 ggml_flash_attn_ext）
 │   ├── ggml_ops_tensor_parallel.cpp       # 多 rank TP 组、分段融合计算图执行、集合通信
 │   ├── ggml_ops_tp_probe.cu               # 选择 TP 传输方式的 peer-copy / NCCL AllReduce 预检
 │   ├── ggml_ops_diffusion.cpp             # DiffusionGemma 融合 decode-layer / 整模型 / lm-head 内核
@@ -650,7 +645,7 @@ span 记账、前缀裁剪、截断、切片——并且不再出现任何模型
 - **原生量化计算**：量化权重（Q4_K_M、Q6_K、Q8_0、IQ2_XXS、MXFP4、NVFP4 等）直接参与 matmul，无需展开为 FP32，节省内存与带宽。批量 `AddmmQuantBatch` 内核可在一次调度内完成对同一量化权重块的多个子矩阵 matmul。
 - **Direct CUDA 内核**：`cuda` 后端加速 fill/copy、unary ops、融合激活、RMSNorm、softmax、index select、因果掩码、RoPE/RoPEEx、cuBLAS GEMM，以及受支持的量化 matmul/get-rows；未覆盖算子会安全回退。
 - **批量 GPU MoE**：`MoEExpertsSwiGLUResidual`（Qwen 3.5/3.6-family）将每个 MoE 层中所有被选中的专家——以及可选的 shared expert 与残差加法——合并为一次 GGML 计算图调度。Nemotron-H 在共享解码运行时上以 `ggml_mul_mat_id` 乘积的形式在每一步的图中运行路由专家。
-- **整模型融合 decode 计算图**（Gemma 4 dense + MoE、Qwen 3.5/3.6）：一个 decode token 的全部计算——每一层、MoE 路由与专家、最终 norm 与 LM head——作为**一次** GGML 计算图提交，而不是每层一次。在 CUDA/Vulkan 上该图只构建一次、张量地址保持稳定后反复重放（KV 写入用 `ggml_set_rows`、行号作为 I64 输入；注意力窗口按 stride 补齐、掩码作为 F16 输入），这正是 ggml-cuda 能把它捕获成 CUDA 图的前提。GPT OSS 不再使用这种图：它在每个执行器上运行共享解码运行时的整前向计算图（见 [docs/models/gptoss_zh-cn.md](docs/models/gptoss_zh-cn.md)）。补齐的注意力窗口必须清零而不能留作未初始化——残留显存按 F16 解读会产生能穿过 `-inf` 掩码的 NaN。
+- **整前向步计算图**（共享解码运行时：Gemma 4、GPT OSS、Qwen 3.5/3.6、Nemotron-H、Mistral 3 以及其他 `StandardDecoderModel` 家族）：一步的全部计算——每一层、MoE 路由与专家、最终 norm 与 LM head——是一个图程序，GGML 图构建器把它作为**一次** GGML 计算图提交，而不是每层一次。decode 步按索引写入 K/V（`set_rows`），并在掩码下读取按桶补齐的注意力窗口，因此同一个桶内的每个 token 都有相同的图签名并重放缓存的图，这正是 ggml-cuda 能把它捕获成 CUDA 图的前提（见 [docs/design/unified-execution.md](docs/design/unified-execution.md)）。补齐的注意力窗口必须清零，而不能保留未初始化内容——以 F16 读出的残留显存会产生 NaN，且 `-inf` 掩码也消除不了。
 - **GLM 5.x 整模型执行器**：`glm-dsa` 是同样的形态。原生 ggml 执行器（`ggml_ops_glm_dsa.cpp`）自行加载分片 GGUF（GLM-5.2 为六个分片，GLM-5.3 的 UD-Q2_K_XL 为七个），并持有 MLA 缓存（每层每 token 一行 576 宽，逐 head 的 K/V 解压被折进 query 和输出）以及 DSA lightning indexer 缓存——78 层里只有 21 层会刷新它。它既可以按层切分到各张可见 GPU，也可以在 `--tp N` 下让每一层跑在每个 rank 上：注意力 head 按列/行并行，路由专家则在**每个专家内部**按行切开，因为 `ggml_mul_mat_id` 要求同一个 token 选中的专家 id 互不相同。并发靠原生序列 slot 而不是分页 KV，在其之上默认启用批量融合 decode（`TS_BATCHED_FUSED_DECODE=0` 可关闭）。`TensorSharp.Models/Models/GlmDsa/` 里是原生路径用来对照的托管逐算子参考实现。末尾的 NextN 块（`blk.78`）在 `--spec` 下驱动 [MTP 投机解码](docs/models/glm_zh-cn.md#nextn--mtp-投机解码)：主干图多输出一个 `h_nextn`，第二张图运行草稿块；该块只在请求了投机时才加载，因为它是一整层额外的解码层，会与 KV 缓存争用显存。
 - **DeepSeek V4 整模型执行器**：`deepseek4` 完全绕开通用的逐算子前向。原生 ggml 执行器（`ggml_ops_deepseek4.cpp`）自行加载分片 GGUF，把权重按层切分到 `--layer-split N` 指定的 GPU 上（默认单设备），在设备上持有全部 DSV4 KV 状态（原始 SWA 环、CSA/HCA 压缩 K 缓存、lightning indexer 缓存、压缩器状态环），并把每个 prefill/decode ubatch 作为一张 `ggml_backend_sched` 计算图执行，配合按形状签名的图缓存，使稳态 decode 直接重放已捕获的 CUDA 图。decode 注意力通过融合的 index-gather 算子取出紧凑的 `[ring | top-512]` K，而不是扫描整个上下文。Direct CUDA 引擎（`TensorSharp.Backends.Cuda/Dsv4/`）在不依赖 ggml 的前提下实现同一模型，把量化权重从分片直接流式写入按设备的显存竞技场。二者都构建在共享的 `Tensor` / `IAllocator` / `Ops` 之上；只有真正 DSV4 特有的计算才留在 DeepSeek V4 的文件里。
 - **DSpark 块级投机解码**（DeepSeek V4）：独立的草稿 GGUF（`--draft-model`）每步提议一整块 token，主干用一次批量前向验证整块。在 ggml 上草稿器就是计算图里额外的三层，其 key ring 由主干图自己提交，因此投机不产生任何主机往返。4×A40 实测 decode 提速 1.3–1.4×（多轮对话最高 2.0×），贪心输出与非投机基线逐字节一致。

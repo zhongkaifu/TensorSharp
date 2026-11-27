@@ -797,10 +797,11 @@ TSG_EXPORT int TSGgml_HostExpertRowsAct(const void* gate, const void* up, const 
     return tsg::host_moe_decode_experts_rows(hm, x, ids, weights, out, skip, nullptr) ? 1 : 0;
 }
 
-// GPT-OSS's biased experts on the host: gate and up products plus each expert's biases, ggml_swiglu_oai at alpha and limit,
-// the down product plus its bias, weighted (ggml's CPU evaluation of an offloaded layer, moe_ffn_host_experts: the biases
-// leave the decode kernel out). Biases F32 [n_ff, num_experts] (gate, up) and [hidden, num_experts] (down). A skipped slot
-// (skip[k] != 0, or a negative id) contributes nothing: its weight is 0. Returns 1 when out[rows, hidden] was written.
+// GPT-OSS's biased experts on the host, on the one-token decode kernel (independent rows, no ggml backend needed: the
+// tensor executors' expert host): gate and up products plus each expert's biases, ggml_swiglu_oai at alpha and limit, the
+// down product plus its bias (left out where down_bias is null), weighted. Biases F32 [n_ff, num_experts] (gate, up) and
+// [hidden, num_experts] (down). A skipped slot (skip[k] != 0, or a negative id) contributes nothing. Returns 1 when
+// out[rows, hidden] was written, 0 (nothing written) for a layout the decode kernel does not take.
 TSG_EXPORT int TSGgml_HostExpertRowsOai(const void* gate, const void* up, const void* down,
                                         int gate_type, int up_type, int down_type,
                                         int num_experts, int hidden, int n_ff, int n_used, int rows,
@@ -825,27 +826,18 @@ TSG_EXPORT int TSGgml_HostExpertRowsOai(const void* gate, const void* up, const 
     const std::int64_t gate_bytes = (std::int64_t)(ggml_row_size((ggml_type)gate_type, hidden) * (std::size_t)n_ff) * num_experts;
     const std::int64_t up_bytes = (std::int64_t)(ggml_row_size((ggml_type)up_type, hidden) * (std::size_t)n_ff) * num_experts;
     const std::int64_t down_bytes = (std::int64_t)(ggml_row_size((ggml_type)down_type, n_ff) * (std::size_t)hidden) * num_experts;
-    {
-        // Independent rows on the one-token decode kernel (no ggml backend needed: the direct CUDA engine's expert host).
-        tsg::HostMoeSegment hm;
-        hm.gate_data = const_cast<void*>(gate); hm.up_data = const_cast<void*>(up); hm.down_data = const_cast<void*>(down);
-        hm.gate_type = gate_type; hm.up_type = up_type; hm.down_type = down_type;
-        hm.gate_ne0 = hidden; hm.gate_ne1 = n_ff; hm.up_ne0 = hidden; hm.up_ne1 = n_ff; hm.down_ne0 = n_ff; hm.down_ne1 = hidden;
-        hm.gate_bytes = gate_bytes; hm.up_bytes = up_bytes; hm.down_bytes = down_bytes;
-        hm.gate_bias = gate_bias; hm.up_bias = up_bias; hm.down_bias = down_bias;
-        hm.activation = 1; hm.oai_alpha = alpha; hm.oai_limit = limit;
-        hm.num_experts = num_experts; hm.n_used = n_used; hm.seq_len = rows; hm.independent_decode_rows = true;
-        hm.hidden = hidden; hm.n_ff = n_ff;
-        std::vector<std::uint8_t> skips(routes, 0);
-        for (std::size_t i = 0; i < routes; i++) skips[i] = slot_weights[i] == 0.0f && slot_ids[i] == 0 ? 1 : 0;
-        if (tsg::host_moe_decode_experts_rows(hm, x, slot_ids.data(), slot_weights.data(), out, skips.data(), nullptr))
-            return 1;
-    }
-    return tsg::moe_ffn_host_experts(x, out, rows, hidden, n_ff, num_experts, n_used, slot_ids.data(), slot_weights.data(),
-               const_cast<void*>(gate), gate_type, hidden, n_ff, gate_bytes,
-               const_cast<void*>(up), up_type, hidden, n_ff, up_bytes,
-               const_cast<void*>(down), down_type, n_ff, hidden, down_bytes,
-               gate_bias, up_bias, down_bias, 1, alpha, limit, /*allow_device_stream=*/ false) ? 1 : 0;
+    tsg::HostMoeSegment hm;
+    hm.gate_data = const_cast<void*>(gate); hm.up_data = const_cast<void*>(up); hm.down_data = const_cast<void*>(down);
+    hm.gate_type = gate_type; hm.up_type = up_type; hm.down_type = down_type;
+    hm.gate_ne0 = hidden; hm.gate_ne1 = n_ff; hm.up_ne0 = hidden; hm.up_ne1 = n_ff; hm.down_ne0 = n_ff; hm.down_ne1 = hidden;
+    hm.gate_bytes = gate_bytes; hm.up_bytes = up_bytes; hm.down_bytes = down_bytes;
+    hm.gate_bias = gate_bias; hm.up_bias = up_bias; hm.down_bias = down_bias;
+    hm.activation = 1; hm.oai_alpha = alpha; hm.oai_limit = limit;
+    hm.num_experts = num_experts; hm.n_used = n_used; hm.seq_len = rows; hm.independent_decode_rows = true;
+    hm.hidden = hidden; hm.n_ff = n_ff;
+    std::vector<std::uint8_t> skips(routes, 0);
+    for (std::size_t i = 0; i < routes; i++) skips[i] = slot_weights[i] == 0.0f && slot_ids[i] == 0 ? 1 : 0;
+    return tsg::host_moe_decode_experts_rows(hm, x, slot_ids.data(), slot_weights.data(), out, skips.data(), nullptr) ? 1 : 0;
 }
 
 // The same for Nemotron-H's one-projection experts: relu(s up)^2, then down; `up` is the up stack (n_ff rows an expert),

@@ -428,10 +428,6 @@ namespace TensorSharp.Runtime.Scheduling
             int admissibleWaiting = CountEpochWaiting(
                 Math.Max(0, _cfg.MaxNumRunningSequences - _running.Count));
             int prefillCandidatesRemaining = prefillSnapshot.Count + admissibleWaiting;
-            // The lone prompt step whose page the waiting requests sharing its prefix wait for
-            // (LonePagePublishBoundary), and where that step ends.
-            SequenceState? pageProducer = null;
-            int pageProducerEnd = 0;
 
             for (int i = 0; i < prefillSnapshot.Count; i++)
             {
@@ -449,21 +445,15 @@ namespace TensorSharp.Runtime.Scheduling
 
                 int promptUncomputed = Math.Max(
                     0, seq.PromptTokens.Count - seq.NumComputedTokens);
-                // The only prompt running, with nothing decoding: the waiters it would hold
-                // back (phase 3) are no contenders, so it takes a lone prompt's step.
-                int pageBoundary = !hasActiveDecode && _running.Count == 1 && prefillSnapshot.Count == 1
-                    ? LonePagePublishBoundary(seq) : 0;
-                bool lone = noContention || pageBoundary > 0;
                 int cap = GetPrefillCap(
-                    lone, hasActiveDecode, tokenBudget,
+                    noContention, hasActiveDecode, tokenBudget,
                     prefillCandidatesRemaining, soloPrefillCap);
-                if (lone) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
+                if (noContention) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
                 int desired = Math.Min(promptUncomputed, cap);
                 int want = Math.Min(desired, Math.Min(tokenBudget, mixedPrefillLeft));
                 want = RunTinyRemainder(seq, want, desired, tokenBudget);
                 want = AlignRecurrentPrefillBoundary(seq, want, promptUncomputed);
                 want = AlignSharedPrefixBoundary(seq, want);
-                want = CutAtBoundary(seq, want, pageBoundary);
                 if (want <= 0)
                 {
                     _nextPrefillRequestId = MixedPrefillResumePoint(seq, firstPrefillServed, firstPrefillTokens, mixedPrefillLeft);
@@ -475,8 +465,6 @@ namespace TensorSharp.Runtime.Scheduling
                 prefillCandidatesRemaining = Math.Max(0, prefillCandidatesRemaining - 1);
                 if (scheduled)
                 {
-                    if (pageBoundary > 0)
-                        NotePageProducer(seq, want, ref pageProducer, ref pageProducerEnd);
                     mixedPrefillLeft -= want;
                     if (firstPrefillServed == null)
                     {
@@ -551,8 +539,7 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     _radixCache!.PrimaryAvailable = _running.Count == 0 && output.ScheduledWork.Count == 0;
                     int length = _prefixCacheLcp?.Invoke(seq) ?? 0;
-                    if (WaitForScheduledPublicCheckpoint(seq, output, length)
-                        || WaitForLonePageProducer(seq, length, pageProducer, pageProducerEnd))
+                    if (WaitForScheduledPublicCheckpoint(seq, output, length))
                     {
                         // The producer is already scheduled to advance this step.
                         // Let its prefill publish the longer common prefix before
@@ -597,11 +584,6 @@ namespace TensorSharp.Runtime.Scheduling
                     promptUncomputed = 1;
                 }
 
-                // The first prompt of an idle engine, when the requests behind it share its
-                // prefix and only its lone step can publish it: they wait (above), so it takes
-                // a lone prompt's step, cut where the prefix they share ends.
-                int pageBoundary = !decodesFirst && pageProducer == null && _running.Count == 0 && output.ScheduledWork.Count == 0
-                    ? LonePagePublishBoundary(seq) : 0;
                 int desired, want;
                 if (decodesFirst)
                 {
@@ -609,17 +591,15 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 else
                 {
-                    bool lone = noContention || pageBoundary > 0;
                     int cap = GetPrefillCap(
-                        lone, hasActiveDecode, tokenBudget,
+                        noContention, hasActiveDecode, tokenBudget,
                         Math.Max(1, prefillCandidatesRemaining), soloPrefillCap);
-                    if (lone) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
+                    if (noContention) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
                     desired = Math.Min(promptUncomputed, cap);
                     want = Math.Min(desired, Math.Min(tokenBudget, mixedPrefillLeft));
                     want = RunTinyRemainder(seq, want, desired, tokenBudget);
                     want = AlignRecurrentPrefillBoundary(seq, want, promptUncomputed);
                     want = AlignSharedPrefixBoundary(seq, want);
-                    want = CutAtBoundary(seq, want, pageBoundary);
                 }
                 if (want <= 0) break;
 
@@ -643,8 +623,6 @@ namespace TensorSharp.Runtime.Scheduling
 
                 bool isPrefill = !decodesFirst && (want > 1 || promptUncomputed > 0);
                 output.ScheduledWork.Add(new ScheduledSequenceWork(seq, want, true, isPrefill));
-                if (pageBoundary > 0)
-                    NotePageProducer(seq, want, ref pageProducer, ref pageProducerEnd);
                 tokenBudget -= want;
                 if (isPrefill)
                     mixedPrefillLeft -= want;
@@ -728,119 +706,6 @@ namespace TensorSharp.Runtime.Scheduling
                     return true;
             return false;
         }
-
-        // -------------------------------------------------------------- lone page producers
-        //
-        // A family whose only reuse across requests is its pages, written by a lone forward
-        // alone (PrefixCacheCoordinator.PagesNeedLoneForward: Nemotron-H's recurrent pages hold
-        // the Mamba2 state only where a per-sequence Forward ended, and a step of two prompts
-        // runs batched, publishing nothing). Before this, requests that shared a system prompt
-        // shared it only when the first happened to reach an idle engine alone: when two or more
-        // arrived before the engine's next step - as a warm server's concurrent burst always does
-        // - they were admitted together, each forwarded the whole prompt batched, no page of it
-        // was kept, and the next burst found nothing either (kvReused=0 on every request, a full
-        // re-prefill each time). Now the first prompt forwards the shared prefix alone, cut at its
-        // block boundary, and the others wait that one step and resume from its page.
-
-        /// <summary>
-        /// Where <paramref name="producer"/>'s next prefill step should end so the requests waiting
-        /// behind it resume from the page it publishes there; 0 for no such step. Only for a family
-        /// whose pages only a lone forward writes, only for a producer whose step stays on the
-        /// linear path, and only when EVERY request this step could admit shares that prefix with
-        /// it: one that does not would join the step, which then runs batched and publishes
-        /// nothing. The boundary is the shortest block-aligned prefix they share with it, so its
-        /// page serves them all.
-        /// </summary>
-        private int LonePagePublishBoundary(SequenceState producer)
-        {
-            if (_waiting.First is not { } head || (head.Next == null && ReferenceEquals(head.Value, producer))
-                || !PrefixCachingActive || producer.KvStateInPagedStorage || producer.MediaSpans.Count > 0
-                || !_radixCache!.PagesNeedLoneForward)
-                return 0;
-            // Every waiter phase 3 may visit: a held one takes no running slot, so the running cap
-            // does not end the visits; only a request of another adapter epoch does.
-            int window = CountEpochWaiting(int.MaxValue);
-            int boundary = int.MaxValue;
-            int sharers = 0, visited = 0;
-            for (var node = _waiting.First; node != null && visited < window; node = node.Next, visited++)
-            {
-                if (ReferenceEquals(node.Value, producer))
-                    continue;
-                boundary = Math.Min(boundary, SharedPageBoundary(node.Value, producer));
-                if (boundary <= producer.NumComputedTokens)
-                    return 0;
-                sharers++;
-            }
-            return sharers > 0 ? boundary : 0;
-        }
-
-        /// <summary>
-        /// The longest block-aligned prefix of <paramref name="sequence"/>'s prompt that a page
-        /// <paramref name="producer"/> publishes can serve: the tokens the two prompts share, short
-        /// of <paramref name="sequence"/>'s last prompt token (always forwarded for its logits),
-        /// inside both requests' cache breakpoints, before any media, and inside both requests'
-        /// public shared prefix (a page past the producer's is its own conversation's alone).
-        /// 0 for a request that is not new or may not reuse at all - an adapter request is
-        /// cache-isolated (its breakpoint limit is 0) - and for a producer that publishes nothing.
-        /// </summary>
-        private int SharedPageBoundary(SequenceState sequence, SequenceState producer)
-        {
-            if (ReferenceEquals(sequence, producer) || sequence.FirstScheduledAt != null
-                || sequence.NumComputedTokens != 0 || sequence.BlockTable.NumBlocks != 0)
-                return 0;
-            int limit = Math.Min(sequence.PromptTokens.Count - 1, producer.PromptTokens.Count);
-            limit = Math.Min(limit, Math.Min(sequence.SharedPrefixTokens, producer.SharedPrefixTokens));
-            if (sequence.CacheBreakpoints != null) limit = Math.Min(limit, sequence.CacheBreakpointLimit);
-            if (producer.CacheBreakpoints != null) limit = Math.Min(limit, producer.CacheBreakpointLimit);
-            foreach (var span in sequence.MediaSpans) limit = Math.Min(limit, span.Start);
-            int shared = 0;
-            while (shared < limit && sequence.PromptTokens[shared] == producer.PromptTokens[shared])
-                shared++;
-            return shared - shared % _cfg.BlockSize;
-        }
-
-        /// <summary>End a prefill chunk at <paramref name="boundary"/> when it would run past it.</summary>
-        private static int CutAtBoundary(SequenceState seq, int want, int boundary)
-        {
-            int start = seq.NumComputedTokens;
-            return boundary > start && boundary < start + want ? boundary - start : want;
-        }
-
-        /// <summary>Record <paramref name="seq"/>'s step of <paramref name="want"/> tokens as this
-        /// step's lone page producer when it ends on a block boundary: the page it publishes is a
-        /// restore point only there.</summary>
-        private void NotePageProducer(SequenceState seq, int want, ref SequenceState? producer, ref int producerEnd)
-        {
-            int end = seq.NumComputedTokens + want;
-            if (want > 0 && end % _cfg.BlockSize == 0)
-            {
-                producer = seq;
-                producerEnd = end;
-            }
-        }
-
-        /// <summary>Whether <paramref name="sequence"/> waits for this step's lone page producer:
-        /// the page it publishes at <paramref name="producerEnd"/> serves more of its prompt than
-        /// the <paramref name="reusableLength"/> tokens the cache serves now.</summary>
-        private bool WaitForLonePageProducer(
-            SequenceState sequence, int reusableLength, SequenceState? producer, int producerEnd)
-        {
-            if (producer == null || producerEnd <= reusableLength
-                || SharedPageBoundary(sequence, producer) < producerEnd)
-                return false;
-            if (!string.Equals(_lonePageWaitLoggedFor, producer.RequestId, StringComparison.Ordinal))
-            {
-                _lonePageWaitLoggedFor = producer.RequestId;
-                _logger.LogInformation(
-                    "{EngineRequestId} and the requests sharing its first {Tokens} prompt tokens wait one step for {Producer} " +
-                    "to forward them alone: this model keeps a shared prefix only from a lone prefill step, so they " +
-                    "then resume from it instead of each forwarding it again.",
-                    sequence.RequestId, producerEnd, producer.RequestId);
-            }
-            return true;
-        }
-
-        private string? _lonePageWaitLoggedFor;
 
         /// <summary>
         /// Add one already-running sequence to this iteration after ensuring its

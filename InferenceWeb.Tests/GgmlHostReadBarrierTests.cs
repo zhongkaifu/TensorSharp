@@ -9,10 +9,11 @@
 // clear its flag and then sync, so a second caller arriving mid-drain returned at once, before
 // the work it had to wait for had completed. The drain now holds a lock across the sync and a
 // caller arriving mid-drain waits for it; the native test tests/host_read_gate_test.cpp shows
-// that with a sync it blocks. These tests pin, through the shipped library, the two facts that
-// design leans on: a queued result is drained exactly once however many threads ask, and CUDA
-// never queues one, so its callers never reach the lock (a rank thread held there behind a
-// sync that waits for its half of an in-kernel collective would deadlock).
+// that with a sync it blocks, and that a queued result is drained exactly once however many
+// threads ask. This test pins, through the shipped library, the fact that design leans on for
+// CUDA: it never queues one, so its callers never reach the lock (a rank thread held there behind
+// a sync that waits for its half of an in-kernel collective would deadlock). The only op that
+// still queues a result is a graph's on Metal with async compute.
 using System;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -41,22 +42,8 @@ public sealed class GgmlHostReadBarrierTests
     private static extern int TSGgml_HostReadBarrier();
 
     /// <summary>
-    /// The CPU backend binds a page-aligned output zero-copy and leaves it marked for the
-    /// barrier, as Metal does. Its sync returns at once, so this checks the bookkeeping rather
-    /// than the wait: of eight concurrent callers one drains, the rest find it drained, none hangs.
-    /// </summary>
-    [GgmlFact(BackendType.GgmlCpu)]
-    public void HostReadBarrier_DrainsAZeroCopyResultOnce_ForConcurrentCallers()
-    {
-        _ = new GgmlContext([0], GgmlBackendType.Cpu);
-        using var device = new HostPointerBuffers();
-        Assert.Equal((1, 0), Drain(device.Run));
-        device.AssertFinite();
-    }
-
-    /// <summary>
-    /// Both paged-attention entry points on CUDA download their result before returning (it
-    /// cannot bind a host pointer), so nothing is left for the barrier.
+    /// The paged attention on CUDA downloads its result before returning (it cannot bind a host
+    /// pointer), so nothing is left for the barrier.
     /// </summary>
     [GgmlFact(BackendType.GgmlCuda)]
     public void HostReadBarrier_IsNeverArmedByCudaPagedAttention()
@@ -65,9 +52,6 @@ public sealed class GgmlHostReadBarrierTests
         var output = new float[Rows];
         Assert.Equal((0, 0), Drain(() => PagedAttentionHost(output)));
         Assert.All(output, x => Assert.True(float.IsFinite(x)));
-        using var device = new HostPointerBuffers();
-        Assert.Equal((0, 0), Drain(device.Run));
-        device.AssertFinite();
     }
 
     /// <summary>
@@ -109,35 +93,5 @@ public sealed class GgmlHostReadBarrierTests
         for (int i = 0; i < q.Length; i++) q[i] = (float)(random.NextDouble() - 0.5);
         for (int i = 0; i < k.Length; i++) { k[i] = (float)(random.NextDouble() - 0.5); v[i] = (float)(random.NextDouble() - 0.5); }
         return (q, k, v);
-    }
-
-    /// <summary>Q and the output in page-aligned native memory, the way a backend tensor's
-    /// storage reaches TSGgml_PagedAttentionForwardDevice.</summary>
-    private sealed unsafe class HostPointerBuffers : IDisposable
-    {
-        private readonly float* _q = (float*)NativeMemory.AlignedAlloc(Rows * sizeof(float), 4096);
-        private readonly float* _output = (float*)NativeMemory.AlignedAlloc(Rows * sizeof(float), 4096);
-
-        public void Run()
-        {
-            var (q, k, v) = Inputs();
-            q.CopyTo(new Span<float>(_q, Rows));
-            new Span<float>(_output, Rows).Fill(float.NaN);
-            GgmlBasicOps.PagedAttentionForwardDevice((IntPtr)_q, k, v, (IntPtr)_output, new[] { 0, Queries },
-                new[] { Keys }, new[] { Keys - 2, Keys - 1 }, Enumerable.Range(0, Keys / BlockSize).ToArray(),
-                new[] { 0 }, 1, Queries, Heads, KvHeads, HeadDim, BlockSize, 1f / MathF.Sqrt(HeadDim));
-        }
-
-        public void AssertFinite()
-        {
-            for (int i = 0; i < Rows; i++)
-                Assert.True(float.IsFinite(_output[i]), $"output {i} is {_output[i]}");
-        }
-
-        public void Dispose()
-        {
-            NativeMemory.AlignedFree(_q);
-            NativeMemory.AlignedFree(_output);
-        }
     }
 }

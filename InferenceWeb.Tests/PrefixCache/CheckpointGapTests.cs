@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using InferenceWeb.Tests.PrefixCache.Fakes;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 using Xunit;
 
 namespace InferenceWeb.Tests.PrefixCache;
@@ -16,12 +17,13 @@ namespace InferenceWeb.Tests.PrefixCache;
 /// </summary>
 public sealed class CheckpointGapTests
 {
-    /// <summary>A holder family with any rewind (MiniMax-M3.1's rules) that declares a checkpoint gap.</summary>
+    /// <summary>A holder family with any rewind (MiniMax-M3.1's rules) that declares a checkpoint gap. Like
+    /// MiniMax-M3.1 it has no batched paged route (no model-paged storage): a lone request runs per sequence.</summary>
     private sealed class GapOracle : OracleModel, ISoloPrefillBudgetModel
     {
         private readonly int _gap;
 
-        internal GapOracle(int gap) : base(OracleFakes.P(8).Traits, 8) => _gap = gap;
+        internal GapOracle(int gap) : base(OracleFakes.P(8).Traits with { Pages = PageSupport.A1HostSlab }, 8) => _gap = gap;
 
         public int PreferredSoloPrefillTokens(int start, int remaining) => 0;
 

@@ -1744,32 +1744,6 @@ internal enum GgmlIndexReductionOp
             int slidingWindow,
             float scale);
 
-        // GPU-resident variant: qData and outData point to existing backend
-        // (Tensor storage) buffers, so the kernel can zero-copy bind them
-        // instead of round-tripping through host arrays + ggml_backend_synchronize.
-        // Eliminates the per-layer queue drain that GetElementsAsFloat would
-        // otherwise force.
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_PagedAttentionForwardDevice(
-            IntPtr qData,
-            IntPtr pagedKData,
-            IntPtr pagedVData,
-            IntPtr outData,
-            IntPtr queryStartLoc,
-            IntPtr seqLens,
-            IntPtr positions,
-            IntPtr blockTableFlat,
-            IntPtr blockTableOffsets,
-            int numSeqs,
-            int numTokens,
-            int numHeads,
-            int numKvHeads,
-            int headDim,
-            int blockSize,
-            int slidingWindow,
-            float scale);
-
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -3718,53 +3692,6 @@ internal enum GgmlIndexReductionOp
                     (IntPtr)btf, (IntPtr)bto,
                     numSeqs, numTokens, numHeads, numKvHeads, headDim,
                     blockSize, slidingWindow, scale), "paged_attention_forward");
-            }
-        }
-
-        /// <summary>
-        /// GPU-resident paged-attention forward. <paramref name="qData"/> and
-        /// <paramref name="outData"/> point to backend-allocated buffers
-        /// (typically <c>tensor.Storage.PtrAtElement(...)</c> on the Metal /
-        /// CUDA backend). The kernel zero-copy binds Q's tensor and writes
-        /// the attention output directly into the caller's output tensor —
-        /// no host-side memcpy round-trip, no per-layer
-        /// <c>ggml_backend_synchronize</c>. K/V paged storage is still passed
-        /// as host arrays.
-        /// </summary>
-        public static unsafe void PagedAttentionForwardDevice(
-            IntPtr qData,
-            float[] pagedKData,
-            float[] pagedVData,
-            IntPtr outData,
-            int[] queryStartLoc,
-            int[] seqLens,
-            int[] positions,
-            int[] blockTableFlat,
-            int[] blockTableOffsets,
-            int numSeqs,
-            int numTokens,
-            int numHeads,
-            int numKvHeads,
-            int headDim,
-            int blockSize,
-            float scale,
-            int slidingWindow = 0)
-        {
-            fixed (float* kp = pagedKData)
-            fixed (float* vp = pagedVData)
-            fixed (int* qsl = queryStartLoc)
-            fixed (int* sl = seqLens)
-            fixed (int* pos = positions)
-            fixed (int* btf = blockTableFlat)
-            fixed (int* bto = blockTableOffsets)
-            {
-                CheckResult(TSGgml_PagedAttentionForwardDevice(
-                    qData, (IntPtr)kp, (IntPtr)vp, outData,
-                    (IntPtr)qsl, (IntPtr)sl, (IntPtr)pos,
-                    (IntPtr)btf, (IntPtr)bto,
-                    numSeqs, numTokens, numHeads, numKvHeads, headDim,
-                    blockSize, slidingWindow, scale),
-                    "paged_attention_forward_device");
             }
         }
 

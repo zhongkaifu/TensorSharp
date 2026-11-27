@@ -3816,36 +3816,6 @@ if (simd_id == 0) {
             });
         }
 
-        // gather_mm: batched matmul where the rows of `a` are gathered by
-        // `lhsIndices` and the (head, expert, ...) rows of `b` are gathered by
-        // `rhsIndices` before the matmul. Either indices array may be null.
-        // Used for MoE routing / speculative decoding.
-        // gather_qmm: fused gather + quantized matmul. Avoids the
-        // materialize-and-route overhead for MoE: instead of dequantizing
-        // each expert separately or gathering input rows then quantized-
-        // matmul, MLX dispatches a single kernel that accesses only the
-        // selected expert blocks.
-        internal static MlxArray GatherQMM(MlxArray x, MlxArray w, MlxArray scales, MlxArray biases, MlxArray lhsIndices, MlxArray rhsIndices, bool transpose, int groupSize, int bits, string mode, bool sortedIndices)
-        {
-            if (!x.IsValid || !w.IsValid || !scales.IsValid)
-                throw new ArgumentException("MLX gather_qmm inputs must be valid arrays.");
-
-            IntPtr modePtr = mode != null ? Marshal.StringToCoTaskMemAnsi(mode) : IntPtr.Zero;
-            try
-            {
-                return MlxWorker.Shared.Invoke(() =>
-                {
-                    MlxArray result;
-                    Check(mlx_gather_qmm(out result, x, w, scales, biases, lhsIndices, rhsIndices, transpose, MlxOptionalInt.Some(groupSize), MlxOptionalInt.Some(bits), modePtr, sortedIndices, DefaultStream()), "running MLX gather_qmm");
-                    return result;
-                });
-            }
-            finally
-            {
-                if (modePtr != IntPtr.Zero) Marshal.FreeCoTaskMem(modePtr);
-            }
-        }
-
         internal static MlxArray Addmm(MlxArray src, MlxArray m1, MlxArray m2, float alpha, float beta)
         {
             return MlxWorker.Shared.Invoke(() =>
@@ -8964,15 +8934,5 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [LibraryImport(LibraryName, EntryPoint = "mlx_array_dtype")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_array_dtype(out int dtype, MlxArray array);
-
-        // ----- mlx_gather_mm / mlx_gather_qmm (MoE-friendly batched matmul) -----
-
-        [LibraryImport(LibraryName, EntryPoint = "mlx_gather_mm")]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int mlx_gather_mm(out MlxArray result, MlxArray a, MlxArray b, MlxArray lhsIndices, MlxArray rhsIndices, [MarshalAs(UnmanagedType.I1)] bool sortedIndices, MlxStream stream);
-
-        [LibraryImport(LibraryName, EntryPoint = "mlx_gather_qmm")]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int mlx_gather_qmm(out MlxArray result, MlxArray x, MlxArray w, MlxArray scales, MlxArray biases, MlxArray lhsIndices, MlxArray rhsIndices, [MarshalAs(UnmanagedType.I1)] bool transpose, MlxOptionalInt groupSize, MlxOptionalInt bits, IntPtr mode, [MarshalAs(UnmanagedType.I1)] bool sortedIndices, MlxStream stream);
     }
 }

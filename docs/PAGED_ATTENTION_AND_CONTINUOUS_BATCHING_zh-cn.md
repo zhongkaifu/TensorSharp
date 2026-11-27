@@ -179,7 +179,7 @@ ExecutionPlan
 
 - **声明式能力，而非异常探测。** 模型通过 `IBatchedPagedModel` 的 getter
   （`BatchedForwardAvailable`、`SupportsBatchedMultimodal`、
-  `SupportsPerSequenceFusedForward`、`SupportsLinearKVMigration` 等）与投机解码
+  `SupportsPerSequenceFusedForward` 等）与投机解码
   接口（`HasDraftHead`、`SpeculationProfitable`、`SupportsBatchedSpecTrunk`）声明
   自身能力，`ExecutionCapabilities.FromModel` 每步做一次快照。模型的静态限制
   （带 MoE 层或块量化 KV cache 的 Gemma 4、张量并行）会体现为
@@ -187,7 +187,7 @@ ExecutionPlan
   `ForwardBatch` 抛 `NotSupportedException` 仅保留为针对单个 batch 的拒绝，
   不再是路由机制。`--no-continuous-batching`（`TS_SCHED_DISABLE_BATCHED=1`）会关闭
   所有批处理路径。
-- **候选有序且安全。** 可拒绝的候选（`BatchedPaged` 的迁移失败/模型拒绝）会落入
+- **候选有序且安全。** 可拒绝的候选（`BatchedPaged`：K/V 只在线性 cache 中的序列交给逐序列路径，模型也可拒绝某个 batch）会落入
   下一个候选；每个计划都以不可
   拒绝的路径收尾。`ExecutionPlannerTests` 扫描能力/特征空间验证该不变量。
 - **可观测性。** `InferenceEngine` 启动时输出一次 capability 报告（哪些路径
@@ -195,8 +195,9 @@ ExecutionPlan
   计划——选中路径、回退链、被拒原因——"这个请求为什么没走快路径" 从考古
   变成日志事实。
 - **路径种类**（`ExecutionPathKind`）：`SpeculativePerSequence`、
-  `PerSequenceFused`、`MixedMultimodalSplit`、`SingleSequenceFused`（N=1 快速
-  路径）、`BatchedPaged`、`PerSequence`。
+  `PerSequenceFused`、`MixedMultimodalSplit`、`BatchedPaged`、`PerSequence`。
+  不再有单独的 N=1 路径：单个序列走 `BatchedPaged`（若它已在每请求缓存中，或必须
+  从另一个存活序列接管所有权，则走 `PerSequenceFused`），其后是 `PerSequence`。
 
 ## 执行路径
 
@@ -223,8 +224,8 @@ GPT OSS 不使用这些内核：在共享解码运行时上，它的 sinks 是�
 同样的批次必须逐位给出同样的 logits；不同的批次不必。哪些请求共处一步、每个请求
 前向多少 token，决定了跑哪些内核：ggml-cuda 对 MXFP4 的
 量化 `mul_mat_id` 在 Turing 与 Ampere 上不超过 7 个 token 时走 MMVQ（Volta、Ada 与
-Blackwell 上为 8 个），超过时走 MMQ；而独自先到达的序列会
-先走单序列 fused 路径。这些内核只在浮点近似平局（near-tie）的范围内一致，贪心解码会
+Blackwell 上为 8 个），超过时走 MMQ；而独自先到达的序列
+最初几步是一个只有它自己的批次。这些内核只在浮点近似平局（near-tie）的范围内一致，贪心解码会
 把一个近似平局变成另一段续写。因此，到达顺序没有固定的并发轮次，即使没有任何缺陷，
 不同运行之间也可能产生不同的 token。调度出相同批次的两次运行则不可能不同。
 
@@ -259,7 +260,7 @@ token 处分叉，连同一进程内的预热轮与测量轮之间也会分叉�
 
 修复后，在 `--conc-gate` 下，三轮运行在 1、4、8 请求轮次的每一步都给出逐位相同的
 logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输出：它的第一个请求在另外七个
-到达之前被单独调度到单序列 fused 路径上。那一步的 logits 已经不同（42.94 对 42.86），
+到达之前被单独调度到旧模型的 N=1 fused 路径上（该路径已删除）。那一步的 logits 已经不同（42.94 对 42.86），
 随后的 argmax 翻转发生在 0.011-0.11 的 margin 上。这属于近似平局一类，`compare.py`
 只报告而不判失败。
 

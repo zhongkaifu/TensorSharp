@@ -1930,42 +1930,6 @@ namespace TensorSharp.GGML
                 blockSize, scale, slidingWindow);
         }
 
-        /// <summary>GPU-resident paged-attention forward. Q and OUT are
-        /// passed as <see cref="IntPtr"/> into existing backend storage
-        /// (typically <c>tensor.Storage.PtrAtElement(tensor.StorageOffset)</c>
-        /// for a GGML-backed <see cref="Tensor"/>). The kernel zero-copy
-        /// binds them to backend buffers so no host-side memcpy / sync
-        /// happens for Q or OUT, eliminating the per-layer queue drain that
-        /// <c>q.GetElementsAsFloat()</c> would otherwise force on the
-        /// Gemma 4 batched path. K/V paged buffers stay as host arrays.
-        /// </summary>
-        public static void PagedAttentionForwardDevice(
-            IntPtr qData,
-            float[] pagedKData,
-            float[] pagedVData,
-            IntPtr outData,
-            int[] queryStartLoc,
-            int[] seqLens,
-            int[] positions,
-            int[] blockTableFlat,
-            int[] blockTableOffsets,
-            int numSeqs,
-            int numTokens,
-            int numHeads,
-            int numKvHeads,
-            int headDim,
-            int blockSize,
-            float scale,
-            int slidingWindow = 0)
-        {
-            GgmlNative.PagedAttentionForwardDevice(
-                qData, pagedKData, pagedVData, outData,
-                queryStartLoc, seqLens, positions,
-                blockTableFlat, blockTableOffsets,
-                numSeqs, numTokens, numHeads, numKvHeads, headDim,
-                blockSize, scale, slidingWindow);
-        }
-
         /// <summary>Whole UMT5-XXL text-encoder forward (24 layers, per-layer relative attention
         /// bias) in ONE resident-weight ggml graph: token ids in, final hidden states out.</summary>
         public static bool TryWanT5Encode(in WanT5EncodeArgs args)

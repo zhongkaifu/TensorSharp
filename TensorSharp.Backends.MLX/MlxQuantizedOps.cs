@@ -1805,7 +1805,7 @@ namespace TensorSharp.MLX
         }
 
         // Q4_K and Q5_K preload into MLX-native AFFINE form (driving the built-in
-        // mlx_quantized_matmul / gather_qmm) rather than raw GGUF blocks. The repack is a
+        // mlx_quantized_matmul) rather than raw GGUF blocks. The repack is a
         // reinterpretation of K-quant, as omlx and mlx-lm store 4/5-bit weights: each 32-element
         // group becomes scale = d*scaleByte, bias = -dmin*minByte, exactly ggml's dequant (w = scale*q
         // + bias) up to rounding the group's scale and bias to F16. Against raw K-quant Metal kernels

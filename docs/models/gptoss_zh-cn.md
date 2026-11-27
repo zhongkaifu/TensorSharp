@@ -241,7 +241,15 @@ GPT-OSS 与 Gemma 4、Qwen 3.5、Nemotron-H、Mistral 3 一样运行在共享解
 - 融合的注意力层 prefill 及其设备端 K/V 窗口（`ggml_ops_transformer_prefill.cpp`）；
 - 带 sink 的分页注意力（`TSGgml_PagedAttentionForwardWithSinks`、`ManagedPagedAttention.ForwardWithSinks`）；
 - MLX 的 `gather_qmm` 堆叠 expert 路径，以及 MLX 的 sink decode、`swiglu_oai` bias-gather 与带 bias 加权求和内核；
-- 它从线性缓存迁移到分页缓存时使用的 K/V 主机读取器。
+- 它从线性缓存迁移到分页缓存时使用的 K/V 主机读取器；
+- 直接 CUDA 的 sink 注意力内核（`TryAttentionSoftmaxWithSinks`、`TryGqaDecodeAttentionWithSinks`、
+  `TryGqaPrefillAttentionWithSinks`）、拆分的 `swiglu_oai` 内核（`TrySwiGluOaiSplit`），以及没有调用者的
+  `TryGqaDecodeAttentionRaw` / `TryGqaDecodeAttentionGgmlCuda`；
+- GGML 的设备端分页注意力（`TSGgml_PagedAttentionForwardDevice`、`TSGgml_PagedAttentionForwardDeviceWithSinks`；
+  主机端的 `TSGgml_PagedAttentionForward` 保留）以及 MLX 的 `gather_mm` / `gather_qmm` 绑定；
+- 调度器中从线性缓存到分页存储的 K/V 迁移（`SupportsLinearKVMigration`、`TryMigrateLinearKVToPaged`），以及只有它
+  才会用到的 N=1 `SingleSequenceFused` 路径和 lone-page-producer 等待。单个序列现在与并发序列一样走 `BatchedPaged`，
+  在每请求缓存上则走 `PerSequenceFused`。
 
 它的开关也一并删除：`TS_GPTOSS_FUSED_DECODE_MAX_CTX`、`TS_GPTOSS_FUSED_ATTN_MAX_SEQ`、`TS_GPTOSS_PREFILL_F16` 与
 `TS_GPTOSS_PREFILL_CHUNK`（提示步遵循 `TS_PREFILL_CHUNK`，环形缓存把一步限制在 512 行）。现在设置其中任何一个都会让启动
@@ -396,8 +404,8 @@ token 同时强制输入两者。NLL 取 README 的 448 个 token，以困惑度
 ## 13. 优化机会
 
 - **直接 CUDA 上带 sink 的提示注意力。** sink 层的提示注意力走通用乘积。一个在 softmax 中包含 sink 的 flash 内核能弥补与
-  ggml_cuda prefill 之间的大部分差距。CUDA 内核 `TryGqaPrefillAttentionWithSinks` / `TryGqaDecodeAttentionWithSinks` 已经存在，
-  但没有接到执行器的环形缓存上。
+  ggml_cuda prefill 之间的大部分差距。旧模型的 sink 内核从未接到执行器的环形缓存上，
+  已随旧模型一起删除，因此需要给支持环形缓存的 flash 内核加上 sink 操作数。
 - **直接 CUDA 上超过窗口之后的录制 decode。** 把环形缓存的下界作为输入录制，就能让这些步重放。
 - **直接 CUDA 上被卸载的提示。** gpt-oss-20b 2880 宽的 expert 走分组 MoE 引擎的每行一个 warp 的路线（2880 既不是 128 的倍数，
   也不是 256 的倍数）。为这个宽度提供一条 tensor-core 路线，可以同时服务被卸载与常驻的提示 expert。

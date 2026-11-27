@@ -180,7 +180,7 @@ internal static class DirectCudaModelChecks
     /// <summary>
     /// Teacher-forced rows of <paramref name="prompts"/> run TOGETHER through the model's batched
     /// entry point (IBatchedPagedModel.ForwardBatch, what the continuous-batching engine runs for
-    /// two or more sequences, and for one on families without a single-sequence fused path): one
+    /// any number of sequences on a family that has one, a solo sequence included): one
     /// prefill batch holding every prompt, then one decode batch per forced token. Block ids come
     /// from one fresh pool per call, so the sequences' recurrent-state slots (a sequence's first
     /// block id) are distinct within a call and reused by the next call, as the engine reuses

@@ -26,22 +26,6 @@ internal sealed partial class PrefixCacheCoordinator
     }
 
     /// <summary>
-    /// Whether this family's only reuse across requests - its pages - is written by a lone
-    /// forward alone. A recurrent page is a restore point only where a per-sequence Forward
-    /// ended (<see cref="PrefixCacheCapabilities.PagesNeedStateAtEnd"/>), and a step that runs
-    /// two prompts takes the batched route, whose model-paged rows carry no recurrent state
-    /// (Nemotron-H): requests that arrive together and share a prompt prefix then each forward
-    /// all of it, and no page of it is ever kept. The scheduler holds such requests back for the
-    /// step in which one of them forwards the prefix alone and publishes it (its lone page
-    /// producer). A family with public checkpoints, or whose batched route writes pages, never
-    /// needs the hold.
-    /// </summary>
-    internal bool PagesNeedLoneForward
-        => SharedPrefixOnlyInStatePages
-           && !ExecutionOptions.FromEnvironment().BatchedPathDisabled
-           && _model is IBatchedPagedModel { BatchedForwardAvailable: true, SupportsLinearKVMigration: true };
-
-    /// <summary>
     /// Whether this family keeps a prefix across requests only as pages that resume where a
     /// forward ended (<see cref="PrefixCacheCapabilities.PagesNeedStateAtEnd"/>): no public
     /// checkpoint holds its shared prefix, so only a page whose forward ended there can.

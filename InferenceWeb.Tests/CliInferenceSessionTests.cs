@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Cli;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace InferenceWeb.Tests;
 
@@ -23,6 +24,12 @@ public sealed class CliInferenceSessionTests
         SoloPrefillChunkSize = 128,
         StopRepetition = false,
     };
+
+    private static OracleModel OnTheSharedRuntime(OracleModel fake)
+    {
+        using (fake)
+            return new OracleModel(fake.Traits with { Pages = PageSupport.A1HostSlab }, 16);
+    }
 
     [Theory]
     [InlineData(false)]
@@ -77,7 +84,10 @@ public sealed class CliInferenceSessionTests
     [InlineData(true)]
     public void PublicWarmupSurvivesNewChatsWithoutSharingPrivateTokens(bool recurrent)
     {
-        using var model = recurrent ? OracleFakes.R() : OracleFakes.P();
+        // The page family as the shared decoder runtime declares it: holders and host-slab pages, no batched
+        // paged route (StandardDecoderModel.BatchedForwardAvailable is false), so a lone request runs on the
+        // primary cache its public checkpoint is captured from.
+        using var model = recurrent ? OracleFakes.R() : OnTheSharedRuntime(OracleFakes.P());
         using var session = new CliInferenceSession(model, Config, NullLogger.Instance);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         int[] system = Enumerable.Range(1, 13).ToArray();

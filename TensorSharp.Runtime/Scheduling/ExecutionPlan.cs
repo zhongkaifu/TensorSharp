@@ -32,13 +32,9 @@ namespace TensorSharp.Runtime.Scheduling
         /// text sequences on the batched paged path.</summary>
         MixedMultimodalSplit,
 
-        /// <summary>N=1 fast path: a solo sequence served through the model's
-        /// fused single-graph Forward against the linear KV cache.</summary>
-        SingleSequenceFused,
-
         /// <summary>vLLM-style batched paged attention (ForwardBatch).
-        /// Declinable: linear→paged migration failure or a model
-        /// NotSupportedException falls through to the next candidate.</summary>
+        /// Declinable: a sequence whose K/V lives only in the linear cache, or a
+        /// model NotSupportedException, falls through to the next candidate.</summary>
         BatchedPaged,
 
         /// <summary>Per-sequence forward with KV-state ownership swap — the
