@@ -314,8 +314,8 @@ jobs:
         if: ${{ matrix.cuda }}
         shell: bash
         # NVIDIA's per-component redistributables, each checked against the
-        # SHA-256 in its release manifest: nvcc, crt, nvvm, cudart, cuBLAS and
-        # CCCL are all the native builds use. No driver/DKMS packages (whose
+        # SHA-256 in its release manifest: nvcc, crt, nvvm, cudart, cuBLAS, CCCL
+        # and NVML's header are all the native builds use. No driver/DKMS packages (whose
         # kernel-module build fails on hosted runners), and no wait for setup
         # actions to list a release - 13.4 has no Windows installer under the
         # usual URLs. Exports CUDA_PATH and puts bin (and bin\x64) on PATH.

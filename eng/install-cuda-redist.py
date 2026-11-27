@@ -34,8 +34,11 @@ import zipfile
 
 DEFAULT_BASE_URL = "https://developer.download.nvidia.com/compute/cuda/redist"
 # What TensorSharp.GGML.Native (ggml-cuda: CCCL, cudart, cuBLAS, the driver stub
-# shipped in cuda_cudart) and the TensorSharp.Backends.Cuda kernel compile need.
-DEFAULT_COMPONENTS = ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "cccl")
+# shipped in cuda_cudart, and nvml.h) and the TensorSharp.Backends.Cuda kernel compile
+# need. ggml-cuda includes <nvml.h> for NVML's types and loads the library from the
+# driver at run time, so cuda_nvml_dev contributes only the header (and an import
+# library nothing links against).
+DEFAULT_COMPONENTS = ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "cuda_nvml_dev", "cccl")
 # Components NVIDIA renamed between releases: the manifests of CUDA 13.0.x and 13.2.x
 # call CCCL "cuda_cccl", 13.4.x calls it "cccl". Either spelling installs whichever
 # one the requested release lists, so the default list works for every CUDA 13.

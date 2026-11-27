@@ -115,7 +115,7 @@ class InstallCudaRedistTests(unittest.TestCase):
         for cccl in ("cuda_cccl", "cccl"):
             with self.subTest(cccl=cccl):
                 manifest = {"release_label": "13.x"}
-                for name in ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", cccl):
+                for name in ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "cuda_nvml_dev", cccl):
                     manifest[name] = {"linux-x86_64": {"relative_path": f"{name}/a.tar.xz", "sha256": "0" * 64}}
                 resolved = redist.resolve_components(manifest, list(redist.DEFAULT_COMPONENTS), "linux-x86_64")
                 self.assertEqual([name for name, _, _ in resolved][-1], cccl)
