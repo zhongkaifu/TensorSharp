@@ -49,7 +49,7 @@ from gguf.quants import dequantize, quantize
 DEFAULT_TARGETS = {
     "mistral3": r"^(blk\.\d+\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_up|ffn_down)\.weight|output\.weight)$",
     "hunyuan-dense": r"^(blk\.\d+\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_up|ffn_down)\.weight|output\.weight)$",
-    # A subset of what Nemotron adapts (NemotronModel.s_textLoraProjections, which also covers
+    # A subset of what Nemotron adapts (NemotronRuntimeModel.s_textLoraProjections, which also covers
     # attn_output, ffn_down, ssm_in/ssm_out, ffn_down_shexp and ffn_latent_up/ffn_latent_out).
     "nemotron_h": r"^(blk\.\d+\.(attn_q|attn_k|attn_v|ffn_up|ffn_up_shexp|ffn_latent_down|ffn_latent_in|ffn_gate_inp)\.weight|output\.weight)$",
 }

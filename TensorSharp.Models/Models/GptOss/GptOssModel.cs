@@ -1695,8 +1695,7 @@ namespace TensorSharp.Models
             // token in the softmax max/exp-sum) and optional sliding-window
             // attention (SWA: keys older than `slidingWindow` positions are
             // masked out). Used as a fallback when the GGML decode kernel is
-            // unavailable for this layer (e.g. F16 cache + sinks not yet
-            // covered by TSGgml_FlashAttnDecodeF32 sink-adapted variant).
+            // unavailable for this layer.
             if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
             {
                 AttentionDecodeWithSinksF16(q, kCache, vCache, result,

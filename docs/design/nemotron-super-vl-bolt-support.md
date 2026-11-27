@@ -89,7 +89,7 @@ Semantic mapping (confirmed by dims):
 - `ffn_latent_down` [4096,1024] = `ffn_latent_in` (hidden -> latent)
 - `ffn_latent_up` [1024,4096] = `ffn_latent_out` (latent -> hidden)
 
-**Fix (in tree):** `NemotronModel.NormalizeLatentWeightNames()` rewrites the dictionary keys
+**Fix (in the legacy model, since removed):** `NemotronModel.NormalizeLatentWeightNames()` rewrites the dictionary keys
 (`down->in`, `up->out`) once, right after `LoadWeights()`, in both `_quantWeights` and `_weights`. Weight
 objects are untouched (their `CacheKey`/device buffers are independent of the dictionary key), so the
 legacy `ffn_latent_in/out` path and the new `ffn_latent_down/up` checkpoint both serve the same downstream
@@ -107,7 +107,7 @@ Routed/non-shared experts carry a **per-expert** sidecar in addition to the NVFP
 `AttachSidecarWeightScales` only attaches a **1-element** `.scale` (covering the shared experts' scalar
 `.scale[1]`); the routed experts' vector `.scale[512]` stays in `_weights` with `Scale = 1.0f` on the views.
 
-**Fix (in tree):** `NemotronModel.InitExpertScales()` reads `ffn_*_exps.scale` and applies the per-expert
+**Fix (in the legacy model, since removed):** `NemotronModel.InitExpertScales()` reads `ffn_*_exps.scale` and applies the per-expert
 multipliers in both `MoEForward` and `TryMoEPrefillBatchedByExpert`. Experts without sidecars
 (IQ-quantized, e.g. Bolt) are a no-op.
 
@@ -145,7 +145,7 @@ blk.21 ffn_up_exps [1024, 2560, 432]  # 432 experts, n_ff 2560
 
 `expert_used_count` and `expert_feed_forward_length` are per-layer arrays `[88]`, not scalars.
 
-**Fix (in tree):** `NemotronModel.InitPerLayerMoEConfig()` derives `_numExpertsPerLayer[]` (from the
+**Fix (in the legacy model, since removed):** `NemotronModel.InitPerLayerMoEConfig()` derives `_numExpertsPerLayer[]` (from the
 stacked expert tensor's last dim) and `_numExpertsUsedPerLayer[]` (from the `expert_used_count` array,
 scalar fallback). `_numExperts`/`_numExpertsUsed` are grown to the observed maximum so every pre-allocated
 routing buffer still fits; `MoEForward` and `TryMoEPrefillBatchedByExpert` route against the per-layer
@@ -243,7 +243,7 @@ The projector was also misdescribed. It is RMSNorm, then 5120 -> 20480, ReLU^2, 
   fails the load with `InvalidDataException` naming the file, the missing or mis-shaped tensors and the
   expected layout, rather than failing the first image. `LinearForward` now throws with the weight's
   name instead of returning `null`.
-- `NemotronModel.LoadVisionEncoder` refuses a projector whose output width is not the language model's
+- `LoadVisionEncoder` (now `NemotronRuntimeModel.LoadVisionEncoder`) refuses a projector whose output width is not the language model's
   hidden size, e.g. a Nano Omni mmproj (2688) with Bolt (4096).
 - `v.patch_embd.weight.1` is skipped with one log line. Nemotron takes no video input.
 - A warmup failure now prints `Nemotron multimodal warmup FAILED (image requests will fail): ...`.
@@ -294,7 +294,7 @@ What changed:
 
 | Piece | Change |
 |---|---|
-| Expert-parallel (EP) MoE | Now serves latent MoE (each rank's kernel reads the latent projection) and per-block expert counts (each layer is partitioned on its own). New native entry `TSGgml_MoEFFNPrefillRouteScaledF32` (TensorSharp-owned `ggml_ops_moe.cpp`; ggml is unchanged) multiplies the ReLU^2 projection by one scale per route before the activation, so Super VL's NVFP4 experts run EP too. A route the kernel neutralises (weight 0) takes the scale of the expert it is pointed at, so it cannot overflow into `Inf * 0 = NaN`. |
+| Expert-parallel (EP) MoE | Now serves latent MoE (each rank's kernel reads the latent projection) and per-block expert counts (each layer is partitioned on its own). New native entry `TSGgml_MoEFFNPrefillRouteScaledF32` (TensorSharp-owned `ggml_ops_moe.cpp`; ggml is unchanged; removed in 2026-11 with the legacy model, which was its only caller) multiplies the ReLU^2 projection by one scale per route before the activation, so Super VL's NVFP4 experts run EP too. A route the kernel neutralises (weight 0) takes the scale of the expert it is pointed at, so it cannot overflow into `Inf * 0 = NaN`. |
 | Per-block MoE (Bolt) | The refusal in `InitPerLayerMoEConfig` is gone; sharding and the expert loops use each layer's own counts. The per-expert (Megatron) split refuses, naming the tensor, an expert width the TP degree cannot split between quant blocks instead of silently dropping the remainder. |
 | Across nodes | Image/audio embeddings exist only on the driver. A forward whose tokens hold `<image>`/`<so_embedding>` syncs the driver's embedding rows to every node with one AllReduce (the driver contributes them, every other rank zeros); the decision is taken from the tokens, which every node sees. The multimodal warm-up is skipped across nodes, since only nodes given the mmproj would join its collectives. |
 | Server (KV snapshots) | `NemotronModel.TensorParallelSnapshot.cs`: each rank's K/V heads are a contiguous run of the single-device block layout, so the block format is unchanged. Across nodes the driver broadcasts each extract/inject (`ModelBase.BroadcastModelControl`) and the bytes move as raw bytes over the TCP mesh (`ICrossNodeByteGroup`, protocol 4): an inject sends the driver's block to every node, an extract gathers each node's head shards on the driver. |
@@ -431,7 +431,7 @@ the feature on the handle being non-zero and fall back.
   - **Bolt:** no longer refused under `--tp`; each block's own expert count and top-k are used (G7).
 
   Expert parallelism now serves these models (G7): every rank's kernel reads the latent projection,
-  and `TSGgml_MoEFFNPrefillRouteScaledF32` applies each route's up scale before ReLU^2. A model whose
+  and `TSGgml_MoEFFNPrefillRouteScaledF32` (since removed with the legacy model) applied each route's up scale before ReLU^2. A model whose
   stacked experts cannot be used for EP falls back to the per-expert row split, which refuses an expert
   width that does not split on quant-block boundaries.
 

@@ -330,8 +330,7 @@ namespace TensorSharp.Server.Host.Hosting
                     "GLM-5.2 and GLM-5.3 non-Flash), which pages extra weights into VRAM, and for --spec-type ngram, " +
                     "which needs no draft-head weights. GLM-5.3 Flash supports ngram; its NextN head is not implemented. A " +
                     "drafter named on --draft-model engages by itself. Engages for solo (non-concurrent) " +
-                    "sequences. Nemotron-H refuses every speculator: under --spec it serves plain decoding and " +
-                    "says so once, and a --draft-model makes its startup load fail. Default: off.",
+                    "sequences. Default: off.",
                     "--spec"),
                 new OptionHelp("--spec-type <name>",
                     "Speculation algorithm. It only picks the algorithm and does not turn speculation on: pair " +
@@ -339,10 +338,10 @@ namespace TensorSharp.Server.Host.Hosting
                     "carries; 'draft-head' and 'block' pin one explicitly; 'ngram' needs no trained weights, " +
                     "drafting by suffix match over the context (strong when the answer quotes its input: " +
                     "summarizing, editing, structured output, agentic loops). N-gram still needs a trunk that " +
-                    "can verify a draft window: Qwen 3.5/3.6/3.8, Qwen 3.8 Flash Next, Gemma 4, GLM-5.x and Muse-Glimmer have " +
+                    "can verify a draft window: Qwen 3.5/3.6/3.8, Qwen 3.8 Flash Next, Gemma 4, GLM-5.x, Muse-Glimmer and Nemotron-H have " +
                     "one; DeepSeek V4/V4.1 only while their --draft-model drafter is loaded; " +
                     "GPT-OSS, Mistral 3 and Hunyuan Dense have no " +
-                    "speculative path at all; Nemotron-H refuses every speculator.",
+                    "speculative path at all.",
                     "--spec --spec-type ngram"),
                 new OptionHelp("--spec-draft <N>",
                     "Maximum draft tokens per step (1-64). Default: 8.",

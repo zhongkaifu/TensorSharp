@@ -2128,11 +2128,9 @@ namespace
         float oai_limit,
         int run_on_cpu,
         const float* post_expert_norm = nullptr,
-        float post_expert_norm_eps = 1e-8f,
-        const float* route_up_scales = nullptr)
+        float post_expert_norm_eps = 1e-8f)
     {
         MoEFFNGraphParams p;
-        p.route_up_scales = route_up_scales;
         p.post_expert_norm = post_expert_norm;
         p.post_expert_norm_eps = post_expert_norm_eps;
         p.hidden_in = hidden_in;
@@ -2171,8 +2169,8 @@ namespace
         // RunPerRank, where every rank would stream its own copy of the
         // same unsharded expert layer to its own device at once. A single
         // device is the case that matters here — it is the path GPT-OSS
-        // and Nemotron-H take at prefill (no fused whole-model prefill
-        // graph, hence no seam), and leaving it host-only cost gpt-oss-20b
+        // takes at prefill (no fused whole-model prefill graph, hence no
+        // seam), and leaving it host-only cost gpt-oss-20b
         // 4-10x against llama.cpp on every offloaded prefill.
         p.allow_device_stream =
             tsg::g_device_count.load(std::memory_order_acquire) <= 1;
@@ -3283,7 +3281,6 @@ extern "C"
     //                          1 = swiglu_oai (gpt-oss clamped variant). Uses
     //                              oai_alpha and oai_limit.
     //                          2 = gelu(gate) * up (Gemma 4 MoE GEGLU split).
-    //                          3 = relu(up)^2 (Nemotron-H MoE).
     TSG_EXPORT int TSGgml_MoEFFNPrefillSwiGLUQuantF32(
         float* hidden_in,
         float* hidden_out,
@@ -3357,41 +3354,6 @@ extern "C"
         }
         catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
         catch (...) { set_last_error("Unknown error in Muse Spark MoE."); return 0; }
-    }
-
-    // TSGgml_MoEFFNPrefillSwiGLUQuantF32 plus route_up_scales: f32 [seq_len, n_used],
-    // one multiplier per route on the single ReLU-squared projection, applied to the
-    // matmul output before the activation (MoEFFNGraphParams::route_up_scales).
-    // Nemotron's NVFP4 experts need it: their per-expert scale2 must be applied
-    // before the squaring. A separate ABI keeps every existing caller unchanged.
-    TSG_EXPORT int TSGgml_MoEFFNPrefillRouteScaledF32(
-        float* hidden_in, float* hidden_out, int seq_len, int hidden_dim, int n_ff,
-        int num_experts, int n_used, const std::int32_t* selected_experts, const float* routing_weights,
-        void* gate_data, int gate_type, std::int64_t gate_ne0, std::int64_t gate_ne1, std::int64_t gate_total_bytes,
-        void* up_data, int up_type, std::int64_t up_ne0, std::int64_t up_ne1, std::int64_t up_total_bytes,
-        void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_total_bytes,
-        const float* gate_bias, const float* up_bias, const float* down_bias,
-        int activation_type, float oai_alpha, float oai_limit, int run_on_cpu,
-        const float* route_up_scales)
-    {
-        try
-        {
-            if (route_up_scales == nullptr)
-            {
-                set_last_error("MoE prefill: route_up_scales is required by this entry point.");
-                return 0;
-            }
-            return moe_ffn_prefill_swiglu_quant_f32_impl(
-                hidden_in, hidden_out, seq_len, hidden_dim, n_ff,
-                num_experts, n_used, selected_experts, routing_weights,
-                gate_data, gate_type, gate_ne0, gate_ne1, gate_total_bytes,
-                up_data, up_type, up_ne0, up_ne1, up_total_bytes,
-                down_data, down_type, down_ne0, down_ne1, down_total_bytes,
-                gate_bias, up_bias, down_bias, activation_type, oai_alpha, oai_limit,
-                run_on_cpu, nullptr, 1e-8f, route_up_scales);
-        }
-        catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
-        catch (...) { set_last_error("Unknown error in route-scaled MoE prefill."); return 0; }
     }
 
 }

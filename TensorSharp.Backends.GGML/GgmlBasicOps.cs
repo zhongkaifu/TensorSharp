@@ -2891,13 +2891,11 @@ namespace TensorSharp.GGML
             SwiGLUOAI = 1,
             /// <summary>gelu(gate) * up tanh-approx GeGLU (Gemma 4 MoE).</summary>
             GEGLUSplit = 2,
-            /// <summary>relu(up)^2 single-projection FFN (Nemotron-H MoE).</summary>
-            ReluSquared = 3,
         }
 
         /// <summary>
         /// Fused MoE FFN forward: expert projection(s), activation
-        /// (SwiGLU split / SwiGLU OAI / GeGLU split / ReLU-squared), down projection,
+        /// (SwiGLU split / SwiGLU OAI / GeGLU split), down projection,
         /// per-token expert weighting, and cross-expert aggregation in a
         /// single GGML graph dispatch (one <c>ggml_mul_mat_id</c> per matmul,
         /// matching llama.cpp's <c>build_moe_ffn</c>).
@@ -2918,9 +2916,7 @@ namespace TensorSharp.GGML
         ///
         /// Set <paramref name="upData"/> to <see cref="IntPtr.Zero"/> when
         /// <paramref name="gateData"/> already contains a pre-fused gate+up
-        /// weight (gate_ne1 = 2*nFf), mirroring llama.cpp's gate_up_exps path,
-        /// or when <paramref name="activation"/> is <see cref="MoEActivation.ReluSquared"/>
-        /// and <paramref name="gateData"/> is the single up projection.
+        /// weight (gate_ne1 = 2*nFf), mirroring llama.cpp's gate_up_exps path.
         ///
         /// <paramref name="hiddenIn"/> and <paramref name="hiddenOut"/> must
         /// both be row-contiguous Float32 tensors of shape
@@ -2931,11 +2927,6 @@ namespace TensorSharp.GGML
         /// Per-expert post-down-projection scales (Gemma 4's
         /// <c>ffn_down_exps.scale</c>) should be folded into
         /// <paramref name="routingWeights"/> by the caller before the call.
-        /// A scale on the projection BEFORE the activation cannot be folded that way
-        /// (Nemotron's NVFP4 up scale2: ReLU-squared would square the unscaled value
-        /// and overflow). Pass it as <paramref name="routeUpScales"/>, one multiplier
-        /// per route laid out like <paramref name="routingWeights"/>; only the
-        /// single-projection <see cref="MoEActivation.ReluSquared"/> takes it.
         /// </summary>
         public static unsafe void MoEFFNPrefill(
             Tensor hiddenIn,
@@ -2958,8 +2949,7 @@ namespace TensorSharp.GGML
             float oaiLimit = 7.0f,
             bool runOnCpu = false,
             float[] postExpertNorm = null,
-            float postExpertNormEps = 1e-8f,
-            float[] routeUpScales = null)
+            float postExpertNormEps = 1e-8f)
         {
             if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
             if (hiddenOut == null) throw new ArgumentNullException(nameof(hiddenOut));
@@ -2993,29 +2983,19 @@ namespace TensorSharp.GGML
                 throw new ArgumentException($"selectedExperts length {selectedExperts.Length} < seqLen*nUsed = {seqLen * nUsed}.");
             if (routingWeights.Length < seqLen * nUsed)
                 throw new ArgumentException($"routingWeights length {routingWeights.Length} < seqLen*nUsed = {seqLen * nUsed}.");
-            if (routeUpScales != null)
-            {
-                if (activation != MoEActivation.ReluSquared)
-                    throw new ArgumentException("routeUpScales is only defined for the single-projection ReLU-squared activation.", nameof(routeUpScales));
-                if (routeUpScales.Length < seqLen * nUsed)
-                    throw new ArgumentException($"routeUpScales length {routeUpScales.Length} < seqLen*nUsed = {seqLen * nUsed}.", nameof(routeUpScales));
-                if (postExpertNorm != null)
-                    throw new ArgumentException("routeUpScales cannot be combined with postExpertNorm.", nameof(routeUpScales));
-            }
 
             if (gateData == IntPtr.Zero || downData == IntPtr.Zero)
                 throw new ArgumentException("gate and down weight pointers must be non-null.");
 
-            bool reluSquared = activation == MoEActivation.ReluSquared;
-            bool fusedGateUp = upData == IntPtr.Zero && !reluSquared;
-            if (reluSquared && upData != IntPtr.Zero)
-                throw new ArgumentException("ReluSquared MoE uses a single projection; pass it as gateData and leave upData as IntPtr.Zero.");
+            if (activation is < MoEActivation.SwiGLUSplit or > MoEActivation.GEGLUSplit)
+                throw new ArgumentOutOfRangeException(nameof(activation));
+            bool fusedGateUp = upData == IntPtr.Zero;
             int gateBiasDim = fusedGateUp ? 2 * nFf : nFf;
             if (gateBias != null && gateBias.Length != gateBiasDim * numExperts)
                 throw new ArgumentException($"gateBias length {gateBias.Length} != gateBiasDim * numExperts = {gateBiasDim * numExperts}.");
             if (upBias != null)
             {
-                if (fusedGateUp || reluSquared) throw new ArgumentException("upBias must be null when upData is null.");
+                if (fusedGateUp) throw new ArgumentException("upBias must be null when upData is null.");
                 if (upBias.Length != nFf * numExperts)
                     throw new ArgumentException($"upBias length {upBias.Length} != nFf * numExperts = {nFf * numExperts}.");
             }
@@ -3039,7 +3019,6 @@ namespace TensorSharp.GGML
             fixed (float* upBiasPtr = upBias)
             fixed (float* downBiasPtr = downBias)
             fixed (float* postExpertNormPtr = postExpertNorm)
-            fixed (float* routeUpScalesPtr = routeUpScales)
             {
                 GgmlNative.MoEFFNPrefillSwiGLUQuant(
                     hiddenInPtr, hiddenOutPtr, seqLen, hiddenDim, nFf,
@@ -3052,8 +3031,7 @@ namespace TensorSharp.GGML
                     upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
                     downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
                     activationType, oaiAlpha, oaiLimit, runOnCpu,
-                    (IntPtr)postExpertNormPtr, postExpertNormEps,
-                    (IntPtr)routeUpScalesPtr);
+                    (IntPtr)postExpertNormPtr, postExpertNormEps);
             }
         }
 

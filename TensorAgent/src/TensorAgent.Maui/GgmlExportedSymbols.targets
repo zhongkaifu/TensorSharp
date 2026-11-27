@@ -267,7 +267,6 @@
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3VocabSize" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEExpertsSwiGLUForwardF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEExpertsSwiGLUResidualF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MoEFFNPrefillRouteScaledF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEFFNPrefillSwiGLUQuantF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierRegister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierRelease" SymbolType="Function" />
