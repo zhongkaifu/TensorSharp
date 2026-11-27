@@ -274,6 +274,7 @@ void Real(string checkpoint, string lora, int? blocks, string only, int cold)
         Ltx25DenoiserOutput o = null;
         double best = double.MaxValue;
         var times = new List<double>();
+        var peaks = new List<long>();
         for (int r = 0; r < (cold > 0 ? cold : repeat); r++)
         {
             if (cold > 0)
@@ -281,14 +282,26 @@ void Real(string checkpoint, string lora, int? blocks, string only, int cold)
                 release.Invoke(model, null);
                 if (allocator is CudaAllocator c) { c.Synchronize(); c.TrimPool(); }
             }
+            // CUDA: the step's peak live device bytes (the allocator's backing less its cached free blocks), polled beside it.
+            long peak = 0;
+            using var sampling = new CancellationTokenSource();
+            Task sampler = allocator is CudaAllocator live ? Task.Run(() =>
+            {
+                while (!sampling.IsCancellationRequested) { peak = Math.Max(peak, live.LiveBytes); Thread.Sleep(1); }
+            }) : Task.CompletedTask;
             var clock = Stopwatch.StartNew();
             o = model.Forward(input, blocks);
             times.Add(clock.Elapsed.TotalMilliseconds);
             best = Math.Min(best, times[^1]);
+            sampling.Cancel();
+            sampler.Wait();
+            peaks.Add(peak);
         }
         if (cold > 0) best = times.Order().ElementAt(times.Count / 2);
         Record(name, o, full: false, best);
         ((JsonObject)((JsonObject)report["cases"])[name])["times"] = new JsonArray(times.Select(t => (JsonNode)Math.Round(t, 1)).ToArray());
+        if (allocator is CudaAllocator)
+            ((JsonObject)((JsonObject)report["cases"])[name])["peakLiveBytes"] = new JsonArray(peaks.Select(p => (JsonNode)p).ToArray());
     }
     Run("first-pass-512x512x17", Plain(17, 512, 512, 1f));
     Run("i2v-first-pass-512x512x17", Guided(17, 512, 512, .9875f, new[] { (0, .7f) }));
