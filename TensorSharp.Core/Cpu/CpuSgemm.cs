@@ -104,8 +104,12 @@ namespace TensorSharp.Cpu
         }
 
         // Rows handled by the unpacked skinny path. Up to here the arithmetic per B element
-        // (M FMAs) is below the cost of copying that element into a panel.
-        private const int SkinnyMaxM = 4;
+        // (M FMAs) is below the cost of copying that element into a panel. The skinny path sums
+        // in another order than the packed tile and the narrow dot path, so a row of a product of
+        // up to this many rows rounds apart from the same row of a wider product, on every ISA
+        // (tests that compare steps of different row counts read it: DEVELOPMENT.md, "Rounding by
+        // row count").
+        internal const int SkinnyMaxM = 4;
 
         // Below this much arithmetic a fork/join costs more than it saves.
         private const double ParallelFlopThreshold = 4e6;
