@@ -110,8 +110,6 @@ internal sealed class AdaptedOracleModel : IHolderPrefixCacheModel, IPrefixCache
 
     public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx) => Inner.ForwardBatch(ctx);
     public bool BatchedForwardAvailable => Inner.BatchedForwardAvailable;
-    public bool SupportsLinearKVMigration => Inner.SupportsLinearKVMigration;
-    public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => Inner.TryMigrateLinearKVToPaged(owner, blockSize);
     public void OnSequenceReleased(string requestId)
     {
         Inner.OnSequenceReleased(requestId);

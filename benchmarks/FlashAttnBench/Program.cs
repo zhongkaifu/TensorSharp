@@ -1,6 +1,6 @@
 // Standalone microbench for the direct-CUDA flash prefill attention kernels
 // (ts_gqa_prefill_flash_group4_*, ts_gqa_prefill_flash_g16d128_*). Times
-// CudaFusedOps.TryGqaPrefillAttentionWithSinks at the real Qwen3.5 / Gemma4 /
+// CudaFusedOps.TryGqaPrefillAttention at the real Qwen3.5 / Gemma4 /
 // Nemotron prefill shapes and verifies against a CPU reference, so the kernels
 // can be tuned without a full model load. The route column is the kernel that
 // actually ran (CudaFusedOps.LastGqaPrefillRoute): a PTX built without a flash
@@ -93,11 +93,10 @@ static void RunOne(string name, int numQHeads, int numKVHeads, int headDim, int 
     using var actual = new Tensor(allocator, DType.Float32, seqLen, numQHeads * headDim);
     var routes = new HashSet<string>();
 
-    // WithSinks(sinks=null) is the entry the models actually use (Qwen full-attn
-    // and Gemma both reach flash through it) and routes d256/d512 at any window.
-    bool ok = CudaFusedOps.TryGqaPrefillAttentionWithSinks(
-        actual, qTensor, kCache, vCache, sinks: null,
-        numQHeads, numKVHeads, headDim, seqLen, kvLen, cacheSize, maskStart, windowSize, scale);
+    // The GQA prefill entry over head-first caches (kvStride = the cache's rows).
+    bool ok = CudaFusedOps.TryGqaPrefillAttention(
+        actual, qTensor, kCache, vCache,
+        numQHeads, numKVHeads, headDim, seqLen, kvLen, maskStart, windowSize, scale, kvStride: cacheSize);
     if (ok) routes.Add(CudaFusedOps.LastGqaPrefillRoute ?? "unknown");
     if (!ok)
     {
@@ -111,16 +110,16 @@ static void RunOne(string name, int numQHeads, int numKVHeads, int headDim, int 
 
     // Warmup + timed.
     for (int w = 0; w < 5; w++)
-        CudaFusedOps.TryGqaPrefillAttentionWithSinks(actual, qTensor, kCache, vCache, sinks: null,
-            numQHeads, numKVHeads, headDim, seqLen, kvLen, cacheSize, maskStart, windowSize, scale);
+        CudaFusedOps.TryGqaPrefillAttention(actual, qTensor, kCache, vCache,
+            numQHeads, numKVHeads, headDim, seqLen, kvLen, maskStart, windowSize, scale, kvStride: cacheSize);
     allocator.Synchronize();
 
     var times = new List<double>();
     for (int it = 0; it < iters; it++)
     {
         var sw = Stopwatch.StartNew();
-        CudaFusedOps.TryGqaPrefillAttentionWithSinks(actual, qTensor, kCache, vCache, sinks: null,
-            numQHeads, numKVHeads, headDim, seqLen, kvLen, cacheSize, maskStart, windowSize, scale);
+        CudaFusedOps.TryGqaPrefillAttention(actual, qTensor, kCache, vCache,
+            numQHeads, numKVHeads, headDim, seqLen, kvLen, maskStart, windowSize, scale, kvStride: cacheSize);
         allocator.Synchronize();
         sw.Stop();
         times.Add(sw.Elapsed.TotalMilliseconds);

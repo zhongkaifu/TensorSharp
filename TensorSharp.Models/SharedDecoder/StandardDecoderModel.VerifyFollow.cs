@@ -139,8 +139,8 @@ namespace TensorSharp.Models
             for (int il = 0; il < cfg.NumLayers; il++)
             {
                 string[] names = _dflashLayerNames[il];
-                int k = EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, rows, names[DfAttnKNorm], positionsNode);
-                int v = step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, rows);
+                int k = EmitDFlashHeads(step, names[DfAttnK], names[DfAttnKBias], g, kvHeads, rows, names[DfAttnKNorm], positionsNode);
+                int v = step.Reshape(DFlashProjection(step, names[DfAttnV], names[DfAttnVBias], g), hd, kvHeads, rows);
                 for (int s = 0; s < n; s++)
                 {
                     if (plan.Keep[s] <= 0) continue;

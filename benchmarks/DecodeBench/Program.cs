@@ -1,7 +1,8 @@
 // Standalone single-sequence decode benchmark for ANY model class. Measures the
-// fused N=1 decode path (ModelBase.Forward over a 1-token batch) that the
-// server's BatchExecutor N=1 fast path uses for steady-state generation — i.e.
-// the decode_tps column in the engine comparison report.
+// fused N=1 decode path (ModelBase.Forward over a 1-token batch): what the
+// server's per-sequence route runs for steady-state generation on a family
+// without a batched entry point (one with ForwardBatch serves a solo sequence
+// through it) — i.e. the decode_tps column in the engine comparison report.
 //
 // Plain exe (no VSTest host) so nsys/ncu can attach to the CUDA work.
 //

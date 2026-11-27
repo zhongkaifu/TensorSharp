@@ -129,14 +129,6 @@ public sealed class CudaFlashG16PrefillTests
             Assert.Equal("flash-g16d128", CudaFusedOps.LastGqaPrefillRoute);
             AssertRowsClose(expected, actual.GetElementsAsFloat(seqLen * NumQHeads * HeadDim), all, tolerance);
         }
-
-        using (var actual = new Tensor(allocator, DType.Float32, seqLen, NumQHeads * HeadDim))
-        {
-            Assert.True(CudaFusedOps.TryGqaPrefillAttentionWithSinks(actual, qTensor, kCache, vCache, sinks: null,
-                NumQHeads, NumKVHeads, HeadDim, seqLen, kvLen, cacheSize, maskStart, windowSize: 0, scale));
-            Assert.Equal("flash-g16d128", CudaFusedOps.LastGqaPrefillRoute);
-            AssertRowsClose(expected, actual.GetElementsAsFloat(seqLen * NumQHeads * HeadDim), all, tolerance);
-        }
     }
 
     [CudaFact]
@@ -154,8 +146,8 @@ public sealed class CudaFlashG16PrefillTests
         using var kCache = Cache(allocator, DType.Float16, k, len, cacheSize);
         using var vCache = Cache(allocator, DType.Float16, v, len, cacheSize);
         using var actual = new Tensor(allocator, DType.Float32, len, NumQHeads * HeadDim);
-        Assert.True(CudaFusedOps.TryGqaPrefillAttentionWithSinks(actual, qTensor, kCache, vCache, sinks: null,
-            NumQHeads, NumKVHeads, HeadDim, len, len, cacheSize, maskStart: 0, windowSize: 0, scale));
+        Assert.True(CudaFusedOps.TryGqaPrefillAttention(actual, qTensor, kCache, vCache,
+            NumQHeads, NumKVHeads, HeadDim, len, len, maskStart: 0, windowSize: 0, scale, kvStride: cacheSize));
         Assert.Equal("flash-g16d128", CudaFusedOps.LastGqaPrefillRoute);
 
         int[] rows = { 0, 1, 63, 64, 549, 1099 };

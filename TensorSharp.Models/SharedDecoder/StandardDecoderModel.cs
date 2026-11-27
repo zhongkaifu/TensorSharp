@@ -274,6 +274,10 @@ namespace TensorSharp.Models
                 _heterogeneousAttention = true;
             }
             MarkKvSharers();
+            for (int l = 0; l < Config.NumLayers; l++)
+                if ((AttentionSinksWeight(l) != null || AttentionProjectionsHaveBiases) && !RequiresGraphs)
+                    throw new NotSupportedException(
+                        $"{Config.Architecture}: attention sinks and biased attention projections run only as graphs; the family must declare RequiresGraphs.");
             if (_heterogeneousAttention && !RequiresGraphs)
                 throw new NotSupportedException(
                     $"{Config.Architecture}: layers of different attention geometry or shared K/V caches run only as graphs; " +
@@ -430,6 +434,22 @@ namespace TensorSharp.Models
         /// cells hold.
         /// </summary>
         protected virtual int SlidingWindow(int layer) => 0;
+
+        /// <summary>
+        /// The per-head attention sinks of attention layer <paramref name="layer"/> (GPT-OSS's <c>attn_sinks.weight</c>, F32
+        /// [heads]): one more logit in each query's softmax that weighs no value (ggml_flash_attn_ext_add_sinks:
+        /// w_k = exp(s_k) / (exp(sink_h) + sum_j exp(s_j))), or null (the default). Under tensor parallelism the sinks split by
+        /// heads with the queries. Graph-only (<see cref="RequiresGraphs"/>): the per-op attention has no sinks.
+        /// </summary>
+        protected virtual string AttentionSinksWeight(int layer) => null;
+
+        /// <summary>
+        /// Whether every attention layer's projections carry biases (GPT-OSS): <c>attn_q</c>, <c>attn_k</c> and <c>attn_v</c>
+        /// (fused at load into <c>attn_qkv.bias</c> where their weights fuse) add theirs to their products, and
+        /// <c>attn_output.bias</c> joins the output projection once (after a tensor-parallel reduce). Graph-only
+        /// (<see cref="RequiresGraphs"/>). Default: no.
+        /// </summary>
+        protected virtual bool AttentionProjectionsHaveBiases => false;
 
         /// <summary>
         /// The per-op counterpart of <see cref="EmitAttentionOutput"/>: what a family applies to the attention result
@@ -737,6 +757,8 @@ namespace TensorSharp.Models
             }
             if (fusedQkv > 0)
                 Console.WriteLine($"  Fused projections: {fusedQkv} QKV");
+            if (AttentionProjectionsHaveBiases)
+                FuseProjectionBiases();
             FuseGateUpWeights();
 
             _qkvFused = new bool[TotalLayers];
@@ -745,6 +767,40 @@ namespace TensorSharp.Models
             {
                 _qkvFused[l] = HasWeight(LayerName(l, "attn_qkv.weight"));
                 _gateUpFused[l] = HasWeight(LayerName(l, "ffn_gate_up.weight"));
+            }
+        }
+
+        /// <summary>
+        /// A biased family's (<see cref="AttentionProjectionsHaveBiases"/>) Q, K and V biases as one [q | k | v] bias,
+        /// <c>attn_qkv.bias</c>, where their weights fused into <c>attn_qkv.weight</c>: the fused product adds it once. Every
+        /// attention layer this process owns must carry its biases, refused at load rather than at the first step.
+        /// </summary>
+        private void FuseProjectionBiases()
+        {
+            for (int l = 0; l < TotalLayers; l++)
+            {
+                if (!OwnsLayer(l) || !IsAttentionLayer(l) || PhysicalLayer(l) != l) continue;
+                string q = LayerName(l, "attn_q.bias"), k = LayerName(l, "attn_k.bias"), v = LayerName(l, "attn_v.bias");
+                string output = LayerName(l, "attn_output.bias");
+                if (!_weights.ContainsKey(output))
+                    throw new InvalidOperationException($"{Config.Architecture} layer {l} is missing '{output}'.");
+                foreach (string bias in SharesKv(l) ? new[] { q } : new[] { q, k, v })
+                    if (!_weights.ContainsKey(bias))
+                        throw new InvalidOperationException($"{Config.Architecture} layer {l} is missing '{bias}'.");
+                if (!HasWeight(LayerName(l, "attn_qkv.weight"))) continue;
+                Tensor qb = _weights[q], kb = _weights[k], vb = _weights[v];
+                long qn = qb.ElementCount(), kn = kb.ElementCount(), vn = vb.ElementCount();
+                string fused = LayerName(l, "attn_qkv.bias");
+                var t = new Tensor(AllocatorForWeight(fused), DType.Float32, qn + kn + vn);
+                using (Tensor flat = qb.View(qn)) using (Tensor to = t.Narrow(0, 0, qn)) Ops.Copy(to, flat);
+                using (Tensor flat = kb.View(kn)) using (Tensor to = t.Narrow(0, qn, kn)) Ops.Copy(to, flat);
+                using (Tensor flat = vb.View(vn)) using (Tensor to = t.Narrow(0, qn + kn, vn)) Ops.Copy(to, flat);
+                _weights[fused] = t;
+                foreach (string bias in new[] { q, k, v })
+                {
+                    _weights[bias].Dispose();
+                    _weights.Remove(bias);
+                }
             }
         }
 

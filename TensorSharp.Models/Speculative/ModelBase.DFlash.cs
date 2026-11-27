@@ -121,7 +121,12 @@ namespace TensorSharp.Models
         // DSpark only (the Nemotron-3.5 attention-sink module); absent in a
         // plain DFlash / DFlash2 file.
         private protected const int DfAttnSinks = 15;
-        private protected const int DfLayerNameCount = 16;
+        // Optional projection biases (the gpt-oss-20b DFlash drafter's attn_{q,k,v,output}.bias); null where the file has none.
+        private protected const int DfAttnQBias = 16;
+        private protected const int DfAttnKBias = 17;
+        private protected const int DfAttnVBias = 18;
+        private protected const int DfAttnOutputBias = 19;
+        private protected const int DfLayerNameCount = 20;
 
         /// <summary>
         /// Default prompt-prefill chunk the speculative executor should use, and
@@ -236,6 +241,18 @@ namespace TensorSharp.Models
         /// borrows the TARGET's token_embd.weight and output.weight, which the file
         /// does not carry.
         /// </summary>
+        /// <summary><paramref name="y"/> [rows, width] plus the drafter's bias <paramref name="bias"/> [width] on every row, in place
+        /// (no bias: unchanged).</summary>
+        private Tensor DFlashBiased(Tensor y, string bias)
+        {
+            if (bias == null) return y;
+            Tensor b = _weights[bias];
+            using Tensor row = b.View(1, b.ElementCount());
+            using Tensor spread = row.Expand(y.Sizes);
+            Ops.Add(y, y, spread);
+            return y;
+        }
+
         public void LoadDFlashDraftWeights(string ggufPath)
         {
             // A trunk that cannot verify a draft window bit-exactly refuses every
@@ -303,6 +320,10 @@ namespace TensorSharp.Models
                 }
                 // llama.cpp's name (blk.N.attn_sinks.weight), or the bare one an earlier export wrote.
                 names[DfAttnSinks] = _weights.ContainsKey(p + "attn_sinks.weight") ? p + "attn_sinks.weight" : p + "attn_sinks";
+                names[DfAttnQBias] = _weights.ContainsKey(p + "attn_q.bias") ? p + "attn_q.bias" : null;
+                names[DfAttnKBias] = _weights.ContainsKey(p + "attn_k.bias") ? p + "attn_k.bias" : null;
+                names[DfAttnVBias] = _weights.ContainsKey(p + "attn_v.bias") ? p + "attn_v.bias" : null;
+                names[DfAttnOutputBias] = _weights.ContainsKey(p + "attn_output.bias") ? p + "attn_output.bias" : null;
                 _dflashLayerNames[il] = names;
             }
 
@@ -934,8 +955,8 @@ namespace TensorSharp.Models
             {
                 string[] names = _dflashLayerNames[il];
 
-                Tensor k = LinearForward(g, names[DfAttnK]);
-                Tensor v = LinearForward(g, names[DfAttnV]);
+                Tensor k = DFlashBiased(LinearForward(g, names[DfAttnK]), names[DfAttnKBias]);
+                Tensor v = DFlashBiased(LinearForward(g, names[DfAttnV]), names[DfAttnVBias]);
 
                 k = DFlashHeadNorm(k, _weights[names[DfAttnKNorm]], kvHeads, n, hd);
                 k = DFlashRoPE(k, kvHeads, n, hd, positions);
@@ -1019,9 +1040,9 @@ namespace TensorSharp.Models
                 if (cfg.HasConv)
                     h = DFlashConvPrepare(h, b, names[DfAttnConvProj], names[DfAttnConvBase], out attnFinishDelta);
 
-                Tensor q = LinearForward(h, names[DfAttnQ]);
-                Tensor k = LinearForward(h, names[DfAttnK]);
-                Tensor v = LinearForward(h, names[DfAttnV]);
+                Tensor q = DFlashBiased(LinearForward(h, names[DfAttnQ]), names[DfAttnQBias]);
+                Tensor k = DFlashBiased(LinearForward(h, names[DfAttnK]), names[DfAttnKBias]);
+                Tensor v = DFlashBiased(LinearForward(h, names[DfAttnV]), names[DfAttnVBias]);
                 h.Dispose();
 
                 q = DFlashHeadNorm(q, _weights[names[DfAttnQNorm]], heads, b, hd);
@@ -1035,7 +1056,7 @@ namespace TensorSharp.Models
                 k.Dispose();
                 v.Dispose();
 
-                Tensor attnOut = LinearForward(attn, names[DfAttnOutput]);
+                Tensor attnOut = DFlashBiased(LinearForward(attn, names[DfAttnOutput]), names[DfAttnOutputBias]);
                 attn.Dispose();
 
                 if (attnFinishDelta != null)

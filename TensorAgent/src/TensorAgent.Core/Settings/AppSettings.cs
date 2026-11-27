@@ -80,7 +80,8 @@ public sealed class AppSettings
     /// A REQUEST, not a guarantee. Architectures whose attention cannot read a
     /// block-quantized cache refuse it at load and use f16 instead -- Gemma 4, whose
     /// sliding-window layers keep a circular cache with float-only helpers, and
-    /// GPT-OSS -- so on those this setting changes nothing and is not allowed to.
+    /// GPT-OSS, which keeps f16 for q4_0 (and takes q8_0 on the GGML backends only)
+    /// -- so on those this setting changes nothing and is not allowed to.
     /// Read at model construction, so a change applies to the next model that loads.
     /// </para>
     /// </summary>

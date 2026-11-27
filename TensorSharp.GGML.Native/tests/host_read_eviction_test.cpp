@@ -7,17 +7,13 @@
 // caches (destroy() ran before the call's barrier), and growth of the shared
 // reuse compute buffer and reuse gallocr (the old buffer is freed before the
 // next op's barrier). Only Metal async queues such a download, so this drives
-// the CPU backend, where the paged-attention device path binds its output
-// zero-copy and marks the barrier the same way, and asks the test diagnostics
-// whether a release ran while that mark was still pending.
+// the CPU backend, marks the barrier through the test diagnostics as such a
+// download does (TSGgml_TestMarkPendingGpuWork), and asks them whether a release
+// ran while that mark was still pending.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <vector>
-#if defined(_WIN32)
-#include <malloc.h>
-#endif
 extern "C" {
 int TSGgml_IsBackendAvailable(int);
 const char* TSGgml_GetLastError();
@@ -25,11 +21,10 @@ int TSGgml_HostReadBarrier();
 int TSGgml_PagedAttentionSessionCount();
 int TSGgml_PrefillAttentionSessionCount();
 int TSGgml_TestUndrainedCacheReleases();
+int TSGgml_TestMarkPendingGpuWork();
 std::int64_t TSGgml_TestReuseAllocate(std::int64_t, int);
 void TSGgml_Shutdown();
 int TSGgml_PagedAttentionForward(const float*,const float*,const float*,float*,const int*,const int*,
-    const int*,const int*,const int*,int,int,int,int,int,int,int,float);
-int TSGgml_PagedAttentionForwardDevice(void*,const float*,const float*,void*,const int*,const int*,
     const int*,const int*,const int*,int,int,int,int,int,int,int,float);
 int TSGgml_FusedPrefillAttentionF32(const float*,const float*,const float*,float*,
     int,int,int,int,int,int,int,float,int);
@@ -98,43 +93,15 @@ bool prefill(const Inputs& in, int i)
     return finite(out.data(), kRowFloats);
 }
 
-// Page-aligned Q and output, which the CPU backend binds zero-copy; the call
-// then leaves its result marked for the barrier, as Metal async does.
-struct HostPointers
+// Work an op left queued for the barrier, as Metal async compute leaves it.
+bool mark()
 {
-    float* q = nullptr;
-    float* out = nullptr;
-    static float* allocate()
+    if (!TSGgml_TestMarkPendingGpuWork())
     {
-        const std::size_t bytes = ((kRowFloats * sizeof(float) + 4095) / 4096) * 4096;
-#if defined(_WIN32)
-        return static_cast<float*>(_aligned_malloc(bytes, 4096));
-#else
-        return static_cast<float*>(std::aligned_alloc(4096, bytes));
-#endif
-    }
-    static void release(float* p)
-    {
-#if defined(_WIN32)
-        _aligned_free(p);
-#else
-        std::free(p);
-#endif
-    }
-    HostPointers() : q(allocate()), out(allocate()) {}
-    ~HostPointers() { release(q); release(out); }
-};
-
-bool mark(const Inputs& in, HostPointers& host)
-{
-    for (int i = 0; i < kRowFloats; i++) { host.q[i] = in.q[i]; host.out[i] = NAN; }
-    if (!TSGgml_PagedAttentionForwardDevice(host.q, in.k.data(), in.v.data(), host.out, kStarts, kLengths,
-            kPositions, kTable, kOffsets, 1, kRows, kHeads, kKvHeads, kDim, kBlock, 0, scale_of(0)))
-    {
-        std::fprintf(stderr, "device paged attention failed: %s\n", TSGgml_GetLastError());
+        std::fprintf(stderr, "marking pending GPU work failed: %s\n", TSGgml_GetLastError());
         return false;
     }
-    return finite(host.out, kRowFloats);
+    return true;
 }
 }
 
@@ -142,11 +109,10 @@ int main()
 {
     if (!TSGgml_IsBackendAvailable(2)) return 77;
     const Inputs in;
-    HostPointers host;
 
-    // Control: the device path really leaves a mark, or nothing below is tested.
-    if (!mark(in, host)) return 1;
-    expect(TSGgml_HostReadBarrier() == 1, "the zero-copy device call left work marked");
+    // Control: the mark really is pending, or nothing below is tested.
+    if (!mark()) return 1;
+    expect(TSGgml_HostReadBarrier() == 1, "the mark left work pending");
     expect(TSGgml_HostReadBarrier() == 0, "one barrier drained the mark");
 
     // Paged attention: fill the cache, mark, then a new scale evicts the LRU session.
@@ -154,7 +120,7 @@ int main()
     for (int i = 0; i < kCacheSize; i++)
         if (!paged(in, i)) return 1;
     expect(TSGgml_PagedAttentionSessionCount() == kCacheSize, "the paged session cache is full");
-    if (!mark(in, host) || !paged(in, kCacheSize)) return 1;
+    if (!mark() || !paged(in, kCacheSize)) return 1;
     expect(TSGgml_PagedAttentionSessionCount() == kCacheSize, "the new paged session replaced an evicted one");
     expect(TSGgml_TestUndrainedCacheReleases() == before,
            "paged attention evicted a session while marked work was pending");
@@ -164,7 +130,7 @@ int main()
     for (int i = 0; i < kCacheSize; i++)
         if (!prefill(in, i)) return 1;
     expect(TSGgml_PrefillAttentionSessionCount() == kCacheSize, "the prefill session cache is full");
-    if (!mark(in, host) || !prefill(in, kCacheSize)) return 1;
+    if (!mark() || !prefill(in, kCacheSize)) return 1;
     expect(TSGgml_PrefillAttentionSessionCount() == kCacheSize, "the new prefill session replaced an evicted one");
     expect(TSGgml_TestUndrainedCacheReleases() == before,
            "prefill attention evicted a session while marked work was pending");
@@ -172,7 +138,7 @@ int main()
     // The shared reuse compute buffer, grown past its 64 MiB slab while marked.
     before = TSGgml_TestUndrainedCacheReleases();
     const std::int64_t small_buffer = TSGgml_TestReuseAllocate(1024, 0);
-    if (small_buffer <= 0 || !mark(in, host)) return 1;
+    if (small_buffer <= 0 || !mark()) return 1;
     const std::int64_t grown_buffer = TSGgml_TestReuseAllocate(std::int64_t(20) << 20, 0);
     expect(grown_buffer > small_buffer, "the reuse compute buffer grew");
     expect(TSGgml_TestUndrainedCacheReleases() == before,
@@ -181,7 +147,7 @@ int main()
     // The shared reuse gallocr, handed a larger graph while marked.
     before = TSGgml_TestUndrainedCacheReleases();
     const std::int64_t small_gallocr = TSGgml_TestReuseAllocate(1024, 1);
-    if (small_gallocr <= 0 || !mark(in, host)) return 1;
+    if (small_gallocr <= 0 || !mark()) return 1;
     const std::int64_t grown_gallocr = TSGgml_TestReuseAllocate(std::int64_t(1) << 20, 1);
     expect(grown_gallocr > small_gallocr, "the reuse gallocr grew");
     expect(TSGgml_TestUndrainedCacheReleases() == before,

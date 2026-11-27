@@ -139,6 +139,7 @@ namespace TensorSharp.GGML
                 if (program.WideTokenRoutes != null) g.MarkWideTokenRoutes(program.WideTokenRoutes);
                 else if (program.WideTokenProducts) g.MarkWideTokenProducts();
                 if (program.Q8Nvfp4Activations) g.MarkQ8Nvfp4Activations();
+                if (program.BackendFusions) g.MarkBackendFusions();
                 foreach (GraphNode n in program.Entries)
                 {
                     switch (n.Kind)

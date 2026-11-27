@@ -49,12 +49,10 @@ public class DeferredPrimaryCacheTests
         Assert.Equal(reference.OutputTokens, actual.OutputTokens);
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ExactContinuation_WithNoRetentionHeadroom_NeverConvertsTheLivePrimary(bool singleSequenceFused)
+    [Fact]
+    public async Task ExactContinuation_WithNoRetentionHeadroom_NeverConvertsTheLivePrimary()
     {
-        var traits = Traits with { Pages = singleSequenceFused ? PageSupport.A2ModelPaged : PageSupport.None };
+        var traits = Traits with { Pages = PageSupport.None };
         var model = new OracleModel(traits, 8) { SpareBytes = 1 };
         model.FailNext("convert"); // A conversion would destroy the valid primary in this fixture.
         using var engine = new InferenceEngine(model, Configuration());

@@ -413,11 +413,10 @@ namespace TensorSharp.Runtime.Scheduling
         public bool UsesLiveCacheContinuation { get; internal set; }
 
         /// <summary>True once this sequence's K/V state has been written into
-        /// the model's paged storage (via <c>ForwardBatch</c> or an explicit
-        /// linear→paged migration). Prevents the executor from later routing
-        /// the same sequence back through the N=1 fast path's
-        /// <c>Forward()</c>, which would write into the disjoint linear KV
-        /// cache and corrupt the sequence's attention.</summary>
+        /// the model's paged storage (via <c>ForwardBatch</c>). Prevents the
+        /// executor from later routing the same sequence back through a
+        /// per-sequence <c>Forward()</c>, which would write into the disjoint
+        /// linear KV cache and corrupt the sequence's attention.</summary>
         public bool KvStateInPagedStorage { get; internal set; }
 
         /// <summary>Returns the token at logical position <paramref name="pos"/>

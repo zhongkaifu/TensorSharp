@@ -28,7 +28,9 @@ namespace TensorSharp.Graph
         /// <summary>Routed SwiGLU experts whose weights stay in host memory: srcs x [n, rows], ids (I32 [k, rows]),
         /// route weights ([k, rows]), then the stacked gate, up and down experts, and optionally the next offloaded
         /// layer's router and gate stack (a hint: an executor may read that layer's predicted experts ahead); Ip: the
-        /// layer, n_ff. Result
+        /// layer, the activation (0 SwiGLU, 1 GPT-OSS's clamped SwiGLU at Fp alpha and limit, 2 GeGLU, 3 relu(up)^2), a fused
+        /// gate|up stack, per-route up scales (srcs[6]), the experts' biases (Ip[4] = 1: srcs[6..8] the gate, up and down
+        /// stacks' F32 [n_ff, E], [n_ff, E], [n, E]). Result
         /// [n, rows] = sum over k of w * down(silu(gate x) * up x) for each row's experts. An executor with
         /// <see cref="GraphCapabilities.HostExperts"/> pauses the program there (an accelerator tier registered
         /// for the gate stack runs the routes it holds); the others do not take it.</summary>
@@ -84,6 +86,11 @@ namespace TensorSharp.Graph
         /// family's ops.
         /// </summary>
         SsmScan = 74,
+        /// <summary>
+        /// GPT-OSS's clamped SwiGLU (ggml_swiglu_oai): srcs gate and up, of one shape. Fp: alpha, limit. With
+        /// g = min(gate, limit) and u = clamp(up, -limit, limit), the result is g * sigmoid(alpha * g) * (u + 1).
+        /// </summary>
+        SwigluOai = 75,
     }
 
     /// <summary>
@@ -483,6 +490,14 @@ namespace TensorSharp.Graph
         /// rows]. The ops: an F32 flash attention (and the gates' ops); a tensor executor serves it with its F32 attention over
         /// bounded score scratch, gating the result in place.</summary>
         FullAttention = 47,
+        /// <summary>GPT-OSS's routed experts (a MoE layer's feed-forward): each row's top-K experts by its router logits (a tie to
+        /// the lower expert), the softmax over those K as the route weights, and the weighted sum of their clamped SwiGLU
+        /// feed-forwards: down · swiglu_oai(gate · x + gate bias, up · x + up bias) + down bias, each expert's biases its own
+        /// (<see cref="GraphOp.SwigluOai"/> at Fp alpha and limit). Inputs: x [n, rows] (the experts' normed input), the router
+        /// logits [E, rows] (their bias added), the gate, up and down stacks [n, ff, E], [n, ff, E], [ff, n, E], then the biases
+        /// (F32) [ff, E], [ff, E], [n, E]. Ip: K, whether the down bias is added (0 on a tensor-parallel rank past the first, whose
+        /// partial the all-reduce sums). Fp: alpha, limit. Result: [n, rows].</summary>
+        OaiRoutedExperts = 48,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
@@ -513,8 +528,9 @@ namespace TensorSharp.Graph
     {
         internal GraphProgram(GraphNode[] entries, int nodeCount, long[] outputFloats, bool replayable, bool reorder,
             int[]? tensorParallelRanks, (ulong, ulong) signature, bool floatProducts = false, bool wideTokenProducts = false,
-            bool q8Nvfp4Activations = false)
+            bool q8Nvfp4Activations = false, bool backendFusions = false)
         {
+            BackendFusions = backendFusions;
             Entries = entries;
             NodeCount = nodeCount;
             OutputFloats = outputFloats;
@@ -561,6 +577,13 @@ namespace TensorSharp.Graph
         /// activations are 8-bit already.</summary>
         public bool Q8Nvfp4Activations { get; }
 
+        /// <summary>The backend's own fusions of this program's chains get the allocation dependencies they ask for
+        /// (<see cref="GraphProgramBuilder.MarkBackendFusions"/>): the GGML executor on ggml-cuda runs the backend's graph optimizer
+        /// hook before allocating (ggml_backend_cuda_graph_optimize: no reorder without GGML_CUDA_GRAPH_OPT), so a fusion whose
+        /// inputs the allocator would otherwise have handed to its output (the routed experts' weighted sum,
+        /// moe_weighted_reduction) runs as one kernel at every width. A family opts in where it measured it.</summary>
+        public bool BackendFusions { get; }
+
         /// <summary>The routes a <see cref="WideTokenProducts"/> program's products and attentions take on ggml_cuda, where the
         /// family that emits it says (null: MiniMax-H3's, the routes the offload was tuned on).</summary>
         public GraphWideTokenRoutes? WideTokenRoutes { get; init; }
@@ -579,6 +602,7 @@ namespace TensorSharp.Graph
         private bool _signatureOnly;
         private bool _wideTokenProducts;
         private bool _q8Nvfp4Activations;
+        private bool _backendFusions;
 
         public GraphProgramBuilder(bool record) => _entries = record ? new List<GraphNode>() : null;
 
@@ -624,6 +648,20 @@ namespace TensorSharp.Graph
 
         /// <summary>Whether <see cref="MarkQ8Nvfp4Activations"/> was called.</summary>
         public bool Q8Nvfp4Activations => _q8Nvfp4Activations;
+
+        /// <summary>The program will carry <see cref="GraphProgram.BackendFusions"/>. Part of the signature; before any entry, as
+        /// <see cref="MarkWideTokenProducts"/>.</summary>
+        public void MarkBackendFusions()
+        {
+            if (NodeCount != 0 || _outputs.Count != 0)
+                throw new InvalidOperationException("BackendFusions is a program attribute: mark it before the first entry.");
+            if (_backendFusions) return;
+            _backendFusions = true;
+            Mix(11);
+        }
+
+        /// <summary>Whether <see cref="MarkBackendFusions"/> was called.</summary>
+        public bool BackendFusions => _backendFusions;
 
         public bool Recording => _entries != null;
 
@@ -764,7 +802,8 @@ namespace TensorSharp.Graph
         {
             if (_entries == null) throw new InvalidOperationException("A hash-only trace has no program.");
             return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature,
-                floatProducts: _floatProducts, wideTokenProducts: _wideTokenProducts, q8Nvfp4Activations: _q8Nvfp4Activations)
+                floatProducts: _floatProducts, wideTokenProducts: _wideTokenProducts, q8Nvfp4Activations: _q8Nvfp4Activations,
+                backendFusions: _backendFusions)
             {
                 WideTokenRoutes = _routes,
             };

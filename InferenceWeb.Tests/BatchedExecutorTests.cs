@@ -218,7 +218,7 @@ public class BatchedExecutorTests
         // would otherwise call seq.TokenAt(NumComputedTokens), which throws
         // ArgumentOutOfRangeException because the sampled token is not in the
         // sequence's token list yet.
-        var model = new StatefulMigrationStubModel("fp-decode-override", peakToken: 7);
+        var model = new StatefulPagedStubModel("fp-decode-override", peakToken: 7);
         using var engine = new InferenceEngine(model, SmallConfig(), NullLogger.Instance);
 
         var sequences = Enumerable.Range(0, 3)
@@ -244,56 +244,9 @@ public class BatchedExecutorTests
     }
 
     [Fact]
-    public void BatchExecutor_BatchDeclineAfterLinearMigration_PreservesOwnerTail()
-    {
-        using var model = new StatefulMigrationStubModel(
-            "fp-migration-decline", peakToken: 7, declineMultiBatchNumber: 1);
-        var cfg = SmallConfig();
-        var pool = new BlockPool(
-            cfg.NumBlocks, cfg.BlockSize, model.ComputeKVBlockByteSize(cfg.BlockSize));
-        var scheduler = new ContinuousBatchScheduler(cfg, pool, NullLogger.Instance);
-        var executor = new BatchExecutor(model, pool, scheduler, NullLogger.Instance);
-
-        var owner = new SequenceState(
-            "migration-owner",
-            Enumerable.Range(1, BlockSize + 3).ToList(),
-            maxNewTokens: 4,
-            BlockSize,
-            SamplingConfig.Greedy);
-        scheduler.Submit(owner);
-        var firstResults = executor.ExecuteStep(scheduler.Schedule());
-        Assert.Single(firstResults);
-        Assert.Null(firstResults[0].Error);
-
-        var newcomer = new SequenceState(
-            "migration-newcomer",
-            Enumerable.Range(2, 4).ToList(),
-            maxNewTokens: 4,
-            BlockSize,
-            SamplingConfig.Greedy);
-        scheduler.Submit(newcomer);
-        var mixedStep = scheduler.Schedule();
-        Assert.Equal(2, mixedStep.ScheduledWork.Count);
-
-        var fallbackResults = executor.ExecuteStep(mixedStep);
-
-        Assert.All(fallbackResults, result => Assert.Null(result.Error));
-        Assert.Equal(1, model.MigrationCalls);
-        // The per-sequence fairness policy serves the fresh newcomer first.
-        // On the next step the prior owner is restored from its captured blocks
-        // and migrated again; that is where a missing partial tail is exposed.
-        Assert.All(executor.ExecuteStep(scheduler.Schedule()), result => Assert.Null(result.Error));
-        Assert.True(model.SawMigratedOwnerFallbackForward,
-            $"The owner did not continue from the complete live linear tail after ForwardBatch declined " +
-            $"(expected {model.OwnerFallbackExpectedLength}, saw {model.OwnerFallbackActualLength}).");
-        Assert.False(model.LostMigratedOwnerTail,
-            "The model's copy-only migration was treated as a destructive handoff before ForwardBatch accepted.");
-    }
-
-    [Fact]
     public void BatchExecutor_PagedBatchDecline_UsesPagedSingletonsAndNextBatchSeesFullHistory()
     {
-        using var model = new StatefulMigrationStubModel(
+        using var model = new StatefulPagedStubModel(
             "fp-paged-decline", peakToken: 7, declineMultiBatchNumber: 2);
         var cfg = SmallConfig();
         var pool = new BlockPool(
@@ -331,7 +284,7 @@ public class BatchedExecutorTests
         {
             Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "0");
 
-            using var model = new StatefulMigrationStubModel(
+            using var model = new StatefulPagedStubModel(
                 "fp-dynamic-batch-disable", peakToken: 7);
             var cfg = SmallConfig();
             var pool = new BlockPool(
@@ -372,52 +325,6 @@ public class BatchedExecutorTests
         {
             Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", previousDisable);
         }
-    }
-
-    [Fact]
-    public void BatchExecutor_MixedMultimodalMigrationFailure_FallsBackBeforeAdvancingEitherSubset()
-    {
-        var injector = new PendingRequestInjector();
-        using var model = new StatefulMigrationStubModel(
-            "fp-mixed-migration-failure",
-            peakToken: 7,
-            migrationSucceeds: false,
-            injector: injector);
-        var cfg = SmallConfig();
-        var pool = new BlockPool(
-            cfg.NumBlocks, cfg.BlockSize, model.ComputeKVBlockByteSize(cfg.BlockSize));
-        var scheduler = new ContinuousBatchScheduler(cfg, pool, NullLogger.Instance);
-        var executor = new BatchExecutor(model, pool, scheduler, NullLogger.Instance);
-
-        var owner = new SequenceState(
-            "mixed-text-owner",
-            Enumerable.Range(1, BlockSize + 1).ToList(),
-            maxNewTokens: 4,
-            BlockSize,
-            SamplingConfig.Greedy);
-        scheduler.Submit(owner);
-        Assert.Null(executor.ExecuteStep(scheduler.Schedule())[0].Error);
-
-        var multimodal = new SequenceState(
-            "mixed-mm",
-            Enumerable.Range(3, 4).ToList(),
-            maxNewTokens: 4,
-            BlockSize,
-            SamplingConfig.Greedy);
-        injector.AddPending(multimodal.RequestId);
-        scheduler.Submit(multimodal);
-        var mixedStep = scheduler.Schedule();
-        Assert.Equal(2, mixedStep.ScheduledWork.Count);
-
-        var results = executor.ExecuteStep(mixedStep);
-
-        Assert.All(results, result => Assert.Null(result.Error));
-        Assert.Equal(1, model.MigrationCalls);
-        Assert.Equal(0, model.ForwardBatchCalls);
-        Assert.All(executor.ExecuteStep(scheduler.Schedule()), result => Assert.Null(result.Error));
-        Assert.True(model.SawMigratedOwnerFallbackForward,
-            $"Expected {model.OwnerFallbackExpectedLength} live tokens, saw {model.OwnerFallbackActualLength}.");
-        Assert.False(model.LostMigratedOwnerTail);
     }
 
     [Fact]
@@ -605,10 +512,9 @@ public class BatchedExecutorTests
         // keeps the GPU saturated on models whose fused single-graph decode is
         // far faster than the batched op-by-op kernel.
         //
-        // The model declares SupportsLinearKVMigration like Gemma 4, so a
-        // single-sequence step uses the N==1 fused Forward fast path rather than
-        // ForwardBatch — hence ForwardBatch must NEVER be called regardless of
-        // how the scheduler interleaves admission.
+        // A single-sequence step takes the per-sequence route too (the model's
+        // fused Forward), so ForwardBatch must NEVER be called regardless of how
+        // the scheduler interleaves admission.
         var model = new PerSeqFusedStubModel("fp-fused");
         // Long-ish generations so multiple sequences overlap for many steps.
         using var engine = new InferenceEngine(model, SmallConfig(), NullLogger.Instance);
@@ -957,53 +863,42 @@ public class BatchedExecutorTests
     }
 
     /// <summary>
-    /// Stateful linear/paged cache model used by the migration-decline tests.
+    /// Stateful linear/paged cache model used by the batch-decline tests.
     /// Tokens themselves stand in for K/V rows, making a missing partial tail
     /// observable without a real attention kernel.
     /// </summary>
-    private sealed class StatefulMigrationStubModel : IModelArchitecture, IBatchedPagedModel
+    private sealed class StatefulPagedStubModel : IModelArchitecture, IBatchedPagedModel
     {
         private readonly string _fp;
         private readonly int _peak;
         private readonly int _declineMultiBatchNumber;
-        private readonly bool _migrationSucceeds;
         private readonly IMultimodalInjector _injector;
         private readonly List<int> _linearHistory = new();
         private readonly Dictionary<string, List<int>> _pagedHistory =
             new(StringComparer.Ordinal);
         private int _multiBatchCalls;
         private bool _declinedMultiBatch;
-        private bool _awaitingOwnerFallback;
-        private string _expectedOwnerRequestId;
-        private int[] _expectedOwnerFallbackHistory = Array.Empty<int>();
 
-        public StatefulMigrationStubModel(
+        public StatefulPagedStubModel(
             string fp,
             int peakToken,
             int declineMultiBatchNumber = 0,
-            bool migrationSucceeds = true,
             IMultimodalInjector injector = null)
         {
             _fp = fp;
             _peak = peakToken;
             _declineMultiBatchNumber = declineMultiBatchNumber;
-            _migrationSucceeds = migrationSucceeds;
             _injector = injector;
             Tokenizer = new StubTokenizer(VocabSize);
         }
 
-        public int MigrationCalls { get; private set; }
         public int ForwardBatchCalls { get; private set; }
         public int SingletonBatchCalls { get; private set; }
         public int LinearForwardCalls { get; private set; }
         public int PagedHistoryValidationFailures { get; private set; }
         public int DecodeRowsServedFromOverride { get; private set; }
         public int DecodeRowsMissingOverride { get; private set; }
-        public bool SawMigratedOwnerFallbackForward { get; private set; }
-        public bool LostMigratedOwnerTail { get; private set; }
         public bool SawAcceptedMultiBatchAfterDecline { get; private set; }
-        public int OwnerFallbackExpectedLength { get; private set; }
-        public int OwnerFallbackActualLength { get; private set; }
 
         public ModelConfig Config { get; } = new ModelConfig { VocabSize = VocabSize };
         public ITokenizer Tokenizer { get; }
@@ -1012,20 +907,12 @@ public class BatchedExecutorTests
         public bool SupportsKVCacheTruncation => true;
         public bool SupportsKVStateSnapshot => true;
         public bool SupportsCrossSequenceKvReuse => true;
-        public bool SupportsLinearKVMigration => true;
         public string KVStateFingerprint => _fp;
         public long ComputeKVBlockByteSize(int tokenCount) => tokenCount * sizeof(int);
 
         public float[] Forward(int[] tokens)
         {
             LinearForwardCalls++;
-            if (_awaitingOwnerFallback
-                && tokens.Length == 1
-                && tokens[0] == _peak)
-            {
-                ValidateRestoredOwnerTail();
-            }
-
             _linearHistory.AddRange(tokens);
             return PeakedLogits();
         }
@@ -1075,26 +962,6 @@ public class BatchedExecutorTests
             return true;
         }
 
-        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize)
-        {
-            MigrationCalls++;
-            if (_awaitingOwnerFallback
-                && string.Equals(owner.RequestId, _expectedOwnerRequestId, StringComparison.Ordinal))
-            {
-                ValidateRestoredOwnerTail();
-            }
-
-            int count = owner.NumComputedTokens;
-            _expectedOwnerFallbackHistory = _linearHistory.Take(count).ToArray();
-            _expectedOwnerRequestId = owner.RequestId;
-            _awaitingOwnerFallback = true;
-            if (!_migrationSucceeds || _linearHistory.Count < count)
-                return false;
-
-            _pagedHistory[owner.RequestId] = _expectedOwnerFallbackHistory.ToList();
-            return true;
-        }
-
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
         {
             ForwardBatchCalls++;
@@ -1118,7 +985,6 @@ public class BatchedExecutorTests
                 throw new NotSupportedException("decline the configured multi-sequence batch");
             }
 
-            _awaitingOwnerFallback = false;
             for (int s = 0; s < ctx.Sequences.Count; s++)
             {
                 var seq = ctx.Sequences[s];
@@ -1192,17 +1058,6 @@ public class BatchedExecutorTests
             var logits = new float[VocabSize];
             logits[_peak] = 10f;
             return logits;
-        }
-
-        private void ValidateRestoredOwnerTail()
-        {
-            OwnerFallbackExpectedLength = _expectedOwnerFallbackHistory.Length;
-            OwnerFallbackActualLength = _linearHistory.Count;
-            if (_linearHistory.SequenceEqual(_expectedOwnerFallbackHistory))
-                SawMigratedOwnerFallbackForward = true;
-            else
-                LostMigratedOwnerTail = true;
-            _awaitingOwnerFallback = false;
         }
 
         public void Dispose() { }
@@ -1386,11 +1241,6 @@ public class BatchedExecutorTests
         }
 
         public bool SupportsPerSequenceFusedForward => true;
-
-        // Mirror Gemma 4: linear KV migration is supported, so the executor's
-        // N==1 fast path uses fused Forward (not ForwardBatch) for single steps.
-        public bool SupportsLinearKVMigration => true;
-        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => true;
 
         public bool CanBatchDecode(string requestId, int position) => _canBatchDecode;
 

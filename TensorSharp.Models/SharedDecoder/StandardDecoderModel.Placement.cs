@@ -310,14 +310,33 @@ namespace TensorSharp.Models
                     else if (_recurrentLayer[l])
                         ShardRecurrentLayer(l);
                     else if (_qkvFused[l])
+                    {
                         ShardConcatenatedColumnParallel(p + "attn_qkv.weight",
                             qRows, KvHeadsOf(l) * KeyDimOf(l), KvHeadsOf(l) * ValueDimOf(l));
+                        // The fused [q | k | v] bias (FuseProjectionBiases): each rank's blocks of the three, as its product's rows.
+                        if (AttentionProjectionsHaveBiases)
+                            ShardVectorSegments(p + "attn_qkv.bias", qRows, KvHeadsOf(l) * KeyDimOf(l), KvHeadsOf(l) * ValueDimOf(l));
+                    }
                     else if (SharesKv(l))
+                    {
                         columns.Add(p + "attn_q.weight");   // a KV-shared layer projects its queries only
+                        if (AttentionProjectionsHaveBiases) ShardVectorSegments(p + "attn_q.bias", qRows);
+                    }
                     else
+                    {
                         columns.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" });
+                        if (AttentionProjectionsHaveBiases)
+                        {
+                            ShardVectorSegments(p + "attn_q.bias", qRows);
+                            ShardVectorSegments(p + "attn_k.bias", KvHeadsOf(l) * KeyDimOf(l));
+                            ShardVectorSegments(p + "attn_v.bias", KvHeadsOf(l) * ValueDimOf(l));
+                        }
+                    }
                     if (IsAttentionLayer(l))
                         columns.AddRange(HeadParallelLayerWeights(l));   // per-head rows, in the query's head blocks
+                    // Per-head attention sinks: a rank's own heads, as its queries.
+                    if (IsAttentionLayer(l) && AttentionSinksWeight(l) is { } sinks)
+                        ShardVectorSegments(sinks, Config.NumHeads);
                     if (IsAttentionLayer(l))
                         rows.Add(p + "attn_output.weight");
                     if (!HasFeedForward(l)) continue;   // a mixer layer (LayerHasFeedForward)
@@ -366,11 +385,81 @@ namespace TensorSharp.Models
                         }
                         columns.AddRange(new[] { p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight" });
                         rows.Add(p + "ffn_down_shexp.weight");
+                        // Per-expert biases of the gate and up rows (GPT-OSS's ffn_{gate,up}_exps.bias, [E, ff]): each rank's slice
+                        // of every expert's width, as its stacks'. The down bias stays whole: a family adds it on rank 0 only.
+                        ShardExpertBiasColumns(p + "ffn_gate_exps.bias");
+                        ShardExpertBiasColumns(p + "ffn_up_exps.bias");
                     }
                 }
                 ShardWeightsForTensorParallelism(columns, rows);
                 if (_mesh.Stages == 1) ShardHeadByVocab();
             }
+        }
+
+        /// <summary>
+        /// A one-dimensional F32 weight whose values follow a column-parallel projection's output rows (a bias, the per-head
+        /// attention sinks), the concatenation of <paramref name="segments"/>: rank r keeps its slice of each segment, in order,
+        /// on its own device (no-op where the weight is absent or the group is not tensor-parallel).
+        /// </summary>
+        private void ShardVectorSegments(string name, params int[] segments)
+        {
+            if (!IsTensorParallel || !_weights.TryGetValue(name, out Tensor w)) return;
+            int ranks = TpDegree, degree = GlobalTpDegree, offset = TpRankOffset;
+            long total = 0;
+            foreach (int segment in segments)
+            {
+                if (segment % degree != 0)
+                    throw new NotSupportedException($"{Config.Architecture}: '{name}' ({segment} values) does not split over {degree} ranks.");
+                total += segment;
+            }
+            if (w.ElementCount() != total)
+                throw new InvalidOperationException($"{Config.Architecture}: '{name}' holds {w.ElementCount()} values, {total} expected.");
+            float[] all = w.GetElementsAsFloat((int)total);
+            var shards = new Tensor[ranks];
+            for (int r = 0; r < ranks; r++)
+            {
+                var part = new float[total / degree];
+                int at = 0, written = 0;
+                foreach (int segment in segments)
+                {
+                    int width = segment / degree;
+                    Array.Copy(all, at + (offset + r) * width, part, written, width);
+                    written += width;
+                    at += segment;
+                }
+                shards[r] = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, part.Length);
+                shards[r].SetElementsAsFloat(part);
+                HostWritten(shards[r]);
+            }
+            _tpWeights[name] = shards;
+            _weights.Remove(name);
+            w.Dispose();
+        }
+
+        /// <summary>Per-expert F32 biases [E, ff] (ggml [ff, E]) of a column-parallel expert stack: rank r keeps columns
+        /// [r ff / T, (r + 1) ff / T) of every expert's row, as its slice of the stack's output rows (no-op where absent).</summary>
+        private void ShardExpertBiasColumns(string name)
+        {
+            if (!IsTensorParallel || !_weights.TryGetValue(name, out Tensor w) || w.DimensionCount != 2) return;
+            int ranks = TpDegree, degree = GlobalTpDegree, offset = TpRankOffset;
+            int experts = (int)w.Sizes[0], width = (int)w.Sizes[1];
+            if (width % degree != 0)
+                throw new NotSupportedException($"{Config.Architecture}: '{name}' ({width} values an expert) does not split over {degree} ranks.");
+            float[] all = w.GetElementsAsFloat(experts * width);
+            int slice = width / degree;
+            var shards = new Tensor[ranks];
+            for (int r = 0; r < ranks; r++)
+            {
+                var part = new float[experts * slice];
+                for (int e = 0; e < experts; e++)
+                    Array.Copy(all, e * width + (offset + r) * slice, part, e * slice, slice);
+                shards[r] = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, experts, slice);
+                shards[r].SetElementsAsFloat(part);
+                HostWritten(shards[r]);
+            }
+            _tpWeights[name] = shards;
+            _weights.Remove(name);
+            w.Dispose();
         }
 
         /// <summary>The per-rank vocabulary slices of the LM head on per-rank graphs (each rank's rows, in rank order).</summary>

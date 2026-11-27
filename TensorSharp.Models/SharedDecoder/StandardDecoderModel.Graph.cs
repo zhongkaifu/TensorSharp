@@ -87,6 +87,16 @@ namespace TensorSharp.Models
         /// live set and measured slower on some families; a family opts in where it measures faster.</summary>
         protected virtual bool GraphConcurrencyReorder => false;
 
+        /// <summary>On ggml_cuda the steps' graphs run ggml-cuda's graph optimizer hook before they are allocated
+        /// (<see cref="GraphProgram.BackendFusions"/>), so its fusions get the allocation dependencies they need at every width
+        /// (the routed experts' weighted sum in prompt steps). Opted in per family where measured. Default: no.</summary>
+        protected virtual bool GgmlCudaBackendFusions => false;
+
+        /// <summary>A family that emits its own routed experts and sizes them by <see cref="GraphStep.FeedForwardRows"/> lets a
+        /// prompt step's last layer run them on the rows the head reads only (<see cref="PrunesLastLayerRows"/>); the runtime's
+        /// own MoE sizes its routes by the step's rows. Default: no.</summary>
+        protected virtual bool PrunesExpertLastLayer => false;
+
         /// <summary>
         /// Whether a step that reads only each sequence's last row (its logits or its final hidden row) runs the last layer's
         /// feed-forward on those rows alone, as llama.cpp's graphs do: the stream leaving the last layer's mixer is cut to the
@@ -1767,7 +1777,11 @@ namespace TensorSharp.Models
                     h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
                 }
                 // The last layer's feed-forward over the rows the head reads only (PrunesLastLayerRows).
-                if (prune && layer == Config.NumLayers - 1) h = EmitLastRows(step, h, width);
+                if (prune && layer == Config.NumLayers - 1)
+                {
+                    h = EmitLastRows(step, h, width);
+                    step.FeedForwardRows = step.Sequences;
+                }
                 if (_hasFfn[layer])
                 {
                     int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
@@ -1797,7 +1811,8 @@ namespace TensorSharp.Models
         private bool PrunesLastLayer(GraphStep step, GraphRequest request, int from, int to)
         {
             int last = Config.NumLayers - 1;
-            return PrunesLastLayerRows && !LastLayerPruningDisabledForTests && from <= last && to == Config.NumLayers && step.Rows > step.Sequences && !_moeLayer[last]
+            return PrunesLastLayerRows && !LastLayerPruningDisabledForTests && from <= last && to == Config.NumLayers && step.Rows > step.Sequences
+                && (!_moeLayer[last] || PrunesExpertLastLayer)
                 && (request.LastRowLogits || request.LastRowHidden) && !request.AllRowLogits && !request.CaptureFinal
                 && request.FollowDraft == DraftFollow.None && request.FollowDFlash == null
                 && !Array.Exists(request.CaptureLayers, c => c >= Config.NumLayers);
@@ -2578,6 +2593,9 @@ namespace TensorSharp.Models
             else if (_qkvFused[layer])
             {
                 int qkv = step.MatMul(LayerName(layer, "attn_qkv.weight"), x);
+                // A biased projection (AttentionProjectionsHaveBiases): the fused [q | k | v] bias, a rank's own blocks under
+                // per-rank graphs (FuseProjectionBiases, ShardProjectionBiases).
+                if (AttentionProjectionsHaveBiases) qkv = step.Op(GraphOp.Add, qkv, step.Weight(LayerName(layer, "attn_qkv.bias")));
                 long width = qWidth + kDim + vDim;
                 q = step.View3(qkv, d, heads, rows, qStride * f, width * f, 0);
                 if (GatedAttentionOutput) gate = step.View3(qkv, d, heads, rows, qStride * f, width * f, d * f);
@@ -2586,11 +2604,11 @@ namespace TensorSharp.Models
             }
             else
             {
-                int qa = step.MatMul(LayerName(layer, "attn_q.weight"), x);
+                int qa = BiasedProjection(step, layer, "attn_q", x);
                 q = step.View3(qa, d, heads, rows, qStride * f, qWidth * f, 0);
                 if (GatedAttentionOutput) gate = step.View3(qa, d, heads, rows, qStride * f, qWidth * f, d * f);
-                k = step.Reshape(step.MatMul(LayerName(layer, "attn_k.weight"), x), d, kvHeads, rows);
-                v = step.Reshape(step.MatMul(LayerName(layer, "attn_v.weight"), x), dv, kvHeads, rows);
+                k = step.Reshape(BiasedProjection(step, layer, "attn_k", x), d, kvHeads, rows);
+                v = step.Reshape(BiasedProjection(step, layer, "attn_v", x), dv, kvHeads, rows);
             }
             int kvType = KvGgmlType(_kvCacheDtype.ToDType());
             GraphCapabilities caps = GraphExecutor.Capabilities;
@@ -2680,6 +2698,8 @@ namespace TensorSharp.Models
             }
 
             float scale = AttentionScale(layer);
+            // Per-head attention sinks (AttentionSinksWeight): one more logit in every query's softmax, the attention's fifth operand.
+            int sinks = Sinks(step, layer);
             long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
             // A source of KV-shared layers keeps each sequence's attention operands for them (KvSourceLayer).
             bool keepForSharers = _kvSharers[layer];
@@ -2691,7 +2711,8 @@ namespace TensorSharp.Models
             // Several sequences' verify windows (each written by index into its own caches, none a prompt chunk or past a ring's
             // first lap): one region an executor may run at its end, launching every sequence's attention together
             // (GraphFusion.SequenceAttentions); a family's own window regions keep theirs.
-            bool together = parts != null && !prep && !WindowAttentionHasRegion && !SequenceAttentionRegionsDisabledForTests;
+            // (Not with sinks: the region's kernels attend without them.)
+            bool together = parts != null && !prep && !WindowAttentionHasRegion && !SequenceAttentionRegionsDisabledForTests && sinks < 0;
             for (int s = 0; together && s < n; s++)
                 together = Indexed(step.Counts[s]) && !RingWrapped(layer, step.Starts[s], step.Counts[s])
                     && !(step.PromptChunks && step.Counts[s] > SmallChunkRows);
@@ -2743,7 +2764,7 @@ namespace TensorSharp.Models
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kWin, vWin, m, ring, new AttentionKeys(-1, ring, start, count), scale);
                     if (fa < 0)
                         fa = step.FlashAttention(qPerm, kWin, vWin, m, scale,
-                            AttentionKvMax(step, layer, s), promptChunk, DeviceBand(step, band, d, kvType));
+                            AttentionKvMax(step, layer, s), promptChunk, DeviceBand(step, band, d, kvType), sinks);
                 }
                 else if (wrapped)
                 {
@@ -2771,7 +2792,7 @@ namespace TensorSharp.Models
                         new AttentionKeys(first, 0, start, count), 0));
                     int m = EmitAttentionMask(step, layer, x, s, mask, start + count - first);
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kAttn, vAttn, m, start + count - first, new AttentionKeys(first, 0, start, count), scale);
-                    if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk);
+                    if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk, sinks: sinks);
 
                     void WriteRun(int fresh, int cache, int width, long rowBytes, int cell, int from, int n)
                         => step.Effect(step.Op(GraphOp.Cpy,
@@ -2827,7 +2848,7 @@ namespace TensorSharp.Models
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kWin, vWin, m, keys, new AttentionKeys(first, 0, start, count), scale);
                     if (fa < 0)
                         fa = step.FlashAttention(qPerm, kWin, vWin, m, scale,
-                            AttentionKvMax(step, layer, s), promptChunk, capacity ? DeviceBand(step, band, d, kvType) : 0);
+                            AttentionKvMax(step, layer, s), promptChunk, capacity ? DeviceBand(step, band, d, kvType) : 0, sinks);
                     if (region) step.EndFused(stackalloc[] { fa });
                 }
                 else
@@ -2866,7 +2887,7 @@ namespace TensorSharp.Models
                         new AttentionKeys(first, 0, start, count), 0));
                     int m = EmitAttentionMask(step, layer, x, s, mask, start + count - first);
                     fa = EmitAttentionCore(step, layer, x, s, qPerm, kAttn, vAttn, m, start + count - first, new AttentionKeys(first, 0, start, count), scale);
-                    if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk);
+                    if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk, sinks: sinks);
                 }
                 int part = step.Reshape(fa, heads * dv, count);
                 if (parts != null) parts.Add(part);
@@ -2884,7 +2905,30 @@ namespace TensorSharp.Models
                 step.EndFused(stackalloc[] { attn });
             }
             attn = EmitAttentionOutput(step, layer, x, attn);
-            return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
+            return AttentionOutputProjection(step, layer, attn);
+        }
+
+        /// <summary>The per-head attention sinks' leaf of <paramref name="layer"/> (<see cref="AttentionSinksWeight"/>; a rank's own
+        /// heads under per-rank graphs, split by heads on ggml's meta device), or -1.</summary>
+        private int Sinks(GraphStep step, int layer)
+            => AttentionSinksWeight(layer) is { } name ? step.Weight(name) : -1;
+
+        /// <summary><paramref name="projection"/>.weight · x plus its bias where the family's projections have them
+        /// (<see cref="AttentionProjectionsHaveBiases"/>).</summary>
+        private int BiasedProjection(GraphStep step, int layer, string projection, int x)
+        {
+            int y = step.MatMul(LayerName(layer, projection + ".weight"), x);
+            return AttentionProjectionsHaveBiases ? step.Op(GraphOp.Add, y, step.Weight(LayerName(layer, projection + ".bias"))) : y;
+        }
+
+        /// <summary>The attention's output projection, plus its bias (<see cref="AttentionProjectionsHaveBiases"/>) once: on rank 0
+        /// of per-rank graphs, whose partials the all-reduce sums (on ggml's meta device the add follows the partial's reduce).</summary>
+        private int AttentionOutputProjection(GraphStep step, int layer, int attn)
+        {
+            int y = step.MatMul(LayerName(layer, "attn_output.weight"), attn);
+            return AttentionProjectionsHaveBiases && step.Rank <= 0
+                ? step.Op(GraphOp.Add, y, step.Weight(LayerName(layer, "attn_output.bias")))
+                : y;
         }
 
         /// <summary>The operands a KV-shared layer's source attended for one sequence of a step: its keys and values (a cache window,
@@ -2928,7 +2972,7 @@ namespace TensorSharp.Models
             int q;
             if (!EmitAttentionProjections(step, layer, x, out q, out int k, out int v))
             {
-                q = step.View3(step.MatMul(LayerName(layer, "attn_q.weight"), x), d, heads, rows, d * f, heads * d * f, 0);
+                q = step.View3(BiasedProjection(step, layer, "attn_q", x), d, heads, rows, d * f, heads * d * f, 0);
                 k = v = -1;
             }
             if (k >= 0 || v >= 0)
@@ -2937,6 +2981,7 @@ namespace TensorSharp.Models
             EmitQueryKey(step, layer, ref q, ref k);
             q = step.Cont(q);
             float scale = AttentionScale(layer);
+            int sinks = Sinks(step, layer);
             int n = step.Sequences, attn = -1;
             var parts = n > 1 && !LegacyBatchedJoinForTests ? new List<int>(n) : null;
             for (int s = 0; s < n; s++)
@@ -2951,14 +2996,14 @@ namespace TensorSharp.Models
                 int m = EmitAttentionMask(step, layer, x, s, kv.Mask, kv.Keys);
                 int fa = EmitAttentionCore(step, layer, x, s, qPerm, kv.K, kv.V, m, kv.Keys, kv.Layout, scale);
                 if (fa < 0)
-                    fa = step.FlashAttention(qPerm, kv.K, kv.V, m, scale, AttentionKvMax(step, layer, s), promptChunk, kv.DeviceBand);
+                    fa = step.FlashAttention(qPerm, kv.K, kv.V, m, scale, AttentionKvMax(step, layer, s), promptChunk, kv.DeviceBand, sinks);
                 int part = step.Reshape(fa, heads * dv, count);
                 if (parts != null) parts.Add(part);
                 else attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
             }
             if (parts != null) attn = JoinSequenceRows(step, parts);
             attn = EmitAttentionOutput(step, layer, x, attn);
-            return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
+            return AttentionOutputProjection(step, layer, attn);
         }
 
         /// <summary>
@@ -3347,6 +3392,8 @@ namespace TensorSharp.Models
                 // The model's --nvfp4-prompt-activations q8: every product of this step's NVFP4 weights quantizes its rows to
                 // 8 bits (the GGML executor asks ggml for it per product).
                 if (model.Q8Nvfp4ActivationsOnGgml) MarkQ8Nvfp4Activations();
+                // A family's opt-in to ggml-cuda's fusions' allocation dependencies (GgmlCudaBackendFusions).
+                if (model._backend == BackendType.GgmlCuda && model.GgmlCudaBackendFusions) MarkBackendFusions();
                 RecurrentSnapshots = snapshots;
                 _m = model;
                 _record = record;
@@ -4109,6 +4156,16 @@ namespace TensorSharp.Models
             }
 
             // ---- composites
+
+            /// <summary>The rows the current layer's feed-forward input has: the step's, or its sequences' last rows once the last
+            /// layer is pruned (<see cref="PrunesLastLayerRows"/>).</summary>
+            public int FeedForwardRows
+            {
+                get => _feedForwardRows > 0 ? _feedForwardRows : Rows;
+                internal set => _feedForwardRows = value;
+            }
+
+            private int _feedForwardRows;
 
             /// <summary>rms_norm(x) * weight, at the model's epsilon.</summary>
             public int RmsNorm(int x, string weight) => RmsNorm(x, Weight(weight), _m.Config.Eps);

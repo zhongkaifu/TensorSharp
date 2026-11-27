@@ -36,7 +36,7 @@ Media in the input column is content the model receives; the output column disti
 | [Qwen3-VL](qwen3vl.md) | Text, image, video | Text | Conditional: media needs the matching projector (with its DeepStack mergers); media prompts run as whole-forward graphs. |
 | [Qwen 3.8 Flash Next](qwen38-flash-next.md) | Text, image, video | Text | Conditional: memory placement, tensor parallelism and the separate MTP head depend on quantization/backend. |
 | [Bonsai2 27B](bonsai2.md) | Text, image with projector | Text | Conditional: single-device GGML only. Recorded Metal and bounded CPU checks do not qualify other devices. |
-| [GPT OSS](gptoss.md) | Text | Text | Implemented: thinking mode and tools; check the card for backend and cache requirements. |
+| [GPT OSS](gptoss.md) | Text | Text | Implemented: thinking mode and tools. Speculation uses n-gram drafts or the separate gpt-oss-20b DFlash block drafter; check the card for backend and cache requirements. |
 | [Nemotron-H / Omni](nemotron.md) | Text; image on Omni; conditional audio | Text | Conditional: audio needs a Parakeet companion absent from public GGUFs. Speculation uses n-gram drafts, the Nemotron 3.5 MTP head or the Lightning DFlash / DSpark block drafters. |
 | [Mistral 3](mistral3.md) | Text, image | Text | Unsupported: explicit thinking mode and tools. Check the named checkpoint/backend coverage. |
 | [Hunyuan Dense](hunyuan-dense.md) | Text | Text | Implemented: single-device text path; tools, tensor parallelism and layer split are unsupported. |

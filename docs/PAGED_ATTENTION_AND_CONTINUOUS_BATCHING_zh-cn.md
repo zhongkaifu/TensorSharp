@@ -19,7 +19,7 @@
 | 前缀缓存 | Radix 树（`PrefixTree`，由 `PrefixCacheCoordinator` 驱动）是服务端、CLI 生成与 TensorAgent 的默认前缀缓存：可复用页面、保留的会话状态与共享前缀检查点都在同一个索引里。`TS_SCHED_PREFIX_CACHE=0` 或 `--no-prefix-cache` 关闭复用。见 [Radix 前缀缓存](#radix-前缀缓存)。 |
 | 批处理执行 | 实现 `IBatchedPagedModel.ForwardBatch` 的模型会把本轮所有序列打包到一次模型调用中，显式传入 `positions`、`slotMapping`、`queryStartLoc` 与每序列 block table。 |
 | 回退执行 | 路径选择集中在 `ExecutionPlanner`：模型+后端能力（`ExecutionCapabilities`）、运维覆盖（`ExecutionOptions`）与每步请求特征共同产出 `ExecutionPlan`（选中路径、回退链、被拒原因）。模型仍可对某个具体 batch 抛出 `NotSupportedException`，该步会落入计划中的下一个候选，最终止于按序列 KV-swap 路径。 |
-| 原生注意力 | `TSGgml_PagedAttentionForward` 在 C++ 中聚合分页 K/V 并派发 `ggml_flash_attn_ext`；GPT OSS 使用 `TSGgml_PagedAttentionForwardWithSinks`。 |
+| 原生注意力 | `TSGgml_PagedAttentionForward` 在 C++ 中聚合分页 K/V 并派发 `ggml_flash_attn_ext`。 |
 | 投机解码 | 为单序列（无并发）请求提供可选的投机解码，在共享解码运行时（Qwen 3.5 家族、Qwen 3.8 Flash Next 及其服务的其他模型族）上并发请求也可投机：学习型草稿头（内嵌 NextN / MTP、Gemma 4 独立的 `gemma4-assistant` GGUF、Qwen 3.8 Flash Next 的共享 MTP 头）、块级草稿器（DSpark、DFlash）以及无需权重的 n-gram 投机器。`BatchExecutor` 为实现了 `ISpeculativeTarget` 的模型驱动共享的 `SpeculativeExecution` 起草 / 验证 / 回滚核心。默认关闭；CLI 与服务端用 `--spec` 或 `--draft-model` 开启。详见 [投机解码（MTP / NextN）](#投机解码mtp--nextn)。 |
 | 并发吞吐 | 通用的主机驻留 `BatchedPaged` 路径本身不能扩展合计 decode 吞吐；Gemma 4 的一次测量在约 **69 tok/s** 处饱和。模型实现 `TryForwardBatchedFusedDecode` 时，per-sequence-fused 路径会先尝试用一张设备图处理活跃 decode 子集，仅在该批次不满足条件或被拒绝时才按请求回退。参见[并发实测表现](#并发实测表现)。 |
 | 队列 API | `/api/queue/status` 报告引擎的实时负载：正在处理的请求、等待批处理槽位的请求与已完成的请求。引擎之外没有任何地方把请求串行化。 |
@@ -179,7 +179,7 @@ ExecutionPlan
 
 - **声明式能力，而非异常探测。** 模型通过 `IBatchedPagedModel` 的 getter
   （`BatchedForwardAvailable`、`SupportsBatchedMultimodal`、
-  `SupportsPerSequenceFusedForward`、`SupportsLinearKVMigration` 等）与投机解码
+  `SupportsPerSequenceFusedForward` 等）与投机解码
   接口（`HasDraftHead`、`SpeculationProfitable`、`SupportsBatchedSpecTrunk`）声明
   自身能力，`ExecutionCapabilities.FromModel` 每步做一次快照。模型的静态限制
   （带 MoE 层或块量化 KV cache 的 Gemma 4、张量并行）会体现为
@@ -187,7 +187,7 @@ ExecutionPlan
   `ForwardBatch` 抛 `NotSupportedException` 仅保留为针对单个 batch 的拒绝，
   不再是路由机制。`--no-continuous-batching`（`TS_SCHED_DISABLE_BATCHED=1`）会关闭
   所有批处理路径。
-- **候选有序且安全。** 可拒绝的候选（`BatchedPaged` 的迁移失败/模型拒绝）会落入
+- **候选有序且安全。** 可拒绝的候选（`BatchedPaged`：K/V 只在线性 cache 中的序列交给逐序列路径，模型也可拒绝某个 batch）会落入
   下一个候选；每个计划都以不可
   拒绝的路径收尾。`ExecutionPlannerTests` 扫描能力/特征空间验证该不变量。
 - **可观测性。** `InferenceEngine` 启动时输出一次 capability 报告（哪些路径
@@ -195,8 +195,9 @@ ExecutionPlan
   计划——选中路径、回退链、被拒原因——"这个请求为什么没走快路径" 从考古
   变成日志事实。
 - **路径种类**（`ExecutionPathKind`）：`SpeculativePerSequence`、
-  `PerSequenceFused`、`MixedMultimodalSplit`、`SingleSequenceFused`（N=1 快速
-  路径）、`BatchedPaged`、`PerSequence`。
+  `PerSequenceFused`、`MixedMultimodalSplit`、`BatchedPaged`、`PerSequence`。
+  不再有单独的 N=1 路径：单个序列走 `BatchedPaged`（若它已在每请求缓存中，或必须
+  从另一个存活序列接管所有权，则走 `PerSequenceFused`），其后是 `PerSequence`。
 
 ## 执行路径
 
@@ -213,19 +214,18 @@ GGML 后端使用原生分页注意力：
 | 内核 | 范围 | 说明 |
 |---|---|---|
 | `TSGgml_PagedAttentionForward` | 标准因果 / 滑窗注意力 | C++ K/V 聚合加 `ggml_flash_attn_ext`。Mistral 3 与大多数 GGML 分页注意力层默认使用。后端没有 flash kernel 的 head 大小（ggml-cuda：40/64/72/80/96/112/128/256 以及 grouped-query 的 192/320/512/576 之外的任何大小）改为以显式注意力运行并警告一次，而不是在 `fattn.cu` 中 abort。 |
-| `TSGgml_PagedAttentionForwardWithSinks` | GPT OSS attention sinks | 将每头可学习 sink logit 加入 softmax 分母。 |
 | `ManagedPagedAttention.Forward` | 纯 C# 回退 | online-softmax 实现，用于正确性与未支持后端回退。 |
 
 Mistral 3 与 Hunyuan Dense 在 GGML 后端上使用原生内核，其他后端使用托管实现。
-GPT OSS 在 GGML 后端上使用原生 sinks kernel，其他后端使用托管实现。
+GPT OSS 不使用这些内核：在共享解码运行时上，它的 sinks 是每个步骤计算图中注意力的一个操作数（见 [GPT OSS 模型卡](models/gptoss_zh-cn.md)）。
 
 ### 并发下的输出一致性
 
 同样的批次必须逐位给出同样的 logits；不同的批次不必。哪些请求共处一步、每个请求
 前向多少 token，决定了跑哪些内核：ggml-cuda 对 MXFP4 的
 量化 `mul_mat_id` 在 Turing 与 Ampere 上不超过 7 个 token 时走 MMVQ（Volta、Ada 与
-Blackwell 上为 8 个），超过时走 MMQ；而独自先到达的序列会
-先走单序列 fused 路径。这些内核只在浮点近似平局（near-tie）的范围内一致，贪心解码会
+Blackwell 上为 8 个），超过时走 MMQ；而独自先到达的序列
+最初几步是一个只有它自己的批次。这些内核只在浮点近似平局（near-tie）的范围内一致，贪心解码会
 把一个近似平局变成另一段续写。因此，到达顺序没有固定的并发轮次，即使没有任何缺陷，
 不同运行之间也可能产生不同的 token。调度出相同批次的两次运行则不可能不同。
 
@@ -245,7 +245,7 @@ Blackwell 上为 8 个），超过时走 MMQ；而独自先到达的序列会
 token 处分叉，连同一进程内的预热轮与测量轮之间也会分叉；在这些运行中 8 个并发请求则没有。步骤跟踪
 显示两次运行的批次完全相同，而在第一个解码步，同一 token 的 logits 相差数个单位
 （41.28 对 38.84），所有 margin 仍然很大。这是缺陷，不是近似平局。独立 MoE 内核
-（`TSGgml_MoEFFNPrefillSwiGLUQuantF32`，批处理分页路径用它计算 GPT OSS 的专家）把每个
+（`TSGgml_MoEFFNPrefillSwiGLUQuantF32`，已删除的旧 GPT OSS 模型的批处理分页路径用它计算专家）把每个
 专家的 bias 作为图的叶子张量上传到可复用的计算缓冲区。分配器在 gate bias 的 `add_id`
 之后释放了它，并把 SwiGLU 激活放在同一块内存上。ggml-cuda 在 1-7 个 token 时把
 `{mul_mat_id, add_id, mul_mat_id, add_id, swiglu_oai}` 融合成一个 MMVQ 内核。该内核
@@ -260,7 +260,7 @@ token 处分叉，连同一进程内的预热轮与测量轮之间也会分叉�
 
 修复后，在 `--conc-gate` 下，三轮运行在 1、4、8 请求轮次的每一步都给出逐位相同的
 logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输出：它的第一个请求在另外七个
-到达之前被单独调度到单序列 fused 路径上。那一步的 logits 已经不同（42.94 对 42.86），
+到达之前被单独调度到旧模型的 N=1 fused 路径上（该路径已删除）。那一步的 logits 已经不同（42.94 对 42.86），
 随后的 argmax 翻转发生在 0.011-0.11 的 margin 上。这属于近似平局一类，`compare.py`
 只报告而不判失败。
 
@@ -309,7 +309,7 @@ GatedDeltaNet 状态（GGML 计算图为每个验证行保留状态；逐算子�
 投机只在模型声明有收益（`SpeculationProfitable`）时启用，这由各模型自己决定：Qwen 3.5/3.6/3.8 与
 GLM 5.2 / GLM-5.3 在所有后端上；Gemma 4 在 ggml 后端（含 `ggml_cpu`）与纯 C# `cuda` 后端上；
 Qwen 3.8 Flash Next 在其可加载的所有后端上；GLM-5.3-Flash 在其 KDA 回滚可用时；Muse Spark 在 GGML 后端上（仅 n-gram），其原生 `--tp` 除外；Muse-Glimmer 在所有后端上；DeepSeek V4 / V4.1
-只在加载了各自草稿器时；Nemotron-H 在所有后端上（n-gram 草稿或 Nemotron 3.5 MTP 头）。GPT OSS、Mistral 3 与
+只在加载了各自草稿器时；Nemotron-H 在所有后端上（n-gram 草稿或 Nemotron 3.5 MTP 头）；GPT OSS 在所有后端上（n-gram 草稿或 gpt-oss-20b DFlash 草稿器）。Mistral 3 与
 Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都走标准 decode。在共享解码运行时之外，并发批次从不投机——当有多个
 序列在运行时，每个序列都走普通的批处理 / 回退步骤；运行时的统一步则在一次前向中验证每个投机请求的窗口。无法挂载的 `--draft-model`（草稿器不匹配或不完整，
 或模型拒绝投机）会在服务端启动时立即失败（`SpeculationStartupValidation`）。`--spec` 不会关闭 Radix
@@ -325,7 +325,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | Mistral 3 | 默认 `ForwardBatch` 路径。使用分页 K/V、YaRN 感知位置、原生分页注意力，并在 prompt 准备后注入视觉 embedding。已在 Ministral-3-14B 上验证；长上下文原生分页注意力比旧按序列 GGML 路径快约 21%。 | `TS_PAGED_ATTN_KERNEL` 选择 `native`、`tensor` 或 `managed`。 |
 | Gemma 4 | 共享解码器运行时的批处理步骤（`Gemma4RuntimeModel`）：覆盖所有检查点（带 per-layer embedding 与 KV 共享层的 E2B/E4B、12B/31B、26B-A4B MoE）、多模态提示、块量化缓存与投机解码（通过 `--draft-model` 加载 `gemma4-assistant` 草稿头、n-gram、DFlash）。 | `--no-continuous-batching` 以及运行时自身的开关。 |
 | Qwen 3.5 / 3.6 / 3.8 family | 共享解码器运行时（`Qwen35RuntimeModel`）。每个请求有自己的 slot：attention K/V 加上 GatedDeltaNet 递归状态。运行中请求的 decode 与 verify 步作为一张图执行（GGML 上为分页批量前向，其他后端为按 slot 的程序）。已结束的会话与共享前缀检查点由 radix 前缀缓存保留，仅限精确前缀，因为递归无法回退。投机使用内嵌的 NextN/MTP 块、DFlash / DFlash2 草稿器或 n-gram。所有后端（包括 `--backend cuda` 上的稠密 NVFP4 检查点）都运行这一运行时。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`--spec` 开启投机。 |
-| GPT OSS | 默认批处理路径。支持 Q/K/V/O bias、YaRN RoPE、滑窗层、attention sinks、MXFP4 MoE expert 与原生 sinks 注意力。已与按序列路径做贪心正确性验证；性能仍主要受逐层图构建限制。在 GGML 后端上（非 TP），并发 decode 改走 per-request fused holder 与 token 批量融合 decode，在 `ggml_cuda` / `ggml_vulkan` 上使用 slot-stable arena。每个结束请求的 holder 会作为它所属会话的终态保留下来并交给下一轮，因此并行的会话各自续接自己的状态（此前，与其他会话并行运行过的会话在下一轮什么都复用不了）。不走 arena 时（Metal），token 批量 decode 的计算图上下文超过了原生上下文池的缓冲区，每个并发步骤都退回到一次只处理一个序列；现在八个并行会话用时 26.8 秒，而不是 45.2 秒。 | — |
+| GPT OSS | 共享解码运行时（`GptOssRuntimeModel`）。每个请求有自己的 slot，K/V 常驻设备；每个偶数层的 128 token 滑动窗口保存在 768 单元的环中。运行中请求的 prompt 分块与 decode 行在所有后端上作为一张图执行，`--tp` 与 `--layer-split` 下同样如此。已结束的会话与检查点通过运行时的 holder 适配器保留（捕获、克隆、交接 holder、导出 / 导入）；不提供 K/V 块快照，因为环不按位置寻址。投机使用 n-gram 草稿或 gpt-oss-20b DFlash 草稿器（`--draft-model`）。在一张 A40 上，服务端在 `ggml_cuda` 上 8 个并发请求的合计 decode 为 230.4 tok/s，已删除的旧模型为 151.0 tok/s（[模型卡](models/gptoss_zh-cn.md)）。 | 与其他运行时家族相同：`--no-continuous-batching` / `TS_SCHED_DISABLE_BATCHED`。 |
 | Nemotron-H | 共享解码运行时（`NemotronRuntimeModel`）。每个请求有自己的 slot：Mamba-2 conv 窗口与 SSM 状态，以及注意力层的分页 K/V。运行中请求的各步在所有后端上作为一张图执行，`--tp` 与 `--layer-split` 下同样如此。已结束的会话与检查点通过运行时的 holder 适配器保留；缓存的前缀在其检查点处携带 Mamba-2 状态，因此续接时 K/V 行与递归状态一起恢复。图像与音频 embedding 作为排队的媒体行写入。投机使用 n-gram 草稿或 Nemotron 3.5 MTP 头。在一张 A40 上，服务端完成 8 个并发 Nemotron 3.5 Lightning 提示用时 2.4 秒，已删除的旧模型为 33.3 秒（[卡片](models/nemotron_zh-cn.md#11-迁移验证)）。 | 与其他运行时家族相同：`--no-continuous-batching` / `TS_SCHED_DISABLE_BATCHED`。 |
 | GLM 5.x | 没有 `ForwardBatch`：MLA 每个 token 只存一行压缩表示，DSA indexer 又要对同一段连续历史打分，没有分页 KV 布局可批。并发改由原生**序列 slot** 承担（`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`）——绑定请求只是切换活动 slot，不搬运 KV 字节，每个 slot 的计算图独立缓存与捕获。在此之上默认启用批量融合 decode（一张图、每序列一个 token，整批只读一遍权重）：4 个并发请求时合计 decode 提速 1.81×。批处理会改变 GEMM 形状，而 2 bit MoE 可能把这点差别放大成不同的专家选择。 | `TS_BATCHED_FUSED_DECODE=0` 关闭批量 decode。 |
 | Hunyuan Dense | 默认 `ForwardBatch` 路径，使用 F32 分页缓冲。块量化（`q8_0` / `q4_0`）KV cache 会保留 KV 快照换入路径，该路径能精确处理这些 dtype。 | — |
@@ -342,13 +342,13 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 请求的 radix 键是它的 prompt token，每个媒体区间以其内容身份为键；每个
 节点记录请求可以从这里续接的状态：
 
-- **页面**：主机 slab 上的 KV 快照或模型自己的分页块，用于没有续接 holder 的家族（GPT OSS、
-  Mistral 3、Hunyuan Dense、Muse-Glimmer）。
+- **页面**：主机 slab 上的 KV 快照或模型自己的分页块，用于没有续接 holder 的家族（Mistral 3、
+  Hunyuan Dense、Muse-Glimmer）。
 - **终态（end state）**：模型自己持有的续接状态。Gemma 4、Qwen 3.5 / 3.6 / 3.8 家族（`qwen35`、
-  `qwen35moe`、`qwen3next`）、Qwen 3.8 Flash Next 与 Nemotron-H（其状态包含 Mamba-2 conv 与 SSM 状态）可以复制它，因此已结束的会话会被保留给下一轮，
+  `qwen35moe`、`qwen3next`）、Qwen 3.8 Flash Next、Nemotron-H（其状态包含 Mamba-2 conv 与 SSM 状态）与 GPT OSS 可以复制它，因此已结束的会话会被保留给下一轮，
   共享公开前缀末尾的状态会被做成检查点并克隆到每个新会话中。前提是它们运行按请求的状态：
   GGML 后端上使用 fused holder 的 Gemma 4，以及在共享解码运行时 slot 上、递归状态可复制时的 Qwen 3.5 家族、
-  Flash Next 与 Nemotron-H（多节点流水线除外），且 `TS_PER_SEQ_FUSED=0` 时一律没有；其他情况下只续接主缓存。
+  Flash Next 与 Nemotron-H（多节点流水线除外），且 `TS_PER_SEQ_FUSED=0` 时一律没有。GPT OSS 在所有后端上都通过运行时 slot 做到这一点。其他情况下只续接主缓存。
   GLM 5.x（原生执行器）与 DeepSeek V4.1 无法复制原生 slot：只能把它整体交给延续该会话的那一轮（只在
   `TS_RETAINED_FUSED_CACHE_MAX` 不为 0 时；V4.1 在加载了 DSpark 草稿器时不交出），也不做共享前缀检查点。
 
@@ -484,10 +484,10 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由；`InjectShortfallAccountingTests`（页面注入提前停止即视为未命中，绝不留下部分状态） |
 | 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`ContentAddressedMediaTests`；`Gemma4MediaAfterReusedPrefixExactnessTests`（受模型门控：复用前缀之后的图片或音频回合对比冷启动 prefill）与 `Gemma4SoftTokenMaskTests` |
 | 越过媒体复用（Qwen 3.5 M-RoPE） | `Qwen35MRopeReferencePositionTests`（与 SGLang `get_rope_index` 夹具比较位置），需显式启用的 `Qwen35ImageFollowUpExactnessTests`（真实权重下图片之后复用与冷启动对比，单请求与并发，检查点文件往返） |
-| 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`、`NemotronRuntimeTests` |
+| 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`NemotronBatchedCorrectnessTests`、`NemotronRuntimeTests`、`GptOssRuntimeTests` |
 | 后端融合下的批处理 MoE 内核 | 原生 CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` / `moe-fused-bias-alias-metal`（`GgmlOpsMoeFusedBiasAliasTest`）：带每专家 bias 的独立 MoE FFN 内核与精确主机计算结果对比，1、4、7 个 token，重复执行 |
-| 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、`SpeculatorRegistryTests`、`NGramSpeculatorTests`、`SpeculationCostGovernorTests`、`NemotronRuntimeTests`（`SpeculativeDecodingMatchesPlainGreedy`）、可选端到端 `Qwen36SpeculativeTests`（`TS_TEST_QWEN36_SPEC=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
-| 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
+| 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、`SpeculatorRegistryTests`、`NGramSpeculatorTests`、`SpeculationCostGovernorTests`、`NemotronRuntimeTests` 与 `GptOssRuntimeTests`（`SpeculativeDecodingMatchesPlainGreedy`）、可选端到端 `Qwen36SpeculativeTests`（`TS_TEST_QWEN36_SPEC=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
+| 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`NemotronBatchedPerfBench` |
 | DiffusionGemma 路径 | `DiffusionGemmaTests` 覆盖去噪、prompt-KV 缓存与批处理生成探针 |
 | 端到端引擎行为 | 通过 `TS_TEST_MODEL_DIR` 指向真实 GGUF 后运行的 `EngineParallelInferenceTests` |
 | 服务端参数翻译 | `ServerOptionsBuilderTests` 覆盖 `--continuous-batching`、`--no-continuous-batching` 与 `--no-prefix-cache`（以及 `--spec` 保持 Radix 开启） |

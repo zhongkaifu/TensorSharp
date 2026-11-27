@@ -51,6 +51,13 @@ namespace TensorSharp.Cuda
         public bool IsValid => IsHost != IntPtr.Zero;
     }
 
+    /// <summary>
+    /// GPT-OSS's routed experts on the MoE engine (<see cref="CudaMoe.Experts"/>): the gate and up stacks' per-expert biases
+    /// (device F32 [experts, ff]), the down stack's ([experts, hidden], zero for none: a tensor-parallel rank other than the
+    /// first) and the clamped SwiGLU's alpha and limit, which replace the plain SwiGLU between the products.
+    /// </summary>
+    internal sealed record CudaOaiExperts(IntPtr GateBias, IntPtr UpBias, IntPtr DownBias, float Alpha, float Limit);
+
     /// <summary>One device's routed-expert scratch, sized for a ubatch.</summary>
     internal sealed class CudaMoeScratch
     {
@@ -307,7 +314,7 @@ namespace TensorSharp.Cuda
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
             int perSlotMaxRows, IntPtr stream, bool? fused = null,
             CudaExpertStage stage = null, in CudaExpertStageLayer stageLayer = default, IntPtr shDownReady = default,
-            bool keepStaged = false, IntPtr curQ81 = default, bool? q2i8 = null, bool q80VecDecode = false)
+            bool keepStaged = false, IntPtr curQ81 = default, bool? q2i8 = null, bool q80VecDecode = false, CudaOaiExperts oai = null)
         {
             if (PerSlotForTest)
                 perSlotMaxRows = int.MaxValue;
@@ -327,7 +334,7 @@ namespace TensorSharp.Cuda
                 CopyStaged(dk, stageLayer, stage, slots, newOnly: false, stream);
             }
             RunExperts(dk, kernels, s, gate, up, down, cur, shDown, ffnOut, nt, nUsed, nExpert, e, ff, clamp,
-                perSlotMaxRows, stream, fused, shDownReady, curQ81, q2i8 ?? Q2_0ExpertsInt8, q80VecDecode);
+                perSlotMaxRows, stream, fused, shDownReady, curQ81, q2i8 ?? Q2_0ExpertsInt8, q80VecDecode, oai);
             if (staging && !keep)
                 dk.MoeUnstage(stageLayer, stage, stream);
         }
@@ -388,15 +395,38 @@ namespace TensorSharp.Cuda
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
             int perSlotMaxRows, IntPtr stream, bool? fused, IntPtr shDownReady = default, IntPtr curQ81 = default,
-            bool q2i8 = false, bool q80VecDecode = false)
+            bool q2i8 = false, bool q80VecDecode = false, CudaOaiExperts oai = null)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
+            // GPT-OSS's experts (oai): the products' rows plus each slot's expert biases and the clamped SwiGLU between them, the
+            // down bias before the weighted sum; their rows are the slots' (per-slot route) or the grouping plan's (RowOfSlot).
+            IntPtr rowOfSlot = IntPtr.Zero;
+            void Activate(Tensor quantized, Tensor scales)
+            {
+                if (oai == null)
+                {
+                    SwigluQuantize(kernels, s.ExpGate, s.ExpUp, quantized, scales, ff, slots, clamp, stream, fused);
+                    return;
+                }
+                kernels.LaunchMoeOaiGluBiasF32(Dsv4CudaEngine.Ptr(s.ExpGate), Dsv4CudaEngine.Ptr(s.ExpUp), Dsv4CudaEngine.Ptr(s.Sel), rowOfSlot,
+                    oai.GateBias, oai.UpBias, ff, slots, oai.Alpha, oai.Limit, stream);
+                if (quantized == null) return;
+                // The rows a grouped route quantizes are every row of the plan; a slot is one row, so slots rows either way.
+                if (scales == null) QuantizeQ81(kernels, s.ExpGate, quantized, ff, slots, stream);
+                else QuantizeQ81Split(kernels, s.ExpGate, quantized, scales, ff, slots, stream);
+            }
+            void DownBias()
+            {
+                if (oai != null && oai.DownBias != IntPtr.Zero)
+                    kernels.LaunchMoeExpertBiasAddF32(Dsv4CudaEngine.Ptr(s.ExpDown), Dsv4CudaEngine.Ptr(s.Sel), rowOfSlot, oai.DownBias, e, slots, stream);
+            }
             ExpertRoute route = SelectRoute(nt, perSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, guType, downType, e, ff,
                 dk.DecodesLegacyQuants);
             bool perSlot = route == ExpertRoute.PerSlot;
             bool mma = route == ExpertRoute.TensorCore;
-            bool int8 = mma && UsesQ2I8(q2i8, dk.HasMoeQ2I8, gate, up, down, e, ff, nUsed);
+            // The int8 route's gate/up kernel applies the plain SwiGLU itself: GPT-OSS's experts take the tensor-core one.
+            bool int8 = mma && oai == null && UsesQ2I8(q2i8, dk.HasMoeQ2I8, gate, up, down, e, ff, nUsed);
             bool staged = route == ExpertRoute.Staged;
             // The per-slot route reads cur's q8_1 rows: the caller's (curQ81, rounded as QuantizeQ81 rounds) when it has them.
             bool given = perSlot && curQ81 != IntPtr.Zero;
@@ -418,11 +448,12 @@ namespace TensorSharp.Cuda
                 else
                     dk.MoeGateUpDecode(gate.Ptr, up.Ptr, act, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
                         nt, nUsed, stream, gate.Table, up.Table);
-                SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
+                Activate(s.ActQ8B, null);
                 if (q80dn)
                     dk.MoeDownDecodeQ80Vec(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, e, ff, down.RowBytes, slots, stream, down.Table);
                 else
                     dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream, down.Table);
+                DownBias();
                 // A shared expert computed on another stream (a fork in the caller's step) joins here, where its output is read.
                 if (shDownReady != IntPtr.Zero)
                     CudaDriverApi.cuStreamWaitEvent(stream, shDownReady, 0).ThrowOnError();
@@ -432,6 +463,7 @@ namespace TensorSharp.Cuda
 
             // The grouping plan, all on the device.
             Plan(dk, kernels, s.Sel, s.Counts, s.Offsets, s.Cursors, s.RowOfSlot, s.SlotToken, slots, nUsed, nExpert, stream);
+            rowOfSlot = Dsv4CudaEngine.Ptr(s.RowOfSlot);
 
             if (int8)
             {
@@ -447,7 +479,8 @@ namespace TensorSharp.Cuda
             {
                 dk.MoeMma(gate.Ptr, up.Ptr, cur, s.Counts, s.Offsets, s.SlotToken,
                     s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream, gate.Table, up.Table);
-                SwigluClamp(s.ExpGate, s.ExpUp, (long)slots * ff, clamp);
+                if (oai != null) Activate(null, null);
+                else SwigluClamp(s.ExpGate, s.ExpUp, (long)slots * ff, clamp);
                 dk.MoeMma(down.Ptr, IntPtr.Zero, s.ExpGate, s.Counts, s.Offsets, null,
                     s.ExpDown, null, downType, e, ff, down.RowBytes, nExpert, stream, down.Table);
             }
@@ -457,7 +490,7 @@ namespace TensorSharp.Cuda
                 // reuse it across the expert's member tokens.
                 dk.MoeGateUpStaged(gate.Ptr, up.Ptr, s.SplitQsA, s.SplitDA, s.Counts, s.Offsets, s.SlotToken,
                     s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream, gate.Table, up.Table);
-                SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.SplitQsB, s.SplitDB, ff, slots, clamp, stream, fused);
+                Activate(s.SplitQsB, s.SplitDB);
                 dk.MoeDownStaged(down.Ptr, s.SplitQsB, s.SplitDB, s.Counts, s.Offsets, s.ExpDown,
                     downType, e, ff, down.RowBytes, nExpert, stream, down.Table);
             }
@@ -465,10 +498,11 @@ namespace TensorSharp.Cuda
             {
                 dk.MoeGateUp(gate.Ptr, up.Ptr, s.ActQ8A, s.Counts, s.Offsets, s.SlotToken,
                     s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream, gate.Table, up.Table);
-                SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
+                Activate(s.ActQ8B, null);
                 dk.MoeDown(down.Ptr, s.ActQ8B, s.Counts, s.Offsets, s.ExpDown,
                     downType, e, ff, down.RowBytes, nExpert, stream, down.Table);
             }
+            DownBias();
             if (shDownReady != IntPtr.Zero)
                 CudaDriverApi.cuStreamWaitEvent(stream, shDownReady, 0).ThrowOnError();
             dk.MoeScatterAdd(s.ExpDown, s.RowOfSlot, s.SelW, shDown, ffnOut, nt, nUsed, e, stream);

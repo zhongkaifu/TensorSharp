@@ -64,12 +64,6 @@ namespace TensorSharp.Runtime.Scheduling
         /// fused holder for an exact-prefix continuation.</summary>
         public bool SupportsRetainedFusedCache { get; init; }
 
-        /// <summary>Model can migrate a sequence's K/V history from the linear
-        /// cache (written by Forward / the N=1 fast path) into paged storage —
-        /// prerequisite for the N=1 fast path, so a second concurrent request
-        /// can transition the owner onto the batched path safely.</summary>
-        public bool SupportsLinearKvMigration { get; init; }
-
         /// <summary>Block-level KV snapshot/restore (paged KV pool, ownership
         /// swap on the per-sequence path).</summary>
         public bool SupportsKvStateSnapshot { get; init; }
@@ -129,7 +123,6 @@ namespace TensorSharp.Runtime.Scheduling
                 SupportsBatchedMultimodal = batched != null && batched.SupportsBatchedMultimodal,
                 SupportsPerSequenceFusedForward = batched != null && batched.SupportsPerSequenceFusedForward,
                 SupportsRetainedFusedCache = batched != null && batched.SupportsRetainedFusedCache,
-                SupportsLinearKvMigration = batched != null && batched.SupportsLinearKVMigration,
                 SupportsKvStateSnapshot = model.SupportsKVStateSnapshot,
                 SupportsCrossSequenceKvReuse = model.SupportsCrossSequenceKvReuse,
                 MaxReusablePrefixTokens = model.MaxReusablePrefixTokens,
@@ -152,7 +145,6 @@ namespace TensorSharp.Runtime.Scheduling
             sb.Append(", batchedMultimodal=").Append(Flag(SupportsBatchedMultimodal));
             sb.Append(", perSeqFused=").Append(Flag(SupportsPerSequenceFusedForward));
             sb.Append(", retainedFused=").Append(Flag(SupportsRetainedFusedCache));
-            sb.Append(", linearKvMigration=").Append(Flag(SupportsLinearKvMigration));
             sb.Append(", kvSnapshot=").Append(Flag(SupportsKvStateSnapshot));
             sb.Append(", crossSeqKvReuse=").Append(Flag(SupportsCrossSequenceKvReuse));
             sb.Append(", maxReusablePrefix=");

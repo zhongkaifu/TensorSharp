@@ -6,13 +6,14 @@
 |---|---|
 | Provider | OpenAI |
 | GGUF architecture keys | `gptoss`, `gpt-oss` |
-| Source class | [`GptOssModel`](../../TensorSharp.Models/Models/GptOss/GptOssModel.cs) (single-sequence) + [`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs) (`IBatchedPagedModel`) |
+| Source class | [`GptOssRuntimeModel`](../../TensorSharp.Models/Models/GptOss/GptOssRuntimeModel.cs) on the shared decoder runtime (`StandardDecoderModel`; its rotary and routed experts in [`GptOssRuntimeModel.Graph.cs`](../../TensorSharp.Models/Models/GptOss/GptOssRuntimeModel.Graph.cs), whole-forward graphs on every executor). The legacy `GptOssModel` was removed (§7, §11). |
 | Example models | gpt-oss-20b |
 | Modalities | Text only |
 | Thinking mode | Yes (Harmony format: `<\|channel>analysis ... <\|channel>final`) |
 | Tool calling | Yes (Harmony `commentary` channel — `to=functions.NAME`); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
-| Speculative decoding | No — GPT OSS has no speculative trunk, so `--spec` (the weight-free n-gram drafter included) serves standard decode |
-| Batched / paged forward | **Default ON.** On GGML backends without `--tp`, concurrent requests use per-request KV holders and a token-batched fused decode graph (`TS_PER_SEQ_FUSED=0` turns the holders off). On other backends they use the paged `ForwardBatch` path: per-layer paged K/V plus attention sinks via native `TSGgml_PagedAttentionForwardWithSinks` (a managed C# fallback on non-GGML backends). Under `--tp` neither route is available and concurrent requests take the per-sequence KV-swap path, as they do under `--no-continuous-batching`. See §11. |
+| Speculative decoding | n-gram drafts (`--spec`, `--spec-type ngram`) and the published gpt-oss-20b DFlash block drafter (`--draft-model`), verified in windows that roll back exactly. The legacy model had no speculative trunk. See §8. |
+| Batched / paged forward | **Default ON** (the shared runtime's batched slots: each request's own device-resident K/V, with a ring for each sliding-window layer; prompt chunks and decode rows of several requests run in one step) — `--no-continuous-batching` forces the per-sequence path. Batching is kept under `--tp` and `--layer-split`. See §8. |
+| Expert offload | `--n-cpu-moe` / `--cpu-moe` on one device or over `--layer-split` stages, every backend; refused with `--tp`. See §10. |
 | Output parser | `HarmonyOutputParser` (always required) |
 
 ## Downloads
@@ -83,7 +84,7 @@ apart from the other architectures in TensorSharp:
         │  RMSNorm(post_attention_norm)                    │
         │  router_linear+bias                              │
         │  topK then softmax(selected experts)             │
-        │  per-expert: SiLUAlphaLimit(gate+bias, up+bias)  │
+        │  per-expert: swiglu_oai(gate+bias, up+bias)      │
         │              ─► down+bias                        │
         │  weighted sum of expert outputs                  │
         │  ─► residual                                     │
@@ -111,7 +112,7 @@ hidden ─► RMSNorm(attn_norm.weight, eps)
        ─► append (K, V) to KV cache
        ─► attention with sinks:
             scores = Q × K^T
-            scores ← apply causal mask (and SWA on even layers when desired)
+            scores ← causal mask (and the 128-token window on even layers)
             sinks  = attn_sinks.weight                   # [numHeads]
             sums   = exp(scores - max) + exp(sinks - max)
             scores = exp(scores - max) / sums            # softmax including sink
@@ -119,18 +120,16 @@ hidden ─► RMSNorm(attn_norm.weight, eps)
        ─► attn_output.weight matmul + bias → o
        ─► residual = hidden + o
 
-       moeInput = (last layer in prefill) ? narrow(seq_len-1) : residual
+       moeInput = (last layer of a prompt step) ? its sequences' last rows : residual
        moeInput ─► RMSNorm(post_attention_norm)
                 ─► router_linear + bias
-                ─► topK(_numExpertsUsed)
-                ─► softmax(selected weights)
-                ─► For each selected expert e:
-                       gate = ffn_gate_up_exps[e][:, :nFf] × moeInput + bias
-                       up   = ffn_gate_up_exps[e][:, nFf:] × moeInput + bias
-                       gate = clamp(gate, -∞, 7)
-                       up   = clamp(up,   -7, 7)
-                       out_e = gate · sigmoid(α · gate) · (up + 1)
-                       out_e = ffn_down_exps[e] × out_e + bias
+                ─► topK(4) of the logits
+                ─► softmax over the 4
+                ─► For each selected expert e (one mul_mat_id + add_id per projection):
+                       up   = ffn_up_exps[e]   × moeInput + up_bias[e]
+                       gate = ffn_gate_exps[e] × moeInput + gate_bias[e]
+                       h    = swiglu_oai(gate, up)          # min(gate, 7), clamp(up, ±7), alpha 1.702
+                       out_e = ffn_down_exps[e] × h + down_bias[e]
                 ─► weighted Σ out_e using router weights
                 ─► residual += weighted_sum
 ```
@@ -138,84 +137,61 @@ hidden ─► RMSNorm(attn_norm.weight, eps)
 After all layers:
 
 ```
-hidden ─► narrow(seq_len-1) if prefill          # GPT OSS narrows BEFORE MoE
-                                                # in the last layer, see § 8
+hidden ─► the sequences' last rows (a prompt step; the last layer's MoE already ran on them only)
        ─► RMSNorm(output_norm.weight, eps)
        ─► output.weight matmul → logits
-       ─► copy to float[VocabSize]
 ```
 
 ## 4. Components in detail
 
 ### 4.1 Attention
 
-- **GQA** with `Config.NumKVHeads < Config.NumHeads`.
-- **Optional fused QKV** (`_isQkvFused`) — if the GGUF ships a single
-  `attn_qkv.weight`, `FuseQKVWeights()` builds a fused tensor; otherwise the
-  three linear ops are dispatched separately.
-- **Bias on every projection**: implemented in `LinearForwardWithBias()`,
-  which performs the matmul and then adds the bias row-by-row. The bias is
-  looked up from `_weights[biasName]`.
-- **No QK-norm**: unlike Gemma / Qwen, GPT OSS skips the per-head Q and K
-  normalization.
-- **Attention sinks**: per-head bias `attn_sinks.weight` (shape
-  `[numHeads]`). Treated as a virtual token in the softmax: its value
-  participates in both max-finding and exp-sum, effectively adding an
-  always-available attention target. Implemented in
-  `ApplySoftmaxWithSinks()` and `AttentionDecodeWithSinks()`.
-- **RoPE**: NeoX-style with YaRN scaling. `Ops.RoPEEx` is called with
-  `origCtxLen = Config.OriginalContextLength` (4096), `freqScale = 1 /
-  RopeScale`, `beta_fast = 32`, `beta_slow = 1`.
-- **Attention pattern**: even layers ⇒ SWA (window from `_slidingWindow`,
-  default 128); odd layers ⇒ full causal. Every decode and prefill path bounds
-  the even (SWA) layers to `_slidingWindow`: the managed per-op path, the fused
-  per-layer and whole-model graphs, and the paged path.
+- **GQA**: 64 query heads over 8 KV heads, head dimension 64, on gpt-oss-20b.
+- **Biases on every projection.** Q, K and V fuse into one `attn_qkv` product at load, layer by layer, where the three
+  share a type, and their biases into one `[q | k | v]` bias added after it. A layer whose three types differ keeps
+  three products, each with its own bias. unsloth's requants mix them, for example IQ4_NL q/k with a Q5_0 v.
+  The output projection adds `attn_output.bias`.
+- **No QK-norm.**
+- **Attention sinks** on every layer: `attn_sinks.weight` (`[numHeads]`) is one more logit in each head's softmax, with
+  no value. It is the attention op's fifth operand. The GGML builder passes it to `ggml_flash_attn_ext_add_sinks`. The
+  tensor executors (`cuda`, `mlx`, `cpu`) run a sink layer on their generic products, the sink as one more column of each
+  row's softmax (`TensorGraphExecutor.FlashAttentionWithSinks`).
+- **RoPE**: NeoX with YaRN (`freq_base` 150000, factor 32 over an original context of 4096, `beta_fast` 32,
+  `beta_slow` 1), as one `GraphRotary` spec.
+- **Attention pattern**: even layers attend a 128-token sliding window, odd layers the whole context. A sliding layer's
+  K/V live in a ring of 768 cells a slot (§9).
 
-### 4.2 FFN — clamped GLU (`SiLUAlphaLimit`)
+### 4.2 FFN — clamped SwiGLU (`swiglu_oai`)
 
 ```
-gate = clamp(gate, -∞, SiluLimit)        # SiluLimit = 7.0
-up   = clamp(up,   -SiluLimit, SiluLimit)
-out  = gate · sigmoid(SiluAlpha · gate) · (up + 1)   # SiluAlpha = 1.702
+g = min(gate + gate_bias, 7)
+u = clamp(up + up_bias, -7, 7)
+h = g · sigmoid(1.702 · g) · (u + 1)
+out = down · h + down_bias
 ```
 
-The constants `SiluAlpha` and `SiluLimit` are hardcoded. The activation is
-implemented with SIMD vectorization in `SiLUAlphaLimitInPlace` and is also
-exposed to the fused MoE prefill kernel as `swiglu_oai`.
+One graph op, `GraphOp.SwigluOai` (alpha 1.702, limit 7): `ggml_swiglu_oai` on GGML, a managed composition on the tensor
+executors. The per-expert biases are `GraphOp.AddId` (`ggml_add_id`): row `e` of a `[width, experts]` bias added to each
+route of expert `e`.
 
 ### 4.3 MoE routing
 
-- Every layer has `_numExperts` experts (32 for gpt-oss-20b) with TopK
-  routing (`_numExpertsUsed = 4`).
-- Routing is `linear(hidden) + bias → TopK → softmax(selected only)`.
-  This is **TopK-then-softmax**, the inverse of Gemma 4's softmax-then-TopK
-  flow.
-- Expert weights are stored as fused `gate ‖ up` rows in
-  `ffn_gate_up_exps.{E}.weight`, with a matching fused
-  `ffn_gate_up_exps.{E}.bias`. `FuseExpertGateUpWeights()` performs this
-  fusion at load time.
-- Expert biases are stored in the GGUF as packed `[numExperts, biasDim]`
-  tensors (`ffn_gate_exps.bias`). `SplitExpertBiases()` unpacks these into
-  per-expert `[biasDim]` tensors before the fusion step.
+- 32 experts, 4 a token (gpt-oss-20b).
+- `ffn_gate_inp · x + ffn_gate_inp.bias`, the top 4 of those logits, then a softmax over the 4 (llama.cpp's
+  `SOFTMAX_WEIGHT`). This is **top-k-then-softmax**, the inverse of Gemma 4's softmax-then-top-k.
+- The experts are read in place from the GGUF's 3-D stacks (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`, MXFP4)
+  with their `[width, experts]` F32 biases.
+- The graph follows llama.cpp's `openai-moe-iswa.cpp` op for op: up `mul_mat_id` + `add_id`, gate `mul_mat_id` +
+  `add_id`, `swiglu_oai`, down `mul_mat_id` + `add_id`, the routes' weights, their sum. ggml-cuda's fusions match that
+  chain: the top-k MoE selection, `mul_mat_id` + `add_id` + GLU, and the experts' weighted sum.
+- On direct CUDA the router and experts are one region (`GraphFusion.OaiRoutedExperts`), served by the MoE engine
+  (`CudaMoe`): the top-k softmax on the device, then the grouped expert kernels with two GPT-OSS kernels for the biased,
+  clamped SwiGLU and the down bias (`ts_moe_oai_glu_bias_f32`, `ts_moe_expert_bias_add_f32`). Decode rows and verify
+  windows run its per-slot kernels.
+- A prompt step's last layer runs its experts on the rows the head reads only (`PrunesExpertLastLayer`), as llama.cpp's
+  graph and the legacy model did.
 
-### 4.4 Stacked MoE prefill kernel (`TryMoEPrefillFused`)
-
-For prefill on a GGML backend, GPT OSS dispatches one
-`ggml_mul_mat_id` + `ggml_add_id` + `swiglu_oai` graph per layer instead of
-looping over active experts per token. The kernel reads:
-
-- The original 3D `ffn_gate_exps.weight`, `ffn_up_exps.weight`,
-  `ffn_down_exps.weight` blocks (zero-cost views into the mmap'd model).
-- A contiguous `[2 * nFf, numExperts]` f32 stacked bias for gate / up
-  (built once by `InitMoeStackedWeights` from the per-expert biases captured
-  before fusion).
-- A contiguous `[hidden, numExperts]` f32 stacked bias for down (also built
-  once at init time).
-
-Per-token routing is computed in C# (TopK + softmax) and the resulting
-`(token, expert)` map is fed to the kernel.
-
-### 4.5 Tokenizer
+### 4.4 Tokenizer
 
 GPT-4o BPE pre-tokenizer with `\p{N}{1,3}` number grouping. Handled by the
 runtime tokenizer when `tokenizer.ggml.pre == "gpt-4o"`.
@@ -242,188 +218,211 @@ blk.{L}.attn_norm.weight
 blk.{L}.attn_q.weight    / attn_q.bias
 blk.{L}.attn_k.weight    / attn_k.bias
 blk.{L}.attn_v.weight    / attn_v.bias
-blk.{L}.attn_qkv.weight  / attn_qkv.bias       # post-fusion (when QKV is fused)
+blk.{L}.attn_qkv.weight  / attn_qkv.bias       # after load, where q/k/v share a type
 blk.{L}.attn_output.weight / attn_output.bias
-blk.{L}.attn_sinks.weight                      # per-head bias [numHeads]
-blk.{L}.post_attention_norm.weight
+blk.{L}.attn_sinks.weight                      # per-head sink logits [numHeads]
+blk.{L}.post_attention_norm.weight             # the FFN norm
 
-blk.{L}.ffn_gate_inp.weight / ffn_gate_inp.bias   # router [numExperts, hidden]
-blk.{L}.ffn_gate_up_exps.{E}.weight                # fused expert gate+up
-blk.{L}.ffn_gate_up_exps.{E}.bias                  # fused expert gate+up bias
-blk.{L}.ffn_down_exps.{E}.weight                   # expert down
-blk.{L}.ffn_down_exps.{E}.bias                     # expert down bias
+blk.{L}.ffn_gate_inp.weight / ffn_gate_inp.bias   # router [hidden, experts] + [experts]
+blk.{L}.ffn_gate_exps.weight / ffn_gate_exps.bias # [hidden, ff, experts] + [ff, experts]
+blk.{L}.ffn_up_exps.weight   / ffn_up_exps.bias   # [hidden, ff, experts] + [ff, experts]
+blk.{L}.ffn_down_exps.weight / ffn_down_exps.bias # [ff, hidden, experts] + [hidden, experts]
 ```
 
-## 7. TensorSharp implementation walkthrough
+## 7. TensorSharp implementation: the shared decoder runtime
 
-Constructor (`GptOssModel(string ggufPath, BackendType backend)`):
+GPT-OSS runs on the shared decoder runtime (`StandardDecoderModel`), as Gemma 4, Qwen 3.5, Nemotron-H and Mistral 3 do.
+[`GptOssRuntimeModel`](../../TensorSharp.Models/Models/GptOss/GptOssRuntimeModel.cs) declares the family:
+- even layers' sliding windows;
+- the sinks and the biased projections, which the runtime's attention serves;
+- `post_attention_norm` as the FFN norm;
+- the YaRN rotary;
+- the routed experts of §4.3 (`EmitFeedForward`).
 
-1. `ParseBaseConfig()`.
-2. Reads MoE counts, the SWA window, expert FFN length, and the YaRN
-   original context length.
-3. `ParseTokenizer()`.
-4. `LoadWeights()`.
-5. `SplitExpertBiases()` — unpacks the GGUF's packed expert bias tensors.
-6. **Snapshot** the gate / up biases per expert *before* fusing. The fused
-   MoE prefill kernel needs the biases in their original split shape to
-   build a contiguous stacked bias table.
-7. `FuseExpertGateUpWeights()` — concatenates each expert's gate and up
-   into `ffn_gate_up_exps.{E}.weight` and the matching fused bias.
-8. `FuseQKVWeights()`.
-9. `PrepareCudaQuantizedWeightsForInference()`.
-10. `InitKVCache(maxSeqLen)`.
-11. `PrecomputeConstants()` — pre-allocates per-layer weight name arrays and
-    per-expert name arrays so the hot loops do no string interpolation.
-12. `InitMoeStackedWeights(preFuseGateBias, preFuseUpBias)` — builds the
-    stacked biases used by the fused MoE prefill kernel. Also resolves the
-    per-layer `StackedExpertWeights` views into the original 3D
-    `_exps.weight` blocks.
+The runtime provides batching, the prefix cache, checkpoints, placements, speculation and expert offload. The family runs
+whole-forward graphs only (`RequiresGraphs`): every step is one graph on the backend's executor, whether a prompt chunk,
+a decode step, batched slots or a verify window. That executor is the GGML graph builder on `ggml_*`,
+`CudaGraphExecutor` on `cuda`, `MlxGraphExecutor` on `mlx` and the managed executor on `cpu`.
 
-`Forward(int[] tokens)` then runs the per-op managed loop:
+What the migration added, all in TensorSharp-owned code (ggml upstream unchanged):
+- **Graph IR**: `GraphOp.SwigluOai`, `GraphOp.AddId` on the tensor executors, and a sink operand on the attention op.
+- **ggml-cuda fusions in prompt steps**: `GraphProgram.BackendFusions` runs ggml-cuda's graph optimizer on a prompt step,
+  after declaring the allocation dependencies it needs. Without it, the experts' weighted sum fused in 1 of 24 layers of a
+  prompt step and ran as a broadcast multiply and three adds in the rest.
+- **Direct CUDA**: the `OaiRoutedExperts` region on the MoE engine (§4.3).
+- **Host experts with biases** (§10).
+- **DFlash drafters with biased projections** (§8).
 
-- Embedding lookup.
-- For each layer: `LinearForwardWithBias` for Q / K / V, RoPE,
-  `AttentionDecodeWithSinks` (or `ApplySoftmaxWithSinks` for prefill), output
-  projection + bias, MoE block (or fused MoE prefill kernel).
-- For the **last** transformer layer in prefill, the residual is narrowed to
-  the last token *before* MoE (an early-exit optimization that skips the MoE
-  computation on positions that do not feed the LM head).
-- Final RMSNorm, LM head, copy to `_logitsBuffer`.
+The legacy `GptOssModel` was removed after the validation in §11, with everything that served only it:
+- its whole-model decode, token-batched decode and prefill graphs (`ggml_ops_gptoss_decode.cpp`,
+  `ggml_ops_gptoss_batched.cpp`, `ggml_ops_gptoss_prefill.cpp`, `ggml_ops_gptoss_kv.h`);
+- the fused attention-layer prefill and its device K/V windows (`ggml_ops_transformer_prefill.cpp`);
+- the paged attention with sinks (`TSGgml_PagedAttentionForwardWithSinks`, `ManagedPagedAttention.ForwardWithSinks`);
+- the MLX `gather_qmm` stacked-expert path and the MLX sink-decode, `swiglu_oai` bias-gather and biased weighted-sum
+  kernels;
+- the K/V host reader of its linear-to-paged migration;
+- the direct-CUDA sink attention kernels (`TryAttentionSoftmaxWithSinks`, `TryGqaDecodeAttentionWithSinks`,
+  `TryGqaPrefillAttentionWithSinks`), the split `swiglu_oai` kernel (`TrySwiGluOaiSplit`) and the unused
+  `TryGqaDecodeAttentionRaw` / `TryGqaDecodeAttentionGgmlCuda` entries;
+- the GGML device paged attention (`TSGgml_PagedAttentionForwardDevice`, `TSGgml_PagedAttentionForwardDeviceWithSinks`;
+  the host `TSGgml_PagedAttentionForward` stays) and the MLX `gather_mm` / `gather_qmm` bindings;
+- in the scheduler, the linear-to-paged K/V migration (`SupportsLinearKVMigration`, `TryMigrateLinearKVToPaged`) and
+  what only it made reachable: the N=1 `SingleSequenceFused` path and the lone-page-producer hold. A solo sequence now
+  takes `BatchedPaged`, or `PerSequenceFused` on a per-request cache, as concurrent ones do.
 
-## 8. Prefill optimization
+Its switches went too: `TS_GPTOSS_FUSED_DECODE_MAX_CTX`, `TS_GPTOSS_FUSED_ATTN_MAX_SEQ`, `TS_GPTOSS_PREFILL_F16` and
+`TS_GPTOSS_PREFILL_CHUNK` (prompt steps follow `TS_PREFILL_CHUNK`, and the rings cap a step at 512 rows). Setting one
+now stops startup and names the change (`RemovedCliFlags`), as the earlier `TS_GPTOSS_*` switches already did.
 
-- **Last-layer narrow before MoE**. Inside the last `TransformerBlock`,
-  `moeInput` is narrowed to `[1, hidden]` so the MoE block only computes the
-  one row that matters for the LM head. All earlier layers compute the MoE
-  branch over the full sequence.
-- **Stacked MoE prefill kernel** (`TryMoEPrefillFused`). One
-  `mul_mat_id + add_id + swiglu_oai` graph dispatch per layer for the
-  routed-expert FFN, replacing per-token per-expert dispatches. See § 4.4.
-- **Pre-built per-layer name arrays** (`_layerNames[L][]`) and per-expert
-  name arrays (`_expertNames[L][E][]`) eliminate string interpolation in the
-  hot loops.
-- **Cached attention sinks** in `_layerSinks[L][numHeads]` so the softmax
-  doesn't need to re-fetch the sinks every step.
+## 8. Serving mechanisms
 
-## 9. Decode optimization
+| Mechanism | Backends | Notes |
+|---|---|---|
+| Continuous batching | all | Batched slots: each request's own K/V (a 768-cell ring for each sliding layer). Concurrent requests' prompt chunks and decode rows run in one step. |
+| Prefix cache, checkpoints | all | The runtime's holder adapter: captures, clones, donated holders, export/import. A rewind past a whole Harmony answer is exact while the rings still hold the positions the next rows' windows read (§9). |
+| `--tp N` | cuda, ggml_cuda, ggml_vulkan | Per-rank graphs. Attention is sharded by heads (the sinks with them), and every expert by its width (gate/up columns, down rows; the down bias added once). Batching is kept. gpt-oss-20b's MXFP4 down rows are 90 blocks, so `--tp 2` splits them and `--tp 4` / `--tp 8` are refused at load with the reason. Covered on simulated devices only (§11). |
+| `--layer-split N` | cuda, ggml_cuda, ggml_vulkan | Whole-layer stages, batching kept. New with the runtime. |
+| Hybrid (`--tp` x `--layer-split`) | none (gap) | The graph-only family has no graphs for tensor-parallel stages yet. |
+| `--n-cpu-moe` / `--cpu-moe` | all | On one device or over stages; refused with `--tp`. See §10. |
+| Speculation | all | n-gram drafts and the DFlash block drafter (below), verified in windows whose rings roll back exactly. |
 
-- **Per-step routing buffers** (`_moeExpertCounts`, `_moeExpertOffsets`,
-  `_moeTokenMap`, `_moeWeightMap`) are reused across tokens.
-- **SIMD-vectorized bias addition and SiLUAlphaLimit activation** in
-  `LinearForwardWithBias` and `SiLUAlphaLimitInPlace`.
-- **Attention sinks softmax.** On the GGML backends the fused whole-model
-  decode graph below runs SWA-masked flash attention with sinks and
-  `mul_mat_id` experts on the device. On the per-op path, the GGML backends
-  run decode attention in the per-layer fused kernel up to
-  `TS_GPTOSS_FUSED_DECODE_MAX_CTX` (default 4096) tokens of context, `cuda`
-  has a GPU sinks decode kernel (`CudaFusedOps.TryGqaDecodeAttentionWithSinks`)
-  and `mlx` a Metal one; anything else runs the sinks softmax on the CPU
-  (scalar with optional SIMD on the exp-sum). Every one of these bounds the
-  SWA layers to `_slidingWindow`.
-- **MXFP4 expert weights** stay quantized in `_quantWeights`; matmul is
-  dispatched through the backend's quantized matmul.
+**DFlash drafter.** [z-lab/gpt-oss-20b-DFlash](https://huggingface.co/z-lab/gpt-oss-20b-DFlash) (0.8B, Apache-2.0)
+attaches with `--draft-model`. A Q5_K_M GGUF is
+[EntityDeletr/gpt-oss-20b-DFlash-GGUF](https://huggingface.co/EntityDeletr/gpt-oss-20b-DFlash-GGUF) `gpt-oss-20b-DFlash.gguf`
+(0.599 GB, revision `93855ebf`):
 
-GPT OSS runs an **entire decode token as one GGML graph dispatch** — every
-layer, the MoE router and experts, the final norm and the LM head — in
-`GptOssModel.FusedModelDecode.cs`, which is what lets ggml-cuda capture it as
-a CUDA graph. Measured on an A40: decode 24 → 154 tok/s, and flat in context
-length (133 tok/s at 16K) where the per-layer path collapsed to 2.3.
+```bash
+hf download EntityDeletr/gpt-oss-20b-DFlash-GGUF gpt-oss-20b-DFlash.gguf --local-dir models
+dotnet run --project TensorSharp.Cli -c Release -- --model models/gpt-oss-20b-MXFP4.gguf \
+  --draft-model models/gpt-oss-20b-DFlash.gguf --backend ggml_cuda --input prompt.txt
+```
 
-## 10. Memory and KV cache strategy
+It has 8 layers, an 8-row block and q/k norms. Its Q, K, V and output projections carry biases, which the runtime's
+drafter now reads (`DfAttnQBias` ... `DfOutputBias`). It uses the target's YaRN rotary and reads trunk layers 2, 7, 12, 17
+and 22.
 
-- Per-layer K and V tensors of shape `[NumKVHeads, maxSeqLen, headDim]`. KV
-  dtype is `f32` or `f16`. An explicit `q8_0` / `q4_0` request is downgraded to
-  `f16` with a notice on stderr: neither fused graph nor the managed sinks
-  fallback can read a block-quantized cache.
-- Prefix reuse across requests goes through the Radix prefix cache: cached pages,
-  the resident primary cache, and on the GGML backends without `--tp` each
-  finished request's holder, kept as its conversation's end state and donated to
-  the next turn (`GptOssModel.PrefixCache.cs`). The holders read none of the
-  pages, so before they were kept a conversation that ran beside another reused
-  nothing on its next turn (0 of 272-519 tokens for eight parallel
-  gpt-oss-20b conversations). Harmony drops the analysis channel when it
-  re-renders a past answer, so continuing a conversation rewinds its whole
-  previous answer; the sliding window masks a linear cache, so a rewind is exact
-  at any depth (a 220-token rewind is bitwise identical to never holding the
-  answer, `GptOssHolderRewindTests`), and the donated holder is not limited to
-  16 tokens. Every later turn now reuses the whole previous prompt.
-- `ResetKVCache()` zeroes everything.
-- The expert FFN weights live in the original 3D
-  `ffn_gate_exps.weight` / `ffn_up_exps.weight` / `ffn_down_exps.weight`
-  blocks loaded by `ModelBase`. `FuseExpertGateUpWeights()` only disposes the
-  per-expert *views*, not the underlying bulk buffer. This means the fused
-  MoE prefill kernel can still address the original blocks directly via
-  `_layerStackedGate` / `_layerStackedUp` / `_layerStackedDown`.
+Measured on one A40 (`ggml_cuda`, greedy, 5 prompts of 79-96 tokens, 128 generated tokens each):
+- **DFlash, 7-token windows:** 60-93 % of the drafts accepted, decoding at 0.84-1.26x the plain rate. It is fastest on
+  code and arithmetic, slowest on free prose.
+- **n-gram, 4-token windows:** 0.95-1.11x.
+- **Parity:** a speculative stream follows plain greedy decoding until a verify window's kernels flip a close pick
+  (`SpeculativeDecodingMatchesPlainGreedy` covers the synthetic files).
 
-## 11. Batched / paged forward (continuous batching)
+The speculation cost governor (`SpeculationCostGovernor`) measures drafting against plain steps and parks it where it
+loses; the runs above went through it. TensorAgent, whose speculation
+setting defaults to n-gram drafts, now speculates on GPT-OSS too (its catalog lists gpt-oss-20b as experimental).
 
-GPT OSS implements `IBatchedPagedModel.ForwardBatch`
-([`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs))
-and keeps it available by default; `--no-continuous-batching` withdraws it,
-which leaves the per-sequence KV-swap path.
+## 9. Memory and KV cache
 
-On the GGML backends without `--tp`, a step with two or more running requests
-does not take this paged path. Each request decodes from its own KV holder,
-swapped in by pointer
-([`GptOssModel.PerSeqCache.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.PerSeqCache.cs)),
-through the fused whole-model decode graph of §9, and a decode step shared by
-two or more such requests runs as ONE token-batched fused graph
-(`GgmlBasicOps.TryGptOssModelDecodeBatched`,
-[`ggml_ops_gptoss_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gptoss_batched.cpp))
-that reads every weight once for all of them. The token-batched step is on by
-default (`TS_BATCHED_FUSED_DECODE=0` falls back to one fused forward per request
-per step) and declines the step, and every request falls back to its own fused
-forward, when routed experts are offloaded to the CPU. A request whose holder has
-to grow this step is left out of the batch and decodes on its own while the
-others still batch. The paged path below is the route on non-GGML backends and with
-`TS_PER_SEQ_FUSED=0`. Under `--tp` neither the holders nor the paged path is
-available, so concurrent requests use the per-sequence KV-swap path. No throughput
-for the token-batched path is recorded in this card.
+- **Full-attention layers** (the odd ones): each slot's K/V holds the whole context, F16 by default
+  (`--kv-cache-dtype`).
+- **Sliding-window layers** (the even ones): a ring per slot of R = 768 cells (the 128-token window plus a 512-row step,
+  aligned to 256). Position p lives in cell p mod R. A request shorter than R uses the ring as a linear cache. A step
+  never writes more than 512 rows of one sequence, so a longer prompt runs in 512-row steps. gpt-oss-20b's 12 rings cost
+  9.4 MB a slot in F16, and a token costs the 12 full layers' 24 KiB. The legacy model's whole-context caches cost
+  48 KiB a token.
+- **Quantized K/V**: a `q8_0` request is kept on the GGML backends. On gpt-oss-20b it moved the mean NLL by -0.0004 on
+  `ggml_cuda` (384 tokens: 2.3060 -> 2.3056) and by +0.008 on `ggml_cpu` (160 tokens), and `ggml_cuda` decoded at
+  158 tok/s. The tensor executors' graphs do not run the rings over a block-quantized cache (direct CUDA's q8_0 row writes
+  do not wrap), so there a `q8_0` request becomes f16 with a notice. A `q4_0` request becomes f16 everywhere: on
+  `ggml_cuda` it cost 0.48 nat a token (2.3060 -> 2.7811). The legacy model made every block type f16.
+- **Rewinds**: a rewind keeps exactly the positions the next rows' windows read, and is refused once a ring has
+  overwritten them (`CanTruncateKVCache`). Harmony drops the analysis channel when it re-renders a past answer, so the
+  next turn rewinds the whole previous answer. That rewind is exact while the conversation holds fewer positions than a
+  ring's cells, and the prefix cache's checkpoints serve the rest.
+  `ARewindPastALongAnswerContinuesAsACacheThatNeverHeldIt` pins it.
+- **K/V block snapshots** (`TryExtractKVBlock`) are not offered: a ring is not position-addressed. The prefix cache uses
+  the runtime's slot clones and checkpoints instead. The real-model conformance script passes on gpt-oss-20b
+  (`GptOss20B_PassesTheConformanceScript`).
+- **Weights** stay in their GGUF formats on every executor (MXFP4 experts, Q8_0 attention and head on the ggml-org file).
 
-The batched port has to
-preserve GPT OSS's three architecture-distinguishing features —
-**attention sinks**, **bias on every projection**, and **per-layer
-alternating SWA** — inside the paged scheduling stack:
+## 10. Expert offload (`--n-cpu-moe` / `--cpu-moe`)
 
-- **Per-layer paged K/V** of layout
-  `[numBlocks * blockSize * numKvHeads * headDim]`, lazily grown
-  copy-on-write.
-- **Batched QKV with bias** per token; NeoX + YaRN RoPE is dispatched
-  with an explicit `positions[]` array.
-- **Per-layer SWA window** — the same alternating local / global window
-  pattern as the legacy path is passed per-call into the paged kernel,
-  so the batched scheduler still sees one uniform model while each
-  layer respects its own attention horizon.
-- **Native paged attention with per-head sinks**:
-  `TSGgml_PagedAttentionForwardWithSinks`
-  ([`ggml_ops_paged_attention.cpp`](../../TensorSharp.GGML.Native/ggml_ops_paged_attention.cpp))
-  combines `ggml_flash_attn_ext` with the `add_sinks` variant so the
-  sink logits participate in softmax normalization without contributing
-  to V — the same numerical behaviour as the per-sequence CPU sinks softmax.
-  Exposed through `GgmlBasicOps.PagedAttentionForwardWithSinks`.
-  - The managed C# fallback,
-    [`ManagedPagedAttention.ForwardWithSinks`](../../TensorSharp.Runtime/Paged/ManagedPagedAttention.cs),
-    is selected on non-GGML backends. Both produce bit-identical greedy
-    output.
-- **MoE FFN** runs through the existing `MoEForward(numTokens)`
-  token-parallel path; no GPT-OSS-specific batched MoE kernel.
+An offloaded layer's routed experts stay in host memory, and the step's graph pauses for them (`GraphOp.MoeHostExperts`
+with GPT-OSS's activation and the three biases). The router and the selection stay on the device.
+- **GGML backends:** the host MoE segment computes them from the GGUF mapping with ggml's CPU kernels: the biased gate
+  and up products, the clamped SwiGLU, then the biased down product. The one-token decode team takes decode rows; the
+  batched CPU MoE graph takes prompt chunks.
+- **Tensor executors:** the runtime's expert host computes them with the same kernels (`TSGgml_HostExpertRowsOai`,
+  through the same decode team).
+- **Direct CUDA** keeps a step on the device:
+  - Decode rows and short chunks ring the host through the expert doorbell (`CudaExpertDoorbell`), which computes the
+    host's routes while the device runs its own. The device then adds every route's down bias, the host's included.
+  - A layer's call stages at most one host expert over the link (`OaiGpuMisses`): a gpt-oss-20b expert is 13.2 MB of
+    MXFP4. Measured decode rates: 14.0 tok/s staging all four routes, 28.7 at two, 31.6 at one, 29.7 at none.
+  - Prompt chunks of 32 rows or more prefetch every host expert of the next layer by DMA while the current one runs
+    (`OaiPrefetchMinRows`): a chunk that long selects about 98 % of the experts anyway. The grouped MoE kernels then run
+    them on the device.
 
-### Verified correctness and throughput
+With `--tp`, offload is refused at load: the per-rank graphs keep their experts on the devices.
 
-- **100% greedy match** vs legacy (12/12 tokens) in
-  [`GptOssBatchedCorrectnessTests`](../../InferenceWeb.Tests/GptOssBatchedCorrectnessTests.cs)
-  — preserved across both the managed sinks fallback and the native
-  sinks kernel.
-- **Throughput remains flat** (~0.93–1.05× across n=1, 3, 5 in
-  [`GptOssBatchedPerfBench`](../../InferenceWeb.Tests/GptOssBatchedPerfBench.cs)).
-  The native sinks kernel didn't move the needle because the legacy
-  per-seq path already runs one fused per-layer kernel
-  (`TryFusedAttnLayerPrefill`: RMSNorm + fused QKV + RoPE + KV-append
-  + sinks-aware softmax + attn + output proj + residual in one
-  cgraph), whereas the batched path issues ~5 separate graphs per
-  layer (norm, QKV, RoPE, paged-attn, output, residual). Closing this
-  gap needs a fused-per-layer batched kernel for GPT OSS — substantial
-  follow-up work.
+Measured on one A40 (ggml `bb877c0c`), 12 of 24 MoE layers offloaded (`TS_N_CPU_MOE=12`), in a container with 7.6 CPUs
+(5 host-expert threads):
+
+| Backend | Prefill 512 tok/s | Decode tok/s | NLL resident -> offloaded |
+|---|---|---|---|
+| ggml_cuda, legacy -> runtime | 1814-2415 -> 2116-2460 | 33.3-39.5 -> 34.0-41.4 | — |
+| cuda, runtime | 551 (547 at 2048) | 29.2-31.6 | 2.7706 -> 2.7700 |
+
+The ranges span two sessions. The legacy model ignored `TS_N_CPU_MOE` on `cuda`: it kept every expert on the GPU (prefill 723 tok/s,
+decode 51 tok/s), so direct-CUDA offload is new. Greedy text on `cuda` with offload follows the resident run until near ties
+(top-2 margins 0.03-0.07 at the first difference).
+
+## 11. Validation of the migration
+
+Dependency: ggml `bb877c0c51f38c52ee2d5e41d58e3d0c20f3fed4`, upstream and unchanged. `ggml_swiglu_oai`, `ggml_add_id`
+and `ggml_flash_attn_ext_add_sinks` are its own ops. The CUDA PTX baseline was rebuilt with CUDA 13.0.88 for the two new
+kernels.
+
+**Synthetic fixtures** (`GptOssSyntheticModelBuilder`, `GptOssRuntimeTests`, 41 tests). The four cases are MXFP4 experts,
+Q8_0 experts, a long one (window 16 over 83 tokens) and one sized for `--tp`. Each is held to the legacy model's logits,
+frozen on the managed backend before it was deleted (`Fixtures/GptOss/LegacySynthetic/managed.json`). `ggml_cpu`,
+`ggml_cuda` and direct `cuda` are checked against the managed backend. Also covered:
+- chunked prefill, every placement over simulated devices, batched slots, concurrent requests;
+- checkpoints, rewinds past a long answer, speculation;
+- host experts on every executor (on direct CUDA: decode rows through the doorbell and prompt chunks staged on the
+  device, with no step falling back to the executor's host path);
+- mixed Q/K/V types fusing layer by layer;
+- the refusal of offload under `--tp`.
+
+The direct-CUDA prefill suite (`DirectCudaPrefillModelTests`) gained GPT-OSS's verify rows, which are bit-identical to
+its decode rows.
+
+**Real checkpoint** (gpt-oss-20b MXFP4, one A40). Teacher-forced argmax agreement with the legacy model is 5 prompts'
+greedy steps, the legacy tokens forced through both. NLL is 448 tokens of the README, reported as perplexity. Speeds are
+the CLI's benchmark, ABBA-ordered:
+
+| Backend | Argmax vs legacy | Perplexity legacy -> runtime | Decode tok/s (after 512) | Prefill 512 tok/s | Decode tok/s after 4K | Prefill 4K tok/s |
+|---|---|---|---|---|---|---|
+| ggml_cuda | 551/561 (near ties, top-2 margin < 0.15) | 10.579 -> 10.546 | 141-150 -> 155-162 | 6095-6348 -> 6191-6531 | 131 -> 157.5 | 5923-6447 -> ~6440 |
+| cuda | 555/561 | 10.620 -> 10.576 | 51 -> 118-120 | ~730 -> ~1750 | — | — |
+
+- **Logits** against an F32 managed-CPU reference: the legacy model and the runtime are equally close (KL ≈ 0).
+- **Server** (`TensorSharp.Server`, aggregate decode tok/s):
+
+  | Requests | ggml_cuda legacy -> runtime | cuda legacy -> runtime |
+  |---|---|---|
+  | 1 | 107.8 -> 140.6 | 39.4 -> 89.3 |
+  | 4 concurrent | 125.0 -> 212.7 | 4.7 -> 127.7 |
+  | 8 concurrent | 151.0 -> 230.4 | 4.7 -> 132.3 |
+
+  Concurrent outputs part from solo ones at near-tie word choices, as the legacy model's did: its concurrent outputs
+  matched solo ones on 1 of 4 and 4 of 8 prompts.
+- **Coverage limits.** These were not run:
+  - `mlx`, `ggml_metal` and `ggml_vulkan`;
+  - multi-GPU `--tp` and `--layer-split`, which were covered on simulated devices only;
+  - gpt-oss-120b.
+- **Known costs.**
+  - `--tp 4` / `--tp 8` are refused for gpt-oss-20b, where the legacy model ran them as expert parallelism.
+    `--layer-split N` serves any N.
+  - Direct-CUDA decode steps past the sliding window run as plans rather than CUDA-graph replays, because a recording
+    would replay its first window's attention floor. Output is exact, but each step pays its launches on the host
+    (118-120 tok/s against ggml_cuda's 155-162).
+  - Direct-CUDA prompt attention on the sink layers runs the generic products (1750 tok/s against ggml_cuda's 6400).
+  - Direct-CUDA offloaded prompts reach 551 tok/s against ggml_cuda's 2460 (§10).
+  - On the synthetic file, chunked prefill on direct CUDA sits up to 3.0e-2 from the single pass: chunks of decode-size
+    rows run the decode kernels. The legacy model kept it within 7.5e-3. Against ggml_cpu the runtime stays inside the
+    bounds the legacy model was held to.
 
 ## 12. Output parser and chat template
 
@@ -483,33 +482,13 @@ alternating SWA** — inside the paged scheduling stack:
 
 ## 13. Optimization opportunities
 
-- **Fused per-layer batched kernel** — the legacy path's
-  `TryFusedAttnLayerPrefill` does one cgraph per layer (norm + fused
-  QKV + RoPE + KV-append + sinks-aware softmax + attn + output proj +
-  residual). The paged `ForwardBatch` path still issues ~5 graphs per
-  layer. On the GGML backends concurrent decode now goes through the
-  per-request holders and the token-batched fused graph instead (§11), so
-  this matters only where the paged path still runs.
-- **Fused QKV in every release** — when the GGUF ships split Q / K / V the
-  per-projection bias add still happens after each separate matmul. A
-  `FusedQKVWithBias` graph would cut 3 dispatches into 1.
-- **Whole-model decode on the paged path** — the fused whole-model decode
-  graph (`GptOssModel.FusedModelDecode.cs`) serves single-sequence decode and
-  the per-request holders, and its token-batched variant serves concurrent
-  decode on the GGML backends; the paged `ForwardBatch` route does not use it,
-  and extending the same single-dispatch treatment there would remove most of
-  its remaining managed overhead.
-- **Device sinks attention on the per-op GGML path** — this matters only on
-  the per-op path (§9), which a GGML backend takes when the whole-model decode
-  graph declines (a layer missing a weight the kernel needs, or tensor
-  parallelism without the fused tensor-parallel plan). The fused whole-model decode
-  graph already runs sinks attention on the device, and so do the `cuda` and
-  `mlx` per-op paths. On the per-op GGML path, past
-  `TS_GPTOSS_FUSED_DECODE_MAX_CTX` decode still falls back to the CPU sinks
-  softmax; lifting that per-layer kernel's context cap would close the gap.
-- **Per-expert decode batching (`cpu` / `cuda`)** — the GGML backends
-  already run single-token MoE as one `mul_mat_id` dispatch and `mlx` as a
-  `gather_qmm` grouped GEMM, but the `cpu` and `cuda` per-op paths still
-  run the experts sequentially per token. A batched decode path there
-  (analogous to Qwen 3.5's `MoEExpertsSwiGLUResidual`) would collapse
-  `numExpertsUsed` dispatches into one.
+- **Direct-CUDA prompt attention with sinks.** A sink layer's prompt attention runs on the generic products. A flash
+  kernel with the sink in its softmax would close most of the gap to ggml_cuda's prefill. The legacy model's sink
+  kernels were never wired to the executor's rings and were removed with it, so this needs a sink operand on the
+  ring-aware flash kernels.
+- **Recorded decode past the window on direct CUDA.** Recording the ring's floor as an input would let those steps replay.
+- **Direct-CUDA offloaded prompts.** gpt-oss-20b's 2880-wide experts take the grouped MoE engine's warp-per-row route
+  (2880 is neither a multiple of 128 nor of 256). A tensor-core route for that width would serve the offloaded and
+  resident prompt experts alike.
+- **`--tp 4` / `--tp 8`** need the down projection's rows split inside an MXFP4 row's 90 blocks, or an expert-parallel
+  placement.

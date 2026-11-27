@@ -31,7 +31,6 @@ public class ExecutionPlannerTests
         BatchedForwardAvailable = true,
         SupportsBatchedMultimodal = false,
         SupportsPerSequenceFusedForward = false,
-        SupportsLinearKvMigration = true,
         SupportsKvStateSnapshot = true,
         SupportsCrossSequenceKvReuse = true,
     };
@@ -118,50 +117,22 @@ public class ExecutionPlannerTests
         Assert.Equal(ExecutionPathKind.PerSequence, plan.Selected);
     }
 
-    // ----- N=1 fused fast path -----
+    // ----- a solo sequence on a batched model -----
 
-    [Fact]
-    public void SoloSequenceInLinearCache_SelectsSingleSequenceFusedFastPath()
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void SoloSequence_OnABatchedModel_SelectsBatchedPaged_WithPerSeqFallback(bool pagedStorage, bool ownershipSwap)
     {
-        var plan = ExecutionPlanner.PlanStep(BatchedCaps(), ExecutionOptions.Default, PlainConfig, Seqs(1));
-
-        Assert.Equal(ExecutionPathKind.SingleSequenceFused, plan.Selected);
-        // Terminal: the per-seq executor cannot decline.
-        Assert.Single(plan.Candidates);
-    }
-
-    [Fact]
-    public void SoloSequenceAlreadyInPagedStorage_StaysOnBatchedPaged()
-    {
-        var features = Seqs(1) with { SoloKvInPagedStorage = true };
+        // No model migrates a linear cache into paged storage any more, so there is no N=1 fast path: a solo
+        // sequence takes the batched path, which sends a linear-only history to the per-sequence route.
+        var features = Seqs(1) with { SoloKvInPagedStorage = pagedStorage, SoloRequiresOwnershipSwap = ownershipSwap };
         var plan = ExecutionPlanner.PlanStep(BatchedCaps(), ExecutionOptions.Default, PlainConfig, features);
 
         Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
-        var rejection = Assert.Single(plan.Rejections, r => r.Path == ExecutionPathKind.SingleSequenceFused);
-        Assert.Contains("paged storage", rejection.Reason);
-    }
-
-    [Fact]
-    public void SoloWithoutLinearKvMigration_RejectsFastPath()
-    {
-        // Without linear->paged migration a second concurrent request would
-        // corrupt the first sequence's attention, so the fast path must not
-        // engage (the original Gemma 4 token-repeat bug).
-        var caps = BatchedCaps() with { SupportsLinearKvMigration = false };
-        var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, PlainConfig, Seqs(1));
-
-        Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
-        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SingleSequenceFused);
-    }
-
-    [Fact]
-    public void SoloRequiringOwnershipSwap_WithoutSnapshot_RejectsFastPath()
-    {
-        var caps = BatchedCaps() with { SupportsKvStateSnapshot = false };
-        var features = Seqs(1) with { SoloRequiresOwnershipSwap = true };
-        var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, PlainConfig, features);
-
-        Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
+        Assert.Equal(new[] { ExecutionPathKind.BatchedPaged, ExecutionPathKind.PerSequence }, plan.Candidates);
+        Assert.Empty(plan.Rejections);
     }
 
     // ----- per-sequence fused concurrency -----
@@ -204,12 +175,12 @@ public class ExecutionPlannerTests
     }
 
     [Fact]
-    public void FusedCapableModel_NeverFusedSolo_KeepsN1FastPath()
+    public void FusedCapableModel_NeverFusedSolo_TakesTheBatchedPath()
     {
         var caps = BatchedCaps() with { SupportsPerSequenceFusedForward = true };
         var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, PlainConfig, Seqs(1));
 
-        Assert.Equal(ExecutionPathKind.SingleSequenceFused, plan.Selected);
+        Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
     }
 
     [Fact]
@@ -327,7 +298,7 @@ public class ExecutionPlannerTests
         var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, SpecConfig, Seqs(1));
 
         Assert.True(plan.SpeculationUnprofitable);
-        Assert.Equal(ExecutionPathKind.SingleSequenceFused, plan.Selected);
+        Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
         Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativePerSequence
             && r.Code == TensorSharp.Runtime.Speculative.SpeculationDeclineReason.Unprofitable);
     }
@@ -338,7 +309,7 @@ public class ExecutionPlannerTests
         var plan = ExecutionPlanner.PlanStep(BatchedCaps(), ExecutionOptions.Default, SpecConfig, Seqs(1));
 
         Assert.False(plan.SpeculationUnprofitable);
-        Assert.Equal(ExecutionPathKind.SingleSequenceFused, plan.Selected);
+        Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
     }
 
     // ----- plan invariants and reporting -----
@@ -353,7 +324,6 @@ public class ExecutionPlannerTests
         foreach (var batchedImpl in new[] { false, true })
         foreach (var available in new[] { false, true })
         foreach (var fusedCap in new[] { false, true })
-        foreach (var migration in new[] { false, true })
         foreach (var snapshot in new[] { false, true })
         foreach (var mtp in new[] { false, true })
         foreach (var disabled in new[] { false, true })
@@ -366,7 +336,6 @@ public class ExecutionPlannerTests
                 SupportsBatchedPagedAttention = batchedImpl,
                 BatchedForwardAvailable = batchedImpl && available,
                 SupportsPerSequenceFusedForward = batchedImpl && fusedCap,
-                SupportsLinearKvMigration = batchedImpl && migration,
                 SupportsKvStateSnapshot = snapshot,
                 SupportsCrossSequenceKvReuse = snapshot,
                 SupportsSpeculativeTrunk = mtp,
@@ -394,13 +363,14 @@ public class ExecutionPlannerTests
     [Fact]
     public void PlanDescribe_ListsSelectedFallbacksAndRejections()
     {
-        var caps = BatchedCaps() with { SupportsLinearKvMigration = false };
-        var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, PlainConfig, Seqs(1));
+        var caps = BatchedCaps() with { SupportsPerSequenceFusedForward = true };
+        var options = ExecutionOptions.Default with { PerSeqFusedEnabled = false };
+        var plan = ExecutionPlanner.PlanStep(caps, options, PlainConfig, Seqs(3));
 
         string desc = plan.Describe();
         Assert.Contains("BatchedPaged", desc);
         Assert.Contains("PerSequence", desc);
-        Assert.Contains("cannot migrate linear KV", desc);
+        Assert.Contains("TS_PER_SEQ_FUSED=0", desc);
     }
 
     [Fact]

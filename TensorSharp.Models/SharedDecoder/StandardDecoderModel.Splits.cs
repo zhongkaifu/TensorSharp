@@ -33,7 +33,10 @@ namespace TensorSharp.Models
 
         private protected virtual LeafSplit GraphWeightSplit(string name, long[] ne, int ggmlType)
         {
-            int dot = name.LastIndexOf(".weight", StringComparison.Ordinal);
+            // A projection's bias (GPT-OSS) splits along its one axis as the weight's output rows do; a row-parallel output's
+            // bias is mirrored (its add follows the partial's reduce on the meta device).
+            bool bias = name.EndsWith(".bias", StringComparison.Ordinal);
+            int dot = name.LastIndexOf(bias ? ".bias" : ".weight", StringComparison.Ordinal);
             string stem = dot > 0 ? name[..dot] : name;
             string part = stem.Contains('.') ? stem[(stem.LastIndexOf('.') + 1)..] : stem;
             // A layer's own geometry (Gemma 4's global layers): the layer is the name's blk.N.
@@ -41,6 +44,19 @@ namespace TensorSharp.Models
             int heads = Config.NumHeads, kvHeads = layer >= 0 ? KvHeadsOf(layer) : Config.NumKVHeads;
             long keyDim = layer >= 0 ? KeyDimOf(layer) : _keyDim, valueDim = layer >= 0 ? ValueDimOf(layer) : _valueDim;
             long qStride = GatedAttentionOutput ? 2L * keyDim : keyDim;
+            if (bias)
+                return part switch
+                {
+                    "attn_q" => Segments(0, (heads * qStride, heads)),
+                    "attn_k" => Segments(0, (kvHeads * keyDim, kvHeads)),
+                    "attn_v" => Segments(0, (kvHeads * valueDim, kvHeads)),
+                    "attn_qkv" => Segments(0, (heads * qStride, heads), (kvHeads * keyDim, kvHeads), (kvHeads * valueDim, kvHeads)),
+                    // Per-expert biases [ff, E] of the column-parallel gate and up stacks: each rank's slice of every expert's rows.
+                    "ffn_gate_exps" or "ffn_up_exps" => Even(0, ne[0]),
+                    _ => null,
+                };
+            // Per-head attention sinks [heads]: a rank's own heads.
+            if (layer >= 0 && AttentionSinksWeight(layer) == name) return Segments(0, (heads, heads));
             switch (part)
             {
                 case "attn_q": return Segments(1, (heads * qStride, heads));

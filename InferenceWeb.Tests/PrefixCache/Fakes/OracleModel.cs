@@ -60,11 +60,6 @@ internal sealed record OracleTraits
     public bool PagesNeedStateAtEnd { get; init; }
     public int PageWindowTokens { get; init; }
     public bool SupportsCopyPagedToHolder { get; init; }
-    /// <summary>A lone request's linear cache can move into pages when a second request arrives, which is
-    /// what lets a lone request take the single-sequence fused path; without it every request runs on the
-    /// batched paged path and produces pages from its first forward.</summary>
-    public bool LinearKvMigration { get; init; } = true;
-
     public bool ReuseAcrossMediaSpan { get; init; } = true;
     /// <summary>A prompt with media also checkpoints before its tail
     /// (<see cref="PrefixCacheCapabilities.CheckpointPromptTailWithMedia"/>), as Qwen3.5 on direct CUDA does.</summary>
@@ -291,20 +286,6 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
     }
 
     private int SlotOf(int[] blockTable, int position) => blockTable[position / BlockSize] * BlockSize + position % BlockSize;
-
-    public bool SupportsLinearKVMigration => BatchedForwardAvailable && Traits.LinearKvMigration;
-
-    public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize)
-    {
-        if (!SupportsLinearKVMigration || blockSize != BlockSize) return false;
-        OracleCache cache = Active;
-        if (owner.BlockTable.CapacityTokens < cache.Length) return false;
-        int[] table = owner.BlockTable.Blocks.Select(b => b.Id).ToArray();
-        for (int pos = 0; pos < cache.Length; pos++)
-            _paged[SlotOf(table, pos)] = cache.Chain[pos + 1];
-        if (Traits.PagedEndStates) _slots[owner.RequestId] = cache.State;
-        return true;
-    }
 
     public bool SupportsPerSequenceFusedForward => HasHolders;
 

@@ -42,6 +42,10 @@ internal sealed class GptOssSyntheticModelBuilder
     public float SinkCenter { get; init; }
     public float SinkSpread { get; init; } = 0.5f;
 
+    /// <summary>Layers whose V projection stays F32 while Q and K are Q8_0 (unsloth's gpt-oss requants quantize the three
+    /// with different types): such a layer cannot fuse its projections. None by default.</summary>
+    public Func<int, bool> F32Values { get; init; } = _ => false;
+
     /// <summary>The sink setting the direct-CUDA model tests use (see DirectCudaPrefillModelTests).</summary>
     public static GptOssSyntheticModelBuilder SensitiveSinks() => new() { SinkCenter = 2f, SinkSpread = 1f };
 
@@ -88,7 +92,8 @@ internal sealed class GptOssSyntheticModelBuilder
             t.Add(Gen(p + "attn_q.bias", 0.05f, qDim));
             t.Add(Q8(Gen(p + "attn_k.weight", 0.06f, Hidden, kvDim)));
             t.Add(Gen(p + "attn_k.bias", 0.05f, kvDim));
-            t.Add(Q8(Gen(p + "attn_v.weight", 0.06f, Hidden, kvDim)));
+            Tensor v = Gen(p + "attn_v.weight", 0.06f, Hidden, kvDim);
+            t.Add(F32Values(l) ? v : Q8(v));
             t.Add(Gen(p + "attn_v.bias", 0.05f, kvDim));
             t.Add(Q8(Gen(p + "attn_output.weight", 0.04f, qDim, Hidden)));
             t.Add(Gen(p + "attn_output.bias", 0.05f, Hidden));

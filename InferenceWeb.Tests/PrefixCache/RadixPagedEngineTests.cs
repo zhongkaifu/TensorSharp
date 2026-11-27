@@ -17,8 +17,8 @@ public class RadixPagedEngineTests
 {
     private const int BlockSize = 8;
 
-    // No linear-cache migration keeps every request on the batched path, so these tests exercise real
-    // page production rather than the oracle's primary-cache fast path (primary reuse has separate coverage).
+    // Every request runs on the batched path (no family migrates a linear cache into pages), so these tests
+    // exercise real page production rather than primary-cache reuse (which has separate coverage).
     private static OracleModel Model(PageSupport pages) => new(new OracleTraits
     {
         Name = "engine-pages-" + pages,
@@ -26,7 +26,6 @@ public class RadixPagedEngineTests
         Pages = pages,
         PrimaryResident = false,
         Truncation = TruncationKind.Any,
-        LinearKvMigration = false,
     }, BlockSize);
 
     private static SchedulerConfig Config(int blocks = 16, bool enabled = true) => new()

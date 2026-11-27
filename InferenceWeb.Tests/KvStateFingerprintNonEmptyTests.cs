@@ -33,7 +33,7 @@ public sealed class KvStateFingerprintNonEmptyTests
     private static readonly Type[] KnownEngineServedFamilies =
     {
         typeof(Qwen35RuntimeModel), typeof(Qwen4ExpRuntimeModel), typeof(Gemma4RuntimeModel),
-        typeof(GptOssModel), typeof(Mistral3Model), typeof(NemotronRuntimeModel), typeof(MuseGlimmerRuntimeModel),
+        typeof(GptOssRuntimeModel), typeof(Mistral3Model), typeof(NemotronRuntimeModel), typeof(MuseGlimmerRuntimeModel),
         typeof(GlmDsaModel), typeof(DeepSeek4Model), typeof(DeepSeek41Model),
     };
 
@@ -80,7 +80,7 @@ public sealed class KvStateFingerprintNonEmptyTests
         new object[] { typeof(HunyuanDenseModel) },
         new object[] { typeof(Qwen35RuntimeModel) },
         new object[] { typeof(Gemma4RuntimeModel) },
-        new object[] { typeof(GptOssModel) },
+        new object[] { typeof(GptOssRuntimeModel) },
         new object[] { typeof(Mistral3Model) },
         new object[] { typeof(NemotronRuntimeModel) },
     };

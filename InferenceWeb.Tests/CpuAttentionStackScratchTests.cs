@@ -191,58 +191,6 @@ public sealed unsafe class CpuAttentionStackScratchTests : IDisposable
     }
 
     // ------------------------------------------------------------------------------------
-    //  The per-model host attention kernels (one score row per head over the attended range)
-    // ------------------------------------------------------------------------------------
-
-    public static IEnumerable<object[]> RowKernels()
-    {
-        foreach (string k in new[] { "gpt-oss", "gpt-oss-tp" })
-        {
-            yield return new object[] { k, false };
-            if (k != "gpt-oss-tp")   // the TP kernel reads an F32 cache only
-                yield return new object[] { k, true };
-        }
-    }
-
-    [Theory]
-    [MemberData(nameof(RowKernels))]
-    public void ModelRowKernels_AtALongContext_OnWorkerSizedStacks_MatchReference(string kernel, bool f16)
-    {
-        // 400,000 keys = 1.6 MB of scores per head: past a worker's stack and a ThreadPool
-        // thread's, so whichever thread runs a head would have overflowed.
-        var c = RowCase.Create(kernel, keys: 400_000, f16, seed: 11);
-        try
-        {
-            OnThread(CpuWorkerPool.WorkerStackBytes, () => { c.Run(); return 0; });
-            AssertMatchesReference(c.Result(), c.Reference());
-        }
-        finally
-        {
-            c.Dispose();
-        }
-    }
-
-    [Theory]
-    [MemberData(nameof(RowKernels))]
-    public void ModelRowKernels_StackAndRentedScratch_GiveBitIdenticalResults(string kernel, bool f16)
-    {
-        var c = RowCase.Create(kernel, keys: 20_000, f16, seed: 13);
-        try
-        {
-            using (CpuScratch.OverrideStackFloatLimit(int.MaxValue))
-                c.Run();
-            float[] onStack = c.Result();
-            using (CpuScratch.OverrideStackFloatLimit(0))
-                c.Run();
-            AssertBitIdentical(onStack, c.Result());
-        }
-        finally
-        {
-            c.Dispose();
-        }
-    }
-
-    // ------------------------------------------------------------------------------------
     //  Helpers
     // ------------------------------------------------------------------------------------
 
@@ -310,81 +258,6 @@ public sealed unsafe class CpuAttentionStackScratchTests : IDisposable
                     output, h * HeadDim);
             }
             return output;
-        }
-    }
-
-    /// <summary>One of the per-model kernels that keeps one score row per head.</summary>
-    private sealed class RowCase : IDisposable
-    {
-        private const int Heads = 2, KvHeads = 1, Dim = 8;
-        private readonly string _kernel;
-        private readonly int _keys;
-        private readonly float _scale;
-        private readonly float[] _q, _k, _v, _sinks;
-        private readonly Tensor _qT, _kT, _vT, _rT;
-
-        private RowCase(string kernel, int keys, bool f16, int seed)
-        {
-            _kernel = kernel;
-            _keys = keys;
-            _scale = 1f / MathF.Sqrt(Dim);
-            var rnd = new Random(seed);
-            int maxSeq = keys + 5;
-            _q = Random(rnd, Heads * Dim);
-            _k = Random(rnd, KvHeads * maxSeq * Dim);
-            _v = Random(rnd, KvHeads * maxSeq * Dim);
-            _sinks = kernel.StartsWith("gpt-oss", StringComparison.Ordinal) ? new[] { 0.25f, -0.5f } : null;
-
-            _qT = FromFloats(_q, 1, Heads * Dim);
-            _rT = new Tensor(Alloc, DType.Float32, 1, Heads * Dim);
-            if (f16)
-            {
-                ushort[] kh = ToHalf(_k), vh = ToHalf(_v);   // widens _k/_v in place to the cached values
-                _kT = FromHalves(kh, KvHeads, maxSeq, Dim);
-                _vT = FromHalves(vh, KvHeads, maxSeq, Dim);
-            }
-            else
-            {
-                _kT = FromFloats(_k, KvHeads, maxSeq, Dim);
-                _vT = FromFloats(_v, KvHeads, maxSeq, Dim);
-            }
-        }
-
-        public static RowCase Create(string kernel, int keys, bool f16, int seed) => new(kernel, keys, f16, seed);
-
-        public void Run()
-        {
-            switch (_kernel)
-            {
-                case "gpt-oss":
-                    GptOssModel.AttentionDecodeWithSinks(_qT, _kT, _vT, _rT, Heads, KvHeads, Dim, _keys, _scale,
-                        _sinks, isSWA: false, slidingWindow: 128);
-                    break;
-                case "gpt-oss-tp":
-                    GptOssModel.AttentionDecodeWithSinksTPHost(_qT, _kT, _vT, _rT, Heads, KvHeads, Dim, 0, _keys, _scale, _sinks);
-                    break;
-                default:
-                    throw new ArgumentException(_kernel);
-            }
-        }
-
-        public float[] Result() => new ReadOnlySpan<float>(TensorComputePrimitives.GetFloatPointer(_rT), Heads * Dim).ToArray();
-
-        public double[] Reference()
-        {
-            var output = new double[Heads * Dim];
-            int maxSeq = _keys + 5;
-            for (int h = 0; h < Heads; h++)
-            {
-                long kvBase = (long)(h / (Heads / KvHeads)) * maxSeq * Dim;
-                ReferenceRow(_q, h * Dim, _k, _v, kvBase, Dim, Dim, _keys, _scale, _sinks?[h], output, h * Dim);
-            }
-            return output;
-        }
-
-        public void Dispose()
-        {
-            _qT.Dispose(); _kT.Dispose(); _vT.Dispose(); _rT.Dispose();
         }
     }
 
@@ -473,19 +346,5 @@ public sealed unsafe class CpuAttentionStackScratchTests : IDisposable
             values[i] = (float)half;
         }
         return h;
-    }
-
-    private static Tensor FromFloats(float[] data, params long[] sizes)
-    {
-        var t = new Tensor(Alloc, DType.Float32, sizes);
-        data.AsSpan().CopyTo(new Span<float>(TensorComputePrimitives.GetFloatPointer(t), data.Length));
-        return t;
-    }
-
-    private static Tensor FromHalves(ushort[] data, params long[] sizes)
-    {
-        var t = new Tensor(Alloc, DType.Float16, sizes);
-        data.AsSpan().CopyTo(new Span<ushort>(TensorComputePrimitives.GetHalfPointer(t), data.Length));
-        return t;
     }
 }

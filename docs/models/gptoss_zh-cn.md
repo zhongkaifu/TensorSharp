@@ -6,13 +6,14 @@
 |---|---|
 | 提供方 | OpenAI |
 | GGUF 架构标识 | `gptoss`、`gpt-oss` |
-| 模型类 | [`GptOssModel`](../../TensorSharp.Models/Models/GptOss/GptOssModel.cs)（旧单序列路径）+ [`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs)（`IBatchedPagedModel`） |
+| 模型类 | [`GptOssRuntimeModel`](../../TensorSharp.Models/Models/GptOss/GptOssRuntimeModel.cs)，运行在共享解码运行时上（`StandardDecoderModel`；旋转位置编码与路由 expert 见 [`GptOssRuntimeModel.Graph.cs`](../../TensorSharp.Models/Models/GptOss/GptOssRuntimeModel.Graph.cs)，每个执行器上都运行整次前向的计算图）。旧的 `GptOssModel` 已删除（§7、§11）。 |
 | 示例模型 | gpt-oss-20b |
 | 模态 | 仅文本 |
 | 思维链模式 | 是（Harmony 格式：`<\|channel>analysis ... <\|channel>final`） |
 | 工具调用 | 是（Harmony `commentary` channel —— `to=functions.NAME`）；可使用 skills、代码工具以及服务端的[子智能体委派](../multi_agent.md) |
-| 投机解码 | 否 —— GPT OSS 没有投机主干，因此 `--spec`（包括无权重的 n-gram 草稿器）只提供普通解码 |
-| 批处理 / 分页前向 | **默认启用。** 在不带 `--tp` 的 GGML 后端上，并发请求使用按请求的 KV holder 与按 token 批处理的融合 decode 图（`TS_PER_SEQ_FUSED=0` 关闭 holder）。其他后端走分页 `ForwardBatch` 路径：每层分页 K/V，注意力 sinks 通过原生 `TSGgml_PagedAttentionForwardWithSinks`（非 GGML 后端使用托管 C# 回退）。`--tp` 下两条路径都不可用，并发请求走按序列 KV-swap 路径，与 `--no-continuous-batching` 时相同。详见 §11。 |
+| 投机解码 | n-gram 草稿（`--spec`、`--spec-type ngram`）与公开的 gpt-oss-20b DFlash 块级草稿器（`--draft-model`），在可精确回退的窗口中验证。旧模型没有投机主干。详见 §8。 |
+| 批处理 / 分页前向 | **默认启用**（共享运行时的批处理槽位：每个请求有自己驻留在设备上的 K/V，每个滑动窗口层一个环形缓存；多个请求的提示块与 decode 行在同一步中运行）—— `--no-continuous-batching` 会强制走按序列路径。`--tp` 与 `--layer-split` 下保持批处理。详见 §8。 |
+| 专家卸载 | `--n-cpu-moe` / `--cpu-moe` 可用于单设备或 `--layer-split` 各阶段，所有后端都支持；`--tp` 下拒绝。详见 §10。 |
 | 输出解析器 | `HarmonyOutputParser`（始终启用） |
 
 ## 下载
@@ -52,7 +53,7 @@ GPT OSS 是 OpenAI 的开放权重 MoE 系列。它有几个让它在 TensorShar
 - **每一层都是 MoE**，TopK 路由后只对被选 expert 做 softmax（与 Gemma 4 的「先 softmax 再 TopK」相反）。
 - **Attention sinks** —— 一种 per-head 学习到的偏置，作为「虚 token」（K=0、V=0）加入 softmax，提供一个永远存在的 attention 目标。
 - **每个线性投影都有 bias**（Q、K、V、attn output、gate、up、down、router）。这在 TensorSharp 支持的架构中独此一家。
-- **Clamped GLU 激活** —— FFN 用类 SiLU 的激活 `x · sigmoid(α · x) · (y + 1)`，gate 被 clamp 到 `[-∞, 7]`，up 被 clamp 到 `[-7, 7]`。
+- **Clamped GLU 激活** —— FFN 用类 SiLU 的激活 `x · sigmoid(α · x) · (y + 1)`，gate 被 clamp 到 `[-∞, 7]`，`up` 值被 clamp 到 `[-7, 7]`。
 - **Harmony 输出格式** —— 每条输出都被包在 `<|channel>analysis ... <|channel>final ...` 标记中。输出解析器标记为 `AlwaysRequired = true`，因为没有「关闭思维链」的模式。
 - **MXFP4 expert 权重**（GGML 量化类型 39）—— gpt-oss-20b 使用的 4 位 microscaling 格式。
 
@@ -73,7 +74,7 @@ GPT OSS 是 OpenAI 的开放权重 MoE 系列。它有几个让它在 TensorShar
         │  RMSNorm(post_attention_norm)                    │
         │  router_linear+bias                              │
         │  topK 后 softmax(选中 experts)                   │
-        │  per-expert: SiLUAlphaLimit(gate+bias, up+bias)  │
+        │  per-expert: swiglu_oai(gate+bias, up+bias)      │
         │              ─► down+bias                        │
         │  expert 输出按 router 权重加权求和                │
         │  ─► residual                                     │
@@ -94,14 +95,14 @@ GPT OSS 是 OpenAI 的开放权重 MoE 系列。它有几个让它在 TensorShar
 ```
 hidden ─► RMSNorm(attn_norm.weight, eps)
        ─► Q+bias, K+bias, V+bias（每个线性都是 matmul + per-row bias add）
-       ─► RoPE_NeoX with YaRN scaling
+       ─► RoPE_NeoX with Yarn scaling
             • origCtxLen = Config.OriginalContextLength (4096)
             • freqScale  = 1 / RopeScale
             • beta_fast  = 32, beta_slow = 1
        ─► append (K, V) 到 KV cache
        ─► attention with sinks:
             scores = Q × K^T
-            scores ← 应用因果 mask（偶数层希望时附加 SWA）
+            scores ← 因果 mask（偶数层另加 128 token 的窗口）
             sinks  = attn_sinks.weight                   # [numHeads]
             sums   = exp(scores - max) + exp(sinks - max)
             scores = exp(scores - max) / sums            # softmax 包含 sink
@@ -109,18 +110,16 @@ hidden ─► RMSNorm(attn_norm.weight, eps)
        ─► attn_output.weight matmul + bias → o
        ─► residual = hidden + o
 
-       moeInput = (prefill 中最后一层) ? narrow(seq_len-1) : residual
+       moeInput = (提示步的最后一层) ? 各序列的最后一行 : residual
        moeInput ─► RMSNorm(post_attention_norm)
                 ─► router_linear + bias
-                ─► topK(_numExpertsUsed)
-                ─► softmax(选中权重)
-                ─► 对每个被选 expert e:
-                       gate = ffn_gate_up_exps[e][:, :nFf] × moeInput + bias
-                       up   = ffn_gate_up_exps[e][:, nFf:] × moeInput + bias
-                       gate = clamp(gate, -∞, 7)
-                       up   = clamp(up,   -7, 7)
-                       out_e = gate · sigmoid(α · gate) · (up + 1)
-                       out_e = ffn_down_exps[e] × out_e + bias
+                ─► 对 logits 取 topK(4)
+                ─► 对这 4 个做 softmax
+                ─► 对每个被选 expert e（每个投影一次 mul_mat_id + add_id）:
+                       up   = ffn_up_exps[e]   × moeInput + up_bias[e]
+                       gate = ffn_gate_exps[e] × moeInput + gate_bias[e]
+                       h    = swiglu_oai(gate, up)          # min(gate, 7)、clamp(up, ±7)、alpha 1.702
+                       out_e = ffn_down_exps[e] × h + down_bias[e]
                 ─► 用 router 权重 weighted Σ out_e
                 ─► residual += weighted_sum
 ```
@@ -128,53 +127,56 @@ hidden ─► RMSNorm(attn_norm.weight, eps)
 所有层完成后：
 
 ```
-hidden ─► narrow(seq_len-1) if prefill          # GPT OSS 在最后一层 MoE 之前就 narrow，
-                                                 # 见 § 8
+hidden ─► 各序列的最后一行（提示步；最后一层的 MoE 已经只在这些行上运行）
        ─► RMSNorm(output_norm.weight, eps)
        ─► output.weight matmul → logits
-       ─► 拷贝到 float[VocabSize]
 ```
 
 ## 4. 组件细节
 
 ### 4.1 Attention
 
-- **GQA**，`Config.NumKVHeads < Config.NumHeads`。
-- **可选融合 QKV**（`_isQkvFused`）—— GGUF 直接给单个 `attn_qkv.weight` 时 `FuseQKVWeights()` 构建融合 tensor，否则三次线性 op 分别派发。
-- **每个投影都有 bias**：在 `LinearForwardWithBias()` 实现，做完 matmul 后逐行加 bias，bias 从 `_weights[biasName]` 取。
-- **没有 QK-norm**：与 Gemma / Qwen 不同，GPT OSS 跳过 per-head Q/K 归一。
-- **Attention sinks**：per-head bias `attn_sinks.weight`（形状 `[numHeads]`）。在 softmax 中作为虚 token：参与 max 计算与 exp 求和，相当于多了一个永远在的 attention 目标。在 `ApplySoftmaxWithSinks()` 与 `AttentionDecodeWithSinks()` 实现。
-- **RoPE**：NeoX 风格 + YaRN scaling。`Ops.RoPEEx` 调用时传入 `origCtxLen = Config.OriginalContextLength`（4096）、`freqScale = 1 / RopeScale`、`beta_fast = 32`、`beta_slow = 1`。
-- **Attention pattern**：偶数层 ⇒ SWA（窗口取自 `_slidingWindow`，默认 128）；奇数层 ⇒ 全因果。所有 decode / prefill 路径都会把偶数层（SWA）限制在 `_slidingWindow` 之内：托管 per-op 路径、逐层融合图与整模型融合图、以及分页路径。
+- **GQA**：gpt-oss-20b 上 64 个 query 头对应 8 个 KV 头，head 维度 64。
+- **每个投影都有 bias。** 在 Q、K、V 类型相同的层上，三者在加载时逐层融合为一个 `attn_qkv` 乘积，它们的 bias 也融合为一个
+  `[q | k | v]` bias，在乘积之后相加。三者类型不同的层保留三个乘积，各带自己的 bias。unsloth 的重新量化文件会混用类型，
+  例如 IQ4_NL 的 q/k 配 Q5_0 的 v。输出投影加上 `attn_output.bias`。
+- **没有 QK-norm。**
+- **Attention sinks**，每一层都有：`attn_sinks.weight`（`[numHeads]`）是每个头的 softmax 中多出的一个 logit，没有对应的
+  value。它是注意力算子的第五个操作数。GGML 构建器把它交给 `ggml_flash_attn_ext_add_sinks`。张量执行器（`cuda`、`mlx`、
+  `cpu`）用通用乘积处理带 sink 的层，把 sink 作为每行 softmax 中的额外一列（`TensorGraphExecutor.FlashAttentionWithSinks`）。
+- **RoPE**：NeoX 风格 + YaRN（`freq_base` 150000，在 4096 的原始上下文上系数为 32，`beta_fast` 32，`beta_slow` 1），
+  作为一个 `GraphRotary` spec。
+- **Attention pattern**：偶数层关注 128 token 的滑动窗口，奇数层关注整个上下文。滑动窗口层的 K/V 存放在每个槽位 768 个
+  单元的环形缓存中（§9）。
 
-### 4.2 FFN —— Clamped GLU（`SiLUAlphaLimit`）
+### 4.2 FFN —— clamped SwiGLU（`swiglu_oai`）
 
 ```
-gate = clamp(gate, -∞, SiluLimit)        # SiluLimit = 7.0
-up   = clamp(up,   -SiluLimit, SiluLimit)
-out  = gate · sigmoid(SiluAlpha · gate) · (up + 1)   # SiluAlpha = 1.702
+g = min(gate + gate_bias, 7)
+u = clamp(up + up_bias, -7, 7)
+h = g · sigmoid(1.702 · g) · (u + 1)
+out = down · h + down_bias
 ```
 
-`SiluAlpha` 与 `SiluLimit` 是硬编码常量。激活在 `SiLUAlphaLimitInPlace` 中以 SIMD 向量化实现，并以 `swiglu_oai` 的形式暴露给融合 MoE prefill kernel。
+它是一个计算图算子 `GraphOp.SwigluOai`（alpha 1.702，limit 7）：GGML 上是 `ggml_swiglu_oai`，张量执行器上是托管的组合实现。
+逐 expert 的 bias 是 `GraphOp.AddId`（`ggml_add_id`）：`[width, experts]` bias 的第 `e` 行加到 expert `e` 的每条路由上。
 
 ### 4.3 MoE 路由
 
-- 每层都有 `_numExperts` 个 expert（gpt-oss-20b 是 32）和 TopK 路由（`_numExpertsUsed = 4`）。
-- 路由：`linear(hidden) + bias → TopK → softmax(只对选中)`。这是**先 TopK 再 softmax**，与 Gemma 4 的「先 softmax 再 TopK」相反。
-- Expert 权重以融合 `gate ‖ up` 行的形式存于 `ffn_gate_up_exps.{E}.weight`，对应融合 bias 在 `ffn_gate_up_exps.{E}.bias`。`FuseExpertGateUpWeights()` 在加载时完成融合。
-- Expert bias 在 GGUF 中以打包 `[numExperts, biasDim]` 的形式存（`ffn_gate_exps.bias`）。`SplitExpertBiases()` 在融合前把它们拆成 per-expert `[biasDim]` tensor。
+- 32 个 expert，每 token 选 4 个（gpt-oss-20b）。
+- `ffn_gate_inp · x + ffn_gate_inp.bias`，取这些 logits 的前 4 个，再对这 4 个做 softmax（llama.cpp 的 `SOFTMAX_WEIGHT`）。
+  这是**先 top-k 再 softmax**，与 Gemma 4 的「先 softmax 再 top-k」相反。
+- expert 直接从 GGUF 的 3-D 堆叠（`ffn_gate_exps`、`ffn_up_exps`、`ffn_down_exps`，MXFP4）原地读取，并带有各自
+  `[width, experts]` 的 F32 bias。
+- 计算图逐个算子沿用 llama.cpp 的 `openai-moe-iswa.cpp`：up `mul_mat_id` + `add_id`，gate `mul_mat_id` + `add_id`，
+  `swiglu_oai`，down `mul_mat_id` + `add_id`，乘上各路由的权重，再求和。ggml-cuda 的融合与这条链对应：top-k MoE 选择、
+  `mul_mat_id` + `add_id` + GLU，以及 expert 的加权求和。
+- 在直接 CUDA 上，router 与 expert 是一个区域（`GraphFusion.OaiRoutedExperts`），由 MoE 引擎（`CudaMoe`）服务：先在设备上
+  做 top-k softmax，再运行分组 expert 内核，另有两个 GPT-OSS 内核负责带 bias 的 clamped SwiGLU 与 down bias
+  （`ts_moe_oai_glu_bias_f32`、`ts_moe_expert_bias_add_f32`）。decode 行与 verify 窗口运行它的逐槽位内核。
+- 提示步的最后一层只在 head 读取的行上运行 expert（`PrunesExpertLastLayer`），与 llama.cpp 的计算图以及旧模型的做法相同。
 
-### 4.4 Stacked MoE prefill kernel（`TryMoEPrefillFused`）
-
-GGML 后端上 prefill 时，GPT OSS 每层只派发一次 `ggml_mul_mat_id` + `ggml_add_id` + `swiglu_oai` 图，而不是按 token 枚举活跃 expert。kernel 读取：
-
-- 原始 3D 的 `ffn_gate_exps.weight`、`ffn_up_exps.weight`、`ffn_down_exps.weight` 块（对 mmap 模型的零成本 view）。
-- 一份连续 `[2 * nFf, numExperts]` f32 的 stacked gate / up bias（在 `InitMoeStackedWeights` 中由融合前捕获的 per-expert bias 一次性构建）。
-- 一份连续 `[hidden, numExperts]` f32 的 stacked down bias（同样一次性构建）。
-
-per-token 路由（TopK + softmax）在 C# 侧完成，得到的 `(token, expert)` 映射喂给 kernel。
-
-### 4.5 分词器
+### 4.4 分词器
 
 GPT-4o BPE pre-tokenizer，带 `\p{N}{1,3}` 数字分组。运行时分词器在 `tokenizer.ggml.pre == "gpt-4o"` 时启用相应分支。
 
@@ -200,118 +202,188 @@ blk.{L}.attn_norm.weight
 blk.{L}.attn_q.weight    / attn_q.bias
 blk.{L}.attn_k.weight    / attn_k.bias
 blk.{L}.attn_v.weight    / attn_v.bias
-blk.{L}.attn_qkv.weight  / attn_qkv.bias       # 融合后（QKV 融合时）
+blk.{L}.attn_qkv.weight  / attn_qkv.bias       # 加载后生成，q/k/v 类型相同时
 blk.{L}.attn_output.weight / attn_output.bias
-blk.{L}.attn_sinks.weight                      # per-head bias [numHeads]
-blk.{L}.post_attention_norm.weight
+blk.{L}.attn_sinks.weight                      # 每个头的 sink logit [numHeads]
+blk.{L}.post_attention_norm.weight             # FFN 的 norm
 
-blk.{L}.ffn_gate_inp.weight / ffn_gate_inp.bias   # router [numExperts, hidden]
-blk.{L}.ffn_gate_up_exps.{E}.weight                # 融合 expert gate+up
-blk.{L}.ffn_gate_up_exps.{E}.bias                  # 融合 expert gate+up bias
-blk.{L}.ffn_down_exps.{E}.weight                   # expert down
-blk.{L}.ffn_down_exps.{E}.bias                     # expert down bias
+blk.{L}.ffn_gate_inp.weight / ffn_gate_inp.bias   # router [hidden, experts] + [experts]
+blk.{L}.ffn_gate_exps.weight / ffn_gate_exps.bias # [hidden, ff, experts] + [ff, experts]
+blk.{L}.ffn_up_exps.weight   / ffn_up_exps.bias   # [hidden, ff, experts] + [ff, experts]
+blk.{L}.ffn_down_exps.weight / ffn_down_exps.bias # [ff, hidden, experts] + [hidden, experts]
 ```
 
-## 7. TensorSharp 实现走读
+## 7. TensorSharp 实现：共享解码运行时
 
-构造函数（`GptOssModel(string ggufPath, BackendType backend)`）：
+GPT-OSS 与 Gemma 4、Qwen 3.5、Nemotron-H、Mistral 3 一样运行在共享解码运行时（`StandardDecoderModel`）上。
+[`GptOssRuntimeModel`](../../TensorSharp.Models/Models/GptOss/GptOssRuntimeModel.cs) 声明该家族：
+- 偶数层的滑动窗口；
+- sink 与带 bias 的投影，由运行时的注意力服务；
+- 以 `post_attention_norm` 作为 FFN norm；
+- YaRN 旋转位置编码；
+- §4.3 的路由 expert（`EmitFeedForward`）。
 
-1. `ParseBaseConfig()`。
-2. 读 MoE 计数、SWA 窗口、expert FFN 长度、YaRN 原始上下文长度。
-3. `ParseTokenizer()`。
-4. `LoadWeights()`。
-5. `SplitExpertBiases()` —— 拆开 GGUF 中打包的 expert bias。
-6. **快照** 每个 expert 的 gate / up bias（在融合**之前**）。融合 MoE prefill kernel 需要原始 split 形状下的 bias 来构建连续 stacked bias 表。
-7. `FuseExpertGateUpWeights()` —— 把每个 expert 的 gate 与 up 拼到 `ffn_gate_up_exps.{E}.weight`，并构建融合 bias。
-8. `FuseQKVWeights()`。
-9. `PrepareCudaQuantizedWeightsForInference()`。
-10. `InitKVCache(maxSeqLen)`。
-11. `PrecomputeConstants()` —— 预分配 per-layer 与 per-expert 的权重名字符串数组，热循环中没有字符串拼接。
-12. `InitMoeStackedWeights(preFuseGateBias, preFuseUpBias)` —— 构建融合 MoE prefill kernel 用的 stacked bias，同时把 per-layer `StackedExpertWeights` 解析为对原始 3D `_exps.weight` 块的 view。
+批处理、前缀缓存、检查点、放置、投机解码与专家卸载都由运行时提供。该家族只运行整次前向的计算图（`RequiresGraphs`）：
+每一步，无论是提示块、decode 步、批处理槽位还是 verify 窗口，都是后端执行器上的一张图。该执行器在 `ggml_*` 上是 GGML
+图构建器，`cuda` 上是 `CudaGraphExecutor`，`mlx` 上是 `MlxGraphExecutor`，`cpu` 上是托管执行器。
 
-`Forward(int[] tokens)` 跑 per-op 托管循环：
+迁移新增的内容全部位于 TensorSharp 自有代码中（ggml 上游未修改）：
+- **计算图 IR**：张量执行器上的 `GraphOp.SwigluOai`、`GraphOp.AddId`，以及注意力算子上的 sink 操作数。
+- **提示步中的 ggml-cuda 融合**：`GraphProgram.BackendFusions` 在提示步上运行 ggml-cuda 的图优化器，先声明它所需的分配依赖。
+  没有它时，提示步的 24 层中只有 1 层融合了 expert 的加权求和，其余各层以一次广播乘法加三次加法运行。
+- **直接 CUDA**：MoE 引擎上的 `OaiRoutedExperts` 区域（§4.3）。
+- **带 bias 的主机 expert**（§10）。
+- **带 bias 投影的 DFlash 草稿器**（§8）。
 
-- Embedding lookup。
-- 每层：`LinearForwardWithBias` 做 Q / K / V，RoPE，`AttentionDecodeWithSinks`（prefill 走 `ApplySoftmaxWithSinks`），输出投影 + bias，MoE block（或融合 MoE prefill kernel）。
-- 在 prefill 的**最后一层**，residual 在 MoE 之前 narrow 到最后一个 token —— 早退优化，跳过那些不喂给 LM head 的位置上的 MoE 计算。
-- 最终 RMSNorm、LM head、拷贝到 `_logitsBuffer`。
+旧的 `GptOssModel` 在 §11 的验证之后被删除，随之删除的还有所有只为它服务的部分：
+- 它的整模型 decode、按 token 批处理的 decode 与 prefill 计算图（`ggml_ops_gptoss_decode.cpp`、
+  `ggml_ops_gptoss_batched.cpp`、`ggml_ops_gptoss_prefill.cpp`、`ggml_ops_gptoss_kv.h`）；
+- 融合的注意力层 prefill 及其设备端 K/V 窗口（`ggml_ops_transformer_prefill.cpp`）；
+- 带 sink 的分页注意力（`TSGgml_PagedAttentionForwardWithSinks`、`ManagedPagedAttention.ForwardWithSinks`）；
+- MLX 的 `gather_qmm` 堆叠 expert 路径，以及 MLX 的 sink decode、`swiglu_oai` bias-gather 与带 bias 加权求和内核；
+- 它从线性缓存迁移到分页缓存时使用的 K/V 主机读取器；
+- 直接 CUDA 的 sink 注意力内核（`TryAttentionSoftmaxWithSinks`、`TryGqaDecodeAttentionWithSinks`、
+  `TryGqaPrefillAttentionWithSinks`）、拆分的 `swiglu_oai` 内核（`TrySwiGluOaiSplit`），以及没有调用者的
+  `TryGqaDecodeAttentionRaw` / `TryGqaDecodeAttentionGgmlCuda`；
+- GGML 的设备端分页注意力（`TSGgml_PagedAttentionForwardDevice`、`TSGgml_PagedAttentionForwardDeviceWithSinks`；
+  主机端的 `TSGgml_PagedAttentionForward` 保留）以及 MLX 的 `gather_mm` / `gather_qmm` 绑定；
+- 调度器中从线性缓存到分页存储的 K/V 迁移（`SupportsLinearKVMigration`、`TryMigrateLinearKVToPaged`），以及只有它
+  才会用到的 N=1 `SingleSequenceFused` 路径和 lone-page-producer 等待。单个序列现在与并发序列一样走 `BatchedPaged`，
+  在每请求缓存上则走 `PerSequenceFused`。
 
-## 8. Prefill 优化
+它的开关也一并删除：`TS_GPTOSS_FUSED_DECODE_MAX_CTX`、`TS_GPTOSS_FUSED_ATTN_MAX_SEQ`、`TS_GPTOSS_PREFILL_F16` 与
+`TS_GPTOSS_PREFILL_CHUNK`（提示步遵循 `TS_PREFILL_CHUNK`，环形缓存把一步限制在 512 行）。现在设置其中任何一个都会让启动
+停止，并说明这一变更（`RemovedCliFlags`），与更早删除的 `TS_GPTOSS_*` 开关相同。
 
-- **最后一层 MoE 之前的 narrow**。最后一个 `TransformerBlock` 内 `moeInput` 被 narrow 到 `[1, hidden]`，让 MoE block 只算关心的那一行。所有更早层的 MoE 仍然在整个序列上算。
-- **Stacked MoE prefill kernel**（`TryMoEPrefillFused`）。每层一次 `mul_mat_id + add_id + swiglu_oai` 图调度替代每 token 每 expert 多次派发，见 § 4.4。
-- **预构建 per-layer 名字数组**（`_layerNames[L][]`）与 per-expert 名字数组（`_expertNames[L][E][]`）消除热循环里的字符串拼接。
-- **缓存 attention sinks** 在 `_layerSinks[L][numHeads]`，softmax 不需要每步重新取。
+## 8. 服务机制
 
-## 9. Decode 优化
+| 机制 | 后端 | 说明 |
+|---|---|---|
+| 连续批处理 | 全部 | 批处理槽位：每个请求有自己的 K/V（每个滑动窗口层一个 768 单元的环形缓存）。并发请求的提示块与 decode 行在同一步中运行。 |
+| 前缀缓存、检查点 | 全部 | 运行时的 holder 适配器：捕获、克隆、捐赠的 holder、导出/导入。只要环形缓存仍保留后续行的窗口要读取的位置，回退整段 Harmony 回答就是精确的（§9）。 |
+| `--tp N` | cuda、ggml_cuda、ggml_vulkan | 按 rank 的计算图。注意力按 head 切分（sink 随之切分），每个 expert 按宽度切分（gate/up 按列、down 按行；down bias 只加一次）。保持批处理。gpt-oss-20b 的 MXFP4 down 行由 90 个块组成，因此 `--tp 2` 能切分它们，`--tp 4` / `--tp 8` 在加载时被拒绝并说明原因。仅在模拟设备上覆盖（§11）。 |
+| `--layer-split N` | cuda、ggml_cuda、ggml_vulkan | 整层阶段，保持批处理。随运行时新增。 |
+| 混合（`--tp` x `--layer-split`） | 无（缺口） | 这个只用计算图的家族还没有张量并行阶段的计算图。 |
+| `--n-cpu-moe` / `--cpu-moe` | 全部 | 单设备或各阶段上可用；`--tp` 下拒绝。见 §10。 |
+| 投机解码 | 全部 | n-gram 草稿与 DFlash 块级草稿器（见下文），在环形缓存可精确回退的窗口中验证。 |
 
-- **每步路由 buffer**（`_moeExpertCounts`、`_moeExpertOffsets`、`_moeTokenMap`、`_moeWeightMap`）跨 token 复用。
-- **SIMD 向量化的 bias 加法与 SiLUAlphaLimit 激活** 在 `LinearForwardWithBias` 与 `SiLUAlphaLimitInPlace`。
-- **Sinks softmax。** 在 GGML 后端上，下文的融合整模型 decode 图在设备上执行带 SWA 掩码与 sinks 的 flash attention 以及 `mul_mat_id` 专家。在 per-op 路径上，GGML 后端在上下文不超过 `TS_GPTOSS_FUSED_DECODE_MAX_CTX`（默认 4096）个 token 时用逐层融合内核做 decode 注意力，`cuda` 有 GPU sinks decode 内核（`CudaFusedOps.TryGqaDecodeAttentionWithSinks`），`mlx` 有对应的 Metal 内核；其余情况下 sinks softmax 跑在 CPU（标量 + 可选 SIMD 求 exp-sum）。这些路径都会把 SWA 层限制在 `_slidingWindow` 之内。
-- **MXFP4 expert 权重** 量化保留在 `_quantWeights`，matmul 由后端的量化 matmul 派发。
+**DFlash 草稿器。** [z-lab/gpt-oss-20b-DFlash](https://huggingface.co/z-lab/gpt-oss-20b-DFlash)（0.8B，Apache-2.0）
+通过 `--draft-model` 加载。Q5_K_M 的 GGUF 为
+[EntityDeletr/gpt-oss-20b-DFlash-GGUF](https://huggingface.co/EntityDeletr/gpt-oss-20b-DFlash-GGUF) 中的 `gpt-oss-20b-DFlash.gguf`
+（0.599 GB，revision `93855ebf`）：
 
-GPT OSS 已经把**整个 decode token 作为一次 GGML 图派发**执行 —— 每一层、MoE 路由与专家、最后的 norm 与 LM head 全部在 `GptOssModel.FusedModelDecode.cs` 的同一张图里，这也是 ggml-cuda 能把它整体捕获成 CUDA graph 的原因。A40 实测：decode 从 24 → 154 tok/s，并且随上下文长度基本持平（16K 时仍有 133 tok/s），而逐层路径在同样长度下已经掉到 2.3。
+```bash
+hf download EntityDeletr/gpt-oss-20b-DFlash-GGUF gpt-oss-20b-DFlash.gguf --local-dir models
+dotnet run --project TensorSharp.Cli -c Release -- --model models/gpt-oss-20b-MXFP4.gguf \
+  --draft-model models/gpt-oss-20b-DFlash.gguf --backend ggml_cuda --input prompt.txt
+```
 
-## 10. 内存与 KV cache 策略
+它有 8 层、8 行的块以及 q/k norm。它的 Q、K、V 与输出投影带 bias，运行时的草稿器现在会读取这些 bias
+（`DfAttnQBias` ... `DfOutputBias`）。它使用目标模型的 YaRN 旋转位置编码，并读取主干第 2、7、12、17 与 22 层。
 
-- 每层 K、V tensor 形状 `[NumKVHeads, maxSeqLen, headDim]`。KV dtype 为 `f32` 或 `f16`；显式请求 `q8_0` / `q4_0` 时会在 stderr 上提示并降为 `f16`（两张融合图与托管 sinks 回退都读不了块量化 cache）。
-- 跨请求的前缀复用走 Radix 前缀缓存：缓存的页、常驻的主缓存，以及在不带 `--tp` 的 GGML 后端上每个结束请求的 holder——它作为所属会话的终态保留下来，交给下一轮（`GptOssModel.PrefixCache.cs`）。holder 读不到任何页，所以在保留 holder 之前，与其他会话并行运行过的会话在下一轮什么都复用不了（八个并行的 gpt-oss-20b 会话在 272-519 个 token 中复用 0 个）。Harmony 在重新渲染过去的回答时会丢掉 analysis 通道，所以续接会话需要回退整段上一轮回答；滑动窗口只是在线性 cache 上做掩码，因此任意深度的回退都是精确的（回退 220 个 token 与从未持有这段回答逐位一致，`GptOssHolderRewindTests`），交出的 holder 不受 16 个 token 的限制。现在每个后续轮次都复用整个上一轮提示词。
-- `ResetKVCache()` 全部清零。
-- Expert FFN 权重在 `ModelBase` 加载的原始 3D `ffn_gate_exps.weight` / `ffn_up_exps.weight` / `ffn_down_exps.weight` 块中。`FuseExpertGateUpWeights()` 只 dispose per-expert *view*，不动底层大缓冲。这样融合 MoE prefill kernel 仍能通过 `_layerStackedGate` / `_layerStackedUp` / `_layerStackedDown` 直接寻址原始块。
+在一张 A40 上实测（`ggml_cuda`，贪心，5 个 79-96 token 的提示，每个生成 128 个 token）：
+- **DFlash，7 token 窗口：** 草稿接受率 60-93 %，decode 速度为普通解码的 0.84-1.26 倍。代码与算术上最快，自由文本上最慢。
+- **n-gram，4 token 窗口：** 0.95-1.11 倍。
+- **一致性：** 投机流会一直跟随普通贪心解码，直到 verify 窗口的内核翻转一个接近的选择
+  （`SpeculativeDecodingMatchesPlainGreedy` 覆盖合成文件）。
 
-## 11. 批处理 / 分页前向（连续批处理）
+投机代价调节器（`SpeculationCostGovernor`）把起草与普通步对比测量，在起草不划算的地方把它停下；上面的运行都经过了它。
+TensorAgent 的投机设置默认使用 n-gram 草稿，现在也会在 GPT-OSS 上投机（它的目录把 gpt-oss-20b 列为实验性）。
 
-GPT OSS 实现了 `IBatchedPagedModel.ForwardBatch`
-（[`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs)）
-并默认保持可用；`--no-continuous-batching` 会撤下它，剩下的就是按序列 KV-swap 路径。
+## 9. 内存与 KV cache
 
-在不带 `--tp` 的 GGML 后端上，有两个及以上运行中请求的步骤并不走这条分页路径。每个
-请求从自己的 KV holder 解码，holder 通过指针切换换入
-（[`GptOssModel.PerSeqCache.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.PerSeqCache.cs)），
-走 §9 的融合整模型 decode 图；由两个及以上这样的请求共享的 decode 步则作为**一张**按
-token 批处理的融合图执行（`GgmlBasicOps.TryGptOssModelDecodeBatched`，
-[`ggml_ops_gptoss_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gptoss_batched.cpp)），
-所有请求只读一遍权重。按 token 批处理的步骤默认开启（`TS_BATCHED_FUSED_DECODE=0` 退回
-每步每个请求各跑一次融合前向）；当路由专家被卸载到 CPU 时拒绝该步，每个请求各自跑一次
-融合前向；某个请求的 holder 在这一步需要扩容时，只有它退出批处理单独 decode，其余请求仍一起
-批处理。非 GGML 后端（以及设置
-`TS_PER_SEQ_FUSED=0` 时）走下面的分页路径。`--tp` 下 holder 与分页路径都不可用，
-并发请求走旧的 KV-swap 路径。本卡片没有记录按 token 批处理路径的吞吐。
+- **全注意力层**（奇数层）：每个槽位的 K/V 保存整个上下文，默认 F16（`--kv-cache-dtype`）。
+- **滑动窗口层**（偶数层）：每个槽位一个 R = 768 单元的环形缓存（128 token 窗口加 512 行的步长，按 256 对齐）。位置 p 位于
+  单元 p mod R。短于 R 的请求把环形缓存当作线性缓存使用。一步写入单个序列的行数从不超过 512，因此更长的提示按 512 行一步
+  运行。gpt-oss-20b 的 12 个环形缓存在 F16 下每个槽位占 9.4 MB，每个 token 占 12 个全注意力层的 24 KiB。旧模型的整上下文
+  缓存每个 token 占 48 KiB。
+- **量化 K/V**：GGML 后端会保留 `q8_0` 请求。在 gpt-oss-20b 上，它让平均 NLL 在 `ggml_cuda` 上变化 -0.0004（384 个 token：
+  2.3060 -> 2.3056），在 `ggml_cpu` 上变化 +0.008（160 个 token），`ggml_cuda` 的 decode 为 158 tok/s。张量执行器的计算图
+  不在块量化缓存上运行环形缓存（直接 CUDA 的 q8_0 行写入不会回绕），因此在那里 `q8_0` 请求会变为 f16 并给出提示。`q4_0`
+  请求在所有后端上都变为 f16：在 `ggml_cuda` 上它每个 token 损失 0.48 nat（2.3060 -> 2.7811）。旧模型把所有块类型都变为 f16。
+- **回退**：回退会精确保留后续行的窗口要读取的位置；一旦某个环形缓存覆盖了这些位置，回退就被拒绝（`CanTruncateKVCache`）。
+  Harmony 在重新渲染过去的回答时会丢掉 analysis 通道，所以下一轮要回退整段上一轮回答。只要会话持有的位置少于环形缓存的
+  单元数，这次回退就是精确的，其余情况由前缀缓存的检查点处理。
+  `ARewindPastALongAnswerContinuesAsACacheThatNeverHeldIt` 锁定这一行为。
+- **K/V 块快照**（`TryExtractKVBlock`）不提供：环形缓存不是按位置寻址的。前缀缓存改用运行时的槽位克隆与检查点。真实模型
+  一致性脚本在 gpt-oss-20b 上通过（`GptOss20B_PassesTheConformanceScript`）。
+- **权重**在每个执行器上都保持 GGUF 格式（ggml-org 文件中 expert 为 MXFP4，注意力与 head 为 Q8_0）。
 
-该批处理移植需要在分页调度栈内保留 GPT OSS 三大架构特征
-—— **注意力 sinks**、**每个投影都有 bias**、**逐层交替 SWA**：
+## 10. 专家卸载（`--n-cpu-moe` / `--cpu-moe`）
 
-- **每层分页 K/V**，布局 `[numBlocks * blockSize * numKvHeads * headDim]`，
-  按需扩容（copy-on-write）。
-- **批处理带 bias 的 QKV**；NeoX + YaRN RoPE 通过显式 `positions[]` 数组
-  派发。
-- **逐层 SWA 窗口** —— 旧路径同样的 local / global 交替模式按层传给分页内
-  核，调度器仍把模型当作一致的整体，每层各自尊重各自的注意力视野。
-- **带每头 sinks 的原生分页注意力**：
-  `TSGgml_PagedAttentionForwardWithSinks`
-  （[`ggml_ops_paged_attention.cpp`](../../TensorSharp.GGML.Native/ggml_ops_paged_attention.cpp)）
-  把 `ggml_flash_attn_ext` 与 `add_sinks` 变体合在一起，让 sink logits 参
-  与 softmax 归一化但不贡献到 V —— 与按序列路径的 CPU sinks softmax 数值行为完全
-  一致。通过 `GgmlBasicOps.PagedAttentionForwardWithSinks` 暴露。
-  - 托管 C# 回退
-    [`ManagedPagedAttention.ForwardWithSinks`](../../TensorSharp.Runtime/Paged/ManagedPagedAttention.cs)
-    在非 GGML 后端上被选中。两者贪心解码 byte 级一致。
-- **MoE FFN** 通过已有的 `MoEForward(numTokens)` token-parallel 路径执行；
-  目前没有 GPT-OSS 专用的批处理 MoE 内核。
+被卸载层的路由 expert 留在主机内存，这一步的计算图会为它们暂停（`GraphOp.MoeHostExperts`，带 GPT-OSS 的激活与三个
+bias）。router 与专家选择留在设备上。
+- **GGML 后端：** 主机 MoE 段用 ggml 的 CPU 内核直接从 GGUF 映射计算它们：带 bias 的 gate 与 up 乘积、clamped SwiGLU，
+  然后是带 bias 的 down 乘积。decode 行由单 token decode 团队处理；提示块由批处理的 CPU MoE 计算图处理。
+- **张量执行器：** 运行时的 expert host 用同样的内核计算它们（`TSGgml_HostExpertRowsOai`，经由同一个 decode 团队）。
+- **直接 CUDA** 把一步留在设备上：
+  - decode 行与短提示块通过 expert doorbell（`CudaExpertDoorbell`）通知主机，主机计算它负责的路由，同时设备运行自己的
+    路由。之后设备为每条路由（包括主机的）加上 down bias。
+  - 一层的一次调用最多经链路把一个主机 expert 传到设备上（`OaiGpuMisses`）：一个 gpt-oss-20b expert 是 13.2 MB 的 MXFP4。
+    实测 decode 速度：四条路由全部传送时 14.0 tok/s，两条时 28.7，一条时 31.6，不传送时 29.7。
+  - 32 行及以上的提示块在当前层运行时通过 DMA 预取下一层的全部主机 expert（`OaiPrefetchMinRows`）：这么长的块本来就会
+    选中约 98 % 的 expert。随后分组 MoE 内核在设备上运行它们。
 
-### 已验证的正确性与吞吐
+`--tp` 下卸载在加载时被拒绝：按 rank 的计算图把 expert 保留在设备上。
 
-- 在 [`GptOssBatchedCorrectnessTests`](../../InferenceWeb.Tests/GptOssBatchedCorrectnessTests.cs)
-  中与旧路径**100% 贪心一致**（12/12 tokens）—— 在托管 sinks 回退与原生
-  sinks 内核两条路径上都保持。
-- **吞吐基本持平**（在
-  [`GptOssBatchedPerfBench`](../../InferenceWeb.Tests/GptOssBatchedPerfBench.cs)
-  中 n=1, 3, 5 范围 ~0.93–1.05×）。原生 sinks 内核没有改变全局，因为旧的
-  单序列路径已经把每层都装进一张融合内核（`TryFusedAttnLayerPrefill`：
-  RMSNorm + 融合 QKV + RoPE + KV-append + 带 sinks 的 softmax + attn +
-  output proj + residual 一张 cgraph），而批处理路径每层要派 ~5 张图
-  （norm、QKV、RoPE、paged-attn、output、residual）。要进一步缩小差距需
-  要给 GPT OSS 写一个 fused-per-layer 的批处理内核 —— 工作量较大。
+在一张 A40 上实测（ggml `bb877c0c`），卸载 24 个 MoE 层中的 12 个（`TS_N_CPU_MOE=12`），容器有 7.6 个 CPU
+（5 个主机 expert 线程）：
+
+| 后端 | Prefill 512 tok/s | Decode tok/s | NLL 常驻 -> 卸载 |
+|---|---|---|---|
+| ggml_cuda，旧模型 -> 运行时 | 1814-2415 -> 2116-2460 | 33.3-39.5 -> 34.0-41.4 | — |
+| cuda，运行时 | 551（2048 时 547） | 29.2-31.6 | 2.7706 -> 2.7700 |
+
+范围跨两次会话。旧模型在 `cuda` 上忽略 `TS_N_CPU_MOE`：它把所有 expert 留在 GPU 上（prefill 723 tok/s、decode 51 tok/s），因此直接 CUDA 的
+卸载是新增的。`cuda` 上带卸载的贪心文本一直跟随常驻运行，直到接近平局处（第一处差异的前两名差距为 0.03-0.07）。
+
+## 11. 迁移验证
+
+依赖：ggml `bb877c0c51f38c52ee2d5e41d58e3d0c20f3fed4`，上游且未修改。`ggml_swiglu_oai`、`ggml_add_id` 与
+`ggml_flash_attn_ext_add_sinks` 是它自己的算子。CUDA PTX 基线已用 CUDA 13.0.88 重新构建，以包含两个新内核。
+
+**合成 fixture**（`GptOssSyntheticModelBuilder`、`GptOssRuntimeTests`，41 个测试）。四种情形：MXFP4 expert、Q8_0 expert、
+一个长序列情形（83 个 token 上的窗口 16），以及一个按 `--tp` 设定尺寸的情形。每种都与旧模型的 logits 对比，这些 logits
+在旧模型删除前于托管后端上冻结（`Fixtures/GptOss/LegacySynthetic/managed.json`）。`ggml_cpu`、`ggml_cuda` 与直接 `cuda`
+都与托管后端对比。还覆盖了：
+- 分块 prefill、模拟设备上的每种放置、批处理槽位、并发请求；
+- 检查点、越过长回答的回退、投机解码；
+- 每个执行器上的主机 expert（直接 CUDA 上：decode 行走 doorbell，提示块在设备上暂存 expert，没有任何一步回退到执行器的主机路径）；
+- 混合 Q/K/V 类型的逐层融合；
+- `--tp` 下拒绝卸载。
+
+直接 CUDA prefill 测试套件（`DirectCudaPrefillModelTests`）新增了 GPT-OSS 的 verify 行，它们与其 decode 行逐位一致。
+
+**真实 checkpoint**（gpt-oss-20b MXFP4，一张 A40）。与旧模型的教师强制 argmax 一致率在 5 个提示的贪心步上统计，旧模型的
+token 同时强制输入两者。NLL 取 README 的 448 个 token，以困惑度报告。速度来自 CLI 的基准，按 ABBA 顺序测量：
+
+| 后端 | 与旧模型 argmax 一致 | 困惑度 旧 -> 运行时 | Decode tok/s（512 之后） | Prefill 512 tok/s | 4K 之后的 Decode tok/s | Prefill 4K tok/s |
+|---|---|---|---|---|---|---|
+| ggml_cuda | 551/561（接近平局，前两名差距 < 0.15） | 10.579 -> 10.546 | 141-150 -> 155-162 | 6095-6348 -> 6191-6531 | 131 -> 157.5 | 5923-6447 -> ~6440 |
+| cuda | 555/561 | 10.620 -> 10.576 | 51 -> 118-120 | ~730 -> ~1750 | — | — |
+
+- **Logits** 与 F32 托管 CPU 参考对比：旧模型与运行时同样接近（KL ≈ 0）。
+- **服务端**（`TensorSharp.Server`，总 decode tok/s）：
+
+  | 请求数 | ggml_cuda 旧 -> 运行时 | cuda 旧 -> 运行时 |
+  |---|---|---|
+  | 1 | 107.8 -> 140.6 | 39.4 -> 89.3 |
+  | 4 个并发 | 125.0 -> 212.7 | 4.7 -> 127.7 |
+  | 8 个并发 | 151.0 -> 230.4 | 4.7 -> 132.3 |
+
+  并发输出与单独输出在接近平局的措辞选择处分叉，旧模型也是如此：旧模型的并发输出在 4 个提示中有 1 个、8 个中有 4 个与单独输出一致。
+- **覆盖限制。** 以下没有运行：
+  - `mlx`、`ggml_metal` 与 `ggml_vulkan`；
+  - 多 GPU 的 `--tp` 与 `--layer-split`，只在模拟设备上覆盖；
+  - gpt-oss-120b。
+- **已知代价。**
+  - gpt-oss-20b 上 `--tp 4` / `--tp 8` 被拒绝，而旧模型以 expert 并行的方式运行它们。`--layer-split N` 支持任意 N。
+  - 直接 CUDA 上超过滑动窗口之后的 decode 步以计划（plan）运行，而不是重放 CUDA graph，因为录制会重放它第一个窗口的
+    注意力下界。输出是精确的，但每一步都要在主机上付出启动开销（118-120 tok/s，ggml_cuda 为 155-162）。
+  - 直接 CUDA 在 sink 层上的提示注意力走通用乘积（1750 tok/s，ggml_cuda 为 6400）。
+  - 直接 CUDA 上被卸载的提示达到 551 tok/s，ggml_cuda 为 2460（§10）。
+  - 在合成文件上，直接 CUDA 的分块 prefill 与单次前向最多相差 3.0e-2：行数与 decode 相同的块运行 decode 内核。旧模型把这一
+    差距保持在 7.5e-3 以内。与 ggml_cpu 对比时，运行时保持在旧模型所受的界限之内。
 
 ## 12. 输出解析器与聊天模板
 
@@ -331,20 +403,10 @@ token 批处理的融合图执行（`GgmlBasicOps.TryGptOssModelDecodeBatched`�
 
 ## 13. 优化机会
 
-- **融合 per-layer 批处理内核** —— 旧路径的 `TryFusedAttnLayerPrefill` 每
-  层只发一张 cgraph（norm + 融合 QKV + RoPE + KV-append + 带 sinks 的
-  softmax + attn + output proj + residual）。分页 `ForwardBatch` 路径目前每层
-  仍要发 ~5 张图。GGML 后端上的并发 decode 如今改走按请求的 holder 与按 token
-  批处理的融合图（§11），因此这一点只在仍然使用分页路径的地方有意义。
-- **任何发布版都用融合 QKV** —— 当 GGUF 拆分 Q / K / V 时，每次单独 matmul
-  后还是要单独 bias add。`FusedQKVWithBias` 图能把 3 次派发合 1。
-- **把整模型 decode 铺到分页路径** —— 融合的整模型 decode 图
-  （`GptOssModel.FusedModelDecode.cs`）服务单序列 decode 与按请求的 holder，
-  它的按 token 批处理变体服务 GGML 后端上的并发 decode；分页 `ForwardBatch` 路径
-  没有用到它，把同样的单次派发做法延伸过去，能消除该路径剩下的大部分托管开销。
-- **per-op GGML 路径上的设备端 sinks 注意力** —— 这只与 per-op 路径（§9）有关：
-  整模型 decode 图拒绝时（某层缺少 kernel 需要的权重，或张量并行下没有融合 TP 计划）GGML 后端会走这条路径。融合整模型 decode
-  图已经在设备上执行 sinks 注意力，`cuda` 与 `mlx` 的 per-op 路径也是如此。在 per-op
-  GGML 路径上，上下文超过 `TS_GPTOSS_FUSED_DECODE_MAX_CTX` 后 decode 仍会退回 CPU
-  sinks softmax；放开该逐层内核的上下文上限即可补上这段差距。
-- **per-expert decode 批处理（`cpu` / `cuda`）** —— GGML 后端已经把单 token MoE 作为一次 `mul_mat_id` 派发执行，`mlx` 用 `gather_qmm` 分组 GEMM，但 `cpu` 与 `cuda` 的 per-op 路径仍然每 token 顺序枚举 expert。在那里引入批量 decode 路径（类比 Qwen 3.5 的 `MoEExpertsSwiGLUResidual`）能把 `numExpertsUsed` 次派发合并为 1 次。
+- **直接 CUDA 上带 sink 的提示注意力。** sink 层的提示注意力走通用乘积。一个在 softmax 中包含 sink 的 flash 内核能弥补与
+  ggml_cuda prefill 之间的大部分差距。旧模型的 sink 内核从未接到执行器的环形缓存上，
+  已随旧模型一起删除，因此需要给支持环形缓存的 flash 内核加上 sink 操作数。
+- **直接 CUDA 上超过窗口之后的录制 decode。** 把环形缓存的下界作为输入录制，就能让这些步重放。
+- **直接 CUDA 上被卸载的提示。** gpt-oss-20b 2880 宽的 expert 走分组 MoE 引擎的每行一个 warp 的路线（2880 既不是 128 的倍数，
+  也不是 256 的倍数）。为这个宽度提供一条 tensor-core 路线，可以同时服务被卸载与常驻的提示 expert。
+- **`--tp 4` / `--tp 8`** 需要在一个 MXFP4 行的 90 个块内部切分 down 投影的行，或者一种 expert 并行的放置。

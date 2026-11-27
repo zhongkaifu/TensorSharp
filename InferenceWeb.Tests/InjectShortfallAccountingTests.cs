@@ -680,8 +680,6 @@ public sealed class InjectShortfallAccountingTests
             => throw new InvalidOperationException("the paged batched path is not part of this fake");
 
         public bool BatchedForwardAvailable => false;
-        public bool SupportsLinearKVMigration => true;
-        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => false;
         public bool SupportsPerSequenceFusedForward => true;
         public bool CanBatchDecode(string requestId, int position) => false;
 

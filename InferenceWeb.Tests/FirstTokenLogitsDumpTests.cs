@@ -106,15 +106,14 @@ public sealed class FirstTokenLogitsDumpTests : IDisposable
     }
 
     /// <summary>The Nemotron <c>--tp 2</c> / Qwen3.8 <c>cuda</c> case: one configuration runs the
-    /// prompt in one forward on the N=1 fused path, the other splits it across forwards on the
-    /// per-sequence fallback. The dumps must be the same row.</summary>
+    /// prompt in one forward, the other splits it across forwards. The dumps must be the same row.</summary>
     [Fact]
-    public void SingleSequenceFusedAndChunkedPerSequence_DumpTheSameRow()
+    public void OnePromptForwardAndChunkedPerSequence_DumpTheSameRow()
     {
         string dumpA = Path.Combine(_dir, "single.f32"), dumpB = Path.Combine(_dir, "split.f32");
 
         FirstTokenLogitsDump.ResetForTests(dumpA);
-        using (var single = new RowModel(_gguf) { LinearMigration = true })
+        using (var single = new RowModel(_gguf))
         {
             RunEngine(single, Config(chunk: 64), ("single", Prompt, 3));
             Assert.Equal(new[] { Prompt.Length }, single.PromptForwardSizes());
@@ -131,7 +130,7 @@ public sealed class FirstTokenLogitsDumpTests : IDisposable
         Assert.Equal(a, b);
         using var sa = ReadSidecar(dumpA);
         using var sb = ReadSidecar(dumpB);
-        Assert.Equal("SingleSequenceFused", sa.RootElement.GetProperty("final_prefill_path").GetString());
+        Assert.Equal("PerSequence", sa.RootElement.GetProperty("final_prefill_path").GetString());
         Assert.Equal("PerSequence", sb.RootElement.GetProperty("final_prefill_path").GetString());
         Assert.Equal(sa.RootElement.GetProperty("prompt_fingerprint").GetString(),
             sb.RootElement.GetProperty("prompt_fingerprint").GetString());
@@ -512,8 +511,8 @@ public sealed class FirstTokenLogitsDumpTests : IDisposable
 
     /// <summary>Stand-in whose every forward yields <see cref="Row"/>(cache length after it, last
     /// token), through a REUSED output buffer as the real models do. Modes: plain per-sequence
-    /// (PerSequence plan), linear migration (SingleSequenceFused), per-request fused holders with
-    /// batched fused prefill/decode (PerSequenceFused).</summary>
+    /// (PerSequence plan) and per-request fused holders with batched fused prefill/decode
+    /// (PerSequenceFused).</summary>
     private sealed class RowModel : ModelBase, IBatchedPagedModel
     {
         private readonly float[] _buffer = new float[Vocab];
@@ -521,7 +520,6 @@ public sealed class FirstTokenLogitsDumpTests : IDisposable
         private string _active;
         private int _primaryLength;
 
-        public bool LinearMigration { get; init; }
         public bool PerSequenceFused { get; init; }
         /// <summary>ForwardRefill runs the prompt in pieces of this size (0: one forward).</summary>
         public int RefillChunk { get; init; }
@@ -585,12 +583,9 @@ public sealed class FirstTokenLogitsDumpTests : IDisposable
         public override bool TryExtractKVBlock(int start, int count, Span<byte> destination) => true;
         public override bool TryInjectKVBlock(int start, int count, ReadOnlySpan<byte> source) { Length = start + count; return true; }
 
-        // IBatchedPagedModel: no ForwardBatch, so a solo request plans SingleSequenceFused only
-        // with linear migration, and PerSequence otherwise.
+        // IBatchedPagedModel: no ForwardBatch, so a solo request plans PerSequence.
         public bool BatchedForwardAvailable => false;
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx) => throw new NotSupportedException();
-        public bool SupportsLinearKVMigration => LinearMigration;
-        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => LinearMigration;
 
         public bool SupportsPerSequenceFusedForward => PerSequenceFused;
         public bool HasFusedSequenceCache(string id) => id != null && _holders.ContainsKey(id);

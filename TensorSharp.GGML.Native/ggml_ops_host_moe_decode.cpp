@@ -97,10 +97,15 @@ namespace tsg
         struct DecodeJob
         {
             int n_rows = 0, n_used = 0, n_embd = 0, n_ff = 0;
-            int activation = 0;          // 0: silu(gate) * up; 2: gelu_tanh(gate) * up; 3: relu(s up)^2
+            int activation = 0;          // 0: silu(gate) * up; 1: GPT-OSS's clamped SwiGLU; 2: gelu_tanh(gate) * up; 3: relu(s up)^2
             int matrices = 2;            // matrices an expert's phase 1 reads: 1 for activation 3 (its up rows, in the gate slot)
             float up_scale[kMaxRows * kMaxUsed] = {};   // activation 3: each route's s
             float swiglu_limit = 0.0f;   // HostMoeSegment::swiglu_limit
+            float oai_alpha = 1.702f, oai_limit = 7.0f;   // activation 1
+            // Activation 1 (GPT-OSS): each route's expert bias rows (null: none).
+            const float* gate_b[kMaxRows * kMaxUsed] = {};
+            const float* up_b[kMaxRows * kMaxUsed] = {};
+            const float* down_b[kMaxRows * kMaxUsed] = {};
             const std::uint8_t* gate[kMaxRows * kMaxUsed] = {};
             const std::uint8_t* up[kMaxRows * kMaxUsed] = {};
             const std::uint8_t* down[kMaxRows * kMaxUsed] = {};
@@ -170,7 +175,20 @@ namespace tsg
             const float* g = j.g + (std::size_t)e * j.n_ff;
             const float* u = j.u + (std::size_t)e * j.n_ff;
             float* h = j.h + (std::size_t)e * j.n_ff;
-            if (j.activation == 3)
+            if (j.activation == 1)
+            {
+                // GPT-OSS (ggml_swiglu_oai): the products plus the expert's biases, the gate clamped from above, the up both ways.
+                const float A = j.oai_alpha, L = j.oai_limit;
+                const float* gb = j.gate_b[e];
+                const float* ub = j.up_b[e];
+                for (int i = 0; i < j.n_ff; ++i)
+                {
+                    const float gi = std::min(g[i] + (gb != nullptr ? gb[i] : 0.0f), L);
+                    const float ui = std::min(std::max(u[i] + (ub != nullptr ? ub[i] : 0.0f), -L), L);
+                    h[i] = gi / (1.0f + std::exp(-A * gi)) * (ui + 1.0f);
+                }
+            }
+            else if (j.activation == 3)
             {
                 // The up product (in the gate slot) times the route's up scale, before the square.
                 const float sc = j.up_scale[e];
@@ -219,10 +237,12 @@ namespace tsg
                 const std::uint8_t* base = j.down[expert_base + e];
                 const void* hq = j.hq + (std::size_t)(expert_base + e) * j.hq_row;
                 const float w = j.weight[expert_base + e];
+                const float* db = j.down_b[expert_base + e];
                 for (int r = r0; r < r1; ++r)
                 {
                     float s = 0.0f;
                     j.down_dot(j.n_ff, &s, 0, base + (std::size_t)r * j.down_row, 0, hq, 0, 1);
+                    if (db != nullptr) s += db[r];
                     acc[r - r0] += w * s;
                 }
             }
@@ -244,6 +264,8 @@ namespace tsg
             for (int r = r0; r < r1; ++r)
                 j.down_dot(j.n_ff, projected + r, 0,
                     base + (std::size_t)r * j.down_row, 0, hq, 0, 1);
+            if (const float* db = j.down_b[e])
+                for (int r = r0; r < r1; ++r) projected[r] += db[r];
         }
 
         void phase4_sum_chunk(DecodeJob& j, int c)
@@ -502,10 +524,12 @@ namespace tsg
         const bool one = hm.activation == 3;
         // A fused [gate | up] stack (Gemma 4): no up stack, the gate stack's experts 2 n_ff rows each, gate first.
         const bool fused = !one && hm.up_data == nullptr;
+        // Activation 1 (GPT-OSS's clamped SwiGLU) over separate gate and up stacks, the experts' biases with it only.
+        const bool oai = hm.activation == 1;
         if (!decode_kernel_enabled() || hm.seq_len < 1 || hm.seq_len > kMaxRows
-            || (hm.activation != 0 && hm.activation != 2 && hm.activation != 3) || (one && hm.up_data != nullptr)
-            || (up_scales != nullptr && !one)
-            || (hm.activation != 0 && hm.swiglu_limit > 0.0f) || hm.gate_bias || hm.up_bias || hm.down_bias
+            || (hm.activation != 0 && hm.activation != 1 && hm.activation != 2 && hm.activation != 3) || (one && hm.up_data != nullptr)
+            || (up_scales != nullptr && !one) || (oai && hm.up_data == nullptr)
+            || (hm.activation != 0 && hm.swiglu_limit > 0.0f) || (!oai && (hm.gate_bias || hm.up_bias || hm.down_bias))
             || hm.n_used <= 0 || hm.n_used > kMaxUsed || hm.num_experts <= 0
             || hm.gate_data == nullptr || hm.down_data == nullptr
             || x == nullptr || ids == nullptr || weights == nullptr || out == nullptr)
@@ -623,9 +647,14 @@ namespace tsg
         j.n_rows = n_rows; j.n_used = hm.n_used; j.n_embd = n_embd; j.n_ff = n_ff;
         j.swiglu_limit = hm.swiglu_limit;
         j.activation = hm.activation;
+        j.oai_alpha = hm.oai_alpha;
+        j.oai_limit = hm.oai_limit;
         j.matrices = one ? 1 : 2;
         for (int k = 0; k < selected; ++k)
         {
+            j.gate_b[k] = oai && hm.gate_bias != nullptr ? hm.gate_bias + (std::size_t)ids[k] * n_ff : nullptr;
+            j.up_b[k] = oai && hm.up_bias != nullptr ? hm.up_bias + (std::size_t)ids[k] * n_ff : nullptr;
+            j.down_b[k] = oai && hm.down_bias != nullptr ? hm.down_bias + (std::size_t)ids[k] * n_embd : nullptr;
             j.gate[k] = resolved[parts * k];
             j.up[k] = one ? nullptr : resolved[parts * k + 1];
             j.down[k] = resolved[parts * k + parts - 1];
@@ -766,6 +795,49 @@ TSG_EXPORT int TSGgml_HostExpertRowsAct(const void* gate, const void* up, const 
     hm.hidden = hidden;
     hm.n_ff = n_ff;
     return tsg::host_moe_decode_experts_rows(hm, x, ids, weights, out, skip, nullptr) ? 1 : 0;
+}
+
+// GPT-OSS's biased experts on the host, on the one-token decode kernel (independent rows, no ggml backend needed: the
+// tensor executors' expert host): gate and up products plus each expert's biases, ggml_swiglu_oai at alpha and limit, the
+// down product plus its bias (left out where down_bias is null), weighted. Biases F32 [n_ff, num_experts] (gate, up) and
+// [hidden, num_experts] (down). A skipped slot (skip[k] != 0, or a negative id) contributes nothing. Returns 1 when
+// out[rows, hidden] was written, 0 (nothing written) for a layout the decode kernel does not take.
+TSG_EXPORT int TSGgml_HostExpertRowsOai(const void* gate, const void* up, const void* down,
+                                        int gate_type, int up_type, int down_type,
+                                        int num_experts, int hidden, int n_ff, int n_used, int rows,
+                                        const float* x, const std::int32_t* ids, const float* weights,
+                                        const std::uint8_t* skip, float* out,
+                                        const float* gate_bias, const float* up_bias, const float* down_bias,
+                                        float alpha, float limit)
+{
+    if (gate == nullptr || up == nullptr || down == nullptr || num_experts <= 0 || hidden <= 0 || n_ff <= 0
+        || n_used <= 0 || rows <= 0 || gate_type < 0 || gate_type >= GGML_TYPE_COUNT || up_type < 0 || up_type >= GGML_TYPE_COUNT
+        || down_type < 0 || down_type >= GGML_TYPE_COUNT)
+        return 0;
+    const std::size_t routes = static_cast<std::size_t>(rows) * n_used;
+    std::vector<std::int32_t> slot_ids(ids, ids + routes);
+    std::vector<float> slot_weights(weights, weights + routes);
+    for (std::size_t i = 0; i < routes; i++)
+        if ((skip != nullptr && skip[i] != 0) || slot_ids[i] < 0 || slot_ids[i] >= num_experts)
+        {
+            slot_ids[i] = 0;
+            slot_weights[i] = 0.0f;
+        }
+    const std::int64_t gate_bytes = (std::int64_t)(ggml_row_size((ggml_type)gate_type, hidden) * (std::size_t)n_ff) * num_experts;
+    const std::int64_t up_bytes = (std::int64_t)(ggml_row_size((ggml_type)up_type, hidden) * (std::size_t)n_ff) * num_experts;
+    const std::int64_t down_bytes = (std::int64_t)(ggml_row_size((ggml_type)down_type, n_ff) * (std::size_t)hidden) * num_experts;
+    tsg::HostMoeSegment hm;
+    hm.gate_data = const_cast<void*>(gate); hm.up_data = const_cast<void*>(up); hm.down_data = const_cast<void*>(down);
+    hm.gate_type = gate_type; hm.up_type = up_type; hm.down_type = down_type;
+    hm.gate_ne0 = hidden; hm.gate_ne1 = n_ff; hm.up_ne0 = hidden; hm.up_ne1 = n_ff; hm.down_ne0 = n_ff; hm.down_ne1 = hidden;
+    hm.gate_bytes = gate_bytes; hm.up_bytes = up_bytes; hm.down_bytes = down_bytes;
+    hm.gate_bias = gate_bias; hm.up_bias = up_bias; hm.down_bias = down_bias;
+    hm.activation = 1; hm.oai_alpha = alpha; hm.oai_limit = limit;
+    hm.num_experts = num_experts; hm.n_used = n_used; hm.seq_len = rows; hm.independent_decode_rows = true;
+    hm.hidden = hidden; hm.n_ff = n_ff;
+    std::vector<std::uint8_t> skips(routes, 0);
+    for (std::size_t i = 0; i < routes; i++) skips[i] = slot_weights[i] == 0.0f && slot_ids[i] == 0 ? 1 : 0;
+    return tsg::host_moe_decode_experts_rows(hm, x, slot_ids.data(), slot_weights.data(), out, skips.data(), nullptr) ? 1 : 0;
 }
 
 // The same for Nemotron-H's one-projection experts: relu(s up)^2, then down; `up` is the up stack (n_ff rows an expert),

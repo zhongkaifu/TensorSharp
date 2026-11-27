@@ -34,7 +34,7 @@ public sealed partial class PrefixCacheContractConformanceTests
     // diffusiongemma-test-gate-was-skipping: a gate and a loader that disagree pass vacuously).
     private const string Gemma4E4B = "gemma-4-e4b-it-q8_0";
     internal const string Qwen35_9B = "qwen3.5-9b-q8_0";
-    private const string GptOss20B = "gpt-oss-20b-q8_0";
+    private const string GptOss20B = "gpt-oss-20b-q8_0|gpt-oss-20b-mxfp4";
     // A40: the whole Qwen 3.8 Flash Next GGUF directory, loaded as a layer split over the GPUs in
     // CUDA_VISIBLE_DEVICES with TENSORSHARP_LAYER_SPLIT_DEGREE set to their count.
     private const string EnvQwen38Dir = "TS_TEST_QWEN38_DIR";
@@ -93,22 +93,25 @@ public sealed partial class PrefixCacheContractConformanceTests
 
     [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvModelDir, GptOss20B)]
-    public void GptOss20B_PassesTheConformanceScript_WithDonatedHolders()
+    public void GptOss20B_PassesTheConformanceScript()
     {
-        using var model = (GptOssModel)Load(GptOss20B);
+        using var model = (GptOssRuntimeModel)Load(GptOss20B);
         model.AttachPrefixCache(new RecordingPayloadSink());
-        ConformanceReport report = PrefixCacheConformanceScript.Run(TextSubject(model, "gpt-oss-20b"));
+        ConformanceSubject subject = TextSubject(model, "gpt-oss-20b") with
+        {
+            // A graph leaves a slot's rows on the device until a sync.
+            ExpectDirtyDonations = true,
+        };
+        ConformanceReport report = PrefixCacheConformanceScript.Run(subject);
 
-        // Class P with donated holders: a finished request's holder continues its conversation's next turn,
-        // the primary converts into one, and a donated holder rewinds any distance.
+        // The shared runtime's slots: captures, clones and donated holders, the sliding-window layers' rings moved whole.
+        Assert.Contains("capture", report.Ran);
+        Assert.Contains("clone x2", report.Ran);
         Assert.Contains("donate/return/donate", report.Ran);
+        Assert.Contains("settle then clone", report.Ran);
         Assert.Contains("primary conversion", report.Ran);
-        Assert.Contains(report.Ran, r => r.StartsWith("truncate in range (", StringComparison.Ordinal) && r.EndsWith("Donate)", StringComparison.Ordinal));
-        PrefixCacheCapabilities caps = model.GetPrefixCacheCapabilities();
-        Assert.Equal(FamilyClass.P, caps.Class);
-        Assert.Equal(EndStateSupport.DonateOnly, caps.EndState);
-        Assert.True(caps.PrimaryResident);
-        Assert.NotEqual(PageSupport.None, caps.Pages);
+        Assert.Contains(report.Ran, r => r.StartsWith("batched release", StringComparison.Ordinal));
+        Assert.Contains(report.Ran, r => r.StartsWith("export/import", StringComparison.Ordinal));
     }
 
     [Trait("Category", "PrefixCacheModel")]

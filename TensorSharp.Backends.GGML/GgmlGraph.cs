@@ -49,6 +49,8 @@ namespace TensorSharp.GGML
         CumSum = 73,
         /// <summary>ggml_ssm_scan (Mamba-2): s, x, dt, A, B, C, ids; ip K states kept.</summary>
         SsmScan = 74,
+        /// <summary>ggml_swiglu_oai (GPT-OSS): gate, up; fp alpha, limit.</summary>
+        SwigluOai = 75,
     }
 
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>
@@ -129,6 +131,14 @@ namespace TensorSharp.GGML
         {
             if (GgmlNative.TSGgml_GraphQ8Nvfp4Activations(Handle, 1) == 0)
                 throw new InvalidOperationException("ggml graph Q8Nvfp4Activations failed: " + GgmlBasicOps.LastNativeError());
+        }
+
+        /// <summary>The backend's fusions of this graph's chains get their allocation dependencies
+        /// (<see cref="TensorSharp.Graph.GraphProgram.BackendFusions"/>; ggml-cuda's graph optimizer hook). Before the first node.</summary>
+        public void MarkBackendFusions()
+        {
+            if (GgmlNative.TSGgml_GraphBackendFusions(Handle, 1) == 0)
+                throw new InvalidOperationException("ggml graph BackendFusions failed: " + GgmlBasicOps.LastNativeError());
         }
 
         /// <summary>Nodes emitted so far.</summary>
@@ -418,6 +428,8 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_GraphQ8Nvfp4Activations(IntPtr graph, int on);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_GraphBackendFusions(IntPtr graph, int on);
 
         [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

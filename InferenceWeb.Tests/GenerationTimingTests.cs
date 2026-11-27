@@ -188,8 +188,6 @@ public sealed class GenerationTimingTests : IDisposable
         public override bool TryExtractKVBlock(int start, int count, Span<byte> destination) => true;
         public override bool TryInjectKVBlock(int start, int count, ReadOnlySpan<byte> source) => true;
         public bool SupportsPerSequenceFusedForward => true;
-        public bool SupportsLinearKVMigration => true;
-        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => true;
         public bool BindSequenceCache(string id) => _bound.Add(id);
         public bool HasFusedSequenceCache(string id) => _bound.Contains(id);
         public bool CanBatchDecode(string id, int position) => true;

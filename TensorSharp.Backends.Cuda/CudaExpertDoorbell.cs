@@ -31,7 +31,7 @@ namespace TensorSharp.Cuda
         public const int MaxRows = 16;
 
         private readonly CudaHostExpertMailbox _box;
-        private readonly ConcurrentDictionary<int, IGraphExpertHost> _hosts = new();
+        private readonly ConcurrentDictionary<int, (IGraphExpertHost Host, CudaOaiExperts Oai)> _hosts = new();
         private readonly Thread _thread;
         private readonly AutoResetEvent _wake = new(false);
         private readonly long _hotTicks;
@@ -67,8 +67,9 @@ namespace TensorSharp.Cuda
 
         public long Served;
 
-        /// <summary>The expert host serving <paramref name="layer"/>'s doorbells.</summary>
-        public void Register(int layer, IGraphExpertHost host) => _hosts[layer] = host;
+        /// <summary>The expert host serving <paramref name="layer"/>'s doorbells; with <paramref name="oai"/>, GPT-OSS's experts
+        /// (IGraphExpertHost.ComputeOai at its alpha and limit) without the down bias, which the device adds for every route.</summary>
+        public void Register(int layer, IGraphExpertHost host, CudaOaiExperts oai = null) => _hosts[layer] = (host, oai);
 
         /// <summary>Before work that may ring: the thread spins until it has gone quiet again.</summary>
         public void Arm()
@@ -107,7 +108,7 @@ namespace TensorSharp.Cuda
             try
             {
                 int layer = _box.Header[0], slots = _box.Header[1];
-                if (!_hosts.TryGetValue(layer, out IGraphExpertHost host) || slots <= 0 || slots % RoutesPerRow != 0
+                if (!_hosts.TryGetValue(layer, out (IGraphExpertHost Host, CudaOaiExperts Oai) entry) || slots <= 0 || slots % RoutesPerRow != 0
                     || slots > MaxRows * RoutesPerRow)
                     throw new InvalidOperationException($"CUDA host experts: a doorbell for layer {layer} with {slots} routes");
                 int rows = slots / RoutesPerRow;
@@ -123,8 +124,12 @@ namespace TensorSharp.Cuda
                 }
                 var ids = new ReadOnlySpan<int>(decoded, slots);
                 var output = new Span<float>(_box.Out, rows * Hidden);
-                if (!host.Compute(layer, new ReadOnlySpan<float>(_box.X, rows * Hidden), ids, new ReadOnlySpan<float>(_box.W, slots),
-                        new ReadOnlySpan<byte>(skip, slots), rows, output))
+                var x = new ReadOnlySpan<float>(_box.X, rows * Hidden);
+                var w = new ReadOnlySpan<float>(_box.W, slots);
+                var skipped = new ReadOnlySpan<byte>(skip, slots);
+                if (entry.Oai is { } oai
+                        ? !entry.Host.ComputeOai(layer, x, ids, w, skipped, rows, output, oai.Alpha, oai.Limit, downBias: false)
+                        : !entry.Host.Compute(layer, x, ids, w, skipped, rows, output))
                     throw new NotSupportedException($"CUDA host experts: the host's expert kernels do not cover layer {layer}'s experts");
                 count = rows;
             }

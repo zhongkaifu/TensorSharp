@@ -196,7 +196,9 @@ namespace {
         bad = base; --bad.gate_ne0; declines_untouched(bad, in, "Wrong gate inner dimension accepted.");
         bad = base; --bad.down_ne1; declines_untouched(bad, in, "Wrong down outer dimension accepted.");
         bad = base; bad.up_data = nullptr; declines_untouched(bad, in, "Unsupported fused gate/up accepted.");
-        bad = base; bad.activation = 1; declines_untouched(bad, in, "Unsupported activation accepted.");
+        bad = base; bad.activation = 4; declines_untouched(bad, in, "Unsupported activation accepted.");
+        // GPT-OSS's clamped SwiGLU (activation 1, the only one the biases above go with) reads separate gate and up stacks.
+        bad = base; bad.activation = 1; bad.up_data = nullptr; declines_untouched(bad, in, "The clamped SwiGLU over a fused gate/up accepted.");
         bad = base; bad.n_used = 0; declines_untouched(bad, in, "No selected experts accepted.");
     }
 

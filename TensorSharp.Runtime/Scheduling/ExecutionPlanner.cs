@@ -158,8 +158,8 @@ namespace TensorSharp.Runtime.Scheduling
                 if (!wanted)
                 {
                     // Solo never-fused sequences intentionally fall through to
-                    // the N=1 fast path / batched path — not a rejection worth
-                    // logging.
+                    // the batched path / per-sequence route — not a rejection
+                    // worth logging.
                 }
                 else if (!options.PerSeqFusedEnabled)
                 {
@@ -180,34 +180,14 @@ namespace TensorSharp.Runtime.Scheduling
                 return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
             }
 
-            // ---- Batched paged path (with the N=1 fused fast path in front) ----
+            // ---- Batched paged path ----
             if (batchedEnabled && batchedImpl && multimodalCount == 0 && features.SequenceCount > 0)
             {
-                if (solo)
-                {
-                    if (!caps.SupportsLinearKvMigration)
-                        rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.SingleSequenceFused,
-                            "model cannot migrate linear KV to paged storage (a second request would corrupt attention)"));
-                    else if (features.SoloKvInPagedStorage)
-                        rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.SingleSequenceFused, "sequence K/V already committed to paged storage"));
-                    else if (features.SoloRequiresOwnershipSwap
-                        && (!caps.SupportsKvStateSnapshot || !caps.SupportsCrossSequenceKvReuse))
-                        rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.SingleSequenceFused,
-                            "ownership swap required but model lacks a reusable KV snapshot"));
-                    else
-                    {
-                        candidates.Add(ExecutionPathKind.SingleSequenceFused); // terminal
-                        return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
-                    }
-                }
-
                 if (caps.BatchedForwardAvailable)
                 {
-                    // Declinable: linear→paged migration may fail, or the model
-                    // may refuse this specific batch (NotSupportedException).
+                    // Declinable: a sequence whose K/V lives only in the linear
+                    // cache goes to the per-sequence route, and the model may
+                    // refuse this specific batch (NotSupportedException).
                     candidates.Add(ExecutionPathKind.BatchedPaged);
                 }
                 else
@@ -268,14 +248,6 @@ namespace TensorSharp.Runtime.Scheduling
                     ? "available (+ token-batched fused decode)"
                     : "available");
 
-            sb.Append("\nN=1 single-sequence fused fast path: ");
-            if (!caps.SupportsBatchedPagedAttention)
-                sb.Append("n/a (no batched contract)");
-            else if (!caps.SupportsLinearKvMigration)
-                sb.Append("unavailable (no linear->paged KV migration)");
-            else
-                sb.Append("available");
-
             sb.Append("\nSpeculative decoding: ");
             if (!config.Speculation.Enabled)
                 sb.Append("off (not requested)");
@@ -331,7 +303,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             // A plan whose last candidate can decline would leave the step
             // unserved; PerSequence never declines, SpeculativePerSequence /
-            // PerSequenceFused / SingleSequenceFused / MixedMultimodalSplit
+            // PerSequenceFused / MixedMultimodalSplit
             // are terminal by construction.
             if (candidates.Count == 0 || candidates[^1] == ExecutionPathKind.BatchedPaged)
             {

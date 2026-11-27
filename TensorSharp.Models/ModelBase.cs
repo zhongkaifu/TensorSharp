@@ -309,6 +309,17 @@ namespace TensorSharp.Models
         protected virtual bool SupportsBlockQuantizedKvCache => true;
 
         /// <summary>
+        /// Why this model keeps an F16 cache where <paramref name="requested"/> (q8_0 or q4_0) was asked for, as the end of a
+        /// sentence that starts with the model's type name, or null where it takes that type. Default: every block type is
+        /// refused where <see cref="SupportsBlockQuantizedKvCache"/> is false. A family that reads one block type but not the
+        /// other, or one only on some backends, answers per type.
+        /// </summary>
+        protected virtual string BlockQuantizedKvCacheRefusal(KvCacheDtype requested)
+            => SupportsBlockQuantizedKvCache
+                ? null
+                : $"cannot read a {requested.ToShortString()} K/V cache on any of its attention paths";
+
+        /// <summary>
         /// Downgrade an explicitly requested block-quantized KV cache to F16 on
         /// architectures that cannot read one (see
         /// <see cref="SupportsBlockQuantizedKvCache"/>), with a message on stderr
@@ -321,13 +332,11 @@ namespace TensorSharp.Models
         /// </summary>
         private void RefuseUnsupportedBlockQuantizedKvCache()
         {
-            if (SupportsBlockQuantizedKvCache) return;
             KvCacheDtype requested = _kvCacheDtype;
             if (requested != KvCacheDtype.Q8_0 && requested != KvCacheDtype.Q4_0) return;
+            if (BlockQuantizedKvCacheRefusal(requested) is not { } reason) return;
 
-            Console.Error.WriteLine(
-                $"[kv-cache] {GetType().Name} cannot read a {requested.ToShortString()} K/V cache "
-                + "on any of its attention paths; using f16 instead.");
+            Console.Error.WriteLine($"[kv-cache] {GetType().Name} {reason}; using f16 instead.");
             _kvCacheDtype = KvCacheDtype.F16;
         }
 
