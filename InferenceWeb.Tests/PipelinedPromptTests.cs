@@ -175,9 +175,10 @@ public sealed class PipelinedPromptTests : IDisposable
     /// <summary>A lone prompt step the model chose for its pipeline that does not pipeline after all runs in the steps it would
     /// have had (the refill's chunks): as many steps, the bits of those steps one after another, nothing pipelined.</summary>
     [Theory]
-    [InlineData("mistral3")]
-    [InlineData("qwen35")]
-    public void AChosenStepThatDoesNotPipelineRunsInTheStepsItWouldHaveHad(string family)
+    [InlineData("mistral3", 0)]
+    [InlineData("qwen35", 0)]
+    [InlineData("mistral3", 32)]
+    public void AChosenStepThatDoesNotPipelineRunsInTheStepsItWouldHaveHad(string family, int schedulerStep)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(family);
@@ -191,6 +192,7 @@ public sealed class PipelinedPromptTests : IDisposable
             sdm.PipelinedPromptForTests = true;
             string[] ids = { "r" };
             sdm.EnsureSequenceSlot("r", 128);
+            if (schedulerStep > 0) sdm.UseSchedulerSoloStep(schedulerStep);
             var logits = new float[1][];
             if (chosen)
             {
@@ -201,15 +203,17 @@ public sealed class PipelinedPromptTests : IDisposable
             else
             {
                 sdm.PipelinedPromptDisabledForTests = true;
-                for (int from = 0; from < prompt.Length; from += 16)
-                    Assert.True(sdm.TryForwardUnified(ids, new[] { prompt[from..Math.Min(prompt.Length, from + 16)] }, new[] { from }, logits));
+                // The scheduler's steps where the engine told the model them, else the refill's chunks.
+                int piece = schedulerStep > 0 ? schedulerStep : 16;
+                for (int from = 0; from < prompt.Length; from += piece)
+                    Assert.True(sdm.TryForwardUnified(ids, new[] { prompt[from..Math.Min(prompt.Length, from + piece)] }, new[] { from }, logits));
             }
             Assert.Equal(0, sdm.PipelinedWavefronts);
             return ((float[])logits[0].Clone(), sdm.BatchedForwardCount);
         }
         var expected = Prompt(chosen: false);
         var actual = Prompt(chosen: true);
-        Assert.Equal(5, expected.Steps);
+        Assert.Equal(schedulerStep > 0 ? 3 : 5, expected.Steps);
         Assert.Equal(expected.Steps, actual.Steps);
         Assert.True(expected.Logits.AsSpan().SequenceEqual(actual.Logits), $"{family}: the fallback's logits differ");
     }

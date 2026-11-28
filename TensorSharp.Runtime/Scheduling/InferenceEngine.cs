@@ -1512,6 +1512,7 @@ namespace TensorSharp.Runtime.Scheduling
                     Math.Min(cfg.SoloPrefillChunkSize, cfg.MaxNumBatchedTokens));
                 return null;
             }
+            solo.UseSchedulerSoloStep(Math.Min(cfg.SoloPrefillChunkSize, cfg.MaxNumBatchedTokens));
             int step = solo.PreferredSoloPrefillTokens(0, int.MaxValue / 2);
             if (step <= 0)
             {

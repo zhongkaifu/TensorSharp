@@ -49,6 +49,11 @@ namespace TensorSharp.Models
         /// (a request's LoRA, say): the step it would have had (0: none chosen).</summary>
         private int _pipelinedSoloFallbackRows;
 
+        /// <summary>The scheduler's own lone-prompt step (0 until the engine attaches the policy).</summary>
+        private int _schedulerSoloStepTokens;
+
+        public void UseSchedulerSoloStep(int tokens) => _schedulerSoloStepTokens = Math.Max(0, tokens);
+
         /// <summary>The chunk rows direct CUDA's next pipelined prompt step takes (its lone prompt step, fitted to the device's
         /// room by <see cref="CudaPromptStepTokens"/>; 0 until one was).</summary>
         private int _cudaPipelinedChunk;
@@ -80,7 +85,8 @@ namespace TensorSharp.Models
             int rest = remaining - step;
             if (rest > 0 && rest <= PipelinedSoloStepTokens / 4) step = remaining;
             if (step <= own || !PipelinesPrompt(step - 1)) return own;
-            _pipelinedSoloFallbackRows = own > 0 ? own : PromptChunkTokens;
+            // The step it would have had: its own, else the scheduler's (the refill's chunk where no engine said).
+            _pipelinedSoloFallbackRows = own > 0 ? own : _schedulerSoloStepTokens > 0 ? _schedulerSoloStepTokens : PromptChunkTokens;
             return step;
         }
 
