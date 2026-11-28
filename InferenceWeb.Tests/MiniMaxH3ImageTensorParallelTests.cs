@@ -319,7 +319,7 @@ public sealed class MiniMaxH3ImageTensorParallelTests(ITestOutputHelper output) 
 
     /// <summary>The decoder's program bound as a tensor executor binds it (its projections as weights, its F32 leaves as
     /// tensors on the device), here the managed executor: the frozen legacy pixels within the cross-lane bound, a program a
-    /// row of tiles; the encoder, whose GroupNorm nodes the tensor executors do not implement, is refused by name.</summary>
+    /// row of tiles (the encoder on a tensor executor: MiniMaxH3ImageEditTests.VaeEncoderMatchesTheNumPyOracleOnTheManagedExecutor).</summary>
     [Theory]
     [InlineData("vae/canvas-32x40")]
     [InlineData("vae/split-4")]
@@ -337,8 +337,6 @@ public sealed class MiniMaxH3ImageTensorParallelTests(ITestOutputHelper output) 
         // Released device copies are made again by the next decode, to the same pixels.
         codec.ReleaseDevice();
         Assert.Equal(got.Pixels, codec.Decode(latent, c.LatentH, c.LatentW).Pixels);
-        Assert.Contains("GraphOp.GroupNorm", Assert.Throws<NotSupportedException>(() =>
-            codec.Encode(new RgbImage(32, 32, new float[32 * 32 * 3]), CancellationToken.None)).Message);
     }
 
     // ================================================================ direct CUDA (GPU validation pending)
@@ -477,7 +475,7 @@ public sealed class MiniMaxH3ImageTensorParallelTests(ITestOutputHelper output) 
     }
 
     /// <summary>The model on direct CUDA with --tp 2: it loads with the group in the pipeline's load (nothing on a device before
-    /// the first image), edits are refused by the VAE encoder's gap, and a Q4_K denoiser whose attention output a 2-way split
+    /// the first image), it takes edits (the VAE encoder runs on the tensor executor), and a Q4_K denoiser whose attention output a 2-way split
     /// would cut is refused at load.</summary>
     [MultiCudaFact(2)]
     public void TheModelShardsItsDenoiserOverTwoCudaGpus()
@@ -489,11 +487,8 @@ public sealed class MiniMaxH3ImageTensorParallelTests(ITestOutputHelper output) 
         using (ModelBase model = ModelBase.Create(dit.DitPath, BackendType.Cuda, tpDegree: 2))
         {
             var runtime = Assert.IsType<MiniMaxH3ImageDiffusionModel>(model);
-            Assert.False(runtime.SupportsImageEdit);
+            Assert.True(runtime.SupportsImageEdit);
             Assert.False(runtime.Pipeline.IsResident(DiffusionComponent.Denoiser));
-            var picture = new RgbImage(64, 64, new float[64 * 64 * 3]);
-            Assert.Contains("GraphOp.GroupNorm", Assert.Throws<NotSupportedException>(() =>
-                runtime.EditImage("x", new[] { picture }, new QwenImageParams())).Message);
         }
         using var q4k = new MiniMaxH3ImageFixture(Q4_K);
         System.IO.File.WriteAllBytes(System.IO.Path.Combine(q4k.Dir, "qwen3vl_32b_minimax_h3-Q4_K_M.gguf"), new byte[16]);

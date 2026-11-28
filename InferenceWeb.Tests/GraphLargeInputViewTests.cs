@@ -59,4 +59,42 @@ public sealed class GraphLargeInputViewTests
                 for (int i = 0; i < d; i++)
                     Assert.Equal(projection[r * width + h * 2 * d + i], got[(r * heads + h) * d + i]);
     }
+
+    /// <summary>A product's first operand bound as an input (MiniMax-H3-Image's PDD head, [hidden, patch] F32 every step): past
+    /// 65,536 floats it stays on the host until read, and the product read its absent tensor (the real 5,376-wide head on
+    /// direct CUDA; the test checkpoints' heads are small enough to be uploaded with the input).</summary>
+    [Theory]
+    [InlineData(16)]     // 256 x 16 floats: uploaded with the input
+    [InlineData(320)]    // 81,920 floats: kept on the host until read
+    public void AProductOfAnInputFirstOperandReadsItAtAnySize(int outputs)
+    {
+        const int k = 256, tokens = 3;
+        float[] head = Enumerable.Range(0, k * outputs).Select(i => (float)((i * 37) % 101 - 50) / 64f).ToArray();
+        float[] x = Enumerable.Range(0, k * tokens).Select(i => (float)((i * 11) % 23 - 11) / 8f).ToArray();
+        var g = new GraphProgramBuilder(record: true);
+        int w = g.Leaf(GraphLeafRole.Input, GraphFormat.F32, new long[] { k, outputs }, IntPtr.Zero, head.Length * 4L);
+        int a = g.Leaf(GraphLeafRole.Input, GraphFormat.F32, new long[] { k, tokens }, IntPtr.Zero, x.Length * 4L);
+        g.Output(g.Op(GraphOp.MulMat, w, a), (long)outputs * tokens);
+        using IGraphPlan plan = new Executor().Compile(g.ToProgram(replayable: true, reorder: false));
+        GCHandle hw = GCHandle.Alloc(head, GCHandleType.Pinned), hx = GCHandle.Alloc(x, GCHandleType.Pinned);
+        try
+        {
+            Assert.True(plan.Run(new[] { w, a }, new[] { hw.AddrOfPinnedObject(), hx.AddrOfPinnedObject() },
+                new[] { head.Length * 4L, x.Length * 4L }), plan.LastError);
+        }
+        finally
+        {
+            hw.Free();
+            hx.Free();
+        }
+        float[] got = plan.Outputs[0];
+        for (int t = 0; t < tokens; t++)
+            for (int o = 0; o < outputs; o++)
+            {
+                double want = 0;
+                for (int i = 0; i < k; i++) want += (double)head[o * k + i] * x[t * k + i];
+                Assert.True(Math.Abs(got[t * outputs + o] - want) <= 1e-4 * (1 + Math.Abs(want)),
+                    $"token {t} output {o}: {got[t * outputs + o]} against {want}");
+            }
+    }
 }

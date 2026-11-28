@@ -348,6 +348,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 DisposeEncoderPlans();
                 foreach (MiniMaxH3ImageWeight w in _all) Release(w);
                 foreach (MiniMaxH3ImageWeight w in _encAll) Release(w);
+                DisposeEncoderTensors();
                 _preloaded = false;
             }
         }
@@ -811,6 +812,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 DisposeEncoderPlans();
                 foreach (MiniMaxH3ImageWeight w in _all) Release(w);
                 foreach (MiniMaxH3ImageWeight w in _encAll) Release(w);
+                DisposeEncoderTensors();
                 foreach (Tensor t in _tensors.Values) t.Dispose();
                 _tensors.Clear();
                 DisposeHost();

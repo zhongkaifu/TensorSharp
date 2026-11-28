@@ -176,10 +176,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
         // ---- IImageGenerationModel ----
         string IImageGenerationModel.ImageModelFamily => ArchitectureId;
 
-        /// <summary>Edits encode their references with the VAE encoder, whose GroupNorm nodes the CUDA graph executor does not
-        /// implement (<see cref="MiniMaxH3ImageVaeCodec.TensorExecutorEncoderGap"/>): on --backend cuda the model makes images
-        /// from text only.</summary>
-        public bool SupportsImageEdit => _backend != BackendType.Cuda;
+        /// <summary>Edits encode their references with the VAE encoder, on every backend the model runs on (direct CUDA's tensor
+        /// executor runs its GroupNorm, Conv2d and reflect pads as the GGML backends do).</summary>
+        public bool SupportsImageEdit => true;
         public bool SupportsEditMask => SupportsImageEdit;
         public long MinimumGenerationArea => MiniMaxH3ImageFamily.MinGenerationArea;
 
@@ -202,7 +201,6 @@ namespace TensorSharp.Models.MiniMaxH3Image
         {
             if (inputs is not { Count: > 0 })
                 throw new ArgumentException("A MiniMax-H3-Image edit needs at least one reference image.");
-            if (!SupportsImageEdit) throw new NotSupportedException(MiniMaxH3ImageVaeCodec.TensorExecutorEncoderGap);
             var references = new DiffusionReference[inputs.Count];
             for (int i = 0; i < references.Length; i++)
                 references[i] = new DiffusionReference(inputs[i] ?? throw new ArgumentException($"Reference image {i + 1} is missing."));

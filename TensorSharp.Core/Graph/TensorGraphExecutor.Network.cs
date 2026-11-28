@@ -38,6 +38,23 @@ namespace TensorSharp.Graph
             return normed.View(x.Sizes);
         }
 
+        /// <summary>
+        /// ggml_group_norm: x [ne0, ne1, ne2, ne3] normalized, each ne3 slice apart, over each of <paramref name="groups"/> runs
+        /// of ne2 / groups channels, unweighted ((x - mean) / sqrt(var + eps)). A group's ne0 ne1 ne2 / groups values are
+        /// contiguous, so it is the layer norm of a row that long.
+        /// </summary>
+        private Tensor GroupNormRows(Tensor x0, long groups, float eps, RunState run)
+        {
+            Tensor x = Contig(x0, run);
+            long[] ne = Ne(x);
+            if (groups <= 0 || ne[2] % groups != 0)
+                throw new NotSupportedException($"group_norm of {ne[2]} channels in {groups} groups (whole groups only)");
+            long cols = ne[0] * ne[1] * (ne[2] / groups), rows = x.ElementCount() / cols;
+            using Tensor rows2 = x.View(rows, cols);
+            using Tensor normed = NormRows(rows2, eps);
+            return normed.View(x.Sizes);
+        }
+
         /// <summary>ggml_norm of the rows of <paramref name="x"/> ([rows, cols], contiguous F32): (x - mean) / sqrt(var + eps),
         /// var the rows' mean squared deviation. Default: the centred rows' RMS norm (the same quotient).</summary>
         protected virtual Tensor NormRows(Tensor x, float eps)

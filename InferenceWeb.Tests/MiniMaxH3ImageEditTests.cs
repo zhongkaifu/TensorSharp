@@ -652,12 +652,35 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
     [GgmlFact(BackendType.GgmlCuda)]
     public void VaeEncoderMatchesTheNumPyOracleOnGgmlCuda() => VaeEncoderMatchesTheOracle(BackendType.GgmlCuda);
 
-    private void VaeEncoderMatchesTheOracle(BackendType backend)
+    /// <summary>The encoder on a tensor executor (its leaves as device tensors, GraphOp.GroupNorm as the layer norm of each
+    /// group's contiguous run): the managed executor, at F32 throughout.</summary>
+    [Fact]
+    public void VaeEncoderMatchesTheNumPyOracleOnTheManagedExecutor()
     {
-        GgmlBasicOps.EnsureBackendAvailable(TestGates.GgmlBackendTypeOf(backend));
+        var cpu = new TensorSharp.Cpu.CpuAllocator(TensorSharp.BlasEnum.DotNet);
+        VaeEncoderMatchesTheOracle(BackendType.Cpu, path => new MiniMaxH3ImageVaeCodec(path, new TensorSharp.Models.Graph.ManagedGraphExecutor(cpu), cpu));
+    }
+
+    /// <summary>The encoder on direct CUDA's tensor executor, so an edit runs on --backend cuda (one GPU, --layer-split, --tp).</summary>
+    [CudaFact]
+    public void VaeEncoderMatchesTheNumPyOracleOnCuda()
+    {
+        using var allocator = new TensorSharp.Cuda.CudaAllocator(0);
+        VaeEncoderMatchesTheOracle(BackendType.Cuda, path => new MiniMaxH3ImageVaeCodec(path, BackendType.Cuda, allocator));
+    }
+
+    private void VaeEncoderMatchesTheOracle(BackendType backend) =>
+        VaeEncoderMatchesTheOracle(backend, path =>
+        {
+            GgmlBasicOps.EnsureBackendAvailable(TestGates.GgmlBackendTypeOf(backend));
+            return new MiniMaxH3ImageVaeCodec(path, backend);
+        });
+
+    private void VaeEncoderMatchesTheOracle(BackendType backend, Func<string, MiniMaxH3ImageVaeCodec> open)
+    {
         using JsonDocument doc = Fixture("vae-encoder-oracle.json");
         using var fx = new MiniMaxH3ImageVaeFixture(blocks: 1, encoder: true);
-        using var codec = new MiniMaxH3ImageVaeCodec(fx.VaePath, backend);
+        using var codec = open(fx.VaePath);
         Assert.True(codec.HasEncoder);
         long decoderBytes = codec.WeightBytes;
         foreach (JsonElement c in doc.RootElement.GetProperty("cases").EnumerateArray())
@@ -677,8 +700,9 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
             output.WriteLine($"{backend} {w}x{h} ({codec.LastEncodeTiles} tiles): moments [48, {lh}, {lw}], max |error| {maxErr:E2} of max |value| {maxAbs:F3}");
             // The GPU backends' F32 products carry 10-bit mantissas: ggml-cuda runs them as TF32 (cuBLAS TF32 tensor-op
             // math, as diffusers' own CUDA convolutions do by default) and ggml-metal's kernel_mul_mm_f32_f32 stages its
-            // tiles in half. 6.5e-4 (A40) and 7.4e-4 (M5 Pro) measured; ggml_cpu stays under 1e-6.
-            double tolerance = backend == BackendType.GgmlCpu ? 2e-4 : 2e-3;
+            // tiles in half. 6.5e-4 (A40) and 7.4e-4 (M5 Pro) measured; ggml_cpu stays under 1e-6. The managed executor's
+            // products are F32 on the host; direct CUDA's take cuBLAS's default math.
+            double tolerance = backend is BackendType.GgmlCpu or BackendType.Cpu ? 2e-4 : 2e-3;
             Assert.True(maxErr <= tolerance * Math.Max(1, maxAbs), $"{backend} {w}x{h}: max |error| {maxErr:E3} against the NumPy oracle");
         }
         // Four 256-pixel tiles share one program, the 64x48 tile another; the encoder's weights now count.

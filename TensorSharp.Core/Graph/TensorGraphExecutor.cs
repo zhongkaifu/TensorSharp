@@ -100,6 +100,8 @@ namespace TensorSharp.Graph
             GraphOp.PadReflect1d,
             // Non-decoder networks (TensorGraphExecutor.Network.cs).
             GraphOp.Norm, GraphOp.GeluErf, GraphOp.DepthwiseConv2d,
+            // MiniMax-H3-Image's VAE encoder (an edit's references).
+            GraphOp.GroupNorm,
             // Qwen-Image-2.1's text conditioner (ggml_gelu's tanh form) and its keys padded to their masks.
             GraphOp.Gelu, GraphOp.Pad,
             // DiffusionGemma's on-device sampling (entropy and the multinomial draw).
@@ -2283,6 +2285,7 @@ namespace TensorSharp.Graph
                 }
                 case GraphOp.RmsNorm: return V(RowNorm(T(0), Fp(0, 1e-6f), run));
                 case GraphOp.Norm: return V(LayerNormRows(T(0), Fp(0, 1e-6f), run));
+                case GraphOp.GroupNorm: return V(GroupNormRows(T(0), Ip(0, 32), Fp(0, 1e-6f), run));
                 case GraphOp.GeluErf: return V(GeluErf(In(T(0), run)));
                 // ggml_gelu: 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))), the backend's GELU kernel.
                 case GraphOp.Gelu: return V(Ops.GELU(null, In(T(0), run)));
@@ -2299,7 +2302,11 @@ namespace TensorSharp.Graph
                 case GraphOp.MulMat:
                 {
                     // ip [1] set: a row block of the weight read alone (GraphStep.MatMulRows), which need not be a shared product.
-                    Tensor y = MatMul(values[n.Srcs[0]], n.Srcs[1], T(1), run, alone: n.Ip != null && n.Ip.Length > 1 && n.Ip[1] != 0);
+                    // A first operand that is neither a weight nor on the device is a large host input (past 65,536 floats, kept
+                    // on the host until read: MiniMax-H3-Image's [hidden, patch] PDD head, bound every step): the product reads it.
+                    Value a = values[n.Srcs[0]];
+                    if (a.Weight == null && a.Tensor == null) a = new Value { Tensor = T(0) };
+                    Tensor y = MatMul(a, n.Srcs[1], T(1), run, alone: n.Ip != null && n.Ip.Length > 1 && n.Ip[1] != 0);
                     return new Value { Tensor = y, Relaid = !y.IsContiguous() };
                 }
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));

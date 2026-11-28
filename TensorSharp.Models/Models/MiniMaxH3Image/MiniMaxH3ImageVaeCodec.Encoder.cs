@@ -56,6 +56,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         }
 
         private readonly List<MiniMaxH3ImageWeight> _encAll = new();
+        /// <summary>On a tensor executor, the encoder's leaves as device tensors (<see cref="EncoderLeaf"/>).</summary>
+        private readonly Dictionary<MiniMaxH3ImageWeight, Tensor> _encTensors = new();
         private readonly List<(int H, int W, (ulong, ulong) Signature, IGraphPlan Plan)> _encPlans = new();
         private EncConv _encIn, _encOut, _encQuant;
         private EncLevel[] _encLevels;
@@ -63,14 +65,6 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         /// <summary>Whether the file carries the encoder (Comfy-Org's minimax_h3_image_vae_fp16 does).</summary>
         public bool HasEncoder => _model.HasTensor("encoder.conv_in.weight");
-
-        /// <summary>Why the encoder does not run on a tensor executor (direct CUDA): its program's GroupNorms are
-        /// <see cref="GraphOp.GroupNorm"/> nodes, which the tensor executors (TensorGraphExecutor, so CudaGraphExecutor) do not
-        /// implement; its Conv2d and PadReflect1d they do. Edits, which encode their references, run on ggml_cuda until the op
-        /// is there.</summary>
-        internal const string TensorExecutorEncoderGap =
-            "MiniMax-H3-Image's VAE encoder (an edit's references) does not run on --backend cuda: its GroupNorm nodes " +
-            "(GraphOp.GroupNorm) are not implemented by the CUDA graph executor. Edit on ggml_cuda; text to image runs on cuda.";
 
         /// <summary>Tiles the last <see cref="Encode"/> encoded, and the seconds its programs ran.</summary>
         public int LastEncodeTiles { get; private set; }
@@ -174,6 +168,34 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return w;
         }
 
+        /// <summary>
+        /// An encoder leaf: on GGML its pinned host bytes; on a tensor executor (direct CUDA) its F32 values as a tensor on the
+        /// device, made at the first encode and kept with the encoder (a convolution reads its kernel as a tensor, and the
+        /// norms' scales and the biases are multiplied and added, never a product's weight).
+        /// </summary>
+        private int EncoderLeaf(GraphEmitter e, MiniMaxH3ImageWeight w, ReadOnlySpan<long> ne)
+        {
+            if (_tensorAllocator == null) return e.HostWeight(w.Format, ne, w.Data, w.Bytes);
+            if (!_encTensors.TryGetValue(w, out Tensor t))
+            {
+                var sizes = new long[ne.Length];
+                for (int i = 0; i < ne.Length; i++) sizes[i] = ne[ne.Length - 1 - i];
+                var values = new float[w.Bytes / sizeof(float)];
+                Marshal.Copy(w.Data, values, 0, values.Length);
+                t = new Tensor(_tensorAllocator, DType.Float32, sizes);
+                t.SetElementsAsFloat(values);
+                _encTensors[w] = t;
+            }
+            return e.HostWeight(w.Format, ne, GraphIdentity.Of(w), w.Bytes, t);
+        }
+
+        /// <summary>Free the encoder's device tensors (a tensor executor's; the host values stay).</summary>
+        private void DisposeEncoderTensors()
+        {
+            foreach (Tensor t in _encTensors.Values) t.Dispose();
+            _encTensors.Clear();
+        }
+
         private long EncoderWeightBytes
         {
             get
@@ -207,7 +229,6 @@ namespace TensorSharp.Models.MiniMaxH3Image
             ArgumentNullException.ThrowIfNull(image);
             if (image.Width % Downsample != 0 || image.Height % Downsample != 0)
                 throw new ArgumentException($"MiniMax-H3-Image encodes whole {Downsample}-pixel cells; the picture is {image.Width}x{image.Height}.", nameof(image));
-            if (_tensorAllocator != null) throw new NotSupportedException(TensorExecutorEncoderGap);
             EnsureEncoder();
             lock (_gate)
             {
@@ -381,7 +402,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 if (v == null) return -1;
                 if (!leaves.TryGetValue(v, out int node))
                 {
-                    node = e.HostWeight(v.Format, stackalloc long[] { v.Ne0 }, v.Data, v.Bytes);
+                    node = EncoderLeaf(e, v, stackalloc long[] { v.Ne0 });
                     leaves[v] = node;
                 }
                 return b.Op(GraphOp.Reshape, stackalloc[] { node }, stackalloc long[] { 1, 1, channels, 1 });
@@ -390,7 +411,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             {
                 if (!leaves.TryGetValue(c.Kernel, out int node))
                 {
-                    node = e.HostWeight(c.Kernel.Format, stackalloc long[] { c.K, c.K, c.Ic, c.Oc }, c.Kernel.Data, c.Kernel.Bytes);
+                    node = EncoderLeaf(e, c.Kernel, stackalloc long[] { c.K, c.K, c.Ic, c.Oc });
                     leaves[c.Kernel] = node;
                 }
                 return node;
