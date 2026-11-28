@@ -2139,7 +2139,8 @@ namespace TensorSharp.Models
         /// <summary>How a stage's ranks compile and run their plans of a step: a compiling executor's (GGML: one executor
         /// compiles for every rank's device and runs the plans together) or the tensor executors' (direct CUDA, and the managed
         /// executor of a simulated group: each rank's own executor compiles its plan, and the plans run in lockstep from one
-        /// all-reduce to the next, <see cref="TensorGraphExecutor.RunRanked"/>).</summary>
+        /// all-reduce to the next, <see cref="TensorGraphExecutor.RunRanked"/>; or, a step that does not advance, each rank's
+        /// stream runs its ops as the ranks' trace emits them, <see cref="TryRunRankedStreamedStep"/>).</summary>
         internal sealed class RankRunner
         {
             private readonly IRankedGraphExecutor _compiled;
@@ -2159,6 +2160,11 @@ namespace TensorSharp.Models
 
             public GraphCapabilities Capabilities => _ranks[0].Capabilities;
 
+            /// <summary>One executor compiles every rank's plan (GGML), where each tensor executor runs its own rank.</summary>
+            public bool Compiles => _compiled != null;
+
+            /// <summary>Rank <paramref name="rank"/>'s streaming executor (the tensor executors).</summary>
+            public IStreamingGraphExecutor Stream(int rank) => (IStreamingGraphExecutor)_ranks[rank];
             public IGraphPlan Compile(GraphProgram program, int rank)
                 => _compiled != null ? _compiled.CompileForRank(program, _firstDevice + rank) : _ranks[rank].Compile(program);
 
@@ -2171,17 +2177,104 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// A span of a step over a stage's tensor-parallel group as per-rank graphs (<see cref="_rankGraphs"/>): every rank's
-        /// program is traced block by block across the ranks, compiled for the rank's device, and the ranks' plans run
-        /// together, pausing at each <see cref="GraphOp.AllReduce"/> while the stage's devices sum the partial (RankRunner).
-        /// Decode kinds replay: a later step only re-traces to bind its inputs and finds the plans by the ranks' signatures,
-        /// and a decode step one position on advances the stage's kept step without a trace.
+        /// program is traced block by block across the ranks. On GGML the ranks' plans are compiled and run together, pausing at
+        /// each <see cref="GraphOp.AllReduce"/> while the stage's devices sum the partial; decode kinds replay (a later step
+        /// re-traces only to find the plans by the ranks' signatures) and a decode step one position on advances the stage's
+        /// kept step without a trace (<see cref="TryRunRankedCompiledStep"/>). The tensor executors take that path for a step
+        /// that advances, and stream every other step: each rank's ops run as the trace emits them, so the host traces while the
+        /// devices work (a compiled step traces first and runs after: direct CUDA's prompt chunks ran 5 % slower, and decode
+        /// steps of a family whose steps do not advance, Mistral-Small-24B's, 5 % slower).
         /// </summary>
         private bool TryRunRankedGraphStep(Tensor hidden, Tensor carry, Slot[] slots, int[] first, int[] counts, int[] starts,
             GraphRequest request, RankedSpan span, out GraphResult result)
         {
             if (!_rankRunners.TryGetValue(span.Stage, out RankRunner runner))
                 _rankRunners[span.Stage] = runner = new RankRunner(this, span.Stage);
-            return TryRunRankedCompiledStep(runner, hidden, carry, slots, first, counts, starts, request, span, out result);
+            if (runner.Compiles || CompiledRankedStepsForTests || RankedStepAdvances(runner, counts, request))
+                return TryRunRankedCompiledStep(runner, hidden, carry, slots, first, counts, starts, request, span, out result);
+            return TryRunRankedStreamedStep(runner, hidden, carry, slots, first, counts, starts, request, span, out result);
+        }
+
+        /// <summary>Tests: the tensor executors run every ranked step as compiled plans in lockstep (the managed executor's
+        /// plans do not replay, so its steps would all stream).</summary>
+        internal bool CompiledRankedStepsForTests { get; set; }
+
+        /// <summary>Whether a ranked step may run as its kept step advanced one position (TryAdvanceDecode's rule): a decode
+        /// step of a family whose decode steps advance, on an executor whose plans replay.</summary>
+        private bool RankedStepAdvances(RankRunner runner, int[] counts, GraphRequest request)
+            => runner.Capabilities.Replays && DecodeStepsAdvance && !DecodeAdvanceDisabled && StepAdapter == null
+               && request.PositionTable == null && !request.RecurrentSnapshots && counts.Length > 0 && Array.TrueForAll(counts, c => c == 1);
+
+        /// <summary>Each kind's programs of the ranks (recorded once, before the kind's first step streams), whose readers
+        /// let each rank's stream free its tensors.</summary>
+        private readonly Dictionary<string, GraphProgram[]> _rankTemplates = new();
+
+        /// <summary>
+        /// A span of a step over a stage's tensor-parallel group on the tensor executors' streams: every rank's program is
+        /// traced on one thread, block by block across the ranks, into its executor's stream, so the ops run as they are
+        /// emitted and the devices work at once; a block's all-reduce runs when the last rank hands its partial in. A kind that
+        /// has not run records the ranks' programs first (nothing runs), for the streams to free tensors by.
+        /// </summary>
+        private bool TryRunRankedStreamedStep(RankRunner runner, Tensor hidden, Tensor carry, Slot[] slots, int[] first, int[] counts,
+            int[] starts, GraphRequest request, RankedSpan span, out GraphResult result)
+        {
+            result = null;
+            int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
+            string kind = $"{span}|{rows}|{slots.Length}|{request.RecurrentSnapshots}|{string.Join(",", counts)}|{request.Shape}|" +
+                          $"{request.LastRowLogits}|{request.AllRowLogits}|{request.CaptureFinal}|{string.Join(",", request.CaptureLayers)}|" +
+                          $"{request.PositionTable != null}|{EmissionVariant(counts, starts)}" + RingWrapVariant(counts, starts);
+            Tensor[] inputs = RankInputs(hidden, span.Stage), carries = carry == null ? null : RankInputs(carry, span.Stage);
+            var steps = new GraphStep[ranks];
+            var streams = new IGraphStream[ranks];
+            try
+            {
+                if (!_rankTemplates.TryGetValue(kind, out GraphProgram[] templates))
+                {
+                    var recorded = new GraphStep[ranks];
+                    try
+                    {
+                        for (int r = 0; r < ranks; r++)
+                            recorded[r] = new GraphStep(this, rows, slots, first, counts, starts, false, request.RecurrentSnapshots, record: true) { Rank = r };
+                        EmitRankedStep(recorded, inputs, carries, request, span);
+                        templates = Array.ConvertAll(recorded, step => step.Record());
+                    }
+                    finally
+                    {
+                        foreach (GraphStep step in recorded) step?.Dispose();
+                    }
+                    _rankTemplates[kind] = templates;
+                }
+                for (int r = 0; r < ranks; r++)
+                {
+                    streams[r] = runner.Stream(r).OpenStream(templates[r]);
+                    steps[r] = new GraphStep(this, rows, slots, first, counts, starts, false, request.RecurrentSnapshots, record: false)
+                        { Rank = r, Sink = streams[r] };
+                }
+                StepOutputs outputs = default;
+                bool ok = streams[0].Execute(() =>
+                {
+                    outputs = EmitRankedStep(steps, inputs, carries, request, span);
+                    bool all = true;
+                    for (int r = 0; r < ranks; r++) all &= steps[r].Run(streams[r]);
+                    return all;
+                });
+                if (!ok)
+                {
+                    string error = Array.Find(streams, st => st.LastError != null)?.LastError;
+                    throw new InvalidOperationException($"{Config.Architecture} tensor-parallel graph step failed: {error}");
+                }
+                GraphRuns++;
+                foreach (Slot slot in slots) slot.DeviceDirty = true;
+                result = RankedResult(outputs, slots.Length, (r, o) => ((IGraphPlan)streams[r]).Outputs[o]);
+                return true;
+            }
+            finally
+            {
+                foreach (GraphStep step in steps) step?.Dispose();
+                foreach (IGraphStream stream in streams) stream?.Dispose();
+                DisposeRankInputs(inputs, hidden);
+                DisposeRankInputs(carries, carry);
+            }
         }
 
         /// <summary>Whether every tensor-parallel partial must be summed exactly in F32, prompt chunks' too (a fast transport may
@@ -2615,10 +2708,17 @@ namespace TensorSharp.Models
         protected virtual void BeginAttentionPrep(GraphStep step, int layer, in AttentionPrepOperands prep)
             => throw new NotSupportedException($"{Config.Architecture} takes no attention prep region.");
 
+        /// <summary>The query heads <paramref name="step"/> traces: one rank's share on a rank's step, every head on a step of no
+        /// rank (one device, a whole-layer stage, or the unsharded draft layer under tensor parallelism).</summary>
+        private int StepHeads(GraphStep step) => step.Rank < 0 ? Config.NumHeads : _localHeads;
+
+        /// <summary>The KV heads of <paramref name="layer"/> <paramref name="step"/> attends (see <see cref="StepHeads"/>).</summary>
+        private int StepKvHeads(GraphStep step, int layer) => step.Rank < 0 ? KvHeadsOf(layer) : LocalKvHeadsOf(layer);
+
         private int EmitAttention(GraphStep step, int layer, int x)
         {
             EmitAttentionInput(step, layer, x);
-            int heads = _localHeads, kvHeads = LocalKvHeadsOf(layer), d = KeyDimOf(layer), dv = ValueDimOf(layer), rows = step.Rows;
+            int heads = StepHeads(step), kvHeads = StepKvHeads(step, layer), d = KeyDimOf(layer), dv = ValueDimOf(layer), rows = step.Rows;
             const long f = sizeof(float);
             long qDim = (long)heads * d, kDim = (long)kvHeads * d, vDim = (long)kvHeads * dv;
             long qWidth = GatedAttentionOutput ? 2 * qDim : qDim;
@@ -3004,7 +3104,7 @@ namespace TensorSharp.Models
         private int EmitSharedKvAttention(GraphStep step, int layer, int x)
         {
             int src = KvSourceOf(layer);
-            int heads = _localHeads, d = KeyDimOf(layer), dv = ValueDimOf(layer), rows = step.Rows;
+            int heads = StepHeads(step), d = KeyDimOf(layer), dv = ValueDimOf(layer), rows = step.Rows;
             const long f = sizeof(float);
             if (GatedAttentionOutput)
                 throw new NotSupportedException($"{Config.Architecture}: a KV-shared layer with a gated attention output is not supported.");
@@ -3054,7 +3154,7 @@ namespace TensorSharp.Models
         /// </summary>
         private protected int EmitCacheReadAttention(GraphStep step, int cacheLayer, int q, int heads, float scale, int s = 0)
         {
-            int kvHeads = LocalKvHeadsOf(cacheLayer), d = KeyDimOf(cacheLayer), dv = ValueDimOf(cacheLayer);
+            int kvHeads = StepKvHeads(step, cacheLayer), d = KeyDimOf(cacheLayer), dv = ValueDimOf(cacheLayer);
             if (heads % kvHeads != 0)
                 throw new InvalidOperationException($"{Config.Architecture}: {heads} query heads do not group onto layer {cacheLayer}'s {kvHeads} KV heads.");
             int count = step.Counts[s], start = step.Starts[s];

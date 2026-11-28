@@ -70,8 +70,10 @@ namespace TensorSharp.Models
             EnsureCacheCapacity(checked(startPos + rows));
             // The layer's rows from here on are the speculator's now, and the carry is not its last row.
             _draftFollowed = -1;
-            // Per-rank graphs do not trace the (unsharded) draft layer: it keeps the per-op path, as under --tp before.
-            if (GraphUnsupportedReason() != null || _rankGraphs)
+            // Under per-rank graphs the draft layer (unsharded, on the last stage's rank 0) runs as that device's graph, a step of
+            // no rank (GraphStep.Rank -1: every head, the model's own weights and the layer's whole cache). It ran per op, which
+            // a family whose draft input the per-op path cannot form (Qwen3.8 Flash Next's hyper-connection streams) failed.
+            if (GraphUnsupportedReason() != null)
             {
                 RunDraftLayerPerOp(tokens, hRows, startPos, logitsOut, hOut);
                 return;

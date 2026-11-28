@@ -443,6 +443,31 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         }
     }
 
+    /// <summary>The tensor executors' compiled per-rank plans in lockstep (TensorGraphExecutor.RunRanked: direct CUDA's
+    /// decode steps that advance) answer as one device, as the streamed ranks do: every step of the script so.</summary>
+    [Theory]
+    [InlineData("mistral3", 2, 1)]
+    [InlineData("qwen3vl", 2, 1)]
+    [InlineData("mistral3", 2, 2)]
+    public void CompiledRankPlansMatchOneDevice(string family, int tp, int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        List<float[]> reference;
+        using (var single = Create(family, path, 1, 1))
+            reference = Script(single);
+        using var placed = Create(family, path, tp, stages);
+        var decoder = Assert.IsAssignableFrom<StandardDecoderModel>(placed);
+        decoder.CompiledRankedStepsForTests = true;
+        List<float[]> actual = Script(placed);
+        Assert.True(decoder.RunsRankGraphs && decoder.GraphRuns > 0, $"{family} tp={tp} stages={stages}: the per-rank plans did not run");
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            Assert.True(rel <= 1e-4, $"{family} tp={tp} stages={stages} compiled row {i}: relL2 {rel:E2}");
+        }
+    }
+
     private static void AssertPlacement(StandardDecoderModel model, int tp, int stages)
     {
         Tensor[][] caches = model.KeyCachesForTests;

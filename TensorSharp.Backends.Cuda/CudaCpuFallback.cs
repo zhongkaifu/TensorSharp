@@ -33,6 +33,9 @@ namespace TensorSharp.Cuda
                     $"WARNING: TensorSharp CUDA op '{opName}' has no GPU implementation for these arguments; " +
                     "it runs on the element-by-element CPU fallback (device-to-host round-trip, orders of " +
                     "magnitude slower). Reported once per op.");
+                // TS_CUDA_PROFILE (an observer): where the fallback was reached, to find the caller to give a device route.
+                if (CudaProfileCounters.Enabled)
+                    Console.Error.WriteLine(Environment.StackTrace);
             }
             catch
             {

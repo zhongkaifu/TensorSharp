@@ -1134,6 +1134,23 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(() => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, mtp), "qwen4exp cpu mtp");
     }
 
+    /// <summary>The MTP head under tensor parallelism and the hybrid: the trunk runs as per-rank graphs, the (unsharded) draft
+    /// layer as one device's graph on the last stage's rank 0, reading the hyper-connection streams it chains. It ran per op
+    /// there, which has no form of this family's draft input, and every drafting request failed (rmsnorm over the streams).</summary>
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(2, 2)]
+    public void MtpUnderTensorParallelismMatchesPlainGreedy(int tp, int stages)
+    {
+        // BF16 projections and experts: the ranks' partial sums keep near-tied logits apart by less than Q8_0's activations.
+        string target = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-mtp-tp.gguf"), indexerTopK: 64, qsa: false,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "q4e-mtp-tp-head.gguf"), indexerTopK: 64);
+        SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(
+            () => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, mtp, layerSplitDegree: stages, tpDegree: tp, tpGroup: new SimulatedDeviceGroup(tp * stages)),
+            $"qwen4exp mtp tp={tp} stages={stages}", tieTolerance: 1e-3);
+    }
+
     [MlxFact]
     public void SpeculationMatchesPlainGreedyOnMlx()
     {
