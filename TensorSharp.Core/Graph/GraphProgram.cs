@@ -10,90 +10,6 @@ using System.Collections.Generic;
 namespace TensorSharp.Graph
 {
     /// <summary>
-    /// The operations of a backend-neutral graph program. Each backend's executor plugin lowers
-    /// them (see <see cref="IGraphExecutor"/>); the parameters follow ggml's semantics, which the
-    /// models were written against (extents innermost first, byte strides, NeoX / multi-axis
-    /// rotary modes).
-    /// </summary>
-    public enum GraphOp
-    {
-        GetRows = 1, Add = 2, Sub = 3, Mul = 4, Div = 5, Scale = 6, ScaleBias = 7,
-        RmsNorm = 8, Norm = 9, L2Norm = 10, GroupNorm = 11, MulMat = 12, MulMatId = 13,
-        Silu = 14, Gelu = 15, GeluQuick = 16, Sigmoid = 17, Softplus = 18, Exp = 19, Neg = 20,
-        Tanh = 21, Relu = 22, Sqr = 23, Sqrt = 24, SwigluSplit = 25, GegluSplit = 26,
-        Reshape = 27, View = 28, Permute = 29, Transpose = 30, Cont = 31, Cast = 32, Cpy = 33,
-        SetRows = 34, RopeExt = 35, FlashAttnExt = 36, SoftMaxExt = 37, Argsort = 38, TopK = 39,
-        SumRows = 40, SsmConv = 41, GatedDeltaNet = 42, Concat = 43, Clamp = 44, Repeat = 45,
-        Pad = 46, Mean = 47, AddId = 48, Argmax = 49, KvWindow = 50, Swiglu = 51, Geglu = 52, RopeMulti = 53,
-        /// <summary>Routed SwiGLU experts whose weights stay in host memory: srcs x [n, rows], ids (I32 [k, rows]),
-        /// route weights ([k, rows]), then the stacked gate, up and down experts, and optionally the next offloaded
-        /// layer's router and gate stack (a hint: an executor may read that layer's predicted experts ahead); Ip: the
-        /// layer, the activation (0 SwiGLU, 1 GPT-OSS's clamped SwiGLU at Fp alpha and limit, 2 GeGLU, 3 relu(up)^2), a fused
-        /// gate|up stack, per-route up scales (srcs[6]), the experts' biases (Ip[4] = 1: srcs[6..8] the gate, up and down
-        /// stacks' F32 [n_ff, E], [n_ff, E], [n, E]). Result
-        /// [n, rows] = sum over k of w * down(silu(gate x) * up x) for each row's experts. An executor with
-        /// <see cref="GraphCapabilities.HostExperts"/> pauses the program there (an accelerator tier registered
-        /// for the gate stack runs the routes it holds); the others do not take it.</summary>
-        MoeHostExperts = 54,
-        /// <summary>A lightning indexer's scores (ggml_lightning_indexer): srcs q [d, heads, rows], keys [d, 1, n],
-        /// the heads' weights [heads, rows] and a mask [n, rows] (F16). Result [n, rows] = sum over heads of
-        /// weight * relu(q_head . key) plus the mask.</summary>
-        LightningIndexer = 55,
-        /// <summary>A top-k selection's attention mask (ggml_top_k_mask): srcs mask [n_kv, rows], picks [n_top, rows]
-        /// (I32), then, where Ip[0..2] are set, each pick's score [n_pick, rows] (a pick lives while its score is
-        /// above -inf), the cells of each pick [n_cells, n_pick] (I32; else a pick is a cell) and cells every row keeps
-        /// [n_extra, rows] (I32). Result [n_kv, rows]: the mask's value at a kept cell, -inf elsewhere; cells out of
-        /// range are skipped.</summary>
-        TopKMask = 56,
-        /// <summary>This rank's partial [n, rows] summed over its tensor-parallel group (every rank gets the total): srcs the
-        /// partial, which no other node reads. The ranks' programs run in lockstep (see <see cref="IGraphCollective"/>), so
-        /// every rank reaches its reduce before any rank reads the total.</summary>
-        AllReduce = 57,
-        /// <summary>A 2-D convolution with zero padding (ggml_conv_2d): srcs the kernel [KW, KH, IC, OC] (F32 or F16) and x
-        /// [W, H, IC, N] (F32). Ip: stride0, stride1, padding0, padding1, dilation0, dilation1 (axis 0 is the width). Result
-        /// [OW, OH, OC, N] (F32), OW = (W + 2 p0 - d0 (KW - 1) - 1) / s0 + 1 (OH alike). With an F16 kernel x is read at F16
-        /// (ggml's im2col columns for it), with an F32 kernel at F32.</summary>
-        Conv2d = 58,
-        /// <summary>Reflect padding along ne0 (ggml_pad_reflect_1d): srcs x (F32, contiguous). Ip: p0 (before), p1 (after),
-        /// each less than ne0. Result [p0 + ne0 + p1, ne1, ne2, ne3]: column p0 + i is x's column i, column p0 - j (1 &lt;= j &lt;=
-        /// p0) is x's column j and column p0 + ne0 - 1 + j (1 &lt;= j &lt;= p1) is x's column ne0 - 1 - j (the edge not
-        /// repeated). Padding of two axes is two passes, the second over a transpose.</summary>
-        PadReflect1d = 59,
-        /// <summary>A depthwise 2-D convolution over rows of channels (ggml_conv_2d_dw_direct's arithmetic, in the layout the
-        /// IR's token rows already have): srcs x [C, W, H, N] (channels innermost) and the kernel [KW, KH, 1, C] (ggml's
-        /// depthwise kernel layout, F32). Ip: stride0, stride1, pad0, pad1, dilation0, dilation1 (index 0 along W, 1 along H;
-        /// zero padding on both sides). Result [C, OW, OH, N] with OW = (W + 2 pad0 - dilation0 (KW - 1) - 1) / stride0 + 1
-        /// (OH likewise): output (c, ow, oh, n) is the sum over the kernel taps, ky outer and kx inner, of
-        /// kernel[kx, ky, 0, c] * x[c, ow stride0 + kx dilation0 - pad0, oh stride1 + ky dilation1 - pad1, n], taps that fall
-        /// outside x contributing nothing.</summary>
-        DepthwiseConv2d = 70,
-        /// <summary>GELU in its exact form, 0.5 x (1 + erf(x / sqrt 2)) (ggml_gelu_erf; <see cref="Gelu"/> is ggml_gelu's tanh
-        /// approximation). Executors without an erf kernel evaluate erf with Abramowitz and Stegun's 7.1.26 (|error| below
-        /// 1.5e-7), as ggml-metal does.</summary>
-        GeluErf = 71,
-        /// <summary>The natural logarithm (ggml_log).</summary>
-        Log = 72,
-        /// <summary>The running sum along ne0 (ggml_cumsum): y[i] = x[0] + ... + x[i] in each row.</summary>
-        CumSum = 73,
-        /// <summary>
-        /// Mamba-2's selective scan (ggml_ssm_scan with a scalar decay per head): srcs the states s [d_state, head_dim, n_head,
-        /// n_seqs], x [head_dim, n_head, n_t, n_seqs], dt [n_head, n_t, n_seqs] (before its softplus), A [1, n_head], B and C
-        /// [d_state, n_group, n_t, n_seqs] (head h reads group h / (n_head / n_group)) and ids (I32 [n_seqs]: the state slot
-        /// each sequence starts from). Ip[0]: K, the states kept (1 or more). Per head and token: dt' = softplus(dt),
-        /// state = state * exp(dt' A) + B (x dt'), y = state . C. Result, F32 and one-dimensional: y [head_dim, n_head, n_t,
-        /// n_seqs], then K state slots [d_state, head_dim, n_head, n_seqs] each: slot 0 the state after the last token, slot j
-        /// the state j tokens before it (a slot older than the tokens is left as it was). The D skip and the gate are the
-        /// family's ops.
-        /// </summary>
-        SsmScan = 74,
-        /// <summary>
-        /// GPT-OSS's clamped SwiGLU (ggml_swiglu_oai): srcs gate and up, of one shape. Fp: alpha, limit. With
-        /// g = min(gate, limit) and u = clamp(up, -limit, limit), the result is g * sigmoid(alpha * g) * (u + 1).
-        /// </summary>
-        SwigluOai = 75,
-    }
-
-    /// <summary>
     /// Which wide routes a <see cref="GraphProgram.WideTokenProducts"/> program takes on ggml_cuda (the DiT offload,
     /// ggml_ops_dit_offload.cpp), as the family that emits it measured them. Without one a program takes MiniMax-H3's: Q4_K and
     /// BF16 weights' products of at least TS_H3_CUBLAS_MIN_ROWS (1024) rows on cuBLAS BF16 and cuDNN for attentions whose
@@ -585,7 +501,7 @@ namespace TensorSharp.Graph
     /// Records a <see cref="GraphProgram"/>. In hash-only mode nothing is kept but the signature, so
     /// a caller can look up a compiled plan for a step before recording it.
     /// </summary>
-    public sealed class GraphProgramBuilder
+    public sealed class GraphProgramBuilder : IGraphOpEmitter
     {
         private readonly List<GraphNode>? _entries;
         private readonly List<long> _outputs = new();
@@ -709,8 +625,12 @@ namespace TensorSharp.Graph
 
         public int Op(GraphOp op, int a, int b) => Op(op, stackalloc[] { a, b });
 
+        /// <summary>Records <paramref name="op"/>. Its operand and parameter counts are checked against the graph schema
+        /// (<see cref="GraphOpSchema"/>) here, in recording and hash-only mode alike, so a malformed op is refused while the
+        /// program is built rather than when an executor reads past its arrays.</summary>
         public int Op(GraphOp op, ReadOnlySpan<int> srcs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
         {
+            if (GraphOpSchema.Check(op, srcs.Length, ip.Length, fp.Length) is { } malformed) throw new ArgumentException(malformed);
             foreach (int src in srcs)
                 if (src < 0 || src >= NodeCount) throw new ArgumentOutOfRangeException(nameof(srcs), $"{op}: source node {src} does not exist");
             Mix(2); Mix((int)op); Mix(srcs); Mix(ip); Mix(fp);

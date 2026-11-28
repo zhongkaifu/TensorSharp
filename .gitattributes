@@ -15,3 +15,8 @@ InferenceWeb.Tests/Fixtures/Knowledge/*.pdf -text
 # Third-party license texts the app ships verbatim: the catalog pins each by the SHA-256
 # of its bytes (CatalogLicenseTerms.Revision), so no checkout may rewrite their line endings.
 TensorAgent/src/TensorAgent.Core/Catalog/Licenses/*.txt -text
+# Graph op schema outputs: generated with LF (eng/graph-schema); GraphOpSchemaTests compares them byte for byte.
+TensorSharp.Core/Graph/GraphOp.g.cs text eol=lf
+TensorSharp.Backends.GGML/GgmlGraphOp.g.cs text eol=lf
+TensorSharp.GGML.Native/tsg_graph_ops.g.h text eol=lf
+TensorSharp.Core/Graph/Schema/*.json text eol=lf

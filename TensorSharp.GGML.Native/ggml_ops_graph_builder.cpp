@@ -54,6 +54,7 @@
 #if defined(TSG_GGML_USE_METAL)
 #include "tsm/tsm_moe.h"
 #endif
+#include "tsg_graph_ops.g.h"
 
 using namespace tsg;
 
@@ -66,76 +67,10 @@ namespace
         LEAF_INPUT = 2,
     };
 
-    // Op codes shared with TensorSharp.GGML.GgmlGraphOp (keep in sync).
-    enum TsgGraphOp : int
-    {
-        OP_GET_ROWS = 1,
-        OP_ADD = 2,
-        OP_SUB = 3,
-        OP_MUL = 4,
-        OP_DIV = 5,
-        OP_SCALE = 6,           // fp: s
-        OP_SCALE_BIAS = 7,      // fp: s, b
-        OP_RMS_NORM = 8,        // fp: eps
-        OP_NORM = 9,            // fp: eps
-        OP_L2_NORM = 10,        // fp: eps
-        OP_GROUP_NORM = 11,     // ip: groups; fp: eps
-        OP_MUL_MAT = 12,        // srcs: weight, x; ip: [acc precision]
-        OP_MUL_MAT_ID = 13,     // srcs: stacked weights, x, ids
-        OP_SILU = 14,
-        OP_GELU = 15,
-        OP_GELU_QUICK = 16,
-        OP_SIGMOID = 17,
-        OP_SOFTPLUS = 18,
-        OP_EXP = 19,
-        OP_NEG = 20,
-        OP_TANH = 21,
-        OP_RELU = 22,
-        OP_SQR = 23,
-        OP_SQRT = 24,
-        OP_SWIGLU_SPLIT = 25,   // silu(a) * b
-        OP_GEGLU_SPLIT = 26,    // gelu(a) * b
-        OP_RESHAPE = 27,        // ip: ne0..ne(n-1)
-        OP_VIEW = 28,           // ip: nd, ne0..ne3, nb1..nb3, offset
-        OP_PERMUTE = 29,        // ip: axis0..axis3
-        OP_TRANSPOSE = 30,
-        OP_CONT = 31,
-        OP_CAST = 32,           // ip: ggml type
-        OP_CPY = 33,            // copy a into b; the result views b
-        OP_SET_ROWS = 34,       // srcs: dst, src, row ids; the result views dst
-        OP_ROPE_EXT = 35,       // srcs: x, positions, [freq factors]; ip: n_dims, mode, n_ctx_orig; fp: base, freq_scale, ext, attn, beta_fast, beta_slow
-        OP_FLASH_ATTN_EXT = 36, // srcs: q, k, v, [mask], [sinks]; fp: scale, max_bias, softcap; ip: [acc precision, n_kv max, rows kind, sliding-window band (GraphAttentionRows: hints for TensorSharp executors, ignored here)]
-        OP_SOFT_MAX_EXT = 37,   // srcs: x, [mask]; fp: scale, max_bias
-        OP_ARGSORT = 38,        // ip: order (0 asc, 1 desc)
-        OP_TOP_K = 39,          // ip: k
-        OP_SUM_ROWS = 40,
-        OP_SSM_CONV = 41,       // srcs: window, kernel
-        OP_GATED_DELTA_NET = 42,// srcs: q, k, v, g, beta, state; ip: snapshots K
-        OP_CONCAT = 43,         // ip: dim
-        OP_CLAMP = 44,          // fp: min, max
-        OP_REPEAT = 45,         // srcs: x, shape-of
-        OP_PAD = 46,            // ip: p0..p3
-        OP_MEAN = 47,
-        OP_ADD_ID = 48,         // srcs: a, b, ids
-        OP_ARGMAX = 49,
-        OP_KV_WINDOW = 50,      // srcs: cache; ip: head_dim, cache_size, kv_heads, start, length, kv_type, query_rows, gqa_ratio (-1: not read by flash attention)
-                                // (a [head_dim, length, kv_heads] window, copied where a backend's attention needs it)
-        OP_SWIGLU = 51,         // silu(first half) * second half, along ne0
-        OP_GEGLU = 52,
-        OP_ROPE_MULTI = 53,     // srcs: x, positions [4 * rows], [freq factors]; ip: n_dims, mode, n_ctx_orig, sections[4]; fp: as ROPE_EXT
-        OP_MOE_HOST = 54,       // srcs: x [n, T], ids [k, T], weights [k, T], gate/up/down expert stacks (host); ip: layer
-        OP_LIGHTNING_INDEXER = 55, // srcs: q [d, heads, T], k [d, 1, n_kv], weights [heads, T], mask [n_kv, T] (F16)
-        OP_TOP_K_MASK = 56,     // srcs: mask [n_kv, T], top_k [n_top, T], then (ip[0..2] flags) score, blocks, extra
-        OP_ALLREDUCE = 57,      // srcs: a tensor-parallel partial; summed in place across the ranks (TSGgml_GraphRunRanked)
-        OP_CONV_2D = 58,        // srcs: kernel [KW, KH, IC, OC] (F32/F16), x [W, H, IC, N]; ip: s0, s1, p0, p1, d0, d1 (ggml_conv_2d)
-        OP_PAD_REFLECT_1D = 59, // srcs: x (F32, contiguous); ip: p0, p1
-        OP_DEPTHWISE_CONV_2D = 70, // srcs: x [C, W, H, N] (channels innermost), kernel [KW, KH, 1, C]; ip: s0, s1, p0, p1, d0, d1
-        OP_GELU_ERF = 71,       // 0.5 x (1 + erf(x / sqrt 2))
-        OP_LOG = 72,            // ggml_log
-        OP_CUMSUM = 73,         // ggml_cumsum: the running sum along ne0
-        OP_SSM_SCAN = 74,       // srcs: s, x, dt, A, B, C, ids; ip: K states kept (ggml_ssm_scan, Mamba-2)
-        OP_SWIGLU_OAI = 75,     // srcs: gate, up; fp: alpha, limit (ggml_swiglu_oai, GPT-OSS)
-    };
+    // The op codes, their operand / parameter slots and the schema hash are generated from
+    // TensorSharp.Core/Graph/Schema/graph-ops.json (tsg_graph_ops.g.h, shared with TensorSharp.Graph.GraphOp and
+    // TensorSharp.GGML.GgmlGraphOp).
+    using namespace tsg::graph_schema;
 
     struct Leaf
     {
@@ -997,15 +932,17 @@ namespace
         case OP_VIEW:
         {
             need(1);
-            if (nip < 9) throw std::runtime_error("graph builder: view needs nd, ne0..ne3, nb1..nb3, offset");
-            const std::size_t off = static_cast<std::size_t>(ip[8]);
-            switch (ip[0])
+            namespace v = slots::view;   // the schema requires every slot (rank, four extents, three strides, the offset)
+            const std::size_t off = static_cast<std::size_t>(ip[v::IP_OFFSET]);
+            const std::int64_t ne0 = ip[v::IP_NE_0], ne1 = ip[v::IP_NE_1], ne2 = ip[v::IP_NE_2], ne3 = ip[v::IP_NE_3];
+            const std::size_t nb1 = static_cast<std::size_t>(ip[v::IP_NB_1]), nb2 = static_cast<std::size_t>(ip[v::IP_NB_2]),
+                              nb3 = static_cast<std::size_t>(ip[v::IP_NB_3]);
+            switch (ip[v::IP_RANK])
             {
-            case 1: return ggml_view_1d(ctx, src(0), ip[1], off);
-            case 2: return ggml_view_2d(ctx, src(0), ip[1], ip[2], static_cast<std::size_t>(ip[5]), off);
-            case 3: return ggml_view_3d(ctx, src(0), ip[1], ip[2], ip[3], static_cast<std::size_t>(ip[5]), static_cast<std::size_t>(ip[6]), off);
-            case 4: return ggml_view_4d(ctx, src(0), ip[1], ip[2], ip[3], ip[4], static_cast<std::size_t>(ip[5]),
-                                        static_cast<std::size_t>(ip[6]), static_cast<std::size_t>(ip[7]), off);
+            case 1: return ggml_view_1d(ctx, src(0), ne0, off);
+            case 2: return ggml_view_2d(ctx, src(0), ne0, ne1, nb1, off);
+            case 3: return ggml_view_3d(ctx, src(0), ne0, ne1, ne2, nb1, nb2, off);
+            case 4: return ggml_view_4d(ctx, src(0), ne0, ne1, ne2, ne3, nb1, nb2, nb3, off);
             default: throw std::runtime_error("graph builder: view rank must be 1-4");
             }
         }
@@ -1019,10 +956,14 @@ namespace
         case OP_CPY: need(2); return ggml_cpy(ctx, src(0), src(1));
         case OP_SET_ROWS: need(3); return ggml_set_rows(ctx, src(0), src(1), src(2));
         case OP_ROPE_EXT:
+        {
             need(2);
-            return ggml_rope_ext(ctx, src(0), src(1), src(2),
-                                 static_cast<int>(ipar(0, 0)), static_cast<int>(ipar(1, 0)), static_cast<int>(ipar(2, 0)),
-                                 fpar(0, 10000.0f), fpar(1, 1.0f), fpar(2, 0.0f), fpar(3, 1.0f), fpar(4, 32.0f), fpar(5, 1.0f));
+            namespace r = slots::rope_ext;
+            return ggml_rope_ext(ctx, src(r::SRC_X), src(r::SRC_POSITIONS), src(r::SRC_FREQ_FACTORS),
+                                 static_cast<int>(ip[r::IP_N_DIMS]), static_cast<int>(ip[r::IP_MODE]), static_cast<int>(ip[r::IP_N_CTX_ORIG]),
+                                 fp[r::FP_FREQ_BASE], fp[r::FP_FREQ_SCALE], fp[r::FP_EXT_FACTOR], fp[r::FP_ATTN_FACTOR],
+                                 fp[r::FP_BETA_FAST], fp[r::FP_BETA_SLOW]);
+        }
         case OP_MOE_HOST: return build_host_experts(g, s, ns, ip, nip, fp, nfp);
         case OP_ALLREDUCE:
         {
@@ -1037,28 +978,34 @@ namespace
         case OP_ROPE_MULTI:
         {
             need(2);
+            namespace r = slots::rope_multi;
             int sections[GGML_MROPE_SECTIONS] = {};
-            for (int i = 0; i < GGML_MROPE_SECTIONS && i < 4; i++) sections[i] = static_cast<int>(ipar(3 + i, 0));
-            return ggml_rope_multi(ctx, src(0), src(1), src(2),
-                                   static_cast<int>(ipar(0, 0)), sections, static_cast<int>(ipar(1, 0)), static_cast<int>(ipar(2, 0)),
-                                   fpar(0, 10000.0f), fpar(1, 1.0f), fpar(2, 0.0f), fpar(3, 1.0f), fpar(4, 32.0f), fpar(5, 1.0f));
+            for (int i = 0; i < GGML_MROPE_SECTIONS && i < 4; i++)
+                sections[i] = static_cast<int>(ipar(r::IP_SECTION_0 + i, r::IP_SECTION_3_DEFAULT));
+            return ggml_rope_multi(ctx, src(r::SRC_X), src(r::SRC_POSITIONS), src(r::SRC_FREQ_FACTORS),
+                                   static_cast<int>(ip[r::IP_N_DIMS]), sections, static_cast<int>(ip[r::IP_MODE]),
+                                   static_cast<int>(ip[r::IP_N_CTX_ORIG]), fp[r::FP_FREQ_BASE], fp[r::FP_FREQ_SCALE],
+                                   fp[r::FP_EXT_FACTOR], fp[r::FP_ATTN_FACTOR], fp[r::FP_BETA_FAST], fp[r::FP_BETA_SLOW]);
         }
         case OP_FLASH_ATTN_EXT:
         {
             need(3);
-            // srcs[4]: optional attention sinks. ip[1] > 0 bounds every mask row's finite entries (a selection's
-            // width): decode and verify rows then attend only those (ggml's sparse path, a one-row kernel); a prompt
-            // chunk over a wide window does on TensorSharp's kernels, else densely.
-            std::int64_t width = ipar(1, 0);
-            if (width > 0 && src(4) == nullptr && src(0)->ne[1] > 16)
+            namespace a = slots::flash_attn_ext;
+            // The sinks are optional. KV_MAX > 0 bounds every mask row's finite entries (a selection's width): decode and
+            // verify rows then attend only those (ggml's sparse path, a one-row kernel); a prompt chunk over a wide window
+            // does on TensorSharp's kernels, else densely.
+            std::int64_t width = ipar(a::IP_KV_MAX, a::IP_KV_MAX_DEFAULT);
+            const float scale = fpar(a::FP_SCALE, a::FP_SCALE_DEFAULT);
+            if (width > 0 && src(a::SRC_SINKS) == nullptr && src(a::SRC_Q)->ne[1] > 16)
             {
-                if (ggml_tensor* sel = try_selected_attention(g, src(0), src(1), src(2), src(3), fpar(0, 1.0f), width))
+                if (ggml_tensor* sel = try_selected_attention(g, src(a::SRC_Q), src(a::SRC_K), src(a::SRC_V), src(a::SRC_MASK), scale, width))
                     return sel;
                 width = 0;
             }
-            ggml_tensor* fa = flash_attn_ext_guarded(ctx, "graph builder", src(0), src(1), src(2), src(3),
-                                                     fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f), src(4),
-                                                     static_cast<ggml_prec>(ipar(0, 0)));
+            ggml_tensor* fa = flash_attn_ext_guarded(ctx, "graph builder", src(a::SRC_Q), src(a::SRC_K), src(a::SRC_V), src(a::SRC_MASK),
+                                                     scale, fpar(a::FP_MAX_BIAS, a::FP_MAX_BIAS_DEFAULT),
+                                                     fpar(a::FP_SOFTCAP, a::FP_SOFTCAP_DEFAULT), src(a::SRC_SINKS),
+                                                     static_cast<ggml_prec>(ipar(a::IP_ACC_PRECISION, a::IP_ACC_PRECISION_DEFAULT)));
             if (width > 0 && fa->op == GGML_OP_FLASH_ATTN_EXT)
                 ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<std::int32_t>(width));
             return fa;
@@ -1168,10 +1115,12 @@ namespace
         case OP_KV_WINDOW:
         {
             need(1);
-            if (nip < 6) throw std::runtime_error("graph builder: kv window needs head_dim, cache_size, kv_heads, start, length, kv_type");
-            ggml_tensor* w = view_kv_cache_window(ctx, src(0), static_cast<int>(ip[0]), static_cast<int>(ip[1]),
-                                                  static_cast<int>(ip[2]), static_cast<int>(ip[3]), static_cast<int>(ip[4]),
-                                                  static_cast<int>(ip[5]), static_cast<int>(ipar(6, 1)), static_cast<int>(ipar(7, 0)));
+            namespace k = slots::kv_window;   // the schema requires the first six slots
+            ggml_tensor* w = view_kv_cache_window(ctx, src(0), static_cast<int>(ip[k::IP_HEAD_DIM]), static_cast<int>(ip[k::IP_CACHE_SIZE]),
+                                                  static_cast<int>(ip[k::IP_KV_HEADS]), static_cast<int>(ip[k::IP_START]),
+                                                  static_cast<int>(ip[k::IP_LENGTH]), static_cast<int>(ip[k::IP_KV_TYPE]),
+                                                  static_cast<int>(ipar(k::IP_QUERY_ROWS, k::IP_QUERY_ROWS_DEFAULT)),
+                                                  static_cast<int>(ipar(k::IP_GQA_RATIO, k::IP_GQA_RATIO_DEFAULT)));
             if (w == nullptr) throw std::runtime_error("graph builder: kv window view failed");
             return w;
         }
@@ -2736,6 +2685,10 @@ TSG_EXPORT int TSGgml_GraphOp(void* handle, int op, const int* srcs, int nsrc,
     try
     {
         if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
+        // The schema's structure first (the managed builder checks the same table; this guards other callers and a
+        // managed side built from another schema).
+        const std::string malformed = tsg::graph_schema::check(op, nsrc, nip, nfp);
+        if (!malformed.empty()) throw std::runtime_error(malformed);
         if (g->serving >= 0) return push_skipped(g);   // a device operation computes the region
         return push(g, build_op(g, op, srcs, nsrc, ip, nip, fp, nfp));
     }
@@ -2744,6 +2697,18 @@ TSG_EXPORT int TSGgml_GraphOp(void* handle, int op, const int* srcs, int nsrc,
         set_last_error(ex.what());
         return -1;
     }
+}
+
+// The graph op schema this library was built from (tsg_graph_ops.g.h): the managed side compares it with its own
+// (TensorSharp.Graph.GraphOpSchema) when the GGML backend initializes and refuses a mismatch.
+TSG_EXPORT const char* TSGgml_GraphSchemaHash()
+{
+    return tsg::graph_schema::kHash;
+}
+
+TSG_EXPORT int TSGgml_GraphSchemaVersion()
+{
+    return tsg::graph_schema::kVersion;
 }
 
 // Shape of a node (ne0..ne3) and its ggml type, so managed code can derive views and checks.

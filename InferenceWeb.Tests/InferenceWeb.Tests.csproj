@@ -15,6 +15,7 @@
     <Compile Remove="Fixtures/PdfProcessFixture/**/*.cs" />
     <ProjectReference Include="Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" ReferenceOutputAssembly="false" />
     <Compile Include="../eng/validation/ValidationSha256.cs" Link="Validation/ValidationSha256.cs" />
+    <Compile Include="../eng/graph-schema/GraphOpSchemaGenerator.cs" Link="GraphSchema/GraphOpSchemaGenerator.cs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />

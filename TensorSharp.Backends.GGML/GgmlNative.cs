@@ -1032,6 +1032,51 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr TSGgml_GraphSchemaHash();
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GraphSchemaVersion();
+
+        private static volatile bool s_graphSchemaChecked;
+
+        internal static (string Hash, int Version) NativeGraphSchema()
+            => (Marshal.PtrToStringAnsi(TSGgml_GraphSchemaHash()) ?? string.Empty, TSGgml_GraphSchemaVersion());
+
+        /// <summary>
+        /// The graph op schema the native bridge was built from must be the managed side's (both are generated from
+        /// TensorSharp.Core/Graph/Schema/graph-ops.json): a library built from another schema would read op codes, operands or
+        /// parameter slots differently. Checked once, when a GGML backend initializes; a mismatch, or a library that predates
+        /// the handshake, is refused with what to rebuild.
+        /// </summary>
+        public static void EnsureGraphSchema()
+        {
+            if (s_graphSchemaChecked) return;
+            string native;
+            int version;
+            try
+            {
+                native = Marshal.PtrToStringAnsi(TSGgml_GraphSchemaHash()) ?? string.Empty;
+                version = TSGgml_GraphSchemaVersion();
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException(
+                    "The native GGML bridge predates the graph op schema handshake (no TSGgml_GraphSchemaHash). Rebuild "
+                    + "`TensorSharp.GGML.Native` from this checkout.", ex);
+            }
+            const string managed = global::TensorSharp.Graph.GraphOpSchema.Hash;
+            const int managedVersion = global::TensorSharp.Graph.GraphOpSchema.Version;
+            if (!string.Equals(native, managed, StringComparison.Ordinal) || version != managedVersion)
+                throw new InvalidOperationException(
+                    $"The native GGML bridge was built from graph op schema v{version} ({native}); the managed code is v"
+                    + $"{managedVersion} ({managed}). Rebuild `TensorSharp.GGML.Native` from this checkout "
+                    + "(and regenerate with `dotnet run --project eng/graph-schema` after editing the schema).");
+            s_graphSchemaChecked = true;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_SetVulkanDeviceIndex(int deviceIndex);
 
         [LibraryImport(DllName)]
@@ -2740,6 +2785,7 @@ internal enum GgmlIndexReductionOp
 
             try
             {
+                EnsureGraphSchema();
                 if (TSGgml_IsBackendAvailable((int)backendType) == 0)
                 {
                     string backendName = backendType switch

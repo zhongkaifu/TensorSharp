@@ -1788,6 +1788,10 @@ namespace TensorSharp.GGML
 
         public static void HostReadBarrier() => GgmlNative.HostReadBarrier();
         public static bool CanInitializeBackend(GgmlBackendType backendType) => GgmlNative.CanInitialize(backendType);
+
+        /// <summary>The graph op schema the native bridge was built from (TSGgml_GraphSchemaHash / Version): it must equal
+        /// TensorSharp.Graph.GraphOpSchema's, which <see cref="EnsureBackendAvailable"/> checks.</summary>
+        public static (string Hash, int Version) NativeGraphSchema() => GgmlNative.NativeGraphSchema();
         public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);
 
         /// <summary>Env var (read at Vulkan backend init) selecting the Vulkan device index.</summary>

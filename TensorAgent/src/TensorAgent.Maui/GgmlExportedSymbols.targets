@@ -186,6 +186,8 @@
     <ReferenceNativeSymbol Include="TSGgml_GraphLeaf" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphLeafIsResident" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOp" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphSchemaHash" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphSchemaVersion" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOutput" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOverlapSteps" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphPreloadWeights" SymbolType="Function" />

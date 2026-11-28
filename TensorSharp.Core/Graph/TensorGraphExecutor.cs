@@ -2370,7 +2370,8 @@ namespace TensorSharp.Graph
                     return V(Conv2d(T(0), T(1), (int)Ip(0, 1), (int)Ip(1, 1), (int)Ip(2, 0), (int)Ip(3, 0), (int)Ip(4, 1), (int)Ip(5, 1), run));
                 case GraphOp.PadReflect1d: return V(PadReflect1d(Contig(T(0), run), (int)Ip(0, 0), (int)Ip(1, 0)));
                 case GraphOp.KvWindow:
-                    return new Value { Tensor = run.Keep(KvWindow(T(0), n.Ip)), Window = new CacheWindow(T(0), n.Ip[3] % n.Ip[1]) };
+                    return new Value { Tensor = run.Keep(KvWindow(T(0), n.Ip)), Window = new CacheWindow(T(0),
+                        n.Ip[GraphOpParams.KvWindow.Ip.Start] % n.Ip[GraphOpParams.KvWindow.Ip.CacheSize]) };
                 case GraphOp.RopeExt:
                 case GraphOp.RopeMulti:
                 {
@@ -3246,11 +3247,13 @@ namespace TensorSharp.Graph
             return r.View(Sizes(Ne(r)));
         }
 
-        /// <summary>view_kv_cache_window: ip = head_dim, cache_size, kv_heads, start, length, ...: the cache
-        /// [kv_heads, cache_size, head_dim]'s rows start .. start + length (no wrap).</summary>
+        /// <summary>view_kv_cache_window (<see cref="GraphOpParams.KvWindow"/>): the cache [kv_heads, cache_size, head_dim]'s
+        /// rows start .. start + length (no wrap).</summary>
         private static Tensor KvWindow(Tensor cache, long[] ip)
         {
-            long d = ip[0], cap = ip[1], heads = ip[2], start = ip[3] % ip[1], length = ip[4];
+            long d = ip[GraphOpParams.KvWindow.Ip.HeadDim], cap = ip[GraphOpParams.KvWindow.Ip.CacheSize];
+            long heads = ip[GraphOpParams.KvWindow.Ip.KvHeads], length = ip[GraphOpParams.KvWindow.Ip.Length];
+            long start = ip[GraphOpParams.KvWindow.Ip.Start] % cap;
             if (start + length > cap) throw new NotSupportedException("a wrapped cache window");
             return Checked(new Tensor(new[] { heads, length, d }, new[] { cap * d, d, 1L }, cache.Storage, cache.StorageOffset + start * d), "cache window");
         }
@@ -3406,14 +3409,17 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>ggml's rotary over x [d, heads, tokens] at positions [tokens] (multi-axis: [4 * tokens],
-        /// axis-major); ip = dims, mode, n_ctx_orig[, sections]; fp = base, freq_scale, ext_factor,
-        /// attn_factor, beta_fast, beta_slow.</summary>
+        /// axis-major); the slots are the schema's (<see cref="GraphOpParams.RopeExt"/>, <see cref="GraphOpParams.RopeMulti"/>:
+        /// the same positions for dims, mode, n_ctx_orig and the frequency parameters, which the schema requires).</summary>
         private Tensor Rope(Tensor x, Value positions, GraphNode n, bool multi, RunState run, int positionsNode = -1, Tensor factors = null)
         {
             long[] ne = Ne(x);
             int d = (int)ne[0], heads = (int)ne[1], tokens = (int)ne[2];
-            int dims = (int)n.Ip[0], mode = (int)n.Ip[1], ctx = (int)n.Ip[2];
-            float freqBase = n.Fp[0], freqScale = n.Fp[1], extFactor = n.Fp[2], attnFactor = n.Fp[3];
+            int dims = (int)n.Ip[GraphOpParams.RopeExt.Ip.NDims], mode = (int)n.Ip[GraphOpParams.RopeExt.Ip.Mode];
+            int ctx = (int)n.Ip[GraphOpParams.RopeExt.Ip.NCtxOrig];
+            float freqBase = n.Fp[GraphOpParams.RopeExt.Fp.FreqBase], freqScale = n.Fp[GraphOpParams.RopeExt.Fp.FreqScale];
+            float extFactor = n.Fp[GraphOpParams.RopeExt.Fp.ExtFactor], attnFactor = n.Fp[GraphOpParams.RopeExt.Fp.AttnFactor];
+            float betaFast = n.Fp[GraphOpParams.RopeExt.Fp.BetaFast], betaSlow = n.Fp[GraphOpParams.RopeExt.Fp.BetaSlow];
             // Read on the host only where the host needs them (multi-axis rows, or no device positions): a recorded step's
             // varying positions are never read back.
             int[] pos = multi || !BroadcastsPositionsOnDevice || positions.Tensor == null ? Ints(positions) : null;
@@ -3422,7 +3428,7 @@ namespace TensorSharp.Graph
             if (multi && mode == RopeTypeVision) return RopeVision(x, pos, n, run);
             // Multi-axis rotary whose axes all carry the same position (every text token) is NeoX rotary at
             // that position: the device kernel, not the host loop below (which reads and writes the rows).
-            if (multi && extFactor == 0f && pos.Length >= 3 * tokens && SameAxes(pos, tokens, n.Ip.Length > 6 && n.Ip[6] > 0 ? 4 : 3))
+            if (multi && extFactor == 0f && pos.Length >= 3 * tokens && SameAxes(pos, tokens, n.Ip.Length > GraphOpParams.RopeMulti.Ip.Section3 && n.Ip[GraphOpParams.RopeMulti.Ip.Section3] > 0 ? 4 : 3))
             {
                 multi = false;
                 mode = 2;   // GGML_ROPE_TYPE_NEOX
@@ -3459,12 +3465,12 @@ namespace TensorSharp.Graph
                     // Frequency factors: the backend's factored rotary over contiguous rows (no strided shortcut).
                     Tensor factored = Ops.NewContiguous(x);
                     using Tensor f4 = factored.View(1, tokens, heads, d);
-                    Ops.RoPEExFactors(f4, f4, p, Contig(factors, run), dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, n.Fp[4], n.Fp[5]);
+                    Ops.RoPEExFactors(f4, f4, p, Contig(factors, run), dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
                     return factored;
                 }
                 if (KernelsReadStridedViews)
                 {
-                    using Tensor rotated = Ops.RoPEEx(null, As4(x, run), p, dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, n.Fp[4], n.Fp[5]);
+                    using Tensor rotated = Ops.RoPEEx(null, As4(x, run), p, dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
                     return rotated.View(Sizes(ne));
                 }
                 // Rotated where it lies into new rows (a fused projection's q or k block, or contiguous rows), where the backend
@@ -3475,14 +3481,19 @@ namespace TensorSharp.Graph
                 }
                 Tensor copy = Ops.NewContiguous(x);
                 using Tensor r4 = copy.View(1, tokens, heads, d);
-                Ops.RoPEEx(r4, r4, p, dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, n.Fp[4], n.Fp[5]);
+                Ops.RoPEEx(r4, r4, p, dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
                 return copy;
             }
             Tensor result = Ops.NewContiguous(x);
             if (extFactor != 0f) throw new NotSupportedException("YaRN multi-axis rotary");
             // Interleaved multi-axis rotary with NeoX pairs: pair i takes the H position when i mod 3 == 1
             // (i < 3 * sections[1]), W when 2 (< 3 * sections[2]), T when 0 (< 3 * sections[0]), else axis 3.
-            int[] sections = { (int)n.Ip[3], (int)n.Ip[4], (int)n.Ip[5], n.Ip.Length > 6 ? (int)n.Ip[6] : 0 };
+            int[] sections =
+            {
+                (int)n.Ip[GraphOpParams.RopeMulti.Ip.Section0], (int)n.Ip[GraphOpParams.RopeMulti.Ip.Section1],
+                (int)n.Ip[GraphOpParams.RopeMulti.Ip.Section2],
+                n.Ip.Length > GraphOpParams.RopeMulti.Ip.Section3 ? (int)n.Ip[GraphOpParams.RopeMulti.Ip.Section3] : 0,
+            };
             int sectDims = sections.Sum(), half = dims / 2;
             float[] v = result.GetElementsAsFloat((int)result.ElementCount());
             float thetaScale = MathF.Pow(freqBase, -2.0f / dims);

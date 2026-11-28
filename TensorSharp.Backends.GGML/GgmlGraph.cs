@@ -21,38 +21,6 @@ namespace TensorSharp.GGML
         Input = 2,
     }
 
-    /// <summary>Op codes of the generic graph (keep in sync with TsgGraphOp in ggml_ops_graph_builder.cpp).</summary>
-    public enum GgmlGraphOp
-    {
-        GetRows = 1, Add = 2, Sub = 3, Mul = 4, Div = 5, Scale = 6, ScaleBias = 7,
-        RmsNorm = 8, Norm = 9, L2Norm = 10, GroupNorm = 11, MulMat = 12, MulMatId = 13,
-        Silu = 14, Gelu = 15, GeluQuick = 16, Sigmoid = 17, Softplus = 18, Exp = 19, Neg = 20,
-        Tanh = 21, Relu = 22, Sqr = 23, Sqrt = 24, SwigluSplit = 25, GegluSplit = 26,
-        Reshape = 27, View = 28, Permute = 29, Transpose = 30, Cont = 31, Cast = 32, Cpy = 33,
-        SetRows = 34, RopeExt = 35, FlashAttnExt = 36, SoftMaxExt = 37, Argsort = 38, TopK = 39,
-        SumRows = 40, SsmConv = 41, GatedDeltaNet = 42, Concat = 43, Clamp = 44, Repeat = 45,
-        Pad = 46, Mean = 47, AddId = 48, Argmax = 49, KvWindow = 50, Swiglu = 51, Geglu = 52, RopeMulti = 53,
-        MoeHostExperts = 54, LightningIndexer = 55, TopKMask = 56,
-        /// <summary>A tensor-parallel partial, summed in place across the ranks of <see cref="GgmlGraph.RunRanked"/>.</summary>
-        AllReduce = 57,
-        /// <summary>ggml_conv_2d: kernel [KW, KH, IC, OC], x [W, H, IC, N]; ip s0, s1, p0, p1, d0, d1.</summary>
-        Conv2d = 58,
-        /// <summary>ggml_pad_reflect_1d: x; ip p0, p1.</summary>
-        PadReflect1d = 59,
-        /// <summary>A depthwise 2-D convolution of rows of channels (GraphOp.DepthwiseConv2d).</summary>
-        DepthwiseConv2d = 70,
-        /// <summary>The exact GELU, 0.5 x (1 + erf(x / sqrt 2)) (ggml_gelu_erf).</summary>
-        GeluErf = 71,
-        /// <summary>ggml_log.</summary>
-        Log = 72,
-        /// <summary>ggml_cumsum: the running sum along ne0.</summary>
-        CumSum = 73,
-        /// <summary>ggml_ssm_scan (Mamba-2): s, x, dt, A, B, C, ids; ip K states kept.</summary>
-        SsmScan = 74,
-        /// <summary>ggml_swiglu_oai (GPT-OSS): gate, up; fp alpha, limit.</summary>
-        SwigluOai = 75,
-    }
-
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>
     public static class GgmlType
     {
@@ -75,6 +43,7 @@ namespace TensorSharp.GGML
         /// optimizer); a family opts in where it measures faster.</param>
         public GgmlGraph(int maxNodes, bool replayable = false, bool reorder = false)
         {
+            GgmlNative.EnsureGraphSchema();
             _handle = GgmlNative.TSGgml_GraphCreate(maxNodes, replayable ? 1 : 0, reorder ? 1 : 0);
             if (_handle == IntPtr.Zero)
                 throw new InvalidOperationException("ggml graph creation failed: " + GgmlBasicOps.LastNativeError());

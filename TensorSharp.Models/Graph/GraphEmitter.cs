@@ -21,7 +21,7 @@ namespace TensorSharp.Models.Graph
     /// diffusion runtime's denoiser and VAE programs both build on it, so the two runtimes record programs the same
     /// way and every executor plugin runs either.
     /// </summary>
-    public class GraphEmitter : IDisposable
+    public class GraphEmitter : IDisposable, IGraphOpEmitter
     {
         private readonly IGraphExecutor _executor;
         private protected readonly GraphProgramBuilder _b;
@@ -290,7 +290,6 @@ namespace TensorSharp.Models.Graph
         public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, bool promptChunk = false, int band = 0, int sinks = -1)
         {
             if (sinks >= 0 && mask < 0) throw new ArgumentException("Attention sinks ride after the mask operand.", nameof(sinks));
-            Span<int> srcs = sinks >= 0 ? stackalloc[] { q, k, v, mask, sinks } : stackalloc[] { q, k, v, mask };
             // ip[2] only on a prompt chunk's op or a device band's (GraphAttentionRows), ip[3] only on a device band's: every
             // other op keeps the ip, bytes and signature it had.
             long rows = promptChunk ? GraphAttentionRows.PromptChunk : GraphAttentionRows.Unsaid;
@@ -298,7 +297,12 @@ namespace TensorSharp.Models.Graph
                 : promptChunk ? stackalloc long[] { 10, Math.Max(kvMax, 0), rows }
                 : kvMax > 0 ? stackalloc long[] { 10, kvMax } : stackalloc long[] { 10 };
             ObserveAttention(ip, band);
-            return Op(GraphOp.FlashAttnExt, mask >= 0 ? srcs : srcs[..3], ip, stackalloc[] { scale, 0f, 0f });
+            // The schema's typed emitter, given exactly the slots the forms above carry (a trailing slot left null is left out).
+            return this.EmitFlashAttnExt(q, k, v, mask, sinks >= 0 ? sinks : -1, accPrecision: 10,
+                kvMax: ip.Length > GraphOpParams.FlashAttnExt.Ip.KvMax ? ip[GraphOpParams.FlashAttnExt.Ip.KvMax] : null,
+                rowsKind: ip.Length > GraphOpParams.FlashAttnExt.Ip.RowsKind ? rows : null,
+                band: ip.Length > GraphOpParams.FlashAttnExt.Ip.Band ? band : null,
+                scale: scale, maxBias: 0f, softcap: 0f);
         }
 
         /// <summary>Called with every attention op's ip (and its device band, 0 for none) before it is emitted.</summary>

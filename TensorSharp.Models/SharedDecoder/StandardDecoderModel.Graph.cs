@@ -3105,8 +3105,8 @@ namespace TensorSharp.Models
                     step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, rowsAt));
                     step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, rowsAt));
                     int gqa = AttendsStridedWindows ? -1 : heads / kvHeads;
-                    int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, ring, kvType, count, gqa });
-                    int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
+                    int kWin = step.EmitKvWindow(ck, d, cap, kvHeads, 0, ring, kvType, queryRows: count, gqaRatio: gqa);
+                    int vWin = step.EmitKvWindow(cv, dv, cap, kvHeads, 0, ring, kvType, queryRows: count, gqaRatio: gqa);
                     int mask = step.RingBandMask(ring, start, count, s, band);
                     if (keepForSharers) step.KeepSharedKv(layer, s, new SharedKvOperands(kWin, vWin, mask, ring, new AttentionKeys(-1, ring, start, count),
                         DeviceBand(step, band, d, kvType)));
@@ -3188,8 +3188,8 @@ namespace TensorSharp.Models
                     if (band > 0 && !capacity) step.LimitAdvance(start, first + stepRows + band - 1, s);
                     int keys = window - first;
                     int gqa = AttendsStridedWindows ? -1 : heads / kvHeads;
-                    int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, first, keys, kvType, count, gqa });
-                    int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, first, keys, kvType, count, gqa });
+                    int kWin = step.EmitKvWindow(ck, d, cap, kvHeads, first, keys, kvType, queryRows: count, gqaRatio: gqa);
+                    int vWin = step.EmitKvWindow(cv, dv, cap, kvHeads, first, keys, kvType, queryRows: count, gqaRatio: gqa);
                     bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));
                     int mask = band > 0 ? step.BandMask(keys, first, start, count, s, band) : step.ChunkMask(window, start, count, s);
                     if (keepForSharers) step.KeepSharedKv(layer, s, new SharedKvOperands(kWin, vWin, mask, keys, new AttentionKeys(first, 0, start, count),
@@ -3379,8 +3379,8 @@ namespace TensorSharp.Models
             int fa;
             if (RingWrapped(cacheLayer, start, count))
             {
-                int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, ring, kvType, count, gqa });
-                int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
+                int kWin = step.EmitKvWindow(ck, d, cap, kvHeads, 0, ring, kvType, queryRows: count, gqaRatio: gqa);
+                int vWin = step.EmitKvWindow(cv, dv, cap, kvHeads, 0, ring, kvType, queryRows: count, gqaRatio: gqa);
                 int mask = step.RingBandMask(ring, start, count, s, band);
                 fa = step.FlashAttention(qPerm, kWin, vWin, mask, scale, AttentionKvMax(step, cacheLayer, s), false, DeviceBand(step, band, d, kvType));
             }
@@ -3392,8 +3392,8 @@ namespace TensorSharp.Models
                 int first = band > 0 && !capacity ? SlidingWindowFirstCell(start, band, stepRows) : 0;
                 if (band > 0 && !capacity) step.LimitAdvance(start, first + stepRows + band - 1, s);
                 int keys = window - first;
-                int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, first, keys, kvType, count, gqa });
-                int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, first, keys, kvType, count, gqa });
+                int kWin = step.EmitKvWindow(ck, d, cap, kvHeads, first, keys, kvType, queryRows: count, gqaRatio: gqa);
+                int vWin = step.EmitKvWindow(cv, dv, cap, kvHeads, first, keys, kvType, queryRows: count, gqaRatio: gqa);
                 int mask = band > 0 ? step.BandMask(keys, first, start, count, s, band) : step.ChunkMask(window, start, count, s);
                 fa = step.FlashAttention(qPerm, kWin, vWin, mask, scale, AttentionKvMax(step, cacheLayer, s), false,
                     capacity ? DeviceBand(step, band, d, kvType) : 0);
@@ -4056,11 +4056,15 @@ namespace TensorSharp.Models
             internal int RopeMultiAt(int x, RotarySpec spec, int table)
             {
                 int[] sections = _m.RotarySections ?? throw new NotSupportedException($"{_m.Config.Architecture} has no multi-axis rotary.");
-                return Op(GraphOp.RopeMulti, stackalloc[] { x, table },
-                    stackalloc long[] { spec.Dims, 40 /* GGML_ROPE_TYPE_IMROPE */, spec.OriginalContext,
-                        sections[0], sections[1], sections[2], sections.Length > 3 ? sections[3] : 0 },
-                    stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+                return RopeMultiOp(x, spec, table, sections);
             }
+
+            /// <summary>ggml's interleaved M-RoPE over the family's sections at a position table (the schema's typed emitter, the
+            /// slots it always wrote).</summary>
+            private int RopeMultiOp(int x, RotarySpec spec, int table, int[] sections)
+                => this.EmitRopeMulti(x, table, spec.Dims, 40 /* GGML_ROPE_TYPE_IMROPE */, spec.OriginalContext,
+                    sections[0], sections[1], sections[2], spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor,
+                    spec.BetaFast, spec.BetaSlow, section3: sections.Length > 3 ? sections[3] : 0);
 
             /// <summary>Multi-axis rotary positions [4 * rows] (I32), or -1.</summary>
             public int PositionTable { get; private set; } = -1;
@@ -4576,13 +4580,9 @@ namespace TensorSharp.Models
             /// <summary>Rotary over x [d, heads, n] at <paramref name="positions"/> (I32 [n]) rather than the step's rows'
             /// positions (keys pooled at their blocks' first cells).</summary>
             internal int RopeAt(int x, RotarySpec spec, int positions)
-                => spec.FreqFactorsWeight != null
-                    ? Op(GraphOp.RopeExt, stackalloc[] { x, positions, Weight(spec.FreqFactorsWeight) },
-                        stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
-                        stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow })
-                    : Op(GraphOp.RopeExt, stackalloc[] { x, positions },
-                        stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
-                        stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+                => this.EmitRopeExt(x, positions, spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext,
+                    spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow,
+                    freqFactors: spec.FreqFactorsWeight != null ? Weight(spec.FreqFactorsWeight) : -1);
 
             /// <summary>Positions [count] of sequence <paramref name="s"/>'s rows (a view of the step's).</summary>
             internal int SequencePositions(int s)
@@ -4601,13 +4601,8 @@ namespace TensorSharp.Models
                     return RopeAt(x, spec, Positions);
                 }
                 if (PositionTable >= 0 && _m.RotarySections is { } sections)
-                    return Op(GraphOp.RopeMulti, stackalloc[] { x, PositionTable },
-                        stackalloc long[] { spec.Dims, 40 /* GGML_ROPE_TYPE_IMROPE */, spec.OriginalContext,
-                            sections[0], sections[1], sections[2], sections.Length > 3 ? sections[3] : 0 },
-                        stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
-                return Op(GraphOp.RopeExt, stackalloc[] { x, Positions },
-                    stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
-                    stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+                    return RopeMultiOp(x, spec, PositionTable, sections);
+                return RopeAt(x, spec, Positions);
             }
 
             /// <summary>Every attention op a traced step emits adds its ip to <see cref="AttentionIpForTests"/> when set
