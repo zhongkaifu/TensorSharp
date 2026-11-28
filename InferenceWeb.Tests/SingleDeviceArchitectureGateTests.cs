@@ -5,7 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Families whose factories never pass --tp on (DiffusionGemma, Wan, MiniMax-H3)
+// Families whose factories never pass --tp on (DiffusionGemma, Wan; MiniMax-H3 before it sharded)
 // used to keep the descriptor's default TensorParallel mode, so the shared gate
 // stepped aside: --tp N was dropped without a word and a distributed group was
 // handed to a model that would never issue its collectives. Declaring them
@@ -24,19 +24,17 @@ public sealed class SingleDeviceArchitectureGateTests
     {
         "diffusion-gemma",
         "wan",
-        // minimax-h3 is no longer here: its denoiser runs --layer-split N as whole-block stages, and its tensor-parallel gap
-        // is held by MiniMaxH3DenoiserTests.TensorParallelIsTheContractsGapAndLayerSplitPassesItsGate.
+        // minimax-h3 is no longer here: its denoiser runs --layer-split N as whole-block stages and --tp N on cuda as
+        // sharded ranks, held by MiniMaxH3DenoiserTests.TensorParallelOnCudaAndLayerSplitPassTheirGates.
     };
 
-    /// <summary>Families without a tensor-parallel path: the single-device ones, and MiniMax-H3 video, whose blocks split over
-    /// GPUs as whole-block stages (--layer-split N: MiniMaxH3DenoiserTests) but are not sharded. LTX 2.5 is no longer here: its
-    /// denoiser shards over GPUs on --backend cuda (Ltx25DenoiserTensorParallelTests), and its ggml_cuda gap is held by
-    /// <see cref="Ltx25_DeclaresTensorParallelismAndLayerSplitOnCuda"/>.</summary>
+    /// <summary>Families without a tensor-parallel path: the single-device ones. MiniMax-H3 video and LTX 2.5 are no longer
+    /// here: their denoisers shard over GPUs on --backend cuda (MiniMaxH3DenoiserTests.TensorParallelRanks*,
+    /// Ltx25DenoiserTensorParallelTests), and their ggml_cuda gaps are held by those families' gate tests.</summary>
     public static TheoryData<string> NoTensorParallelFamilies => new()
     {
         "diffusion-gemma",
         "wan",
-        "minimax-h3",
     };
 
     private static ModelArchitectureDescriptor Arch(string id)

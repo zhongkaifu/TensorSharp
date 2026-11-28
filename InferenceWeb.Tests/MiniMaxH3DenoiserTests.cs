@@ -621,26 +621,313 @@ public sealed class MiniMaxH3DenoiserTests(ITestOutputHelper output)
         Assert.Equal(2 * compiles, staged.Compiles);   // one program a stage wherever one device compiles one
     }
 
-    /// <summary>The family's contract: the shared diffusion runtime's, with layer split on cuda and ggml_cuda (whole-block
-    /// stages, the tests above), which the gate lets through there and refuses on a backend of one device; tensor parallelism
-    /// and the hybrid are gaps the gate refuses, naming the family, and distributed groups are refused.</summary>
+    // ================================================================ tensor parallelism (--tp N)
+
+    /// <summary>Whether the tests' degrees split a case's fixture: the Q4_K fixture's attention output projection reads 256
+    /// columns, one Q4_K block a row, which two ranks cannot share in whole blocks, so the denoiser refuses it
+    /// (<see cref="TensorParallelRefusesWhatDoesNotDivide"/>); the release's 7168 columns split over 2, 4 and 7 GPUs.</summary>
+    private static bool Splits(MiniMaxH3VideoGoldens.StepCase c) => c.Projections != MiniMaxH3ImageFixture.Q4_K;
+
+    /// <summary>
+    /// Each step's video and audio against one device's: the L2 norm of the difference over the reference's within
+    /// <paramref name="l2Bound"/>, and the largest difference over the largest value within <paramref name="maxBound"/>, both
+    /// logged. The ranks sum each row-parallel projection's partials in another order than one device's product sums its
+    /// columns, so the steps agree to rounding, not bit for bit.
+    /// </summary>
+    private void AssertRanksClose(List<(float[] Video, float[] Audio)> want, List<(float[] Video, float[] Audio)> got, string what,
+        double l2Bound, double maxBound)
+    {
+        Assert.Equal(want.Count, got.Count);
+        for (int i = 0; i < want.Count; i++)
+        {
+            var (video, videoL2) = Compare(want[i].Video, got[i].Video);
+            var (audio, audioL2) = Compare(want[i].Audio, got[i].Audio);
+            output.WriteLine($"[h3-tp] {what}, step {i + 1}: ranks vs one device: video max {video:E3} (L2 {videoL2:E3}), " +
+                             $"audio max {audio:E3} (L2 {audioL2:E3})");
+            Assert.True(videoL2 <= l2Bound && audioL2 <= l2Bound,
+                $"{what}, step {i + 1}: relative L2 video {videoL2:E3}, audio {audioL2:E3} (bound {l2Bound:E1})");
+            Assert.True(video <= maxBound && audio <= maxBound,
+                $"{what}, step {i + 1}: largest difference video {video:E3}, audio {audio:E3} (bound {maxBound:E1})");
+        }
+    }
+
+    /// <summary>
+    /// The trunk sharded over a simulated group of <paramref name="ranks"/> host devices (SimulatedDeviceGroup: host
+    /// allocators, an exact host all-reduce; the managed executor a rank, serving the wide DiT regions as one device's does):
+    /// every splitting case's every step, video and audio, equals one device's to rounding, with and without the LoRA plug-in
+    /// (each rank binds its share of the trunk's factors, the token refiner's whole on rank 0) and again after it; each rank
+    /// compiles where one device compiles (once a geometry and LoRA set), two all-reduces a block a step, the refiner once a
+    /// prompt; released device copies give the ranks' first bytes again. A rank holds its shards, not the whole trunk.
+    /// <para>
+    /// Measured on the x64 dev container (two and four ranks, every step): BF16 within relative L2 2.3e-7 and a largest
+    /// difference of 3.9e-7 of the largest value (with the LoRA plug-in; 2.2e-7 without), Q8_0 within 1.5e-7 and 2.3e-7.
+    /// Bounds: 1e-5 for both on the float formats; on Q8_0 2e-4 and 2e-3, since the managed block-format products quantize
+    /// their activations and another host's kernels may flip one rounding where the reduction order moves a value across a
+    /// code boundary (the one-device lane saw a flip move a step by 7.6e-4, CheckCase).
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void TensorParallelRanksMatchOneDeviceOnTheManagedExecutor(int ranks)
+    {
+        foreach (MiniMaxH3VideoGoldens.StepCase c in MiniMaxH3VideoGoldens.Cases.Where(Splits))
+        {
+            bool roundsActivations = c.Projections == MiniMaxH3ImageFixture.Q8_0;
+            double l2Bound = roundsActivations ? 2e-4 : 1e-5, maxBound = roundsActivations ? 2e-3 : 1e-5;
+            using var fx = new MiniMaxH3VideoFixture(c.Projections);
+            using var one = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu);
+            using var group = new SimulatedDeviceGroup(ranks);
+            using var tp = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu, tensorParallel: group);
+            Assert.Equal(ranks, tp.Ranks.Count);
+            Assert.Null(tp.Stages);
+            Assert.True(tp.OnTensorExecutor);
+            Assert.True(tp.WeightBytes < one.WeightBytes, "a rank holds its shards of the trunk, not all of it");
+
+            List<(float[] Video, float[] Audio)> want = Steps(one, c, null);
+            int reduces = group.AllReduceCount;
+            List<(float[] Video, float[] Audio)> first = Steps(tp, c, null);
+            AssertRanksClose(want, first, $"{c.Name} over {ranks} ranks", l2Bound, maxBound);
+            Assert.Equal(2 * 2 * MiniMaxH3VideoFixture.Blocks, group.AllReduceCount - reduces);   // two steps, two a block
+            // One program a rank wherever one device compiles one (a geometry), replayed by the steps that follow.
+            Assert.InRange(one.Compiles, 1, 2);
+            Assert.Equal(ranks * one.Compiles, tp.Compiles);
+            Assert.Equal(1, one.Refinements);
+            Assert.Equal(one.Refinements, tp.Refinements);
+
+            if (c.Lora)
+            {
+                string manifest = fx.WriteLora();
+                using MiniMaxH3LoraSet oneSet = LoadLora(manifest, one, BackendType.Cpu);
+                using MiniMaxH3LoraSet tpSet = LoadLora(manifest, tp, BackendType.Cpu);
+                AssertRanksClose(Steps(one, c, oneSet), Steps(tp, c, tpSet), $"{c.Name} over {ranks} ranks with the LoRA plug-in",
+                    l2Bound, maxBound);
+                Assert.Same(tpSet, tp.BoundLora);
+                Assert.True(tp.RankLoraCopies > 0, "the ranks' shares of fc1's up and of out's and fc2's downs are copies");
+                Assert.Equal(ranks * one.Compiles, tp.Compiles);
+                Assert.Equal(one.Refinements, tp.Refinements);
+                // Without the adapters again: no rank keeps the set's plan, factors or shares.
+                AssertRanksClose(Steps(one, c, null), Steps(tp, c, null), $"{c.Name} over {ranks} ranks after the LoRA plug-in",
+                    l2Bound, maxBound);
+                Assert.Null(tp.BoundLora);
+                Assert.Equal(0, tp.RankLoraCopies);
+                Assert.Equal(ranks * one.Compiles, tp.Compiles);
+            }
+
+            // Released device copies (every rank's plan with them): the next steps compile each rank again, to the same bytes.
+            one.ReleaseDevice();
+            tp.ReleaseDevice();
+            List<(float[] Video, float[] Audio)> released = Steps(tp, c, null);
+            AssertRanksClose(Steps(one, c, null), released, $"{c.Name} over {ranks} ranks after released device copies", l2Bound,
+                maxBound);
+            AssertStepBits(first, released, $"{c.Name} over {ranks} ranks after released device copies, against the first steps");
+            Assert.Equal(ranks * one.Compiles, tp.Compiles);
+        }
+    }
+
+    /// <summary>
+    /// A rank's weights: the trunk's projections are its shares (qkv and fc1 its rows of each stacked part, out and fc2 its
+    /// input columns, each rank's shards together the whole projection's bytes), every other leaf is the denoiser's own, the
+    /// token refiner's on rank 0 only; a rank's share of a stacked projection is the rank's rows of each part, in part order.
+    /// </summary>
     [Fact]
-    public void TensorParallelIsTheContractsGapAndLayerSplitPassesItsGate()
+    public void TensorParallelRanksHoldTheirShardsOfEachBlock()
+    {
+        using var fx = new MiniMaxH3VideoFixture(MiniMaxH3ImageFixture.BF16);
+        using var group = new SimulatedDeviceGroup(2);
+        using var tp = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu, tensorParallel: group);
+        using var weights = new MiniMaxH3DenoiserWeights(fx.DitPath, BackendType.Cpu);
+        List<MiniMaxH3DitWeight> rank0 = tp.RankWeights(0), rank1 = tp.RankWeights(1);
+        Assert.Contains(rank0, w => w.Ne0 == MiniMaxH3VideoFixture.Inner / 2 && w.Ne1 == MiniMaxH3VideoFixture.Hidden);   // out's columns
+        Assert.Contains(rank0, w => w.Ne0 == MiniMaxH3VideoFixture.Hidden && w.Ne1 == 3 * MiniMaxH3VideoFixture.Inner / 2);   // qkv's rows
+        Assert.Contains(rank0, w => w.Ne0 == MiniMaxH3VideoFixture.Hidden && w.Ne1 == MiniMaxH3VideoFixture.Ffn);   // fc1's rows of each half
+        Assert.Contains(rank0, w => w.Ne0 == MiniMaxH3VideoFixture.Ffn / 2 && w.Ne1 == MiniMaxH3VideoFixture.Hidden);   // fc2's columns
+        long refiner = weights.Refiner.SelectMany(MiniMaxH3DenoiserWeights.Of).Sum(w => w.Bytes) + weights.ConditionProj.Weight.Bytes +
+                       (weights.ConditionProj.Bias?.Bytes ?? 0) + (weights.RefinerFinalNorm?.Bytes ?? 0);
+        // Rank 0 holds every weight but the other rank's half of the trunk's projections; rank 1 the same but the refiner.
+        Assert.Equal(weights.Bytes - TrunkProjectionBytes(weights) / 2, rank0.Sum(w => w.Bytes));
+        Assert.Equal(rank0.Sum(w => w.Bytes) - refiner, rank1.Sum(w => w.Bytes));
+        Assert.Equal(rank0.Sum(w => w.Bytes), tp.WeightBytes);
+
+        // Rank 1's qkv share is the rows of its heads of q, then of k, then of v; its fc1 share its rows of gate, then of value.
+        MiniMaxH3DitWeight wholeQkv = weights.Blocks[0].Qkv.Weight, wholeFc1 = weights.Blocks[0].Fc1.Weight;
+        MiniMaxH3DitWeight qkv = rank1.Single(w => w.Ne1 == 3 * MiniMaxH3VideoFixture.Inner / 2 && w.Bytes == wholeQkv.Bytes / 2 &&
+            Rows(w, 0).SequenceEqual(Rows(wholeQkv, MiniMaxH3VideoFixture.Inner / 2)));
+        long half = MiniMaxH3VideoFixture.Inner / 2;
+        for (int part = 0; part < 3; part++)
+            Assert.Equal(Rows(wholeQkv, part * MiniMaxH3VideoFixture.Inner + half, half), Rows(qkv, part * half, half));
+        MiniMaxH3DitWeight fc1 = rank1.Single(w => w.Ne1 == MiniMaxH3VideoFixture.Ffn && w.Ne0 == MiniMaxH3VideoFixture.Hidden &&
+            Rows(w, 0).SequenceEqual(Rows(wholeFc1, MiniMaxH3VideoFixture.Ffn / 2)));
+        for (int part = 0; part < 2; part++)
+            Assert.Equal(Rows(wholeFc1, part * MiniMaxH3VideoFixture.Ffn + MiniMaxH3VideoFixture.Ffn / 2, MiniMaxH3VideoFixture.Ffn / 2),
+                Rows(fc1, part * MiniMaxH3VideoFixture.Ffn / 2, MiniMaxH3VideoFixture.Ffn / 2));
+    }
+
+    /// <summary>The bytes of the trunk's qkv, out, fc1 and fc2 (the projections the ranks shard).</summary>
+    private static long TrunkProjectionBytes(MiniMaxH3DenoiserWeights w) =>
+        w.Blocks.Sum(b => b.Qkv.Weight.Bytes + b.Out.Weight.Bytes + b.Fc1.Weight.Bytes + b.Fc2.Weight.Bytes);
+
+    /// <summary>Rows [<paramref name="first"/>, + <paramref name="count"/>) of a projection's bytes (one row if count is 1).</summary>
+    private static unsafe byte[] Rows(MiniMaxH3DitWeight w, long first, long count = 1)
+    {
+        long row = w.Bytes / w.Ne1;
+        return new ReadOnlySpan<byte>((byte*)w.Data + first * row, checked((int)(count * row))).ToArray();
+    }
+
+    /// <summary>
+    /// What tensor parallelism refuses, at load, with the reason: a degree that does not divide the heads (every rank holds
+    /// whole heads), one whose share of a row-parallel projection's input columns cuts its quant blocks (the Q4_K fixture's
+    /// 256 columns over two ranks), the hybrid (tensor-parallel stages), and a GGML backend (its ranked runner takes no DiT
+    /// regions). The release's shapes (56 heads of 128, FFN 14336): Q4_K splits over 2, 4 and 7 GPUs, not 8 (896 columns a
+    /// GPU), Q8_0 over 8; 3 GPUs divide no head count of 56.
+    /// </summary>
+    [Fact]
+    public void TensorParallelRefusesWhatDoesNotDivide()
+    {
+        using var fx = new MiniMaxH3VideoFixture(MiniMaxH3ImageFixture.BF16);
+        using (var three = new SimulatedDeviceGroup(3))
+        {
+            var heads = Assert.Throws<NotSupportedException>(() => new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu, tensorParallel: three));
+            Assert.Contains("--tp 3", heads.Message, StringComparison.Ordinal);
+            Assert.Contains($"{MiniMaxH3VideoFixture.Heads} heads", heads.Message, StringComparison.Ordinal);
+        }
+        using var two = new SimulatedDeviceGroup(2);
+        using (var q4 = new MiniMaxH3VideoFixture(MiniMaxH3ImageFixture.Q4_K))
+        {
+            var blocks = Assert.Throws<NotSupportedException>(() => new MiniMaxH3Denoiser(q4.DitPath, BackendType.Cpu, tensorParallel: two));
+            Assert.Contains("out_proj", blocks.Message, StringComparison.Ordinal);
+            Assert.Contains("Q4_K", blocks.Message, StringComparison.Ordinal);
+            Assert.Contains("--tp 2", blocks.Message, StringComparison.Ordinal);
+        }
+        var devices = new IAllocator[] { new CpuAllocator(BlasEnum.DotNet), new CpuAllocator(BlasEnum.DotNet) };
+        var hybrid = Assert.Throws<NotSupportedException>(() =>
+            new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu, devices: devices, tensorParallel: two));
+        Assert.Contains("--layer-split or --tp", hybrid.Message, StringComparison.Ordinal);
+        var ggml = Assert.Throws<NotSupportedException>(() => new MiniMaxH3Denoiser(fx.DitPath, BackendType.GgmlCpu, tensorParallel: two));
+        Assert.Contains("ranked graph runner", ggml.Message, StringComparison.Ordinal);
+        // A group of one is one device.
+        using (var single = new SimulatedDeviceGroup(1))
+        using (var dit = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu, tensorParallel: single))
+            Assert.Null(dit.Ranks);
+
+        var release = new MiniMaxH3Config
+        {
+            HiddenSize = 5376, NumLayers = 50, NumAttentionHeads = 56, AttentionHeadDim = 128, FfnHiddenSize = 14336,
+        };
+        IEnumerable<(string, int, long)> RowParallel(int format) => Enumerable.Range(0, release.NumLayers).SelectMany(i => new[]
+        {
+            ($"blocks.{i}.attn.out_proj.weight", format, (long)release.AttentionInnerDim),
+            ($"blocks.{i}.mlp.fc2.weight", format, (long)release.FfnHiddenSize),
+        });
+        foreach (int degree in new[] { 2, 4, 7 })
+            Assert.Null(MiniMaxH3Denoiser.TensorParallelRefusal(release, degree, RowParallel(MiniMaxH3ImageFixture.Q4_K)));
+        string eight = MiniMaxH3Denoiser.TensorParallelRefusal(release, 8, RowParallel(MiniMaxH3ImageFixture.Q4_K));
+        Assert.Contains("896", eight, StringComparison.Ordinal);
+        Assert.Contains("Q4_K", eight, StringComparison.Ordinal);
+        Assert.Null(MiniMaxH3Denoiser.TensorParallelRefusal(release, 8, RowParallel(MiniMaxH3ImageFixture.Q8_0)));
+        Assert.Contains("56 heads", MiniMaxH3Denoiser.TensorParallelRefusal(release, 3, RowParallel(MiniMaxH3ImageFixture.BF16)),
+            StringComparison.Ordinal);
+        Assert.Null(MiniMaxH3Denoiser.TensorParallelRefusal(release, 1, RowParallel(MiniMaxH3ImageFixture.Q4_K)));
+    }
+
+    /// <summary>The model refuses --tp off the direct CUDA backend at load, before its companions are resolved, naming the
+    /// backend: a supplied group on cpu does not reach a denoiser.</summary>
+    [Fact]
+    public void TheModelRefusesTensorParallelismOffCuda()
+    {
+        using var fx = new MiniMaxH3VideoFixture(MiniMaxH3ImageFixture.BF16);
+        var group = new SimulatedDeviceGroup(2);
+        var e = Assert.Throws<ModelLoadRefusedException>(() => new MiniMaxH3Model(fx.DitPath, BackendType.Cpu, tpDegree: 2, tpGroup: group));
+        Assert.Contains("--backend cuda", e.Message, StringComparison.Ordinal);
+        Assert.Contains("--tp 2", e.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same over two CUDA devices (the direct CUDA backend's group: one tensor executor a device, the partials summed by
+    /// the device-ordered peer reduction), every case's steps against one GPU's, plain and with the LoRA plug-in where the
+    /// case has one: within relative L2 1e-5 and 1e-4 of the largest value (the products keep their activations in F32 on
+    /// both; the ranks sum the row-parallel partials in another order). The Q4_K fixture is refused (it does not split over
+    /// two in whole blocks). Every rank compiles once a geometry; its weights' copies stay on its device after a step and go
+    /// with the denoiser.
+    /// </summary>
+    [MultiCudaTheory(2)]
+    [MemberData(nameof(CaseNames))]
+    public void TensorParallelOnTwoCudaDevicesMatchesOneDevice(string name)
+    {
+        MiniMaxH3VideoGoldens.StepCase c = MiniMaxH3VideoGoldens.Cases.Single(x => x.Name == name);
+        using var fx = new MiniMaxH3VideoFixture(c.Projections);
+        using var group = new TensorSharp.Cuda.TensorParallelGroup(2);
+        if (!Splits(c))
+        {
+            var refused = Assert.Throws<NotSupportedException>(() =>
+                new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cuda, group.GetAllocator(0), tensorParallel: group));
+            Assert.Contains("Q4_K", refused.Message, StringComparison.Ordinal);
+            return;
+        }
+        string manifest = c.Lora ? fx.WriteLora() : null;
+        List<(float[] Video, float[] Audio)> want, wantLora = null;
+        int compiles;
+        using (var one = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cuda, group.GetAllocator(0)))
+        using (MiniMaxH3LoraSet set = c.Lora ? LoadLora(manifest, one, BackendType.Cuda) : null)
+        {
+            want = Steps(one, c, null);
+            if (set != null) wantLora = Steps(one, c, set);
+            compiles = one.Compiles;
+        }
+        var tp = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cuda, group.GetAllocator(0), tensorParallel: group);
+        try
+        {
+            Assert.Equal(2, tp.Ranks.Count);
+            AssertRanksClose(want, Steps(tp, c, null), name + " over two CUDA devices", 1e-5, 1e-4);
+            if (c.Lora)
+            {
+                using MiniMaxH3LoraSet tpSet = LoadLora(manifest, tp, BackendType.Cuda);
+                AssertRanksClose(wantLora, Steps(tp, c, tpSet), name + " over two CUDA devices with the LoRA plug-in", 1e-5, 1e-4);
+            }
+            Assert.Equal(2 * compiles, tp.Compiles);   // one program a rank wherever one device compiles one
+            IReadOnlyList<IntPtr> keys = tp.DeviceCopyKeysForTest();
+            int Resident(int rank) => keys.Count(k => CudaQuantizedOps.TryGetResidentDevicePtr(group.GetCudaAllocator(rank), k, out _, out _));
+            Assert.True(Resident(0) > 0 && Resident(1) > 0, "each rank's weights stay resident on its device");
+            tp.Dispose();
+            Assert.Equal(0, Resident(0));
+            Assert.Equal(0, Resident(1));
+        }
+        finally
+        {
+            tp.Dispose();
+        }
+    }
+
+    /// <summary>The family's contract: the shared diffusion runtime's, with layer split on cuda and ggml_cuda (whole-block
+    /// stages) and tensor parallelism on cuda (the ranks), both proven by the tests above, which the gate lets through there; tensor
+    /// parallelism on ggml_cuda and the hybrid are gaps the gate refuses, naming the family; a backend of one device refuses
+    /// both, and distributed groups are refused.</summary>
+    [Fact]
+    public void TensorParallelOnCudaAndLayerSplitPassTheirGates()
     {
         Assert.True(ModelArchitectureRegistry.TryGet("minimax-h3", out var arch));
         Assert.Equal(ServingImplementation.SharedDiffusionRuntime, arch.Serving.Implementation);
         Assert.Equal(new[] { BackendType.Cuda, BackendType.GgmlCuda }, arch.Serving.LayerSplit.Backends);
-        Assert.Empty(arch.Serving.TensorParallel.Backends);
+        Assert.Equal(new[] { BackendType.Cuda }, arch.Serving.TensorParallel.Backends);
         Assert.Empty(arch.Serving.HybridParallel.Backends);
+        Assert.False(arch.SupportsDistributedTensorParallel);
         Assert.Contains("minimax-h3", arch.Serving.TensorParallel.GapReason, StringComparison.Ordinal);
         foreach (BackendType backend in new[] { BackendType.Cuda, BackendType.GgmlCuda })
         {
             ITensorParallelGroup group = null;
             Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(arch, backend, 1, ref group, out int split, 2));
             Assert.Equal(2, split);
-            var tp = Assert.Throws<NotSupportedException>(() => ModelBase.ResolveTensorParallelSupport(arch, backend, 2, ref group, out _));
-            Assert.Contains("--tp 2", tp.Message, StringComparison.Ordinal);
-            Assert.Contains("minimax-h3", tp.Message, StringComparison.Ordinal);
+            if (backend == BackendType.Cuda)
+            {
+                Assert.Equal(2, ModelBase.ResolveTensorParallelSupport(arch, backend, 2, ref group, out int noSplit));
+                Assert.Equal(1, noSplit);
+            }
+            else
+            {
+                var tp = Assert.Throws<NotSupportedException>(() => ModelBase.ResolveTensorParallelSupport(arch, backend, 2, ref group, out _));
+                Assert.Contains("--tp 2", tp.Message, StringComparison.Ordinal);
+                Assert.Contains("minimax-h3", tp.Message, StringComparison.Ordinal);
+            }
             var hybrid = Assert.Throws<NotSupportedException>(() =>
                 ModelBase.ResolveTensorParallelSupport(arch, backend, 2, ref group, out _, 2));
             Assert.Contains("--layer-split 2", hybrid.Message, StringComparison.Ordinal);

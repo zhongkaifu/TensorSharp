@@ -1779,7 +1779,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | Hunyuan Dense | ✅ + 按层切分 + 混合 | 共享解码运行时：与 Mistral 3 相同的放置方式（`--tp T`、`--layer-split P` 及两者组合），每种放置下都保持批处理。 |
 | DiffusionGemma | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | Wan 2.1 / 2.2 | — | 仅支持单设备：张量并行、按层切分和分布式组均在启动时被拒绝 |
-| MiniMax-H3 | 按层切分 | `cuda` 与 `ggml_cuda` 上的 `--layer-split N` 把去噪器的 50 个块按整块分段放到 N 张 GPU 上，按权重字节均衡：每张 GPU 只持有本段的权重与 LoRA 因子，残差流每步在段与段之间传递一次。文本编码器、视觉塔与两个 VAE 留在第一张 GPU 上。它用来容纳单卡放不下的去噪器，不会让单步更快。`--tp N > 1`、`--tp` 与 `--layer-split` 组合以及分布式组均在启动时被拒绝。已在两个模拟的主机设备上逐位验证；双 GPU 测试尚未运行 |
+| MiniMax-H3 | TP（`cuda`）+ 按层切分 | `cuda` 与 `ggml_cuda` 上的 `--layer-split N` 把去噪器的 50 个块按整块分段放到 N 张 GPU 上，按权重字节均衡：每张 GPU 只持有本段的权重与 LoRA 因子，残差流每步在段与段之间传递一次。它用来容纳单卡放不下的去噪器，不会让单步更快。`cuda` 上的 `--tp N` 则切分每个块（每张 GPU 持有每块 56/N 个注意力头与 14336/N 个 FFN 列，每块两次 all-reduce；LoRA 插件随之切分）：N 必须整除 56 个头，且每张 GPU 分到的注意力输出投影与 fc2 输入列必须是完整的量化块，因此 Q4_K 检查点可用 `--tp 2`、`4` 或 `7`，`8` 在加载时被拒绝。两种方式下文本编码器、视觉塔与两个 VAE 都留在第一张 GPU 上。`ggml_cuda` 上的 `--tp`（GGML 的分 rank 运行器不接受 DiT 区域）、`--tp` 与 `--layer-split` 组合以及分布式组均在启动时被拒绝。已在模拟的主机设备上验证（按层切分逐位一致；`--tp 2` 与 `--tp 4` 与单设备相差在 4e-7 以内）；双 GPU 测试尚未运行，也不声称有加速 |
 | Qwen-Image-2.1 | ✅（仅本地，扩散 Transformer） | 在 `ggml_cuda` / `ggml_vulkan` 上，`--tp N`（N 为任何能整除 32 个注意力头的 GPU 数——单机上为 2、4、8 或 16——并受切分时的块对齐约束）切分 DiT 的注意力头与 MLP 列；LoRA 插件随之切分。用已退役的原生计算图在 2× A40 上以 `ggml_cuda` 实测加速 1.34-1.57×，但在 `ggml_vulkan` 上比单卡更慢（0.86×，主机归约）；扩散运行时的切分程序尚未在两张 GPU 上运行过。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，不支持多节点组。见 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#cuda-graph-与张量并行) |
 
 ### 后端支持
