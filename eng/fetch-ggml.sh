@@ -5,11 +5,14 @@
 # (TensorSharp.GGML.Native/CMakeLists.txt) and the CUDA PTX kernels
 # (TensorSharp.Backends.Cuda/native/kernels/tensorsharp_kernels.cu) consume the
 # sources at ExternalProjects/ggml. The directory is not committed; it is fetched
-# here at build time so the repo tracks upstream ggml.
+# here at build time from upstream ggml's latest release (its newest vX.Y.Z tag),
+# not from its moving master branch.
 #
 # Environment overrides:
 #   TENSORSHARP_GGML_GIT_URL   git URL                (default: ggml-org/ggml)
-#   TENSORSHARP_GGML_GIT_REF   branch/tag/commit      (default: master, the ggml default branch)
+#   TENSORSHARP_GGML_GIT_REF   branch/tag/commit, or latest-release (default): the
+#                              highest stable vX.Y.Z tag at the URL, looked up with
+#                              git ls-remote (master follows the default branch)
 #   TENSORSHARP_GGML_NO_UPDATE if set to 1/ON/true and a checkout or complete
 #                              source copy exists, use what is on disk.
 #
@@ -24,7 +27,7 @@ GGML_DIR="${REPO_ROOT}/ExternalProjects/ggml"
 LOCK_FILE="${EXTERNAL_PROJECTS_DIR}/.ggml-fetch.lock"
 
 GIT_URL="${TENSORSHARP_GGML_GIT_URL:-https://github.com/ggml-org/ggml.git}"
-GIT_REF="${TENSORSHARP_GGML_GIT_REF:-master}"
+GIT_REF="${TENSORSHARP_GGML_GIT_REF:-latest-release}"
 NO_UPDATE_RAW="${TENSORSHARP_GGML_NO_UPDATE:-}"
 
 mkdir -p "${EXTERNAL_PROJECTS_DIR}"
@@ -59,12 +62,36 @@ if is_truthy "${NO_UPDATE_RAW}" &&
     exit 0
 fi
 
-if [[ -d "${GGML_DIR}/.git" ]]; then
-    if is_truthy "${NO_UPDATE_RAW}"; then
-        echo "ggml: TENSORSHARP_GGML_NO_UPDATE set; using existing checkout at ${GGML_DIR}"
-        exit 0
-    fi
+if [[ -d "${GGML_DIR}/.git" ]] && is_truthy "${NO_UPDATE_RAW}"; then
+    echo "ggml: TENSORSHARP_GGML_NO_UPDATE set; using existing checkout at ${GGML_DIR}"
+    exit 0
+fi
 
+# The newest stable release tag (vMAJOR.MINOR.PATCH, no pre-release suffix) at the
+# URL, compared numerically (v1.10.0 after v1.9.0); empty when the remote cannot
+# be listed (offline) or has none.
+latest_release() {
+    git ls-remote --tags --refs "${GIT_URL}" 'refs/tags/v*' 2>/dev/null \
+        | awk '{ sub("^refs/tags/", "", $2); print $2 }' \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sed 's/^v//' | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1 | sed 's/^/v/' || true
+}
+
+if [[ "${GIT_REF}" == latest-release ]]; then
+    RELEASE="$(latest_release)"
+    if [[ -n "${RELEASE}" && "${RELEASE}" != v ]]; then
+        echo "ggml: latest release at ${GIT_URL} is ${RELEASE}"
+        GIT_REF="${RELEASE}"
+    elif [[ -d "${GGML_DIR}/.git" ]]; then
+        echo "ggml: WARNING - could not list the releases at ${GIT_URL} (offline?); using existing checkout" >&2
+        exit 0
+    else
+        echo "ggml: could not list the releases at ${GIT_URL} (offline?); set TENSORSHARP_GGML_GIT_REF to a tag, branch or commit" >&2
+        exit 1
+    fi
+fi
+
+if [[ -d "${GGML_DIR}/.git" ]]; then
     echo "ggml: updating existing checkout to ${GIT_REF} (${GIT_URL})"
     git -C "${GGML_DIR}" remote set-url origin "${GIT_URL}" 2>/dev/null || true
     if git -C "${GGML_DIR}" fetch --depth 1 origin "${GIT_REF}" 2>/dev/null; then

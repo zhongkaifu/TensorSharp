@@ -51,7 +51,7 @@ python eng/run-local-regression.py --mode plan --model-root D:\TensorSharp-model
 
 在独立 checkout 中完成构建，避免不同任务改写同一个 `bin`、`obj` 或原生构建树。不要对正在运行推理或链接原生 DLL 的目录重新配置、清理或复制库文件。
 
-首次构建的 ggml 获取默认跟随上游分支。要求可复现时，通过 `TENSORSHARP_GGML_GIT_REF` 明确选择依赖 revision，并记录实际 checkout；已有依赖离线重建可用 `TENSORSHARP_GGML_NO_UPDATE=1`。不要修改上游 ggml 源码来绕过测试失败。
+首次构建的 ggml 获取默认取上游最新 Release（最高的稳定版 `vX.Y.Z` 标签）。要求可复现时，通过 `TENSORSHARP_GGML_GIT_REF` 明确选择依赖 revision，并记录实际 checkout；已有依赖离线重建可用 `TENSORSHARP_GGML_NO_UPDATE=1`。不要修改上游 ggml 源码来绕过测试失败。
 
 现有默认输出位置如下；宿主并非都输出到 `bin/Release/net10.0`：
 

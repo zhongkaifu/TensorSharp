@@ -4,11 +4,14 @@
 # (TensorSharp.GGML.Native/CMakeLists.txt) and the CUDA PTX kernels
 # (TensorSharp.Backends.Cuda/native/kernels/tensorsharp_kernels.cu) consume the
 # sources at ExternalProjects/ggml. The directory is not committed; it is fetched
-# here at build time so the repo tracks upstream ggml.
+# here at build time from upstream ggml's latest release (its newest vX.Y.Z tag),
+# not from its moving master branch.
 #
 # Environment overrides:
 #   TENSORSHARP_GGML_GIT_URL   git URL                (default: ggml-org/ggml)
-#   TENSORSHARP_GGML_GIT_REF   branch/tag/commit      (default: master, the ggml default branch)
+#   TENSORSHARP_GGML_GIT_REF   branch/tag/commit, or latest-release (default): the
+#                              highest stable vX.Y.Z tag at the URL, looked up with
+#                              git ls-remote (master follows the default branch)
 #   TENSORSHARP_GGML_NO_UPDATE if set to 1/ON/true and a checkout or complete
 #                              source copy exists, use what is on disk.
 # Fetching and building leave upstream sources unchanged. Model-specific
@@ -21,7 +24,7 @@ $ExternalProjectsDir = Join-Path $RepoRoot "ExternalProjects"
 $GgmlDir = Join-Path $ExternalProjectsDir "ggml"
 
 $GitUrl = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_GIT_URL)) { "https://github.com/ggml-org/ggml.git" } else { $env:TENSORSHARP_GGML_GIT_URL }
-$GitRef = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_GIT_REF)) { "master" } else { $env:TENSORSHARP_GGML_GIT_REF }
+$GitRef = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_GIT_REF)) { "latest-release" } else { $env:TENSORSHARP_GGML_GIT_REF }
 
 New-Item -ItemType Directory -Force -Path $ExternalProjectsDir | Out-Null
 $Sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -55,11 +58,45 @@ if ((Test-Truthy $env:TENSORSHARP_GGML_NO_UPDATE) -and
     exit 0
 }
 
-if (Test-Path (Join-Path $GgmlDir ".git")) {
-    if (Test-Truthy $env:TENSORSHARP_GGML_NO_UPDATE) {
-        Write-Host "ggml: TENSORSHARP_GGML_NO_UPDATE set; using existing checkout at $GgmlDir"
+$HasCheckout = Test-Path (Join-Path $GgmlDir ".git")
+if ($HasCheckout -and (Test-Truthy $env:TENSORSHARP_GGML_NO_UPDATE)) {
+    Write-Host "ggml: TENSORSHARP_GGML_NO_UPDATE set; using existing checkout at $GgmlDir"
+    exit 0
+}
+
+# The newest stable release tag (vMAJOR.MINOR.PATCH, no pre-release suffix) at the
+# URL, compared numerically (v1.10.0 after v1.9.0); $null when the remote cannot
+# be listed (offline) or has none. git's stderr is not redirected (see below).
+function Get-LatestRelease {
+    $lines = @(git ls-remote --tags --refs $GitUrl 'refs/tags/v*')
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $tags = foreach ($line in $lines) {
+        $name = ($line -split '\s+')[1] -replace '^refs/tags/', ''
+        if ($name -match '^v(\d+)\.(\d+)\.(\d+)$') {
+            [pscustomobject]@{ Tag = $name; Version = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3]) }
+        }
+    }
+    $latest = $tags | Sort-Object Version | Select-Object -Last 1
+    if ($null -eq $latest) { return $null }
+    return $latest.Tag
+}
+
+if ($GitRef -eq "latest-release") {
+    $Release = Get-LatestRelease
+    if ($Release) {
+        Write-Host "ggml: latest release at $GitUrl is $Release"
+        $GitRef = $Release
+    }
+    elseif ($HasCheckout) {
+        Write-Warning "ggml: could not list the releases at $GitUrl (offline?); using existing checkout"
         exit 0
     }
+    else {
+        throw "ggml: could not list the releases at $GitUrl (offline?); set TENSORSHARP_GGML_GIT_REF to a tag, branch or commit"
+    }
+}
+
+if ($HasCheckout) {
 
     Write-Host "ggml: updating existing checkout to $GitRef ($GitUrl)"
     # Do not redirect git's stderr (no `2>$null`): git writes normal progress and

@@ -161,6 +161,38 @@ for ref in fixture-v1 "${FIRST_COMMIT}"; do
     assert_clean_checkout "${FRESH_WORKSPACE}" "${FIRST_COMMIT}" "fresh custom ref ${ref} stays clean"
 done
 
+# The default ref (unset or empty TENSORSHARP_GGML_GIT_REF) is the newest stable
+# release tag: vX.Y.Z compared numerically, pre-release and other tags ignored.
+git -C "${UPSTREAM}" tag v0.9.0 "${SECOND_COMMIT}"
+git -C "${UPSTREAM}" tag v0.10.0 "${FIRST_COMMIT}"
+git -C "${UPSTREAM}" tag v0.11.0-rc1 "${SECOND_COMMIT}"
+RELEASE_WORKSPACE="${TEST_ROOT}/release"
+mkdir -p "${RELEASE_WORKSPACE}/eng"
+cp "${FETCH_SCRIPT}" "${RELEASE_WORKSPACE}/eng/${FETCH_NAME}"
+run_fetch "${RELEASE_WORKSPACE}" ''
+assert_clean_checkout "${RELEASE_WORKSPACE}" "${FIRST_COMMIT}" 'default ref clones the latest release (v0.10.0, not v0.9.0 or a pre-release)'
+[[ "$(cat "${TEST_ROOT}/fetch.log")" == *'latest release'*'v0.10.0'* ]] \
+    || fail 'the latest release was not reported'
+run_fetch "${RELEASE_WORKSPACE}" master
+assert_clean_checkout "${RELEASE_WORKSPACE}" "${SECOND_COMMIT}" 'master still follows the default branch'
+run_fetch "${RELEASE_WORKSPACE}" latest-release
+assert_clean_checkout "${RELEASE_WORKSPACE}" "${FIRST_COMMIT}" 'latest-release updates an existing checkout to the release'
+# Offline: an existing checkout stays; without one the fetch fails and says how to pin.
+run_fetch "${RELEASE_WORKSPACE}" '' '' "${TEST_ROOT}/missing-origin"
+assert_clean_checkout "${RELEASE_WORKSPACE}" "${FIRST_COMMIT}" 'offline latest-release keeps the existing checkout'
+[[ "$(cat "${TEST_ROOT}/fetch.log")" == *'could not list the releases'* ]] \
+    || fail 'offline latest-release did not report the failed lookup'
+OFFLINE_WORKSPACE="${TEST_ROOT}/offline-fresh"
+mkdir -p "${OFFLINE_WORKSPACE}/eng"
+cp "${FETCH_SCRIPT}" "${OFFLINE_WORKSPACE}/eng/${FETCH_NAME}"
+if TENSORSHARP_GGML_GIT_URL="${TEST_ROOT}/missing-origin" TENSORSHARP_GGML_GIT_REF='' \
+     "${FETCH_RUNNER[@]}" "${OFFLINE_WORKSPACE}/eng/${FETCH_NAME}" > "${TEST_ROOT}/fetch.log" 2>&1; then
+    fail 'offline latest-release without a checkout succeeded'
+fi
+[[ "$(cat "${TEST_ROOT}/fetch.log")" == *'TENSORSHARP_GGML_GIT_REF'* ]] \
+    || fail 'offline latest-release without a checkout did not say how to pin a ref'
+echo 'PASS: offline latest-release without a checkout fails with advice'
+
 [[ -z "$(git -C "${UPSTREAM}" status --porcelain --untracked-files=all)" ]] \
     || fail 'fixture upstream was modified'
 [[ "$(git -C "${UPSTREAM}" rev-parse HEAD)" == "${SECOND_COMMIT}" ]] \
