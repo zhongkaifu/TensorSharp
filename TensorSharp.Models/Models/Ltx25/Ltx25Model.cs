@@ -40,6 +40,8 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     /// <summary>The x2 spatial latent upscaler between the half- and full-size passes.</summary>
     internal string LatentUpscalerPath { get; }
     internal IAllocator DirectAllocator => _allocator;
+    // The devices of the denoiser's whole-block stages (--layer-split N), the first DirectAllocator itself; null for one device.
+    private readonly IReadOnlyList<IAllocator> _denoiserDevices;
     // One clip at a time, and never across an adapter swap or an unload.
     private readonly object _generationLock = new();
     private DiffusionVideoPipeline _pipeline;
@@ -57,7 +59,10 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     /// <summary>The pipeline's denoiser, or null before the first clip.</summary>
     internal IDenoiser LoadedDenoiser => _pipeline?.LoadedDenoiser;
 
-    public Ltx25Model(string checkpoint, BackendType backend) : base(checkpoint, DirectBackend(backend))
+    /// <param name="layerSplitDegree">Devices the denoiser's 48 blocks are split over as whole-block stages (--layer-split N,
+    /// --backend cuda): each holds its share of the blocks; the text encoder, the VAEs and the upscaler run on the first.</param>
+    public Ltx25Model(string checkpoint, BackendType backend, int layerSplitDegree = 1)
+        : base(checkpoint, DirectBackend(backend), layerSplitDegree: layerSplitDegree)
     {
         try
         {
@@ -65,6 +70,8 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             if (geometry.VideoDim != 4096 || geometry.AudioDim != 2048 || geometry.Layers != 48 ||
                 geometry.VideoChannels != 128 || geometry.AudioChannels != 128)
                 throw new NotSupportedException("LTX generation requires the authentic 48-layer LTX 2.5 AV checkpoint.");
+            // The stage devices, made (and a split past the visible CUDA devices refused) before any companion is resolved.
+            _denoiserDevices = StageDeviceAllocators();
             if (IsDevCheckpointName(checkpoint))
                 throw new ModelLoadRefusedException(
                     $"'{Path.GetFileName(checkpoint)}' is LTX 2.5's dev checkpoint, which is sampled with 30 steps at CFG 3. " +
@@ -79,6 +86,9 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             DiffusionVaePath = ResolveDiffusionVae(VideoVaePath, _allocator is CudaAllocator);
             Console.WriteLine($"  [ltx25] video decoder: {(UsesDiffusionDecoder ? "diffusion" : "convolutional")} " +
                 $"({Path.GetFileName(DiffusionVaePath ?? VideoVaePath)})");
+            if (_denoiserDevices != null)
+                Console.WriteLine($"  placement    = denoiser blocks over {_denoiserDevices.Count} GPUs as whole-block stages " +
+                    "(the text encoder, VAEs and upscaler on the first)");
             string configuredReference = Environment.GetEnvironmentVariable("TS_LTX25_INGREDIENTS_LORA");
             string reference = null;
             if (!string.IsNullOrWhiteSpace(configuredReference))
@@ -216,17 +226,28 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             {
                 own?.Dispose();
                 StopCompanionPrefetch();
-                if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
-                else if (_allocator is MlxAllocator) MlxBackend.ClearCache();
+                TrimDevicePools();
             }
         }
     }
 
+    /// <summary>Return the free buffers of the model's devices to them (CUDA's pools trimmed after a sync, MLX's cache cleared):
+    /// the first device's, and under a split every stage device's too, whose pools hold the denoiser's freed working buffers.</summary>
+    internal void TrimDevicePools()
+    {
+        if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
+        else if (_allocator is MlxAllocator) MlxBackend.ClearCache();
+        if (_denoiserDevices == null) return;
+        foreach (IAllocator device in _denoiserDevices)
+            if (!ReferenceEquals(device, _allocator) && device is CudaAllocator stage) { stage.Synchronize(); stage.TrimPool(); }
+    }
+
     /// <summary>The runtime's load: the denoiser, the text encoder and the VAE this model resolved (the upscaler, the diffusion
-    /// decoder and the audio VAE travel with the family).</summary>
+    /// decoder and the audio VAE travel with the family), and the denoiser's stage devices under a split.</summary>
     private DiffusionLoad Load() => new()
     {
         Backend = DirectBackend(_backend),
+        DenoiserDevices = _denoiserDevices,
         Files = new Dictionary<string, string>
         {
             [DiffusionLoad.Denoiser] = CheckpointPath,
@@ -323,8 +344,7 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             _pipeline?.Dispose();
             _pipeline = null;
             base.TrimIdleMemory();
-            if (_allocator is MlxAllocator) MlxBackend.ClearCache();
-            else if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
+            TrimDevicePools();
         }
     }
 

@@ -49,7 +49,12 @@ dotnet run --project TensorSharp.Cli -- \
 | `mlx` / `ggml_metal` | 扩散运行时的 MLX tensor executor |
 | `cpu` / `ggml_cpu` | 扩散运行时的托管 CPU tensor executor |
 
-不支持 Vulkan 或多 GPU。GPU 测量不证明 CPU 吞吐。
+不支持 Vulkan。NVIDIA 上 `--backend cuda --layer-split N` 把去噪器的 48 个块按整块阶段分到 N 张 GPU：
+每张卡持有一段按字节均衡的连续块，以及每个阶段都要计算的 AdaLN 投影；视频与音频残差流经主机内存传到下一张卡；
+文本编码器、VAE 与上采样器留在第一张卡。它让单卡放不下的去噪器得以运行，但不会加快单步。`ggml_cuda` 只用一张卡，
+不支持 `--tp`。在托管 CPU executor 的两个主机设备上（合成两块检查点，带与不带 Ingredients 适配器），各阶段与单设备
+逐位一致；双 GPU 对比（`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`）与真实检查点的整段生成尚未在 GPU 上运行。
+GPU 测量不证明 CPU 吞吐。
 桌面 MP4 音轨需要 `PATH` 上的 FFmpeg 或 `TS_FFMPEG`，CLI 另写原始 PCM WAV；
 Mac 应用通过 AVFoundation 编码。
 
@@ -92,7 +97,7 @@ Studio 和聊天使用相同的生成流程，但结果一致不等于手指或�
 普通单张首图上传在自动或 `i2v` 模式采用上述 0.7/1.0 默认值；显式 `ImageConditions` 强度、
 有序多图、尾帧和其他模式保持原值，各阶段会记录实际引导强度。
 当前保留用户提示词，不自动使用官方 ComfyUI 模板的图像感知提示词增强。
-不支持参考视频/音频、retake、HDR/EXR、生成式关键帧槽或多 GPU。
+不支持参考视频/音频、retake、HDR/EXR 或生成式关键帧槽；多 GPU 仅限 `cuda` 上去噪器的整块阶段（见上文）。
 关闭音频解码仍运行训练好的联合 AV 去噪器。
 原生音频可能略短于视频；导出裁掉多余音频，不给短音轨补齐。
 

@@ -12,24 +12,22 @@ internal static class Ltx25Architecture
         Id = Ltx25Model.ArchitectureId,
         DisplayName = "LTX 2.5 Distilled",
         Aliases = new[] { Ltx25Model.ArchitectureId, "ltx", "ltxv", "ltx2", "ltx-2", "ltx_2_5" },
-        Factory = context => new Ltx25Model(context.GgufPath, context.Backend),
+        Factory = context => new Ltx25Model(context.GgufPath, context.Backend, context.LayerSplitDegree),
         ApplyNativeTunables = ConfigurePrecision,
         DetectFromTensors = file => file.Tensors.ContainsKey("patchify_proj.weight") &&
             file.Tensors.ContainsKey("audio_patchify_proj.weight") &&
             file.Tensors.ContainsKey("transformer_blocks.0.prompt_scale_shift_table") &&
             file.Tensors.ContainsKey("transformer_blocks.0.attn1.to_gate_logits.weight"),
-        Serving = new ServingContract
-            {
-                Implementation = ServingImplementation.Bespoke,
-                Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.Mlx, BackendType.GgmlMetal, BackendType.GgmlCuda },
-                Autoregressive = false,
-                HasRoutedExperts = false,
-                ContinuousBatching = MechanismSupport.NotApplicable("generates media, not decode steps; requests are serialized by its pipeline"),
-                TensorParallel = MechanismSupport.None("ltx-2.5 has no tensor-parallel path; it runs on one GPU and extra GPUs stay idle."),
-                LayerSplit = MechanismSupport.None("ltx-2.5 has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
-                HybridParallel = MechanismSupport.None("ltx-2.5 has no multi-GPU placement to combine."),
-                ExpertOffload = MechanismSupport.NotApplicable("no routed experts"),
-            },
+        // A clip runs on the shared diffusion runtime's video pipeline (DiffusionVideoPipeline with Ltx25Family). The denoiser's
+        // 48 blocks split over GPUs as whole-block stages (DenoiserStages) on the CUDA tensor executor (--backend cuda); the
+        // ggml_cuda name selects that executor on one GPU, and tensor parallelism has no sharded program.
+        Serving = ServingContract.SharedDiffusionRuntime(
+            new[] { BackendType.Cpu, BackendType.Cuda, BackendType.Mlx, BackendType.GgmlMetal, BackendType.GgmlCuda },
+            tensorParallelGap: "ltx-2.5 has no tensor-parallel path: its blocks are not sharded; --layer-split N on --backend cuda " +
+                "places them over several GPUs.",
+            layerSplitGap: "ltx-2.5 splits its blocks over GPUs on --backend cuda (its CUDA tensor executor); ggml_cuda selects " +
+                "that executor on one GPU: use --backend cuda --layer-split N.",
+            layerSplitBackends: new[] { BackendType.Cuda }),
     };
 
     private static void ConfigurePrecision(ModelCreateContext context)

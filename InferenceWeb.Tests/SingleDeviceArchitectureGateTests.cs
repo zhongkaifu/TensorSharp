@@ -26,6 +26,16 @@ public sealed class SingleDeviceArchitectureGateTests
         "wan",
         // minimax-h3 is no longer here: its denoiser runs --layer-split N as whole-block stages, and its tensor-parallel gap
         // is held by MiniMaxH3DenoiserTests.TensorParallelIsTheContractsGapAndLayerSplitPassesItsGate.
+    };
+
+    /// <summary>Families without a tensor-parallel path: the single-device ones, and MiniMax-H3 video and LTX 2.5, whose
+    /// blocks split over GPUs as whole-block stages (--layer-split N: MiniMaxH3DenoiserTests and Ltx25DenoiserStageTests'
+    /// WholeBlockStages*) but are not sharded.</summary>
+    public static TheoryData<string> NoTensorParallelFamilies => new()
+    {
+        "diffusion-gemma",
+        "wan",
+        "minimax-h3",
         "ltx-2.5",
     };
 
@@ -46,8 +56,18 @@ public sealed class SingleDeviceArchitectureGateTests
         Assert.Contains(id, arch.Serving.TensorParallel.GapReason, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>LTX 2.5 declares no tensor parallelism (a gap naming the family) and layer split on cuda only.</summary>
+    [Fact]
+    public void Ltx25_DeclaresNoTensorParallelismAndLayerSplitOnCuda()
+    {
+        var arch = Arch("ltx-2.5");
+        Assert.Empty(arch.Serving.TensorParallel.Backends);
+        Assert.Contains("ltx-2.5", arch.Serving.TensorParallel.GapReason, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(new[] { BackendType.Cuda }, arch.Serving.LayerSplit.Backends);
+    }
+
     [Theory]
-    [MemberData(nameof(SingleDeviceFamilies))]
+    [MemberData(nameof(NoTensorParallelFamilies))]
     public void LocalTp_IsRefusedWithoutFallingBack(string id)
     {
         var arch = Arch(id);
@@ -61,7 +81,7 @@ public sealed class SingleDeviceArchitectureGateTests
     }
 
     [Theory]
-    [MemberData(nameof(SingleDeviceFamilies))]
+    [MemberData(nameof(NoTensorParallelFamilies))]
     public void DistributedGroup_IsRefused(string id)
     {
         ITensorParallelGroup group = new StubTpGroup();
@@ -73,7 +93,7 @@ public sealed class SingleDeviceArchitectureGateTests
     }
 
     [Theory]
-    [MemberData(nameof(SingleDeviceFamilies))]
+    [MemberData(nameof(NoTensorParallelFamilies))]
     public void NoTpRequested_StaysSilent(string id)
     {
         var arch = Arch(id);

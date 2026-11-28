@@ -3,13 +3,15 @@
 //
 // LTX 2.5's AV denoiser weights as graph leaves: every projection a pointer into the GGUF's mapping in its stored format (the
 // device caches key on it), every norm weight, bias, modulation table and the keyframe embedding an F32 tensor on the
-// executor's allocator (BF16 and F16 widened exactly, as the direct denoiser held them).
+// executor's allocator (BF16 and F16 widened exactly, as the direct denoiser held them); under whole-block stages
+// (--layer-split N) each stage's executor gets its own copies of the small tensors its program binds.
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using TensorSharp.Graph;
 using TensorSharp.Models.Direct;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.Ltx25;
@@ -30,7 +32,8 @@ internal sealed class Ltx25DenoiserWeights : IDisposable
     private readonly GgufFile _file;
     private readonly IAllocator _allocator;
     private readonly Dictionary<string, Ltx25Weight> _projections = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, Tensor> _vectors = new(StringComparer.Ordinal);
+    // The small tensors made so far, by the allocator they live on (the executor's, or under stages each stage's).
+    private readonly Dictionary<IAllocator, Dictionary<string, Tensor>> _vectors = new(ReferenceEqualityComparer.Instance);
     private bool _disposed;
 
     public Ltx25DenoiserWeights(string path, IAllocator allocator)
@@ -86,21 +89,55 @@ internal sealed class Ltx25DenoiserWeights : IDisposable
 
     /// <summary>A small tensor (a bias, a norm weight, a modulation table, the keyframe embedding) as F32 on the executor's
     /// allocator, in the checkpoint's row-major order, made once.</summary>
-    public Tensor Vector(string name)
+    public Tensor Vector(string name) => Vector(name, _allocator);
+
+    /// <summary><see cref="Vector(string)"/> on <paramref name="allocator"/>: a whole-block stage's tensor executor binds the
+    /// small tensors of its own program on its own device (another GPU's tensor is not its memory), so each stage device gets
+    /// its copy the first time its program emits the tensor.</summary>
+    public Tensor Vector(string name, IAllocator allocator)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_vectors.TryGetValue(name, out Tensor t)) return t;
+        ArgumentNullException.ThrowIfNull(allocator);
+        if (!_vectors.TryGetValue(allocator, out Dictionary<string, Tensor> made))
+            _vectors[allocator] = made = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+        if (made.TryGetValue(name, out Tensor t)) return t;
         string full = Config.Prefix + name;
         float[] values = DirectOps.DequantTensor(_file, full);
         // Sized as the ggml extents read outermost first (a [dim, 9] table is 9 rows of dim).
-        t = new Tensor(_allocator, DType.Float32, Extents(name).Reverse().ToArray());
+        t = new Tensor(allocator, DType.Float32, Extents(name).Reverse().ToArray());
         t.SetElementsAsFloat(values);
-        _vectors[name] = t;
+        made[name] = t;
         return t;
     }
 
     /// <summary>The ggml extents of a small tensor (innermost first).</summary>
     public long[] Extents(string name) => _file.Tensors[Config.Prefix + name].Shape.Select(s => checked((long)s)).ToArray();
+
+    /// <summary>Each block's projection bytes, in block order: a whole-block split (<see cref="DenoiserStages"/>) balances
+    /// them.</summary>
+    public long[] BlockBytes()
+    {
+        var bytes = new long[Config.Layers];
+        foreach (Ltx25Weight w in _projections.Values)
+            if (BlockOf(w.Name) is int block and >= 0 && block < bytes.Length) bytes[block] += w.Bytes;
+        return bytes;
+    }
+
+    /// <summary>Whether the program of <paramref name="span"/> binds projection <paramref name="w"/>: its blocks' projections;
+    /// the patchify projections where it opens the step and the output heads where it closes it; and every other projection
+    /// outside the blocks (the eight AdaLN MLPs), which every stage computes from the step's timestep features itself.</summary>
+    public bool Binds(DenoiserSpan span, Ltx25Weight w)
+    {
+        int block = BlockOf(w.Name);
+        if (block >= 0) return block >= span.First && block < span.End;
+        if (w.Name is "patchify_proj" or "audio_patchify_proj") return span.IsFirst;
+        if (w.Name is "proj_out" or "audio_proj_out") return span.IsLast;
+        return true;
+    }
+
+    /// <summary>The projection bytes the program of <paramref name="span"/> binds (<see cref="Binds"/>): what its stage's
+    /// device holds.</summary>
+    public long BytesOf(DenoiserSpan span) => _projections.Values.Where(w => Binds(span, w)).Sum(w => w.Bytes);
 
     /// <summary>The block index of a projection name, or -1 for one outside the blocks (patchify, the AdaLN embedders, the
     /// output heads).</summary>
@@ -116,7 +153,8 @@ internal sealed class Ltx25DenoiserWeights : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        foreach (Tensor t in _vectors.Values) t.Dispose();
+        foreach (Dictionary<string, Tensor> made in _vectors.Values)
+            foreach (Tensor t in made.Values) t.Dispose();
         _vectors.Clear();
         _projections.Clear();
         _file.Dispose();

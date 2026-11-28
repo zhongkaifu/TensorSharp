@@ -7,7 +7,9 @@
 // sequence of the original Lightricks graph as the direct denoiser computed it (whole-inner Q/K RMS norms, per-head split
 // RoPE, 2 * sigmoid head gates, frozen pre-cross-attention stream states), and the executor takes that denoiser's kernels: its
 // products as DirectLinear ran them (TensorGraphExecutor.DirectProducts), its norms (GraphFusion.RowNorm), its per-head
-// rotary tables (HeadRotary), head gates (HeadGate) and F32 attention (FullAttention).
+// rotary tables (HeadRotary), head gates (HeadGate) and F32 attention (FullAttention). Under --layer-split N the blocks run
+// as whole-block stages over several devices (DenoiserStages): each stage's program is its blocks on its own device, the
+// video and audio residual streams handed from one stage to the next.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -65,6 +67,15 @@ public sealed record Ltx25DenoiserOutput(float[] VideoVelocity, float[] AudioVel
 /// resident (on CUDA reading the file ahead in the order the blocks run) and compiles the step's program, which every later
 /// step of the same geometry replays with new inputs. The Ingredients IC-LoRA arrives as the step's adapter set
 /// (<see cref="Ltx25LoraSet"/>): its unscaled B @ A updates are added to the adapted projections in exact F32.
+/// <para>
+/// Over several devices (<c>--layer-split N</c>) the 48 blocks are contiguous stages balanced by their projections' bytes
+/// (<see cref="DenoiserStages"/>), each stage a program of its own on its device's executor (made as the one device's, with
+/// direct products): the first also patchifies the latents and adds the keyframe embedding, the last also runs the output
+/// heads, and each hands the video and audio residual streams on as F32 rows, the next stage's inputs. Every stage takes the
+/// prompt contexts and the timestep features as its own inputs and computes the eight AdaLN MLPs itself, binds its own
+/// blocks' projections and Ingredients factors on its device, and keeps its own copies of the rotary tables and the small
+/// tensors. A pass's later steps rerun each stage's plan with only the new timestep features written, as on one device.
+/// </para>
 /// </summary>
 public sealed class Ltx25Denoiser : IDenoiser
 {
@@ -76,7 +87,13 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     private readonly Ltx25DenoiserWeights _w;
     private readonly IAllocator _allocator;
-    private readonly TensorGraphExecutor _executor;
+    private readonly TensorGraphExecutor _executor;   // the one device's, or stage 0's under a split
+    // Whole-block stages over several devices (--layer-split N), or null for one device: each stage's executor (this
+    // denoiser's, made as the one device's), each stage's live step, and the largest stage's projection bytes.
+    private readonly DenoiserStages _stages;
+    private readonly TensorGraphExecutor[] _stageExecutors;
+    private readonly LiveStep[] _stageLive;
+    private readonly long _stageWeightBytes;
     private readonly object _gate = new();
     private readonly List<(ulong, ulong, IGraphPlan)> _plans = new();
     private readonly HashSet<Ltx25Weight> _warmed = new();
@@ -95,11 +112,16 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// <summary>The checkpoint's file.</summary>
     public string Path => _w.Path;
 
-    /// <summary>Steps that compiled their program (the rest replayed a cached plan).</summary>
-    internal int Compiles { get; private set; }
+    /// <summary>Steps that compiled their program (the rest replayed a cached plan); under a split, stage programs.</summary>
+    internal int Compiles => _compiles + (_stages?.Compiles ?? 0);
 
-    /// <summary>The executor the steps run on (tests).</summary>
+    private int _compiles;
+
+    /// <summary>The executor the steps run on (tests); stage 0's under a split.</summary>
     internal TensorGraphExecutor Executor => _executor;
+
+    /// <summary>The whole-block stages, or null for one device (a test seam).</summary>
+    internal DenoiserStages Stages => _stages;
 
     public bool ReferenceLoraLoaded => _ownedLora != null;
     public int ReferenceLoraProjections => _ownedLora?.ProjectionCount ?? 0;
@@ -108,18 +130,45 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// <summary>The denoiser of <paramref name="checkpoint"/> on <paramref name="allocator"/>'s backend: CUDA, MLX or the CPU,
     /// each on a tensor executor of its own that takes the direct engines' kernels. <paramref name="referenceLoraPath"/>, when
     /// given, is an Ingredients adapter <see cref="Forward"/> applies to inputs that ask for it.</summary>
-    public Ltx25Denoiser(string checkpoint, IAllocator allocator, string referenceLoraPath = null)
+    /// <param name="devices">The devices of a whole-block split (<c>--layer-split N</c>, <see cref="DenoiserStages"/>), one a
+    /// stage, the first <paramref name="allocator"/> itself (the latents, the keyframe embedding and the first blocks live
+    /// there); null or one device runs every block on <paramref name="allocator"/>. CUDA devices, or managed CPU host
+    /// "devices" (functional placement for tests).</param>
+    public Ltx25Denoiser(string checkpoint, IAllocator allocator, string referenceLoraPath = null, IReadOnlyList<IAllocator> devices = null)
     {
         _allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
+        bool split = devices is { Count: > 1 };
+        if (split && !ReferenceEquals(devices[0], allocator))
+            throw new ArgumentException("A whole-block split's first device is the denoiser's allocator.", nameof(devices));
+        if (split && devices.Any(d => d is MlxAllocator))
+            throw new NotSupportedException("LTX 2.5's whole-block stages run on CUDA devices; MLX exposes one device.");
         _w = new Ltx25DenoiserWeights(checkpoint, allocator);
+        var made = new List<TensorGraphExecutor>();
         try
         {
-            _executor = CreateExecutor(allocator);
+            if (split)
+            {
+                // Each stage's executor is made as the one device's (direct products, the wide DiT regions), so a stage runs
+                // the one device's kernels; this denoiser owns them.
+                _stages = new DenoiserStages(_w.BlockBytes(), devices, a =>
+                {
+                    TensorGraphExecutor x = CreateExecutor(a);
+                    made.Add(x);
+                    return x;
+                });
+                _stageExecutors = new TensorGraphExecutor[_stages.Count];
+                for (int s = 0; s < _stageExecutors.Length; s++) _stageExecutors[s] = (TensorGraphExecutor)_stages.Executor(s);
+                _stageLive = new LiveStep[_stages.Count];
+                for (int s = 0; s < _stages.Count; s++) _stageWeightBytes = Math.Max(_stageWeightBytes, _w.BytesOf(_stages.Span(s)));
+                _executor = _stageExecutors[0];
+            }
+            else _executor = CreateExecutor(allocator);
             if (referenceLoraPath != null) _ownedLora = Ltx25LoraSet.Open(referenceLoraPath, _w.File, _w.Config);
         }
         catch
         {
-            (_executor as IDisposable)?.Dispose();
+            foreach (TensorGraphExecutor x in made) (x as IDisposable)?.Dispose();
+            if (made.Count == 0) (_executor as IDisposable)?.Dispose();
             _w.Dispose();
             throw;
         }
@@ -139,7 +188,10 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     public DenoiserCaps Caps { get; } = new() { Streams = new[] { AudioStream } };
 
-    public long WeightBytes => _w.Bytes + (AdapterBytes?.Invoke() ?? 0);
+    /// <summary>The projections' device bytes: under a split, the largest stage's share (each device holds its stage's blocks,
+    /// the AdaLN MLPs every stage computes, and the first's patchify or the last's output projections). The Ingredients
+    /// factors count whole, as on one device.</summary>
+    public long WeightBytes => (_stages == null ? _w.Bytes : _stageWeightBytes) + (AdapterBytes?.Invoke() ?? 0);
 
     /// <summary>The device bytes of the Ingredients factors the next steps may bind, for residency.</summary>
     internal Func<long> AdapterBytes { get; set; }
@@ -236,19 +288,21 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     private Ltx25DenoiserOutput RunStep(Ltx25DenoiserInput input, Ltx25LoraSet lora, int blocks)
     {
+        if (_stages != null) return RunStages(input, lora, blocks);
         RopeCache rope = Rope(input);
         Tensor keyframes = Keyframes(input);
         float[][] features = StepFeatures(input);
+        var span = new DenoiserSpan(0, blocks, IsFirst: true, IsLast: true);
         // A pass's later steps run the program its first step emitted: the latents, contexts, tables and adapter are the
         // same objects (the sampler steps its state in place), so only the timestep features are written again, into the
         // arrays the live trace binds. Anything else new (another pass, a request, a caller's fresh arrays) emits again.
-        var key = new LiveKey(input.Video, input.Audio, input.VideoContext, input.AudioContext, rope, keyframes, lora, blocks,
-            features.Select(f => f.Length).ToArray());
+        var key = new LiveKey(input.Video, input.Audio, input.VideoContext, input.AudioContext, rope, keyframes, lora, span,
+            features.Select(f => f.Length).ToArray(), null, null);
         if (_live == null || !_live.Key.Equals(key))
         {
             _live?.Dispose();
             _live = null;
-            var step = new StepValues(input, blocks, lora, rope, keyframes, features);
+            var step = new StepValues(input, span, lora, rope[0], keyframes, features, _allocator, null, null);
             var trace = new GraphEmitter(_executor, record: false);
             try { Emit(trace, step); }
             catch { trace.Dispose(); throw; }
@@ -272,7 +326,7 @@ public sealed class Ltx25Denoiser : IDenoiser
                 double emitted = clock.Elapsed.TotalSeconds;
                 plan = recorded.Compile(replayable: true);
                 Keep(recorded.Signature, plan);
-                Compiles++;
+                _compiles++;
                 Console.WriteLine($"  [ltx25] step program for {input.VideoTokens} video + {input.AudioTokens} audio tokens: " +
                     $"emitted in {emitted:F2}s, compiled in {clock.Elapsed.TotalSeconds - emitted:F2}s");
             }
@@ -293,14 +347,93 @@ public sealed class Ltx25Denoiser : IDenoiser
         return new Ltx25DenoiserOutput(video, audio, blocks);
     }
 
-    /// <summary>What makes a step's program and bindings the previous step's: the very arrays and tables it binds and its shape.</summary>
+    /// <summary>
+    /// One step over the whole-block stages: each stage's program on its device, in block order, the video and audio residual
+    /// streams the previous stage's plan wrote (its output arrays, which every run of that plan rewrites) bound as the next
+    /// stage's inputs; the last stage's outputs are the velocities. A block limit (a partial-depth diagnostic) clips the
+    /// spans: a stage between the first and the last with no block left is skipped, the streams passing it unchanged.
+    /// </summary>
+    private Ltx25DenoiserOutput RunStages(Ltx25DenoiserInput input, Ltx25LoraSet lora, int blocks)
+    {
+        RopeCache rope = Rope(input);
+        Tensor keyframes = Keyframes(input);
+        float[][] features = StepFeatures(input);
+        float[][] streams = null;
+        for (int st = 0; st < _stages.Count; st++)
+        {
+            DenoiserSpan whole = _stages.Span(st);
+            var span = new DenoiserSpan(Math.Min(whole.First, blocks), Math.Min(whole.End, blocks), whole.IsFirst, whole.IsLast);
+            if (!span.IsFirst && !span.IsLast && span.First == span.End) continue;
+            streams = RunStage(st, span, input, lora, rope, keyframes, features, streams?[0], streams?[1]);
+        }
+        float[] video = (float[])streams[0].Clone(), audio = (float[])streams[1].Clone();
+        foreach (float v in video) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        foreach (float v in audio) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        return new Ltx25DenoiserOutput(video, audio, blocks);
+    }
+
+    /// <summary>
+    /// Stage <paramref name="st"/>'s part of a step, the one device's live step per stage: while the stage's inputs are the
+    /// arrays its last step bound (the same latents, contexts, tables, adapter, and the previous stage's same plan outputs),
+    /// only the new timestep features are written into the arrays its kept trace binds, and its plan runs again. Otherwise the
+    /// stages' runner (<see cref="DenoiserStages.RunAll"/>) traces the program, compiles it where the stage's plan was compiled
+    /// for another signature, and runs it; a trace of the same program, its inputs pinned, is kept for the later steps.
+    /// Returns the stage's outputs (the two residual streams, or the last stage's velocities), valid until it runs again.
+    /// </summary>
+    private float[][] RunStage(int st, DenoiserSpan span, Ltx25DenoiserInput input, Ltx25LoraSet lora, RopeCache rope, Tensor keyframes,
+        float[][] features, float[] carryVideo, float[] carryAudio)
+    {
+        Tensor stageKeyframes = span.IsFirst ? keyframes : null;
+        var key = new LiveKey(input.Video, input.Audio, input.VideoContext, input.AudioContext, rope, stageKeyframes, lora, span,
+            features.Select(f => f.Length).ToArray(), carryVideo, carryAudio);
+        LiveStep live = _stageLive[st];
+        string what = span.End > span.First ? $"blocks {span.First}-{span.End - 1}" : "no blocks";
+        if (live != null && live.Key.Equals(key) && ReferenceEquals(live.Plan, _stages.Plan(st)))
+        {
+            for (int i = 0; i < features.Length; i++) Array.Copy(features[i], live.Features[i], features[i].Length);
+            if (!_stages.OnDevice(st, () => live.Emitter.Run(live.Plan)))
+            {
+                string error = live.Plan.LastError;
+                live.Dispose();
+                _stageLive[st] = null;
+                throw new InvalidOperationException($"LTX denoiser stage {st} ({what}) failed: " + error);
+            }
+            return live.Plan.Outputs;
+        }
+        live?.Dispose();
+        _stageLive[st] = null;
+        var step = new StepValues(input, span, lora, rope[st], stageKeyframes, features, _stages.TensorAllocator(st), carryVideo, carryAudio);
+        var trace = new GraphEmitter(_stageExecutors[st], record: false);
+        float[][] outputs;
+        try
+        {
+            Emit(trace, step);
+            int compiled = _stages.Compiles;
+            var clock = Stopwatch.StartNew();
+            outputs = _stages.RunAll(st, e => Emit(e, step), "LTX 2.5 denoiser");
+            if (_stages.Compiles != compiled)
+                Console.WriteLine($"  [ltx25] stage {st} ({what}) program for {input.VideoTokens} video + {input.AudioTokens} audio tokens: " +
+                    $"emitted, compiled and run in {clock.Elapsed.TotalSeconds:F2}s");
+        }
+        catch
+        {
+            trace.Dispose();
+            throw;
+        }
+        _stageLive[st] = new LiveStep(key, trace, _stages.Plan(st), features);
+        return outputs;
+    }
+
+    /// <summary>What makes a step's program and bindings the previous step's: the very arrays and tables it binds and its shape
+    /// (under a split, also the previous stage's output arrays the stage reads).</summary>
     private sealed record LiveKey(float[] Video, float[] Audio, float[] VideoContext, float[] AudioContext, RopeCache Rope, Tensor Keyframes,
-        Ltx25LoraSet Lora, int Blocks, int[] FeatureLengths)
+        Ltx25LoraSet Lora, DenoiserSpan Span, int[] FeatureLengths, float[] CarryVideo, float[] CarryAudio)
     {
         public bool Equals(LiveKey other) => other != null && ReferenceEquals(Video, other.Video) && ReferenceEquals(Audio, other.Audio)
             && ReferenceEquals(VideoContext, other.VideoContext) && ReferenceEquals(AudioContext, other.AudioContext)
             && ReferenceEquals(Rope, other.Rope) && ReferenceEquals(Keyframes, other.Keyframes) && ReferenceEquals(Lora, other.Lora)
-            && Blocks == other.Blocks && FeatureLengths.AsSpan().SequenceEqual(other.FeatureLengths);
+            && Span == other.Span && FeatureLengths.AsSpan().SequenceEqual(other.FeatureLengths)
+            && ReferenceEquals(CarryVideo, other.CarryVideo) && ReferenceEquals(CarryAudio, other.CarryAudio);
 
         public override int GetHashCode() => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Video);
     }
@@ -365,17 +498,42 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     private void DropPlans()
     {
-        _live?.Dispose();
-        _live = null;
+        DropLive();
         foreach (var (_, _, plan) in _plans) plan.Dispose();
         _plans.Clear();
+        _stages?.DropPlans();
     }
 
-    /// <summary>Unpin the last step's inputs (a request's state arrays) and forget its trace; the plans stay.</summary>
+    /// <summary>Unpin the last step's inputs (a request's state arrays) and forget its trace, every stage's under a split; the
+    /// plans stay.</summary>
     private void DropLive()
     {
         _live?.Dispose();
         _live = null;
+        if (_stageLive == null) return;
+        for (int s = 0; s < _stageLive.Length; s++)
+        {
+            _stageLive[s]?.Dispose();
+            _stageLive[s] = null;
+        }
+    }
+
+    /// <summary>The devices the steps run on, each with its executor: the one device, or every stage's.</summary>
+    private IEnumerable<(IAllocator Device, TensorGraphExecutor Executor)> Lanes()
+    {
+        if (_stages == null)
+        {
+            yield return (_allocator, _executor);
+            yield break;
+        }
+        for (int s = 0; s < _stages.Count; s++) yield return (_stages.TensorAllocator(s), _stageExecutors[s]);
+    }
+
+    /// <summary>The direct kernels' scratch of every CUDA executor the steps run on goes back to its device.</summary>
+    private void ReleaseDirectWorkspaces()
+    {
+        foreach (var (_, executor) in Lanes())
+            if (executor is CudaGraphExecutor cuda) cuda.ReleaseDirectWorkspaces();
     }
 
     /// <summary>Bind <paramref name="lora"/> for the step: another set than the one bound before drops the old set's device
@@ -408,7 +566,9 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// work queued for the blocks before it; just before, its file pages are warmed (<see cref="Ltx25CudaFilePrefault"/>)
     /// and the file's read-ahead moves to its block (the prelude and output tensors first, then one stage per block: the
     /// file stores tensors alphabetically). The step's end (<see cref="EndUpload"/>) stops the read-ahead. On MLX every
-    /// projection is converted to its device form before the step.
+    /// projection is converted to its device form before the step. Under a split every stage's executor takes the hook: the
+    /// stages run their blocks in block order, so the file is read ahead in the same order, each stage device uploading its
+    /// own blocks (and the AdaLN MLPs every stage computes).
     /// </summary>
     private void MakeResident()
     {
@@ -427,7 +587,7 @@ public sealed class Ltx25Denoiser : IDenoiser
                 stages.Select(s => s.Select(w => (w.FileOffset, w.Bytes))),
                 message => Console.WriteLine("  [ltx25] warning: denoiser " + message));
             _prefault ??= _w.File.IsSplit ? null : new Ltx25CudaFilePrefault(_w.File);
-            _executor.BeforeDirectProduct = weight =>
+            Action<IGraphWeight> beforeProduct = weight =>
             {
                 // The adapter's factors are host copies, not the checkpoint's pages.
                 if (weight is not Ltx25Weight w || w.FileOffset < 0) return;
@@ -435,6 +595,7 @@ public sealed class Ltx25Denoiser : IDenoiser
                 if (block >= 0) _uploadRead?.Enter(block + 1);
                 if (_prefault != null && _warmed.Add(w)) _prefault.Warm(w.Data, w.FileOffset, w.Bytes);
             };
+            foreach (var (_, executor) in Lanes()) executor.BeforeDirectProduct = beforeProduct;
             _uploading = true;
             return;
         }
@@ -450,7 +611,7 @@ public sealed class Ltx25Denoiser : IDenoiser
     private void EndUpload(bool complete)
     {
         if (!_uploading) return;
-        _executor.BeforeDirectProduct = null;
+        foreach (var (_, executor) in Lanes()) executor.BeforeDirectProduct = null;
         _uploading = false;
         if (_uploadRead != null)
         {
@@ -464,16 +625,18 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     /// <summary>Drop the device copy of the host bytes at <paramref name="data"/>: the CUDA and MLX resident-weight caches key
     /// them by that address (a copy left there outlives the denoiser, and a file mapped later at that address would compute
-    /// with the old values); the managed executor's F32 copies by the same address.</summary>
+    /// with the old values); the managed executor's F32 copies by the same address. Under a split, every stage device's copy
+    /// (a device that never uploaded it has none to drop).</summary>
     private void ReleaseCopy(IntPtr data)
     {
         if (data == IntPtr.Zero) return;
-        switch (_allocator)
-        {
-            case CudaAllocator cuda: CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data); break;
-            case MlxAllocator mlx: MlxQuantizedOps.ReleaseQuantizedWeight(mlx, data); _executor.Invalidate(data); break;
-            default: _executor.Invalidate(data); break;
-        }
+        foreach (var (device, executor) in Lanes())
+            switch (device)
+            {
+                case CudaAllocator cuda: CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data); break;
+                case MlxAllocator mlx: MlxQuantizedOps.ReleaseQuantizedWeight(mlx, data); executor.Invalidate(data); break;
+                default: executor.Invalidate(data); break;
+            }
     }
 
     private void ReleaseFactors(Ltx25LoraSet set)
@@ -481,14 +644,14 @@ public sealed class Ltx25Denoiser : IDenoiser
         foreach (IntPtr factor in set.FactorAddresses) ReleaseCopy(factor);
     }
 
-    /// <summary>A clip's denoising ended: the direct kernels' scratch goes back to the device before the decode.</summary>
+    /// <summary>A clip's denoising ended: the direct kernels' scratch goes back to the device (every stage's) before the decode.</summary>
     public void FinishRequest()
     {
         lock (_gate)
         {
             if (_disposed) return;
             DropLive();
-            if (_executor is CudaGraphExecutor cuda) cuda.ReleaseDirectWorkspaces();
+            ReleaseDirectWorkspaces();
         }
     }
 
@@ -498,12 +661,12 @@ public sealed class Ltx25Denoiser : IDenoiser
         {
             if (_disposed) return;
             DropPlans();
-            if (_executor is CudaGraphExecutor cuda) cuda.ReleaseDirectWorkspaces();
+            ReleaseDirectWorkspaces();
         }
     }
 
-    /// <summary>Drops the projections' and factors' device copies, the position tables and the plans; the mapping and the
-    /// small tensors stay, so the next step uploads from memory again.</summary>
+    /// <summary>Drops the projections' and factors' device copies, the position tables and the plans (on every stage device
+    /// under a split); the mapping and the small tensors stay, so the next step uploads from memory again.</summary>
     public void ReleaseDevice()
     {
         lock (_gate)
@@ -514,7 +677,7 @@ public sealed class Ltx25Denoiser : IDenoiser
             _rope = null;
             _keyframes.Absolute?.Dispose();
             _keyframes = default;
-            if (_executor is CudaGraphExecutor cuda) cuda.ReleaseDirectWorkspaces();
+            ReleaseDirectWorkspaces();
             foreach (Ltx25Weight w in _w.Projections) ReleaseCopy(w.Data);
             if (_boundLora != null) ReleaseFactors(_boundLora);
             _resident = false;
@@ -537,7 +700,8 @@ public sealed class Ltx25Denoiser : IDenoiser
             _ownedLora?.Dispose();
             _ownedLora = null;
             _prefault?.Dispose();
-            (_executor as IDisposable)?.Dispose();
+            _stages?.Dispose();
+            foreach (var (_, executor) in Lanes()) (executor as IDisposable)?.Dispose();
             _w.Dispose();
             _disposed = true;
         }
@@ -546,25 +710,34 @@ public sealed class Ltx25Denoiser : IDenoiser
     // ---- per-request tables
 
     /// <summary>The rotary tables of a geometry (video, audio and the video's temporal positions at the audio width), on the
-    /// executor's allocator: they do not depend on sigma, so one request's steps share them. The caller's coordinates are
-    /// snapshotted, so edits to a reused grid rebuild them.</summary>
+    /// executor's allocator, or under a split one copy on each stage's device (every block reads all three; another GPU's
+    /// tensor is not a stage's memory): they do not depend on sigma, so one request's steps share them. Each table is computed
+    /// on the host once and copied to every device. The caller's coordinates are snapshotted, so edits to a reused grid rebuild
+    /// them.</summary>
     private sealed class RopeCache : IDisposable
     {
         private readonly float[] _video, _audio;
         private readonly Ltx25FrequencyPrecision _precision;
-        public readonly (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim) Video, Audio, CrossVideo;
+        private readonly RopeTables[] _devices;
 
-        public RopeCache(IAllocator allocator, Ltx25Config c, Ltx25DenoiserInput input)
+        public RopeCache(IReadOnlyList<IAllocator> allocators, Ltx25Config c, Ltx25DenoiserInput input)
         {
             _video = (float[])input.VideoPositions.Boundaries.Clone();
             _audio = (float[])input.AudioPositions.Boundaries.Clone();
             _precision = input.FrequencyPrecision;
+            _devices = new RopeTables[allocators.Count];
+            for (int d = 0; d < _devices.Length; d++) _devices[d] = new RopeTables();
             try
             {
-                Video = Device(allocator, Ltx25Geometry.BuildRope(input.VideoPositions, c.VideoDim, c.VideoHeads, _precision));
-                Audio = Device(allocator, Ltx25Geometry.BuildRope(input.AudioPositions, c.AudioDim, c.AudioHeads, _precision));
-                CrossVideo = Device(allocator, Ltx25Geometry.BuildRope(Ltx25Geometry.TemporalPositions(input.VideoPositions),
-                    c.AudioDim, c.AudioHeads, _precision));
+                Ltx25Rope video = Ltx25Geometry.BuildRope(input.VideoPositions, c.VideoDim, c.VideoHeads, _precision);
+                for (int d = 0; d < _devices.Length; d++) _devices[d].Video = Device(allocators[d], video);
+                video = null;
+                Ltx25Rope audio = Ltx25Geometry.BuildRope(input.AudioPositions, c.AudioDim, c.AudioHeads, _precision);
+                for (int d = 0; d < _devices.Length; d++) _devices[d].Audio = Device(allocators[d], audio);
+                audio = null;
+                Ltx25Rope cross = Ltx25Geometry.BuildRope(Ltx25Geometry.TemporalPositions(input.VideoPositions),
+                    c.AudioDim, c.AudioHeads, _precision);
+                for (int d = 0; d < _devices.Length; d++) _devices[d].CrossVideo = Device(allocators[d], cross);
             }
             catch
             {
@@ -572,6 +745,9 @@ public sealed class Ltx25Denoiser : IDenoiser
                 throw;
             }
         }
+
+        /// <summary>The tables on device <paramref name="device"/> (0 for one device, else the stage).</summary>
+        public RopeTables this[int device] => _devices[device];
 
         private static (Tensor, Tensor, int, int, int) Device(IAllocator allocator, Ltx25Rope rope)
         {
@@ -587,6 +763,17 @@ public sealed class Ltx25Denoiser : IDenoiser
 
         public void Dispose()
         {
+            foreach (RopeTables tables in _devices) tables?.Dispose();
+        }
+    }
+
+    /// <summary>One device's rotary tables: [tokens, heads, head dim / 2] cosines and sines with their geometry.</summary>
+    private sealed class RopeTables : IDisposable
+    {
+        public (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim) Video, Audio, CrossVideo;
+
+        public void Dispose()
+        {
             Video.Cos?.Dispose(); Video.Sin?.Dispose();
             Audio.Cos?.Dispose(); Audio.Sin?.Dispose();
             CrossVideo.Cos?.Dispose(); CrossVideo.Sin?.Dispose();
@@ -599,7 +786,7 @@ public sealed class Ltx25Denoiser : IDenoiser
         // Release the old geometry's tables before making potentially large new ones.
         _rope?.Dispose();
         _rope = null;
-        return _rope = new RopeCache(_allocator, Config, input);
+        return _rope = new RopeCache(_stages == null ? new[] { _allocator } : Lanes().Select(l => l.Device).ToArray(), Config, input);
     }
 
     /// <summary>The keyframe embedding the marked tokens add ([tokens, dim]: 0 or 1 times the embedding, the products the
@@ -629,19 +816,36 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     private sealed class StepValues
     {
-        public StepValues(Ltx25DenoiserInput input, int blocks, Ltx25LoraSet lora, RopeCache rope, Tensor keyframes, float[][] features)
+        public StepValues(Ltx25DenoiserInput input, DenoiserSpan span, Ltx25LoraSet lora, RopeTables rope, Tensor keyframes,
+            float[][] features, IAllocator device, float[] carryVideo, float[] carryAudio)
         {
-            Input = input; Blocks = blocks; Lora = lora; Rope = rope; Keyframes = keyframes; Features = features;
+            Input = input; Span = span; Lora = lora; Rope = rope; Keyframes = keyframes; Features = features; Device = device;
+            CarryVideo = carryVideo; CarryAudio = carryAudio;
         }
 
         /// <summary><see cref="StepFeatures"/>' six rows, bound as the program's inputs.</summary>
         public float[][] Features { get; }
 
         public Ltx25DenoiserInput Input { get; }
-        public int Blocks { get; }
+
+        /// <summary>The blocks the program runs, and whether it opens the step (patchify) and closes it (the output heads): every
+        /// block, both, on one device.</summary>
+        public DenoiserSpan Span { get; }
+
         public Ltx25LoraSet Lora { get; }
-        public RopeCache Rope { get; }
+
+        /// <summary>The rotary tables on the program's device.</summary>
+        public RopeTables Rope { get; }
+
         public Tensor Keyframes { get; }
+
+        /// <summary>Where the program's small tensors live (the executor's allocator, or its stage's device).</summary>
+        public IAllocator Device { get; }
+
+        /// <summary>The video and audio residual streams the previous stage handed on ([dim, tokens] F32 rows), where the
+        /// program does not open the step.</summary>
+        public float[] CarryVideo { get; }
+        public float[] CarryAudio { get; }
     }
 
     /// <summary>Original cosine-first 256-feature timestep encoding, before
@@ -670,12 +874,23 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// cross-stream attentions over both streams' norms frozen before either residual moves, and the feed-forwards, then each
     /// stream's layer-normed, modulated output head. The latents, contexts and timestep features are inputs; the rotary
     /// tables and the keyframe embedding are fixed for a request (tensors), so a geometry's steps share one plan.
+    /// <para>
+    /// A whole-block stage's program is the part of that program its span holds (<see cref="StepValues.Span"/>): where it does
+    /// not open the step, the two residual streams the previous stage handed on are its first inputs in place of the patchify
+    /// projections; only its blocks run; where it does not close the step, the two streams are its outputs in place of the
+    /// heads. The contexts and timestep features are every stage's inputs and every stage computes the eight AdaLN MLPs from
+    /// them: exact (the same products of the same inputs), and cheaper than handing on their coefficients, which on a guided
+    /// pass are rows of 13 coefficients a video token (about 2.3 GB at 10,752 tokens, through host memory at every stage
+    /// boundary each step), against about one block's worth of products to recompute (nothing measurable on an unguided pass,
+    /// whose coefficients are one row).
+    /// </para>
     /// </summary>
     private void Emit(GraphEmitter e, StepValues s)
     {
         Ltx25Config c = Config;
         GraphProgramBuilder b = e.Builder;
         Ltx25DenoiserInput input = s.Input;
+        DenoiserSpan span = s.Span;
         float eps = Ltx25Config.NormEpsilon;
         var leaves = new Dictionary<object, int>();
         e.MarkWideTokenProducts();
@@ -693,7 +908,7 @@ public sealed class Ltx25Denoiser : IDenoiser
         int Vector(string name)
         {
             if (leaves.TryGetValue(name, out int node)) return node;
-            Tensor t = _w.Vector(name);
+            Tensor t = _w.Vector(name, s.Device);
             node = e.TensorWeight(t, _w.Extents(name));
             leaves[name] = node;
             return node;
@@ -765,10 +980,20 @@ public sealed class Ltx25Denoiser : IDenoiser
         float[] videoTimes = input.VideoTimesteps ?? new[] { input.VideoSigma }, audioTimes = input.AudioTimesteps ?? new[] { input.AudioSigma };
         long tv = videoTimes.Length, ta = audioTimes.Length;
 
-        // ---- inputs
-        int video = Linear("patchify_proj", e.InputF32(input.Video, c.VideoChannels, nv));
-        int audio = Linear("audio_patchify_proj", e.InputF32(input.Audio, c.AudioChannels, na));
-        if (s.Keyframes != null) video = b.Op(GraphOp.Add, video, Constant(s.Keyframes, vdim, nv));
+        // ---- inputs: the latents through their patchify projections (and the keyframe embedding) where the program opens the
+        // step, else the two residual streams the previous stage handed on; the contexts in every program
+        int video, audio;
+        if (span.IsFirst)
+        {
+            video = Linear("patchify_proj", e.InputF32(input.Video, c.VideoChannels, nv));
+            audio = Linear("audio_patchify_proj", e.InputF32(input.Audio, c.AudioChannels, na));
+            if (s.Keyframes != null) video = b.Op(GraphOp.Add, video, Constant(s.Keyframes, vdim, nv));
+        }
+        else
+        {
+            video = e.InputF32(s.CarryVideo ?? throw new ArgumentException("a later stage needs the video stream", nameof(s)), vdim, nv);
+            audio = e.InputF32(s.CarryAudio ?? throw new ArgumentException("a later stage needs the audio stream", nameof(s)), adim, na);
+        }
         int videoContext = e.InputF32(input.VideoContext, c.VideoContextDim, nvc);
         int audioContext = e.InputF32(input.AudioContext, c.AudioContextDim, nac);
 
@@ -784,8 +1009,8 @@ public sealed class Ltx25Denoiser : IDenoiser
         int audioCross = Ada("av_ca_audio_scale_shift_adaln_single", audioFeatures).Coefficients;
         int audioCrossGate = Ada("av_ca_v2a_gate_adaln_single", Features(5)).Coefficients;
 
-        RopeCache rope = s.Rope;
-        for (int i = 0; i < s.Blocks; i++)
+        RopeTables rope = s.Rope;
+        for (int i = span.First; i < span.End; i++)
         {
             string block = $"transformer_blocks.{i}.";
             // Self and text attention of each stream.
@@ -850,6 +1075,14 @@ public sealed class Ltx25Denoiser : IDenoiser
             }
             video = FeedForward(true, video);
             audio = FeedForward(false, audio);
+        }
+
+        // A stage that does not close the step hands both residual streams on.
+        if (!span.IsLast)
+        {
+            e.Output(video, nv * vdim);
+            e.Output(audio, na * adim);
+            return;
         }
 
         // ---- output heads: the embedded timestep plus the table's two rows, the layer-normed state modulated, then proj_out

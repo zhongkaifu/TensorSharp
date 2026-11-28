@@ -56,7 +56,17 @@ Use `--backend cuda` or `ggml_cuda` on NVIDIA GPUs (the CUDA tensor executor).
 `mlx` and `ggml_metal` select the MLX tensor executor on Apple Silicon. `cpu` and
 `ggml_cpu` select the managed CPU tensor executor; GPU generation measurements do
 not establish CPU throughput.
-Vulkan and multi-GPU execution are unsupported. Desktop MP4 audio requires
+Vulkan is unsupported. On NVIDIA, `--backend cuda --layer-split N` splits the
+denoiser's 48 blocks over N GPUs as whole-block stages: each GPU holds a
+contiguous run of blocks (balanced by bytes) and the AdaLN projections every stage
+computes, the video and audio streams cross from one GPU to the next through host
+memory, and the text encoder, VAEs and upscaler stay on the first GPU. It runs a
+denoiser one GPU cannot hold; it does not make a step faster. `ggml_cuda` runs on
+one GPU, and `--tp` is unsupported. The stages give one device's bits on the
+managed CPU executor (two host devices, the synthetic two-block checkpoint, with and
+without an Ingredients adapter); the two-GPU comparison
+(`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`) and real-checkpoint
+clips have not been run on GPUs yet. Desktop MP4 audio requires
 FFmpeg on `PATH` or `TS_FFMPEG`; the CLI also writes the original PCM as a WAV.
 The Mac app encodes audio/video through AVFoundation.
 
@@ -113,8 +123,9 @@ Ingredients IC-LoRA described below. For video continuation, `ContinuationVideoP
 (or the HTTP `continueFromVideos` field) uses the exact last frame of the first clip as
 frame zero; a second clip pins the new take's last frame. `ReferenceVideoPaths` (HTTP
 `referenceVideos`) in `Mode = "ref"` instead supplies a full temporal reference clip.
-Reference audio, retake/refinement, HDR/EXR, generated
-keyframe slots and multi-GPU splitting remain unavailable. Disabling audio decode still runs the trained joint
+Reference audio, retake/refinement, HDR/EXR and generated
+keyframe slots remain unavailable; multi-GPU is the denoiser's whole-block stages on `cuda`
+only (see [Files and startup](#files-and-startup)). Disabling audio decode still runs the trained joint
 AV denoiser.
 The native audio length can be slightly shorter than the video duration; the
 original decoder/export rule crops excess samples and does not pad short tracks.

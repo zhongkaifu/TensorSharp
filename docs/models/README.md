@@ -59,7 +59,7 @@ DeepSeek 1017 defaults to approximate YOCO prefill; read its [quality and benchm
 |---|---|---|---|
 | [Qwen-Image-2.1](qwenimage21.md) | Text, optional reference/mask images | Images / image edits | Conditional: matching encoder/VAE and sampling recipe; component coverage varies by backend. |
 | [MiniMax-H3-Image](minimax-h3-image.md) | Text | Images, ~4 to 20 MP | Conditional: ggml backends only (`ggml_cuda` measured); six distilled steps, guidance 1; editing not implemented. |
-| [LTX 2.5 Distilled](ltx-2.5.md) | Text, image keyframes; optional identity sheets | Video + 48 kHz stereo | Experimental: current two-stage recipe and companions; Vulkan and multi-GPU are unsupported. |
+| [LTX 2.5 Distilled](ltx-2.5.md) | Text, image keyframes; optional identity sheets | Video + 48 kHz stereo | Experimental: current two-stage recipe and companions; Vulkan is unsupported; multi-GPU is `--layer-split N` on `cuda` (whole-block denoiser stages). |
 | [MiniMax-H3](minimax-h3.md) | Text, keyframes or reference media by checkpoint | Video + 32 kHz stereo | Conditional: distinct FL2VA/Ref2VA checkpoints. Component gates and whole-generation coverage differ. |
 | [Wan 2.1 / 2.2](wan.md) | Text, image by variant | Video (no audio) | Conditional: variant-specific encoders/VAE, sampler and step schedule; multi-GPU is unsupported. |
 
