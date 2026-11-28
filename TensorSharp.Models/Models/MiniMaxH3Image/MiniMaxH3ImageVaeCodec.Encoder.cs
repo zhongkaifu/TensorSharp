@@ -64,6 +64,14 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>Whether the file carries the encoder (Comfy-Org's minimax_h3_image_vae_fp16 does).</summary>
         public bool HasEncoder => _model.HasTensor("encoder.conv_in.weight");
 
+        /// <summary>Why the encoder does not run on a tensor executor (direct CUDA): its program's GroupNorms are
+        /// <see cref="GraphOp.GroupNorm"/> nodes, which the tensor executors (TensorGraphExecutor, so CudaGraphExecutor) do not
+        /// implement; its Conv2d and PadReflect1d they do. Edits, which encode their references, run on ggml_cuda until the op
+        /// is there.</summary>
+        internal const string TensorExecutorEncoderGap =
+            "MiniMax-H3-Image's VAE encoder (an edit's references) does not run on --backend cuda: its GroupNorm nodes " +
+            "(GraphOp.GroupNorm) are not implemented by the CUDA graph executor. Edit on ggml_cuda; text to image runs on cuda.";
+
         /// <summary>Tiles the last <see cref="Encode"/> encoded, and the seconds its programs ran.</summary>
         public int LastEncodeTiles { get; private set; }
 
@@ -199,6 +207,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             ArgumentNullException.ThrowIfNull(image);
             if (image.Width % Downsample != 0 || image.Height % Downsample != 0)
                 throw new ArgumentException($"MiniMax-H3-Image encodes whole {Downsample}-pixel cells; the picture is {image.Width}x{image.Height}.", nameof(image));
+            if (_tensorAllocator != null) throw new NotSupportedException(TensorExecutorEncoderGap);
             EnsureEncoder();
             lock (_gate)
             {

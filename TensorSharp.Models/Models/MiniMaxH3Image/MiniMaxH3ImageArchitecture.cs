@@ -20,7 +20,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
             Id = MiniMaxH3ImageFamily.ArchitectureId,
             DisplayName = "MiniMax-H3-Image",
             Aliases = new[] { MiniMaxH3ImageFamily.ArchitectureId, "minimax_h3_image" },
-            Factory = c => new MiniMaxH3ImageDiffusionModel(c.GgufPath, c.Backend, c.LayerSplitDegree),
+            // --tp shards the denoiser (heads and MLP columns per GPU, direct CUDA); --layer-split splits its blocks over the
+            // GPUs as whole-block stages. Either way the text encoder and the VAE stay on the first GPU.
+            Factory = c => new MiniMaxH3ImageDiffusionModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
             // Style adapters (any number, bare weights too) and one speed adapter (config/lora/minimax-h3-image-*.json).
             LoraPluginType = Runtime.LoraCliFlags.MiniMaxH3ImagePluginType,
             DetectFromTensors = LooksLikeDenoiser,
@@ -34,10 +36,15 @@ namespace TensorSharp.Models.MiniMaxH3Image
             RelabelledFileDescription =
                 "a '" + HyVidLabel + "'-labelled GGUF from ComfyUI-GGUF's converter whose tensors are the " +
                 "MiniMax-H3-Image denoiser (the H3 DiT with no audio stream) - e.g. unsloth/MiniMax-H3-Image-GGUF",
+            // Direct CUDA runs every component on the CUDA tensor executor (the VAE encoder of an edit excepted: the model then
+            // makes images from text only). Tensor parallelism is direct CUDA's (DenoiserRanks: the ranks' programs in lockstep,
+            // the peer sum); ggml_cuda's ranked runner refuses this step's offload nodes, so it stays a gap there. Layer split
+            // runs whole-block stages on both CUDA backends. The hybrid is a gap, refused at load.
             Serving = ServingContract.SharedDiffusionRuntime(
-                new[] { BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda },
-                tensorParallelGap: "minimax-h3-image has no tensor-parallel path; it runs on one GPU and extra GPUs stay idle.",
-                layerSplitBackends: new[] { BackendType.GgmlCuda }),
+                new[] { BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.Cuda },
+                tensorParallelBackends: new[] { BackendType.Cuda },
+                tensorParallelGap: MiniMaxH3ImageDenoiser.GgmlTensorParallelGap,
+                layerSplitBackends: new[] { BackendType.GgmlCuda, BackendType.Cuda }),
         };
 
         /// <summary>The architecture detector for a GGUF that holds the image denoiser.</summary>

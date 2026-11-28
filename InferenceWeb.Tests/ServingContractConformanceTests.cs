@@ -99,6 +99,8 @@ public sealed class ServingContractConformanceTests
         "minimax-h3: HybridParallel@ggml_cuda",
         // The denoiser shards over cuda's GPUs (MiniMaxH3DenoiserTests.TensorParallel*); GGML's ranked runner takes no DiT regions.
         "minimax-h3: TensorParallel@ggml_cuda",
+        // Direct CUDA joined the family's backends with --tp and --layer-split there; the hybrid is a gap on it too.
+        "minimax-h3-image: HybridParallel@cuda",
         "minimax-h3-image: HybridParallel@ggml_cuda",
         "minimax-h3-image: TensorParallel@ggml_cuda",
         "minimax-m3: HybridParallel@ggml_cuda",

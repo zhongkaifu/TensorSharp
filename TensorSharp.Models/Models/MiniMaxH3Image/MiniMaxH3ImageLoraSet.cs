@@ -23,8 +23,9 @@
 // Several adapters on one projection are concatenated along the rank (Qwen-Image-2.1's packing), so a projection takes one
 // shrink and one expand per slot whatever the adapter count. Each rank component is balanced (down row and up column of
 // equal norm; the product is unchanged) and stored F16 unless a value would reach F16's range (then F32) or the backend is
-// ggml_cpu (F32 always: its ARM kernels accumulate F16 dot products in F16) or the managed executor (F32). Ranks are
-// zero-padded to 64 on Metal (its simdgroup kernel needs K >= 64) and to 16 elsewhere; the managed executor keeps them.
+// ggml_cpu (F32 always: its ARM kernels accumulate F16 dot products in F16) or a tensor executor (the managed one, direct
+// CUDA: F32). Ranks are zero-padded to 64 on Metal (its simdgroup kernel needs K >= 64) and to 16 elsewhere; the tensor
+// executors keep them.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -132,6 +133,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         /// <summary>The backend the factors are packed for (their element type and rank padding).</summary>
         internal BackendType Backend { get; }
+
+        /// <summary>Whether the factors are packed for a tensor executor (the managed one on cpu, the CUDA one on cuda): F32, no
+        /// rank padding, bound as objects; a GGML backend binds its packed factors by host pointer.</summary>
+        internal bool ForTensorExecutor => Backend is BackendType.Cpu or BackendType.Cuda;
 
         /// <summary>The checkpoint's shape the set was validated against.</summary>
         internal MiniMaxH3Config Config => _cfg;
@@ -644,7 +649,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 _ => MiniMaxH3LoraKeys.Shape(_cfg, MiniMaxH3LoraTarget.Fc2),
             };
             long slotRows = threeSlots ? _cfg.AttentionInnerDim : output;
-            bool managed = Backend == BackendType.Cpu;
+            // The tensor executors (managed, direct CUDA) take F32 factors at their own rank, as MiniMax-H3 video's set packs
+            // them for its tensor executors.
+            bool managed = ForTensorExecutor;
             bool f32Only = managed || Backend == BackendType.GgmlCpu;
             int multiple = managed ? 1 : Backend == BackendType.GgmlMetal ? 64 : 16;
             var parts = new List<Part>();
@@ -781,7 +788,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
             foreach (IntPtr p in FactorPointers())
             {
                 if (hook != null) hook(p);
-                else if (Backend != BackendType.Cpu) GgmlBasicOps.InvalidateHostBuffer(p);
+                // A tensor executor's copies are its denoiser's to release (it keys them by the handles it bound).
+                else if (!ForTensorExecutor) GgmlBasicOps.InvalidateHostBuffer(p);
             }
         }
 

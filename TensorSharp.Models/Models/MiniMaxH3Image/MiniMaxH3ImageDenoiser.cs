@@ -9,6 +9,11 @@
 // and the final layer with the step's PDD head), emitted through GraphEmitter with the diffusion-transformer regions and
 // run by the backend's graph executor. The program is the graph the retired TSGgml_MiniMaxH3DitForward built, node for node,
 // so a backend that lowers it as that native graph did computes the same velocity bit for bit (see the emission below).
+//
+// On direct CUDA (--backend cuda) the same program runs on the CUDA tensor executor as MiniMax-H3 video's denoiser runs its
+// (the same 50-block trunk): F32 activations in every product, the diffusion-transformer regions served by the executor's
+// own kernels. Over several GPUs it runs as whole-block stages (--layer-split N, DenoiserStages) or Megatron-sharded
+// (--tp N, DenoiserRanks): each rank holds its heads of every attention and its slice of every MLP, two all-reduces a block.
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -27,76 +32,138 @@ namespace TensorSharp.Models.MiniMaxH3Image
     /// The MiniMax-H3-Image DiT as an <see cref="IDenoiser"/>. Making one maps the file and reads its small tensors on the
     /// host; its first step makes the weights resident (<see cref="Preload"/>, MiniMax-H3's uploader on the GGML backends)
     /// and compiles the step's program, which every later step of the same geometry replays with new inputs.
+    /// <para>
+    /// Over a tensor-parallel group (<c>--tp N</c> on <see cref="BackendType.Cuda"/>; a simulated group's host devices in the
+    /// tests) the blocks are sharded Megatron-style (<see cref="DenoiserRanks"/>, <see cref="DitShards"/>): each rank holds
+    /// rows of every block's stacked [q | k | v] (its heads) and [gate | value] projections and the matching input columns of
+    /// the attention output and fc2, so a rank's attention and SwiGLU are its own heads and MLP columns, and each of the two
+    /// row-parallel products is summed over the ranks (<see cref="GraphOp.AllReduce"/>) before the gated residual adds it to the
+    /// rank's copy of the stream. The token refiner, the modulations, norms, patch projections, final layer and PDD heads are
+    /// whole on every rank, so the stream is the same on every rank between blocks and the velocity is rank 0's.
+    /// </para>
     /// </summary>
     public sealed class MiniMaxH3ImageDenoiser : IDenoiser
     {
         /// <summary>MiniMax-H3's q8_1 overflow guard around a product of a block-quantized weight (h3_mm's kH3MmScale).</summary>
         internal const float GuardScale = 1024f;
 
+        /// <summary>Why ggml_cuda cannot shard this denoiser: its ranked runner refuses graphs that carry diffusion-transformer
+        /// offload nodes (TSGgml_GraphRunRanked, <c>dit_regions &gt; 0</c>), and ggml_cuda serves this step's regions as exactly
+        /// those fused nodes. The serving contract's gap and the denoiser's refusal both say it.</summary>
+        internal const string GgmlTensorParallelGap =
+            "minimax-h3-image runs its tensor-parallel denoiser on --backend cuda only: ggml_cuda's ranked graph runner refuses " +
+            "programs with diffusion-transformer offload nodes, which its step is served as. Use --backend cuda --tp N, or " +
+            "--layer-split N on ggml_cuda.";
+
         private readonly MiniMaxH3ImageWeights _w;
         private readonly IGraphExecutor _executor;
         private readonly IAllocator _tensorAllocator;   // tensor executors bind weights as objects: their F32 vectors live here
-        private readonly Dictionary<MiniMaxH3ImageWeight, Tensor> _tensors = new();
+        // A tensor executor's F32 vectors, one tensor per weight and device (the stage or rank whose program binds it).
+        private readonly Dictionary<(MiniMaxH3ImageWeight, int), Tensor> _tensors = new();
         private readonly object _gate = new();
         private readonly Dictionary<(int, int), (float[] Weight, float[] Bias)> _heads = new();
         private float[] _headGrid;
-        private (float[] Positions, float[] Cos, float[] Sin) _rope;
+        private (float[] Positions, float[] Cos, float[] Sin, float[] SinSigned) _rope;
         private IGraphPlan _plan;
         private (ulong, ulong) _planSignature;
         private bool _preloaded;
         private bool _disposed;
-        // The LoRA set the cached plan binds (null: none), and a tensor executor's handles for its factors.
+        // The LoRA set the cached plan binds (null: none), and a tensor executor's handles for its factors (keyed by the bytes
+        // and extents they bind: a rank's slot of a factor starts where the whole factor does).
         private MiniMaxH3ImageLoraSet _lora;
-        private readonly Dictionary<IntPtr, MiniMaxH3ImageWeight> _loraHandles = new();
+        private readonly Dictionary<(IntPtr, long, long), MiniMaxH3ImageWeight> _loraHandles = new();
         // Whole-block stages over several devices (--layer-split N), or null for one device; while a stage's program is
         // emitted, the stage whose tensor executor holds the F32 vectors its weights bind.
         private readonly DenoiserStages _stages;
         private int _emitStage;
+        // Tensor parallelism (--tp N), or null: the ranks, each rank's blocks (their sharded projections, the rest shared), the
+        // projection copies the shards own, the bound LoRA set's per-rank factors (trunk blocks; the refiner's are whole) and
+        // the copies those own; while a rank's program is emitted, its rank.
+        private readonly DenoiserRanks _ranks;
+        private readonly MiniMaxH3ImageBlock[][] _rankBlocks;
+        private readonly List<IntPtr> _shardOwned = new();
+        private MiniMaxH3ImageLoraSet.Factors[][] _rankLora;
+        private readonly List<IntPtr> _rankLoraOwned = new();
+        private int _emitRank;
 
         /// <summary>The denoiser in <paramref name="path"/> (a GGUF, or the safetensors release in its original names) on
-        /// <paramref name="backend"/>: a GGML backend (its graph executor) or <see cref="BackendType.Cpu"/> (the managed
-        /// executor).</summary>
+        /// <paramref name="backend"/>: a GGML backend (its graph executor), <see cref="BackendType.Cpu"/> (the managed executor)
+        /// or <see cref="BackendType.Cuda"/> (the CUDA tensor executor on <paramref name="allocator"/>'s device).</summary>
         /// <param name="devices">The devices of a whole-block split (<c>--layer-split N</c>, <see cref="DenoiserStages"/>), one a
         /// stage; null or one for one device.</param>
-        public MiniMaxH3ImageDenoiser(string path, BackendType backend, IReadOnlyList<IAllocator> devices = null)
-            : this(new MiniMaxH3WeightFile(path ?? throw new ArgumentNullException(nameof(path))), ownsFile: true, backend, null, null, devices)
+        /// <param name="allocator">The device of a one-device step on <see cref="BackendType.Cuda"/> (a
+        /// <see cref="TensorSharp.Cuda.CudaAllocator"/>); unused elsewhere.</param>
+        /// <param name="tensorParallel">The group the blocks shard over (<c>--tp N</c>, <see cref="DenoiserRanks"/>): direct CUDA's
+        /// <see cref="TensorSharp.Cuda.TensorParallelGroup"/>, or a simulated group's host devices on <see cref="BackendType.Cpu"/>;
+        /// null or a group of one for one device.</param>
+        public MiniMaxH3ImageDenoiser(string path, BackendType backend, IReadOnlyList<IAllocator> devices = null, IAllocator allocator = null,
+            ITensorParallelGroup tensorParallel = null)
+            : this(new MiniMaxH3WeightFile(path ?? throw new ArgumentNullException(nameof(path))), ownsFile: true, backend, null, allocator,
+                devices, tensorParallel)
         {
         }
 
         /// <param name="executor">The executor the steps run on; null resolves it from <paramref name="backend"/>.</param>
-        /// <param name="tensorAllocator">Where a tensor executor's F32 vectors live (null: the managed CPU's).</param>
+        /// <param name="tensorAllocator">Where a tensor executor's F32 vectors live (null: the managed CPU's); with no
+        /// <paramref name="executor"/>, the direct-CUDA device.</param>
         internal MiniMaxH3ImageDenoiser(MiniMaxH3WeightFile file, bool ownsFile, BackendType backend, IGraphExecutor executor,
-            IAllocator tensorAllocator, IReadOnlyList<IAllocator> devices = null)
+            IAllocator tensorAllocator, IReadOnlyList<IAllocator> devices = null, ITensorParallelGroup tensorParallel = null)
         {
             Backend = backend;
             _w = new MiniMaxH3ImageWeights(file, ownsFile, backend);   // disposes an owned file when it throws
             try
             {
-                if (devices is { Count: > 1 })
+                if (tensorParallel is { Degree: > 1 })
                 {
-                    _stages = new DenoiserStages(_w.BlockBytes(), devices);
+                    if (devices is { Count: > 1 })
+                        throw new NotSupportedException(
+                            "MiniMax-H3-Image shards its denoiser over a tensor-parallel group or splits its blocks over devices, not both.");
+                    if (IsGgml(backend)) throw new NotSupportedException(GgmlTensorParallelGap);
+                    if (backend is not (BackendType.Cuda or BackendType.Cpu))
+                        throw new NotSupportedException(
+                            $"MiniMax-H3-Image shards its denoiser on --backend cuda, not {Architecture.BackendNames.OptionName(backend)}.");
+                    if (executor != null) throw new ArgumentException("a tensor-parallel denoiser makes one executor a rank", nameof(executor));
+                    if (TensorParallelRefusal(file, tensorParallel.Degree) is string refusal) throw new NotSupportedException(refusal);
+                    _ranks = new DenoiserRanks(tensorParallel, DeviceExecutor);
+                    (_executor, _tensorAllocator) = (_ranks.Executor(0), _ranks.TensorAllocator(0));
+                    _rankBlocks = ShardBlocks(_w, _ranks.Count, _shardOwned);
+                }
+                else if (devices is { Count: > 1 })
+                {
+                    // Each stage's executor is the one a single device of its backend runs (DeviceExecutor), so a stage runs
+                    // its blocks with the products and served regions one device runs them with.
+                    _stages = new DenoiserStages(_w.BlockBytes(), devices, DeviceExecutor);
                     (_executor, _tensorAllocator) = (_stages.Executor(0), _stages.TensorAllocator(0));
                 }
+                else if (executor != null)
+                    (_executor, _tensorAllocator) = (executor,
+                        executor.Capabilities.BindsHostPointers ? null : tensorAllocator ?? throw new ArgumentNullException(nameof(tensorAllocator)));
                 else
-                    (_executor, _tensorAllocator) = executor != null
-                        ? (executor, executor.Capabilities.BindsHostPointers ? null : tensorAllocator ?? throw new ArgumentNullException(nameof(tensorAllocator)))
-                        : Resolve(backend);
+                    (_executor, _tensorAllocator) = Resolve(backend, tensorAllocator);
             }
             catch
             {
+                FreeShards();
                 _w.Dispose();
                 throw;
             }
         }
 
-        private static (IGraphExecutor, IAllocator) Resolve(BackendType backend) => backend switch
+        private static bool IsGgml(BackendType backend) =>
+            backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu or BackendType.GgmlVulkan;
+
+        private static (IGraphExecutor, IAllocator) Resolve(BackendType backend, IAllocator allocator) => backend switch
         {
             BackendType.GgmlCuda => (GgmlGraphExecutor.For(GgmlBackendType.Cuda), null),
             BackendType.GgmlMetal => (GgmlGraphExecutor.For(GgmlBackendType.Metal), null),
             BackendType.GgmlCpu => (GgmlGraphExecutor.For(GgmlBackendType.Cpu), null),
             BackendType.Cpu => ManagedExecutor(),
+            // The registered CUDA graph executor, as MiniMax-H3 video's denoiser takes it on cuda (GraphExecutors.For).
+            BackendType.Cuda => allocator is TensorSharp.Cuda.CudaAllocator cuda
+                ? (DeviceExecutor(cuda), cuda)
+                : throw new ArgumentException("MiniMax-H3-Image's denoiser on --backend cuda runs on a CUDA device's allocator.", nameof(allocator)),
             _ => throw new NotSupportedException(
-                $"MiniMax-H3-Image's denoiser runs on ggml_cuda, ggml_metal, ggml_cpu or cpu, not {Architecture.BackendNames.OptionName(backend)}."),
+                $"MiniMax-H3-Image's denoiser runs on ggml_cuda, ggml_metal, ggml_cpu, cuda or cpu, not {Architecture.BackendNames.OptionName(backend)}."),
         };
 
         private static (IGraphExecutor, IAllocator) ManagedExecutor()
@@ -105,31 +172,65 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return (new ManagedGraphExecutor(allocator), allocator);
         }
 
+        /// <summary>The executor one device of a tensor executor's backend runs the steps on, the same for one device, each
+        /// whole-block stage and each tensor-parallel rank: on the host the managed executor as the one-device step makes it
+        /// (its regions as their ops, its own products), on a CUDA device the registered CUDA graph executor (F32 products,
+        /// served regions: <see cref="FloatProducts"/>). Null on GGML (the stages take the backend's one executor).</summary>
+        private static IGraphExecutor DeviceExecutor(IAllocator device) => device switch
+        {
+            CpuAllocator cpu => new ManagedGraphExecutor(cpu),
+            TensorSharp.Cuda.CudaAllocator cuda => GraphExecutors.For(cuda),
+            _ => null,
+        };
+
+        /// <summary>
+        /// Whether the steps take F32 products (<see cref="GraphEmitter"/>'s floatProducts): on direct CUDA, as MiniMax-H3 video's
+        /// denoiser takes them there (the retired direct DiT's bounded F32 products, no q8_1 rounding of the activations, so no
+        /// overflow guard), with the executor's own kernels for the wide program's regions; the managed executor keeps its own
+        /// products and runs the regions' ops, and the GGML executor takes them as the retired native graph did.
+        /// </summary>
+        private bool FloatProducts => _tensorAllocator != null && _executor is not ManagedGraphExecutor;
+
         public BackendType Backend { get; }
 
         public MiniMaxH3Config Config => _w.Config;
 
-        /// <summary>The executor the steps run on.</summary>
+        /// <summary>The executor the steps run on (rank 0's under tensor parallelism, the first stage's under a split).</summary>
         internal IGraphExecutor Executor => _executor;
 
-        /// <summary>The plan the last step ran (a test seam: its served and lowered regions); the last stage's under a split.</summary>
-        internal IGraphPlan LastPlan => _stages?.Plan(_stages.Count - 1) ?? _plan;
+        /// <summary>Whether the steps run on a tensor executor (weights bound as objects, F32 LoRA factors).</summary>
+        internal bool OnTensorExecutor => _tensorAllocator != null;
 
-        /// <summary>Steps that compiled their program (the rest replayed the cached plan); under a split, stage programs.</summary>
-        internal int Compiles => _compiles + (_stages?.Compiles ?? 0);
+        /// <summary>The plan the last step ran (a test seam: its served and lowered regions); the last stage's under a split,
+        /// rank 0's under tensor parallelism.</summary>
+        internal IGraphPlan LastPlan => _ranks != null ? _ranks.Plans?[0] : _stages?.Plan(_stages.Count - 1) ?? _plan;
+
+        /// <summary>Steps that compiled their program (the rest replayed the cached plan); under a split, stage programs; under
+        /// tensor parallelism, rank programs.</summary>
+        internal int Compiles => _compiles + (_stages?.Compiles ?? 0) + (_ranks?.Compiles ?? 0);
 
         private int _compiles;
 
         /// <summary>The whole-block stages, or null for one device (a test seam).</summary>
         internal DenoiserStages Stages => _stages;
 
+        /// <summary>The tensor-parallel ranks, or null (a test seam).</summary>
+        internal DenoiserRanks Ranks => _ranks;
+
         public DenoiserCaps Caps { get; } = new();
 
-        /// <summary>The weights' device bytes: under a split, the largest stage's share (each device holds its own).</summary>
+        /// <summary>The weights' device bytes: under a split, the largest stage's share; under tensor parallelism, a rank's
+        /// (the replicated weights and its shards; each device holds its own).</summary>
         public long WeightBytes => StageWeightBytes() + (AdapterBytes?.Invoke() ?? 0);
 
         private long StageWeightBytes()
         {
+            if (_ranks != null)
+            {
+                long rank = 0;
+                foreach (MiniMaxH3ImageWeight w in RankWeights(0)) rank += w.Bytes;
+                return rank;
+            }
             if (_stages == null) return _w.Bytes;
             long most = 0;
             for (int s = 0; s < _stages.Count; s++)
@@ -139,6 +240,139 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 most = Math.Max(most, bytes);
             }
             return most;
+        }
+
+        /// <summary>The weight leaves rank <paramref name="rank"/>'s program binds: the replicated ones (the token refiner, the
+        /// patch and condition projections, the final layer) and its blocks' (their shards, norms and modulations).</summary>
+        private IEnumerable<MiniMaxH3ImageWeight> RankWeights(int rank)
+        {
+            foreach (MiniMaxH3ImageWeight w in _w.WeightsOf(new DenoiserSpan(0, 0, true, true))) yield return w;
+            foreach (MiniMaxH3ImageBlock block in _rankBlocks[rank])
+                foreach (MiniMaxH3ImageWeight w in MiniMaxH3ImageWeights.Of(block)) yield return w;
+        }
+
+        // ---- tensor parallelism
+
+        /// <summary>
+        /// Why the denoiser in <paramref name="file"/> cannot shard over <paramref name="ranks"/> devices, or null: every rank
+        /// holds whole heads (the heads divide), an equal slice of the MLP (the FFN width divides), and the row-parallel products'
+        /// input columns (attention output: inner / ranks; fc2: FFN / ranks) cut no quant block of the stored format (Q4_K's
+        /// 256-element blocks: 7168 / ranks and 14336 / ranks for the release, so --tp 2 and 4, not 8), and its block
+        /// projections carry no bias (a row-parallel bias would join every rank's partial).
+        /// </summary>
+        internal static string TensorParallelRefusal(MiniMaxH3WeightFile file, int ranks)
+        {
+            ArgumentNullException.ThrowIfNull(file);
+            if (ranks < 2) return null;
+            MiniMaxH3Config c = MiniMaxH3Config.Detect(file.Tensors);
+            if (c.NumAttentionHeads % ranks != 0)
+                return $"MiniMax-H3-Image tensor parallelism needs a GPU count that divides its {c.NumAttentionHeads} attention heads " +
+                       $"(every GPU holds whole heads); --tp {ranks} does not.";
+            if (c.FfnHiddenSize % ranks != 0)
+                return $"MiniMax-H3-Image tensor parallelism needs a GPU count that divides its {c.FfnHiddenSize}-wide MLP; --tp {ranks} does not.";
+            for (int i = 0; i < c.NumLayers; i++)
+            {
+                string p = $"{c.Prefix}blocks.{i}.";
+                foreach (string bias in new[] { "attn.qkv_proj.bias", "attn.out_proj.bias", "mlp.fc1.bias", "mlp.fc2.bias" })
+                    if (file.Tensors.ContainsKey(p + bias))
+                        return $"MiniMax-H3-Image tensor parallelism shards bias-free projections; {p + bias} is a bias.";
+                foreach (var (name, width) in new[] { ("attn.out_proj.weight", (long)c.AttentionInnerDim), ("mlp.fc2.weight", (long)c.FfnHiddenSize) })
+                {
+                    if (!file.Tensors.TryGetValue(p + name, out GgufTensorInfo info)) continue;
+                    long block = GgufFile.GetBlockSize(info.Type);
+                    if (width % (block * ranks) != 0)
+                        return $"MiniMax-H3-Image tensor parallelism over {ranks} GPUs gives each {width / ranks} input columns of " +
+                               $"{p + name}, which cut its {info.Type} format's {block}-element blocks; use a --tp that divides " +
+                               $"{width / block} blocks.";
+                }
+            }
+            return null;
+        }
+
+        /// <summary>Each rank's blocks: rows of the stacked [q | k | v] (its heads of each third) and [gate | value] (its MLP
+        /// columns of each half) as copies of those runs, the attention output's and fc2's matching input columns as
+        /// block-aligned copies (<see cref="DitShards"/>, owned by <paramref name="owned"/>); norms and modulations shared.</summary>
+        private static MiniMaxH3ImageBlock[][] ShardBlocks(MiniMaxH3ImageWeights w, int ranks, List<IntPtr> owned)
+        {
+            static MiniMaxH3ImageLinear Shard(MiniMaxH3ImageLinear l, Func<DitShards.Slice, DitShards.Slice> cut)
+            {
+                MiniMaxH3ImageWeight x = l.Weight;
+                DitShards.Slice s = cut(new DitShards.Slice(x.Format, x.Ne0, x.Ne1, x.Data, x.Bytes));
+                return new MiniMaxH3ImageLinear(new MiniMaxH3ImageWeight(s.Format, s.Ne0, s.Ne1, s.Data, s.Bytes), null);
+            }
+            var result = new MiniMaxH3ImageBlock[ranks][];
+            for (int r = 0; r < ranks; r++)
+            {
+                int rank = r;
+                result[r] = new MiniMaxH3ImageBlock[w.Blocks.Length];
+                for (int i = 0; i < w.Blocks.Length; i++)
+                {
+                    MiniMaxH3ImageBlock b = w.Blocks[i];
+                    result[r][i] = new MiniMaxH3ImageBlock
+                    {
+                        Norm1 = b.Norm1, Norm2 = b.Norm2, QNorm = b.QNorm, KNorm = b.KNorm, AdaLn = b.AdaLn,
+                        Qkv = Shard(b.Qkv, s => DitShards.Rows(s, 3, rank, ranks, owned)),
+                        Out = Shard(b.Out, s => DitShards.Columns(s, rank, ranks, owned)),
+                        Fc1 = Shard(b.Fc1, s => DitShards.Rows(s, 2, rank, ranks, owned)),
+                        Fc2 = Shard(b.Fc2, s => DitShards.Columns(s, rank, ranks, owned)),
+                    };
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// The bound LoRA set's trunk factors for each rank, as its projections are sharded: a column-parallel projection's
+        /// (qkv, fc1) down whole and the rank's output rows of up (a view where a part is one slot, a copy of the rank's run of
+        /// each stacked part where one part spans all of them), its slot rows divided; a row-parallel projection's (attention
+        /// output, fc2) the rank's input columns of down (a copy) and up whole, so the update joins the rank's partial before
+        /// the all-reduce sums them. The copies go to <see cref="_rankLoraOwned"/>, freed when the set is unbound.
+        /// </summary>
+        private MiniMaxH3ImageLoraSet.Factors[][] ShardLora(MiniMaxH3ImageLoraSet lora)
+        {
+            int ranks = _ranks.Count, blocks = _w.Blocks.Length;
+            var result = new MiniMaxH3ImageLoraSet.Factors[ranks][];
+            for (int r = 0; r < ranks; r++)
+            {
+                result[r] = new MiniMaxH3ImageLoraSet.Factors[blocks * MiniMaxH3ImageLoraSet.ProjectionCount];
+                for (int bi = 0; bi < blocks; bi++)
+                    for (int pi = 0; pi < MiniMaxH3ImageLoraSet.ProjectionCount; pi++)
+                    {
+                        var projection = (MiniMaxH3ImageLoraSet.Projection)pi;
+                        MiniMaxH3ImageLoraSet.Factors f = lora.Get(false, bi, projection);
+                        if (f == null) continue;
+                        bool columnParallel = projection is MiniMaxH3ImageLoraSet.Projection.Qkv or MiniMaxH3ImageLoraSet.Projection.Fc1;
+                        int stacked = projection == MiniMaxH3ImageLoraSet.Projection.Qkv ? 3 : 2;
+                        var parts = new MiniMaxH3ImageLoraSet.Part[f.Parts.Length];
+                        for (int i = 0; i < parts.Length; i++)
+                        {
+                            MiniMaxH3ImageLoraSet.Part p = f.Parts[i];
+                            var down = new DitShards.Slice(p.Format, p.In, p.Rank, p.Down, p.DownBytes);
+                            var up = new DitShards.Slice(p.Format, p.Rank, p.Out, p.Up, p.UpBytes);
+                            if (columnParallel)
+                                up = DitShards.Rows(up, f.SlotRows > 0 ? 1 : stacked, r, ranks, _rankLoraOwned);
+                            else
+                                down = DitShards.Columns(down, r, ranks, _rankLoraOwned);
+                            parts[i] = new MiniMaxH3ImageLoraSet.Part
+                            {
+                                Slot = p.Slot, Format = p.Format, Rank = p.Rank, In = down.Ne0, Out = up.Ne1,
+                                Down = down.Data, DownBytes = down.Bytes, Up = up.Data, UpBytes = up.Bytes,
+                            };
+                        }
+                        result[r][bi * MiniMaxH3ImageLoraSet.ProjectionCount + pi] = new MiniMaxH3ImageLoraSet.Factors
+                        {
+                            SlotRows = columnParallel && f.SlotRows > 0 ? f.SlotRows / ranks : f.SlotRows,
+                            Parts = parts,
+                        };
+                    }
+            }
+            return result;
+        }
+
+        private void FreeShards()
+        {
+            foreach (IntPtr p in _shardOwned) QuantizedWeight.FreeBuffer(p);
+            _shardOwned.Clear();
         }
 
         /// <summary>The device bytes of the LoRA factors the next steps bind (the family's current set), for residency.</summary>
@@ -288,29 +522,37 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     throw new ArgumentException("A request's LoRA adapters are one loaded set: the adapters carry different sets.", nameof(adapters));
             if (!set.Fits(_w.Config))
                 throw new ArgumentException("The LoRA set was loaded for a MiniMax-H3-Image checkpoint of another shape.", nameof(adapters));
-            if ((set.Backend == BackendType.Cpu) != (_tensorAllocator != null))
+            if (set.ForTensorExecutor != OnTensorExecutor)
                 throw new ArgumentException($"The LoRA set is packed for {set.Backend}; this denoiser runs on {Backend}.", nameof(adapters));
             return set;
         }
 
         /// <summary>Bind <paramref name="lora"/> for the steps that follow: a different set than the cached plan's drops the plan
         /// and the previous set's device copies first, so no step ever runs with factors of a set it was not given (a set
-        /// disposed in between may hand its addresses to the next one).</summary>
+        /// disposed in between may hand its addresses to the next one). Under tensor parallelism the new set's trunk factors are
+        /// cut for each rank here, once a set.</summary>
         private void BindLora(MiniMaxH3ImageLoraSet lora)
         {
             if (ReferenceEquals(lora, _lora)) return;
             DropPlans();
             ReleaseLoraDevice();
             _lora = lora;
+            if (lora != null && _ranks != null) _rankLora = ShardLora(lora);
         }
 
-        /// <summary>Drop the bound set's device copies and the tensor executor's handles for them.</summary>
+        /// <summary>Drop the bound set's device copies (the GGML executor's, keyed by the set's factors; a tensor executor's, keyed
+        /// by the factors and rank slices it bound, on every device that bound them), the tensor executor's handles for them,
+        /// and the rank slices the set's sharding copied.</summary>
         private void ReleaseLoraDevice()
         {
             if (_lora == null) return;
             if (_tensorAllocator == null)
                 foreach (IntPtr p in _lora.FactorPointers()) Invalidate(p);
+            foreach ((IntPtr data, _, _) in _loraHandles.Keys) ReleaseEverywhere(data);
             _loraHandles.Clear();
+            _rankLora = null;
+            foreach (IntPtr p in _rankLoraOwned) QuantizedWeight.FreeBuffer(p);
+            _rankLoraOwned.Clear();
         }
 
         /// <summary>Forget the bound LoRA set (and its device copies and the plan that binds them): the model calls it under its
@@ -367,7 +609,26 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     Lora = lora,
                 };
                 (step.Cos, step.Sin) = Rope(layout.Positions);
+                step.SinSigned = _rope.SinSigned;
                 PreloadLocked();
+                bool floatProducts = FloatProducts;
+
+                // Tensor parallelism: every rank's program (its heads and MLP columns, two all-reduces a block) traced, compiled
+                // once a geometry and LoRA set, and run in lockstep; the velocity is rank 0's.
+                if (_ranks != null)
+                {
+                    try
+                    {
+                        DenoiserSpan whole = DenoiserSpan.Whole(_w.Blocks.Length);
+                        float[][] outputs = _ranks.Run((e, rank) =>
+                        {
+                            _emitRank = rank;
+                            Emit(e, step, whole, null, rank);
+                        }, "MiniMax-H3-Image denoiser", floatProducts);
+                        return outputs[0];
+                    }
+                    finally { _emitRank = 0; }
+                }
 
                 // Whole-block stages: each stage's program on its device, the residual stream handed from one to the next.
                 if (_stages != null)
@@ -380,7 +641,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                             DenoiserSpan span = _stages.Span(st);
                             float[] input = carry;
                             _emitStage = st;
-                            carry = _stages.Run(st, e => Emit(e, step, span, input), "MiniMax-H3-Image denoiser");
+                            carry = _stages.Run(st, e => Emit(e, step, span, input), "MiniMax-H3-Image denoiser", floatProducts);
                         }
                     }
                     finally { _emitStage = 0; }
@@ -389,14 +650,14 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
                 // The program's signature first (a hash-only trace, whose inputs this step runs with); a geometry the cached
                 // plan was not compiled for records the program and compiles it, after the old plan's memory is released.
-                using (var trace = new GraphEmitter(_executor, record: false))
+                using (var trace = new GraphEmitter(_executor, record: false, floatProducts))
                 {
                     Emit(trace, step);
                     if (_plan == null || _planSignature != trace.Signature)
                     {
                         _plan?.Dispose();
                         _plan = null;
-                        using var recorded = new GraphEmitter(_executor, record: true);
+                        using var recorded = new GraphEmitter(_executor, record: true, floatProducts);
                         Emit(recorded, step);
                         _plan = recorded.Compile(replayable: true);
                         _planSignature = recorded.Signature;
@@ -484,7 +745,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     }
                 }
             }
-            _rope = ((float[])positions.Clone(), cos, sin);
+            // [-sin(first half), sin(second half)] a row: the table GraphDitRegions.SignedSine makes from sin (negation is exact),
+            // which the F32-products program binds as an input so an executor serving the rotary reads the table's host values.
+            var signed = (float[])sin.Clone();
+            for (int t = 0; t < tokens; t++)
+                for (int j = 0; j < half; j++) signed[(long)t * rot + j] = -signed[(long)t * rot + j];
+            _rope = ((float[])positions.Clone(), cos, sin, signed);
             return (cos, sin);
         }
 
@@ -516,6 +782,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             public GraphSegment[] Segments;
             public float[] TimeEmbed;      // [timeEmbedDim, timesteps]
             public float[] Cos, Sin;       // [rot, tokens]
+            public float[] SinSigned;      // [rot, tokens]: [-sin(first half), sin(second half)], the F32-products program's input
             public (float[] Weight, float[] Bias) Head;
             public MiniMaxH3ImageLoraSet Lora;   // null: no adapters
         }
@@ -536,8 +803,13 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// projections; else the residual stream the previous stage handed on (<paramref name="carry"/>, [hidden, tokens]).
         /// Where it closes the step, the final layer and the velocity; else the residual stream as its output. Every stage takes
         /// the step's time embedding, rotary and segment tables as its own inputs.
+        /// <para>Under tensor parallelism, rank <paramref name="rank"/>'s program of the whole step: its blocks' shards (heads / N
+        /// of q, k and v, FFN / N of gate and value, the matching input columns of the attention output and fc2) and the LoRA
+        /// set's slices of them, an all-reduce after each row-parallel product, the rest whole. With F32 products
+        /// (<see cref="FloatProducts"/>, direct CUDA) a block-quantized product takes no q8_1 guard and the signed rotary sine is a
+        /// host input; the GGML and managed programs are the ones they always were.</para>
         /// </summary>
-        private void Emit(GraphEmitter e, StepValues s, DenoiserSpan span, float[] carry)
+        private void Emit(GraphEmitter e, StepValues s, DenoiserSpan span, float[] carry, int rank = 0)
         {
             MiniMaxH3Config c = _w.Config;
             GraphProgramBuilder b = e.Builder;
@@ -545,6 +817,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
             int rot = c.RopeRotaryDim, ntok = s.Layout.TokenCount, nts = s.Layout.Timesteps.Length;
             float eps = c.NormEps;
             float scale = 1f / MathF.Sqrt(hd);
+            int ranks = _ranks?.Count ?? 1;
+            // A rank's heads and attention width in the blocks (the token refiner is whole on every rank).
+            int rankHeads = heads / ranks, rankInner = inner / ranks;
+            bool floatProducts = FloatProducts;
             var quantized = new HashSet<int>();
             var leaves = new Dictionary<MiniMaxH3ImageWeight, int>();
 
@@ -562,8 +838,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
             }
             int Scale(int x, float f) => b.Op(GraphOp.Scale, stackalloc[] { x }, default, stackalloc[] { f });
             // h3_mm: a block-quantized weight's product takes the q8_1 guard (on ggml_cuda's wide routes, which need none, the
-            // executor drops the pair where cuBLAS takes the product: GraphProgram.WideTokenProducts).
-            int Product(GraphProgramBuilder g, int w, int x) => quantized.Contains(w)
+            // executor drops the pair where cuBLAS takes the product: GraphProgram.WideTokenProducts). F32 products never round
+            // their activations to q8_1, and MiniMax-H3 video's denoiser takes them without it on direct CUDA.
+            int Product(GraphProgramBuilder g, int w, int x) => quantized.Contains(w) && !floatProducts
                 ? Scale(g.Op(GraphOp.MulMat, w, Scale(x, 1f / GuardScale)), GuardScale)
                 : g.Op(GraphOp.MulMat, w, x);
             int Linear(MiniMaxH3ImageLinear l, int x, bool guard = true)
@@ -581,13 +858,18 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 long bytes = up ? p.UpBytes : p.DownBytes;
                 ReadOnlySpan<long> ne = up ? stackalloc long[] { p.Rank, p.Out } : stackalloc long[] { p.In, p.Rank };
                 if (_tensorAllocator == null) return e.HostWeight(p.Format, ne, data, bytes);
-                if (!_loraHandles.TryGetValue(data, out MiniMaxH3ImageWeight handle))
-                    _loraHandles[data] = handle = new MiniMaxH3ImageWeight(p.Format, ne[0], ne[1], data, bytes);
+                if (!_loraHandles.TryGetValue((data, ne[0], ne[1]), out MiniMaxH3ImageWeight handle))
+                    _loraHandles[(data, ne[0], ne[1])] = handle = new MiniMaxH3ImageWeight(p.Format, ne[0], ne[1], data, bytes);
                 return e.HostWeight(p.Format, ne, GraphIdentity.Of(handle), bytes, handle);
             }
+            // The set's factors of a projection: a trunk block's are the rank's slices under tensor parallelism.
+            MiniMaxH3ImageLoraSet.Factors FactorsOf(bool refiner, int block, MiniMaxH3ImageLoraSet.Projection projection) =>
+                refiner || _rankLora == null
+                    ? lora?.Get(refiner, block, projection)
+                    : _rankLora[rank][block * MiniMaxH3ImageLoraSet.ProjectionCount + (int)projection];
             int Adapted(MiniMaxH3ImageLinear l, int x, long rows, bool refiner, int block, MiniMaxH3ImageLoraSet.Projection projection)
             {
-                MiniMaxH3ImageLoraSet.Factors f = lora?.Get(refiner, block, projection);
+                MiniMaxH3ImageLoraSet.Factors f = FactorsOf(refiner, block, projection);
                 if (f == null) return Linear(l, x);
                 var parts = new GraphDitRegions.LoraPart[f.Parts.Length];
                 for (int i = 0; i < parts.Length; i++)
@@ -596,11 +878,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 return l.Bias != null ? b.Op(GraphOp.Add, y, Leaf(l.Bias)) : y;
             }
             bool HasLora(bool refiner, int block, MiniMaxH3ImageLoraSet.Projection projection) =>
-                lora?.Get(refiner, block, projection) != null;
+                FactorsOf(refiner, block, projection) != null;
             int Norm(int x, MiniMaxH3ImageWeight w) => b.Op(GraphOp.Mul, b.Op(GraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps }), Leaf(w));
-            // q, k and v of a stacked [q | k | v] product: [hd, heads, rows] views, rows a product row apart.
-            int Third(int qkv, int i, int rows) => b.Op(GraphOp.View, stackalloc[] { qkv },
-                stackalloc long[] { 3, hd, heads, rows, 1, hd * 4L, 3L * inner * 4, 0, (long)i * inner * 4 });
+            // q, k and v of a stacked [q | k | v] product of n heads (width n * hd each): [hd, n, rows] views, rows a product row
+            // apart (a rank's product stacks its own heads of each).
+            int Third(int qkv, int i, int rows, int n, int width) => b.Op(GraphOp.View, stackalloc[] { qkv },
+                stackalloc long[] { 3, hd, n, rows, 1, hd * 4L, 3L * width * 4, 0, (long)i * width * 4 });
             int Rows(int x, long width, int start, int count) => b.Op(GraphOp.View, stackalloc[] { x },
                 stackalloc long[] { 2, width, count, 1, 1, width * 4, 0, 0, (long)start * width * 4 });
 
@@ -615,8 +898,15 @@ namespace TensorSharp.Models.MiniMaxH3Image
             int Modulations(MiniMaxH3ImageLinear l, long columns) => b.Op(GraphOp.Reshape, stackalloc[] { Linear(l, temb, guard: false) },
                 stackalloc long[] { hidden, columns });
             int cosT = e.InputF32(s.Cos, rot, ntok);
-            int sinT = e.InputF32(s.Sin, rot, ntok);
-            int sinS = GraphDitRegions.SignedSine(b, sinT, rot, ntok);
+            int sinS;
+            // The signed sine made on the host (the same values) where an executor serves the rotary from its tables' host
+            // values (direct CUDA's TableRopeQkNorm: the device would otherwise read the computed table back every block).
+            if (floatProducts) sinS = e.InputF32(s.SinSigned, rot, ntok);
+            else
+            {
+                int sinT = e.InputF32(s.Sin, rot, ntok);
+                sinS = GraphDitRegions.SignedSine(b, sinT, rot, ntok);
+            }
             int tin = span.IsFirst && s.TextCount > 0 ? e.InputF32(s.Text, c.TextDim, s.TextCount) : -1;
             GraphDitRegions.CheckSegments(s.Segments, ntok, 18L * nts, 5);
             int table = e.InputI32(GraphDitRegions.SegmentTable(s.Segments), 3, s.Segments.Length);
@@ -631,7 +921,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     MiniMaxH3ImageBlock r = _w.Refiner[ri];
                     int n1 = Norm(ctx, r.Norm1);
                     int qkv = Adapted(r.Qkv, n1, s.TextCount, true, ri, MiniMaxH3ImageLoraSet.Projection.Qkv);
-                    int q = Third(qkv, 0, s.TextCount), k = Third(qkv, 1, s.TextCount), v = Third(qkv, 2, s.TextCount);
+                    int q = Third(qkv, 0, s.TextCount, heads, inner), k = Third(qkv, 1, s.TextCount, heads, inner);
+                    int v = Third(qkv, 2, s.TextCount, heads, inner);
                     q = r.QNorm != null ? Norm(q, r.QNorm) : b.Op(GraphOp.Cont, q);
                     k = r.KNorm != null ? Norm(k, r.KNorm) : b.Op(GraphOp.Cont, k);
                     int merged = GraphDitRegions.Attention(b, q, k, v, hd, heads, s.TextCount, scale, GraphDitRegions.FlashVScale(s.TextCount));
@@ -667,14 +958,17 @@ namespace TensorSharp.Models.MiniMaxH3Image
             float vScale = GraphDitRegions.FlashVScale(ntok);
             for (int bi = span.First; bi < span.End; bi++)
             {
-                MiniMaxH3ImageBlock blk = _w.Blocks[bi];
+                MiniMaxH3ImageBlock blk = _rankBlocks?[rank][bi] ?? _w.Blocks[bi];
                 // The curve-table variant feeds the interpolated embedding straight in (no SiLU), and takes no guard.
                 int mods = Modulations(blk.AdaLn, 18L * nts);
                 int h = GraphDitRegions.AdaLnModulate(b, x, Leaf(blk.Norm1), mods, table, s.Segments, hidden, 0, 1, eps);
                 int qkv = Adapted(blk.Qkv, h, ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Qkv);
-                int merged = GraphDitRegions.TableRopeQkNormAttention(b, Third(qkv, 0, ntok), Third(qkv, 1, ntok), Third(qkv, 2, ntok),
-                    Leaf(blk.QNorm), Leaf(blk.KNorm), cosT, sinS, hd, heads, ntok, rot, eps, scale, vScale);
+                int merged = GraphDitRegions.TableRopeQkNormAttention(b, Third(qkv, 0, ntok, rankHeads, rankInner),
+                    Third(qkv, 1, ntok, rankHeads, rankInner), Third(qkv, 2, ntok, rankHeads, rankInner),
+                    Leaf(blk.QNorm), Leaf(blk.KNorm), cosT, sinS, hd, rankHeads, ntok, rot, eps, scale, vScale);
                 int attn = Adapted(blk.Out, merged, ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Out);
+                // A rank's output product is its heads' partial: the ranks' sum is the whole product.
+                if (ranks > 1) attn = b.Op(GraphOp.AllReduce, attn);
                 x = GraphDitRegions.GatedResidual(b, x, attn, -1, -1, mods, table, s.Segments, hidden, 2);
                 h = GraphDitRegions.AdaLnModulate(b, x, Leaf(blk.Norm2), mods, table, s.Segments, hidden, 3, 4, eps);
                 // With an update on fc1 or fc2 the MLP is its two projections around the SwiGLU (a SwigluFfn region holds
@@ -683,6 +977,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     ? Adapted(blk.Fc2, b.Op(GraphOp.Swiglu, Adapted(blk.Fc1, h, ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Fc1)),
                         ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Fc2)
                     : GraphDitRegions.SwigluFfn(b, h, Leaf(blk.Fc1.Weight), Leaf(blk.Fc2.Weight), -1, -1, Product);
+                // fc2's product over a rank's MLP columns is its partial, as the attention output's.
+                if (ranks > 1) m = b.Op(GraphOp.AllReduce, m);
                 x = GraphDitRegions.GatedResidual(b, x, m, -1, -1, mods, table, s.Segments, hidden, 5);
             }
 
@@ -706,17 +1002,21 @@ namespace TensorSharp.Models.MiniMaxH3Image
             e.Output(velocity, (long)c.VideoPatchDim * s.ImageCount);
         }
 
-        /// <summary>A tensor executor's object for a weight leaf: an F32 vector as a tensor, a projection as itself.</summary>
+        /// <summary>A tensor executor's object for a weight leaf: an F32 vector as a tensor on the device whose program binds it
+        /// (the one device, the stage being emitted, or the rank being emitted: every rank binds the replicated vectors), a
+        /// projection as itself.</summary>
         private object Handle(MiniMaxH3ImageWeight w)
         {
             if (!w.Vector) return w;
-            if (!_tensors.TryGetValue(w, out Tensor t))
+            int device = _ranks != null ? _emitRank : _emitStage;
+            if (!_tensors.TryGetValue((w, device), out Tensor t))
             {
                 var values = new float[w.Ne0];
                 Marshal.Copy(w.Data, values, 0, values.Length);
-                t = new Tensor(_stages?.TensorAllocator(_emitStage) ?? _tensorAllocator, DType.Float32, w.Ne0);
+                IAllocator allocator = _ranks?.TensorAllocator(_emitRank) ?? _stages?.TensorAllocator(_emitStage) ?? _tensorAllocator;
+                t = new Tensor(allocator, DType.Float32, w.Ne0);
                 t.SetElementsAsFloat(values);
-                _tensors[w] = t;
+                _tensors[(w, device)] = t;
             }
             return t;
         }
@@ -728,19 +1028,104 @@ namespace TensorSharp.Models.MiniMaxH3Image
             lock (_gate) DropPlans();
         }
 
-        /// <summary>The cached plan, or every stage's.</summary>
+        /// <summary>A request's denoise ended. On direct CUDA the plans go and the step's intermediates the allocators pooled
+        /// return to the driver (<see cref="TensorSharp.Cuda.CudaAllocator.TrimPool"/>), as MiniMax-H3 video's denoiser hands
+        /// its device over to the VAE: their shapes are of no use to the decode. The weights stay. Elsewhere nothing changes.</summary>
+        public void FinishRequest()
+        {
+            if (_tensorAllocator is not TensorSharp.Cuda.CudaAllocator) return;
+            lock (_gate)
+            {
+                if (_disposed) return;
+                DropPlans();
+                foreach (IAllocator a in TensorAllocators()) (a as TensorSharp.Cuda.CudaAllocator)?.TrimPool();
+            }
+        }
+
+        /// <summary>Where the tensor executors keep what the steps allocate: the one device's allocator, each stage's or each
+        /// rank's (null on GGML).</summary>
+        private IEnumerable<IAllocator> TensorAllocators()
+        {
+            if (_ranks != null)
+                for (int r = 0; r < _ranks.Count; r++) yield return _ranks.TensorAllocator(r);
+            else if (_stages != null)
+                for (int s = 0; s < _stages.Count; s++) yield return _stages.TensorAllocator(s);
+            else yield return _tensorAllocator;
+        }
+
+        /// <summary>The cached plan, or every stage's, or every rank's.</summary>
         private void DropPlans()
         {
             _plan?.Dispose();
             _plan = null;
             _stages?.DropPlans();
+            _ranks?.DropPlans();
         }
 
-        /// <summary>Drop the device copies of host buffer <paramref name="data"/>: every stage device's under a split.</summary>
+        /// <summary>Drop the GGML executor's device copies of host buffer <paramref name="data"/>: every stage device's under a
+        /// split.</summary>
         private void Invalidate(IntPtr data)
         {
             if (_stages != null) _stages.InvalidateEverywhere(data);
             else _executor.Invalidate(data);
+        }
+
+        /// <summary>Drop every device copy of the host bytes at <paramref name="data"/>. The GGML graph executor keys it by those
+        /// bytes (<see cref="Invalidate"/>). The CUDA tensor executor keeps a projection's copy in the backend's resident-weight
+        /// cache under the same address, which <see cref="IGraphExecutor.Invalidate"/> does not reach (MiniMax-H3 video's
+        /// denoiser releases its copies the same way): a copy left there outlives the denoiser, its device memory stays taken,
+        /// and a file or LoRA set mapped later at that address would compute with the old values. Every device that may hold one
+        /// is asked (each stage's, each rank's: releasing a key a device does not hold is a no-op).</summary>
+        private void ReleaseEverywhere(IntPtr data)
+        {
+            if (data == IntPtr.Zero) return;
+            if (_tensorAllocator == null)
+            {
+                Invalidate(data);
+                return;
+            }
+            if (_ranks != null)
+                for (int r = 0; r < _ranks.Count; r++) ReleaseCopy(data, _ranks.TensorAllocator(r), _ranks.Executor(r));
+            else if (_stages != null)
+                for (int s = 0; s < _stages.Count; s++) ReleaseCopy(data, _stages.TensorAllocator(s), _stages.Executor(s));
+            else ReleaseCopy(data, _tensorAllocator, _executor);
+        }
+
+        private static void ReleaseCopy(IntPtr data, IAllocator allocator, IGraphExecutor executor)
+        {
+            if (allocator is TensorSharp.Cuda.CudaAllocator cuda) TensorSharp.Cuda.CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data);
+            else executor.Invalidate(data);
+        }
+
+        /// <summary>Every weight leaf a device may hold a copy of: the file's and, under tensor parallelism, the ranks' shards.</summary>
+        private IEnumerable<MiniMaxH3ImageWeight> BoundWeights()
+        {
+            foreach (MiniMaxH3ImageWeight w in _w.All) yield return w;
+            foreach (MiniMaxH3ImageWeight w in ShardWeights()) yield return w;
+        }
+
+        /// <summary>The ranks' sharded projections (none without tensor parallelism).</summary>
+        private IEnumerable<MiniMaxH3ImageWeight> ShardWeights()
+        {
+            if (_rankBlocks == null) yield break;
+            foreach (MiniMaxH3ImageBlock[] blocks in _rankBlocks)
+                foreach (MiniMaxH3ImageBlock b in blocks)
+                    foreach (MiniMaxH3ImageLinear l in new[] { b.Qkv, b.Out, b.Fc1, b.Fc2 })
+                        yield return l.Weight;
+        }
+
+        /// <summary>The host addresses the device copies of the projections, the shards and the bound LoRA set's factors are
+        /// keyed by (tests).</summary>
+        internal IReadOnlyList<IntPtr> DeviceCopyKeysForTest()
+        {
+            lock (_gate)
+            {
+                var keys = new List<IntPtr>();
+                foreach (MiniMaxH3ImageWeight w in BoundWeights())
+                    if (!w.Vector) keys.Add(w.Data);
+                foreach ((IntPtr data, _, _) in _loraHandles.Keys) keys.Add(data);
+                return keys;
+            }
         }
 
         /// <summary>Drops the weights' device copies (and the plan, which binds them); the mapping stays, so the next step
@@ -751,10 +1136,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
             {
                 if (_disposed) return;
                 DropPlans();
-                foreach (MiniMaxH3ImageWeight w in _w.All) Invalidate(w.Data);
-                // The LoRA factors' copies too; the set stays bound and the next step uploads them again.
+                foreach (MiniMaxH3ImageWeight w in BoundWeights()) ReleaseEverywhere(w.Data);
+                // The LoRA factors' copies too (a tensor executor's of the factors and rank slices it bound); the set stays
+                // bound and the next step uploads them again.
                 if (_lora != null && _tensorAllocator == null)
                     foreach (IntPtr p in _lora.FactorPointers()) Invalidate(p);
+                foreach ((IntPtr data, _, _) in _loraHandles.Keys) ReleaseEverywhere(data);
                 _preloaded = false;
             }
         }
@@ -768,12 +1155,16 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 DropPlans();
                 ReleaseLoraDevice();
                 _lora = null;
-                // The pinned vectors are this denoiser's own; a borrowed mapping's projections are its owner's to release.
+                // The pinned vectors are this denoiser's own; a borrowed mapping's projections are its owner's to release. The
+                // ranks' shards are this denoiser's: their copies go before their bytes are freed.
                 foreach (MiniMaxH3ImageWeight w in _w.All)
-                    if (w.Vector || _w.OwnsFile) Invalidate(w.Data);
+                    if (w.Vector || _w.OwnsFile) ReleaseEverywhere(w.Data);
+                foreach (MiniMaxH3ImageWeight w in ShardWeights()) ReleaseEverywhere(w.Data);
                 _stages?.Dispose();
+                _ranks?.Dispose();
                 foreach (Tensor t in _tensors.Values) t.Dispose();
                 _tensors.Clear();
+                FreeShards();
                 _w.Dispose();
             }
         }

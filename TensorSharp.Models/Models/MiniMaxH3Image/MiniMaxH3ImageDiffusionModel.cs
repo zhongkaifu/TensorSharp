@@ -17,6 +17,10 @@
 // The denoiser is the safetensors release in its original names (Comfy-Org/MiniMax-H3-Image) or a GGUF with the same
 // tensors; the text encoder and the VAE come through the H3 companion flags --video-text-encoder and --video-vae, or sit
 // beside the denoiser.
+//
+// On --backend cuda (direct CUDA) every component runs on the CUDA tensor executor or MiniMax-H3's direct implementations,
+// text to image only (the VAE encoder an edit needs does not run there); --tp N shards the denoiser over the GPUs and
+// --layer-split N splits its blocks over them (also on ggml_cuda), the text encoder and the VAE on the first.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -45,29 +49,59 @@ namespace TensorSharp.Models.MiniMaxH3Image
         private readonly object _generationLock = new();
         private volatile bool _disposed;
 
+        /// <param name="tpDegree">GPUs the denoiser is sharded over (--tp N; cuda): each holds its heads of every attention and
+        /// its slice of every MLP (MiniMaxH3ImageDenoiser over the model's tensor-parallel group); the text encoder and the VAE
+        /// run on the first.</param>
+        /// <param name="tpGroup">A caller's tensor-parallel group (null: the model makes direct CUDA's for --tp N).</param>
         /// <param name="layerSplitDegree">Devices the denoiser's blocks are split over as whole-block stages (--layer-split N;
-        /// ggml_cuda): each holds its share of the weights, the text encoder and the VAE run on the first.</param>
-        public MiniMaxH3ImageDiffusionModel(string ditPath, BackendType backend, int layerSplitDegree = 1)
-            : base(ditPath, backend, layerSplitDegree: layerSplitDegree, openGguf: false)
+        /// ggml_cuda and cuda): each holds its share of the weights, the text encoder and the VAE run on the first.</param>
+        public MiniMaxH3ImageDiffusionModel(string ditPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1)
+            : base(ditPath, backend, tpDegree, tpGroup, layerSplitDegree: layerSplitDegree, openGguf: false)
         {
-            if (backend is not (BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu))
-                throw new ModelLoadRefusedException(
-                    $"MiniMax-H3-Image runs on --backend ggml_cuda, ggml_metal or ggml_cpu, not {Architecture.BackendNames.OptionName(backend)}.");
-            float[] grid;
-            using (var probe = new MiniMaxH3WeightFile(ditPath))
+            try
             {
-                DitConfig = MiniMaxH3Config.Detect(probe.Tensors);
-                if (DitConfig.HasAudio)
+                if (backend is not (BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu or BackendType.Cuda))
                     throw new ModelLoadRefusedException(
-                        $"{Path.GetFileName(ditPath)} is a MiniMax-H3 audio-video denoiser; load it as minimax-h3.");
-                if (DitConfig.PddSteps < 2)
+                        $"MiniMax-H3-Image runs on --backend ggml_cuda, ggml_metal, ggml_cpu or cuda, not {Architecture.BackendNames.OptionName(backend)}.");
+                // The serving contract's gate refuses these before a load; a model made directly is held to the same.
+                if (IsTensorParallel && backend != BackendType.Cuda)
+                    throw new ModelLoadRefusedException(MiniMaxH3ImageDenoiser.GgmlTensorParallelGap);
+                if (IsTensorParallel && (TpNodeCount > 1 || GlobalTpDegree != TpDegree))
                     throw new ModelLoadRefusedException(
-                        $"{Path.GetFileName(ditPath)} has one output head; MiniMax-H3-Image's distilled denoiser stacks one per step.");
-                grid = MiniMaxH3ImageSampling.GridFrom(probe.SafetensorsMetadata, DitConfig.PddSteps);
+                        "MiniMax-H3-Image tensor parallelism shards over the GPUs of one machine; a multi-node --tp group is not supported.");
+                float[] grid;
+                using (var probe = new MiniMaxH3WeightFile(ditPath))
+                {
+                    DitConfig = MiniMaxH3Config.Detect(probe.Tensors);
+                    if (DitConfig.HasAudio)
+                        throw new ModelLoadRefusedException(
+                            $"{Path.GetFileName(ditPath)} is a MiniMax-H3 audio-video denoiser; load it as minimax-h3.");
+                    if (DitConfig.PddSteps < 2)
+                        throw new ModelLoadRefusedException(
+                            $"{Path.GetFileName(ditPath)} has one output head; MiniMax-H3-Image's distilled denoiser stacks one per step.");
+                    // A shard that would split a head, the MLP or a quant block is refused now, not at the first image.
+                    if (IsTensorParallel && MiniMaxH3ImageDenoiser.TensorParallelRefusal(probe, TpDegree) is string refusal)
+                        throw new ModelLoadRefusedException(refusal);
+                    grid = MiniMaxH3ImageSampling.GridFrom(probe.SafetensorsMetadata, DitConfig.PddSteps);
+                }
+                // Direct CUDA's components run on the model's first GPU (the tensor-parallel group's rank 0 under --tp).
+                _family = new MiniMaxH3ImageFamily(grid) { DeviceAllocator = backend == BackendType.Cuda ? _allocator : null };
+                Config = new ModelConfig { Architecture = ArchitectureId, VocabSize = 0 };
+                _pipeline = CreatePipeline(ditPath, backend, grid);
+                ApplyInheritedLoras();
             }
-            _family = new MiniMaxH3ImageFamily(grid);
-            Config = new ModelConfig { Architecture = ArchitectureId, VocabSize = 0 };
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
 
+        /// <summary>The runtime's pipeline over the family: the companions resolved beside the denoiser, and the denoiser's
+        /// placement (one device, whole-block stages, or the tensor-parallel group).</summary>
+        private DiffusionPipeline CreatePipeline(string ditPath, BackendType backend, float[] grid)
+        {
             string dir = Path.GetDirectoryName(Path.GetFullPath(ditPath));
             string tePath = MiniMaxH3Model.ResolveCompanion("TS_VIDEO_TEXT_ENCODER", dir,
                 new[] { "qwen3vl_32b_minimax_h3-Q4_K_M.gguf" },
@@ -89,12 +123,16 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     "MiniMaxAI/MiniMax-H3 processor/ beside it) and minimax_h3_image_vae_fp16.safetensors " +
                     "(Comfy-Org/MiniMax-H3-Image).");
 
-            if (layerSplitDegree > 1)
-                Console.WriteLine($"  placement    = denoiser blocks over {layerSplitDegree} GPUs as whole-block stages (the text encoder and VAE on the first)");
+            if (LayerSplitDegree > 1)
+                Console.WriteLine($"  placement    = denoiser blocks over {LayerSplitDegree} GPUs as whole-block stages (the text encoder and VAE on the first)");
+            if (IsTensorParallel)
+                Console.WriteLine($"  placement    = denoiser sharded over {TpDegree} GPUs ({DitConfig.NumAttentionHeads / TpDegree} heads and " +
+                                  $"{DitConfig.FfnHiddenSize / TpDegree} MLP columns each; the text encoder and VAE on the first)");
             var load = new DiffusionLoad
             {
                 Backend = backend,
                 DenoiserDevices = StageDeviceAllocators(),
+                TensorParallelGroup = IsTensorParallel ? _tpGroup : null,
                 Files = new Dictionary<string, string>
                 {
                     [DiffusionLoad.Denoiser] = ditPath,
@@ -102,9 +140,11 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     [DiffusionLoad.Vae] = vaePath,
                 },
             };
-            _pipeline = new DiffusionPipeline(_family, load);
-            ApplyInheritedLoras();
+            return new DiffusionPipeline(_family, load);
         }
+
+        // MiniMaxH3ImageDenoiser shards its blocks on the model's tensor-parallel group when the pipeline makes it.
+        protected override bool ShardsWeightsInComponents => true;
 
         public MiniMaxH3Config DitConfig { get; }
 
@@ -135,8 +175,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         // ---- IImageGenerationModel ----
         string IImageGenerationModel.ImageModelFamily => ArchitectureId;
-        public bool SupportsImageEdit => true;
-        public bool SupportsEditMask => true;
+
+        /// <summary>Edits encode their references with the VAE encoder, whose GroupNorm nodes the CUDA graph executor does not
+        /// implement (<see cref="MiniMaxH3ImageVaeCodec.TensorExecutorEncoderGap"/>): on --backend cuda the model makes images
+        /// from text only.</summary>
+        public bool SupportsImageEdit => _backend != BackendType.Cuda;
+        public bool SupportsEditMask => SupportsImageEdit;
         public long MinimumGenerationArea => MiniMaxH3ImageFamily.MinGenerationArea;
 
         /// <summary>
@@ -158,6 +202,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         {
             if (inputs is not { Count: > 0 })
                 throw new ArgumentException("A MiniMax-H3-Image edit needs at least one reference image.");
+            if (!SupportsImageEdit) throw new NotSupportedException(MiniMaxH3ImageVaeCodec.TensorExecutorEncoderGap);
             var references = new DiffusionReference[inputs.Count];
             for (int i = 0; i < references.Length; i++)
                 references[i] = new DiffusionReference(inputs[i] ?? throw new ArgumentException($"Reference image {i + 1} is missing."));
@@ -255,8 +300,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
             _disposed = true;
             lock (_generationLock)
             {
-                _pipeline.Dispose();
-                DisposeLoras();
+                // Null when the constructor refused the load before the pipeline was made.
+                _pipeline?.Dispose();
+                if (_family != null) DisposeLoras();
                 base.Dispose();
             }
         }

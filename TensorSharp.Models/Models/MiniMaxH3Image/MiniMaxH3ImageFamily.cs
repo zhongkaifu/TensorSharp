@@ -100,16 +100,23 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         public IReferencePolicy References { get; }
 
+        /// <summary>The device the components run on with a tensor executor (direct CUDA: the model's first GPU, the text
+        /// encoder's, the VAE's and a one-device denoiser's); null on the GGML backends, whose executors bind host pointers.</summary>
+        internal IAllocator DeviceAllocator { get; init; }
+
         public IConditioner CreateConditioner(DiffusionLoad load)
         {
             ArgumentNullException.ThrowIfNull(load);
-            return Conditioner = new MiniMaxH3ImageConditioner(load.File(DiffusionLoad.TextEncoder), load.Backend);
+            return Conditioner = new MiniMaxH3ImageConditioner(load.File(DiffusionLoad.TextEncoder), load.Backend, DeviceAllocator);
         }
 
+        /// <summary>The denoiser on one device, split over the load's <see cref="DiffusionLoad.DenoiserDevices"/> as whole-block
+        /// stages, or sharded over its <see cref="DiffusionLoad.TensorParallelGroup"/>.</summary>
         public IDenoiser CreateDenoiser(DiffusionLoad load)
         {
             ArgumentNullException.ThrowIfNull(load);
-            return Denoiser = new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend, load.DenoiserDevices)
+            return Denoiser = new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend, load.DenoiserDevices, DeviceAllocator,
+                load.TensorParallelGroup)
             {
                 AdapterBytes = () => Lora?.FactorBytes ?? 0,
             };
@@ -125,7 +132,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public IVaeCodec CreateVae(DiffusionLoad load)
         {
             ArgumentNullException.ThrowIfNull(load);
-            return Vae = new MiniMaxH3ImageVaeCodec(load.File(DiffusionLoad.Vae), load.Backend);
+            return Vae = new MiniMaxH3ImageVaeCodec(load.File(DiffusionLoad.Vae), load.Backend, DeviceAllocator);
         }
 
         /// <summary>The conditioner this family made last (its token count is the model's timing line's).</summary>
