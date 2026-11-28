@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
@@ -448,23 +449,25 @@ namespace TensorSharp.Cuda
                 ((CudaStorage)tensors[r].Storage).MarkDeviceModified();
         }
 
-        /// <summary>Rank <paramref name="rank"/>'s scratch of at least <paramref name="bytes"/>. A smaller one is freed once the
-        /// rank's stream has finished with it (its last sum may still be writing it).</summary>
+        /// <summary>Rank <paramref name="rank"/>'s scratch of at least <paramref name="bytes"/>. A smaller one is retired, not
+        /// freed: a recorded decode step (one graph over every rank, RankedDecodeCapture) keeps reading the scratch it was
+        /// recorded with, so a longer prompt's partials growing it must not free it under the recording. Each new one is at
+        /// least twice the last, so the retired ones hold less than the live one; all go at <see cref="Dispose"/>.</summary>
         private IntPtr Scratch(int rank, long bytes)
         {
             if (_scratchBytes[rank] >= bytes) return _scratch[rank];
             CudaAllocator a = _allocators[rank];
-            if (_scratch[rank] != IntPtr.Zero)
-            {
-                a.Stream.Synchronize();
-                CudaDriverApi.cuMemFree(_scratch[rank]);
-            }
+            a.Context.MakeCurrent();
+            if (_scratch[rank] != IntPtr.Zero) _retiredScratch.Add((rank, _scratch[rank]));
             // Rounded up to a MiB so a prompt chunk's growing partials do not reallocate every step.
-            long size = (bytes + (1L << 20) - 1) & ~((1L << 20) - 1);
+            long size = (Math.Max(bytes, 2 * _scratchBytes[rank]) + (1L << 20) - 1) & ~((1L << 20) - 1);
             CudaDriverApi.cuMemAlloc(out _scratch[rank], new UIntPtr((ulong)size)).ThrowOnError();
             _scratchBytes[rank] = size;
             return _scratch[rank];
         }
+
+        /// <summary>Scratch buffers a larger one replaced (<see cref="Scratch"/>), by rank.</summary>
+        private readonly List<(int Rank, IntPtr Buffer)> _retiredScratch = new();
 
         private unsafe void AllReduceViaHost(Tensor dst, Tensor src, int elementCount, long byteCount)
         {
@@ -522,6 +525,13 @@ namespace TensorSharp.Cuda
                 _stagingBuffer = IntPtr.Zero;
                 _stagingBufferBytes = 0;
             }
+            foreach ((int rank, IntPtr buffer) in _retiredScratch)
+            {
+                _allocators[rank].Context.MakeCurrent();
+                _allocators[rank].Stream.Synchronize();
+                CudaDriverApi.cuMemFree(buffer);
+            }
+            _retiredScratch.Clear();
             for (int r = 0; r < _worldSize; r++)
             {
                 if (_ready[r] == IntPtr.Zero && _scratch[r] == IntPtr.Zero) continue;

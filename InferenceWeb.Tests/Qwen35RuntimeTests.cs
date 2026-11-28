@@ -394,6 +394,52 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>Direct-CUDA tensor parallelism records a kept decode step once over both GPUs (one CUDA graph holding each
+    /// rank's kernels and their all-reduces) and replays it a position on: the rows equal the ranks' plans run unrecorded,
+    /// and one GPU's within the placement bound. A second prompt in the same slot records again.</summary>
+    [MultiCudaTheory(2)]
+    [InlineData("dense")]
+    [InlineData("moe-tp")]
+    public void DirectCudaTensorParallelDecodeReplaysItsRecording(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        List<float[]> reference;
+        using (var single = Create(path, backend: BackendType.Cuda))
+            reference = LongScript(single);
+        List<float[]> unrecorded;
+        using (var group = new TensorSharp.Cuda.TensorParallelGroup(2))
+        using (var plain = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, group, 1) { DecodeCaptureDisabled = true })
+            unrecorded = LongScript(plain);
+        using var recordedGroup = new TensorSharp.Cuda.TensorParallelGroup(2);
+        using var placed = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, recordedGroup, 1);
+        List<float[]> recorded = LongScript(placed);
+        Assert.True(placed.DecodeRecordings >= 2, $"{variant}: {placed.DecodeRecordings} recordings");
+        Assert.True(placed.RecordedDecodeReplays >= 8, $"{variant}: {placed.RecordedDecodeReplays} recorded replays");
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(recorded[i], unrecorded[i]);
+            Assert.True(rel <= 1e-5, $"{variant} row {i}: recorded against unrecorded relL2 {rel:E2}");
+            double one = RelL2(recorded[i], reference[i]);
+            Assert.True(one <= (variant == "moe-tp" ? 2.5e-2 : 5e-3), $"{variant} row {i}: against one GPU relL2 {one:E2}");
+        }
+    }
+
+    /// <summary>A prompt and twelve decode steps, then another prompt in the reset slot and six more.</summary>
+    private static List<float[]> LongScript(ModelBase model)
+    {
+        var rows = new List<float[]>();
+        int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
+        rows.Add((float[])model.ForwardRefill(prompt).Clone());
+        for (int t = 0; t < 12; t++)
+            rows.Add((float[])model.Forward(new[] { 71 + (t * 13) % 90 }).Clone());
+        model.ResetKVCache();
+        rows.Add((float[])model.ForwardRefill(new[] { 33, 34, 35, 36, 37, 38, 39 }).Clone());
+        for (int t = 0; t < 6; t++)
+            rows.Add((float[])model.Forward(new[] { 40 + t }).Clone());
+        return rows;
+    }
+
     /// <summary>Speculation on per-rank graphs: each rank's verify keeps its recurrent states' window, and the commit runs
     /// per rank on its own share of the heads; the NextN draft layer runs whole (unsharded) on rank 0.</summary>
     [Fact]

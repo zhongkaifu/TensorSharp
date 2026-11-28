@@ -1012,18 +1012,7 @@ namespace TensorSharp.Models
                     r.Step.CountRun(cached.Plan, System.Diagnostics.Stopwatch.GetTimestamp() - launched);
                 }
                 for (int o = 0; o < r.CaptureOutputs.Length; o++)
-                {
-                    Tensor t = r.CaptureOutputs[o];
-                    float[] into = cached.Outputs[o];
-                    if (t.ElementType == DType.Int32)
-                    {
-                        int count = (int)Math.Min(into.LongLength, t.ElementCount());
-                        int[] ints = t.GetElementsAsInt(count);
-                        for (int i = 0; i < count; i++) into[i] = ints[i];
-                    }
-                    else if (t.ElementCount() == into.LongLength) t.CopyToArray(into);
-                    else Array.Copy(t.GetElementsAsFloat((int)Math.Min(into.LongLength, t.ElementCount())), into, (int)Math.Min(into.LongLength, t.ElementCount()));
-                }
+                    ReadRecordedOutput(r.CaptureOutputs[o], cached.Outputs[o]);
                 return true;
             }
             finally
@@ -2145,6 +2134,7 @@ namespace TensorSharp.Models
         {
             private readonly IRankedGraphExecutor _compiled;
             private readonly IGraphExecutor[] _ranks;
+            private readonly IAllocator[] _allocators;
             private readonly int _firstDevice;
 
             public RankRunner(StandardDecoderModel model, int stage)
@@ -2152,7 +2142,8 @@ namespace TensorSharp.Models
                 int ranks = model._mesh.TensorParallel;
                 _firstDevice = model._mesh.GlobalDevice(stage, 0);
                 _ranks = new IGraphExecutor[ranks];
-                for (int r = 0; r < ranks; r++) _ranks[r] = model.ExecutorFor(model._mesh.Allocator(stage, r));
+                _allocators = new IAllocator[ranks];
+                for (int r = 0; r < ranks; r++) _ranks[r] = model.ExecutorFor(_allocators[r] = model._mesh.Allocator(stage, r));
                 _compiled = _ranks[0] as IRankedGraphExecutor;
                 if (_compiled == null && !Array.TrueForAll(_ranks, x => x is TensorGraphExecutor))
                     throw new NotSupportedException($"{_ranks[0]?.GetType().Name ?? "no executor"} runs no per-rank graphs");
@@ -2170,6 +2161,37 @@ namespace TensorSharp.Models
 
             public bool Run(IGraphPlan[] plans, GraphRunInputs[] inputs, bool exactSums, out string error)
                 => _compiled != null ? _compiled.RunRanked(plans, inputs, exactSums, out error) : TensorGraphExecutor.RunRanked(plans, inputs, out error);
+
+            /// <summary>Every rank's executor can record a decode step (the tensor executors of direct CUDA).</summary>
+            private IDecodeCaptureExecutor[] Recorders()
+            {
+                if (_compiled != null || _ranks.Length < 2) return null;
+                var recorders = new IDecodeCaptureExecutor[_ranks.Length];
+                for (int r = 0; r < _ranks.Length; r++)
+                    if ((recorders[r] = _ranks[r] as IDecodeCaptureExecutor) == null) return null;
+                return recorders;
+            }
+
+            /// <summary>A recording of a kept decode step over every rank, launched as one (null where the ranks cannot).</summary>
+            public IRankedDecodeCapture OpenRecording() => Recorders() is { } recorders ? recorders[0].OpenRankedDecodeCapture(recorders) : null;
+
+            /// <summary>Whether the ranks record decode steps at all, and how many sequences one recording may batch.</summary>
+            public int MaxRecordedSequences
+            {
+                get
+                {
+                    if (Recorders() is not { } recorders) return 0;
+                    int most = int.MaxValue;
+                    foreach (IDecodeCaptureExecutor x in recorders) most = Math.Min(most, x.MaxRecordedSequences);
+                    return most;
+                }
+            }
+
+            /// <summary>Every rank's device keeps room for another recording.</summary>
+            public bool HasRoomToRecord() => Recorders() is { } recorders && Array.TrueForAll(recorders, x => x.HasRoomToRecord());
+
+            /// <summary>Rank <paramref name="rank"/>'s allocator (which of a slot's tensors are that rank's).</summary>
+            public IAllocator Allocator(int rank) => _allocators[rank];
         }
 
         /// <summary>The runner of each whole-layer stage's ranks (<see cref="RankRunner"/>), made on first use.</summary>
@@ -2299,6 +2321,23 @@ namespace TensorSharp.Models
             public string Shape;
             public long Epoch;
             public long Bindings, Stamp;
+
+            /// <summary>The step recorded over every rank (direct CUDA), its kept outputs a rank, and how its recording went
+            /// (<see cref="TryRunRankedRecorded"/>).</summary>
+            public IRankedDecodeCapture Capture;
+            public Tensor[][] CaptureOutputs;
+            public bool CaptureFailed;
+            public int Advances;
+
+            public void DisposeCapture()
+            {
+                if (CaptureOutputs != null)
+                    foreach (Tensor[] rank in CaptureOutputs)
+                        if (rank != null) foreach (Tensor t in rank) t?.Dispose();
+                CaptureOutputs = null;
+                Capture?.Dispose();
+                Capture = null;
+            }
         }
 
         /// <summary>The kept per-rank decode step of each whole-layer stage (one without stages: stage 0's).</summary>
@@ -2330,6 +2369,7 @@ namespace TensorSharp.Models
         private void DropRankedReplay(int stage)
         {
             if (!_rankedReplays.Remove(stage, out RankedReplay replay)) return;
+            replay.DisposeCapture();
             foreach (GraphStep step in replay.Steps) step?.Dispose();
         }
 
@@ -2371,6 +2411,138 @@ namespace TensorSharp.Models
             plans = cached;
             outputs = r.Outputs;
             return true;
+        }
+
+        /// <summary>
+        /// Run a stage's kept tensor-parallel decode step, advanced one position, as one recording over every rank's device
+        /// (<see cref="IRankedDecodeCapture"/>, direct CUDA): its first advance records it and every later one replays it with
+        /// this position's inputs, lengths and write rows. Unrecorded, the host launched every rank's kernels in turn each token
+        /// (Qwen3.8 Flash Next under --tp 2: 27.6 tok/s, against 96.2 over two recorded whole-layer stages). False runs the
+        /// ranks' plans as usual; a recording that fails is tried once more on the next advance, then not again.
+        /// </summary>
+        private bool TryRunRankedRecorded(RankRunner runner, int stage, CachedGraph[] plans, Slot[] slots, int[] starts)
+        {
+            RankedReplay r = _rankedReplays[stage];
+            GraphStep[] steps = r.Steps;
+            if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length > runner.MaxRecordedSequences
+                || (_expertHost != null && !runner.Capabilities.RecordsHostExperts))
+                return false;
+            var keeps = new IGraphTensorOutputs[plans.Length];
+            for (int k = 0; k < plans.Length; k++)
+                if ((keeps[k] = plans[k].Plan as IGraphTensorOutputs) == null) return false;
+            foreach (GraphStep step in steps)
+                if (step.AttentionFloor > 0 || AnyFloor(step.AttentionFloors)) return false;
+            if (Array.Exists(steps, step => step.SlidingFloorInWindow))
+            {
+                NoteSlidingWindowUnrecorded();
+                return false;
+            }
+            if (r.Capture == null)
+            {
+                r.Advances++;
+                if (!runner.HasRoomToRecord())
+                {
+                    r.Advances = 0;
+                    return false;
+                }
+                r.Capture = runner.OpenRecording();
+                if (r.Capture == null)
+                {
+                    r.CaptureFailed = true;
+                    return false;
+                }
+            }
+            int n = slots.Length, ranks = steps.Length;
+            Span<int> writeRows = stackalloc int[n], attends = stackalloc int[n];
+            for (int s = 0; s < n; s++)
+            {
+                writeRows[s] = starts[s];
+                attends[s] = starts[s] + steps[0].Counts[s];
+            }
+            int bound = 0;
+            try
+            {
+                for (; bound < ranks; bound++)
+                    if (!steps[bound].BindStable(r.Capture.Rank(bound)))
+                    {
+                        r.DisposeCapture();
+                        r.CaptureFailed = true;
+                        return false;
+                    }
+                if (!r.Capture.Captured)
+                {
+                    // Each rank names its sequences by its own caches and states, and writes those in place.
+                    var sequences = new IReadOnlyList<IReadOnlyList<Tensor>>[ranks];
+                    var written = new IReadOnlyList<Tensor>[ranks];
+                    for (int k = 0; k < ranks; k++)
+                    {
+                        IAllocator alloc = runner.Allocator(k);
+                        var own = new IReadOnlyList<Tensor>[n];
+                        var all = new List<Tensor>();
+                        for (int s = 0; s < n; s++)
+                        {
+                            List<Tensor> mine = WrittenTensors(slots[s]).FindAll(t => ReferenceEquals(t.Storage.Allocator, alloc));
+                            own[s] = mine;
+                            all.AddRange(mine);
+                        }
+                        sequences[k] = own;
+                        written[k] = all;
+                    }
+                    foreach (IGraphTensorOutputs keep in keeps) keep.KeepTensors = true;
+                    IGraphPlan[] ranPlans = Array.ConvertAll(plans, p => p.Plan);
+                    GraphRunInputs[] inputs = Array.ConvertAll(steps, step => step.RunInputs());
+                    bool recorded = r.Capture.CaptureAndLaunch(() => runner.Run(ranPlans, inputs, true, out _), attends, writeRows,
+                        sequences, written);
+                    if (!recorded)
+                    {
+                        foreach (IGraphTensorOutputs keep in keeps) keep.KeepTensors = false;
+                        r.DisposeCapture();
+                        r.CaptureFailed = r.Advances > 1;
+                        return false;
+                    }
+                    DecodeRecordings++;
+                    r.CaptureOutputs = new Tensor[ranks][];
+                    for (int k = 0; k < ranks; k++)
+                    {
+                        r.CaptureOutputs[k] = new Tensor[plans[k].Outputs.Length];
+                        for (int o = 0; o < r.CaptureOutputs[k].Length; o++) r.CaptureOutputs[k][o] = keeps[k].TakeOutput(o);
+                        keeps[k].KeepTensors = false;
+                    }
+                }
+                else
+                {
+                    if (!r.Capture.TryLaunch(attends, writeRows))
+                    {
+                        // Out of device memory: this step runs as usual and the stage's recording is not made again.
+                        r.DisposeCapture();
+                        r.CaptureFailed = true;
+                        return false;
+                    }
+                    for (int k = 0; k < ranks; k++) r.Capture.Rank(k).MarkWritten(r.CaptureOutputs[k]);
+                    RecordedDecodeReplays++;
+                }
+                for (int k = 0; k < ranks; k++)
+                    for (int o = 0; o < r.CaptureOutputs[k].Length; o++)
+                        ReadRecordedOutput(r.CaptureOutputs[k][o], plans[k].Outputs[o]);
+                return true;
+            }
+            finally
+            {
+                for (int k = 0; k < bound; k++) steps[k].UnbindStable();
+            }
+        }
+
+        /// <summary>A recorded step's kept output <paramref name="t"/> read into the plan's output array.</summary>
+        private static void ReadRecordedOutput(Tensor t, float[] into)
+        {
+            if (t.ElementType == DType.Int32)
+            {
+                int count = (int)Math.Min(into.LongLength, t.ElementCount());
+                int[] ints = t.GetElementsAsInt(count);
+                for (int i = 0; i < count; i++) into[i] = ints[i];
+            }
+            else if (t.ElementCount() == into.LongLength) t.CopyToArray(into);
+            else Array.Copy(t.GetElementsAsFloat((int)Math.Min(into.LongLength, t.ElementCount())), into, (int)Math.Min(into.LongLength, t.ElementCount()));
         }
 
         private void ClearRankGraphCache()
@@ -2477,7 +2649,9 @@ namespace TensorSharp.Models
                 // Decode and verify partials are summed exactly; a prompt chunk's take the fast transport (as Qwen35Model's
                 // tensor-parallel graphs do), unless the family needs exact sums throughout.
                 bool exact = ExactTensorParallelSums || replayable;
-                if (!runner.Run(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), exact, out string error))
+                string error = null;
+                if (!(replayed && TryRunRankedRecorded(runner, span.Stage, plans, slots, starts))
+                    && !runner.Run(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), exact, out error))
                 {
                     if (replayed) DropRankedReplay(span.Stage);
                     throw new InvalidOperationException($"{Config.Architecture} tensor-parallel graph step failed: {error}");

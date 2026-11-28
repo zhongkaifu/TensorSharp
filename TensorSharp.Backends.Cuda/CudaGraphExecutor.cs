@@ -99,6 +99,21 @@ namespace TensorSharp.Cuda
         public IDecodeCapture OpenDecodeCapture()
             => Allocator is CudaAllocator cuda ? new RuntimeDecodeCapture(cuda) : null;
 
+        /// <summary>A tensor-parallel decode step over <paramref name="ranks"/> (this executor rank 0, each a direct-CUDA executor
+        /// on its own device) recorded as one graph over their devices (<see cref="RankedDecodeCapture"/>).</summary>
+        public IRankedDecodeCapture OpenRankedDecodeCapture(IReadOnlyList<IDecodeCaptureExecutor> ranks)
+        {
+            if (ranks == null || ranks.Count < 2 || !ReferenceEquals(ranks[0], this)) return null;
+            var allocators = new CudaAllocator[ranks.Count];
+            var devices = new HashSet<int>();
+            for (int r = 0; r < ranks.Count; r++)
+            {
+                if (ranks[r] is not CudaGraphExecutor { Allocator: CudaAllocator cuda } || !devices.Add(cuda.DeviceId)) return null;
+                allocators[r] = cuda;
+            }
+            return new RankedDecodeCapture(Array.ConvertAll(allocators, a => new RuntimeDecodeCapture(a)));
+        }
+
         /// <summary>A batched decode step records too: each sequence's attention and cache append read its own length and write
         /// row (<see cref="CudaDecodeDynParams"/>, the sequence named by the cache a launch reads or writes). Four Qwen3.8-27B
         /// conversations decoding together had run every step unrecorded: 93.4 tok/s each against the direct engine's 108.9,
