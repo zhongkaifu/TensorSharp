@@ -46,6 +46,12 @@ namespace TensorSharp.Models
         private static readonly int MlxEvalEveryNLayers = ResolvePositiveEnv("TS_MLX_EVAL_EVERY_N_LAYERS", 4);
         private static readonly int PrefillChunkTokens = ResolvePositiveEnv("TS_PREFILL_CHUNK", 2048);
 
+        /// <summary>Tests: the rows of a long prompt's chunks (<c>TS_PREFILL_CHUNK</c>, 2,048, otherwise), so a short prompt
+        /// spans several.</summary>
+        internal int? PromptChunkTokensForTests { get; set; }
+
+        private int PromptChunkTokens => PromptChunkTokensForTests ?? PrefillChunkTokens;
+
         private readonly int _requestedTensorParallel;
         private readonly int _requestedStages;
 
@@ -1027,9 +1033,15 @@ namespace TensorSharp.Models
                 // Long prompts run in chunks so the per-layer score tensor stays bounded
                 // (~heads x chunk x context). Media carry positions within one forward, and a
                 // multi-node pipeline follows the serialized protocol, so neither is chunked.
-                if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
+                if (tokens == null || tokens.Length <= PromptChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
                     return ForwardCore(tokens);
                 int last = tokens.Length - 1;
+                // Over local whole-layer stages the chunks pipeline: each stage works on its own chunk at once.
+                if (PipelinesPrompt(last))
+                {
+                    TryRunPipelinedPrompt(tokens, last);
+                    return ForwardCore(new[] { tokens[last] });
+                }
                 // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
                 IDisposable overlap = null;
                 if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs)
@@ -1039,9 +1051,9 @@ namespace TensorSharp.Models
                 }
                 try
                 {
-                    for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                    for (int pos = 0; pos < last; pos += PromptChunkTokens)
                     {
-                        int len = Math.Min(PrefillChunkTokens, last - pos);
+                        int len = Math.Min(PromptChunkTokens, last - pos);
                         RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
                     }
                 }
