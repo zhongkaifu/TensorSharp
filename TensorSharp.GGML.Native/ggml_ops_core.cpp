@@ -1397,28 +1397,6 @@ namespace tsg
         return true;
     }
 
-    // Probe-only lookup: an EXISTING DeviceCopy-mode cached buffer for `data`
-    // covering exactly `bytes`. Never allocates, uploads, or evicts — callers
-    // that only want to READ the current resident bytes (the qwen4exp arena join)
-    // use this so probing absent entries cannot create device copies.
-    bool try_peek_cached_device_copy(const void* data, std::size_t bytes,
-                                     ggml_backend_buffer_t& out_buffer, void*& out_addr)
-    {
-        out_buffer = nullptr;
-        out_addr = nullptr;
-        if (data == nullptr || bytes == 0)
-            return false;
-        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-        auto it = g_host_buffer_cache.find(const_cast<void*>(data));
-        if (it == g_host_buffer_cache.end() ||
-            it->second.mode != CachedBufferMode::DeviceCopy ||
-            it->second.bytes != bytes)
-            return false;
-        out_buffer = it->second.buffer;
-        out_addr = cached_buffer_addr(it->second);
-        return out_addr != nullptr;
-    }
-
     bool try_get_cacheable_tensor_buffer(
         ggml_backend_t backend, ggml_backend_dev_t dev,
         ggml_tensor* tensor, void* data, std::size_t bytes,

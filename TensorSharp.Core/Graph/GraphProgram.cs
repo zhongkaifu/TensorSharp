@@ -106,9 +106,9 @@ namespace TensorSharp.Graph
     public sealed record GraphWideTokenRoutes(long MinRows, bool Q6K, bool StridedAttention, bool FloatWeightsOnGgml);
 
     /// <summary>
-    /// A tensor-parallel group's sum for executors whose ranks' programs are traced in lockstep on one thread: each
-    /// rank's <see cref="GraphOp.AllReduce"/> hands its partial in, and the last rank's arrival sums them in place (the
-    /// group's collective), before the trace emits any rank's next node.
+    /// A tensor-parallel group's sum for the tensor executors, whose ranks' plans run in lockstep on one thread
+    /// (TensorGraphExecutor.RunRanked): each rank's <see cref="GraphOp.AllReduce"/> hands its partial in, and the last rank's
+    /// arrival sums them in place (the group's collective) before any rank runs its next op.
     /// </summary>
     public interface IGraphCollective
     {

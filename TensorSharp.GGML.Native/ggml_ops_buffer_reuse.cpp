@@ -20,7 +20,7 @@
 // 16K prompt's arena (4-5 GB) took the server down. So before a new buffer of 512 MB or more is made, the working set
 // must hold it and a headroom: the kept arenas of every reusing type go first, then the quarter of headroom, and when
 // it still does not fit the allocation fails. The span builders report that as "failed to allocate graph tensors" and
-// prefill the prompt again in halves (Qwen4ExpModel.ForwardInSpans), as a failed allocation on CUDA always did.
+// prefill the prompt again in smaller steps, as a failed allocation on CUDA always did.
 #include "ggml_ops_internal.h"
 #include "ggml-backend-impl.h"
 

@@ -684,8 +684,8 @@ namespace
         hm.hidden = static_cast<int>(n);
         ggml_tensor* hot = nullptr;
         // A verify-width step (2 to 8 rows) overlaps up to two window misses a row with the routes the slots hold: they
-        // are read in the background and computed after a second cut that only waits for them (Qwen4ExpModel's
-        // overlap; the wait segment follows this pause, ending at the first group so it precedes the cut).
+        // are read in the background and computed after a second cut that only waits for them (the wait segment
+        // follows this pause, ending at the first group so it precedes the cut).
         tsg::HostMoeSegment overlap_wait;
         constexpr int overlap_routes = 2;
         // An accelerator tier's part runs gated products (host_moe_build_hot_part): the one-projection experts have none, and
@@ -1180,8 +1180,8 @@ namespace
         }
     }
 
-    // Prompt-width device operations from this many rows (the same switch as Qwen4ExpModel's spans; the kernels'
-    // own switches are TS_METAL_GDN_PROMPT and TS_METAL_HC_READ).
+    // Prompt-width device operations from this many rows (the kernels' own switches are TS_METAL_GDN_PROMPT and
+    // TS_METAL_HC_READ).
     int device_ops_min_rows()
     {
         static const int v = [] {
@@ -1201,7 +1201,7 @@ namespace
 
     // A prompt chunk's flash attention under a selection's mask (every row at most `width` finite cells) over a wide
     // window, as one device operation: the mask compacted into each row's cell list (tsm_qsa_compact), then the
-    // attention over those cells only (tsm_qsa_attn, Qwen4ExpModel's prompt kernel). Null where it does not apply.
+    // attention over those cells only (tsm_qsa_attn). Null where it does not apply.
     ggml_tensor* try_selected_attention(TsgGraph* g, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
                                         float scale, std::int64_t width)
     {

@@ -121,7 +121,7 @@ public static class MauiProgram
 
     private static void ApplyDesktopEngineSettings()
     {
-        // Managed-to-managed (Qwen4ExpModel reads it with Environment.GetEnvironmentVariable), so
+        // Managed-to-managed (Qwen4ExpFormat reads it with Environment.GetEnvironmentVariable), so
         // SetEnvironmentVariable is enough; no native getenv reads it.
         if (Environment.GetEnvironmentVariable(FlashNextHcQ8Variable) is not { Length: > 0 })
             Environment.SetEnvironmentVariable(FlashNextHcQ8Variable, "1");

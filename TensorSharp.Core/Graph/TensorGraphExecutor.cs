@@ -669,6 +669,8 @@ namespace TensorSharp.Graph
         protected sealed class RunState
         {
             public readonly List<Tensor> Owned = new();
+            /// <summary>The all-reduces this run has handed its partials to (a ranked run pauses after each, RunRanked).</summary>
+            public int AllReduces;
             /// <summary>Full products of a weight with a node's rows, shared by the row blocks a
             /// packed weight is split into.</summary>
             public readonly Dictionary<(IGraphWeight, int), Tensor> Products = new();
@@ -1332,7 +1334,12 @@ namespace TensorSharp.Graph
                     switch (e.Kind)
                     {
                         case GraphNodeKind.Leaf:
-                        case GraphNodeKind.Op: nodes[n++] = e; break;
+                        case GraphNodeKind.Op:
+                            // Every rank runs every all-reduce: a rank whose copy of the sum nothing reads (the last layer's
+                            // on a rank that runs no head) still hands its partial to the others.
+                            if (e.Kind == GraphNodeKind.Op && e.Op == GraphOp.AllReduce) roots.Add(n);
+                            nodes[n++] = e;
+                            break;
                         case GraphNodeKind.Output:
                         case GraphNodeKind.Effect: roots.Add(e.Node); break;
                         case GraphNodeKind.Alias: roots.Add(e.Srcs[1]); break;
@@ -1441,7 +1448,100 @@ namespace TensorSharp.Graph
                 });
             }
 
+            /// <summary>The run of <see cref="Run(ReadOnlySpan{int}, ReadOnlySpan{IntPtr}, ReadOnlySpan{long}, ReadOnlySpan{object})"/>
+            /// in segments: it pauses (yields) after each all-reduce it hands its partial to, for the other ranks of its
+            /// collective to reach theirs (<see cref="RunRanked"/>).</summary>
+            internal IEnumerable<bool> Segments(GraphRunInputs inputs)
+            {
+                var bound = new Dictionary<int, (IntPtr Data, long Bytes, object Handle)>(inputs.Nodes?.Length ?? 0);
+                for (int i = 0; i < (inputs.Nodes?.Length ?? 0); i++)
+                    bound[inputs.Nodes[i]] = (inputs.Data[i], inputs.Bytes[i], inputs.Handles != null && inputs.Handles.Length > i ? inputs.Handles[i] : null);
+                var session = new Session(_x, _dead, _x.LivenessOf(_program));
+                bool floatProducts = _x.FloatProducts, wideTokenProducts = _x.WideTokenProducts;
+                _x.FloatProducts = _program.FloatProducts;
+                _x.WideTokenProducts = _program.WideTokenProducts;
+                try
+                {
+                    int node = 0, reduced = 0;
+                    foreach (GraphNode e in _program.Entries)
+                    {
+                        if (e.Kind is GraphNodeKind.Leaf or GraphNodeKind.Op)
+                        {
+                            int index = node++;
+                            session.Entry(index, e);
+                            if (e.Kind == GraphNodeKind.Leaf && e.Role == GraphLeafRole.Input && bound.TryGetValue(index, out var input))
+                                session.InputData(index, input.Data, input.Bytes, input.Handle);
+                        }
+                        else
+                        {
+                            session.Entry(-1, e);
+                        }
+                        // An op a fused region deferred runs when the region closes: the pause follows the all-reduce's run.
+                        while (reduced < session.Run.AllReduces)
+                        {
+                            reduced++;
+                            yield return true;
+                        }
+                    }
+                    _kept = KeepTensors ? new Tensor[Outputs.Length] : null;
+                    session.Finish(Outputs, _kept);
+                }
+                finally
+                {
+                    _x.FloatProducts = floatProducts;
+                    _x.WideTokenProducts = wideTokenProducts;
+                    session.Dispose();
+                }
+            }
+
             public void Dispose() { }
+        }
+
+        /// <summary>
+        /// One tensor-parallel step's compiled plans, plan r compiled by rank r's executor (each executor joined to the ranks'
+        /// collective, <see cref="JoinCollective"/>), run in lockstep: rank by rank, each plan's ops up to the next all-reduce
+        /// it hands its partial to, so the last rank's arrival sums every partial before any rank reads the sum; then the next
+        /// segment. A collective that orders the sum on the devices (direct CUDA's peer reduction) never waits for them, so the
+        /// ranks' devices run each segment together while the host enqueues the next. False with <paramref name="error"/> when
+        /// a rank failed or the ranks disagree on their all-reduces.
+        /// </summary>
+        public static bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, out string error)
+        {
+            ArgumentNullException.ThrowIfNull(plans);
+            ArgumentNullException.ThrowIfNull(inputs);
+            if (plans.Length != inputs.Length) throw new ArgumentException("one input set a plan", nameof(inputs));
+            var runs = new IEnumerator<bool>[plans.Length];
+            try
+            {
+                for (int r = 0; r < plans.Length; r++)
+                    runs[r] = (plans[r] as Plan ?? throw new ArgumentException($"plan {r} is not a tensor executor's", nameof(plans)))
+                        .Segments(inputs[r]).GetEnumerator();
+                int segment = 0;
+                while (true)
+                {
+                    int paused = 0;
+                    for (int r = 0; r < runs.Length; r++)
+                        if (runs[r].MoveNext()) paused++;
+                    if (paused == 0) break;
+                    if (paused != runs.Length)
+                    {
+                        error = $"the ranks' plans disagree on their all-reduces: {paused} of {runs.Length} reached all-reduce {segment}";
+                        return false;
+                    }
+                    segment++;
+                }
+                error = null;
+                return true;
+            }
+            catch (Exception ex) when (ex is NotSupportedException or ArgumentException or InvalidOperationException)
+            {
+                error = ex.ToString();
+                return false;
+            }
+            finally
+            {
+                foreach (IEnumerator<bool> run in runs) run?.Dispose();
+            }
         }
 
         /// <summary>A program run as the runtime emits it (<see cref="IGraphStream"/>).</summary>
@@ -2283,6 +2383,7 @@ namespace TensorSharp.Graph
                     if (partial.StorageOffset != 0 || partial.Storage.ElementCount != partial.ElementCount())
                         partial = run.Keep(Ops.NewContiguous(partial));
                     Collective.Contribute(CollectiveRank, partial.CopyRef());
+                    run.AllReduces++;
                     return V(partial.CopyRef());
                 }
                 case GraphOp.TopKMask:

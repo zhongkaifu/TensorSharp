@@ -331,7 +331,7 @@ namespace TensorSharp.Models.Graph
         public IGraphPlan Compile(bool replayable, bool reorder = false) => Executor.Compile(ToProgram(replayable, reorder));
 
         /// <summary>This trace's per-run inputs, for a run of several plans together.</summary>
-        public GraphRunInputs RunInputs() => new(_inputs.ToArray(), _inputData.ToArray(), _inputBytes.ToArray());
+        public GraphRunInputs RunInputs() => new(_inputs.ToArray(), _inputData.ToArray(), _inputBytes.ToArray(), _inputHandles.ToArray());
 
         /// <summary>Run <paramref name="plan"/> (compiled from this trace or one of the same signature) on this trace's inputs.</summary>
         public virtual bool Run(IGraphPlan plan) => plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),

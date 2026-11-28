@@ -58,6 +58,9 @@ namespace TensorSharp.Cuda
                 $"({string.Join(", ", System.Linq.Enumerable.Range(0, degree).Select(i => CudaDevice.GetDevice(i).Name))})");
         }
 
+        /// <summary>The group's peer collective (tests; null with one GPU).</summary>
+        internal CudaP2PCommunicator Communicator => _communicator;
+
         /// <summary>Number of GPUs in this parallel group.</summary>
         public int Degree { get; }
 

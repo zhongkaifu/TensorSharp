@@ -2136,78 +2136,52 @@ namespace TensorSharp.Models
         private string RankedShape(GraphRequest request, RankedSpan span)
             => _mesh.Stages > 1 ? $"{request.Shape}|stage{span.Stage}" : request.Shape;
 
-        /// <summary>Each kind's programs of the ranks (recorded once, before the kind's first step streams), whose readers
-        /// let each rank's stream free its tensors.</summary>
-        private readonly Dictionary<string, GraphProgram[]> _rankTemplates = new();
+        /// <summary>How a stage's ranks compile and run their plans of a step: a compiling executor's (GGML: one executor
+        /// compiles for every rank's device and runs the plans together) or the tensor executors' (direct CUDA, and the managed
+        /// executor of a simulated group: each rank's own executor compiles its plan, and the plans run in lockstep from one
+        /// all-reduce to the next, <see cref="TensorGraphExecutor.RunRanked"/>).</summary>
+        internal sealed class RankRunner
+        {
+            private readonly IRankedGraphExecutor _compiled;
+            private readonly IGraphExecutor[] _ranks;
+            private readonly int _firstDevice;
+
+            public RankRunner(StandardDecoderModel model, int stage)
+            {
+                int ranks = model._mesh.TensorParallel;
+                _firstDevice = model._mesh.GlobalDevice(stage, 0);
+                _ranks = new IGraphExecutor[ranks];
+                for (int r = 0; r < ranks; r++) _ranks[r] = model.ExecutorFor(model._mesh.Allocator(stage, r));
+                _compiled = _ranks[0] as IRankedGraphExecutor;
+                if (_compiled == null && !Array.TrueForAll(_ranks, x => x is TensorGraphExecutor))
+                    throw new NotSupportedException($"{_ranks[0]?.GetType().Name ?? "no executor"} runs no per-rank graphs");
+            }
+
+            public GraphCapabilities Capabilities => _ranks[0].Capabilities;
+
+            public IGraphPlan Compile(GraphProgram program, int rank)
+                => _compiled != null ? _compiled.CompileForRank(program, _firstDevice + rank) : _ranks[rank].Compile(program);
+
+            public bool Run(IGraphPlan[] plans, GraphRunInputs[] inputs, bool exactSums, out string error)
+                => _compiled != null ? _compiled.RunRanked(plans, inputs, exactSums, out error) : TensorGraphExecutor.RunRanked(plans, inputs, out error);
+        }
+
+        /// <summary>The runner of each whole-layer stage's ranks (<see cref="RankRunner"/>), made on first use.</summary>
+        private readonly Dictionary<int, RankRunner> _rankRunners = new();
 
         /// <summary>
         /// A span of a step over a stage's tensor-parallel group as per-rank graphs (<see cref="_rankGraphs"/>): every rank's
-        /// program is traced on one thread, block by block across the ranks, into its executor's stream, so the ops run as they
-        /// are emitted and the devices work at once; a block's all-reduce runs when the last rank hands its partial in. A kind
-        /// that has not run records the ranks' programs first (nothing runs), for the streams to free tensors by.
+        /// program is traced block by block across the ranks, compiled for the rank's device, and the ranks' plans run
+        /// together, pausing at each <see cref="GraphOp.AllReduce"/> while the stage's devices sum the partial (RankRunner).
+        /// Decode kinds replay: a later step only re-traces to bind its inputs and finds the plans by the ranks' signatures,
+        /// and a decode step one position on advances the stage's kept step without a trace.
         /// </summary>
         private bool TryRunRankedGraphStep(Tensor hidden, Tensor carry, Slot[] slots, int[] first, int[] counts, int[] starts,
             GraphRequest request, RankedSpan span, out GraphResult result)
         {
-            if (ExecutorFor(_mesh.Allocator(span.Stage, 0)) is IRankedGraphExecutor compiled)
-                return TryRunRankedCompiledStep(compiled, hidden, carry, slots, first, counts, starts, request, span, out result);
-            result = null;
-            int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
-            string kind = $"{span}|{rows}|{slots.Length}|{request.RecurrentSnapshots}|{string.Join(",", counts)}|{request.Shape}|" +
-                          $"{request.LastRowLogits}|{request.AllRowLogits}|{request.CaptureFinal}|{string.Join(",", request.CaptureLayers)}|" +
-                          $"{request.PositionTable != null}|{EmissionVariant(counts, starts)}" + RingWrapVariant(counts, starts);
-            Tensor[] inputs = RankInputs(hidden, span.Stage), carries = carry == null ? null : RankInputs(carry, span.Stage);
-            var steps = new GraphStep[ranks];
-            var streams = new IGraphStream[ranks];
-            try
-            {
-                if (!_rankTemplates.TryGetValue(kind, out GraphProgram[] templates))
-                {
-                    var recorded = new GraphStep[ranks];
-                    try
-                    {
-                        for (int r = 0; r < ranks; r++)
-                            recorded[r] = new GraphStep(this, rows, slots, first, counts, starts, false, request.RecurrentSnapshots, record: true) { Rank = r };
-                        EmitRankedStep(recorded, inputs, carries, request, span);
-                        templates = Array.ConvertAll(recorded, step => step.Record());
-                    }
-                    finally
-                    {
-                        foreach (GraphStep step in recorded) step?.Dispose();
-                    }
-                    _rankTemplates[kind] = templates;
-                }
-                for (int r = 0; r < ranks; r++)
-                {
-                    streams[r] = ((IStreamingGraphExecutor)ExecutorFor(_mesh.Allocator(span.Stage, r))).OpenStream(templates[r]);
-                    steps[r] = new GraphStep(this, rows, slots, first, counts, starts, false, request.RecurrentSnapshots, record: false)
-                        { Rank = r, Sink = streams[r] };
-                }
-                StepOutputs outputs = default;
-                bool ok = streams[0].Execute(() =>
-                {
-                    outputs = EmitRankedStep(steps, inputs, carries, request, span);
-                    bool all = true;
-                    for (int r = 0; r < ranks; r++) all &= steps[r].Run(streams[r]);
-                    return all;
-                });
-                if (!ok)
-                {
-                    string error = Array.Find(streams, st => st.LastError != null)?.LastError;
-                    throw new InvalidOperationException($"{Config.Architecture} tensor-parallel graph step failed: {error}");
-                }
-                GraphRuns++;
-                foreach (Slot slot in slots) slot.DeviceDirty = true;
-                result = RankedResult(outputs, slots.Length, (r, o) => ((IGraphPlan)streams[r]).Outputs[o]);
-                return true;
-            }
-            finally
-            {
-                foreach (GraphStep step in steps) step?.Dispose();
-                foreach (IGraphStream stream in streams) stream?.Dispose();
-                DisposeRankInputs(inputs, hidden);
-                DisposeRankInputs(carries, carry);
-            }
+            if (!_rankRunners.TryGetValue(span.Stage, out RankRunner runner))
+                _rankRunners[span.Stage] = runner = new RankRunner(this, span.Stage);
+            return TryRunRankedCompiledStep(runner, hidden, carry, slots, first, counts, starts, request, span, out result);
         }
 
         /// <summary>Whether every tensor-parallel partial must be summed exactly in F32, prompt chunks' too (a fast transport may
@@ -2327,20 +2301,13 @@ namespace TensorSharp.Models
             return (a, b);
         }
 
-        /// <summary>
-        /// A span of a step over a stage's tensor-parallel group on an executor that compiles whole programs (GGML): every
-        /// rank's program is traced block by block across the ranks, compiled for the rank's device, and the ranks' plans run
-        /// together, pausing at each <see cref="GraphOp.AllReduce"/> while the stage's devices sum the partial
-        /// (IRankedGraphExecutor). Decode kinds replay: a later step only re-traces to bind its inputs and finds the plans by
-        /// the ranks' signatures, and a decode step one position on advances the stage's kept step without a trace.
-        /// </summary>
-        private bool TryRunRankedCompiledStep(IRankedGraphExecutor executor, Tensor hidden, Tensor carry, Slot[] slots, int[] first,
+        private bool TryRunRankedCompiledStep(RankRunner runner, Tensor hidden, Tensor carry, Slot[] slots, int[] first,
             int[] counts, int[] starts, GraphRequest request, RankedSpan span, out GraphResult result)
         {
             result = null;
             int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
             string shape = RankedShape(request, span);
-            bool replayable = executor.Capabilities.Replays;
+            bool replayable = runner.Capabilities.Replays;
             foreach (int c in counts) replayable &= c <= SmallChunkRows;
             // A decode step one position on from the last runs as it advanced, without a trace (TryAdvanceDecode's rule).
             bool advance = replayable && DecodeStepsAdvance && !DecodeAdvanceDisabled && StepAdapter == null && request.PositionTable == null
@@ -2389,7 +2356,7 @@ namespace TensorSharp.Models
                     try
                     {
                         for (int r = 0; r < ranks; r++)
-                            plans[r] = steps[r].BuildForRank(executor, _mesh.GlobalDevice(span.Stage, r), replayable);
+                            plans[r] = steps[r].BuildForRank(runner, r, replayable);
                     }
                     catch
                     {
@@ -2417,7 +2384,7 @@ namespace TensorSharp.Models
                 // Decode and verify partials are summed exactly; a prompt chunk's take the fast transport (as Qwen35Model's
                 // tensor-parallel graphs do), unless the family needs exact sums throughout.
                 bool exact = ExactTensorParallelSums || replayable;
-                if (!executor.RunRanked(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), exact, out string error))
+                if (!runner.Run(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), exact, out string error))
                 {
                     if (replayed) DropRankedReplay(span.Stage);
                     throw new InvalidOperationException($"{Config.Architecture} tensor-parallel graph step failed: {error}");
@@ -4370,13 +4337,13 @@ namespace TensorSharp.Models
                 return new CachedGraph { Plan = _m.GraphExecutor.Compile(program) };
             }
 
-            /// <summary>Compile this rank's recorded program for device <paramref name="device"/> of a compiling executor.</summary>
-            internal CachedGraph BuildForRank(IRankedGraphExecutor executor, int device, bool replayable)
+            /// <summary>Compile this rank's recorded program for rank <paramref name="rank"/> of its stage (<see cref="RankRunner"/>).</summary>
+            internal CachedGraph BuildForRank(RankRunner runner, int rank, bool replayable)
             {
                 if (!_record) throw new InvalidOperationException("a hash-only trace cannot be built");
                 GraphProgram program = _b.ToProgram(replayable, false);
                 Program = program;
-                return new CachedGraph { Plan = executor.CompileForRank(program, device) };
+                return new CachedGraph { Plan = runner.Compile(program, rank) };
             }
 
             /// <summary>Run <paramref name="plan"/> on this step's inputs, counted in the <see cref="StepCensus"/>.</summary>

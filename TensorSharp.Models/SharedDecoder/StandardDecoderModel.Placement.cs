@@ -77,9 +77,9 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Per-rank graphs for a local mesh of <paramref name="tp"/> ranks a stage (<see cref="_rankGraphs"/>): one stage's
-        /// group (tensor parallelism), or every stage's of a hybrid placement. A streaming executor sums each partial as the
-        /// stage's last rank hands it in (a collective a stage); a compiling one (GGML) runs the stage's plans together,
-        /// pausing at every all-reduce (IRankedGraphExecutor).
+        /// group (tensor parallelism), or every stage's of a hybrid placement. GGML's executor runs the stage's plans together,
+        /// pausing at every all-reduce (IRankedGraphExecutor); the tensor executors run each rank's own plan in lockstep, the
+        /// stage's last rank to reach an all-reduce summing every partial (a collective a stage, TensorGraphExecutor.RunRanked).
         /// </summary>
         private void EnableRankGraphs(int tp)
         {
@@ -100,9 +100,10 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Tensor parallelism as each rank's own program (every executor that lowers the shared decoder: GGML's compiled plans,
-        /// direct CUDA's and the managed streams of a simulated group): every rank traces its shard of the step on its device's
-        /// executor, the ranks' nodes interleaved block by block (TryRunRankedGraphStep); each block's partial is summed by
+        /// Tensor parallelism as each rank's own program (every executor that lowers the shared decoder: GGML's, direct CUDA's
+        /// and the managed executor of a simulated group, all as compiled plans that replay and advance a decode step): every
+        /// rank traces its shard of the step for its device, the ranks' nodes interleaved block by block, and the ranks' plans
+        /// run together from one all-reduce to the next (TryRunRankedGraphStep, RankRunner); each block's partial is summed by
         /// <see cref="GraphOp.AllReduce"/> before it joins the rank's copy of the residual stream. A hybrid placement runs each
         /// whole-layer stage so over its own group, the stream passing from stage to stage (TryRunStagedGraphStep). Routed
         /// experts are sharded like the dense feed-forwards (each expert's width), not spread whole over the ranks as the

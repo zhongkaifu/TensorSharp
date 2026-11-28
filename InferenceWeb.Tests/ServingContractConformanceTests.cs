@@ -27,7 +27,7 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly HashSet<string> LegacyBespokeFamilies = new(StringComparer.Ordinal)
     {
-        "qwen4exp", "muse-spark",
+        "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
         "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video

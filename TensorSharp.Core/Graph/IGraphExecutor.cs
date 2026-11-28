@@ -252,13 +252,15 @@ namespace TensorSharp.Graph
 
     /// <summary>One rank's inputs for <see cref="IRankedGraphExecutor.RunRanked"/>: the input nodes with their per-run
     /// host bytes and byte counts.</summary>
-    public readonly record struct GraphRunInputs(int[] Nodes, IntPtr[] Data, long[] Bytes);
+    /// <summary>A plan run's inputs: each input node's host bytes and, for executors that bind tensors by object, its handle
+    /// (null where the step bound none).</summary>
+    public readonly record struct GraphRunInputs(int[] Nodes, IntPtr[] Data, long[] Bytes, object[] Handles = null);
 
     /// <summary>
     /// An executor whose compiled plans of one tensor-parallel step run together: plan r, compiled on rank r, runs
     /// with its inputs while every rank pauses at each <see cref="GraphOp.AllReduce"/> to sum the partial in place
-    /// (on the devices where the backend has a collective), then continues. For executors that compile whole
-    /// programs; a streaming executor reduces as the ranks' nodes arrive instead.
+    /// (on the devices where the backend has a collective), then continues: one executor compiles every rank's plan (GGML).
+    /// The tensor executors compile each rank's plan on its own executor and run them so (TensorGraphExecutor.RunRanked).
     /// </summary>
     public interface IRankedGraphExecutor : IGraphExecutor
     {

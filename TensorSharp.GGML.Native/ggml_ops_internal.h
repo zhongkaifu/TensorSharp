@@ -1018,8 +1018,9 @@ namespace tsg
 
         // A device operation in place of host experts (no host work, no transfers): the cut follows the last of
         // device_inputs in graph order, and device_op encodes its work on the accelerator's queue right after that
-        // segment is submitted, before the next one, which reads what it writes (ggml_ops_qwen4exp.cpp's prompt GDN
-        // layers on TensorSharp's Metal kernels). False with set_last_error on a failure.
+        // segment is submitted, before the next one, which reads what it writes (the graph builder's prompt-width GDN,
+        // hyper-connection and selected-attention operations on TensorSharp's Metal kernels). False with set_last_error on
+        // a failure.
         std::function<bool(ggml_backend_t)> device_op;
         const char* device_name = "device op";   // what TS_GGML_NODE_PROFILE's prompt-pass report calls it
         std::vector<ggml_tensor*> device_inputs;
@@ -1533,9 +1534,9 @@ namespace tsg
 
     // Execute `graph` as the alternating accelerator/host sequence described
     // above. `seg_end` must come from host_moe_build_segment_ends. `backend`
-    // runs the accelerator segments; null means g_backend. A kernel that
-    // computes its graph on a wrapper backend (the qwen4exp span's precise
-    // CUDA backend) passes that one, so the slices see the same kernels.
+    // runs the accelerator segments; null means g_backend. A graph computed on
+    // a wrapper backend (the graph builder's graph_backend) passes that one, so
+    // the slices see the same kernels.
     bool host_moe_execute_segments(
         ggml_cgraph* graph,
         const std::vector<HostMoeSegment>& segments,
@@ -2012,9 +2013,6 @@ namespace tsg
         void* data, std::size_t bytes, bool cacheable,
         ggml_backend_buffer_t& out_buffer,
         bool allow_unified_weight = false);
-
-    bool try_peek_cached_device_copy(const void* data, std::size_t bytes,
-                                     ggml_backend_buffer_t& out_buffer, void*& out_addr);
 
     // THE KEY, AND THE CALLER'S DUTY. A cached device copy (and its initialised
     // flag and bound address) is keyed by the address of the host bytes and their

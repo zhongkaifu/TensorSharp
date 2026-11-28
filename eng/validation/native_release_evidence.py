@@ -76,8 +76,8 @@ def expected_placement(model_id, profile):
 def placement_evidence(log, model_id, profile):
     """Recognize existing banners, retaining exact supporting lines.
 
-    Sources: ModelBase, Gemma4Model, each model's TensorParallel partial,
-    Qwen4ExpModel.BuildLayerPlacement and ggml_ops_glm_dsa.cpp load summary.
+    Sources: ModelBase, the shared decoder runtime's placement banners
+    (StandardDecoderModel.BuildMesh) and ggml_ops_glm_dsa.cpp load summary.
     An individual fused-kernel decline does not invalidate genuine per-op TP.
     """
     lines = log.splitlines()

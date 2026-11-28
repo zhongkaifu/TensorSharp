@@ -1960,8 +1960,13 @@ correctness for that checkpoint, not a general speedup.
 Split the model across N GPUs within one process (direct CUDA, or the GGML CUDA / Vulkan backends). Each GPU holds `1/N` of
 the sharded weights (column-parallel QKV/gate/up, row-parallel output/down) plus
 a full copy of replicated weights (norms, embeddings, LM head). Per-GPU KV
-caches are independent; AllReduce (via CUDA P2P copies + elementwise-add kernel)
-reconverges the hidden state after each row-parallel projection.
+caches are independent; AllReduce reconverges the hidden state after each
+row-parallel projection. On direct CUDA it runs ordered on the devices where
+every GPU pair passed the peer self-test: the ranks' streams wait on each
+other's events, every rank sums the partials over the peer mappings in rank order
+(the same bits on every rank) and the host never waits, so a step's kernels keep
+flowing across its reductions. Each rank's step is a compiled plan that replays
+and advances a decode step, as on `ggml_cuda`.
 
 ```bash
 # CLI: 2-GPU tensor parallelism
@@ -2126,8 +2131,11 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 
 ### Cluster tuning & diagnostics
 
-Local AllReduce prefers CUDA peer-to-peer DMA. At startup the group enables peer
-access for every device pair that reports it, then runs a round-trip self-test:
+Local AllReduce prefers CUDA peer-to-peer access. At startup the group enables peer
+access for every device pair that reports it, then runs a round-trip self-test
+(a peer copy and a kernel reading the peer's memory); with every pair good the
+reduction runs ordered on the devices (no host synchronization), else it reduces
+to GPU 0 and broadcasts with the host waiting for every device:
 some topologies (L4 behind certain PCIe switches, IOMMU-enabled hosts, small
 BAR1 windows) advertise peer access but silently transfer corrupt data, and any
 pair that fails the test is demoted to host staging permanently. Hardware
