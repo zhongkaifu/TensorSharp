@@ -592,11 +592,6 @@ namespace TensorSharp.Runtime.Scheduling
         private List<SequenceStepResult>? TryExecutePath(
             ExecutionPathKind path, SchedulerOutput output, ExecutionOptions options)
         {
-            // Groups' decode steps still in flight (IPipelinedBatchedDecode) leave their sequences' LastLogits unfilled:
-            // any step but another pipelined decode step finishes them first.
-            if (_model is IPipelinedBatchedDecode pipe && pipe.HasPendingPipelinedDecode
-                && (path != ExecutionPathKind.PerSequenceFused || !PipelinesStep(pipe, output, options)))
-                pipe.DrainPipelinedDecode();
             switch (path)
             {
                 case ExecutionPathKind.SpeculativePerSequence:
@@ -1158,16 +1153,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// the path does not itself CAPTURE blocks back into the shared pool
         /// (a concurrent request never writes the shared block storage), so it
         /// can't corrupt blocks shared via copy-on-write.</summary>
-        // TS_SCHED_PIPELINE_DECODE=0: a model that can keep two groups' decode steps in flight decodes every step as one
-        // batch instead (IPipelinedBatchedDecode; the same tokens either way).
-        private static readonly bool s_pipelineDecode =
-            !string.Equals(Environment.GetEnvironmentVariable("TS_SCHED_PIPELINE_DECODE"), "0", StringComparison.Ordinal);
-
-        /// <summary>Steps whose decoders ran as two groups in flight (tests, diagnostics).</summary>
-        internal static long PipelinedDecodeSteps;
-
         private KeyValuePair<string, object?> _phaseArchitectureTag;
-        private static readonly KeyValuePair<string, object?> s_phaseFinish = new(Telemetry.TelemetryAttributes.StepPhase, "finish");
         private static readonly KeyValuePair<string, object?> s_phaseSample = new(Telemetry.TelemetryAttributes.StepPhase, "sample");
         private static readonly KeyValuePair<string, object?> s_phaseIssue = new(Telemetry.TelemetryAttributes.StepPhase, "issue");
 
@@ -1188,152 +1174,6 @@ namespace TensorSharp.Runtime.Scheduling
             histogram.Record((double)(now - since) / Stopwatch.Frequency, _phaseArchitectureTag, phase,
                 new KeyValuePair<string, object?>(Telemetry.TelemetryAttributes.RowsBucket, Telemetry.TelemetryAttributes.RowsBucketOf(rows)));
             return now;
-        }
-
-        // Each decoding sequence's group while it pipelines, and its order of joining (a group's rows keep that order, so
-        // its captured steps are reused while its members stay).
-        private readonly Dictionary<string, (int Group, long Rank)> _pipeGroupOf = new Dictionary<string, (int, long)>(StringComparer.Ordinal);
-        private long _pipeRank;
-
-        /// <summary>Whether this step's decoders run as pipelined groups: a model that keeps two in flight, every scheduled
-        /// item a decode step (two or more), and no speculation (whose paths read the logits) unless the model's groups
-        /// outrun its batched verify (<see cref="IPipelinedBatchedDecode.PipelinedDecodeOutrunsSpeculation"/>).</summary>
-        private bool PipelinesStep(IPipelinedBatchedDecode pipe, SchedulerOutput output, ExecutionOptions options)
-        {
-            if (!s_pipelineDecode || !options.BatchedFusedDecodeEnabled
-                || (SpeculationEnabledThisStep && !pipe.PipelinedDecodeOutrunsSpeculation)
-                || output.ScheduledWork.Count < 2 || pipe.PipelinedDecodeGroups < 2)
-                return false;
-            foreach (var work in output.ScheduledWork)
-                if (work.IsPrefill)
-                    return false;
-            return true;
-        }
-
-        /// <summary>The step's decoders in two groups, each in the order it joined; null when there are fewer than two. A
-        /// sequence keeps its group; a new one joins the smaller; groups are dealt again (after the steps in flight finish,
-        /// as rows change groups) only when one is empty or holds two more than the other.</summary>
-        private List<ScheduledSequenceWork>[]? PipelineGroups(IPipelinedBatchedDecode pipe, List<ScheduledSequenceWork> decodeWork)
-        {
-            if (decodeWork.Count < 2)
-                return null;
-            var live = new HashSet<string>(decodeWork.Select(w => w.Sequence.RequestId), StringComparer.Ordinal);
-            foreach (var id in _pipeGroupOf.Keys.Where(k => !live.Contains(k)).ToList())
-                _pipeGroupOf.Remove(id);
-            var counts = new int[2];
-            foreach (var (group, _) in _pipeGroupOf.Values)
-                counts[group]++;
-            foreach (var work in decodeWork)
-            {
-                string id = work.Sequence.RequestId;
-                if (_pipeGroupOf.ContainsKey(id))
-                    continue;
-                int g = counts[1] < counts[0] ? 1 : 0;
-                _pipeGroupOf[id] = (g, _pipeRank++);
-                counts[g]++;
-            }
-            if (Math.Min(counts[0], counts[1]) < 1 || Math.Abs(counts[0] - counts[1]) > 2)
-            {
-                // Rows change groups: the steps in flight finish first, then the groups are dealt in turn.
-                pipe.DrainPipelinedDecode();
-                var ordered = _pipeGroupOf.OrderBy(kv => kv.Value.Rank).Select(kv => kv.Key).ToList();
-                for (int i = 0; i < ordered.Count; i++)
-                    _pipeGroupOf[ordered[i]] = (i % 2, _pipeGroupOf[ordered[i]].Rank);
-            }
-            var groups = new[] { new List<ScheduledSequenceWork>(), new List<ScheduledSequenceWork>() };
-            foreach (var work in decodeWork.OrderBy(w => _pipeGroupOf[w.Sequence.RequestId].Rank))
-                groups[_pipeGroupOf[work.Sequence.RequestId].Group].Add(work);
-            return groups[0].Count >= 1 && groups[1].Count >= 1 ? groups : null;
-        }
-
-        /// <summary>
-        /// The decode step as two groups in flight: for each group, finish its previous step (its rows' logits), sample its
-        /// rows from them, and issue its next step without waiting for it. The ids handled (their tokens appended), or null
-        /// when the step was not split (nothing changed). A group the model declines decodes as one synchronous batch, or,
-        /// declined too, keeps its drawn tokens for the round-robin loop.
-        /// </summary>
-        private HashSet<string>? TryPipelinedDecode(IBatchedPagedModel fused, IPipelinedBatchedDecode pipe,
-            List<ScheduledSequenceWork> decodeWork, List<SequenceStepResult> results)
-        {
-            var groups = PipelineGroups(pipe, decodeWork);
-            if (groups == null)
-                return null;
-            HashSet<string>? handled = null;
-            for (int g = 0; g < groups.Length; g++)
-            {
-                var work = groups[g];
-                int cnt = work.Count;
-                long phaseAt = Stopwatch.GetTimestamp();
-                pipe.FinishPipelinedDecode(g);
-                phaseAt = RecordStepPhase(s_phaseFinish, phaseAt, cnt);
-                var ids = new string[cnt];
-                var toks = new int[cnt];
-                var pos = new int[cnt];
-                if (ParallelSampling && cnt >= ParallelSamplingMinRows && !FirstTokenLogitsDump.IsArmed)
-                {
-                    try
-                    {
-                        Parallel.For(0, cnt, i => toks[i] = PeekPendingOrSample(work[i].Sequence));
-                    }
-                    catch (AggregateException ae) when (ae.InnerExceptions.Count > 0)
-                    {
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
-                    }
-                    Interlocked.Increment(ref ParallelSampledSteps);
-                }
-                else
-                    for (int i = 0; i < cnt; i++)
-                        toks[i] = PeekPendingOrSample(work[i].Sequence);
-                for (int i = 0; i < cnt; i++)
-                {
-                    pos[i] = work[i].Sequence.NumComputedTokens;
-                    ids[i] = work[i].Sequence.RequestId;
-                }
-                var outLogits = new float[cnt][];
-                phaseAt = RecordStepPhase(s_phaseSample, phaseAt, cnt);
-                long started = Stopwatch.GetTimestamp();
-                bool ok = pipe.TryIssuePipelinedDecode(g, ids, toks, pos, outLogits);
-                if (!ok)
-                {
-                    pipe.DrainPipelinedDecode();
-                    ok = fused.TryForwardBatchedFusedDecode(ids, toks, pos, outLogits);
-                }
-                RecordStepPhase(s_phaseIssue, phaseAt, cnt);
-                if (!ok)
-                {
-                    // Keep the draws (a stochastic sampler advanced) for the round-robin loop, as the batched path does.
-                    for (int i = 0; i < cnt; i++)
-                    {
-                        work[i].Sequence.PendingDeviceToken = toks[i];
-                        work[i].Sequence.PendingDevicePosition = pos[i];
-                    }
-                    continue;
-                }
-                long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / cnt;
-                ReportBatchedFusedDecodeSuccess(cnt);
-                for (int i = 0; i < cnt; i++)
-                {
-                    var seq = work[i].Sequence;
-                    seq.AppendOutputToken(toks[i]);
-                    seq.PendingDeviceToken = null;
-                    seq.LastLogits = outLogits[i];
-                    seq.AdvanceComputedTokens(1);
-                    if (!seq.FirstTokenAt.HasValue) seq.FirstTokenAt = DateTime.UtcNow;
-                    results.Add(new SequenceStepResult
-                    {
-                        Sequence = seq,
-                        TokensForwarded = 1,
-                        SampledToken = toks[i],
-                        IsPrefill = false,
-                        FullBlocksCaptured = 0,
-                        ForwardElapsedTicks = ticksPerSequence,
-                    });
-                    (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
-                }
-            }
-            if (handled != null)
-                Interlocked.Increment(ref PipelinedDecodeSteps);
-            return handled;
         }
 
         private List<SequenceStepResult> ExecuteStepPerSequenceFused(
@@ -1422,58 +1262,17 @@ namespace TensorSharp.Runtime.Scheduling
                         fused.CanBatchDecode(work.Sequence.RequestId, work.Sequence.NumComputedTokens))
                         decodeWork.Add(work);
                 int dn = decodeWork.Count;
-                // A layer split's GPUs each run one group's half at a time (IPipelinedBatchedDecode): the step's
-                // decoders in two groups, each group's step left in flight until the group samples again.
-                bool pipelined = false;
-                if (dn == n && _model is IPipelinedBatchedDecode pipe && PipelinesStep(pipe, output, options))
-                {
-                    try
-                    {
-                        var handled = TryPipelinedDecode(fused, pipe, decodeWork, results);
-                        if (handled != null)
-                        {
-                            if (handled.Count == n)
-                                return results;
-                            handledBatched = handled;
-                            pipelined = true;
-                        }
-                        else if (pipe.HasPendingPipelinedDecode)
-                            pipe.DrainPipelinedDecode();
-                    }
-                    catch (Exception ex)
-                    {
-                        // As the batched path below: a throwing kernel may have written some caches, so the whole
-                        // decode subset fails rather than retrying against partially advanced state.
-                        handledBatched = new HashSet<string>(decodeWork.Select(work => work.Sequence.RequestId));
-                        results.RemoveAll(result => handledBatched.Contains(result.Sequence.RequestId));
-                        _logger.LogError(ex, "Pipelined batched decode failed for {Count} sequences; failing the affected requests.", dn);
-                        foreach (var work in decodeWork)
-                        {
-                            var seq = work.Sequence;
-                            seq.Error = ex;
-                            results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
-                        }
-                        return results;
-                    }
-                }
                 // A lone decode beside prefill chunks speculates too. Decoding it one
                 // token per step behind another request's 2048-token chunk (~300 ms a
                 // step) stretched a 41-token reply over seconds; the batched verify of a
                 // single sequence costs about what that plain decode does.
-                bool speculate = !pipelined && (dn >= 2 || (dn == 1
-                    && !_pendingRetainedFusedTruncations.ContainsKey(decodeWork[0].Sequence.RequestId)));
-                // The step's prompt chunk rides the batched verify when the model can carry it:
-                // one forward for both, so the verify reads no weights of its own.
-                HashSet<string>? mixedHandled = null;
-                ScheduledSequenceWork? mixedWork = speculate ? TryStageMixedPrefill(fused, output, results, ref mixedHandled) : null;
-                long specStarted = Stopwatch.GetTimestamp();
+                bool speculate = dn >= 2 || (dn == 1
+                    && !_pendingRetainedFusedTruncations.ContainsKey(decodeWork[0].Sequence.RequestId));
                 bool speculated = speculate && TryRunBatchedSpeculativeSubset(decodeWork, results, ref handledBatched);
-                if (mixedWork != null)
-                    CompleteMixedPrefill(mixedWork, Stopwatch.GetTimestamp() - specStarted, results, ref mixedHandled);
                 // No batched verify: on a trunk that prefers it, one sequence takes a solo speculative turn instead.
-                if (!pipelined && !speculated && dn >= 2 && dn == n && TrySpeculativeTurn(fused, decodeWork, results))
+                if (!speculated && dn >= 2 && dn == n && TrySpeculativeTurn(fused, decodeWork, results))
                     return results;
-                if (!pipelined && !speculated && dn >= 2)
+                if (!speculated && dn >= 2)
                 {
                     var reqIds = new string[dn];
                     var btokens = new int[dn];
@@ -1634,11 +1433,6 @@ namespace TensorSharp.Runtime.Scheduling
                             results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
                         }
                     }
-                }
-                if (mixedHandled != null)
-                {
-                    handledBatched ??= new HashSet<string>(StringComparer.Ordinal);
-                    handledBatched.UnionWith(mixedHandled);
                 }
                 if (handledBatched != null && handledBatched.Count == n)
                     return results;
@@ -1855,100 +1649,6 @@ namespace TensorSharp.Runtime.Scheduling
                 }
             }
             return results;
-        }
-
-        // TS_SCHED_MIXED_STEP=0 keeps a step's prompt chunk out of its batched verify.
-        private static readonly bool s_mixedStep = Environment.GetEnvironmentVariable("TS_SCHED_MIXED_STEP") != "0";
-
-        /// <summary>
-        /// Stage the step's one prompt chunk to ride its batched verify (see
-        /// <see cref="IMixedStepPrefillTarget"/>), its holder bound and its media queued as the
-        /// per-sequence loop does. Null when the step has no such chunk or the model declines it;
-        /// a sequence whose step ended while binding goes to <paramref name="handled"/>.
-        /// </summary>
-        private ScheduledSequenceWork? TryStageMixedPrefill(IBatchedPagedModel fused, SchedulerOutput output,
-            List<SequenceStepResult> results, ref HashSet<string>? handled)
-        {
-            if (!s_mixedStep || _model is not IMixedStepPrefillTarget target)
-                return null;
-            ScheduledSequenceWork? pick = null;
-            foreach (var work in output.ScheduledWork)
-            {
-                if (!work.IsPrefill)
-                    continue;
-                // Several chunks share their weight reads in the batched prefill instead.
-                if (pick != null)
-                    return null;
-                pick = work;
-            }
-            if (pick == null)
-                return null;
-            var seq = pick.Sequence;
-            int prevComputed = seq.NumComputedTokens;
-            try
-            {
-                if (!BindFusedHolder(fused, seq, results))
-                {
-                    (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
-                    return null;
-                }
-                int[] tokens = BuildPrefillChunk(seq, pick);
-                int position = seq.NumComputedTokens, end = position + tokens.Length;
-                _model.MultimodalInjector?.QueuePromptEmbeddingsForSlice(position, tokens.Length, seq.RequestId);
-                bool whole = end >= seq.PromptTokens.Count || seq.IsPublicCheckpointBoundary(end);
-                return target.StageMixedPrefill(seq.RequestId, tokens, position, whole) ? pick : null;
-            }
-            catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == prevComputed
-                                                               && !fused.HasFusedSequenceCache(seq.RequestId))
-            {
-                _logger.LogDebug("No sequence slot for {EngineRequestId} yet: {Reason}", seq.RequestId, ex.Message);
-                results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Fused per-seq step failed for sequence {EngineRequestId}", seq.RequestId);
-                results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
-                seq.Error = ex;
-            }
-            (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
-            return null;
-        }
-
-        /// <summary>Book the staged chunk the batched verify ran (a prefix of it when the model
-        /// trimmed it to its GEMM tiles); one no verify ran stays for the per-sequence loop.</summary>
-        private void CompleteMixedPrefill(ScheduledSequenceWork work, long elapsedTicks, List<SequenceStepResult> results,
-            ref HashSet<string>? handled)
-        {
-            var seq = work.Sequence;
-            try
-            {
-                bool carried = ((IMixedStepPrefillTarget)_model).TakeMixedPrefill(seq.RequestId, out int ran, out float[]? logits);
-                if (s_batchedSpecLog)
-                    Console.Error.WriteLine($"[mixed-step] {seq.RequestId} @{seq.NumComputedTokens} " +
-                        $"{(carried ? $"ran {ran}/{work.NumScheduledTokens}" : $"not carried ({work.NumScheduledTokens})")}");
-                if (!carried)
-                    return;
-                seq.LastLogits = logits;
-                seq.AdvanceComputedTokens(ran);
-                MaybeCheckpointSharedPrefix(seq);
-                results.Add(new SequenceStepResult
-                {
-                    Sequence = seq,
-                    TokensForwarded = ran,
-                    SampledToken = -1,
-                    IsPrefill = true,
-                    FullBlocksCaptured = 0,
-                    ForwardElapsedTicks = elapsedTicks,
-                });
-            }
-            catch (Exception ex)
-            {
-                // The forward that carried it may have written its cache: fail it rather than rerun it.
-                _logger.LogError(ex, "Mixed-step prefill failed for sequence {EngineRequestId}", seq.RequestId);
-                results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
-                seq.Error = ex;
-            }
-            (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
         }
 
         /// <summary>Bind <paramref name="seq"/>'s per-request holder for this step's forward: rewind a

@@ -244,15 +244,14 @@ public sealed class RuntimeHeadAndStreamHookTests(ITestOutputHelper output) : ID
     }
 
     /// <summary>Tensor parallelism (per-rank programs, with the vocabulary-split head where the ranks score their slices of the
-    /// vocabulary), whole-layer stages and their hybrid (whose tensor-parallel stages run the per-op ranks with programs
-    /// off; one tensor-parallel stage always runs per-rank programs) on simulated devices give the one-device transformed
-    /// logits.</summary>
+    /// vocabulary), whole-layer stages (programs and per op) and their hybrid (every tensor-parallel group runs per-rank
+    /// programs, a hybrid's on each stage's group, the last stage's ranks scoring their slices of the vocabulary) on
+    /// simulated devices give the one-device transformed logits.</summary>
     [Theory]
     [InlineData(2, 1, true)]
     [InlineData(1, 2, true)]
     [InlineData(1, 2, false)]
     [InlineData(2, 2, true)]
-    [InlineData(2, 2, false)]
     public void PlacementsTransformAsOneDevice(int tp, int stages, bool graphs)
     {
         string path = Fixture("dense");
@@ -340,13 +339,13 @@ public sealed class RuntimeHeadAndStreamHookTests(ITestOutputHelper output) : ID
         Assert.True(moved >= 1e-2 && moved >= 100 * same, $"{backend} {site}: the fixture does not show the epsilon ({moved:E2})");
     }
 
-    /// <summary>The post norms' epsilon holds on the per-op tensor-parallel layers (each rank's reduced partial is normed),
-    /// whole-layer stages and their hybrid.</summary>
+    /// <summary>The post norms' epsilon holds on the per-rank tensor-parallel layers (each rank's reduced partial is normed),
+    /// whole-layer stages (programs and per op) and their hybrid (per-rank programs on every stage's group).</summary>
     [Theory]
     [InlineData(2, 1, true)]
     [InlineData(1, 2, true)]
     [InlineData(1, 2, false)]
-    [InlineData(2, 2, false)]
+    [InlineData(2, 2, true)]
     public void PlacementsTakeThePostNormEpsilon(int tp, int stages, bool graphs)
     {
         string plainPath = Fixture("post", postNorms: true);
@@ -445,13 +444,12 @@ public sealed class RuntimeHeadAndStreamHookTests(ITestOutputHelper output) : ID
     }
 
     /// <summary>The stream input runs once under tensor parallelism (before the stream is replicated to the ranks), whole-layer
-    /// stages and their hybrid, on the per-op path and as programs.</summary>
+    /// stages (on the per-op path and as programs) and their hybrid (per-rank programs on every stage's group).</summary>
     [Theory]
     [InlineData(2, 1, true)]
     [InlineData(1, 2, true)]
     [InlineData(1, 2, false)]
     [InlineData(2, 2, true)]
-    [InlineData(2, 2, false)]
     public void PlacementsRunTheStreamInputOnce(int tp, int stages, bool graphs)
     {
         string path = Fixture("dense"), scaledPath = ScaledEmbedding();

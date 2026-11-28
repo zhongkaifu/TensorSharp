@@ -78,9 +78,9 @@ public sealed class GraphEmitterTests
         // The same program by hand: leaves bound by the tensors' identities (this executor binds objects).
         var b = new GraphProgramBuilder(record: true);
         int input = b.Leaf(GraphLeafRole.Input, GraphFormat.F32, new long[] { K, N }, IntPtr.Zero, 0);
-        int gl = b.Leaf(GraphLeafRole.Weight, GraphFormat.F32, new long[] { K, 1 }, GraphIdentity.Of(g.Storage, g.StorageOffset), g.Storage.ByteLength, null, g);
+        int gl = b.Leaf(GraphLeafRole.Weight, GraphFormat.F32, new long[] { K, 1 }, GraphIdentity.Of(g.Storage, g.StorageOffset), g.Storage.ByteLength, g);
         int normed = b.Op(GraphOp.Mul, b.Op(GraphOp.RmsNorm, stackalloc[] { input }, default, stackalloc[] { Eps }), gl);
-        int wl = b.Leaf(GraphLeafRole.Weight, GraphFormat.F32, new long[] { K, M }, GraphIdentity.Of(w.Storage, w.StorageOffset), w.Storage.ByteLength, null, w);
+        int wl = b.Leaf(GraphLeafRole.Weight, GraphFormat.F32, new long[] { K, M }, GraphIdentity.Of(w.Storage, w.StorageOffset), w.Storage.ByteLength, w);
         int y = b.Op(GraphOp.MulMat, wl, normed);
         int view = b.Op(GraphOp.View, stackalloc[] { input }, stackalloc long[] { 2, K / 2, N, 1, 1, K * 4L, 0, 0, 0 });
         int half = b.Op(GraphOp.Cont, view);

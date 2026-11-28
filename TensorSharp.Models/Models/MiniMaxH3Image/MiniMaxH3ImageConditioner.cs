@@ -29,28 +29,56 @@ namespace TensorSharp.Models.MiniMaxH3Image
     /// The MiniMax-H3 text encoder as an <see cref="IConditioner"/>. Making one maps the encoder GGUF, reads its tokenizer
     /// files and its small tensors on the host; its first encode makes the trunk resident. <see cref="ReleaseDevice"/>
     /// hands the trunk's device copies back and keeps the mapping, so the next encode uploads from memory.
+    /// <para>On direct CUDA (<see cref="BackendType.Cuda"/>) the trunk and the vision tower are MiniMax-H3's direct
+    /// implementations on the device's allocator (MiniMaxH3DirectTextEncoder and MiniMaxH3DirectVisionEncoder, the ones
+    /// MiniMax-H3 video's conditioner runs there): the encoder opens at the first encode and <see cref="ReleaseDevice"/>
+    /// disposes it (its weights' device copies live in the direct linears, which the GGML residency calls do not reach), as
+    /// the video conditioner releases its encoder; the next encode opens it again.</para>
     /// </summary>
     public sealed class MiniMaxH3ImageConditioner : IConditioner
     {
-        private readonly MiniMaxH3TextEncoder _encoder;
+        private readonly string _path;
+        private readonly IAllocator _allocator;   // direct CUDA's device; null on GGML
+        private MiniMaxH3TextEncoder _encoder;     // on direct CUDA opened on first use since the last release
+        private MiniMaxH3TextEncoderConfig _config;
         private readonly object _gate = new();
         private bool _disposed;
 
         /// <param name="path">The encoder GGUF (unsloth/MiniMax-H3-GGUF qwen3vl_32b_minimax_h3-*.gguf) with vocab.json,
         /// merges.txt and tokenizer_config.json beside it.</param>
-        public MiniMaxH3ImageConditioner(string path, BackendType backend)
+        /// <param name="allocator">The device on <see cref="BackendType.Cuda"/> (a <see cref="TensorSharp.Cuda.CudaAllocator"/>).</param>
+        public MiniMaxH3ImageConditioner(string path, BackendType backend, IAllocator allocator = null)
         {
             ArgumentNullException.ThrowIfNull(path);
-            if (backend is not (BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu))
-                throw new NotSupportedException($"MiniMax-H3-Image's text encoder runs on ggml_cuda, ggml_metal or ggml_cpu, not {backend}.");
+            if (backend is not (BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu or BackendType.Cuda))
+                throw new NotSupportedException($"MiniMax-H3-Image's text encoder runs on ggml_cuda, ggml_metal, ggml_cpu or cuda, not {backend}.");
+            if (backend == BackendType.Cuda && allocator is not TensorSharp.Cuda.CudaAllocator)
+                throw new ArgumentException("MiniMax-H3-Image's text encoder on --backend cuda runs on a CUDA device's allocator.", nameof(allocator));
             Backend = backend;
-            _encoder = new MiniMaxH3TextEncoder(path, null, backend, null);
+            _path = path;
+            _allocator = backend == BackendType.Cuda ? allocator : null;
+            if (_allocator == null)
+            {
+                _encoder = new MiniMaxH3TextEncoder(path, null, backend, null);
+                _config = _encoder.Config;
+            }
+            else
+            {
+                using var gguf = new GgufFile(path);
+                _config = MiniMaxH3TextEncoder.DetectConfig(gguf);
+            }
         }
 
         public BackendType Backend { get; }
 
+        /// <summary>Whether the trunk is the direct implementation on a tensor backend's device (direct CUDA).</summary>
+        private bool Direct => _allocator != null;
+
+        /// <summary>The encoder, opened on direct CUDA at its first use since the last release.</summary>
+        private MiniMaxH3TextEncoder Encoder => _encoder ??= new MiniMaxH3TextEncoder(_path, null, Backend, _allocator);
+
         /// <summary>The hidden width of a conditioning row.</summary>
-        public int Width => _encoder.Config.Hidden;
+        public int Width => _config.Hidden;
 
         /// <summary>Tokens the last encode read (the timing line's "text tokens").</summary>
         public int LastTokens { get; private set; }
@@ -58,8 +86,20 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>Tokens of a prompt or a label at most (max_sequence_length).</summary>
         public const int MaxSequenceLength = 4096;
 
-        /// <summary>The trunk's device bytes, and the vision tower's once an edit has used it.</summary>
-        public long WeightBytes => _encoder.DeviceWeightBytes + (_visionUsed ? _encoder.Vision.DeviceWeightBytes : 0);
+        /// <summary>The trunk's device bytes, and the vision tower's once an edit has used it. On direct CUDA before the encoder
+        /// opens, the file's bytes (its weights are uploaded as stored: MiniMax-H3 video's conditioner's count).</summary>
+        public long WeightBytes
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    if (_encoder != null) return _encoder.DeviceWeightBytes + (_visionUsed ? _encoder.Vision.DeviceWeightBytes : 0);
+                    try { return new System.IO.FileInfo(_path).Length; }
+                    catch (Exception e) when (e is System.IO.IOException or UnauthorizedAccessException) { return 0; }
+                }
+            }
+        }
 
         private bool _visionUsed;
 
@@ -67,7 +107,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// edit's vision rows and the vision tower's own for its largest picture.</summary>
         public long WorkingBytes(DiffusionWorkload workload)
         {
-            if (workload.Pictures is not { Count: > 0 } pictures) return WorkingBytesFor(_encoder.Config, workload.Prompt);
+            if (workload.Pictures is not { Count: > 0 } pictures) return WorkingBytesFor(_config, workload.Prompt);
             long rows = 0, largest = 0;
             foreach (PresentedImage picture in pictures)
             {
@@ -76,8 +116,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 largest = Math.Max(largest, tokens);
             }
             long seq = Math.Max(16, (workload.Prompt?.Length ?? 0) / 3 + 16) + rows;
-            return WorkingBytesFor(_encoder.Config, workload.Prompt, rows) + VisionWorkingBytesFor(largest) +
-                   ScoreBytesFor(seq, _encoder.Config.Heads);
+            return WorkingBytesFor(_config, workload.Prompt, rows) + VisionWorkingBytesFor(largest) +
+                   ScoreBytesFor(seq, _config.Heads);
         }
 
         /// <summary>The F32 scores one query block of an edit's attention keeps (at most this, whole sequences below it): the
@@ -130,12 +170,13 @@ namespace TensorSharp.Models.MiniMaxH3Image
             lock (_gate)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
+                MiniMaxH3TextEncoder encoder = Encoder;
                 // Raw prompt tokens (no chat template); an empty prompt is the encoder's BOS alone.
-                List<int> ids = _encoder.Tokenize(prompt ?? string.Empty);
-                if (ids.Count == 0) ids.Add(_encoder.Tokenizer.BosTokenId);
-                float[] hidden = _encoder.Encode(ids);
+                List<int> ids = encoder.Tokenize(prompt ?? string.Empty);
+                if (ids.Count == 0) ids.Add(encoder.Tokenizer.BosTokenId);
+                float[] hidden = encoder.Encode(ids);
                 LastTokens = ids.Count;
-                return new ConditioningSet(hidden, ids.Count, _encoder.Config.Hidden);
+                return new ConditioningSet(hidden, ids.Count, encoder.Config.Hidden);
             }
         }
 
@@ -147,11 +188,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
             lock (_gate)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
-                if (!_encoder.HasVision)
+                MiniMaxH3TextEncoder encoder = Encoder;
+                if (!encoder.HasVision)
                     throw new InvalidOperationException(
                         "Editing needs the Qwen3-VL vision tower, and this text-encoder checkpoint does not carry one. Point " +
                         "--video-text-encoder at the full qwen3vl_32b_minimax_h3 GGUF.");
-                BpeTokenizer tokenizer = _encoder.Tokenizer;
+                BpeTokenizer tokenizer = encoder.Tokenizer;
                 MiniMaxH3Requests.RequireVisionTokens(tokenizer);
                 var markers = (Single(tokenizer, "<|vision_start|>"), Single(tokenizer, "<|image_pad|>"), Single(tokenizer, "<|vision_end|>"));
                 var outputs = new MiniMaxH3VisionOutput[pictures.Count];
@@ -159,24 +201,25 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 for (int i = 0; i < pictures.Count; i++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    outputs[i] = _encoder.Vision.Encode(pictures[i].Image);
+                    outputs[i] = encoder.Vision.Encode(pictures[i].Image);
                     _visionUsed = true;
                 }
                 vision.Stop();
                 var counts = new int[outputs.Length];
                 for (int i = 0; i < counts.Length; i++) counts[i] = outputs[i].TokenCount;
-                var (ids, tags, starts) = Present(_encoder.Tokenize, markers, counts, prompt);
+                var (ids, tags, starts) = Present(encoder.Tokenize, markers, counts, prompt);
                 var images = new List<MiniMaxH3PromptImage>(outputs.Length);
                 for (int i = 0; i < outputs.Length; i++)
                     images.Add(new MiniMaxH3PromptImage { TokenIndex = starts[i], Vision = outputs[i] });
                 cancellationToken.ThrowIfCancellationRequested();
                 // The vision rows make the sequence thousands of tokens long, where the trunk's whole scores
-                // ([seq, seq, heads] F32) would not fit: it materializes them a block of query rows at a time.
-                int queryChunk = QueryChunkForPictures ?? QueryChunkFor(ids.Count, _encoder.Config.Heads);
-                float[] hidden = _encoder.Encode(ids, images, flashAttention: FlashAttentionForPictures, queryChunk: queryChunk);
+                // ([seq, seq, heads] F32) would not fit: it materializes them a block of query rows at a time. (The direct
+                // trunk's fused causal attention streams its keys, as MiniMax-H3 video's Ref2VA prompts run it.)
+                int queryChunk = QueryChunkForPictures ?? QueryChunkFor(ids.Count, encoder.Config.Heads);
+                float[] hidden = encoder.Encode(ids, images, flashAttention: FlashAttentionForPictures, queryChunk: queryChunk);
                 LastTokens = ids.Count;
                 LastPresentation = (ids.ToArray(), tags.ToArray());
-                return new ConditioningSet(hidden, ids.Count, _encoder.Config.Hidden, tags.ToArray())
+                return new ConditioningSet(hidden, ids.Count, encoder.Config.Hidden, tags.ToArray())
                 {
                     VisionSeconds = vision.Elapsed.TotalSeconds,
                 };
@@ -235,19 +278,33 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>The token ids and tags of the last edit's presentation (a parity seam).</summary>
         internal (int[] Ids, int[] Tags) LastPresentation { get; private set; }
 
+        /// <summary>On direct CUDA the encoder is released after every encode, as MiniMax-H3 video's conditioner releases it
+        /// there: that backend has no device budget for the residency plan to weigh (GpuMemoryBudget covers the GGML GPU
+        /// backends), and the 17 GB trunk must not sit beside the denoiser. On GGML the plan decides.</summary>
+        public bool ReleaseAfterPhase => Direct;
+
         /// <summary>The native trunk's compute buffers (MiniMax-H3's shared reuse allocator, which only this component uses
         /// on the runtime).</summary>
         public void ReleaseWorkspace()
         {
             lock (_gate)
-                if (!_disposed) ReleaseSharedScratch();
+                if (!_disposed && !Direct) ReleaseSharedScratch();
         }
 
+        /// <summary>On GGML the trunk's (and the vision tower's) device copies go and the mapping stays; on direct CUDA the
+        /// encoder is disposed (its direct linears own their copies) and the next encode opens it again.</summary>
         public void ReleaseDevice()
         {
             lock (_gate)
             {
                 if (_disposed) return;
+                if (Direct)
+                {
+                    _encoder?.Dispose();
+                    _encoder = null;
+                    _visionUsed = false;
+                    return;
+                }
                 _encoder.ReleaseDeviceResidency();
                 if (_visionUsed) _encoder.Vision.ReleaseDeviceResidency();
                 ReleaseSharedScratch();
@@ -263,7 +320,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
             {
                 if (_disposed) return;
                 _disposed = true;
-                _encoder.Dispose();
+                _encoder?.Dispose();
+                _encoder = null;
             }
         }
     }

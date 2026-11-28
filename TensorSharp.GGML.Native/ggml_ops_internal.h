@@ -273,6 +273,12 @@ namespace tsg
         // The sidecar must be released before backend replacement/teardown.
         ggml_backend_t spark_float32_backend = nullptr;
         std::mutex spark_float32_mutex;
+        // Inkling 2's fused-op backend over this rank's ggml-cuda backend (made at its first use; null where it cannot
+        // be made, and not asked again until the backend is released). One per rank, released with the backend as the
+        // Spark sidecar is: a layer split runs each stage's graphs on its own rank's backend.
+        ggml_backend_t inkling_fused_backend = nullptr;
+        bool inkling_fused_made = false;
+        std::mutex inkling_fused_mutex;
         // Index into the ggml device list this slot was initialized from
         // (== the CUDA/Vulkan ordinal). -1 until initialized.
         int device_index = -1;
@@ -854,6 +860,9 @@ namespace tsg
     // The TP communicator mutex serializes these calls and teardown.
     int tp_cuda_allreduce_f32(ggml_backend_t* backends, ggml_tensor** tensors, int count);
     void tp_cuda_allreduce_f32_free();
+    // TensorSharp's exact F32 all-reduce over peer memory (no NCCL): 1 summed, 0 not usable here (nothing queued), -1 failed.
+    int tp_p2p_allreduce_f32(ggml_backend_t* backends, ggml_tensor** tensors, int count);
+    void tp_p2p_allreduce_free();
 
     // Behavioural check that peer copies between the given devices actually
     // deliver data (some hosts advertise P2P that never completes). 1 = ok,
@@ -1012,8 +1021,9 @@ namespace tsg
 
         // A device operation in place of host experts (no host work, no transfers): the cut follows the last of
         // device_inputs in graph order, and device_op encodes its work on the accelerator's queue right after that
-        // segment is submitted, before the next one, which reads what it writes (ggml_ops_qwen4exp.cpp's prompt GDN
-        // layers on TensorSharp's Metal kernels). False with set_last_error on a failure.
+        // segment is submitted, before the next one, which reads what it writes (the graph builder's prompt-width GDN,
+        // hyper-connection and selected-attention operations on TensorSharp's Metal kernels). False with set_last_error on
+        // a failure.
         std::function<bool(ggml_backend_t)> device_op;
         const char* device_name = "device op";   // what TS_GGML_NODE_PROFILE's prompt-pass report calls it
         std::vector<ggml_tensor*> device_inputs;
@@ -1165,6 +1175,9 @@ namespace tsg
     {
         // Optional TensorSharp wrapper sharing this rank's underlying device stream.
         ggml_backend_t backend = nullptr;
+        // The device this plan runs on, or -1 for its rank index. A ranked run's plans are one group's: consecutive
+        // devices from plans[0]'s (a hybrid placement's stage of devices [first, first + ranks) inside the context).
+        int device = -1;
         // Some upstream device collectives compress large F32 tensors to BF16.
         // Precision-sensitive graph families require exact F32 transport instead.
         bool allreduce_f32 = false;
@@ -1195,6 +1208,7 @@ namespace tsg
         void clear()
         {
             backend = nullptr;
+            device = -1;
             allreduce_f32 = false;
             graph = nullptr;
             seg_end.clear();
@@ -1216,8 +1230,11 @@ namespace tsg
     // the builder did not emit.
     bool tp_plan_segments(TpRankPlan& plan, const std::vector<ggml_tensor*>& boundary);
 
-    // Run one segmented graph per rank. `plans[r]` must describe rank r and all
-    // ranks must agree on the segment count. Returns false (with the last error
+    // Run one segmented graph per rank. `plans[r]` must describe rank r of the
+    // group (device plans[0]->device + r, or rank r of the context when the
+    // plans carry no device) and all ranks must agree on the segment count. A
+    // group of devices other than the context's whole set reduces through host
+    // staging: the context's collective spans all of its devices. Returns false (with the last error
     // set) when a submission or a collective fails.
     /// Cross-node AllReduce hook: sums `data` element-wise across every node
     /// of the cluster and leaves the result in place on all of them. Returns
@@ -1520,9 +1537,9 @@ namespace tsg
 
     // Execute `graph` as the alternating accelerator/host sequence described
     // above. `seg_end` must come from host_moe_build_segment_ends. `backend`
-    // runs the accelerator segments; null means g_backend. A kernel that
-    // computes its graph on a wrapper backend (the qwen4exp span's precise
-    // CUDA backend) passes that one, so the slices see the same kernels.
+    // runs the accelerator segments; null means g_backend. A graph computed on
+    // a wrapper backend (the graph builder's graph_backend) passes that one, so
+    // the slices see the same kernels.
     bool host_moe_execute_segments(
         ggml_cgraph* graph,
         const std::vector<HostMoeSegment>& segments,
@@ -1621,6 +1638,8 @@ namespace tsg
     // Free the cached reuse buffer (called from TSGgml_Shutdown).
     void free_reuse_compute_buffer();
 
+    // Free the active rank's fused-op sidecars (the Spark F32 backend and Inkling 2's fused-op backend) before its backend
+    // is replaced or freed; the plural form frees every rank's.
     void free_spark_float32_backend();
     void free_spark_float32_backends();
 
@@ -1997,9 +2016,6 @@ namespace tsg
         void* data, std::size_t bytes, bool cacheable,
         ggml_backend_buffer_t& out_buffer,
         bool allow_unified_weight = false);
-
-    bool try_peek_cached_device_copy(const void* data, std::size_t bytes,
-                                     ggml_backend_buffer_t& out_buffer, void*& out_addr);
 
     // THE KEY, AND THE CALLER'S DUTY. A cached device copy (and its initialised
     // flag and bound address) is keyed by the address of the host bytes and their

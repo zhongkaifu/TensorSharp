@@ -57,18 +57,22 @@ namespace TensorSharp.Models
             int rankOffset = TpRankOffset;
             var colPatterns = new List<string>(columnParallelPatterns);
             var rowPatterns = new List<string>(rowParallelPatterns);
-
-            if (tp > 1 || globalTp > 1)
-                Console.WriteLine($"  ShardWeightsForTP: tp={tp} globalTp={globalTp} rankOffset={rankOffset} colPatterns=[{string.Join(",", colPatterns)}] rowPatterns=[{string.Join(",", rowPatterns)}]");
+            // The patterns are mostly whole tensor names (a routed-expert model lists every expert's members: Qwen3.8's
+            // 74K), so a name is looked up first and only scanned for as a substring when it is not one of them; scanning
+            // every name against every pattern cost a minute and a half of the load.
+            var colNames = new HashSet<string>(colPatterns, StringComparer.Ordinal);
+            var rowNames = new HashSet<string>(rowPatterns, StringComparer.Ordinal);
+            bool IsColumn(string name) => colNames.Contains(name) || (!rowNames.Contains(name) && colPatterns.Any(p => name.Contains(p)));
+            bool IsRow(string name) => rowNames.Contains(name) || (!colNames.Contains(name) && rowPatterns.Any(p => name.Contains(p)));
 
             // Shard quantized weights.
             var quantToRemove = new List<string>();
-            var colParallelOwners = new List<QuantizedWeight>();
+            var colParallelOwners = new HashSet<QuantizedWeight>(ReferenceEqualityComparer.Instance);
             foreach (var kv in _quantWeights)
             {
                 string name = kv.Key;
-                bool isCol = colPatterns.Any(p => name.Contains(p));
-                bool isRow = !isCol && rowPatterns.Any(p => name.Contains(p));
+                bool isCol = IsColumn(name);
+                bool isRow = !isCol && IsRow(name);
                 if (!isCol && !isRow) continue;
 
                 var qw = kv.Value;
@@ -113,9 +117,6 @@ namespace TensorSharp.Models
                     long dstRowBytes = (ne0PerShard / blockSize) * typeSize;
                     long totalBytesPerShard = qw.Ne1 * dstRowBytes;
                     long blockBytesPerShard = blocksPerShard * typeSize;
-
-                    if (quantToRemove.Count < 2)
-                        Console.WriteLine($"    Row-parallel quant debug: {name} origNe0={qw.Ne0} origNe1={qw.Ne1} globalTp={globalTp} blockSize={blockSize} blocksPerRow={blocksPerRow} blocksPerShard={blocksPerShard} ne0PerShard={ne0PerShard} totalBytesPerShard={totalBytesPerShard}");
 
 
                     // Extract every rank's slice concurrently: each rank writes
@@ -172,8 +173,8 @@ namespace TensorSharp.Models
             foreach (var kv in _weights)
             {
                 string name = kv.Key;
-                bool isCol = colPatterns.Any(p => name.Contains(p));
-                bool isRow = !isCol && rowPatterns.Any(p => name.Contains(p));
+                bool isCol = IsColumn(name);
+                bool isRow = !isCol && IsRow(name);
                 if (!isCol && !isRow) continue;
 
                 var w = kv.Value;

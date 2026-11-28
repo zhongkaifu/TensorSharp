@@ -40,7 +40,7 @@
 | [Nemotron-H / Omni](nemotron_zh-cn.md) | 文本；Omni 图像；有条件的音频 | 文本 | 条件支持：音频需要公开 GGUF 未附带的 Parakeet 伴随文件。投机解码使用 n-gram 草稿、Nemotron 3.5 MTP 头或 Lightning 的 DFlash / DSpark 块级草稿器。 |
 | [Mistral 3](mistral3_zh-cn.md) | 文本、图像 | 文本 | 不支持：显式思考模式与工具。验证范围以具体检查点与后端为准。 |
 | [Hunyuan Dense](hunyuan-dense_zh-cn.md) | 文本 | 文本 | 已实现：单设备文本路径；不支持工具、张量并行与层切分。 |
-| [Raon-1 nano](raon_zh-cn.md) | 文本 | 文本 | 已实现：在 `cpu` 与各 GGML 后端上以单设备整模型前向图运行；Q8_0 已在 `ggml_cuda`、`ggml_cpu` 与 `cpu` 上对照 Transformers 验证。 |
+| [Raon-1 nano](raon_zh-cn.md) | 文本 | 文本 | 已实现：在 `cpu` 与各 GGML 后端上以整模型前向图运行，单设备或 `--layer-split N` 阶段；Q8_0 已在 `ggml_cuda`、`ggml_cpu` 与 `cpu` 上对照 Transformers 验证。 |
 | [LFM3 / LFM3-Omni](lfm3_zh-cn.md) | 文本；Omni 借助投影器输入图像、视频、音频 | 文本；Omni 可输出语音（TTS 与语音聊天回复） | 有条件：聊天协议与 Omni 的图像、视频、音频输入已与 llama.cpp 端到端核对（Metal、MLX、CPU 路径，以及 NVIDIA A40 上的 ggml_cuda、直连 CUDA 与 ggml_vulkan；文本服务的场景也在 RTX PRO 4500 上运行）。NVFP4 配置的 FP4 张量核心路径（Blackwell）已在这块 RTX PRO 4500（sm_120）上运行。 |
 | [GLM 5.x](glm_zh-cn.md) | 文本；仅 5.3-Flash 支持图像 | 文本 | 条件支持：5.2/5.3 仅文本。NextN 不支持启用张量并行的运行；CPU 参考路径有数值限制。 |
 | [DeepSeek V4 Flash](deepseek4_zh-cn.md) | 文本 | 文本 | 条件支持：核对内存与放置；可选的 DSpark 投机解码需要匹配草稿器。 |
@@ -58,8 +58,8 @@ DeepSeek 1017 的默认 YOCO prefill 是近似计算；选择精确设置前请�
 | 模型家族 / 卡片 | 输入 | 输出 / 任务 | 条件与证据 |
 |---|---|---|---|
 | [Qwen-Image-2.1](qwenimage21_zh-cn.md) | 文本、可选参考 / 蒙版图像 | 图像 / 图像编辑 | 条件支持：匹配编码器 / VAE 与采样配方；组件验证覆盖随后端变化。 |
-| [LTX 2.5 Distilled](ltx-2.5_zh-cn.md) | 文本、图像关键帧；可选身份参考图 | 视频 + 48 kHz 立体声 | 实验性：使用当前两阶段配方与伴随模型；不支持 Vulkan 与多 GPU。 |
-| [MiniMax-H3-Image](minimax-h3-image_zh-cn.md) | 文本 | 图像，约 4 至 20 MP | 条件支持：仅 ggml 后端（已在 `ggml_cuda` 上实测）；6 步蒸馏、guidance 1；尚未实现编辑。 |
+| [LTX 2.5 Distilled](ltx-2.5_zh-cn.md) | 文本、图像关键帧；可选身份参考图 | 视频 + 48 kHz 立体声 | 实验性：使用当前两阶段配方与伴随模型；不支持 Vulkan；多 GPU 为 `cuda` 上的 `--layer-split N`（去噪器整块阶段）或 `--tp N`（去噪器块张量并行切分）。 |
+| [MiniMax-H3-Image](minimax-h3-image_zh-cn.md) | 文本 | 图像，约 4 至 20 MP | 条件支持：ggml 后端（已在 `ggml_cuda` 上实测），以及 `cuda` 上的文生图（支持 `--tp` 与 `--layer-split`，GPU 验证待完成）；6 步蒸馏、guidance 1。 |
 | [MiniMax-H3](minimax-h3_zh-cn.md) | 文本、关键帧或由检查点决定的参考媒体 | 视频 + 32 kHz 立体声 | 条件支持：FL2VA / Ref2VA 是不同检查点。组件门控与完整生成验证范围不同。 |
 | [Wan 2.1 / 2.2](wan_zh-cn.md) | 文本；图像取决于变体 | 视频（无音频） | 条件支持：按变体匹配编码器 / VAE、采样器与步数；不支持多 GPU。 |
 

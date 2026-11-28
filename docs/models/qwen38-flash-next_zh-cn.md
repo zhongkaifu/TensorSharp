@@ -52,7 +52,7 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 - 带加速器 tier 的主机专家：独立显存上同样会收集路由 profile，下次加载时把每层最常路由的专家留在显存中。
 - 投机解码：经 `--draft-model mtp-*.gguf` 使用共享 MTP 头，或使用 DFlash2 drafter。
 
-该模型族的 `--tp` 与 `--layer-split` 是互斥的放置方式，二者的混合会被拒绝。
+`--tp T --layer-split P` 运行运行时的混合放置：每个整层阶段在自己的 T 个设备上以按 rank 的计算图运行其层（Qwen4ExpRuntimeTests.HybridRankGraphsMatchOneDeviceOnTheManagedCpu，只在模拟设备上覆盖过）。
 
 视觉沿用 Qwen3.5-VL 塔，位置用 (T,H,W) IMRoPE，支持多图与多轮图像会话。
 
@@ -623,7 +623,7 @@ Qwen/MoE 回归通过 CUDA 327 项（跳过 17）和 CPU 319 项（跳过 22）�
 `-ncmoe 12` 为 466.14 / 18.84。
 
 `--backend cuda` 在 CUDA 图执行器上运行共享运行时，与 `ggml_cuda` 一样接受 `--n-cpu-moe` / `--cpu-moe`（主机专家）、
-`--tp N` 与 `--layer-split N`（`--tp` 与 `--layer-split` 同时使用会被拒绝，`--tp` 下的主机专家也会被拒绝）；这些尚未在 GPU 上测量。
+`--tp N`、`--layer-split N` 及其混合（`--tp` 下的主机专家会被拒绝）；这些尚未在 GPU 上测量。
 `--tp` 切分什么、拒绝什么见[多 GPU](#多-gpu)。
 
 **历史：已移除的直连 CUDA 引擎。** 在 2026-11 移除之前，`--backend cuda` 加载自己的直连引擎（`Qwen4ExpCudaModel`）。
@@ -1707,7 +1707,7 @@ ggml 路径通过页缓存读取 host 专家与 PLE n-gram 表。在本机的网
 
 ## 多 GPU
 
-两种放置方式都由共享运行时提供，且对该模型族是互斥模式：`--tp` 与 `--layer-split` 同时使用会被拒绝。
+两种放置方式及其混合（`--tp T --layer-split P`，每个阶段的层在自己的 T 个设备上以按 rank 的计算图运行）都由共享运行时提供。
 
 - **`--tp N`** 在 `cuda` 与 `ggml_cuda`（ggml 的融合张量并行 all-reduce 可用时）上运行 per-rank 图。ggml 的图执行器只在
   CUDA 上运行按 rank 的图，而该模型族没有逐算子路径，所以 `ggml_vulkan` 上没有 `--tp`。每个 rank 追踪每一步中自己的分片：注意力与
@@ -1727,6 +1727,12 @@ ggml 路径通过页缓存读取 host 专家与 PLE n-gram 表。在本机的网
 `RankGraphsMatchOneDeviceOnTheManagedCpu`、`RankGraphsSelectTheSameQsaBlocksAsOneDevice`）以及两张 CUDA GPU 上
 （`StagesOnTwoGpusMatchOneGpu`、`RankGraphsOnTwoGpusMatchOneGpu`、`HostExpertsOnTwoGpuStagesMatchOneGpu`）都与单设备
 结果一致。`eng/ForcedLogitProbe` 在固定相同 token 历史下比较完整模型 logits，避免早期贪心分歧掩盖后续 decode 的数值误差。
+
+在两张 RTX PRO 4000 Blackwell（各 24 GB，PCIe，无 NCCL；`Q2_0` 预设，`MAX_CONTEXT=16384`、`TS_Q4E_HC_Q8=1`、
+`TS_Q4E_MTP_EXPERTS=q2_0`；512/128，取两次最佳）上实测：`ggml_cuda --tp 2` 预填 1,935 tok/s、解码 73.5 tok/s，
+5,130 token 的提示词预填 4.0 s（两段层切分为 3.4 s）。该模型族对所有部分和做精确求和，没有 NCCL 时每 32,764 个浮点数
+调用一次集合通信（该提示词需 18.4 s），直到 TensorSharp 的对等内存精确 all-reduce 接管较宽的部分和。直接 CUDA 的数据、
+张量并行解码步的录制以及这些数字的演变见 [unified-execution.md](../design/unified-execution.md)（英文）第 9.6 与 9.7 节。
 
 **历史：`Qwen4ExpModel` 的张量并行。** 已移除的实现在 `ggml_cuda` 的 `--tp` 下只切分 FFN：gate/up 产生本地中间通道，
 以 FP32 汇集后由 down 计算互不重叠的输出行；注意力、GDN、QSA 与 PLE 复制运行，输出头在 rank 0。它要求固定几种
@@ -1857,7 +1863,7 @@ MTP 在两个场景中均实际达到验证宽度 8，并覆盖拒绝回滚。�
 
 `--backend cuda` 通过共享解码运行时（`Qwen4ExpRuntimeModel`）服务该模型族，其图运行在 CUDA 图执行器上。服务契约与
 `ggml_cuda` 上的运行时相同：每个请求有自己的 slot，运行中请求的 decode 步一起执行，`--tp N` 运行 per-rank 图，
-`--layer-split N` 按整层放置，`--n-cpu-moe` / `--cpu-moe` 把路由专家交给主机；`--tp` 与 `--layer-split` 同时使用会被拒绝。
+`--layer-split N` 按整层放置，`--n-cpu-moe` / `--cpu-moe` 把路由专家交给主机；`--tp T --layer-split P` 让每个阶段在自己的组上运行按 rank 的计算图。
 预设为 `config/qwen3.8-flash-next-cuda.json`，其中的 `TS_Q4E_HC_Q8` 与 `TS_Q4E_MTP_EXPERTS` 由运行时读取。自直连引擎移除后，
 这条路径尚未在 GPU 上测量，本卡中的数字都不描述它。已移除的直连引擎（`Qwen4ExpCudaModel`）在 2026-11-07 至 11-12
 的服务测量（两张 H100 NVL 上的 sequence slot、批量 decode 图与双 decode 通道）作为历史记录保留在

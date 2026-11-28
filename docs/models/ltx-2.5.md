@@ -56,7 +56,37 @@ Use `--backend cuda` or `ggml_cuda` on NVIDIA GPUs (the CUDA tensor executor).
 `mlx` and `ggml_metal` select the MLX tensor executor on Apple Silicon. `cpu` and
 `ggml_cpu` select the managed CPU tensor executor; GPU generation measurements do
 not establish CPU throughput.
-Vulkan and multi-GPU execution are unsupported. Desktop MP4 audio requires
+Vulkan is unsupported. On NVIDIA, `--backend cuda --layer-split N` splits the
+denoiser's 48 blocks over N GPUs as whole-block stages: each GPU holds a
+contiguous run of blocks (balanced by bytes) and the AdaLN projections every stage
+computes, the video and audio streams cross from one GPU to the next through host
+memory, and the text encoder, VAEs and upscaler stay on the first GPU. It runs a
+denoiser one GPU cannot hold; it does not make a step faster. `--backend cuda --tp N`
+instead shards every block over N GPUs (Megatron style): each GPU holds 32/N heads of
+every attention (q, k, v, the head gates and its columns of the output projection)
+and 1/N of every feed-forward, and the AdaLN MLPs, modulation tables and output heads
+whole; the GPUs run each step together, summing the output projections' partials and
+the whole-width q/k norms' sums of squares by all-reduces (14 a block). N must divide
+the 32 heads, and with Q4_K weights the 2,048-wide row-parallel projections cap N at
+8 (whole 256-value blocks a GPU); other degrees are refused at load. The two cannot be
+combined, and `ggml_cuda` runs on one GPU. The stages give one device's bits on the
+managed CPU executor (two host devices, the synthetic two-block checkpoint, with and
+without an Ingredients adapter), and `--tp 2` on a simulated two-device group stays
+within 2.3e-7 of one device (relative, every step of every oracle case, with and
+without the adapter); the two-GPU comparisons
+(`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`,
+`Ltx25DenoiserTests.TensorParallelRanksOnTwoGpusMatchOneGpu`, with and without the
+adapter) pass on two RTX PRO 4000 Blackwell (24 GB each, PCIe, no NCCL). On the real
+distilled checkpoint (`config/ltx-2.5-distilled.json`, 17 frames at 512x320,
+`--diffusion-seed 7`, two runs each) the denoising loop took 8.8-9.4 s on one GPU
+(0.43 s a step after the first; 13.0 GB), 8.9-9.1 s over two stages (0.44 s; 7.5 +
+7.3 GB) with the same frames byte for byte, and 7.9-8.0 s under `--tp 2` (0.36 s;
+7.3 + 7.2 GB). `--tp 2` differs from one GPU in the order its partials are summed,
+which the distilled schedule's few steps carry into the clip: the same lake, boat and
+light, the sail cut differently (PSNR 26.9 dB over the 17 frames, the same on every
+run). At this size a step has a few hundred tokens, too few for the sharded products
+to pay much more than their all-reduces. The IC-LoRA adapters are gated on Hugging
+Face and were not run on GPUs. Desktop MP4 audio requires
 FFmpeg on `PATH` or `TS_FFMPEG`; the CLI also writes the original PCM as a WAV.
 The Mac app encodes audio/video through AVFoundation.
 
@@ -113,8 +143,9 @@ Ingredients IC-LoRA described below. For video continuation, `ContinuationVideoP
 (or the HTTP `continueFromVideos` field) uses the exact last frame of the first clip as
 frame zero; a second clip pins the new take's last frame. `ReferenceVideoPaths` (HTTP
 `referenceVideos`) in `Mode = "ref"` instead supplies a full temporal reference clip.
-Reference audio, retake/refinement, HDR/EXR, generated
-keyframe slots and multi-GPU splitting remain unavailable. Disabling audio decode still runs the trained joint
+Reference audio, retake/refinement, HDR/EXR and generated
+keyframe slots remain unavailable; multi-GPU is the denoiser's whole-block stages or its
+tensor-parallel shards on `cuda` only (see [Files and startup](#files-and-startup)). Disabling audio decode still runs the trained joint
 AV denoiser.
 The native audio length can be slightly shorter than the video duration; the
 original decoder/export rule crops excess samples and does not pad short tracks.

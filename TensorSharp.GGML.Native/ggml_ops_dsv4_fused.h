@@ -60,9 +60,7 @@ enum tsg_dsv4_fused_kind : int32_t
     // Unmasked F32 vision attention. Inputs [D,N,H,B], output [D,H,N,B].
     // Cooperatively stage K/V tiles across queries; softmax stays F32.
     TSG_ATTN_VISION_F32         = 24,
-    // Qwen4Exp prefill: sum_k round(expert[k] * route[k]) in expert order.
-    // Separate F32 multiplies/adds match its materialized upstream graph.
-    TSG_Q4E_EXPERT_REDUCE       = 25,
+    // 25: retired (the removed Qwen4Exp engine's prefill expert reduce); the number is not reused.
     // V4.1 routed-MoE tensor parallelism: src x[embedding,tokens],
     // weights[1,used,tokens], ids I32[used,tokens] -> dst[embedding,tokens].
     // `object` is the TP executor's layer; on the CUDA backend the node is

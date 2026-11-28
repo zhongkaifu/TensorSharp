@@ -122,6 +122,18 @@ namespace TensorSharp.Models
             return step.Op(GraphOp.Mul, x, step.Op(GraphOp.ScaleBias, stackalloc[] { t }, default, stackalloc[] { 0.5f, 0.5f }));
         }
 
+        /// <summary>Whole-layer stages hand the step's per-layer embeddings [layers x ple, rows] on beside the hc streams: the
+        /// first stage makes them from the embedded rows (<see cref="EmitStreamInput"/>), every layer reads its own.</summary>
+        protected override int StageCarryWidth => Spec.PleWidth;
+
+        protected override int EmitStageCarry(GraphStep step) => PleRows(step);
+
+        protected override void TakeStageCarry(GraphStep step, int carry)
+        {
+            _pleNode = carry;
+            _pleStep = step;
+        }
+
         /// <summary>The mean of the streams, then the output norm.</summary>
         protected override int EmitStreamOutput(GraphStep step, int stream)
             => step.RmsNorm(EmitCaptureRow(step, stream), "output_norm.weight");

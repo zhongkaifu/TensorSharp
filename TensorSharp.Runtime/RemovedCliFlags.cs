@@ -527,6 +527,15 @@ namespace TensorSharp.Runtime
             ("TS_GGML_TP_FUSED_MATMUL",
                 "the single-thread multi-rank linear it engaged (never the default) allocated a device buffer per rank "
                 + "per call and measured 2.3x slower on Qwen 3.5 35B (ggml_cuda --tp 2); local TP always runs the per-rank path."),
+            ("TS_GRAPH_TENSOR_PARALLEL",
+                "the shared decoder runtime's tensor parallelism on ggml's meta device (never the default) was removed: it no longer "
+                + "loaded a model, and --tp runs each rank's shard as its own graph, the ranks' graphs reducing together."),
+            ("TS_SCHED_PIPELINE_DECODE",
+                "no model keeps two decode groups in flight any more (the layer-split engine that did was removed); every "
+                + "decode step runs its sequences as one batch, and the switch was removed with the pipelined path."),
+            ("TS_SCHED_MIXED_STEP",
+                "no model carries a prompt chunk inside its batched verify any more (the direct-CUDA Qwen engine that did was "
+                + "removed); TS_SCHED_MIXED_PREFILL_TOKENS still bounds a step's prompt tokens beside its decodes."),
             ("TS_DSV41_TP",
                 "--tp N enables DeepSeek V4.1 routed-MoE tensor parallelism (2..8 GPUs); the environment entry "
                 + "point was removed."),

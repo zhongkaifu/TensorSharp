@@ -1081,6 +1081,28 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         Assert.True(group.AllReduceCount > 0, "the ranks never reduced");
     }
 
+    /// <summary>The hybrid (--tp 2 --layer-split 2) on four simulated devices: every whole-layer stage runs its layers as
+    /// per-rank graphs over its own pair, the stream (with the per-layer embeddings and hyper-connection streams) passing from
+    /// stage to stage, and every row answers as one device's.</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void HybridRankGraphsMatchOneDeviceOnTheManagedCpu(bool qsa, bool chunkedPrompt)
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-hybrid-{qsa}.gguf"), indexerTopK: 64, qsa: qsa,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        ModelBase Placed()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cpu, layerSplitDegree: 2, tpDegree: 2, tpGroup: new SimulatedDeviceGroup(4));
+            Assert.Equal(2, model.Mesh.TensorParallel);
+            Assert.Equal(2, model.Mesh.Stages);
+            Assert.True(model.RunsRankGraphs, "the hybrid's stages do not run per-rank graphs");
+            return model;
+        }
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt), Run(Placed, chunkedPrompt), 1e-4,
+            $"tp2 x stages2 qsa={qsa} chunked={chunkedPrompt}");
+    }
+
     [Fact]
     public void RankGraphsSelectTheSameQsaBlocksAsOneDevice()
     {
@@ -1110,6 +1132,23 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         var (target, mtp) = SpecFixtures(qsa: false);
         SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => new Qwen4ExpRuntimeModel(target, BackendType.Cpu), "qwen4exp cpu");
         SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(() => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, mtp), "qwen4exp cpu mtp");
+    }
+
+    /// <summary>The MTP head under tensor parallelism and the hybrid: the trunk runs as per-rank graphs, the (unsharded) draft
+    /// layer as one device's graph on the last stage's rank 0, reading the hyper-connection streams it chains. It ran per op
+    /// there, which has no form of this family's draft input, and every drafting request failed (rmsnorm over the streams).</summary>
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(2, 2)]
+    public void MtpUnderTensorParallelismMatchesPlainGreedy(int tp, int stages)
+    {
+        // BF16 projections and experts: the ranks' partial sums keep near-tied logits apart by less than Q8_0's activations.
+        string target = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-mtp-tp.gguf"), indexerTopK: 64, qsa: false,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "q4e-mtp-tp-head.gguf"), indexerTopK: 64);
+        SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(
+            () => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, mtp, layerSplitDegree: stages, tpDegree: tp, tpGroup: new SimulatedDeviceGroup(tp * stages)),
+            $"qwen4exp mtp tp={tp} stages={stages}", tieTolerance: 1e-3);
     }
 
     [MlxFact]

@@ -510,6 +510,8 @@ public class ContinuousBatchSchedulerTests
         Assert.False(defaults.SoloPrefillChunkSizeChosen);
         var sched = new ContinuousBatchScheduler(defaults, NewPool(64), NullLogger.Instance);
         Assert.Same(policy, InferenceEngine.AttachSoloPrefillPolicy(policy, defaults, sched, NullLogger.Instance));
+        // The model is told the scheduler's own step (the solo chunk bounded by the batched-token budget).
+        Assert.Equal(4096, policy.SchedulerStep);
 
         // A chosen size, in code or from TS_SCHED_SOLO_PREFILL_CHUNK, applies as documented; it
         // survives the engine's own copies of the configuration.
@@ -528,6 +530,10 @@ public class ContinuousBatchSchedulerTests
     private sealed class SoloPolicyStub(int step) : ISoloPrefillBudgetModel
     {
         public List<(int Start, int Remaining)> Calls { get; } = new();
+
+        public int SchedulerStep { get; private set; }
+
+        public void UseSchedulerSoloStep(int tokens) => SchedulerStep = tokens;
 
         public int PreferredSoloPrefillTokens(int start, int remaining)
         {

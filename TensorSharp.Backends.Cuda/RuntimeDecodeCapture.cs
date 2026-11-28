@@ -151,25 +151,63 @@ namespace TensorSharp.Cuda
             return t;
         }
 
-        public bool CaptureAndLaunch(Func<bool> run, ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows,
-            IReadOnlyList<IReadOnlyList<Tensor>> sequences, IReadOnlyList<Tensor> written)
+        /// <summary>Whether a recording over these sequences can start (inputs bound, lengths for each sequence).</summary>
+        internal bool CanRecord(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows, IReadOnlyList<IReadOnlyList<Tensor>> sequences)
+            => !Captured && !_disposed && _graphs.IsUsable && _dyn.IsValid && _stable.Count > 0 && attendLengths.Length >= 1
+               && attendLengths.Length <= CudaDecodeDynParams.MaxSequences && writeRows.Length == attendLengths.Length
+               && sequences != null && sequences.Count == attendLengths.Length;
+
+        /// <summary>Before a recording: room on the device, the inputs uploaded (the varying ones to the pinned buffer), the
+        /// lengths written and the sequences named.</summary>
+        internal void Prepare(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows, IReadOnlyList<IReadOnlyList<Tensor>> sequences)
         {
-            if (Captured || _disposed || !_graphs.IsUsable || !_dyn.IsValid || _stable.Count == 0 || attendLengths.Length < 1
-                || attendLengths.Length > CudaDecodeDynParams.MaxSequences || writeRows.Length != attendLengths.Length
-                || sequences == null || sequences.Count != attendLengths.Length)
-                return false;
             _allocator.OnRecordedStepLaunching();
             ReleaseCachedBlocksWhenShort();
             PinVaryingInputs();
             Upload();
             _dyn.Write(attendLengths, writeRows);
             _dyn.NameSequences(sequences);
+        }
+
+        /// <summary>Inside the recording, on this allocator's stream: the lengths' and the varying inputs' copies, the graph's
+        /// leading nodes.</summary>
+        internal void EnqueueLeadingCopies()
+        {
+            _dyn.EnqueueUpload();
+            EnqueueVaryingCopies();
+        }
+
+        /// <summary>Before a replay: the inputs uploaded and this position's lengths written.</summary>
+        internal void PrepareLaunch(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows)
+        {
+            _allocator.OnRecordedStepLaunching();
+            Upload();
+            _dyn.Write(attendLengths, writeRows);
+        }
+
+        internal CudaAllocator Allocator => _allocator;
+        internal CudaPrefillGraphCache Graphs => _graphs;
+        internal CudaDecodeDynParams Dyn => _dyn;
+        internal const string RecordingKey = Key;
+
+        /// <summary>The stable tensor a recording's entry keeps first (any of them: each is kept alive with it).</summary>
+        internal Tensor FirstStable => _stable.Values.First();
+
+        /// <summary>This rank's part was recorded in a tensor-parallel group's launch (<see cref="RankedDecodeCapture"/>): its
+        /// stable inputs keep their shapes from now on.</summary>
+        internal void MarkRecordedInGroup() => Captured = true;
+
+        public bool CaptureAndLaunch(Func<bool> run, ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows,
+            IReadOnlyList<IReadOnlyList<Tensor>> sequences, IReadOnlyList<Tensor> written)
+        {
+            if (!CanRecord(attendLengths, writeRows, sequences))
+                return false;
+            Prepare(attendLengths, writeRows, sequences);
             if (!_graphs.BeginCapture(Key)) return false;
             bool ok;
             try
             {
-                _dyn.EnqueueUpload();
-                EnqueueVaryingCopies();
+                EnqueueLeadingCopies();
                 _dyn.Activate();
                 ok = run();
             }
@@ -214,9 +252,7 @@ namespace TensorSharp.Cuda
         public bool TryLaunch(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows)
         {
             if (!Captured) throw new InvalidOperationException("no decode step is recorded");
-            _allocator.OnRecordedStepLaunching();
-            Upload();
-            _dyn.Write(attendLengths, writeRows);
+            PrepareLaunch(attendLengths, writeRows);
             try
             {
                 _graphs.Replay(Key);

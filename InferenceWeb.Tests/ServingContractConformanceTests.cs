@@ -27,9 +27,9 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly HashSet<string> LegacyBespokeFamilies = new(StringComparer.Ordinal)
     {
-        "qwen4exp", "muse-spark",
+        "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
-        "wan", "ltx-2.5", "minimax-h3",
+        "wan",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
         // families they generate media rather than decode steps, so the decoder runtime does not apply.
         "whisper", "kokoro", "ace-step-1.5",
@@ -70,9 +70,6 @@ public sealed class ServingContractConformanceTests
         "diffusion-gemma: TensorParallel@cuda",
         "diffusion-gemma: TensorParallel@ggml_cuda",
         "diffusion-gemma: TensorParallel@ggml_vulkan",
-        "gemma4: HybridParallel@cuda",
-        "gemma4: HybridParallel@ggml_cuda",
-        "gemma4: HybridParallel@ggml_vulkan",
         "glm-dsa: ContinuousBatching@cpu",
         "glm-dsa: HybridParallel@ggml_cuda",
         "glm-dsa: HybridParallel@ggml_vulkan",
@@ -83,9 +80,6 @@ public sealed class ServingContractConformanceTests
         "glm5next: HybridParallel@ggml_cuda",
         "glm5next: HybridParallel@ggml_vulkan",
         "glm5next: TensorParallel@cuda",
-        "gptoss: HybridParallel@cuda",
-        "gptoss: HybridParallel@ggml_cuda",
-        "gptoss: HybridParallel@ggml_vulkan",
         // Inkling 2 (milestone 1) runs on one device with its experts resident: its loop, depth-mixed stream and own expert
         // path have no placement or host-expert route yet (docs/design/inkling2-on-shared-runtime.md).
         "inkling2: ExpertOffload@ggml_cuda",
@@ -99,38 +93,27 @@ public sealed class ServingContractConformanceTests
         "inkling2: TensorParallel@ggml_vulkan",
         "ltx-2.5: HybridParallel@cuda",
         "ltx-2.5: HybridParallel@ggml_cuda",
-        "ltx-2.5: LayerSplit@cuda",
         "ltx-2.5: LayerSplit@ggml_cuda",
-        "ltx-2.5: TensorParallel@cuda",
         "ltx-2.5: TensorParallel@ggml_cuda",
         "minimax-h3: HybridParallel@cuda",
         "minimax-h3: HybridParallel@ggml_cuda",
-        "minimax-h3: LayerSplit@cuda",
-        "minimax-h3: LayerSplit@ggml_cuda",
-        "minimax-h3: TensorParallel@cuda",
+        // The denoiser shards over cuda's GPUs (MiniMaxH3DenoiserTests.TensorParallel*); GGML's ranked runner takes no DiT regions.
         "minimax-h3: TensorParallel@ggml_cuda",
+        // Direct CUDA joined the family's backends with --tp and --layer-split there; the hybrid is a gap on it too.
+        "minimax-h3-image: HybridParallel@cuda",
         "minimax-h3-image: HybridParallel@ggml_cuda",
-        "minimax-h3-image: LayerSplit@ggml_cuda",
         "minimax-h3-image: TensorParallel@ggml_cuda",
         "minimax-m3: HybridParallel@ggml_cuda",
         "muse-spark: HybridParallel@ggml_cuda",
         "muse-spark: HybridParallel@ggml_vulkan",
         "muse-spark: TensorParallel+batching@ggml_vulkan",
-        "nemotron_h: HybridParallel@cuda",
-        "nemotron_h: HybridParallel@ggml_cuda",
-        "nemotron_h: HybridParallel@ggml_vulkan",
-        "qwen4exp: HybridParallel@cuda",
-        "qwen4exp: HybridParallel@ggml_cuda",
-        "qwen4exp: HybridParallel@ggml_vulkan",
         "qwen_image: HybridParallel@ggml_cuda",
         "qwen_image: HybridParallel@ggml_vulkan",
-        "qwen_image: LayerSplit@ggml_cuda",
+        // Whole-block stages run on ggml_cuda (QwenImage21DenoiserTests.WholeBlockStages*); no test covers them on ggml_vulkan.
         "qwen_image: LayerSplit@ggml_vulkan",
-        // Raon-1 nano runs on one device: its hyper-connection streams, per-layer embeddings and RDA state have no placement yet.
+        // Raon-1 nano's lowering traces no rank's shard: whole-layer stages only.
         "raon1nano: HybridParallel@ggml_cuda",
         "raon1nano: HybridParallel@ggml_vulkan",
-        "raon1nano: LayerSplit@ggml_cuda",
-        "raon1nano: LayerSplit@ggml_vulkan",
         "raon1nano: TensorParallel@ggml_cuda",
         "raon1nano: TensorParallel@ggml_vulkan",
         "wan: HybridParallel@ggml_cuda",
@@ -200,10 +183,12 @@ public sealed class ServingContractConformanceTests
     /// The families on the shared diffusion runtime (TensorSharp.Models.SharedDiffusion). Each is proven by its own suites
     /// against the implementation it replaced (MiniMax-H3-Image: MiniMaxH3ImageDenoiserTests, MiniMaxH3ImageVaeCodecTests
     /// and MiniMaxH3ImageSwitchTests against the legacy model's denoiser and decoder; Qwen-Image-2.1: QwenImage21DenoiserTests
-    /// against the retired transformer's frozen outputs, QwenImage21Goldens). A family moved there leaves
-    /// <see cref="LegacyBespokeFamilies"/> and joins this list.
+    /// against the retired transformer's frozen outputs, QwenImage21Goldens; MiniMax-H3 video: MiniMaxH3DenoiserTests against the
+    /// retired DiT's frozen steps, MiniMaxH3VideoGoldens; LTX 2.5, whose clips run on the video pipeline: Ltx25DenoiserTests
+    /// against the unchanged official LTX and the retired direct denoiser's frozen steps, Ltx25LegacyGoldenTests). A family
+    /// moved there leaves <see cref="LegacyBespokeFamilies"/> and joins this list.
     /// </summary>
-    internal static readonly HashSet<string> DiffusionRuntimeFamilies = new(StringComparer.Ordinal) { "minimax-h3-image", "qwen_image" };
+    internal static readonly HashSet<string> DiffusionRuntimeFamilies = new(StringComparer.Ordinal) { "minimax-h3", "minimax-h3-image", "qwen_image", "ltx-2.5" };
 
     [Fact]
     public void TheDiffusionRuntimeFamiliesAreExactlyTheKnownOnes()

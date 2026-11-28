@@ -30,7 +30,7 @@ namespace TensorSharp.Models.Graph
             IGraphExpertWeights set = Weights.ExpertStack(name, experts);
             if (set == null) return default;
             // GGML binds the whole table's host bytes as the 3-D operand; the tensor executors run its members.
-            int id = _b.Leaf(GraphLeafRole.Weight, set.Format, stackalloc long[] { set.Ne0, set.Ne1, set.Ne2 }, set.Data, set.Bytes, null, set);
+            int id = _b.Leaf(GraphLeafRole.Weight, set.Format, stackalloc long[] { set.Ne0, set.Ne1, set.Ne2 }, set.Data, set.Bytes, set);
             v = new NetValue(id, set.Ne0, set.Ne1, set.Ne2, 1, false, set.Format);
             _weightLeaves[key] = v;
             return v;

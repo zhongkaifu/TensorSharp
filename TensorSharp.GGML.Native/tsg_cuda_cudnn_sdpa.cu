@@ -246,6 +246,7 @@ using PlanKey = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
 struct SdpaState
 {
     std::mutex mu;
+    bool touched = false;   // a call on this state's device used it (the release visits only those)
     cudnnHandle_t handle = nullptr;
     bool probed = false, usable = false;
     std::map<PlanKey, Plan> plans;
@@ -255,9 +256,23 @@ struct SdpaState
     std::size_t scratchBytes = 0;
 };
 
+// One state a device: the cuDNN handle, its plans, workspace and scratch are a device's own. A layer split runs
+// MiniMax-H3's blocks on several GPUs of one process, where one process-wide state had run the second GPU's attention with
+// the first GPU's handle and buffers.
+constexpr int kSdpaDevices = 16;
+
+SdpaState& state_of(int device)
+{
+    static SdpaState s[kSdpaDevices];
+    return s[device];
+}
+
 SdpaState& state()
 {
-    static SdpaState s;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= kSdpaDevices) device = 0;
+    SdpaState& s = state_of(device);
+    s.touched = true;
     return s;
 }
 
@@ -609,15 +624,23 @@ bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const fl
 // the convolution release at the pipeline's stage boundaries.
 void tsg_cudnn_sdpa_release(void)
 {
-    SdpaState& s = state();
-    std::lock_guard<std::mutex> lock(s.mu);
-    s.plans.clear();
-    if (s.scratch != nullptr) { cudaFree(s.scratch); s.scratch = nullptr; s.scratchBytes = 0; }
-    if (s.workspace != nullptr) { cudaFree(s.workspace); s.workspace = nullptr; s.workspaceBytes = 0; }
-    if (s.handle != nullptr && api().loaded) cudnnDestroy(s.handle);
-    s.handle = nullptr;
-    s.probed = false;
-    s.usable = false;
+    // Every device whose state a call used, that device current; the caller's device is current again after.
+    int previous = 0;
+    const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+    for (int d = 0; d < kSdpaDevices; d++)
+    {
+        SdpaState& s = state_of(d);
+        if (!s.touched || cudaSetDevice(d) != cudaSuccess) continue;
+        std::lock_guard<std::mutex> lock(s.mu);
+        s.plans.clear();
+        if (s.scratch != nullptr) { cudaFree(s.scratch); s.scratch = nullptr; s.scratchBytes = 0; }
+        if (s.workspace != nullptr) { cudaFree(s.workspace); s.workspace = nullptr; s.workspaceBytes = 0; }
+        if (s.handle != nullptr && api().loaded) cudnnDestroy(s.handle);
+        s.handle = nullptr;
+        s.probed = false;
+        s.usable = false;
+    }
+    if (restore) cudaSetDevice(previous);
 #if defined(TSG_HAVE_FLASH_ATTN)
     tsg_flash_attn_release();
 #endif

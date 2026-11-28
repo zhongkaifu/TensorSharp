@@ -303,6 +303,37 @@ FL2VA 上 1280×768×107 的首尾帧片段有 34,991 个打包 token，此时�
 `artifacts/minimax-h3/fl2v-face-investigation/` 与 `artifacts/minimax-h3/speed/hr/`
 （本地验证证据，未提交）。
 
+### 多 GPU
+
+`--layer-split N`（`cuda`、`ggml_cuda`）把去噪器的 50 个块按权重字节均衡切成整块阶段，每张 GPU 一段：
+每张卡持有本段的权重与 LoRA 因子，残差流以 F32 经主机内存逐段传递，文本编码器、VAE 与 token refiner
+留在第一张卡上。这是容量模式：各段依次运行，一步不会比装得下全部块的单卡更快。`--tp N`（仅 `cuda`）
+按 Megatron 方式切分每个块：每张卡持有堆叠 q、k、v 的 heads / N、fc1 的 gate 与 value 行的 FFN / N，
+以及注意力输出投影与 fc2 对应的输入列，每个乘积之后对部分和求和（每块两次精确 F32 all-reduce，
+经对等内存按设备顺序进行）。AdaLN 投影、归一化、patch 投影、最终层与输出头在每张卡上完整保留；
+token refiner 在第一张卡上运行。Turbo 插件的主干因子按同样方式切分（qkv 与 fc1 取 up 的行，输出投影
+与 fc2 取 down 的列）。`N` 必须整除头数与 FFN，行并行切分不能拆开量化块，否则加载时拒绝。
+`ggml_cuda` 上的 `--tp`（其分 rank 执行器不接受 DiT 区域）以及 `--tp` 与 `--layer-split` 同用都会被拒绝。
+
+2026-11-28 在两张 NVIDIA RTX PRO 4000 Blackwell（各 24 GB，PCIe，无 NCCL；ggml `bb877c0c` 未改动，
+CUDA 13.2）上实测：`config/minimax-h3-fl2va.json`，640x384 共 17 帧，`--diffusion-seed 7`，提示词
+"a red fox trotting through falling snow, cinematic"，每项一次。时间为去噪循环（括号内为第一步之后的步时中位数，第一步还要编译与上传），峰值为每 0.5 秒采样的
+各卡显存占用（第一张卡还持有文本编码器与 VAE），PSNR 按解码出的 22 帧计算：
+
+| 后端、插件 | 单卡 | `--layer-split 2` | `--tp 2` | 与单卡相比 PSNR：层切分 / TP |
+|---|---:|---:|---:|---|
+| `ggml_cuda` | 21.9 s（1.03 s），16.4 GB | 22.0 s（1.01 s），15.2 + 6.5 GB | 拒绝 | 逐字节相同 / - |
+| `ggml_cuda`，Turbo 4 步 | 6.4 s，18.0 GB | 6.3 s，15.2 + 7.2 GB | 拒绝 | 逐字节相同 / - |
+| `cuda` | 110.0 s（每步 5.42 s），21.9 GB | 113.3 s（5.61 s），16.6 + 6.6 GB | 62.5 s（2.93 s），16.7 + 6.4 GB | 逐字节相同 / 42.0 dB |
+| `cuda`，Turbo 4 步 | 显存不足 | 24.9 s（5.88 s），17.9 + 8.2 GB | 17.3 s（3.16 s），18.2 + 8.4 GB | - / 与层切分相比 40.8 dB |
+
+层切分逐字节给出单卡的帧。`--tp 2` 让直接 CUDA 的一步快 1.85 倍；其帧与单卡的差别来自部分和的求和顺序
+（狐狸与步态相同）。Turbo 插件在 `cuda` 上装不进一张 24 GB 的卡，在两张卡上可以运行。该模型在单卡上直接
+CUDA 比 `ggml_cuda` 慢约五倍（110 s 对 21.9 s），因此装得下时 `ggml_cuda` 仍是更快的选择；这一差距本次未处理。
+双卡测试（`MiniMaxH3DenoiserTests.WholeBlockStagesOnTwoCudaDevicesMatchOneDevice`、
+`WholeBlockStagesOnTwoGgmlCudaGpusMatchOneGpu` 与 `TensorParallelOnTwoCudaDevicesMatchesOneDevice`，
+各覆盖 8 个冻结用例，其中两个带插件）在同一台机器上通过。
+
 ## 需要的文件
 
 | 文件 | 大小 | 用途 / 来源 |

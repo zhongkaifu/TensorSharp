@@ -28,7 +28,7 @@ patch.
 | Tool calling | The template's Qwen 3.5-style `<tool_call><function=…>` blocks, parsed by the Qwen 3.5 output parser. Not yet exercised end to end. |
 | Backends | `cpu` (managed), `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `ggml_vulkan`. `cuda` and `mlx` are refused at load. |
 | Batching | Continuous batching, checkpoints and speculative verify, via the shared runtime |
-| Multi-GPU | None. Tensor parallelism, layer split and hybrid placement are declared gaps. |
+| Multi-GPU | `--layer-split N` on `ggml_cuda` and `ggml_vulkan`: the shared runtime's whole-layer stages, the hc streams and the step's per-layer embeddings (the stage carry) passing from stage to stage, each layer's RDA state on its stage (`RaonRuntimeTests.PlacementMatchesOneDevice`, simulated devices: the one device's logits). Tensor parallelism and the hybrid are declared gaps: the family's lowering traces no rank's shard. |
 | MTP | `*_MTP` files load, but their NextN block is skipped (not loaded or run) |
 
 ## Run it

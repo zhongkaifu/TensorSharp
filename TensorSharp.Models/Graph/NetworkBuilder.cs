@@ -163,13 +163,13 @@ namespace TensorSharp.Models.Graph
         private NetValue QuantizedLeaf(QuantizedWeight q)
         {
             // GGML binds the host bytes (its device copies are keyed on them); the tensor executors read the weight object.
-            int id = _b.Leaf(GraphLeafRole.Weight, q.GgmlType, stackalloc long[] { q.Ne0, q.Ne1 }, q.Data, q.RawBytes, null, q);
+            int id = _b.Leaf(GraphLeafRole.Weight, q.GgmlType, stackalloc long[] { q.Ne0, q.Ne1 }, q.Data, q.RawBytes, q);
             return new NetValue(id, q.Ne0, q.Ne1, 1, 1, false, q.GgmlType);
         }
 
         private NetValue DenseLeaf(Tensor t, ReadOnlySpan<long> ne)
         {
-            int id = _b.Leaf(GraphLeafRole.Weight, GraphFormat.F32, ne, LeafIdentity(t), t.Storage.ByteLength - t.StorageOffset * sizeof(float), null, t);
+            int id = _b.Leaf(GraphLeafRole.Weight, GraphFormat.F32, ne, LeafIdentity(t), t.Storage.ByteLength - t.StorageOffset * sizeof(float), t);
             return Value(id, ne, false, GraphFormat.F32);
         }
 
@@ -188,7 +188,7 @@ namespace TensorSharp.Models.Graph
                 _ => throw new NotSupportedException($"a state of {t.ElementType}"),
             };
             if (ne == null || ne.Length == 0) ne = ExtentsOf(t);
-            int id = _b.Leaf(GraphLeafRole.State, format, ne, LeafIdentity(t), t.Storage.ByteLength - t.StorageOffset * t.ElementType.Size(), null, t);
+            int id = _b.Leaf(GraphLeafRole.State, format, ne, LeafIdentity(t), t.Storage.ByteLength - t.StorageOffset * t.ElementType.Size(), t);
             v = Value(id, ne, false, format);
             _stateLeaves[t] = v;
             return v;

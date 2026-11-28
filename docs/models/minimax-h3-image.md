@@ -25,7 +25,9 @@ family, its text encoder with the vision tower, denoiser and VAE encoder and dec
 phase by phase by one pipeline) on `ggml_cuda`, `ggml_metal` and `ggml_cpu`, end to end. It
 has been run with real weights on `ggml_cuda` (an H100 and an A40) and on `ggml_metal` (an
 M5 Pro); `ggml_cpu` runs the same programs (validated on small synthetic checkpoints; with
-real weights it takes tens of minutes a picture). An edit can be limited to a selection of `<Picture 1>` with a mask
+real weights it takes tens of minutes a picture). Text to image and editing also run on `cuda`
+(direct CUDA), on one GPU or several ([Several GPUs](#several-gpus)), measured on two RTX PRO
+4000s. An edit can be limited to a selection of `<Picture 1>` with a mask
 ([Masked edits](#masked-edits)), and the chat hosts edit across turns ([Multi-turn](#multi-turn)).
 
 | Component | File | Source |
@@ -366,6 +368,61 @@ selection and words). In TensorAgent:
   `int8-all` adds the VAE decoder's F16 projections. It replaces `TS_H3_INT8_MATMUL` (`1` is
   `int8`, `all` is `int8-all`), which a host now refuses by name. Other backends run the
   products as stored, as before, and the host says so once.
+
+## Several GPUs
+
+- **`--backend cuda`.** The DiT runs the same step program on the CUDA graph executor, as
+  MiniMax-H3 video's denoiser runs its 50 blocks there: F32 activations in every product
+  (no q8_1 guard), the attention, rotary, modulations, gated residuals and LoRA updates on
+  the executor's own kernels. The text encoder and vision tower are MiniMax-H3's direct
+  implementations, the VAE decoder and encoder the same programs on the CUDA executor (its
+  `GraphOp.GroupNorm` is the layer norm of each group's contiguous run), so edits run there
+  too. Its products keep F32 activations, which makes a step about five times slower than
+  `ggml_cuda`'s int8 tensor-core products on the same GPU (below).
+- **`--layer-split N`** (`ggml_cuda`, `cuda`). The 50 blocks as whole-block stages, one a GPU
+  (balanced by weight bytes); each GPU holds its stage's weights and LoRA factors, the
+  residual stream goes from stage to stage, and the text encoder and VAE run on the first.
+  It is a capacity mode: a step is no faster than one GPU that holds it all.
+- **`--tp N`** (`cuda`). The DiT sharded Megatron-style: each GPU holds `56 / N` heads of
+  every attention (rows of the stacked q, k, v) and `14336 / N` MLP columns (rows of gate and
+  value), and the matching input columns of the attention output and of fc2, summed over the
+  GPUs after each (two all-reduces a block); the token refiner, modulations, norms, patch
+  projections, final layer and heads are whole on every GPU. A LoRA set's updates are cut the
+  same way. `N` must divide the heads, and the row-parallel splits must not cut a quant block
+  (Q4_K: `--tp 2` and `4`, not `8`); anything else is refused at load. On `ggml_cuda` `--tp`
+  is refused: its ranked graph runner does not run programs with the step's fused DiT nodes.
+  `--tp` with `--layer-split` is refused too.
+- **Validation.** On the synthetic checkpoint the sharded steps on the managed executor over
+  two simulated devices match one device within 4e-7 (relative L2; Q8_0 within 3e-5, where the
+  managed products round activations), with and without LoRA
+  (`MiniMaxH3ImageTensorParallelTests`); the CUDA tests (one GPU against the managed executor,
+  stages and `--tp 2` on two GPUs against one, the decoder against the frozen pixels, the
+  encoder against the NumPy oracle) pass on two RTX PRO 4000s.
+- **Measured** on 2026-11-28 on two NVIDIA RTX PRO 4000 Blackwell (24 GB each, PCIe, no NCCL;
+  ggml `bb877c0c` unchanged, CUDA 13.2): `config/minimax-h3-image-q4km.json` (the pruned Q4_K_M
+  DiT), "a red paper lantern in a snowy courtyard at dusk", 1024x1024, `--diffusion-seed 7`,
+  one run each; the edit is "Make the lantern in <Picture 1> deep blue, keep everything else
+  the same" on the one-GPU `ggml_cuda` picture (sampled at 2048x2048, returned at 1024x1024).
+  Time is the denoising loop (in parentheses the median step after the first, which also
+  compiles and uploads); peak is each GPU's used memory sampled every 0.5 s, the first GPU
+  also holding the text encoder and the VAE:
+
+  | Workload | 1 GPU | `--layer-split 2` | `--tp 2` | PSNR vs 1 GPU: split / TP |
+  |---|---:|---:|---:|---|
+  | `ggml_cuda` | 5.8 s (0.70 s), 15.3 GB | 5.8 s (0.68 s), 22.8 + 6.9 GB | refused | identical / - |
+  | `ggml_cuda`, pDMD 2-step | 3.3 s, 15.5 GB | 3.5 s, 15.2 + 7.6 GB | refused | identical / - |
+  | `ggml_cuda`, edit | 26.3 s (4.17 s), 17.7 GB | | refused | |
+  | `cuda` | 28.1 s (3.50 s), 13.3 GB | 22.4 s (3.47 s), 12.4 + 6.7 GB | 13.8 s (1.92 s), 12.1 + 7.3 GB | identical / 52.3 dB |
+  | `cuda`, pDMD 2-step | 9.0 s (3.66 s), 15.8 GB | | 8.1 s (1.97 s), 11.9 + 8.9 GB | - / 61.8 dB |
+  | `cuda`, edit | 144.3 s (23.9 s), 18.0 GB | 147.7 s (24.5 s), 16.3 + 9.0 GB | 84.5 s (12.6 s), 16.3 + 9.7 GB | identical / 57.9 dB |
+
+  The stages give one GPU's pixels; `--tp 2` halves a direct-CUDA step (1.8-1.9x) and differs
+  from one GPU only in the order its partials are summed. Every edit turned the lanterns blue
+  and kept the rest. The backends differ in their products (q8_1-guarded int8 on `ggml_cuda`,
+  F32 activations on `cuda`): the same courtyard, details apart (21.1 dB; the edits 42.0 dB).
+  `ggml_cuda` on one GPU stays the fastest placement where it fits; `--tp` there is a gap (its
+  ranked graph runner does not run the DiT offload nodes). Over two stages on `ggml_cuda` the
+  first GPU peaked at 22.8 of 24 GB, close to what residency budgets.
 
 ## Memory
 
@@ -744,4 +801,5 @@ an edit that names them `<Picture 1>`, `<Picture 2>`, ... in order, as for Qwen-
   does): designed as an off-by-default experiment, not built or measured.
 - The prompt expander (MiniMaxAI/MiniMax-H3-Image-PE). ComfyUI's text-to-image
   template leaves it off by default.
-- The `mlx`, `cuda` and `cpu` (pure C#) backends.
+- The `mlx` and `cpu` (pure C#) backends, and `--tp` on `ggml_cuda` (its ranked graph runner
+  does not run the DiT offload nodes).

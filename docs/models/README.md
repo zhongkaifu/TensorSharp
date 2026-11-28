@@ -40,7 +40,7 @@ Media in the input column is content the model receives; the output column disti
 | [Nemotron-H / Omni](nemotron.md) | Text; image on Omni; conditional audio | Text | Conditional: audio needs a Parakeet companion absent from public GGUFs. Speculation uses n-gram drafts, the Nemotron 3.5 MTP head or the Lightning DFlash / DSpark block drafters. |
 | [Mistral 3](mistral3.md) | Text, image | Text | Unsupported: explicit thinking mode and tools. Check the named checkpoint/backend coverage. |
 | [Hunyuan Dense](hunyuan-dense.md) | Text | Text | Implemented: single-device text path; tools, tensor parallelism and layer split are unsupported. |
-| [Raon-1 nano](raon.md) | Text | Text | Implemented: single-device whole-forward graphs on `cpu` and the GGML backends; Q8_0 checked against Transformers on `ggml_cuda`, `ggml_cpu` and `cpu`. |
+| [Raon-1 nano](raon.md) | Text | Text | Implemented: whole-forward graphs on `cpu` and the GGML backends, on one device or `--layer-split N` stages; Q8_0 checked against Transformers on `ggml_cuda`, `ggml_cpu` and `cpu`. |
 | [LFM3 / LFM3-Omni](lfm3.md) | Text; image, video, audio on Omni with its projector | Text; speech on Omni (TTS and spoken chat replies) | Conditional: the chat protocol and Omni image, video and audio input are checked against llama.cpp end to end (Metal, MLX, the CPU lanes, and ggml_cuda, direct CUDA and ggml_vulkan on an NVIDIA A40; the text server's scenarios also on an RTX PRO 4500). The NVFP4 config's FP4 tensor-core route (Blackwell) ran on that RTX PRO 4500 (sm_120). |
 | [GLM 5.x](glm.md) | Text; image only on 5.3-Flash | Text | Conditional: 5.2/5.3 are text-only. NextN excludes active tensor parallelism; the CPU reference has numerical limits. |
 | [DeepSeek V4 Flash](deepseek4.md) | Text | Text | Conditional: check memory and placement; optional DSpark speculation requires a matching drafter. |
@@ -58,8 +58,8 @@ DeepSeek 1017 defaults to approximate YOCO prefill; read its [quality and benchm
 | Family / card | Inputs | Output / task | Conditions and evidence |
 |---|---|---|---|
 | [Qwen-Image-2.1](qwenimage21.md) | Text, optional reference/mask images | Images / image edits | Conditional: matching encoder/VAE and sampling recipe; component coverage varies by backend. |
-| [MiniMax-H3-Image](minimax-h3-image.md) | Text | Images, ~4 to 20 MP | Conditional: ggml backends only (`ggml_cuda` measured); six distilled steps, guidance 1; editing not implemented. |
-| [LTX 2.5 Distilled](ltx-2.5.md) | Text, image keyframes; optional identity sheets | Video + 48 kHz stereo | Experimental: current two-stage recipe and companions; Vulkan and multi-GPU are unsupported. |
+| [MiniMax-H3-Image](minimax-h3-image.md) | Text | Images, ~4 to 20 MP | Conditional: ggml backends (`ggml_cuda` measured), and text to image on `cuda` with `--tp` and `--layer-split` (GPU validation pending); six distilled steps, guidance 1. |
+| [LTX 2.5 Distilled](ltx-2.5.md) | Text, image keyframes; optional identity sheets | Video + 48 kHz stereo | Experimental: current two-stage recipe and companions; Vulkan is unsupported; multi-GPU is `--layer-split N` (whole-block denoiser stages) or `--tp N` (sharded denoiser blocks) on `cuda`. |
 | [MiniMax-H3](minimax-h3.md) | Text, keyframes or reference media by checkpoint | Video + 32 kHz stereo | Conditional: distinct FL2VA/Ref2VA checkpoints. Component gates and whole-generation coverage differ. |
 | [Wan 2.1 / 2.2](wan.md) | Text, image by variant | Video (no audio) | Conditional: variant-specific encoders/VAE, sampler and step schedule; multi-GPU is unsupported. |
 

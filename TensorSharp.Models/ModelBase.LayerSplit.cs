@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -114,6 +115,28 @@ public abstract partial class ModelBase
 
     /// <summary>The allocator of local layer-split device <paramref name="rank"/> (rank 0 when unsplit).</summary>
     protected IAllocator LayerDeviceAllocator(int rank) => _layerAllocators == null ? _allocator : _layerAllocators[rank];
+
+    /// <summary>
+    /// The local devices of <c>--layer-split N</c> for a family that places its own blocks (a diffusion denoiser's whole-block
+    /// stages, <see cref="SharedDiffusion.DenoiserStages"/>) and has no decoder layer plan: one allocator a stage, the same
+    /// devices <see cref="ConfigureLayerPlacement"/> gives a decoder (the GGML context's ranks, the direct-CUDA devices
+    /// TENSORSHARP_LAYER_SPLIT_DEVICES names). Null without a split. A multi-node pipeline is refused: its stage protocol
+    /// carries a decoder's activations.
+    /// </summary>
+    protected IReadOnlyList<IAllocator> StageDeviceAllocators()
+    {
+        if (LayerSplitDegree <= 1 && LayerSplitGroup == null) return null;
+        if (LayerSplitGroup != null)
+            throw new NotSupportedException($"{GetType().Name} splits its blocks over this process's devices only, not over nodes.");
+        if (_layerAllocators == null)
+        {
+            if (_backend == BackendType.Cuda) RefuseLayerSplitPastTheCudaDevices();
+            var allocators = new IAllocator[LayerSplitDegree];
+            for (int rank = 0; rank < allocators.Length; rank++) allocators[rank] = CreateLayerDeviceAllocator(rank);
+            _layerAllocators = allocators;
+        }
+        return _layerAllocators;
+    }
 
     protected IAllocator LayerAllocator(int layer) => LayerPlacement == null
         ? _allocator : _layerAllocators[LayerPlacement.LocalRank(layer)];

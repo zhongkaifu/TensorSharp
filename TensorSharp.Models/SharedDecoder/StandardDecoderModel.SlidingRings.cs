@@ -177,7 +177,7 @@ namespace TensorSharp.Models
             // A plain prompt's pieces overlap on the device (IGraphExecutor.OverlapSteps): each piece's run returns with its work
             // queued while the next is traced and built. The caches hold the whole prompt first, so no piece grows them.
             IDisposable overlap = null;
-            if (overlapSteps && OverlapPromptSteps && !follow && media.Length == 0 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
+            if (overlapSteps && OverlapPromptSteps && !follow && media.Length == 0 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs)
             {
                 EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
                 overlap = GraphExecutor.OverlapSteps();

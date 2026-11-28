@@ -848,29 +848,39 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Refuse, before uploading any of them, quantized weights that cannot fit the device's
-        /// free memory. The direct cuda backend keeps the whole model on one device: GLM-5.3-Flash
-        /// (~180 GB) on a 45 GB A40 uploaded for minutes and then aborted the process on a CUDA
-        /// out-of-memory with a core dump. Only the weights are counted, so a model that could fit
-        /// is never refused here; a later out-of-memory stays the genuine error it is.
+        /// Refuse, before uploading any of them, quantized weights that cannot fit their devices' free memory: each device
+        /// is asked for its own share (one device holds the whole model; a layer split's GPUs each hold their layers',
+        /// AllocatorForWeight). GLM-5.3-Flash (~180 GB) on a 45 GB A40 uploaded for minutes and then aborted the process on
+        /// a CUDA out-of-memory with a core dump. Only the weights are counted, so a model that could fit is never refused
+        /// here; a later out-of-memory stays the genuine error it is. Every weight used to be counted against the first
+        /// device, so a layer split of a model no one GPU holds (Qwen3.8-Flash-Next's 35 GB of weights over two 24 GB GPUs)
+        /// was refused.
         /// </summary>
         private void RefuseQuantizedWeightsThatCannotFit(CudaAllocator allocator)
         {
             // What the preload uploads: a model that leaves weights in host memory (planned expert offload) is not
             // refused for them.
-            long needed = 0;
+            var needed = new Dictionary<CudaAllocator, long>();
             foreach (var (name, qw) in _quantWeights)
                 if (qw.HasHostData && CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType) && ShouldPreloadDirectCudaWeight(name))
-                    needed += qw.RawBytes;
-            long free, total;
-            try { (free, total) = allocator.GetMemoryInfo(); }
-            catch (Exception) { return; }   // unknown: the upload itself decides
-            if (needed <= free)
-                return;
-            throw new ModelLoadRefusedException(
-                $"the model's quantized weights need {needed >> 20} MiB of device memory and the CUDA device has " +
-                $"{free >> 20} MiB free of {total >> 20} MiB. The cuda backend keeps the whole model on one device; " +
-                "use --backend ggml_cuda (with --layer-split N or --tp N for several GPUs) or a smaller quantization.");
+                {
+                    CudaAllocator owner = AllocatorForWeight(name) as CudaAllocator ?? allocator;
+                    needed[owner] = needed.GetValueOrDefault(owner) + qw.RawBytes;
+                }
+            foreach (var (owner, bytes) in needed)
+            {
+                long free, total;
+                try { (free, total) = owner.GetMemoryInfo(); }
+                catch (Exception) { continue; }   // unknown: the upload itself decides
+                if (bytes <= free)
+                    continue;
+                throw new ModelLoadRefusedException(
+                    $"the model's quantized weights need {bytes >> 20} MiB of CUDA device {owner.DeviceId}'s memory and it has " +
+                    $"{free >> 20} MiB free of {total >> 20} MiB" +
+                    (needed.Count == 1 ? ". The cuda backend keeps the whole model on that device; use --layer-split N or --tp N " +
+                        "for several GPUs, " : "; ") +
+                    "use --backend ggml_cuda or a smaller quantization.");
+            }
         }
 
         // TS_GGML_RETAIN_HOST_WEIGHTS=1 keeps every quantized weight's host copy

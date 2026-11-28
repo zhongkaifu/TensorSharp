@@ -106,9 +106,9 @@ namespace TensorSharp.Graph
     public sealed record GraphWideTokenRoutes(long MinRows, bool Q6K, bool StridedAttention, bool FloatWeightsOnGgml);
 
     /// <summary>
-    /// A tensor-parallel group's sum for executors whose ranks' programs are traced in lockstep on one thread: each
-    /// rank's <see cref="GraphOp.AllReduce"/> hands its partial in, and the last rank's arrival sums them in place (the
-    /// group's collective), before the trace emits any rank's next node.
+    /// A tensor-parallel group's sum for the tensor executors, whose ranks' plans run in lockstep on one thread
+    /// (TensorGraphExecutor.RunRanked): each rank's <see cref="GraphOp.AllReduce"/> hands its partial in, and the last rank's
+    /// arrival sums them in place (the group's collective) before any rank runs its next op.
     /// </summary>
     public interface IGraphCollective
     {
@@ -181,10 +181,6 @@ namespace TensorSharp.Graph
     {
         IGraphWeight Expert(int index);
     }
-
-    /// <summary>How a leaf spreads over tensor-parallel ranks: along <see cref="Axis"/>, <see cref="Ne"/>
-    /// holding each (segment, rank)'s extent, segment s repeating <see cref="Nr"/>[s] times.</summary>
-    public sealed record GraphSplit(int Axis, long[] Ne, uint[] Nr);
 
     public enum GraphNodeKind : byte { Leaf, Op, Effect, Output, Alias, Boundary, Fused, FusedEnd }
 
@@ -517,7 +513,6 @@ namespace TensorSharp.Graph
         public long Bytes { get; init; }
         /// <summary>The node an effect, output or alias refers to.</summary>
         public int Node { get; init; }
-        public GraphSplit? Split { get; init; }
         /// <summary>A leaf's object for backends that run on tensors: the <see cref="Tensor"/> of a weight
         /// or state, or the <see cref="IGraphWeight"/> of a quantized weight (null for inputs).</summary>
         public object? Handle { get; init; }
@@ -527,7 +522,7 @@ namespace TensorSharp.Graph
     public sealed class GraphProgram
     {
         internal GraphProgram(GraphNode[] entries, int nodeCount, long[] outputFloats, bool replayable, bool reorder,
-            int[]? tensorParallelRanks, (ulong, ulong) signature, bool floatProducts = false, bool wideTokenProducts = false,
+            (ulong, ulong) signature, bool floatProducts = false, bool wideTokenProducts = false,
             bool q8Nvfp4Activations = false, bool backendFusions = false)
         {
             BackendFusions = backendFusions;
@@ -536,7 +531,6 @@ namespace TensorSharp.Graph
             OutputFloats = outputFloats;
             Replayable = replayable;
             Reorder = reorder;
-            TensorParallelRanks = tensorParallelRanks;
             Signature = signature;
             FloatProducts = floatProducts;
             WideTokenProducts = wideTokenProducts;
@@ -551,8 +545,6 @@ namespace TensorSharp.Graph
         public bool Replayable { get; }
         /// <summary>The backend may reorder independent work for concurrency.</summary>
         public bool Reorder { get; }
-        /// <summary>Ranks the program spreads over (tensor parallelism), or null.</summary>
-        public int[]? TensorParallelRanks { get; }
         /// <summary>A hash of everything that shapes the program (not its per-run input values).</summary>
         public (ulong, ulong) Signature { get; }
         /// <summary>
@@ -699,7 +691,7 @@ namespace TensorSharp.Graph
 
         public void Mix(ReadOnlySpan<float> values) { Mix(values.Length); foreach (float v in values) Mix(BitConverter.SingleToInt32Bits(v)); }
 
-        public int Leaf(GraphLeafRole role, int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, GraphSplit? split = null, object? handle = null)
+        public int Leaf(GraphLeafRole role, int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, object? handle = null)
         {
             Mix(1); Mix((int)role); Mix(format); Mix(ne);
             if (role != GraphLeafRole.Input)
@@ -709,8 +701,7 @@ namespace TensorSharp.Graph
                 _signatureOnly = false;
                 Mix(bytes);
             }
-            if (split != null) { Mix(100 + split.Axis); Mix(split.Ne); }
-            if (Keeping) Emit(NodeCount, new GraphNode { Kind = GraphNodeKind.Leaf, Role = role, Format = format, Ne = ne.ToArray(), Data = data, Bytes = bytes, Split = split, Handle = handle });
+            if (Keeping) Emit(NodeCount, new GraphNode { Kind = GraphNodeKind.Leaf, Role = role, Format = format, Ne = ne.ToArray(), Data = data, Bytes = bytes, Handle = handle });
             return NodeCount++;
         }
 
@@ -798,10 +789,10 @@ namespace TensorSharp.Graph
 
         private bool _floatProducts;
 
-        public GraphProgram ToProgram(bool replayable, bool reorder, int[]? tensorParallelRanks = null)
+        public GraphProgram ToProgram(bool replayable, bool reorder)
         {
             if (_entries == null) throw new InvalidOperationException("A hash-only trace has no program.");
-            return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature,
+            return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, Signature,
                 floatProducts: _floatProducts, wideTokenProducts: _wideTokenProducts, q8Nvfp4Activations: _q8Nvfp4Activations,
                 backendFusions: _backendFusions)
             {

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
@@ -6,15 +7,20 @@ namespace TensorSharp.Cuda
     /// <summary>
     /// Multi-GPU collective operations using CUDA peer-to-peer memory access.
     /// Works on any platform with CUDA (Windows, Linux) without requiring NCCL.
-    /// 
-    /// AllReduce algorithm (reduce-to-zero + broadcast):
+    ///
+    /// AllReduce where every pair of GPUs reads the other's memory from kernels (the self-test below verifies it): ordered
+    /// on the devices, without the host waiting for any of them. Each rank's stream records that its partial is ready and
+    /// waits for its peers'; every rank then sums all the partials, read in place over the peer mappings, in rank order
+    /// ((p0 + p1) + p2 ...: the same additions on every rank, so every rank holds the same bits, the ones the
+    /// reduce-to-zero below makes) into its own scratch; once every rank has read the others' partials (a second event a
+    /// rank), each copies its sum over its partial. The host only enqueues: a tensor-parallel step's ops keep flowing to the
+    /// devices across its reductions, where the reduce-to-zero waited for every device three times a reduction.
+    ///
+    /// Otherwise (a pair without verified peer access, no kernels) reduce-to-zero + broadcast:
     ///   1. Each non-zero GPU copies its partial to GPU 0's staging buffer
     ///   2. GPU 0 accumulates: buffer[0] += staging (via elementwise-add kernel)
     ///   3. GPU 0 broadcasts the reduced result to all other GPUs
-    /// 
-    /// For N=2 this is optimal (1 copy + 1 add + 1 broadcast). For N≤8 the
-    /// serial reduction on GPU 0 is bandwidth-bound on the P2P links, which
-    /// matches ring-allreduce throughput when NVLink is not available.
+    /// with the host waiting for every device before and after.
     /// </summary>
     internal sealed class CudaP2PCommunicator : IDisposable
     {
@@ -26,6 +32,17 @@ namespace TensorSharp.Cuda
         private IntPtr _stagingBuffer;
         private long _stagingBufferBytes;
 
+        // The device-ordered AllReduce: each rank's "partial ready" and "peers read" events and its sum's scratch.
+        private readonly bool _deviceOrdered;
+        private readonly IntPtr[] _ready, _summed, _scratch;
+        private readonly long[] _scratchBytes;
+
+        /// <summary>Tests: reduce through the host-synchronized reduce-to-zero even where peers read each other.</summary>
+        internal bool HostSynchronizedForTests { get; set; }
+
+        /// <summary>Whether AllReduce runs ordered on the devices (every pair's kernels read the peer's memory).</summary>
+        internal bool DeviceOrdered => _deviceOrdered && !HostSynchronizedForTests;
+
         public CudaP2PCommunicator(CudaAllocator[] allocators)
         {
             _allocators = allocators ?? throw new ArgumentNullException(nameof(allocators));
@@ -35,6 +52,23 @@ namespace TensorSharp.Cuda
                 throw new ArgumentException("P2P communicator requires at least 2 GPUs.", nameof(allocators));
 
             _p2pEnabled = EnablePeerAccess(allocators);
+            _deviceOrdered = Array.TrueForAll(allocators, a => a.Kernels != null);
+            for (int i = 0; i < _worldSize; i++)
+                for (int j = 0; j < _worldSize; j++)
+                    _deviceOrdered &= i == j || _p2pEnabled[i * _worldSize + j];
+            _ready = new IntPtr[_worldSize];
+            _summed = new IntPtr[_worldSize];
+            _scratch = new IntPtr[_worldSize];
+            _scratchBytes = new long[_worldSize];
+            if (!_deviceOrdered) return;
+            const uint disableTiming = 0x2;   // CU_EVENT_DISABLE_TIMING
+            for (int r = 0; r < _worldSize; r++)
+            {
+                allocators[r].Context.MakeCurrent();
+                CudaDriverApi.cuEventCreate(out _ready[r], disableTiming).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out _summed[r], disableTiming).ThrowOnError();
+            }
+            Console.WriteLine($"  TP: AllReduce ordered on the {_worldSize} devices (peer reads, no host synchronization).");
         }
 
         public int WorldSize => _worldSize;
@@ -278,9 +312,16 @@ namespace TensorSharp.Cuda
             // GetFloatPtr/PtrAtElement checkout marks the storage host-dirty) still
             // has a STALE device buffer until this runs, and we would reduce the
             // stale contents. Mirrors CudaStorage.CopyDeviceFrom, which does the
-            // same before a cross-device copy.
+            // same before a cross-device copy. The upload is enqueued on the rank's
+            // stream, ahead of the reduction on either path.
             for (int i = 0; i < _worldSize; i++)
                 ((CudaStorage)tensors[i].Storage).EnsureDeviceCurrent();
+
+            if (DeviceOrdered)
+            {
+                AllReduceOnDevices(tensors, byteCount, elementCount);
+                return;
+            }
 
             // Synchronize all GPUs to ensure partial results are complete
             // (this also flushes the async HtoD uploads issued just above).
@@ -362,6 +403,72 @@ namespace TensorSharp.Cuda
                 ((CudaStorage)tensors[i].Storage).MarkDeviceModified();
         }
 
+        /// <summary>The device-ordered AllReduce (see the class summary): event waits between the ranks' streams, every rank
+        /// summing every partial in rank order into its scratch, then over its partial once its peers have read it.</summary>
+        private void AllReduceOnDevices(Tensor[] tensors, long byteCount, int elementCount)
+        {
+            var pointers = new IntPtr[_worldSize];
+            for (int r = 0; r < _worldSize; r++)
+            {
+                if (tensors[r].Storage.ByteLength != byteCount)
+                    throw new ArgumentException($"AllReduce partials differ in size: rank {r} has {tensors[r].Storage.ByteLength} bytes, rank 0 {byteCount}.");
+                pointers[r] = DevicePtr(tensors[r]);
+            }
+            // Every partial is ready on its own stream.
+            for (int r = 0; r < _worldSize; r++)
+            {
+                _allocators[r].Context.MakeCurrent();
+                CudaDriverApi.cuEventRecord(_ready[r], _allocators[r].Stream.Handle).ThrowOnError();
+            }
+            // Each rank waits for its peers' partials and sums them all, in rank order, into its scratch.
+            for (int r = 0; r < _worldSize; r++)
+            {
+                CudaAllocator a = _allocators[r];
+                a.Context.MakeCurrent();
+                IntPtr stream = a.Stream.Handle;
+                for (int k = 0; k < _worldSize; k++)
+                    if (k != r) CudaDriverApi.cuStreamWaitEvent(stream, _ready[k], 0).ThrowOnError();
+                IntPtr scratch = Scratch(r, byteCount);
+                a.Kernels.LaunchBinaryF32(pointers[0], pointers[1], scratch, elementCount, 0, stream);   // op 0: add
+                for (int k = 2; k < _worldSize; k++)
+                    a.Kernels.LaunchBinaryF32(scratch, pointers[k], scratch, elementCount, 0, stream);
+                CudaDriverApi.cuEventRecord(_summed[r], stream).ThrowOnError();
+            }
+            // Once every rank has read the others' partials, each writes its sum over its own.
+            for (int r = 0; r < _worldSize; r++)
+            {
+                CudaAllocator a = _allocators[r];
+                a.Context.MakeCurrent();
+                IntPtr stream = a.Stream.Handle;
+                for (int k = 0; k < _worldSize; k++)
+                    if (k != r) CudaDriverApi.cuStreamWaitEvent(stream, _summed[k], 0).ThrowOnError();
+                CudaDriverApi.cuMemcpyDtoDAsync(pointers[r], _scratch[r], new UIntPtr((ulong)byteCount), stream).ThrowOnError();
+            }
+            // The device buffers were written through raw pointers (see the host-synchronized path's note).
+            for (int r = 0; r < _worldSize; r++)
+                ((CudaStorage)tensors[r].Storage).MarkDeviceModified();
+        }
+
+        /// <summary>Rank <paramref name="rank"/>'s scratch of at least <paramref name="bytes"/>. A smaller one is retired, not
+        /// freed: a recorded decode step (one graph over every rank, RankedDecodeCapture) keeps reading the scratch it was
+        /// recorded with, so a longer prompt's partials growing it must not free it under the recording. Each new one is at
+        /// least twice the last, so the retired ones hold less than the live one; all go at <see cref="Dispose"/>.</summary>
+        private IntPtr Scratch(int rank, long bytes)
+        {
+            if (_scratchBytes[rank] >= bytes) return _scratch[rank];
+            CudaAllocator a = _allocators[rank];
+            a.Context.MakeCurrent();
+            if (_scratch[rank] != IntPtr.Zero) _retiredScratch.Add((rank, _scratch[rank]));
+            // Rounded up to a MiB so a prompt chunk's growing partials do not reallocate every step.
+            long size = (Math.Max(bytes, 2 * _scratchBytes[rank]) + (1L << 20) - 1) & ~((1L << 20) - 1);
+            CudaDriverApi.cuMemAlloc(out _scratch[rank], new UIntPtr((ulong)size)).ThrowOnError();
+            _scratchBytes[rank] = size;
+            return _scratch[rank];
+        }
+
+        /// <summary>Scratch buffers a larger one replaced (<see cref="Scratch"/>), by rank.</summary>
+        private readonly List<(int Rank, IntPtr Buffer)> _retiredScratch = new();
+
         private unsafe void AllReduceViaHost(Tensor dst, Tensor src, int elementCount, long byteCount)
         {
             // Copy src (GPU i) → host, copy dst (GPU 0) → host, add on host,
@@ -417,6 +524,24 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuMemFree(_stagingBuffer);
                 _stagingBuffer = IntPtr.Zero;
                 _stagingBufferBytes = 0;
+            }
+            foreach ((int rank, IntPtr buffer) in _retiredScratch)
+            {
+                _allocators[rank].Context.MakeCurrent();
+                _allocators[rank].Stream.Synchronize();
+                CudaDriverApi.cuMemFree(buffer);
+            }
+            _retiredScratch.Clear();
+            for (int r = 0; r < _worldSize; r++)
+            {
+                if (_ready[r] == IntPtr.Zero && _scratch[r] == IntPtr.Zero) continue;
+                _allocators[r].Context.MakeCurrent();
+                _allocators[r].Stream.Synchronize();
+                if (_scratch[r] != IntPtr.Zero) CudaDriverApi.cuMemFree(_scratch[r]);
+                if (_ready[r] != IntPtr.Zero) CudaDriverApi.cuEventDestroy(_ready[r]);
+                if (_summed[r] != IntPtr.Zero) CudaDriverApi.cuEventDestroy(_summed[r]);
+                _scratch[r] = _ready[r] = _summed[r] = IntPtr.Zero;
+                _scratchBytes[r] = 0;
             }
         }
     }

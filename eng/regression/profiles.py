@@ -9,7 +9,7 @@ CPU_MOE_SOURCES = [
     "TensorSharp.Models/MoeCpuOffloadConfig.cs",
     "TensorSharp.Models/ModelBase.WeightLoading.cs",
     "TensorSharp.Models/SharedDecoder/StandardDecoderModel.ExpertPlacement.cs",
-    "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.ExpertPlacement.cs",
+    "TensorSharp.Models/Models/Qwen4Exp/Runtime/Qwen4ExpRuntimeModel.cs",
 ]
 
 

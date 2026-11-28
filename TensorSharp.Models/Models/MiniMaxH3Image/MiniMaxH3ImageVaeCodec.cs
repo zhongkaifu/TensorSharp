@@ -12,7 +12,9 @@
 // program is the graph h3_vit_decode builds, node for node: ggml_cuda serves its regions as that graph's fused nodes (F16
 // products on cuBLAS, one cuDNN attention over the row of tiles, the scaled residuals), and every other backend runs their
 // ops, which are its unfused nodes. Its native graph is sized from the program, so any batch of tiles decodes on every
-// backend (the native batched decode sizes a graph for the fused nodes only and aborts elsewhere past four tiles).
+// backend (the native batched decode sizes a graph for the fused nodes only and aborts elsewhere past four tiles). On direct
+// CUDA the same program runs on the CUDA tensor executor (its projections bound as weights, its F32 leaves as tensors on the
+// device), which runs the regions' ops; the managed executor binds it the same way in the tests.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -84,6 +86,11 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         private readonly SafetensorsModel _model;
         private readonly IGraphExecutor _executor;
+        // A tensor executor's device (direct CUDA; the managed one in tests), whose F32 leaves are tensors there; null on GGML,
+        // whose executors bind every leaf by host pointer.
+        private readonly IAllocator _tensorAllocator;
+        private readonly Dictionary<MiniMaxH3ImageWeight, Tensor> _tensors = new();
+        private readonly HashSet<MiniMaxH3ImageWeight> _hostValues = new();   // the pinned F32 leaves (Vec): tensors, never products
         private readonly List<GCHandle> _pins = new();
         private readonly List<MiniMaxH3ImageWeight> _all = new();
         private readonly Block[] _blocks;
@@ -96,26 +103,34 @@ namespace TensorSharp.Models.MiniMaxH3Image
         private bool _disposed;
 
         /// <param name="path">The VAE file (Comfy-Org/MiniMax-H3-Image vae/minimax_h3_image_vae_fp16.safetensors).</param>
-        /// <param name="backend">A GGML backend: its graph executor runs the decoder.</param>
-        public MiniMaxH3ImageVaeCodec(string path, BackendType backend)
+        /// <param name="backend">A GGML backend (its graph executor runs the decoder) or <see cref="BackendType.Cuda"/> (the CUDA
+        /// tensor executor on <paramref name="allocator"/>'s device).</param>
+        /// <param name="allocator">The device on <see cref="BackendType.Cuda"/> (a <see cref="TensorSharp.Cuda.CudaAllocator"/>).</param>
+        public MiniMaxH3ImageVaeCodec(string path, BackendType backend, IAllocator allocator = null)
             : this(path, backend switch
             {
                 BackendType.GgmlCuda => GgmlGraphExecutor.For(GgmlBackendType.Cuda),
                 BackendType.GgmlMetal => GgmlGraphExecutor.For(GgmlBackendType.Metal),
                 BackendType.GgmlCpu => GgmlGraphExecutor.For(GgmlBackendType.Cpu),
+                BackendType.Cuda => allocator is TensorSharp.Cuda.CudaAllocator cuda
+                    ? GraphExecutors.For(cuda)
+                    : throw new ArgumentException("MiniMax-H3-Image's VAE on --backend cuda runs on a CUDA device's allocator.", nameof(allocator)),
                 _ => throw new NotSupportedException(
-                    $"MiniMax-H3-Image's VAE runs on ggml_cuda, ggml_metal or ggml_cpu, not {Architecture.BackendNames.OptionName(backend)}."),
-            })
+                    $"MiniMax-H3-Image's VAE runs on ggml_cuda, ggml_metal, ggml_cpu or cuda, not {Architecture.BackendNames.OptionName(backend)}."),
+            }, backend == BackendType.Cuda ? allocator : null)
         {
         }
 
-        /// <param name="executor">A graph executor that binds weights by host pointer (the GGML executors).</param>
-        internal MiniMaxH3ImageVaeCodec(string path, IGraphExecutor executor)
+        /// <param name="executor">The decoder's graph executor: a GGML one (binds every leaf by host pointer) or a tensor
+        /// executor on <paramref name="tensorAllocator"/>'s device (its projections bound as weights, its F32 leaves as tensors
+        /// there).</param>
+        internal MiniMaxH3ImageVaeCodec(string path, IGraphExecutor executor, IAllocator tensorAllocator = null)
         {
             ArgumentNullException.ThrowIfNull(path);
             _executor = executor ?? throw new ArgumentNullException(nameof(executor));
-            if (!executor.Capabilities.BindsHostPointers)
+            if (!executor.Capabilities.BindsHostPointers && tensorAllocator == null)
                 throw new NotSupportedException("MiniMax-H3-Image's VAE binds its weights by host pointer; this executor does not.");
+            _tensorAllocator = executor.Capabilities.BindsHostPointers ? null : tensorAllocator;
             _model = SafetensorsModel.Open(path);
             try
             {
@@ -235,7 +250,42 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 ? new MiniMaxH3ImageWeight(GraphFormat.F32, rows, values.LongLength / rows, h.AddrOfPinnedObject(), values.LongLength * sizeof(float))
                 : new MiniMaxH3ImageWeight(GraphFormat.F32, values.LongLength, 1, h.AddrOfPinnedObject(), values.LongLength * sizeof(float), Vector: true);
             _all.Add(w);
+            _hostValues.Add(w);
             return w;
+        }
+
+        /// <summary>
+        /// A decoder leaf in the program: on GGML its host bytes; on a tensor executor a projection as itself (the executor
+        /// uploads and caches it by its address) and a pinned F32 leaf (a bias, a norm, a scale, the register tokens: values the
+        /// program adds, multiplies or concatenates, never a product's weight) as a tensor on the device, made once.
+        /// </summary>
+        private int LeafOf(GraphEmitter e, MiniMaxH3ImageWeight w)
+        {
+            ReadOnlySpan<long> ne = w.Vector ? stackalloc long[] { w.Ne0 } : stackalloc long[] { w.Ne0, w.Ne1 };
+            if (_tensorAllocator == null) return e.HostWeight(w.Format, ne, w.Data, w.Bytes);
+            object handle = w;
+            if (_hostValues.Contains(w))
+            {
+                if (!_tensors.TryGetValue(w, out Tensor t))
+                {
+                    var values = new float[w.Bytes / sizeof(float)];
+                    Marshal.Copy(w.Data, values, 0, values.Length);
+                    t = w.Vector ? new Tensor(_tensorAllocator, DType.Float32, w.Ne0) : new Tensor(_tensorAllocator, DType.Float32, w.Ne1, w.Ne0);
+                    t.SetElementsAsFloat(values);
+                    _tensors[w] = t;
+                }
+                handle = t;
+            }
+            return e.HostWeight(w.Format, ne, GraphIdentity.Of(w), w.Bytes, handle);
+        }
+
+        /// <summary>Drop every device copy of the leaf's bytes: the GGML executor's by address (<see cref="IGraphExecutor.Invalidate"/>);
+        /// on direct CUDA a projection's copy in the backend's resident-weight cache, which Invalidate does not reach (the
+        /// denoiser releases its copies the same way). A pinned F32 leaf's tensor stays (the codec's own, freed with it).</summary>
+        private void Release(MiniMaxH3ImageWeight w)
+        {
+            if (_tensorAllocator is TensorSharp.Cuda.CudaAllocator cuda) TensorSharp.Cuda.CudaQuantizedOps.ReleaseQuantizedWeight(cuda, w.Data);
+            else _executor.Invalidate(w.Data);
         }
 
         // ---- IResidentComponent
@@ -296,8 +346,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 if (_disposed) return;
                 DisposePlans();
                 DisposeEncoderPlans();
-                foreach (MiniMaxH3ImageWeight w in _all) _executor.Invalidate(w.Data);
-                foreach (MiniMaxH3ImageWeight w in _encAll) _executor.Invalidate(w.Data);
+                foreach (MiniMaxH3ImageWeight w in _all) Release(w);
+                foreach (MiniMaxH3ImageWeight w in _encAll) Release(w);
+                DisposeEncoderTensors();
                 _preloaded = false;
             }
         }
@@ -316,7 +367,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         private int PreloadLocked()
         {
             if (_preloaded) return 0;
-            int copied = _executor.Preload(new List<IGraphWeight>(_all), "minimax-h3-image/vae");
+            // A tensor executor uploads a projection at its first product (its F32 leaves are tensors already).
+            int copied = _tensorAllocator == null ? _executor.Preload(new List<IGraphWeight>(_all), "minimax-h3-image/vae") : 0;
             _preloaded = true;
             return copied;
         }
@@ -641,8 +693,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             {
                 if (w == null) return -1;
                 if (leaves.TryGetValue(w, out int node)) return node;
-                ReadOnlySpan<long> ne = w.Vector ? stackalloc long[] { w.Ne0 } : stackalloc long[] { w.Ne0, w.Ne1 };
-                node = e.HostWeight(w.Format, ne, w.Data, w.Bytes);
+                node = LeafOf(e, w);
                 leaves[w] = node;
                 return node;
             }
@@ -759,8 +810,11 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 _disposed = true;
                 DisposePlans();
                 DisposeEncoderPlans();
-                foreach (MiniMaxH3ImageWeight w in _all) _executor.Invalidate(w.Data);
-                foreach (MiniMaxH3ImageWeight w in _encAll) _executor.Invalidate(w.Data);
+                foreach (MiniMaxH3ImageWeight w in _all) Release(w);
+                foreach (MiniMaxH3ImageWeight w in _encAll) Release(w);
+                DisposeEncoderTensors();
+                foreach (Tensor t in _tensors.Values) t.Dispose();
+                _tensors.Clear();
                 DisposeHost();
             }
         }

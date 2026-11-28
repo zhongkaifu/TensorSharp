@@ -247,7 +247,8 @@ picture. "Before" is the same build without reference-keyed edit noise.
 
 Images, hashes and the analysis are in ignored `artifacts/editnoise4/` and
 `artifacts/editnoise5/` (local validation evidence, not committed). Not measured:
-CUDA, Vulkan and `--tp`, the `cpu` backend, the TensorAgent apps (they pass the same
+CUDA, Vulkan and `--tp` for edits (text to image on two GPUs:
+[The runtime on two GPUs](#the-runtime-on-two-gpus)), the `cpu` backend, the TensorAgent apps (they pass the same
 pictures to the same pipeline, but run on Mono; their PNG decoding was checked by a
 Swift copy of it on macOS, not on iOS), masked and multi-reference edits on Turbo,
 and JPEG or HEIC sources.
@@ -1276,7 +1277,8 @@ GPUs, following vLLM-Omni's layout for 2.1:
   groups are refused.
 
 Measured with the retired native graph on two NVIDIA A40s in different CPU sockets
-(46 GB each); the runtime's sharded programs have not been run on two GPUs. Peer
+(46 GB each); the runtime's sharded programs on two GPUs are measured
+[below](#the-runtime-on-two-gpus). Peer
 access is not functional between them, so NCCL used its shared-memory transport.
 The prefix cache was on unless stated; step times exclude step 1:
 
@@ -1315,6 +1317,64 @@ real two-GPU group. With the real Q4_K_M weights on Metal, the retired graph's
 sharded predictions were within 0.07–0.10% relative L2 of the unsharded ones, with
 and without the prefix cache. vLLM-Omni lists
 TP for 2.1 as unverified and publishes no 2.1 scaling numbers.
+
+**Layer split.** With `--layer-split N` on `ggml_cuda`, the 32 blocks are split
+into N contiguous runs, one per GPU, balanced by weight bytes (the first GPU's run
+also counts the input, text, time and modulation projections; the last's counts
+the output head). Each prediction runs one program per GPU, in turn:
+
+- The first GPU embeds the inputs and runs its blocks. It then hands on the packed
+  text-and-image stream (F32, through host memory), together with the shared
+  modulation and time embedding (a few KiB per step), so no other GPU holds the
+  time or modulation weights.
+- Each later GPU runs its blocks on what it received. The last GPU also runs the
+  output head.
+
+Nothing is sharded and no collective runs, so the stages compute exactly what one
+GPU computes. Each GPU keeps its own compiled plans (two, for the CFG branches)
+and the prefix cache of its own layers, which must fit in half of that GPU's free
+memory. The text encoder, vision encoder and VAE run on the first GPU. This is a
+capacity mode: the GPUs run one after another, so a step is no faster than on one
+GPU that holds the whole transformer.
+
+Hybrid placement (`--layer-split` with `--tp`), `ggml_vulkan` (no test covers the
+stages there yet), `cpu` and multi-node groups are refused. On the managed
+executor, stages on two host "devices" give predictions bit-identical to one
+device's, with and without a LoRA and with the prefix cache on or declined
+(`QwenImage21DenoiserTests.WholeBlockStagesMatchOneDeviceOnTheManagedExecutor`).
+The two-GPU `ggml_cuda` test
+(`QwenImage21DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`, which bounds the
+stages' difference from one GPU at 1e-5 of the largest value) passes on two RTX PRO
+4000s, and the real weights' images over two stages are byte-identical to one GPU's
+(below).
+
+#### The runtime on two GPUs
+
+Measured on 2026-11-28 on two NVIDIA RTX PRO 4000 Blackwell (24 GB each, PCIe, no
+NCCL; ggml `bb877c0c` unchanged, CUDA 13.2), `--backend ggml_cuda`, the Q4_K_M
+presets (`config/qwen-image-2.1.json`, `config/qwen-image-2.1-turbo.json`), 1024²,
+the presets' steps, `--diffusion-seed 7`, one run each. Time is the denoising loop (in
+parentheses the median step after the first, which also compiles and uploads);
+peak is each GPU's used memory sampled every 0.5 s (the first GPU also runs the
+encoders and the VAE):
+
+| Workload | 1 GPU | `--layer-split 2` | `--tp 2` | PSNR vs 1 GPU: split / TP |
+|---|---:|---:|---:|---|
+| 2.1 | 44.6 s (1.05 s a step), 5.6 GB | 43.3 s (1.05 s), 4.9 + 3.5 GB | 34.4 s (0.79 s), 5.0 + 3.2 GB | identical / 40.4 dB |
+| 2.1-Turbo | 10.2 s (1.07 s), 6.0 GB | 10.0 s, 5.0 + 3.7 GB | 9.9 s (0.76 s), 5.0 + 3.3 GB | identical / 28.2 dB |
+| 2.1 + Fun-Acc-4Step LoRA | 6.3 s (1.27 s), 6.0 GB | 6.8 s, 4.9 + 3.7 GB | 5.2 s (0.90 s), 5.0 + 3.4 GB | identical / 40.6 dB |
+
+Without NCCL, ggml-cuda's own transport carries wide sums in BF16, so the runtime's
+exact F32 sums ran one of the context's collectives per 32,764 floats: hundreds a
+block, and `--tp 2` took 83.2 s, 18.3 s and 10.4 s for the three rows. TensorSharp's
+own exact all-reduce over peer memory (`ggml_ops_tp_probe.cu`: events, a peer copy of
+every other rank's partial, a sum in rank order on each GPU) takes a partial wider
+than one such piece in one collective; narrower partials (a text model's decode step)
+keep the context's collective, which costs less there. `TS_GGML_TP_P2P_ALLREDUCE=0`
+turns it off. The sums are the same: the images are byte-identical with and without
+it. The Turbo and LoRA rows' TP memory was sampled before this change (its scratch adds one partial a peer).
+Turbo's few large steps carry the summation-order difference further: the same room
+and cat, details moved.
 
 **Vulkan VAE.** ggml-vulkan multiplies F32 matrices through F16
 cooperative-matrix operands on GPUs that have them, and the VAE feeds some

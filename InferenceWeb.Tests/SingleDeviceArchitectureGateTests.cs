@@ -5,7 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Families whose factories never pass --tp on (DiffusionGemma, Wan, MiniMax-H3)
+// Families whose factories never pass --tp on (DiffusionGemma, Wan; MiniMax-H3 before it sharded)
 // used to keep the descriptor's default TensorParallel mode, so the shared gate
 // stepped aside: --tp N was dropped without a word and a distributed group was
 // handed to a model that would never issue its collectives. Declaring them
@@ -24,8 +24,17 @@ public sealed class SingleDeviceArchitectureGateTests
     {
         "diffusion-gemma",
         "wan",
-        "minimax-h3",
-        "ltx-2.5",
+        // minimax-h3 is no longer here: its denoiser runs --layer-split N as whole-block stages and --tp N on cuda as
+        // sharded ranks, held by MiniMaxH3DenoiserTests.TensorParallelOnCudaAndLayerSplitPassTheirGates.
+    };
+
+    /// <summary>Families without a tensor-parallel path: the single-device ones. MiniMax-H3 video and LTX 2.5 are no longer
+    /// here: their denoisers shard over GPUs on --backend cuda (MiniMaxH3DenoiserTests.TensorParallelRanks*,
+    /// Ltx25DenoiserTensorParallelTests), and their ggml_cuda gaps are held by those families' gate tests.</summary>
+    public static TheoryData<string> NoTensorParallelFamilies => new()
+    {
+        "diffusion-gemma",
+        "wan",
     };
 
     private static ModelArchitectureDescriptor Arch(string id)
@@ -45,8 +54,27 @@ public sealed class SingleDeviceArchitectureGateTests
         Assert.Contains(id, arch.Serving.TensorParallel.GapReason, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>LTX 2.5 declares tensor parallelism and layer split on cuda only (ggml_cuda's gaps naming the family), no hybrid,
+    /// and no distributed tensor parallelism; --tp on ggml_cuda is refused without falling back.</summary>
+    [Fact]
+    public void Ltx25_DeclaresTensorParallelismAndLayerSplitOnCuda()
+    {
+        var arch = Arch("ltx-2.5");
+        Assert.Equal(new[] { BackendType.Cuda }, arch.Serving.TensorParallel.Backends);
+        Assert.Contains("ltx-2.5", arch.Serving.TensorParallel.GapReason, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(new[] { BackendType.Cuda }, arch.Serving.LayerSplit.Backends);
+        Assert.Empty(arch.Serving.HybridParallel.Backends);
+        Assert.False(arch.SupportsDistributedTensorParallel);
+        ITensorParallelGroup group = null;
+        var error = Assert.Throws<NotSupportedException>(() =>
+            TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(arch, BackendType.GgmlCuda, 2, ref group, out _));
+        Assert.Null(group);
+        Assert.Contains("--tp 2", error.Message, StringComparison.Ordinal);
+        Assert.Contains("ltx-2.5", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Theory]
-    [MemberData(nameof(SingleDeviceFamilies))]
+    [MemberData(nameof(NoTensorParallelFamilies))]
     public void LocalTp_IsRefusedWithoutFallingBack(string id)
     {
         var arch = Arch(id);
@@ -60,7 +88,7 @@ public sealed class SingleDeviceArchitectureGateTests
     }
 
     [Theory]
-    [MemberData(nameof(SingleDeviceFamilies))]
+    [MemberData(nameof(NoTensorParallelFamilies))]
     public void DistributedGroup_IsRefused(string id)
     {
         ITensorParallelGroup group = new StubTpGroup();
@@ -72,7 +100,7 @@ public sealed class SingleDeviceArchitectureGateTests
     }
 
     [Theory]
-    [MemberData(nameof(SingleDeviceFamilies))]
+    [MemberData(nameof(NoTensorParallelFamilies))]
     public void NoTpRequested_StaysSilent(string id)
     {
         var arch = Arch(id);

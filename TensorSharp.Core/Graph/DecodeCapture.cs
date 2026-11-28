@@ -38,6 +38,37 @@ namespace TensorSharp.Graph
         /// <summary>The sequences one recorded step may batch, each reading its own attention length and write row on the
         /// device.</summary>
         int MaxRecordedSequences => 1;
+
+        /// <summary>A capture of one kept tensor-parallel decode step over <paramref name="ranks"/> (this executor rank 0, each
+        /// rank's executor on its own device), recorded as one launch for every rank; null where the ranks cannot record so.</summary>
+        IRankedDecodeCapture OpenRankedDecodeCapture(IReadOnlyList<IDecodeCaptureExecutor> ranks) => null;
+    }
+
+    /// <summary>
+    /// A tensor-parallel decode step's ranks recorded as one launch (their all-reduces ordered on the devices inside it) and
+    /// replayed a position on at a time: each rank binds its inputs to its own <see cref="Rank"/>'s stable tensors, and the
+    /// recording and every replay run every rank's work together.
+    /// </summary>
+    public interface IRankedDecodeCapture : IDisposable
+    {
+        /// <summary>The step is recorded: <see cref="TryLaunch"/> replays it.</summary>
+        bool Captured { get; }
+
+        /// <summary>Why the last <see cref="CaptureAndLaunch"/> recorded nothing, or null.</summary>
+        string Refusal => null;
+
+        /// <summary>Rank <paramref name="rank"/>'s stable inputs (<see cref="IDecodeCapture.Stable"/>) and the tensors a launch
+        /// rewrote (<see cref="IDecodeCapture.MarkWritten"/>); the group records and launches.</summary>
+        IDecodeCapture Rank(int rank);
+
+        /// <summary>Record <paramref name="run"/>, which runs every rank's plan (device work only), and launch it. Each rank's
+        /// sequences and written tensors are given as <see cref="IDecodeCapture.CaptureAndLaunch"/> takes them.</summary>
+        bool CaptureAndLaunch(Func<bool> run, ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows,
+            IReadOnlyList<IReadOnlyList<Tensor>>[] sequences, IReadOnlyList<Tensor>[] written);
+
+        /// <summary>Replay the recorded step with this position's lengths and write rows (see
+        /// <see cref="IDecodeCapture.TryLaunch"/>).</summary>
+        bool TryLaunch(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows);
     }
 
     /// <summary>

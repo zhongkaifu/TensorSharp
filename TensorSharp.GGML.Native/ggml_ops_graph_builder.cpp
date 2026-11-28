@@ -146,8 +146,6 @@ namespace
         bool uploaded;   // bound to compute memory: uploaded every run (and downloaded after, for STATE)
         bool host_only = false;                        // read from host memory at a host-expert pause, never bound
         bool repacked = false;                         // ggml-cpu: bound to its CPU_REPACK copy (ggml_ops_cpu_graph.h)
-        bool has_split = false;                        // tensor parallelism: how the leaf spreads over the ranks
-        ggml_backend_meta_split_state split{};
     };
 
     struct Output
@@ -188,122 +186,6 @@ namespace
 
     // Rows whose greedy id was read from their full logits (a tie of every candidate, or a NaN or infinity), for tests.
     std::atomic<std::int64_t> g_greedy_full_rows{0};
-
-    // ---- tensor parallelism: a graph on ggml's meta device over several ranks (upstream's
-    // tensor-split mechanism). Weights and states live in meta buffers, spread by the split state
-    // the managed side gives each leaf (heads, channels, experts; mirrored otherwise); compute
-    // tensors take the meta backend's inferred states, and its collectives reduce partial sums.
-    struct TpGroup
-    {
-        std::vector<int> ranks;
-        ggml_backend_dev_t meta = nullptr;
-        ggml_backend_t backend = nullptr;
-    };
-
-    std::mutex g_tp_mu;
-    std::vector<std::unique_ptr<TpGroup>> g_tp_groups;
-
-    // Split states of meta-resident tensors, by tensor name (the meta buffer asks by tensor).
-    std::mutex g_split_mu;
-    std::unordered_map<std::string, ggml_backend_meta_split_state> g_splits;
-
-    ggml_backend_meta_split_state tp_split_cb(const ggml_tensor* t, void*)
-    {
-        ggml_backend_meta_split_state st;
-        std::memset(&st, 0, sizeof(st));
-        st.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
-        st.nr[0] = 1;
-        st.n_segments = 1;
-        std::lock_guard<std::mutex> lk(g_split_mu);
-        auto it = g_splits.find(t->name);
-        return it == g_splits.end() ? st : it->second;
-    }
-
-    TpGroup* tp_group(const int* ranks, int n)
-    {
-        std::lock_guard<std::mutex> lk(g_tp_mu);
-        for (const auto& grp : g_tp_groups)
-            if (static_cast<int>(grp->ranks.size()) == n && std::equal(grp->ranks.begin(), grp->ranks.end(), ranks))
-                return grp.get();
-        if (n < 2 || n > GGML_BACKEND_META_MAX_DEVICES)
-            throw std::runtime_error("graph builder: tensor parallelism spans 2 to 16 ranks");
-        auto grp = std::make_unique<TpGroup>();
-        ggml_backend_dev_t devs[GGML_BACKEND_META_MAX_DEVICES] = {};
-        int device_indices[GGML_BACKEND_META_MAX_DEVICES] = {};
-        for (int i = 0; i < n; i++)
-        {
-            ScopedRank scope(ranks[i]);
-            if (!ensure_backend() || g_backend == nullptr)
-                throw std::runtime_error("graph builder: a tensor-parallel rank has no backend");
-            devs[i] = ggml_backend_get_device(g_backend);
-            device_indices[i] = dev().device_index >= 0 ? dev().device_index : ranks[i];
-            grp->ranks.push_back(ranks[i]);
-        }
-#ifdef TSG_GGML_USE_CUDA
-        tp_cuda_prepare_collective(device_indices, n);   // before the meta backend creates its communicator
-#else
-        (void) device_indices;
-#endif
-        static std::mutex meta_mu;   // ggml's meta device cache is not thread-safe
-        std::lock_guard<std::mutex> meta_lk(meta_mu);
-        grp->meta = ggml_backend_meta_device(devs, static_cast<size_t>(n), tp_split_cb, nullptr);
-        grp->backend = grp->meta != nullptr ? ggml_backend_dev_init(grp->meta, nullptr) : nullptr;
-        if (grp->backend == nullptr)
-            throw std::runtime_error("graph builder: creating the tensor-parallel backend failed");
-        g_tp_groups.push_back(std::move(grp));
-        return g_tp_groups.back().get();
-    }
-
-    // A weight or state resident in a meta buffer, keyed by its host pointer; a graph's leaf is
-    // placed at the same address, so it aliases the resident slices on every rank.
-    struct MetaResident
-    {
-        ggml_context* ctx = nullptr;
-        ggml_backend_buffer_t buf = nullptr;
-        ggml_tensor* t = nullptr;
-        std::size_t bytes = 0;
-        ~MetaResident()
-        {
-            if (buf != nullptr) ggml_backend_buffer_free(buf);
-            if (ctx != nullptr) ggml_free(ctx);
-        }
-    };
-
-    std::mutex g_resident_mu;   // also serializes meta set_tensor (not thread-safe)
-    std::map<std::pair<TpGroup*, void*>, std::unique_ptr<MetaResident>> g_residents;
-
-    MetaResident* meta_resident(TpGroup* grp, const Leaf& leaf)
-    {
-        std::lock_guard<std::mutex> lk(g_resident_mu);
-        auto key = std::make_pair(grp, leaf.data);
-        auto it = g_residents.find(key);
-        if (it != g_residents.end())
-        {
-            if (it->second->bytes == leaf.bytes && ggml_are_same_shape(it->second->t, leaf.tensor) && it->second->t->type == leaf.tensor->type)
-                return it->second.get();
-            g_residents.erase(it);
-        }
-        auto r = std::make_unique<MetaResident>();
-        char name[GGML_MAX_NAME];
-        std::snprintf(name, sizeof(name), "tsgtp:%p:%d", leaf.data, leaf.has_split ? static_cast<int>(leaf.split.axis) : -1);
-        if (leaf.has_split)
-        {
-            std::lock_guard<std::mutex> slk(g_split_mu);
-            g_splits[name] = leaf.split;
-        }
-        ggml_init_params params{ ggml_tensor_overhead() * 2, nullptr, true };
-        r->ctx = ggml_init(params);
-        if (r->ctx == nullptr) throw std::runtime_error("graph builder: tensor-parallel context allocation failed");
-        r->t = ggml_new_tensor(r->ctx, leaf.tensor->type, GGML_MAX_DIMS, leaf.tensor->ne);
-        ggml_set_name(r->t, name);
-        r->buf = ggml_backend_alloc_ctx_tensors_from_buft(r->ctx, ggml_backend_dev_buffer_type(grp->meta));
-        if (r->buf == nullptr) throw std::runtime_error("graph builder: tensor-parallel weight allocation failed (out of device memory?)");
-        r->bytes = leaf.bytes;
-        ggml_backend_tensor_set(r->t, resolve_upload_source(leaf.data), 0, leaf.bytes);
-        MetaResident* raw = r.get();
-        g_residents[key] = std::move(r);
-        return raw;
-    }
 
     // The cgraph's slots: every tensor the context can hold (lowering emits several ggml tensors for one program
     // node - a tiered host-expert pause builds its hot part, about a dozen per MoE layer), plus leaves from other
@@ -455,7 +337,6 @@ namespace
 
     struct TsgGraph
     {
-        TpGroup* tp = nullptr;     // tensor parallelism: the meta device this graph runs on
         ggml_context* ctx = nullptr;
         ggml_cgraph* graph = nullptr;
         ggml_gallocr_t galloc = nullptr;
@@ -560,7 +441,7 @@ namespace
         }
     };
 
-    ggml_backend_t graph_backend(const TsgGraph* g) { return g->tp != nullptr ? g->tp->backend : g_backend; }
+    ggml_backend_t graph_backend(const TsgGraph*) { return g_backend; }
 
 
     ggml_tensor* node_at(TsgGraph* g, int index)
@@ -611,7 +492,7 @@ namespace
                 return tsg::bonsai_mul_mat_memo(g->ctx, w, x, leaf->data, g->bonsai);
         }
         // ggml-cpu: weights it has no fast kernel for here (BF16 on ARM64; BF16 and NVFP4 prompt products on Apple).
-        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU)
+        if (g_backend_type == BACKEND_TYPE_CPU)
         {
             const ggml_tensor* base = w->view_src != nullptr ? w->view_src : w;
             if (Leaf* leaf = leaf_of(g, base); leaf != nullptr && leaf->role == LEAF_WEIGHT)
@@ -651,7 +532,7 @@ namespace
     {
         ggml_context* ctx = g->ctx;
         const std::int64_t routes = ids->ne[0], rows = ids->ne[1];
-        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL || metal_mul_mm_id_routes(routes) || !metal_mul_mm_id_path(as, ids)
+        if (g_backend_type != BACKEND_TYPE_METAL || metal_mul_mm_id_routes(routes) || !metal_mul_mm_id_path(as, ids)
             || (b->ne[1] != 1 && b->ne[1] != routes))
             return ggml_mul_mat_id(ctx, as, b, ids);
         ggml_tensor* flat_ids = ggml_reshape_2d(ctx, ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids), 1, routes * rows);
@@ -667,7 +548,6 @@ namespace
     ggml_tensor* build_host_experts(TsgGraph* g, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
         if (ns < 6) throw std::runtime_error("graph builder: host experts take x, ids, weights and three expert stacks");
-        if (g->tp != nullptr) throw std::runtime_error("graph builder: host experts under tensor parallelism are not supported");
         ggml_context* ctx = g->ctx;
         ggml_tensor* x = node_at(g, s[0]);
         ggml_tensor* ids = node_at(g, s[1]);
@@ -804,8 +684,8 @@ namespace
         hm.hidden = static_cast<int>(n);
         ggml_tensor* hot = nullptr;
         // A verify-width step (2 to 8 rows) overlaps up to two window misses a row with the routes the slots hold: they
-        // are read in the background and computed after a second cut that only waits for them (Qwen4ExpModel's
-        // overlap; the wait segment follows this pause, ending at the first group so it precedes the cut).
+        // are read in the background and computed after a second cut that only waits for them (the wait segment
+        // follows this pause, ending at the first group so it precedes the cut).
         tsg::HostMoeSegment overlap_wait;
         constexpr int overlap_routes = 2;
         // An accelerator tier's part runs gated products (host_moe_build_hot_part): the one-projection experts have none, and
@@ -870,7 +750,7 @@ namespace
     ggml_tensor* unguarded_wide_product(TsgGraph* g, ggml_tensor* product, float s)
     {
 #if defined(TSG_GGML_USE_CUDA)
-        if (!g->wide_token_products || g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) return nullptr;
+        if (!g->wide_token_products || g_backend_type != BACKEND_TYPE_CUDA) return nullptr;
         if (product == nullptr || product->op != GGML_OP_MUL_MAT || !(s > 0.0f) || !std::isfinite(s)) return nullptr;
         int exponent = 0;
         if (std::frexp(s, &exponent) != 0.5f) return nullptr;   // a power of two
@@ -923,7 +803,6 @@ namespace
     // the run's end; the program's node is a view of the ids (its output receives the resolved ids instead of its bytes).
     ggml_tensor* greedy_head(TsgGraph* g, ggml_tensor* x, ggml_tensor* mask)
     {
-        if (g->tp != nullptr) throw std::runtime_error("graph builder: a greedy head runs on one device's graph");
         if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] < 1)
             throw std::runtime_error("graph builder: a greedy head reads contiguous F32 rows [vocab, rows]");
         if (x->ne[0] > (std::int64_t{1} << 24))
@@ -1167,15 +1046,6 @@ namespace
         case OP_FLASH_ATTN_EXT:
         {
             need(3);
-            if (g->tp != nullptr)
-            {
-                // Tensor parallelism: the explicit-ops fallback would pair query heads with KV heads
-                // split differently, which the meta device cannot run (build() refuses unsupported nodes).
-                ggml_tensor* fa = ggml_flash_attn_ext(ctx, src(0), src(1), src(2), src(3), fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f));
-                ggml_prec_set_acc(fa, static_cast<ggml_prec>(ipar(0, 0)));
-                if (src(4) != nullptr) ggml_flash_attn_ext_add_sinks(fa, src(4));
-                return fa;
-            }
             // srcs[4]: optional attention sinks. ip[1] > 0 bounds every mask row's finite entries (a selection's
             // width): decode and verify rows then attend only those (ggml's sparse path, a one-row kernel); a prompt
             // chunk over a wide window does on TensorSharp's kernels, else densely.
@@ -1310,8 +1180,8 @@ namespace
         }
     }
 
-    // Prompt-width device operations from this many rows (the same switch as Qwen4ExpModel's spans; the kernels'
-    // own switches are TS_METAL_GDN_PROMPT and TS_METAL_HC_READ).
+    // Prompt-width device operations from this many rows (the kernels' own switches are TS_METAL_GDN_PROMPT and
+    // TS_METAL_HC_READ).
     int device_ops_min_rows()
     {
         static const int v = [] {
@@ -1331,12 +1201,12 @@ namespace
 
     // A prompt chunk's flash attention under a selection's mask (every row at most `width` finite cells) over a wide
     // window, as one device operation: the mask compacted into each row's cell list (tsm_qsa_compact), then the
-    // attention over those cells only (tsm_qsa_attn, Qwen4ExpModel's prompt kernel). Null where it does not apply.
+    // attention over those cells only (tsm_qsa_attn). Null where it does not apply.
     ggml_tensor* try_selected_attention(TsgGraph* g, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
                                         float scale, std::int64_t width)
     {
 #if defined(TSG_GGML_USE_METAL)
-        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL || mask == nullptr || width <= 0) return nullptr;
+        if (g_backend_type != BACKEND_TYPE_METAL || mask == nullptr || width <= 0) return nullptr;
         const std::int64_t D = q->ne[0], T = q->ne[1], heads = q->ne[2], cells = k->ne[1], kv_heads = k->ne[2];
         if (T < device_ops_min_rows() || q->type != GGML_TYPE_F32 || q->ne[3] != 1 || v->ne[0] != D || v->ne[1] != cells
             || v->ne[2] != kv_heads || mask->ne[0] != cells || mask->ne[1] != T || !io_bindable(mask, GGML_TYPE_F16))
@@ -1472,16 +1342,29 @@ namespace
     // TSGgml_GraphRun runs the graph through tsg::dit_offload_compute. False (the ops are built) where the operands, the
     // device or a switch (TS_H3_FUSED, TS_H3_CUDNN_ATTENTION, TS_H3_CUBLAS_MATMUL) say otherwise.
 #if defined(TSG_GGML_USE_CUDA)
-    // The fused-op backend wrapping this process's ggml-cuda backend (made once a backend), or null where it cannot be made.
+    // The fused-op backend wrapping the active rank's ggml-cuda backend (made once a rank, freed with the rank's backend), or
+    // null where it cannot be made. One wrapper for the last backend asked had made a new one (a private cuBLAS handle with
+    // its 64 MiB workspace) at every switch between two ranks and never freed the old: a two-GPU layer split, whose stages
+    // run on their own ranks, lost 64 MiB a GPU at every decode step until the GPUs were full.
     ggml_backend_t inkling_backend()
     {
-        static ggml_backend_t wrapper = nullptr, wrapped = nullptr;
-        if (wrapped != g_backend)
+        if (g_backend == nullptr) return nullptr;
+        auto& state = tsg::dev();
+        std::lock_guard<std::mutex> lock(state.inkling_fused_mutex);
+        if (!state.inkling_fused_made)
         {
-            wrapper = g_backend != nullptr ? tsg_dsv4_fused_backend_try_init(g_backend) : nullptr;
-            wrapped = g_backend;
+            state.inkling_fused_backend = tsg_dsv4_fused_backend_try_init(g_backend);
+            state.inkling_fused_made = true;
         }
-        return wrapper;
+        return state.inkling_fused_backend;
+    }
+
+    // TS_INKLING_CAPTURE_ALL=1 (experiment): every replayable graph of an Inkling model's step (its drafter's too) as one CUDA
+    // graph through the fused-op backend.
+    bool inkling_capture_all()
+    {
+        static const bool on = std::getenv("TS_INKLING_CAPTURE_ALL") != nullptr && std::getenv("TS_INKLING_CAPTURE_ALL")[0] == '1';
+        return on;
     }
 
     // Which Inkling kinds are served (TS_INKLING_FUSED: unset or "1" all of them, "0" none, else a list of clip, conv, mix,
@@ -1531,7 +1414,7 @@ namespace
                            std::vector<ggml_tensor*>& results)
     {
         if (kind < FUSED_INKLING_CLIP || kind > FUSED_INKLING_REL_TABLE) return false;
-        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) return false;
+        if (g_backend_type != BACKEND_TYPE_CUDA) return false;
         if ((inkling_fused_mask() & (1u << (kind - FUSED_INKLING_CLIP))) == 0) return false;
         if (inkling_backend() == nullptr) return false;
         std::vector<ggml_tensor*> in(static_cast<std::size_t>(ns));
@@ -1761,7 +1644,7 @@ namespace
                            std::vector<ggml_tensor*>& results, std::string& why)
     {
         if (kind != FUSED_INKLING_ATTENTION) return false;
-        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) { why = "not a single-device ggml_cuda graph"; return false; }
+        if (g_backend_type != BACKEND_TYPE_CUDA) { why = "not a single-device ggml_cuda graph"; return false; }
         if (inkling_backend() == nullptr) { why = "no fused-op backend"; return false; }
         if (ns != 6 || nip < 6 || nfp < 1)
         {
@@ -1828,7 +1711,7 @@ namespace
     bool try_serve_in_graph(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp,
                             std::vector<ggml_tensor*>& results)
     {
-        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA || !tsg::h3_fused_enabled()) return false;
+        if (g_backend_type != BACKEND_TYPE_CUDA || !tsg::h3_fused_enabled()) return false;
         // The ViT decoder's kinds are MiniMax-H3's alone, so they need no program attribute to keep other programs as they
         // were; the DiT's need WideTokenProducts.
         const bool vit = kind == FUSED_VIT_ATTENTION || kind == FUSED_SCALED_RESIDUAL;
@@ -2152,7 +2035,7 @@ namespace
     bool try_lower_dit_attention(TsgGraph* g, int kind, const int* s, int ns, const float* fp, int nfp,
                                  std::vector<ggml_tensor*>& results)
     {
-        if (kind != FUSED_DIT_ATTENTION || g->tp != nullptr || ns != 3 || nfp < 2) return false;
+        if (kind != FUSED_DIT_ATTENTION || ns != 3 || nfp < 2) return false;
         ggml_tensor* q = node_at(g, s[0]);
         ggml_tensor* k = node_at(g, s[1]);
         ggml_tensor* v = node_at(g, s[2]);
@@ -2183,7 +2066,7 @@ namespace
                                std::vector<ggml_tensor*>& results)
     {
 #if defined(TSG_GGML_USE_METAL)
-        if (kind != FUSED_LORA_LINEAR || g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL || !g->wide_token_products)
+        if (kind != FUSED_LORA_LINEAR || g_backend_type != BACKEND_TYPE_METAL || !g->wide_token_products)
             return false;
         if (ns < 4 || (ns - 2) % 2 != 0 || nip < 2) return false;
         ggml_tensor* x = node_at(g, s[0]);
@@ -2252,7 +2135,7 @@ namespace
     bool try_serve_region(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
 #if defined(TSG_GGML_USE_METAL)
-        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL) return false;
+        if (g_backend_type != BACKEND_TYPE_METAL) return false;
         std::vector<ggml_tensor*> in(static_cast<std::size_t>(ns));
         for (int i = 0; i < ns; i++) in[static_cast<std::size_t>(i)] = node_at(g, s[i]);
         if (kind == FUSED_DELTA_NET_PROMPT)
@@ -2528,7 +2411,7 @@ namespace
     // device bytes are the same. One-shot graphs (prompt chunks: a few inputs) keep the allocator's memory.
     void pack_run_inputs(TsgGraph* g)
     {
-        if (g->tp != nullptr || !g->replayable || (g_backend_type != BACKEND_TYPE_CUDA && g_backend_type != BACKEND_TYPE_VULKAN))
+        if (!g->replayable || (g_backend_type != BACKEND_TYPE_CUDA && g_backend_type != BACKEND_TYPE_VULKAN))
             return;
         std::unordered_map<const ggml_tensor*, bool> read;
         for (int i = 0; i < g->graph->n_leafs; i++) read[g->graph->leafs[i]] = true;
@@ -2639,7 +2522,7 @@ namespace
         // (GraphProgram.BackendFusions): the backend's optimizer hook asks for the allocation dependencies that keep a fused
         // kernel's inputs apart from its output; without them a prompt step's allocator reused the route weights' memory for
         // the sum and the fusion declined (its memory-range check). It reorders nothing unless GGML_CUDA_GRAPH_OPT=1.
-        else if (g->backend_fusions && g_backend_type == BACKEND_TYPE_CUDA && g->tp == nullptr && g->host_moe.empty()
+        else if (g->backend_fusions && g_backend_type == BACKEND_TYPE_CUDA && g->host_moe.empty()
                  && graph_backend(g) != nullptr)
             tsg_optimize_graph_with_alloc_dependencies(graph_backend(g), g->ctx, g->graph);
         // Otherwise ggml-metal still fuses the graph's chains when it encodes them, and runs independent neighbours
@@ -2647,24 +2530,6 @@ namespace
         // concurrent node (Qwen3.6-35B-A3B decoded two different texts in alternate runs on an M5 Pro).
         else if (g_backend_type == BACKEND_TYPE_METAL) tsg_add_metal_fusion_alloc_dependencies(g->ctx, g->graph);
 
-        if (g->tp != nullptr)
-        {
-            // A node the ranks cannot run would fall back to the CPU and come back mirrored, which
-            // aborts the meta device mid-graph: refuse the graph instead (Muse Spark's tp_check_graph).
-            for (int i = 0; i < ggml_graph_n_nodes(g->graph); i++)
-            {
-                ggml_tensor* node = ggml_graph_node(g->graph, i);
-                if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE
-                    || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
-                if (ggml_nelements(node) == 0 || node->op == GGML_OP_ARANGE || !ggml_backend_supports_op(g->tp->backend, node))
-                {
-                    char why[256];
-                    std::snprintf(why, sizeof(why), "graph builder: %s [%lld, %lld, %lld, %lld] cannot run on the tensor-parallel devices",
-                                  ggml_op_desc(node), (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
-                    throw std::runtime_error(why);
-                }
-            }
-        }
         ggml_backend_dev_t dev = ggml_backend_get_device(graph_backend(g));
         if (!g->seam_rows.empty() && g->seam_rows.begin()->second.first->buffer == nullptr)
         {
@@ -2690,7 +2555,7 @@ namespace
                 }
         }
         bool fresh_weights = false;   // a weight got a new device copy
-        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) bind_cpu_weights(g);
+        if (g_backend_type == BACKEND_TYPE_CPU) bind_cpu_weights(g);
         for (Leaf& leaf : g->leaves)
         {
             leaf.uploaded = !leaf.host_only;
@@ -2700,16 +2565,6 @@ namespace
                 continue;
             }
             if (leaf.role == LEAF_INPUT || leaf.data == nullptr || leaf.host_only) continue;
-            if (g->tp != nullptr)
-            {
-                // Weights and states are resident in meta buffers (uploaded once, spread by their split).
-                MetaResident* r = meta_resident(g->tp, leaf);
-                ggml_set_name(leaf.tensor, r->t->name);
-                if (ggml_backend_tensor_alloc(r->buf, leaf.tensor, r->t->data) != GGML_STATUS_SUCCESS)
-                    throw std::runtime_error("graph builder: binding a tensor-parallel leaf failed");
-                leaf.uploaded = false;
-                continue;
-            }
             const auto usage = leaf.role == LEAF_STATE ? GGML_BACKEND_BUFFER_USAGE_COMPUTE : GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
             // Weights live as long as the model, so even a small one (a norm, a per-head gate
             // constant) keeps a device copy: in compute memory it would be uploaded every run, a
@@ -2748,7 +2603,7 @@ namespace
 #if defined(TSG_GGML_USE_CUDA)
         // The DiT offload's int8 and FP8 routes keep what they derive from a weight by its device address (as MiniMax-H3's
         // graphs do after their uploads): a new device copy may sit where another weight's was.
-        if (fresh_weights && g->tp == nullptr && (g->dit_regions > 0 || g->wide_token_products) && g_backend_type == BACKEND_TYPE_CUDA)
+        if (fresh_weights && (g->dit_regions > 0 || g->wide_token_products) && g_backend_type == BACKEND_TYPE_CUDA)
         {
             tsg_cuda_q4k_gemm_forget_weights();
             tsg_cuda_f16_gemm_forget_weights();
@@ -2788,7 +2643,7 @@ namespace
         // A one-shot graph borrows the backend's persistent, reused compute allocator (the
         // memory the fused graphs share, grown on demand); a graph that will be replayed keeps
         // its own, so no other graph can reuse its intermediates between runs.
-        if (g->tp == nullptr && !g->replayable && alloc_graph_reuse_gallocr(g->graph))
+        if (!g->replayable && alloc_graph_reuse_gallocr(g->graph))
         {
             g->built = true;
             return true;
@@ -2807,72 +2662,6 @@ namespace
         g->replayable = true;
         g->built = true;
         return true;
-    }
-}
-
-// A graph over `nranks` ranks with tensor parallelism (ggml's meta device): leaves given a split
-// (TSGgml_GraphLeafSplit) spread over the ranks, the rest are mirrored.
-TSG_EXPORT void* TSGgml_GraphCreateTp(int max_nodes, int replayable, const int* ranks, int nranks)
-{
-    try
-    {
-        if (ranks == nullptr || nranks < 2) throw std::runtime_error("graph builder: tensor parallelism needs 2 or more ranks");
-        TpGroup* grp = tp_group(ranks, nranks);
-        if (max_nodes < 16) max_nodes = 16;
-        auto* g = new TsgGraph();
-        g->tp = grp;
-        g->rank = ranks[0];
-        g->max_nodes = max_nodes;
-        g->replayable = replayable != 0;
-        ggml_init_params params{};
-        params.mem_size = ggml_tensor_overhead() * static_cast<std::size_t>(max_nodes) * 2
-                          + ggml_graph_overhead_custom(graph_slots(max_nodes), false);
-        params.no_alloc = true;
-        g->ctx = ggml_init(params);
-        if (g->ctx == nullptr)
-        {
-            delete g;
-            set_last_error("graph builder: ggml_init failed.");
-            return nullptr;
-        }
-        return g;
-    }
-    catch (const std::exception& ex)
-    {
-        set_last_error(ex.what());
-        return nullptr;
-    }
-}
-
-// How leaf `node` spreads over a tensor-parallel graph's ranks: split along `axis` (0-3) with
-// `ne` = per (segment, rank) extents, segment s repeating nr[s] times (ggml_backend_meta_split_state).
-TSG_EXPORT int TSGgml_GraphLeafSplit(void* handle, int node, int axis, const std::int64_t* ne, int nne,
-                                     const std::uint32_t* nr, int nsegments)
-{
-    auto* g = static_cast<TsgGraph*>(handle);
-    try
-    {
-        if (g == nullptr || g->tp == nullptr || g->built) throw std::runtime_error("graph builder: a split needs an unbuilt tensor-parallel graph");
-        if (axis < 0 || axis >= GGML_MAX_DIMS || nsegments < 1 || nsegments > 16 || nne != nsegments * static_cast<int>(g->tp->ranks.size()))
-            throw std::runtime_error("graph builder: bad leaf split");
-        ggml_tensor* t = node_at(g, node);
-        for (Leaf& leaf : g->leaves)
-        {
-            if (leaf.tensor != t) continue;
-            std::memset(&leaf.split, 0, sizeof(leaf.split));
-            leaf.split.axis = static_cast<ggml_backend_meta_split_axis>(axis);
-            for (int i = 0; i < nne; i++) leaf.split.ne[i] = ne[i];
-            for (int s2 = 0; s2 < nsegments; s2++) leaf.split.nr[s2] = nr != nullptr ? nr[s2] : 1;
-            leaf.split.n_segments = static_cast<std::uint32_t>(nsegments);
-            leaf.has_split = true;
-            return 1;
-        }
-        throw std::runtime_error("graph builder: a split names a node that is not a leaf");
-    }
-    catch (const std::exception& ex)
-    {
-        set_last_error(ex.what());
-        return 0;
     }
 }
 
@@ -3295,7 +3084,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         // Device work queued by earlier calls may still read or write these host buffers.
         host_read_barrier();
         upload_run_inputs(g, inputs, input_data, input_bytes, ninputs);
-        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) tsg::cpu_pools_select(g_backend, g->product_rows);
+        if (g_backend_type == BACKEND_TYPE_CPU) tsg::cpu_pools_select(g_backend, g->product_rows);
         // Its computes (segments, profiled nodes) keep that pool (tsg::compute_graph would pick one per segment).
         tsg::CpuGraphRuntimeScope runtime;
 
@@ -3317,7 +3106,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
                 return 0;
             }
         }
-        else if (g->tp == nullptr && (g->dit_regions > 0 || (g->wide_token_products && g_backend_type == BACKEND_TYPE_CUDA)))
+        else if ((g->dit_regions > 0 || (g->wide_token_products && g_backend_type == BACKEND_TYPE_CUDA)))
         {
             // The DiT offload: its fused nodes, cuDNN attention and (wide programs) the cuBLAS/int8 products, between ggml
             // segments; profiled under TS_GGML_NODE_PROFILE as the H3 graphs are. Synchronous.
@@ -3329,9 +3118,9 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         }
 #if defined(TSG_GGML_USE_CUDA)
         // TS_INKLING_CAPTURE_ALL=1 (experiment): every replayable graph of an Inkling model's step (its drafter's too) as one
-        // CUDA graph through the same path.
-        else if (g->inkling_nodes > 0 || (g->replayable && g->tp == nullptr && g_backend_type == BACKEND_TYPE_CUDA && inkling_backend() != nullptr
-                 && []() { static const bool on = std::getenv("TS_INKLING_CAPTURE_ALL") != nullptr && std::getenv("TS_INKLING_CAPTURE_ALL")[0] == '1'; return on; }()))
+        // CUDA graph through the same path. The switch is read first: a graph without fused nodes makes no fused-op backend.
+        else if (g->inkling_nodes > 0 || (inkling_capture_all() && g->replayable && g_backend_type == BACKEND_TYPE_CUDA
+                 && inkling_backend() != nullptr))
         {
             // Inkling 2's fused nodes: the fused-op backend runs the graph's ordinary nodes on ggml-cuda as graph views and
             // launches the fused ones between them, all on one stream.
@@ -3395,7 +3184,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
                 ggml_backend_tensor_get_async(graph_backend(g), leaf.tensor, leaf.data, 0, leaf.bytes);
                 host_results = true;
             }
-        if (!host_results && !g->replayable && g->tp == nullptr && g->host_moe.empty() && !graph_node_profile_enabled()
+        if (!host_results && !g->replayable && g->host_moe.empty() && !graph_node_profile_enabled()
             && g_overlap_steps.load(std::memory_order_acquire) > 0)
         {
             // Nothing for the host to read: the run returns with its work queued (TSGgml_GraphOverlapSteps).
@@ -3435,12 +3224,20 @@ TSG_EXPORT int TSGgml_GraphRunRanked(void* const* handles, int nranks, const int
         std::vector<tsg::TpRankPlan> plans(static_cast<std::size_t>(nranks));
         std::vector<tsg::TpRankPlan*> plan_ptrs(static_cast<std::size_t>(nranks));
         host_read_barrier();
+        // The group's first device: a tensor-parallel run spans the context's devices from 0, a whole-layer stage's of a
+        // hybrid placement those from the stage's first.
+        const int base = handles[0] != nullptr ? static_cast<TsgGraph*>(handles[0])->rank : 0;
+        if (base < 0 || base + nranks > tsg::g_device_count.load(std::memory_order_acquire))
+        {
+            set_last_error("graph builder: a ranked run's graphs name devices outside the context.");
+            return 0;
+        }
         for (int r = 0; r < nranks; r++)
         {
             auto* g = static_cast<TsgGraph*>(handles[r]);
-            if (g == nullptr || g->rank != r || g->tp != nullptr || !g->host_moe.empty() || g->dit_regions > 0)
+            if (g == nullptr || g->rank != base + r || !g->host_moe.empty() || g->dit_regions > 0)
             {
-                set_last_error("graph builder: a ranked run takes rank r's own graph, without host experts or DiT offload nodes, for every rank r.");
+                set_last_error("graph builder: a ranked run takes the graphs of consecutive devices in rank order, without host experts or DiT offload nodes.");
                 return 0;
             }
             ScopedRank scope(g->rank);
@@ -3455,6 +3252,7 @@ TSG_EXPORT int TSGgml_GraphRunRanked(void* const* handles, int nranks, const int
             upload_run_inputs(g, inputs[r], input_data[r], input_bytes[r], ninputs[r]);
             tsg::TpRankPlan& plan = plans[static_cast<std::size_t>(r)];
             plan.backend = graph_backend(g);
+            plan.device = g->rank;
             plan.allreduce_f32 = exact_f32 != 0;
             plan.graph = g->graph;
             plan.ar_tensor = g->tp_partials;
@@ -3662,40 +3460,5 @@ TSG_EXPORT int TSGgml_GraphAlias(void* handle, int node, int base, std::int64_t 
     {
         set_last_error(ex.what());
         return 0;
-    }
-}
-
-namespace tsg_graphtp
-{
-    // The host bytes behind `ptr` changed (or are being freed): drop its meta residents (graphs
-    // bound to them are dropped by the managed side first).
-    void on_drop(void* ptr)
-    {
-        std::lock_guard<std::mutex> lk(g_resident_mu);
-        for (auto it = g_residents.begin(); it != g_residents.end();)
-            it = it->first.second == ptr ? g_residents.erase(it) : std::next(it);
-    }
-
-    // Every meta resident of host bytes inside `ranges` (an owner releasing its memory: TSGgml_ReleaseHostRanges).
-    void on_drop_ranges(const tsg::HostRanges& ranges)
-    {
-        std::lock_guard<std::mutex> lk(g_resident_mu);
-        for (auto it = g_residents.begin(); it != g_residents.end();)
-            it = ranges.contains(it->first.second) ? g_residents.erase(it) : std::next(it);
-    }
-
-    // Gather a meta-resident state back into its host bytes; false when `ptr` has none.
-    bool sync_to_host(void* ptr, std::size_t size)
-    {
-        std::lock_guard<std::mutex> lk(g_resident_mu);
-        bool any = false;
-        for (auto& [key, r] : g_residents)
-        {
-            if (key.second != ptr) continue;
-            ggml_backend_synchronize(key.first->backend);
-            ggml_backend_tensor_get(r->t, ptr, 0, std::min(size, r->bytes));
-            any = true;
-        }
-        return any;
     }
 }

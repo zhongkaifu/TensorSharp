@@ -671,6 +671,45 @@ before run's log is in `artifacts/minimax-h3/fl2v-face-investigation/` and the
 after run's in `artifacts/minimax-h3/speed/hr/` (local validation evidence, not
 committed).
 
+### Multiple GPUs
+
+`--layer-split N` (`cuda`, `ggml_cuda`) runs the denoiser's 50 blocks as whole-block stages, one a GPU,
+balanced by weight bytes: each GPU holds its stage's weights and LoRA factors, the residual stream goes
+from stage to stage through host memory in F32, and the text encoder, the VAEs and the token refiner stay
+on the first GPU. It is a capacity mode: the stages run one after another, so a step is no faster than
+one GPU that holds every block. `--tp N` (`cuda` only) shards every block Megatron-style: each GPU holds
+heads / N of the stacked q, k and v, FFN / N of fc1's gate and value rows, and the matching input
+columns of the attention output and fc2, whose partials are summed after each product (two exact F32
+all-reduces a block, device-ordered over peer memory). The AdaLN projections, norms, patch projections,
+final layer and heads are whole on every GPU; the token refiner runs on the first. A Turbo plug-in's
+trunk factors are cut the same way (up rows for qkv and fc1, down columns for the output projection and
+fc2). `N` must divide the heads and the FFN, and a row-parallel split must keep quantized blocks whole;
+anything else is refused at load. `--tp` on `ggml_cuda` (its ranked runner takes no DiT regions) and
+`--tp` with `--layer-split` are refused.
+
+Measured on 2026-11-28 on two NVIDIA RTX PRO 4000 Blackwell (24 GB each, PCIe, no NCCL; ggml `bb877c0c`
+unchanged, CUDA 13.2): `config/minimax-h3-fl2va.json`, 17 frames at 640x384, `--diffusion-seed 7`,
+"a red fox trotting through falling snow, cinematic", one run each. Time is the denoising loop (in
+parentheses the median step after the first, which also compiles and uploads); peak is
+each GPU's used memory sampled every 0.5 s (the first GPU also holds the text encoder and the VAEs); PSNR
+is over the 22 decoded frames:
+
+| Backend, plug-in | 1 GPU | `--layer-split 2` | `--tp 2` | PSNR vs 1 GPU: split / TP |
+|---|---:|---:|---:|---|
+| `ggml_cuda` | 21.9 s (1.03 s), 16.4 GB | 22.0 s (1.01 s), 15.2 + 6.5 GB | refused | identical / - |
+| `ggml_cuda`, Turbo 4-step | 6.4 s, 18.0 GB | 6.3 s, 15.2 + 7.2 GB | refused | identical / - |
+| `cuda` | 110.0 s (5.42 s a step), 21.9 GB | 113.3 s (5.61 s), 16.6 + 6.6 GB | 62.5 s (2.93 s), 16.7 + 6.4 GB | identical / 42.0 dB |
+| `cuda`, Turbo 4-step | out of memory | 24.9 s (5.88 s), 17.9 + 8.2 GB | 17.3 s (3.16 s), 18.2 + 8.4 GB | - / 40.8 dB against the split |
+
+The stages give one GPU's frames byte for byte. `--tp 2` makes a direct-CUDA step 1.85x faster; its
+frames differ from one GPU's in the order the partials are summed (the fox and its gait the same). The
+Turbo plug-in does not fit one 24 GB GPU on `cuda` and runs over two. Direct CUDA is about five times
+slower than `ggml_cuda` on this model on one GPU (110 s against 21.9 s), so where `ggml_cuda` fits, it
+stays the faster choice; that gap is not addressed here. The two-GPU tests
+(`MiniMaxH3DenoiserTests.WholeBlockStagesOnTwoCudaDevicesMatchOneDevice`,
+`WholeBlockStagesOnTwoGgmlCudaGpusMatchOneGpu` and `TensorParallelOnTwoCudaDevicesMatchesOneDevice`, the
+eight frozen cases each, two of them with a plug-in) pass on the same machine.
+
 ## Files
 
 Five model files cooperate: two denoisers and three shared networks. The two

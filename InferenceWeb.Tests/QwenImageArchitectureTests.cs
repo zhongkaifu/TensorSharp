@@ -119,6 +119,25 @@ public sealed class QwenImageArchitectureTests
         }
     }
 
+    /// <summary>--layer-split is the contract's on ggml_cuda (whole-block stages, QwenImage21DenoiserTests.WholeBlockStages*),
+    /// so the gate lets it through there; it refuses it, before anything loads, on a backend of one device, as the contract's
+    /// gap on ggml_vulkan (no test covers the stages there), and with --tp (the hybrid: tensor-parallel stages).</summary>
+    [Fact]
+    public void LayerSplitIsTheContractsOnGgmlCudaAndRefusedElsewhereBeforeAnythingLoads()
+    {
+        MechanismSupport split = QwenImage21Architecture.Descriptor.Serving.LayerSplit;
+        Assert.Equal(new[] { BackendType.GgmlCuda }, split.Backends);
+        Assert.Empty(QwenImage21Architecture.Descriptor.Serving.HybridParallel.Backends);
+        using var fixture = new TensorHeader(Version21Tensors("", fused: true));
+        var single = Assert.Throws<NotSupportedException>(() => ModelBase.Create(fixture.Path, BackendType.GgmlCpu, layerSplitDegree: 2));
+        Assert.Contains("--layer-split", single.Message);
+        var vulkan = Assert.Throws<NotSupportedException>(() => ModelBase.Create(fixture.Path, BackendType.GgmlVulkan, layerSplitDegree: 2));
+        Assert.Contains("validated on ggml_cuda only", vulkan.Message);
+        var hybrid = Assert.Throws<NotSupportedException>(() =>
+            ModelBase.Create(fixture.Path, BackendType.GgmlCuda, tpDegree: 2, layerSplitDegree: 2));
+        Assert.Contains("tensor-parallel stages", hybrid.Message);
+    }
+
     [ModelFact("TENSORSHARP_QWEN21_DIT")]
     public void RealVersion21CheckpointResolvesFromItsTensorTable()
     {

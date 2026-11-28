@@ -23,12 +23,21 @@ namespace tsg {
     void free_spark_float32_backend()
     {
         auto& state = dev();
-        std::lock_guard<std::mutex> lock(state.spark_float32_mutex);
-        if (state.spark_float32_backend != nullptr)
         {
-            ggml_backend_free(state.spark_float32_backend);
-            state.spark_float32_backend = nullptr;
+            std::lock_guard<std::mutex> lock(state.spark_float32_mutex);
+            if (state.spark_float32_backend != nullptr)
+            {
+                ggml_backend_free(state.spark_float32_backend);
+                state.spark_float32_backend = nullptr;
+            }
         }
+        std::lock_guard<std::mutex> lock(state.inkling_fused_mutex);
+        if (state.inkling_fused_backend != nullptr)
+        {
+            ggml_backend_free(state.inkling_fused_backend);
+            state.inkling_fused_backend = nullptr;
+        }
+        state.inkling_fused_made = false;
     }
 
     void free_spark_float32_backends()

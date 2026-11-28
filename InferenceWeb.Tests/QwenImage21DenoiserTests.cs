@@ -6,11 +6,14 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System.Text;
 using System.Text.Json.Nodes;
+using TensorSharp;
+using TensorSharp.Cpu;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.GGML;
 using TensorSharp.Models.QwenImage21;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
+using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
@@ -24,8 +27,13 @@ public sealed class QwenImage21DenoiserTests : IDisposable
 {
     internal const int Channels = 16, TextDim = 48, Heads = 2, HeadDim = 32, Dim = Heads * HeadDim, Layers = 2, Ff = 96;
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-qi21-denoiser-" + Guid.NewGuid().ToString("N"));
+    private readonly ITestOutputHelper _output;
 
-    public QwenImage21DenoiserTests() => Directory.CreateDirectory(_dir);
+    public QwenImage21DenoiserTests(ITestOutputHelper output)
+    {
+        _output = output;
+        Directory.CreateDirectory(_dir);
+    }
 
     public void Dispose()
     {
@@ -520,5 +528,179 @@ public sealed class QwenImage21DenoiserTests : IDisposable
         Assert.Equal(plain, Step(null));
         Assert.Equal(adapted, Step(set));
         Assert.Equal(plain, Step(null));
+    }
+
+    // ---- whole-block stages (--layer-split N)
+
+    /// <summary>A CFG pair over one request's references and target: its own conditioning, and a negative prompt's with three
+    /// more text rows (another geometry, so the branches compile programs of their own), each with its layout.</summary>
+    private static (ConditioningSet Text, QwenImage21Layout Layout)[] CfgBranches(
+        (ConditioningSet Text, LatentRef[] References, QwenImage21Layout Layout, float[] Target) request, int headDim, int seed)
+    {
+        ConditioningSet text = request.Text;
+        var slots = new List<int>(text.Modalities);
+        slots.AddRange(new[] { 0, 0, 0 });
+        var negative = new ConditioningSet(Rand(slots.Count * text.Width, seed, 1f), slots.Count, text.Width, slots.ToArray());
+        var shapes = new List<(int, int)>();
+        foreach (LatentRef r in request.References) shapes.Add((r.Shape.Height, r.Shape.Width));
+        shapes.Add((4, 6));
+        var layout = QwenImage21Layout.Build(slots.Count, request.References.Length > 0 ? slots.ToArray() : null, shapes, headDim);
+        return new[] { (text, request.Layout), (negative, layout) };
+    }
+
+    /// <summary>A guided request's predictions: both branches at every step of QwenImage21Goldens.Steps (the state moved by
+    /// the CFG 4 velocity), then the request finished; the modes the predictions ran beside them.</summary>
+    private static (List<float[]> Velocities, List<QwenImage21Denoiser.Mode> Modes) CfgTrajectory(QwenImage21Denoiser denoiser,
+        (ConditioningSet Text, QwenImage21Layout Layout)[] branches, LatentRef[] references, float[] target, QwenImage21LoraSet set)
+    {
+        var velocities = new List<float[]>();
+        var modes = new List<QwenImage21Denoiser.Mode>();
+        float[] x = (float[])target.Clone();
+        foreach (var (sigma, step) in QwenImage21Goldens.Steps)
+        {
+            var pair = new List<float[]>();
+            foreach (var (text, layout) in branches)
+            {
+                pair.Add((float[])denoiser.Predict(x, text, references, layout, sigma, step, false, set).Clone());
+                modes.Add(denoiser.LastMode);
+            }
+            velocities.AddRange(pair);
+            var guided = new float[x.Length];
+            for (int k = 0; k < guided.Length; k++) guided[k] = pair[1][k] + 4f * (pair[0][k] - pair[1][k]);
+            QwenImage21Goldens.Advance(x, guided, sigma);
+        }
+        denoiser.FinishRequest();
+        return (velocities, modes);
+    }
+
+    private static void AssertBitExact(List<float[]> want, List<float[]> got, string what)
+    {
+        Assert.Equal(want.Count, got.Count);
+        for (int i = 0; i < want.Count; i++)
+        {
+            Assert.Equal(want[i].Length, got[i].Length);
+            int differ = 0;
+            for (int k = 0; k < want[i].Length; k++)
+                if (BitConverter.SingleToInt32Bits(want[i][k]) != BitConverter.SingleToInt32Bits(got[i][k])) differ++;
+            Assert.True(differ == 0, $"{what} prediction {i + 1} (step {i / 2 + 1}, branch {i % 2}): {differ} of {want[i].Length} values differ");
+        }
+    }
+
+    /// <summary>The largest error relative to the largest value, and the relative L2 error.</summary>
+    private static (double Rel, double RelL2) Compare(float[] want, float[] got)
+    {
+        double scale = want.Max(v => Math.Abs((double)v)), worst = 0, l2 = 0, n2 = 0;
+        for (int k = 0; k < want.Length; k++)
+        {
+            Assert.True(float.IsFinite(got[k]), $"value {k} is {got[k]}");
+            double d = got[k] - (double)want[k];
+            worst = Math.Max(worst, Math.Abs(d));
+            l2 += d * d;
+            n2 += (double)want[k] * want[k];
+        }
+        return (worst / scale, Math.Sqrt(l2 / n2));
+    }
+
+    /// <summary>
+    /// The transformer's blocks over two host "devices" as whole-block stages (DenoiserStages: one program a stage, the packed
+    /// stream, the shared modulation and the time embedding handed on as F32 rows), on the managed executor: every prediction
+    /// of a guided request (both CFG branches, through the prefix cache's extract and cached programs, or with the cache
+    /// declined) equals one device's bit for bit, with and without a LoRA plug-in (each stage binds its own blocks' factors;
+    /// the first the input, time and modulation ones, the last proj_out's), and after the plug-in is unbound again. Each stage
+    /// compiles what one device compiles, once a program: two programs a branch with the cache, one without.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 2, false)]
+    [InlineData(true, 1, false)]
+    [InlineData(false, 0, true)]
+    public void WholeBlockStagesMatchOneDeviceOnTheManagedExecutor(bool wide, int references, bool declined)
+    {
+        // The small plug-in's gate and up factors over a fused checkpoint (split into row views) and over a separate one.
+        string dit = wide ? QwenImage21WideFixture.WriteTransformer(_dir, fused: true) : WriteTransformer(_dir, fused: !declined);
+        string loraPath = wide ? QwenImage21WideFixture.WriteLora(_dir) : WriteLora(_dir);
+        Func<long> free = declined ? () => 1024 : () => -1;
+        using var one = new QwenImage21Denoiser(dit, BackendType.Cpu) { FreeMemory = free };
+        var devices = new IAllocator[] { new CpuAllocator(BlasEnum.DotNet), new CpuAllocator(BlasEnum.DotNet) };
+        using var staged = new QwenImage21Denoiser(dit, BackendType.Cpu, devices) { FreeMemory = free };
+        Assert.Equal(2, staged.Stages.Count);
+        Assert.Equal((0, 1), (staged.Stages.First(0), staged.Stages.End(0)));
+        Assert.Equal((1, 2), (staged.Stages.First(1), staged.Stages.End(1)));
+        // The stages bind every leaf once between them, and a device holds the larger share.
+        var shares = new[] { staged.Weights.WeightsOf(staged.Stages.Span(0)), staged.Weights.WeightsOf(staged.Stages.Span(1)) };
+        Assert.Equal(staged.Weights.All.OrderBy(w => w.Data).Select(w => w.Data), shares.SelectMany(s => s).OrderBy(w => w.Data).Select(w => w.Data));
+        Assert.Equal(shares.Max(s => s.Sum(w => w.Bytes)), staged.WeightBytes);
+        Assert.True(staged.WeightBytes < one.WeightBytes);
+
+        var request = wide ? QwenImage21WideFixture.Request(references, 31) : Request(references, 31);
+        var branches = CfgBranches(request, wide ? QwenImage21WideFixture.HeadDim : HeadDim, 77);
+        var (want, wantModes) = CfgTrajectory(one, branches, request.References, request.Target, null);
+        var (got, gotModes) = CfgTrajectory(staged, branches, request.References, request.Target, null);
+        var expectedModes = QwenImage21Goldens.Steps.SelectMany(s => Enumerable.Repeat(declined ? QwenImage21Denoiser.Mode.Full
+            : s.Step == 0 ? QwenImage21Denoiser.Mode.Extract : QwenImage21Denoiser.Mode.Cached, 2));
+        Assert.Equal(expectedModes, wantModes);
+        Assert.Equal(wantModes, gotModes);
+        AssertBitExact(want, got, "stages, no LoRA");
+        // Once a program: with the cache each branch's extract and cached programs, without it each branch's one (two retained
+        // plans a stage, as one device keeps, so the alternating branches replay theirs).
+        int programs = declined ? 2 : 4;
+        Assert.Equal(programs, one.Compiles);
+        Assert.Equal((programs, programs), (staged.StageCompiles(0), staged.StageCompiles(1)));
+        Assert.Equal(2 * programs, staged.Compiles);
+
+        using var oneSet = QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, one.Weights.Gguf, "", BackendType.Cpu, 1);
+        using var stagedSet = QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, staged.Weights.Gguf, "", BackendType.Cpu, 1);
+        var (wantLora, _) = CfgTrajectory(one, branches, request.References, request.Target, oneSet);
+        var (gotLora, _) = CfgTrajectory(staged, branches, request.References, request.Target, stagedSet);
+        Assert.NotEqual(want[0], wantLora[0]);   // the plug-in moves the velocity: the comparison is not vacuous
+        AssertBitExact(wantLora, gotLora, "stages, LoRA");
+        // Unbound again: no stage keeps the set's plans or factors.
+        var (wantAfter, _) = CfgTrajectory(one, branches, request.References, request.Target, null);
+        var (gotAfter, _) = CfgTrajectory(staged, branches, request.References, request.Target, null);
+        AssertBitExact(want, gotAfter, "stages after the LoRA");
+        AssertBitExact(wantAfter, gotAfter, "stages after the LoRA (one device)");
+        Assert.Equal((one.Compiles, one.Compiles), (staged.StageCompiles(0), staged.StageCompiles(1)));
+    }
+
+    /// <summary>
+    /// The same over two GPUs of one ggml_cuda context (the layer split's: collectives off), each stage's programs compiled and
+    /// run with its GPU active and its weights preloaded there: every prediction of a guided request through the prefix cache
+    /// (F16 keys and values, each stage's own layers on its own GPU) equals one GPU's within 1e-5 of the largest value, plain
+    /// and with a LoRA plug-in, on the small transformer (explicit attention: ggml-cuda's flash attention takes no 32-wide
+    /// head) and the wide one (flash attention, 128-wide heads, DoRA and norm replacements). The measured errors are logged.
+    /// </summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void WholeBlockStagesOnTwoGpusMatchOneGpu(bool wide)
+    {
+        GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
+        string dit = wide ? QwenImage21WideFixture.WriteTransformer(_dir, fused: true) : WriteTransformer(_dir, fused: true);
+        string loraPath = wide ? QwenImage21WideFixture.WriteLora(_dir) : WriteLora(_dir);
+        var request = wide ? QwenImage21WideFixture.Request(1, 31) : Request(1, 31);
+        var branches = CfgBranches(request, wide ? QwenImage21WideFixture.HeadDim : HeadDim, 77);
+        List<float[]> want, wantLora;
+        using (var one = new QwenImage21Denoiser(dit, BackendType.GgmlCuda) { FreeMemory = () => -1 })
+        using (var set = QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, one.Weights.Gguf, "", BackendType.GgmlCuda, 1))
+        {
+            want = CfgTrajectory(one, branches, request.References, request.Target, null).Velocities;
+            wantLora = CfgTrajectory(one, branches, request.References, request.Target, set).Velocities;
+        }
+        var context = new GgmlContext(new[] { 0, 1 }, GgmlBackendType.Cuda, enableCollectives: false);   // as a layer-split model makes it
+        var devices = new IAllocator[] { new GgmlAllocator(context, 0), new GgmlAllocator(context, 1) };
+        using var staged = new QwenImage21Denoiser(dit, BackendType.GgmlCuda, devices) { FreeMemory = () => -1 };
+        Assert.Equal(new[] { 0, 1 }, staged.Stages.Devices);
+        Assert.True(staged.Preload() > 0);
+        using var stagedSet = QwenImage21LoraSet.Load(new[] { new LoraSpec(loraPath, 0.8f) }, staged.Weights.Gguf, "", BackendType.GgmlCuda, 1);
+        var (got, modes) = CfgTrajectory(staged, branches, request.References, request.Target, null);
+        Assert.Equal(QwenImage21Denoiser.Mode.Cached, modes[^1]);
+        List<float[]> gotLora = CfgTrajectory(staged, branches, request.References, request.Target, stagedSet).Velocities;
+        for (int i = 0; i < want.Count; i++)
+        {
+            var (rel, relL2) = Compare(want[i], got[i]);
+            var (relLora, relL2Lora) = Compare(wantLora[i], gotLora[i]);
+            _output.WriteLine($"{(wide ? "wide" : "small")} step {i / 2 + 1} branch {i % 2}: stages vs one GPU max {rel:E3} (L2 {relL2:E3}); " +
+                              $"with LoRA max {relLora:E3} (L2 {relL2Lora:E3})");
+            Assert.True(rel <= 1e-5 && relLora <= 1e-5, $"prediction {i + 1}: {rel:E3} / {relLora:E3}");
+        }
     }
 }

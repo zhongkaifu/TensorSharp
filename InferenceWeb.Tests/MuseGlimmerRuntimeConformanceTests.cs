@@ -29,8 +29,7 @@ public sealed class MuseGlimmerRuntimeConformanceTests(ITestOutputHelper output)
     public void PlacementMatchesOneDevice(int tp, int stages)
     {
         using var suite = new MuseGlimmerRuntimeTests(output);
-        // A hybrid's tensor-parallel stages run per op; the others run as programs.
-        suite.PlacementsOnSimulatedDevicesGiveTheOneDeviceLogits(tp, stages, graphs: !(tp > 1 && stages > 1));
+        suite.PlacementsOnSimulatedDevicesGiveTheOneDeviceLogits(tp, stages, graphs: true);
     }
 
     [Theory]

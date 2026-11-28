@@ -23,7 +23,10 @@
 // A clip runs on the diffusion runtime's video pipeline (SharedDiffusion/DiffusionVideoPipeline)
 // with the MiniMax-H3 family's hooks (MiniMaxH3Family): the denoiser's steps are graph programs
 // (MiniMaxH3Denoiser) that the GGML graph executor runs on ggml_cuda / ggml_metal / ggml_cpu and
-// the tensor executors run on cpu / cuda / mlx.
+// the tensor executors run on cpu / cuda / mlx. With --layer-split N (cuda, ggml_cuda) the denoiser's
+// blocks run as whole-block stages over N GPUs (SharedDiffusion/DenoiserStages); with --tp N (cuda)
+// they are sharded over N GPUs, heads and FFN columns a GPU (SharedDiffusion/DenoiserRanks); either
+// way the text encoder, vision tower and VAEs stay on the first.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -60,6 +63,8 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly string _tePath;
         private readonly string _vaePath;
         private readonly string _audioVaePath;
+        // The devices the denoiser's whole-block stages run on (--layer-split N), or null for one device.
+        private readonly IReadOnlyList<IAllocator> _denoiserDevices;
         private DiffusionVideoPipeline _pipeline;
 
         /// <summary>The audio VAE's role among the diffusion load's files.</summary>
@@ -84,8 +89,16 @@ namespace TensorSharp.Models.MiniMaxH3
         public MiniMaxH3Config DitConfig { get; }
         public MiniMaxH3Partition Partition { get; }
 
-        public MiniMaxH3Model(string ggufPath, BackendType backend)
-            : base(ggufPath, backend)
+        /// <param name="layerSplitDegree">Devices the denoiser's blocks are split over as whole-block stages (<c>--layer-split
+        /// N</c>; cuda and ggml_cuda): each holds its share of the weights, the text encoder, vision tower and both VAEs run on
+        /// the first.</param>
+        /// <param name="tpDegree">GPUs the denoiser's blocks are sharded over (<c>--tp N</c>; cuda): each holds its heads and
+        /// FFN columns of every block, the text encoder, vision tower and both VAEs run on the first. A degree the checkpoint's
+        /// heads, FFN width or quant blocks do not divide is refused here, before anything is loaded.</param>
+        /// <param name="tpGroup">The group the loader made for the degree, or null (ModelBase makes the direct CUDA backend's).</param>
+        public MiniMaxH3Model(string ggufPath, BackendType backend, int layerSplitDegree = 1, int tpDegree = 1,
+            ITensorParallelGroup tpGroup = null)
+            : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree: layerSplitDegree)
         {
             _ditPath = ggufPath;
             string dir = Path.GetDirectoryName(Path.GetFullPath(ggufPath));
@@ -93,6 +106,11 @@ namespace TensorSharp.Models.MiniMaxH3
             using (var probe = new GgufFile(ggufPath))
             {
                 DitConfig = MiniMaxH3Config.Detect(probe.Tensors);
+                if (IsTensorParallel && TensorParallelRefusal(probe, DitConfig) is string refusal)
+                {
+                    Dispose();
+                    throw new ModelLoadRefusedException(refusal);
+                }
             }
             Partition = MiniMaxH3Config.PartitionFromFileName(ggufPath);
             string alternatePath = ResolveAlternateDenoiser(ggufPath, Partition);
@@ -105,6 +123,12 @@ namespace TensorSharp.Models.MiniMaxH3
                     if (!SameDenoiserShape(DitConfig, alternateConfig))
                     {
                         Console.WriteLine($"MiniMax-H3 alternate denoiser ignored (incompatible tensor shapes): {alternatePath}");
+                        alternatePath = null;
+                    }
+                    else if (IsTensorParallel && TensorParallelRefusal(alternate, alternateConfig) is string alternateRefusal)
+                    {
+                        // Its blocks would be refused at its mode's first clip: the mode is not offered instead.
+                        Console.WriteLine($"MiniMax-H3 alternate denoiser ignored ({alternateRefusal}): {alternatePath}");
                         alternatePath = null;
                     }
                 }
@@ -143,6 +167,16 @@ namespace TensorSharp.Models.MiniMaxH3
                     "(Comfy-Org/MiniMax-H3). The text encoder also needs vocab.json, merges.txt " +
                     "and tokenizer_config.json (MiniMaxAI/MiniMax-H3, processor/) beside it, since " +
                     "its GGUF carries no tokenizer; a photo or a reference needs the last of them.");
+
+            // The stages' devices now, so a split past the devices this process sees is refused at load, not at the first clip.
+            _denoiserDevices = StageDeviceAllocators();
+            if (_denoiserDevices != null)
+                Console.WriteLine($"  placement    = denoiser blocks over {_denoiserDevices.Count} GPUs as whole-block stages " +
+                                  "(the text encoder, vision tower and VAEs on the first)");
+            if (IsTensorParallel)
+                Console.WriteLine($"  placement    = denoiser blocks sharded over {TpDegree} GPUs ({DitConfig.NumAttentionHeads / TpDegree} " +
+                                  $"heads and {DitConfig.FfnHiddenSize / TpDegree} FFN columns each; the text encoder, vision tower " +
+                                  "and VAEs on the first)");
 
             // LoRA plug-ins from the host (--lora / TS_LORAS). They are loaded and checked
             // against the transformer now, so a bad adapter or a contradicted recipe fails
@@ -200,6 +234,40 @@ namespace TensorSharp.Models.MiniMaxH3
             && a.TextDim == b.TextDim && a.RopeInvFreqLength == b.RopeInvFreqLength
             && a.TimeEmbedding == b.TimeEmbedding && a.TimeEmbedDim == b.TimeEmbedDim
             && a.AdaLnCurveGrid == b.AdaLnCurveGrid;
+
+        // ---- tensor parallelism ----
+
+        /// <summary>
+        /// Why this load cannot shard <paramref name="file"/>'s denoiser over the tensor-parallel group, or null: the shards run
+        /// on the direct CUDA backend's tensor executors over one machine's GPUs, and the degree must divide the heads, the FFN
+        /// width and every row-parallel projection's quant blocks (<see cref="MiniMaxH3Denoiser.TensorParallelRefusal"/>, read
+        /// from the tensor table alone, so a degree the checkpoint cannot take is refused before anything is loaded).
+        /// </summary>
+        private string TensorParallelRefusal(GgufFile file, MiniMaxH3Config config)
+        {
+            if (Backend != BackendType.Cuda)
+                return $"MiniMax-H3 shards its denoiser over the GPUs of --backend cuda (--tp {TpDegree}); --backend " +
+                       $"{Architecture.BackendNames.OptionName(Backend)} is not supported." +
+                       (IsGgmlBackend ? " " + MiniMaxH3Denoiser.GgmlTensorParallelGap : "");
+            if (TpNodeCount > 1 || GlobalTpDegree != TpDegree)
+                return "MiniMax-H3 shards its denoiser over the GPUs of one machine; a multi-node --tp group is not supported.";
+            var rowParallel = new List<(string, int, long)>();
+            for (int i = 0; i < config.NumLayers; i++)
+                foreach (string name in new[] { "attn.out_proj.weight", "mlp.fc2.weight" })
+                {
+                    string key = $"{config.Prefix}blocks.{i}.{name}";
+                    // A missing or malformed tensor is the denoiser loader's refusal, which names it.
+                    if (file.Tensors.TryGetValue(key, out GgufTensorInfo info) && info.Shape.Length == 2)
+                        rowParallel.Add((key, (int)info.Type, (long)info.Shape[0]));
+                }
+            return MiniMaxH3Denoiser.TensorParallelRefusal(config, TpDegree, rowParallel);
+        }
+
+        /// <summary>The group the denoiser shards its blocks over, or null on one device.</summary>
+        internal ITensorParallelGroup DenoiserTensorParallelGroup => IsTensorParallel ? _tpGroup : null;
+
+        // MiniMaxH3Denoiser shards its blocks on this group when the pipeline makes it (MiniMaxH3Family.CreateDenoiser).
+        protected override bool ShardsWeightsInComponents => true;
 
         // ---- LoRA plug-ins (ILoraPluginHost) ----
 
@@ -433,7 +501,8 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
-        /// <summary>The runtime's load: the denoisers, the text encoder and the VAEs this model resolved.</summary>
+        /// <summary>The runtime's load: the denoisers, the text encoder and the VAEs this model resolved, the devices of the
+        /// denoiser's whole-block stages under a split, and the group its blocks are sharded over under tensor parallelism.</summary>
         private DiffusionLoad Load()
         {
             var files = new Dictionary<string, string>
@@ -443,7 +512,10 @@ namespace TensorSharp.Models.MiniMaxH3
                 [DiffusionLoad.Vae] = _vaePath,
             };
             if (_audioVaePath != null) files[AudioVaeRole] = _audioVaePath;
-            return new DiffusionLoad { Backend = Backend, Files = files };
+            return new DiffusionLoad
+            {
+                Backend = Backend, Files = files, DenoiserDevices = _denoiserDevices, TensorParallelGroup = DenoiserTensorParallelGroup,
+            };
         }
 
         /// <summary>A runtime report as the hosts' progress: "text-encode" (with the encoder, the denoiser's load and the

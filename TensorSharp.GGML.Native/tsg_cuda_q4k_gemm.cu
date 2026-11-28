@@ -611,6 +611,7 @@ struct Int8Pending
 struct GemmState
 {
     std::mutex mu;
+    bool touched = false;   // a call on this state's device used it (the releases visit only those)
     cublasHandle_t handle = nullptr;
     bool probed = false, usable = false;
     void* w = nullptr; std::size_t wBytes = 0;
@@ -631,10 +632,40 @@ struct GemmState
 #endif
 };
 
+// One state a device: the cuBLAS handle, the staging buffers and the int8/FP8 codes kept by device address are a device's
+// own. A layer split runs MiniMax-H3's blocks on several GPUs of one process, where one process-wide state had served the
+// second GPU's products with the first GPU's handle and buffers ("backend graph execution failed" on its stage).
+constexpr int kGemmDevices = 16;
+
+GemmState& state_of(int device)
+{
+    static GemmState s[kGemmDevices];
+    return s[device];
+}
+
 GemmState& state()
 {
-    static GemmState s;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= kGemmDevices) device = 0;
+    GemmState& s = state_of(device);
+    s.touched = true;
     return s;
+}
+
+// Run `body` on every device whose state a call used, that device current; the caller's device is current again after.
+template <typename F>
+void for_each_state(F body)
+{
+    int previous = 0;
+    const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+    for (int d = 0; d < kGemmDevices; d++)
+    {
+        GemmState& s = state_of(d);
+        if (!s.touched) continue;
+        if (cudaSetDevice(d) != cudaSuccess) continue;
+        body(s);
+    }
+    if (restore) cudaSetDevice(previous);
 }
 
 void* ensure(void*& p, std::size_t& have, std::size_t need)
@@ -1891,9 +1922,13 @@ bool tsg_cuda_int8_materialize(const void* data)
 int tsg_cuda_int8_forget_pending(void)
 {
 #if defined(TSG_CUDA_FP8_GEMM)
-    GemmState& s = state();
-    std::lock_guard<std::mutex> lock(s.mu);
-    return int8_forget_pending(s);
+    int forgotten = 0;
+    for_each_state([&](GemmState& s)
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        forgotten += int8_forget_pending(s);
+    });
+    return forgotten;
 #else
     return 0;
 #endif
@@ -1904,9 +1939,11 @@ int tsg_cuda_int8_forget_pending(void)
 void tsg_cuda_f16_gemm_forget_weights(void)
 {
 #if defined(TSG_CUDA_FP8_GEMM)
-    GemmState& s = state();
-    std::lock_guard<std::mutex> lock(s.mu);
-    fp8_forget_codes(s);
+    for_each_state([](GemmState& s)
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        fp8_forget_codes(s);
+    });
 #endif
 }
 
@@ -1915,28 +1952,32 @@ void tsg_cuda_f16_gemm_forget_weights(void)
 void tsg_cuda_q4k_gemm_forget_weights(void)
 {
 #if defined(TSG_CUDA_FP8_GEMM)
-    GemmState& s = state();
-    std::lock_guard<std::mutex> lock(s.mu);
-    for (auto& kv : s.int8Kept) int8_free_codes(kv.second.codes);
-    s.int8Kept.clear();
+    for_each_state([](GemmState& s)
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        for (auto& kv : s.int8Kept) int8_free_codes(kv.second.codes);
+        s.int8Kept.clear();
+    });
 #endif
 }
 
 void tsg_cuda_q4k_gemm_release(void)
 {
     tsg_stage::dump("release");
-    GemmState& s = state();
-    std::lock_guard<std::mutex> lock(s.mu);
-    if (s.w != nullptr) { cudaFree(s.w); s.w = nullptr; s.wBytes = 0; }
-    if (s.x != nullptr) { cudaFree(s.x); s.x = nullptr; s.xBytes = 0; }
-    if (s.d != nullptr) { cudaFree(s.d); s.d = nullptr; s.dBytes = 0; }
+    for_each_state([](GemmState& s)
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (s.w != nullptr) { cudaFree(s.w); s.w = nullptr; s.wBytes = 0; }
+        if (s.x != nullptr) { cudaFree(s.x); s.x = nullptr; s.xBytes = 0; }
+        if (s.d != nullptr) { cudaFree(s.d); s.d = nullptr; s.dBytes = 0; }
 #if defined(TSG_CUDA_FP8_GEMM)
-    fp8_release(s);     // the exponent guesses are host memory and stay
+        fp8_release(s);     // the exponent guesses are host memory and stay
 #endif
-    if (s.handle != nullptr) cublasDestroy(s.handle);
-    s.handle = nullptr;
-    s.probed = false;
-    s.usable = false;
+        if (s.handle != nullptr) cublasDestroy(s.handle);
+        s.handle = nullptr;
+        s.probed = false;
+        s.usable = false;
+    });
 }
 
 } // extern "C"

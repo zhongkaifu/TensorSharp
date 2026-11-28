@@ -394,6 +394,62 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>Direct-CUDA tensor parallelism records a kept decode step once over both GPUs (one CUDA graph holding each
+    /// rank's kernels and their all-reduces) and replays it a position on: the rows equal the ranks' plans run unrecorded,
+    /// and one GPU's within the placement bound. A second prompt in the same slot records again. Every decode step after a
+    /// prompt's first advances (a check of the slot objects had re-traced each one). The BF16 experts of "moe-tp" read their
+    /// routes back mid-step, so neither one GPU nor the ranks record them: the placement records where one GPU does.</summary>
+    [MultiCudaTheory(2)]
+    [InlineData("dense")]
+    [InlineData("moe-tp")]
+    public void DirectCudaTensorParallelDecodeReplaysItsRecording(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        List<float[]> reference;
+        bool singleRecords;
+        using (var single = Create(path, backend: BackendType.Cuda))
+        {
+            reference = LongScript(single);
+            singleRecords = single.DecodeRecordings > 0;
+        }
+        List<float[]> unrecorded;
+        using (var group = new TensorSharp.Cuda.TensorParallelGroup(2))
+        using (var plain = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, group, 1) { DecodeCaptureDisabled = true })
+            unrecorded = LongScript(plain);
+        using var recordedGroup = new TensorSharp.Cuda.TensorParallelGroup(2);
+        using var placed = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, recordedGroup, 1);
+        List<float[]> recorded = LongScript(placed);
+        string counts = $"{variant}: {placed.DecodeRecordings} recordings, {placed.RecordedDecodeReplays} replays, {placed.DecodeAdvances} " +
+            $"advances (last unrecorded: {placed.RankedRecordingSkipped ?? "none"}; last not advanced: {placed.RankedAdvanceRefused ?? "none"})";
+        Assert.True(placed.DecodeAdvances >= 15, counts);
+        Assert.Equal(variant == "dense", singleRecords);
+        if (singleRecords)
+            Assert.True(placed.DecodeRecordings >= 2 && placed.RecordedDecodeReplays >= 12, counts);
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(recorded[i], unrecorded[i]);
+            Assert.True(rel <= 1e-5, $"{variant} row {i}: recorded against unrecorded relL2 {rel:E2}");
+            double one = RelL2(recorded[i], reference[i]);
+            Assert.True(one <= (variant == "moe-tp" ? 2.5e-2 : 5e-3), $"{variant} row {i}: against one GPU relL2 {one:E2}");
+        }
+    }
+
+    /// <summary>A prompt and twelve decode steps, then another prompt in the reset slot and six more.</summary>
+    private static List<float[]> LongScript(ModelBase model)
+    {
+        var rows = new List<float[]>();
+        int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
+        rows.Add((float[])model.ForwardRefill(prompt).Clone());
+        for (int t = 0; t < 12; t++)
+            rows.Add((float[])model.Forward(new[] { 71 + (t * 13) % 90 }).Clone());
+        model.ResetKVCache();
+        rows.Add((float[])model.ForwardRefill(new[] { 33, 34, 35, 36, 37, 38, 39 }).Clone());
+        for (int t = 0; t < 6; t++)
+            rows.Add((float[])model.Forward(new[] { 40 + t }).Clone());
+        return rows;
+    }
+
     /// <summary>Speculation on per-rank graphs: each rank's verify keeps its recurrent states' window, and the commit runs
     /// per rank on its own share of the heads; the NextN draft layer runs whole (unsharded) on rank 0.</summary>
     [Fact]
@@ -517,8 +573,10 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.Equal(tp, placed.Mesh.TensorParallel);
         Assert.Equal(stages, placed.Mesh.Stages);
         List<float[]> actual = Script(placed);
-        // One stage of tensor parallelism runs per-rank graphs: their partials meet in the graphs' all-reduces.
-        if (tp > 1 && stages == 1) Assert.True(group.AllReduceCount > 0 && placed.GraphRuns > 0, $"{variant} tp={tp}: no per-rank graph ran");
+        // Tensor parallelism runs per-rank graphs, a hybrid's on every stage's group: their partials meet in the graphs'
+        // all-reduces (one stage's through the group's own collective).
+        if (tp > 1) Assert.True(placed.RunsRankGraphs && placed.GraphRuns > 0, $"{variant} tp={tp} stages={stages}: no per-rank graph ran");
+        if (tp > 1 && stages == 1) Assert.True(group.AllReduceCount > 0, $"{variant} tp={tp}: no all-reduce ran on the group");
         double tolerance = tp == 1 ? 0 : 1e-4;
         for (int i = 0; i < reference.Count; i++)
         {
@@ -1703,6 +1761,36 @@ public sealed class Qwen35RuntimeTests : IDisposable
         model.SlotDeviceMemoryForTests = d => (Need(d), total);
         Assert.True(model.RoomForSlotsForTests(capacity, 1));
         Assert.False(model.RoomForSlotsForTests(capacity, 2));
+    }
+
+    /// <summary>A new request's slot on a mesh (two whole-layer stages, or two tensor-parallel ranks) waits while any device
+    /// holding part of it is short of its share beside its headroom, and the prefix cache sees that device's deficit. Before,
+    /// a layer-split or tensor-parallel model gave every concurrent request a slot until a GPU filled and ggml aborted the
+    /// process; one device's own probe had been the only admission.</summary>
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(1, 2)]
+    public void ANewSlotWaitsForRoomOnEveryDeviceOfAMesh(int stages, int tp)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), tp: tp, stages: stages);
+        var unified = (IUnifiedBatchModel)model;
+        unified.EnsureSequenceSlot("a", 64);
+        var shares = model.SlotSharesForTests;
+        Assert.Equal(2, shares.Length);
+        const long total = 1L << 34;
+        long plenty = long.MaxValue / 4;
+        // Devices without a report (host memory, simulated devices) measure nothing.
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        model.SlotDeviceMemoryForTests = _ => (plenty, total);
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        unified.EnsureSequenceSlot("b", 64);
+        // The second device has nothing free: its share does not fit, whatever the first device holds.
+        model.SlotDeviceMemoryForTests = d => (d == 1 ? 0 : plenty, total);
+        Assert.True(model.DeviceSlotDeficitBytes > 0);
+        Assert.Throws<SequenceSlotUnavailableException>(() => unified.EnsureSequenceSlot("c", 64));
+        model.SlotDeviceMemoryForTests = _ => (plenty, total);
+        unified.EnsureSequenceSlot("c", 64);
     }
 
     /// <summary>A conversation's next turn adopts its retained slot (exactly its rows) and reserves past it: the rows move into

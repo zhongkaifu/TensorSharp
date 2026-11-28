@@ -46,8 +46,12 @@ namespace TensorSharp.Models.QwenImage21
         private AdapterSet _adapters = AdapterSet.Empty;
         private volatile bool _disposed;
 
-        public QwenImage21DiffusionModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
-            : base(ggufPath, backend, tpDegree, tpGroup)
+        /// <param name="layerSplitDegree">GPUs the transformer's blocks are split over as whole-block stages (--layer-split N;
+        /// ggml_cuda): each holds its share of the weights and the prefix cache of its own layers; the text encoder, vision
+        /// encoder and VAE run on the first.</param>
+        public QwenImage21DiffusionModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1)
+            : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree: layerSplitDegree)
         {
             try
             {
@@ -70,6 +74,14 @@ namespace TensorSharp.Models.QwenImage21
                         "Qwen-Image-2.1 tensor parallelism shards over the GPUs of one machine; a multi-node --tp group is not supported.");
                 if (IsTensorParallel && DitTensorParallelRefusal(TpDegree) is string tpRefusal)
                     throw new ModelLoadRefusedException(tpRefusal);
+                // The serving contract's gate refuses the rest before a load; a model made directly is held to the same.
+                if (LayerSplitGroup != null)
+                    throw new ModelLoadRefusedException(
+                        "Qwen-Image-2.1 splits its transformer's blocks over the GPUs of one machine; a multi-node --layer-split is not supported.");
+                if (LayerSplitDegree > 1 && backend != BackendType.GgmlCuda)
+                    throw new ModelLoadRefusedException(
+                        $"Qwen-Image-2.1 splits its transformer's blocks over the GPUs of ggml_cuda (--layer-split {LayerSplitDegree}); " +
+                        $"--backend {Architecture.BackendNames.OptionName(backend)} is not supported. Remove --layer-split or choose ggml_cuda.");
                 Config = new ModelConfig
                 {
                     Architecture = ArchitectureId, HiddenSize = 4096, NumLayers = 32, NumHeads = 32, NumKVHeads = 32, Eps = 1e-6f, VocabSize = 0,
@@ -120,13 +132,17 @@ namespace TensorSharp.Models.QwenImage21
                 _family = new QwenImage21Family(backend, Variant)
                 {
                     ConditionerFactory = load => new QwenImage21ConditionerComponent(_tePath, _mmprojPath, backend, () => ReleaseComputeBuffers()),
-                    DenoiserFactory = load => _denoiser = CreateDenoiser(),
+                    DenoiserFactory = load => _denoiser = CreateDenoiser(load),
                     VaeFactory = load => _vae = new QwenImage21VaeCodec(() => VaeWeightSource, backend, FileLength(_vaePath),
                         owner => ReleaseComputeBuffers(owner)),
                 };
+                if (LayerSplitDegree > 1)
+                    Console.WriteLine($"  placement    = transformer blocks over {LayerSplitDegree} GPUs as whole-block stages " +
+                        "(the text encoder, vision encoder and VAE on the first)");
                 var diffusionLoad = new DiffusionLoad
                 {
                     Backend = backend,
+                    DenoiserDevices = StageDeviceAllocators(),
                     Files = new Dictionary<string, string>
                     {
                         [DiffusionLoad.Denoiser] = ggufPath,
@@ -160,10 +176,12 @@ namespace TensorSharp.Models.QwenImage21
             catch { Dispose(); throw; }
         }
 
-        private QwenImage21Denoiser CreateDenoiser()
+        /// <summary>The transformer on one device, sharded over the tensor-parallel group, or split over the load's
+        /// <see cref="DiffusionLoad.DenoiserDevices"/> as whole-block stages.</summary>
+        private QwenImage21Denoiser CreateDenoiser(DiffusionLoad load)
         {
             var weights = new QwenImage21Weights(_gguf, ownsFile: false, Path.GetFileName(DitPath));
-            return new QwenImage21Denoiser(weights, Backend, null, null, DitTensorParallelGroup)
+            return new QwenImage21Denoiser(weights, Backend, null, null, DitTensorParallelGroup, load?.DenoiserDevices)
             {
                 ReleaseAfterPhase = true,
                 ReleaseCompute = () => ReleaseComputeBuffers(),

@@ -134,14 +134,9 @@ namespace TensorSharp.Runtime.Telemetry
         /// <summary>A captured CUDA graph's kind: <c>solo</c> (one sequence's decode step) or
         /// <c>batched</c>.</summary>
         public const string GraphKind = "tensorsharp.cuda_graph.kind";
-        /// <summary>The host's part of a decode step: <c>finish</c> (waiting for the step's logits and copying them),
-        /// <c>sample</c>, <c>issue</c> (queueing the next step's GPU work), <c>draft</c>, <c>verify</c>.</summary>
+        /// <summary>The host's part of a decode step: <c>sample</c>, <c>issue</c> (queueing the step's GPU work),
+        /// <c>draft</c>, <c>verify</c>.</summary>
         public const string StepPhase = "tensorsharp.engine.step.phase";
-        /// <summary>How a decode lane's step ended for the host: <c>ready</c> (done before the host came back) or
-        /// <c>waited</c>.</summary>
-        public const string LaneFinish = "tensorsharp.engine.lane.finish";
-        /// <summary>What the host was doing for a decode lane: <c>issue</c>, <c>wait</c> or <c>idle</c>.</summary>
-        public const string LaneState = "tensorsharp.engine.lane.state";
         /// <summary>Tokens a speculator drafted for one verify window.</summary>
         public const string SpeculativeDrafted = "tensorsharp.speculative.drafted";
         /// <summary>The speculation algorithm that drafted (<c>draft-head</c> for a per-token head such as

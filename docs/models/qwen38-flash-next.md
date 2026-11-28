@@ -61,7 +61,8 @@ runtime. They are not family code. The same applies to:
   each layer's most-routed experts in VRAM.
 - Speculative decoding: the shared MTP head through `--draft-model mtp-*.gguf`, or a DFlash2 drafter.
 
-`--tp` and `--layer-split` are separate placement modes for this family. Their hybrid is refused.
+`--tp T --layer-split P` runs the runtime's hybrid: every whole-layer stage runs its layers as per-rank graphs over its own
+T devices (Qwen4ExpRuntimeTests.HybridRankGraphsMatchOneDeviceOnTheManagedCpu, simulated devices only).
 
 Vision rides the Qwen3.5-VL tower with (T,H,W) IMRoPE positions. Multi-image and multi-turn image sessions are
 supported.
@@ -952,8 +953,8 @@ A40 (46 GB) with 12 layers' experts on the host, `ggml_cuda` measured 600 / 30.2
 (random tokens, pp512 / tg128) against llama-bench's 466.14 / 18.84 with `-ncmoe 12`.
 
 `--backend cuda` runs the shared runtime on the CUDA graph executor, which accepts `--n-cpu-moe` /
-`--cpu-moe` (host experts), `--tp N` and `--layer-split N` as `ggml_cuda` does (`--tp` with `--layer-split` is
-refused, and so are host experts under `--tp`); none of that has been measured on a GPU yet. See
+`--cpu-moe` (host experts), `--tp N`, `--layer-split N` and their hybrid as `ggml_cuda` does (host experts are refused
+under `--tp`); none of that has been measured on a GPU yet. See
 [Multi-GPU](#multi-gpu) for what `--tp` splits and what it refuses.
 
 **Historical: the removed direct-CUDA engine.** Until its removal in 2026-11, `--backend cuda` loaded a direct
@@ -2251,8 +2252,8 @@ shard from RAM (`/dev/shm`).
 
 ## Multi-GPU
 
-Both placements are the shared runtime's and are separate modes for this family:
-`--tp` together with `--layer-split` is refused.
+Both placements and their hybrid (`--tp T --layer-split P`, every stage's layers as per-rank graphs over its own T
+devices) are the shared runtime's.
 
 - **`--tp N`** runs per-rank graphs on `cuda` and on `ggml_cuda` (where ggml's
   fused tensor-parallel all-reduce is available). ggml's graph executor runs
@@ -2289,6 +2290,15 @@ and on two CUDA GPUs (`StagesOnTwoGpusMatchOneGpu`, `RankGraphsOnTwoGpusMatchOne
 `HostExpertsOnTwoGpuStagesMatchOneGpu`). `eng/ForcedLogitProbe` compares
 full-model logits while forcing identical token histories, so an early greedy
 mismatch cannot hide the numerical error of later decode steps.
+
+Measured on two RTX PRO 4000 Blackwell (24 GB each, PCIe, no NCCL; the `Q2_0` preset
+with `MAX_CONTEXT=16384`, `TS_Q4E_HC_Q8=1`, `TS_Q4E_MTP_EXPERTS=q2_0`; 512/128 best of
+two): `ggml_cuda --tp 2` prefills 1,935 tok/s and decodes 73.5, and its 5,130-token
+prompt takes 4.0 s (3.4 s over two stages). This family sums every partial exactly,
+which without NCCL ran one collective per 32,764 floats (18.4 s for that prompt) until
+TensorSharp's exact all-reduce over peer memory took the wider partials. Direct CUDA's
+numbers, the recorded tensor-parallel decode steps and the history of these figures are
+in [unified-execution.md](../design/unified-execution.md) sections 9.6 and 9.7.
 
 **Historical: `Qwen4ExpModel`'s tensor parallelism.** The removed implementation
 split only the FFNs under `--tp` on `ggml_cuda`: gate/up produced local
@@ -2462,7 +2472,7 @@ Startup prints which mode ran and the per-GPU layer/byte split.
 `--backend cuda` serves the family through the shared decoder runtime (`Qwen4ExpRuntimeModel`), whose graphs run on the
 CUDA graph executor. Its serving contract is the runtime's, as on `ggml_cuda`: every request has a slot of its own, the
 running requests' decode steps run together, `--tp N` runs per-rank graphs, `--layer-split N` places whole layers, and
-`--n-cpu-moe` / `--cpu-moe` leave routed experts to the host; `--tp` together with `--layer-split` is refused. The
+`--n-cpu-moe` / `--cpu-moe` leave routed experts to the host; `--tp T --layer-split P` runs per-rank graphs on every stage's group. The
 preset is `config/qwen3.8-flash-next-cuda.json`; its `TS_Q4E_HC_Q8` and `TS_Q4E_MTP_EXPERTS` settings are read by the
 runtime. This path has not been measured on a GPU since the direct engine below was removed, so no figure in this card
 describes it.

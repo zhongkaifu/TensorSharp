@@ -46,6 +46,28 @@ namespace TensorSharp.Models
         private static readonly int MlxEvalEveryNLayers = ResolvePositiveEnv("TS_MLX_EVAL_EVERY_N_LAYERS", 4);
         private static readonly int PrefillChunkTokens = ResolvePositiveEnv("TS_PREFILL_CHUNK", 2048);
 
+        /// <summary>Rows of a pipelined prompt's chunks over whole-layer stages (StandardDecoderModel.PipelinedPrompt.cs): a
+        /// wavefront takes its longest stage's chunk, and the engine's lone prompt steps are at most 4,096 rows
+        /// (TS_SCHED_MAX_BATCHED_TOKENS), so the stages fill and drain once a step. A 5,131-token prompt over two ggml_cuda
+        /// stages on two RTX 2000 Ada: 1.86 s in 256-row chunks, 2.17 s in 384, 1.98 s in 512, 2.20 s in 768 and 2.25 s in
+        /// 1,024 (Qwen3.5-9B Q8_0; 3.07 s one after another); 256 rows were also the fastest for Nemotron-H-8B, Qwen3.8-27B
+        /// and Mistral-Small-3.1-24B.</summary>
+        private static readonly int PipelinedChunkTokensDefault = ResolvePositiveEnv("TS_PIPELINED_CHUNK", 256);
+
+        /// <summary>Tests: the rows of a long prompt's chunks, pipelined or not (<c>TS_PREFILL_CHUNK</c>, 2,048, and
+        /// <c>TS_PIPELINED_CHUNK</c>, 256, otherwise), so a short prompt spans several.</summary>
+        internal int? PromptChunkTokensForTests { get; set; }
+
+        private int PromptChunkTokens => PromptChunkTokensForTests ?? PrefillChunkTokens;
+
+        private static readonly bool PipelinedChunkChosen = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_PIPELINED_CHUNK"));
+
+        /// <summary>The rows of a pipelined prompt's chunks: on direct CUDA its lone prompt step (the activations the device's room
+        /// holds, at most 2,048 rows: its products of prompt rows cost about the same at any rows, so 256-row chunks were slower
+        /// than no pipeline, Qwen3.8-27B UD-IQ3_XXS 17.4 s against 11.5 s), elsewhere <c>TS_PIPELINED_CHUNK</c> (256).</summary>
+        private int PipelinedChunkTokens => PromptChunkTokensForTests
+            ?? (_backend == BackendType.Cuda && !PipelinedChunkChosen ? CudaPipelinedChunkRows : PipelinedChunkTokensDefault);
+
         private readonly int _requestedTensorParallel;
         private readonly int _requestedStages;
 
@@ -60,6 +82,10 @@ namespace TensorSharp.Models
         private int _localHeads;
         private int _localKvHeads;
         private readonly ConcurrentDictionary<(Tensor Weight, int Device), Tensor> _replicas = new();
+
+        /// <summary>The whole-layer stage whose device is active (<see cref="EnterStage"/>): a stage's graphs read the model's
+        /// replicated weights from that device.</summary>
+        private int _activeStage;
 
         /// <param name="tpDegree">T, the tensor-parallel degree of every stage.</param>
         /// <param name="tpGroup">A caller-supplied device group: a distributed TP group, a
@@ -224,9 +250,9 @@ namespace TensorSharp.Models
         private protected int KvHeadsOf(int layer) => (uint)layer < (uint)_layerKvHeads.Length ? _layerKvHeads[layer] : Config.NumKVHeads;
 
         /// <summary>The KV heads of <paramref name="layer"/> one rank holds: the model's over the shard degree (all of them on
-        /// one device and on ggml's meta device, whose graphs keep global shapes).</summary>
+        /// one device).</summary>
         private protected int LocalKvHeadsOf(int layer)
-            => _graphTpRanks != null || _shardDegree <= 1 ? KvHeadsOf(layer) : KvHeadsOf(layer) / _shardDegree;
+            => _shardDegree <= 1 ? KvHeadsOf(layer) : KvHeadsOf(layer) / _shardDegree;
 
         /// <summary>The layer whose cache <paramref name="layer"/> attends (<see cref="KvSourceLayer"/>).</summary>
         private protected int KvSourceOf(int layer) => (uint)layer < (uint)_kvSource.Length ? _kvSource[layer] : layer;
@@ -1020,24 +1046,30 @@ namespace TensorSharp.Models
             _promptScope = true;
             try
             {
+                // Over local whole-layer stages the chunks pipeline: each stage works on its own chunk at once.
+                if (tokens is { Length: > 2 } && PipelinesPrompt(tokens.Length - 1))
+                {
+                    TryRunPipelinedPrompt(tokens, tokens.Length - 1);
+                    return ForwardCore(new[] { tokens[^1] });
+                }
                 // Long prompts run in chunks so the per-layer score tensor stays bounded
                 // (~heads x chunk x context). Media carry positions within one forward, and a
                 // multi-node pipeline follows the serialized protocol, so neither is chunked.
-                if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
+                if (tokens == null || tokens.Length <= PromptChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
                     return ForwardCore(tokens);
                 int last = tokens.Length - 1;
                 // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
                 IDisposable overlap = null;
-                if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
+                if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs)
                 {
                     EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
                     overlap = GraphExecutor.OverlapSteps();
                 }
                 try
                 {
-                    for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                    for (int pos = 0; pos < last; pos += PromptChunkTokens)
                     {
-                        int len = Math.Min(PrefillChunkTokens, last - pos);
+                        int len = Math.Min(PromptChunkTokens, last - pos);
                         RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
                     }
                 }
@@ -1864,6 +1896,7 @@ namespace TensorSharp.Models
         private void EnterStage(int stage)
         {
             if (_mesh == null || _mesh.IsSingleDevice) return;
+            _activeStage = stage;
             _allocator = _mesh.Allocator(stage, 0);
             if (IsGgmlBackend) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(stage, 0));
         }

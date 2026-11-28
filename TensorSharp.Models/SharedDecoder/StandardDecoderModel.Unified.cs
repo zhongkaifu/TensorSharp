@@ -32,12 +32,63 @@ namespace TensorSharp.Models
         /// 8.99 s at 31 GB). Elsewhere the scheduler's own steps (0).
         /// </summary>
         public int PreferredSoloPrefillTokens(int start, int remaining)
-            => _backend switch
+        {
+            int own = _backend switch
             {
                 BackendType.Mlx => Math.Min(remaining, MlxPromptStepTokens),
                 BackendType.Cuda => CudaPromptStepTokens(remaining),
                 _ => 0,
             };
+            return PipelinedSoloStep(remaining, own);
+        }
+
+        /// <summary>A lone prompt's step where it pipelines over whole-layer stages (StandardDecoderModel.PipelinedPrompt.cs).</summary>
+        internal const int PipelinedSoloStepTokens = 8192;
+
+        /// <summary>The rows a lone prompt step the model chose for its pipeline runs in when it does not pipeline after all
+        /// (a request's LoRA, say): the step it would have had (0: none chosen).</summary>
+        private int _pipelinedSoloFallbackRows;
+
+        /// <summary>The scheduler's own lone-prompt step (0 until the engine attaches the policy).</summary>
+        private int _schedulerSoloStepTokens;
+
+        public void UseSchedulerSoloStep(int tokens) => _schedulerSoloStepTokens = Math.Max(0, tokens);
+
+        /// <summary>The chunk rows direct CUDA's next pipelined prompt step takes (its lone prompt step, fitted to the device's
+        /// room by <see cref="CudaPromptStepTokens"/>; 0 until one was).</summary>
+        private int _cudaPipelinedChunk;
+
+        private int CudaPipelinedChunkRows => _cudaPipelinedChunk > 0 ? _cudaPipelinedChunk : _cudaPromptRows > 0 ? _cudaPromptRows : MaxCudaPromptStepRows;
+
+        /// <summary>
+        /// Where a lone prompt pipelines over the stages, it asks for steps of <see cref="PipelinedSoloStepTokens"/> (Muse Spark's
+        /// rule: a remainder of at most a quarter step joins the step before it), each step's chunks the pipeline's: the stages
+        /// fill and drain once a step, so the scheduler's 4,096-row steps (and direct CUDA's 2,048) each left a stage idle for
+        /// a chunk at either end, and on direct CUDA a step that is itself one chunk does not pipeline at all. On direct CUDA the
+        /// chunks are the step <paramref name="own"/> it fitted to the device's room. Else <paramref name="own"/>; and so once
+        /// a prompt was followed (a draft layer or DFlash ring takes its rows, and such a step does not pipeline): the engine
+        /// registers that only when it speculates, after the step is chosen, so the first such step runs in the steps it would
+        /// have had (the fallback in TryForwardSlots). Qwen3.8-27B carries an MTP layer and serves without speculation unless
+        /// asked: declined for the layer alone, its 5,131-token prompt over two ggml_cuda stages took 6.68 s in 4,096-row
+        /// steps against 6.43 s in one.
+        /// </summary>
+        private int PipelinedSoloStep(int remaining, int own)
+        {
+            _pipelinedSoloFallbackRows = 0;
+            if (remaining <= 0 || _promptsFollowed || _backend == BackendType.Mlx) return own;
+            if (_backend == BackendType.Cuda)
+            {
+                if (own <= 0) return own;   // the remainder fits one step of its own
+                _cudaPipelinedChunk = own;
+            }
+            int step = Math.Min(remaining, PipelinedSoloStepTokens);
+            int rest = remaining - step;
+            if (rest > 0 && rest <= PipelinedSoloStepTokens / 4) step = remaining;
+            if (step <= own || !PipelinesPrompt(step - 1)) return own;
+            // The step it would have had: its own, else the scheduler's (the refill's chunk where no engine said).
+            _pipelinedSoloFallbackRows = own > 0 ? own : _schedulerSoloStepTokens > 0 ? _schedulerSoloStepTokens : PromptChunkTokens;
+            return step;
+        }
 
         /// <summary>Device memory a direct-CUDA prompt step keeps beside its rows' activations (cuBLAS workspace, the
         /// dequantized-weight and activation scratch).</summary>
@@ -285,9 +336,8 @@ namespace TensorSharp.Models
         /// decode step had read back Qwen3.8's 248,320 logits (1 MB) and scanned them on the host.</summary>
         public bool SupportsUnifiedGreedyIds => GraphGreedyIds && !_rankGraphs && _mesh.Stages == 1;
 
-        /// <summary>This model's graphs may end in greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>) - except
-        /// tensor-parallel graphs on ggml's meta device, whose head reads its logits.</summary>
-        private bool GraphGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true && _graphTpRanks == null;
+        /// <summary>This model's graphs may end in greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>).</summary>
+        private bool GraphGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true;
 
         public bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens)
         {
@@ -518,13 +568,8 @@ namespace TensorSharp.Models
             if (_slotShares == null || _slotShares.Length == 0) return null;
             foreach (var (stage, rank, perToken, states) in _slotShares)
             {
-                long free, total;
-                if (SlotDeviceMemoryForTests?.Invoke(_mesh.GlobalDevice(stage, rank)) is { } stand)
-                    (free, total) = stand;
-                else if (_mesh.Allocator(stage, rank) is not IDeviceMemoryInfo memory || memory.SharesHostMemory
-                    || !memory.TryGetDeviceMemory(out free, out total))
-                    return null;
-                if (free < count * (perToken * capacity + states + SlotExtraBytes) + DeviceHeadroom(total) + PromptStepBytes)
+                if (MeshDeviceMemory(stage, rank) is not { } memory) return null;
+                if (memory.Free < count * (perToken * capacity + states + SlotExtraBytes) + DeviceHeadroom(memory.Total) + PromptStepBytes)
                     return false;
             }
             return true;

@@ -151,6 +151,36 @@
       ]
     },
     {
+      "id": "qwen3vl",
+      "aliases": [
+        "qwen3vl",
+        "qwen3vlmoe"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "layout": "dense_or_moe",
+      "notes": "Qwen3-VL dense and MoE on the shared decoder runtime (DeepStack, interleaved M-RoPE); the model's mmproj is required for media.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Qwen3VL/Qwen3VLArchitecture.cs",
+        "docs/models/qwen3vl.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
+    },
+    {
       "id": "qwen4exp",
       "aliases": [
         "qwen4exp"
@@ -182,6 +212,57 @@
         "qwen3.8-flash-next-mtp",
         "qwen3.8-flash-next-ud-q2_k_xl"
       ]
+    },
+    {
+      "id": "inkling2",
+      "aliases": [
+        "inkling2",
+        "inkling2_loop"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "layout": "moe",
+      "notes": "Looped mixture of experts on the shared runtime: whole-forward graphs on one device; --tp, --layer-split and expert offload are declared gaps.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Inkling2/Inkling2Architecture.cs",
+        "docs/design/inkling2-on-shared-runtime.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its design doc, so no regression preset can plan it.",
+      "presets": []
+    },
+    {
+      "id": "raon1nano",
+      "aliases": [
+        "raon1nano"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "layout": "dense",
+      "notes": "KRAFTON Raon-1 nano on the shared decoder runtime as whole-forward graphs; --layer-split on ggml_cuda and ggml_vulkan, --tp a declared gap.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Raon/RaonArchitecture.cs",
+        "docs/models/raon.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
     },
     {
       "id": "gptoss",
@@ -264,9 +345,9 @@
       "layout": "dense",
       "notes": "Only Qwen-Image 2.1; earlier models refused. Direct CUDA/MLX refused. Requires dedicated VAE and Qwen3-VL encoder.",
       "source_evidence": [
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md",
-        "TensorSharp.Models/Models/QwenImage/QwenImageArchitecture.cs"
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21Architecture.cs"
       ],
       "configuration_status": "configured",
       "presets": [
@@ -2282,7 +2363,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-anime-consistency.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2311,7 +2392,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-casual-phone.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2340,7 +2421,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-detail-enhancer.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2369,7 +2450,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-film-stills.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2398,7 +2479,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-fix.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2427,7 +2508,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-fun-acc-4step.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2456,7 +2537,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-grainscape.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2485,7 +2566,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-natural-exposure.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2514,7 +2595,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-object-mover.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2543,7 +2624,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-object-remover.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2572,7 +2653,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-pruna-5step.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2601,7 +2682,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-pruna-8step.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2630,7 +2711,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-viggle-turbo.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -2659,7 +2740,7 @@
       ],
       "source_evidence": [
         "config/lora/qwen-image-2.1-voxel-style.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md"
       ],
       "layout": "dense",
@@ -3374,7 +3455,7 @@
       ],
       "source_evidence": [
         "config/qwen-image-2.1-turbo.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md",
         "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
       ],
@@ -3412,7 +3493,7 @@
       ],
       "source_evidence": [
         "config/qwen-image-2.1.json",
-        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "TensorSharp.Models/Models/QwenImage21/QwenImage21DiffusionModel.cs",
         "docs/models/qwenimage21.md",
         "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
       ],
@@ -5125,7 +5206,7 @@
         "eng/regression/speculation.py",
         "benchmarks/AgentTurnBench/Program.cs",
         "eng/validation/validate-speculative-rows.py",
-        "TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs",
+        "TensorSharp.Models/SharedDecoder/StandardDecoderModel.Speculative.cs",
         "TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Speculative.cs",
         "TensorSharp.Models/Models/MiniMaxM3/MiniMaxM3Model.Speculative.cs"
       ],

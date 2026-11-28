@@ -47,7 +47,7 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
     {
         ModelArchitectureDescriptor d = ModelArchitectureRegistry.All.Single(a => a.Id == MiniMaxH3ImageFamily.ArchitectureId);
         Assert.Equal(ServingImplementation.SharedDiffusionRuntime, d.Serving.Implementation);
-        Assert.Equal(new[] { BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda }, d.Serving.Backends);
+        Assert.Equal(new[] { BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.Cuda }, d.Serving.Backends);
         Assert.False(d.Serving.Autoregressive);
         Assert.Equal(SupportKind.NotApplicable, d.Serving.ContinuousBatching.Kind);
         Assert.Equal(ServingContract.DiffusionJobsReason, d.Serving.ContinuousBatching.Reason);
@@ -144,22 +144,32 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
         using var vae = new MiniMaxH3ImageVaeFixture(2);
         Companions(dit.Dir, vae);
         var model = Assert.Throws<ModelLoadRefusedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlVulkan));
-        Assert.Contains("runs on --backend ggml_cuda, ggml_metal or ggml_cpu, not ggml_vulkan", model.Message);
+        Assert.Contains("runs on --backend ggml_cuda, ggml_metal, ggml_cpu or cuda, not ggml_vulkan", model.Message);
         var denoiser = Assert.Throws<NotSupportedException>(() => new MiniMaxH3ImageDenoiser(dit.DitPath, BackendType.GgmlVulkan));
         Assert.EndsWith("not ggml_vulkan.", denoiser.Message);
         var codec = Assert.Throws<NotSupportedException>(() => new MiniMaxH3ImageVaeCodec(vae.VaePath, BackendType.GgmlVulkan));
         Assert.EndsWith("not ggml_vulkan.", codec.Message);
     }
 
-    /// <summary>Multi-GPU requests are refused by the contract's gaps, as for any family, before anything loads.</summary>
+    /// <summary>Tensor parallelism is the contract's on direct CUDA (DenoiserRanks: MiniMaxH3ImageTensorParallelTests) and a gap
+    /// on ggml_cuda, whose ranked runner refuses the step's offload nodes: there the gate refuses it with that reason before
+    /// anything loads. Layer split is the contract's on ggml_cuda and cuda (whole-block stages:
+    /// MiniMaxH3ImageLoraDenoiserTests.WholeBlockStages*, MiniMaxH3ImageTensorParallelTests), so the gate lets it through, and
+    /// on a backend of one device it is refused there; the hybrid is a gap on both.</summary>
     [Fact]
-    public void TensorParallelAndLayerSplitAreTheContractsGaps()
+    public void TensorParallelIsDirectCudasAndLayerSplitPassesItsGate()
     {
         using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16, safetensors: true);
+        ServingContract serving = MiniMaxH3ImageArchitecture.Descriptor.Serving;
+        Assert.Equal(new[] { BackendType.Cuda }, serving.TensorParallel.Backends);
+        Assert.Equal(MiniMaxH3ImageDenoiser.GgmlTensorParallelGap, serving.TensorParallel.GapReason);
         var tp = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCuda, tpDegree: 2));
-        Assert.Contains("tensor-parallel", tp.Message);
-        var split = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCuda, layerSplitDegree: 2));
-        Assert.Contains("layer-split", split.Message);
+        Assert.Contains("does not implement --tp 2 on --backend ggml_cuda", tp.Message);
+        Assert.Contains("ranked graph runner refuses programs with diffusion-transformer offload nodes", tp.Message);
+        Assert.Equal(new[] { BackendType.GgmlCuda, BackendType.Cuda }, serving.LayerSplit.Backends);
+        Assert.Empty(serving.HybridParallel.Backends);
+        var cpu = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCpu, layerSplitDegree: 2));
+        Assert.Contains("layer-split", cpu.Message);
     }
 
     /// <summary>The family's detector: the H3 DiT's video and text projections under one prefix, and no audio stream.</summary>

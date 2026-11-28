@@ -500,7 +500,7 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_SCHED_MAX_BATCHED_TOKENS` | `4096` | 每步 token 预算。 |
 | `TS_SCHED_MAX_RUNNING_SEQS` | `16` | 最大同时执行序列数。 |
 | `TS_SCHED_PREFILL_CHUNK` | `256` | 存在活跃 decode 时每请求的 prefill 上限；仅 prefill 的步骤会公平分配完整 token 预算。服务端参数：`--prefill-chunk-size N`。 |
-| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | solo（无争用）请求的每步 prefill 上限——以大分块把 prompt 送入融合整图 prefill 路径。受 `TS_SCHED_MAX_BATCHED_TOKENS` 约束。有自己单请求步长的模型（`ISoloPrefillBudgetModel`）——启用流水化 prefill 的 Muse Spark：8192 token，不超过 2048 的余量并入前一步——在未设置该变量时自行决定步长，且步长可超过 `TS_SCHED_MAX_BATCHED_TOKENS`；设置了该变量则按此处所述生效，并关闭模型自己的步长。只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。引擎日志会说明当前生效的是哪条规则。 |
+| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | solo（无争用）请求的每步 prefill 上限——以大分块把 prompt 送入融合整图 prefill 路径。受 `TS_SCHED_MAX_BATCHED_TOKENS` 约束。有自己单请求步长的模型（`ISoloPrefillBudgetModel`）——启用流水化 prefill 的 Muse Spark，以及在 `ggml_cuda`、`ggml_vulkan` 和 `cuda` 上以本机 `--layer-split` 分段运行的共享解码运行时（直到有 prompt 被草稿器跟随为止）：8192 token，不超过 2048 的余量并入前一步——在未设置该变量时自行决定步长，且步长可超过 `TS_SCHED_MAX_BATCHED_TOKENS`；设置了该变量则按此处所述生效，并关闭模型自己的步长。只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。引擎日志会说明当前生效的是哪条规则。 |
 | `TS_SCHED_NUM_BLOCKS` | `256` | 引擎块池物理块数。 |
 | `TS_SCHED_BLOCK_SIZE` | 只靠页面复用的家族（Hunyuan Dense、Mistral 3）为 `16`，其余为 `256` | 每块 token 数。只靠整页做跨请求复用的家族按这个粒度复用：块大小为 256 时，短于一块的一轮什么都复用不了。 |
 | `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭准入时的全部提示复用：Radix 的页面、终态与检查点。`--no-prefix-cache`（CLI 与服务端）会设置它。 |

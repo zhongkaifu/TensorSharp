@@ -29,5 +29,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// request one more forward pass, which for a model whose pass has a large fixed cost is most
         /// of a short turn's latency. 0 (the default) cuts at every boundary.</summary>
         int CheckpointGapTokens => 0;
+
+        /// <summary>The scheduler's own lone-prompt step (<see cref="SchedulerConfig.SoloPrefillChunkSize"/> bounded by
+        /// <see cref="SchedulerConfig.MaxNumBatchedTokens"/>), told once when the policy attaches: a step the model chose
+        /// that does not run as it planned (the shared decoder runtime's pipelined prompts, where a request turns out to have
+        /// its prompt followed by a drafter) runs in the steps it would have had.</summary>
+        void UseSchedulerSoloStep(int tokens) { }
     }
 }

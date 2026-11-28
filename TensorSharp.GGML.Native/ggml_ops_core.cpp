@@ -1397,28 +1397,6 @@ namespace tsg
         return true;
     }
 
-    // Probe-only lookup: an EXISTING DeviceCopy-mode cached buffer for `data`
-    // covering exactly `bytes`. Never allocates, uploads, or evicts — callers
-    // that only want to READ the current resident bytes (the qwen4exp arena join)
-    // use this so probing absent entries cannot create device copies.
-    bool try_peek_cached_device_copy(const void* data, std::size_t bytes,
-                                     ggml_backend_buffer_t& out_buffer, void*& out_addr)
-    {
-        out_buffer = nullptr;
-        out_addr = nullptr;
-        if (data == nullptr || bytes == 0)
-            return false;
-        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-        auto it = g_host_buffer_cache.find(const_cast<void*>(data));
-        if (it == g_host_buffer_cache.end() ||
-            it->second.mode != CachedBufferMode::DeviceCopy ||
-            it->second.bytes != bytes)
-            return false;
-        out_buffer = it->second.buffer;
-        out_addr = cached_buffer_addr(it->second);
-        return out_addr != nullptr;
-    }
-
     bool try_get_cacheable_tensor_buffer(
         ggml_backend_t backend, ggml_backend_dev_t dev,
         ggml_tensor* tensor, void* data, std::size_t bytes,
@@ -3968,12 +3946,6 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
     return 1;
 }
 
-namespace tsg_graphtp
-{
-    void on_drop(void* ptr);
-    void on_drop_ranges(const tsg::HostRanges& ranges);
-    bool sync_to_host(void* ptr, std::size_t size);
-}
 
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
@@ -3985,7 +3957,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
         invalidate_cached_buffer(ptr);
     }
 
-    tsg_graphtp::on_drop(ptr);
     tsg::moe_hot_tier_on_drop(ptr);
     tsg::host_expert_io_on_drop(ptr);
 }
@@ -4051,7 +4022,6 @@ TSG_EXPORT int TSGgml_ReleaseHostRanges(const void* const* bases, const std::uin
         }
 
         tsg::cpu_repack_forget_ranges(ranges.spans);
-        tsg_graphtp::on_drop_ranges(ranges);
         tsg::moe_hot_tier_drop_ranges(ranges);
         for (const auto& span : ranges.spans) tsg::host_expert_io_on_drop(reinterpret_cast<const void*>(span.first));
         tsg::host_pin_release_ranges(ranges.spans);
@@ -4069,7 +4039,7 @@ TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
 {
     // Queued work (an overlapped graph step, Metal's lazy sync) may still write what this downloads.
     host_read_barrier();
-    bool any = tsg_graphtp::sync_to_host(ptr, size);
+    bool any = false;
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {
         tsg::ScopedRank rank(r);

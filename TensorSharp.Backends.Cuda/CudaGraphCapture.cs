@@ -31,7 +31,17 @@ namespace TensorSharp.Cuda
     internal static class CudaGraphCapture
     {
         private static readonly object Sync = new object();
-        private static CaptureContext active;
+        // The allocators being captured, each with its context: one, or every rank of a tensor-parallel decode step recorded
+        // as one graph (RankedDecodeCapture). Replaced whole under Sync, read without it.
+        private static CaptureContext[] actives = Array.Empty<CaptureContext>();
+
+        /// <summary>The context of the capture on <paramref name="allocator"/>, or null.</summary>
+        private static CaptureContext Of(CudaAllocator allocator)
+        {
+            foreach (CaptureContext ctx in Volatile.Read(ref actives))
+                if (ReferenceEquals(ctx.Allocator, allocator)) return ctx;
+            return null;
+        }
 
         internal sealed class CaptureContext
         {
@@ -45,14 +55,21 @@ namespace TensorSharp.Cuda
             public readonly List<IntPtr> DonatedHostBuffers = new List<IntPtr>();
         }
 
-        internal static CaptureContext Begin(CudaAllocator allocator)
+        /// <summary>Start tracking a capture on <paramref name="allocator"/>; null while one is tracked there already, or while
+        /// a capture another caller began is open (<paramref name="joining"/>: this allocator joins that capture, as a rank of
+        /// one recorded tensor-parallel step).</summary>
+        internal static CaptureContext Begin(CudaAllocator allocator, bool joining = false)
         {
             lock (Sync)
             {
-                if (active != null)
+                if (joining ? Of(allocator) != null : actives.Length != 0)
                     return null;
-                active = new CaptureContext { Allocator = allocator };
-                return active;
+                var ctx = new CaptureContext { Allocator = allocator };
+                var next = new CaptureContext[actives.Length + 1];
+                actives.CopyTo(next, 0);
+                next[^1] = ctx;
+                Volatile.Write(ref actives, next);
+                return ctx;
             }
         }
 
@@ -60,19 +77,19 @@ namespace TensorSharp.Cuda
         {
             lock (Sync)
             {
-                if (ReferenceEquals(active, context))
-                    active = null;
+                int at = Array.IndexOf(actives, context);
+                if (at < 0) return;
+                var next = new CaptureContext[actives.Length - 1];
+                for (int i = 0, j = 0; i < actives.Length; i++)
+                    if (i != at) next[j++] = actives[i];
+                Volatile.Write(ref actives, next);
             }
         }
 
         /// <summary>A capture is being recorded on some allocator.</summary>
-        internal static bool AnyCapturing => active != null;
+        internal static bool AnyCapturing => Volatile.Read(ref actives).Length != 0;
 
-        internal static bool IsCapturing(CudaAllocator allocator)
-        {
-            CaptureContext ctx = active;
-            return ctx != null && ReferenceEquals(ctx.Allocator, allocator);
-        }
+        internal static bool IsCapturing(CudaAllocator allocator) => Of(allocator) != null;
 
         // Allocators a just-ended capture is settling on (CudaPrefillGraphCache.EndCaptureAndLaunch, from before the capture
         // ends until its graph has taken the pool blocks its kernels used), with how many; under Sync.
@@ -123,8 +140,8 @@ namespace TensorSharp.Cuda
 
         internal static void OnRent(CudaAllocator allocator, IntPtr ptr, long bytes)
         {
-            CaptureContext ctx = active;
-            if (ctx == null || !ReferenceEquals(ctx.Allocator, allocator) || ptr == IntPtr.Zero)
+            CaptureContext ctx = Of(allocator);
+            if (ctx == null || ptr == IntPtr.Zero)
                 return;
             lock (Sync)
             {
@@ -141,8 +158,8 @@ namespace TensorSharp.Cuda
         /// </summary>
         internal static bool InterceptReturn(CudaAllocator allocator, IntPtr ptr, long bytes, bool wouldPool)
         {
-            CaptureContext ctx = active;
-            if (ctx == null || !ReferenceEquals(ctx.Allocator, allocator) || ptr == IntPtr.Zero)
+            CaptureContext ctx = Of(allocator);
+            if (ctx == null || ptr == IntPtr.Zero)
                 return false;
             lock (Sync)
             {
@@ -166,8 +183,8 @@ namespace TensorSharp.Cuda
         /// at the capture's end unless the region's join released it (through <see cref="InterceptReturn"/>) first.</summary>
         internal static void OnDeferredReturn(CudaAllocator allocator, IntPtr ptr, long bytes)
         {
-            CaptureContext ctx = active;
-            if (ctx == null || !ReferenceEquals(ctx.Allocator, allocator) || ptr == IntPtr.Zero)
+            CaptureContext ctx = Of(allocator);
+            if (ctx == null || ptr == IntPtr.Zero)
                 return;
             lock (Sync) ctx.DeferredBlocks.Add((ptr, bytes));
         }
@@ -175,8 +192,8 @@ namespace TensorSharp.Cuda
         internal static void OnHostBufferOrphaned(CudaAllocator allocator, IntPtr hostBuffer, out bool donated)
         {
             donated = false;
-            CaptureContext ctx = active;
-            if (ctx == null || !ReferenceEquals(ctx.Allocator, allocator) || hostBuffer == IntPtr.Zero)
+            CaptureContext ctx = Of(allocator);
+            if (ctx == null || hostBuffer == IntPtr.Zero)
                 return;
             lock (Sync)
             {
@@ -201,11 +218,11 @@ namespace TensorSharp.Cuda
 
         internal static void OnStreamSynchronize(IntPtr streamHandle)
         {
-            CaptureContext ctx = active;
-            if (ctx != null && ctx.Allocator.Stream.Handle == streamHandle)
-                throw new CudaGraphCaptureAbortedException(
-                    "Stream synchronization (host read of device data) is not permitted while a CUDA graph capture is active."
-                    + (DiagnosticLog ? "\n" + Environment.StackTrace : string.Empty));
+            foreach (CaptureContext ctx in Volatile.Read(ref actives))
+                if (ctx.Allocator.Stream.Handle == streamHandle)
+                    throw new CudaGraphCaptureAbortedException(
+                        "Stream synchronization (host read of device data) is not permitted while a CUDA graph capture is active."
+                        + (DiagnosticLog ? "\n" + Environment.StackTrace : string.Empty));
         }
     }
 
@@ -255,8 +272,19 @@ namespace TensorSharp.Cuda
         // allocators may launch ordinary work concurrently. Keep the ambient
         // source thread-local and retain the owning instance so a launcher can
         // reject a dynamic pointer that belongs to another allocator/stream.
+        // The active blocks: one, or each rank's of a tensor-parallel step recorded as one graph (each read by its own
+        // allocator's launches).
         [ThreadStatic]
-        private static CudaDecodeDynParams activeInstance;
+        private static CudaDecodeDynParams[] activeInstances;
+
+        private static CudaDecodeDynParams ActiveFor(CudaAllocator launchAllocator)
+        {
+            CudaDecodeDynParams[] active = activeInstances;
+            if (active != null)
+                foreach (CudaDecodeDynParams p in active)
+                    if (ReferenceEquals(p.allocator, launchAllocator)) return p;
+            return null;
+        }
 
         [ThreadStatic]
         private static int captureMaxAttendLen;
@@ -291,8 +319,8 @@ namespace TensorSharp.Cuda
         /// sequence aborts the recording (it would replay one sequence's length for another's).</summary>
         internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator, Storage owner)
         {
-            CudaDecodeDynParams active = activeInstance;
-            if (active == null || !ReferenceEquals(active.allocator, launchAllocator) || active.devicePtr == IntPtr.Zero)
+            CudaDecodeDynParams active = ActiveFor(launchAllocator);
+            if (active == null || active.devicePtr == IntPtr.Zero)
                 return IntPtr.Zero;
             int sequence = 0;
             if (active.sequences > 1 && (owner == null || !active.sequenceOf.TryGetValue(owner, out sequence)))
@@ -303,8 +331,8 @@ namespace TensorSharp.Cuda
         /// <summary>Whether a recorded step is being captured on <paramref name="launchAllocator"/> (its lengths read on the device).</summary>
         internal static bool IsActive(CudaAllocator launchAllocator)
         {
-            CudaDecodeDynParams active = activeInstance;
-            return active != null && ReferenceEquals(active.allocator, launchAllocator) && active.devicePtr != IntPtr.Zero;
+            CudaDecodeDynParams active = ActiveFor(launchAllocator);
+            return active != null && active.devicePtr != IntPtr.Zero;
         }
 
         /// <summary>The recorded step's sequences, by the tensors their launchers name them by (each sequence's caches): one
@@ -399,19 +427,29 @@ namespace TensorSharp.Cuda
         /// <see cref="Deactivate"/> in a finally).</summary>
         public void Activate()
         {
-            activeInstance = this;
+            activeInstances = new[] { this };
+            captureMaxAttendLen = 0;
+        }
+
+        /// <summary>Every rank's block of a tensor-parallel step recorded as one graph, each for its own allocator's launches
+        /// (clear with <see cref="Deactivate"/>).</summary>
+        public static void ActivateAll(IReadOnlyList<CudaDecodeDynParams> blocks)
+        {
+            var active = new CudaDecodeDynParams[blocks.Count];
+            for (int i = 0; i < active.Length; i++) active[i] = blocks[i];
+            activeInstances = active;
             captureMaxAttendLen = 0;
         }
 
         public static void Deactivate()
         {
-            activeInstance = null;
+            activeInstances = null;
             windowRow = 0;
         }
 
         internal static void LimitCaptureAttendLen(int limit)
         {
-            if (activeInstance != null &&
+            if (activeInstances != null &&
                 limit > 0 &&
                 (captureMaxAttendLen == 0 || limit < captureMaxAttendLen))
             {
@@ -423,8 +461,8 @@ namespace TensorSharp.Cuda
         {
             if (devicePtr != IntPtr.Zero)
             {
-                if (ReferenceEquals(activeInstance, this))
-                    activeInstance = null;
+                if (activeInstances != null && Array.IndexOf(activeInstances, this) >= 0)
+                    activeInstances = null;
                 allocator?.Context.MakeCurrent();
                 CudaDriverApi.cuMemFree(devicePtr);
                 devicePtr = IntPtr.Zero;
@@ -682,6 +720,25 @@ namespace TensorSharp.Cuda
                 return false;
             }
 
+            StoreEntry(key, ctx, exec, graph, pinnedHidden, keepAlive, maxAttendLen);
+            CudaDriverApi.cuGraphLaunch(exec, allocator.Stream.Handle).ThrowOnError();
+            CaptureCount++;
+            if (Log)
+                Console.WriteLine($"[cuda-graph] captured {key} ({entries[key].OwnedBlocks.Count} owned blocks)");
+            return true;
+        }
+
+        /// <summary>
+        /// Aborts an active capture after a failure (illegal sync, CUDA error).
+        /// Pops the stream out of capture mode, releases quarantined blocks and
+        /// blacklists the key so the shape never tries again.
+        /// </summary>
+        /// <summary>Take ownership of every pool block the captured kernels used on this allocator and keep the recording as
+        /// <paramref name="key"/>'s entry (<paramref name="exec"/> zero for a rank that joined another's capture: the graph is
+        /// that rank's to launch).</summary>
+        private void StoreEntry(string key, CudaGraphCapture.CaptureContext ctx, IntPtr exec, IntPtr graph, Tensor pinnedHidden,
+            IEnumerable<Tensor> keepAlive, int maxAttendLen)
+        {
             // Take ownership of every pool block the captured kernels used: the
             // free ones are stolen out of the pool so nothing else can rent them
             // while this graph can replay.
@@ -733,19 +790,91 @@ namespace TensorSharp.Cuda
                 LastUse = ++useCounter,
                 MaxAttendLen = maxAttendLen,
             };
-
-            CudaDriverApi.cuGraphLaunch(exec, allocator.Stream.Handle).ThrowOnError();
-            CaptureCount++;
-            if (Log)
-                Console.WriteLine($"[cuda-graph] captured {key} ({owned.Count} owned blocks)");
-            return true;
         }
 
         /// <summary>
-        /// Aborts an active capture after a failure (illegal sync, CUDA error).
-        /// Pops the stream out of capture mode, releases quarantined blocks and
-        /// blacklists the key so the shape never tries again.
+        /// Join the capture another rank's cache began (<see cref="BeginCapture"/>): this allocator's stream waits on
+        /// <paramref name="fork"/>, an event recorded on the capturing stream, and so records into the same graph (a
+        /// tensor-parallel decode step recorded as one graph over its ranks' devices); its memory is tracked as a capture's.
         /// </summary>
+        internal bool BeginJoinedCapture(string key, IntPtr fork)
+        {
+            if (!IsUsable || captureContext != null)
+                return false;
+            CudaGraphCapture.CaptureContext ctx = CudaGraphCapture.Begin(allocator, joining: true);
+            if (ctx == null)
+                return false;
+            allocator.Context.MakeCurrent();
+            if (CudaDriverApi.cuStreamWaitEvent(allocator.Stream.Handle, fork, 0) != 0)
+            {
+                CudaGraphCapture.End(ctx);
+                return false;
+            }
+            captureContext = ctx;
+            captureKey = key;
+            return true;
+        }
+
+        /// <summary>The capture this cache joined ended (<paramref name="recorded"/>: its graph was made): the blocks its work
+        /// used become <paramref name="key"/>'s entry, which keeps <paramref name="keepAlive"/> and launches nothing itself, or
+        /// go back.</summary>
+        internal void EndJoinedCapture(string key, Tensor pinnedHidden, IEnumerable<Tensor> keepAlive, bool recorded)
+        {
+            CudaGraphCapture.CaptureContext ctx = captureContext;
+            if (ctx == null || !string.Equals(captureKey, key, StringComparison.Ordinal))
+                return;
+            CudaGraphCapture.BeginSettling(allocator);
+            try
+            {
+                CudaGraphCapture.End(ctx);
+                captureContext = null;
+                captureKey = null;
+                if (recorded)
+                {
+                    StoreEntry(key, ctx, IntPtr.Zero, IntPtr.Zero, pinnedHidden, keepAlive, 0);
+                    CaptureCount++;
+                }
+                else
+                {
+                    ReleaseContextBlocks(ctx);
+                    blacklist.Add(key);
+                }
+            }
+            finally
+            {
+                CudaGraphCapture.EndSettling(allocator);
+            }
+        }
+
+        /// <summary>The joined capture failed: tracking ends, the blocks go back, and a stream the capture left recording is
+        /// taken out of it.</summary>
+        internal void AbortJoinedCapture(string key)
+        {
+            CudaGraphCapture.CaptureContext ctx = captureContext;
+            if (ctx == null)
+                return;
+            allocator.Context.MakeCurrent();
+            if (CudaDriverApi.cuStreamIsCapturing(allocator.Stream.Handle, out int status) == 0 && status != 0
+                && CudaDriverApi.cuStreamEndCapture(allocator.Stream.Handle, out IntPtr graph) == 0 && graph != IntPtr.Zero)
+                CudaDriverApi.cuGraphDestroy(graph);
+            CudaGraphCapture.End(ctx);
+            captureContext = null;
+            captureKey = null;
+            ReleaseContextBlocks(ctx);
+            blacklist.Add(key);
+        }
+
+        /// <summary>Another rank launched the graph this cache's <paramref name="key"/> joined: its tensors were rewritten on
+        /// the device.</summary>
+        internal void MarkReplayed(string key)
+        {
+            Entry entry = entries[key];
+            MarkDeviceModified(entry.InputHidden);
+            foreach (Tensor t in entry.KeepAlive)
+                MarkDeviceModified(t);
+            ReplayCount++;
+        }
+
         public void AbortCapture(string key) => AbortCapture(key, null);
 
         public void AbortCapture(string key, string reason)
@@ -802,7 +931,7 @@ namespace TensorSharp.Cuda
             // The graph may have a replay in flight; entries are only disposed
             // between forwards (each forward ends in a logits sync), so the
             // stream is idle with respect to this graph here.
-            CudaDriverApi.cuGraphExecDestroy(entry.Exec);
+            if (entry.Exec != IntPtr.Zero) CudaDriverApi.cuGraphExecDestroy(entry.Exec);
             if (entry.Template != IntPtr.Zero) CudaDriverApi.cuGraphDestroy(entry.Template);
             foreach (Tensor t in entry.KeepAlive)
                 t.Dispose();

@@ -21,7 +21,8 @@ TensorSharp 在其共享扩散运行时（`TensorSharp.Models.SharedDiffusion`�
 系列的文本编码器及其视觉塔、去噪器与 VAE 编码器和解码器，由同一条流水线按阶段运行）上运行文生图与
 图像编辑（最多 16 张参考图，见[图像编辑](#图像编辑)），`ggml_cuda`、`ggml_metal` 与 `ggml_cpu` 均可
 端到端运行。已用真实权重在 `ggml_cuda`（H100 与 A40）和 `ggml_metal`（M5 Pro）上实测；`ggml_cpu`
-运行相同的程序（已在小型合成检查点上验证；使用真实权重时每张图需要数十分钟）。编辑可以用遮罩限定在 `<Picture 1>` 的
+运行相同的程序（已在小型合成检查点上验证；使用真实权重时每张图需要数十分钟）。文生图与编辑也可在 `cuda`（直接 CUDA）上以单卡或
+多卡运行（见[多 GPU](#多-gpu)），已在两张 RTX PRO 4000 上实测。编辑可以用遮罩限定在 `<Picture 1>` 的
 一个选区内（见[遮罩编辑](#遮罩编辑)），聊天宿主可以跨轮次连续编辑（见[多轮对话](#多轮对话)）。
 
 | 组件 | 文件 | 来源 |
@@ -278,6 +279,43 @@ TensorAgent 的聊天（其 `/api/chat` 轮次）会把每条消息与之前的�
   `int8` 让 DiT 的投影在 int8 Tensor Core 上运行（见下文）；`int8-all` 再加上 VAE 解码器的 F16 投影。它取代
   `TS_H3_INT8_MATMUL`（`1` 即 `int8`，`all` 即 `int8-all`），主机现在会按名称拒绝该旧变量。其他后端照旧按原样运行，
   主机会提示一次。
+
+## 多 GPU
+
+- **`--backend cuda`。** DiT 在 CUDA 图执行器上运行同一个每步程序，与 MiniMax-H3 视频去噪器在该后端运行其 50 个块的方式相同：
+  所有矩阵乘保持 F32 激活（不加 q8_1 保护），注意力、旋转位置编码、调制、门控残差与 LoRA 更新由执行器自带的内核完成。
+  文本编码器与视觉塔使用 MiniMax-H3 的直接实现，VAE 解码器与编码器在 CUDA 执行器上运行同样的程序（其 `GraphOp.GroupNorm`
+  即每组连续数据的 layer norm），因此编辑也可在该后端运行。其矩阵乘保持 F32 激活，所以同一张卡上一步比 `ggml_cuda` 的 int8
+  张量核心乘法慢约五倍（见下文）。
+- **`--layer-split N`**（`ggml_cuda`、`cuda`）。把 50 个块按整块分段，每张 GPU 一段（按权重字节均衡）；每张 GPU 只保存
+  本段的权重与 LoRA 因子，残差流逐段传递，文本编码器与 VAE 在第一张 GPU 上运行。这是容量模式：单步并不比能容纳全部权重的单卡更快。
+- **`--tp N`**（`cuda`）。按 Megatron 方式切分 DiT：每张 GPU 持有每个注意力的 `56 / N` 个头（堆叠 q、k、v 的行）与
+  `14336 / N` 个 MLP 列（gate 与 value 的行），以及注意力输出与 fc2 对应的输入列，二者之后各在 GPU 间求和一次（每块两次 all-reduce）；
+  token refiner、调制、归一化、patch 投影、最终层与输出头在每张 GPU 上完整保存。LoRA 更新按同样方式切分。`N` 必须整除头数，
+  且行并行切分不能切断量化块（Q4_K：`--tp 2` 与 `4` 可以，`8` 不行）；其他情况在加载时拒绝。`ggml_cuda` 上的 `--tp`
+  会被拒绝：其分 rank 图运行器不运行含有该步融合 DiT 节点的程序。`--tp` 与 `--layer-split` 同时使用也会被拒绝。
+- **验证。** 在合成检查点上，托管执行器在两个模拟设备上的切分步与单设备一致，相对 L2 误差在 4e-7 以内（Q8_0 在 3e-5 以内，
+  因为托管乘法会对激活做舍入），带与不带 LoRA 均如此（`MiniMaxH3ImageTensorParallelTests`）；CUDA 测试（单 GPU 对比托管执行器、
+  两张 GPU 的分段与 `--tp 2` 对比单 GPU、解码器对比冻结像素、编码器对比 NumPy oracle）在两张 RTX PRO 4000 上通过。
+- **实测**（2026-11-28，两张 NVIDIA RTX PRO 4000 Blackwell，各 24 GB，PCIe，无 NCCL；ggml `bb877c0c` 未改动，CUDA 13.2）：
+  `config/minimax-h3-image-q4km.json`（剪枝的 Q4_K_M DiT），提示词 "a red paper lantern in a snowy courtyard at dusk"，1024x1024，
+  `--diffusion-seed 7`，每项一次；编辑以单卡 `ggml_cuda` 生成的图片为 `<Picture 1>`，提示词 "Make the lantern in <Picture 1> deep
+  blue, keep everything else the same"（在 2048x2048 上采样，返回 1024x1024）。时间为去噪循环（括号内为第一步之后的步时中位数，
+  第一步还要编译与上传）；峰值为每 0.5 秒采样的各卡显存占用，第一张卡还持有文本编码器与 VAE：
+
+  | 工作负载 | 单卡 | `--layer-split 2` | `--tp 2` | 与单卡相比 PSNR：层切分 / TP |
+  |---|---:|---:|---:|---|
+  | `ggml_cuda` | 5.8 s（0.70 s），15.3 GB | 5.8 s（0.68 s），22.8 + 6.9 GB | 拒绝 | 逐字节相同 / - |
+  | `ggml_cuda`，pDMD 2 步 | 3.3 s，15.5 GB | 3.5 s，15.2 + 7.6 GB | 拒绝 | 逐字节相同 / - |
+  | `ggml_cuda`，编辑 | 26.3 s（4.17 s），17.7 GB | | 拒绝 | |
+  | `cuda` | 28.1 s（3.50 s），13.3 GB | 22.4 s（3.47 s），12.4 + 6.7 GB | 13.8 s（1.92 s），12.1 + 7.3 GB | 逐字节相同 / 52.3 dB |
+  | `cuda`，pDMD 2 步 | 9.0 s（3.66 s），15.8 GB | | 8.1 s（1.97 s），11.9 + 8.9 GB | - / 61.8 dB |
+  | `cuda`，编辑 | 144.3 s（23.9 s），18.0 GB | 147.7 s（24.5 s），16.3 + 9.0 GB | 84.5 s（12.6 s），16.3 + 9.7 GB | 逐字节相同 / 57.9 dB |
+
+  层切分逐字节给出单卡的像素；`--tp 2` 让直接 CUDA 的一步快 1.8–1.9 倍，与单卡的差别只来自部分和的求和顺序。每次编辑都把灯笼
+  变成蓝色并保留其余内容。两个后端的乘法不同（`ggml_cuda` 为 q8_1 保护的 int8，`cuda` 为 F32 激活）：庭院相同，细节有别
+  （21.1 dB；编辑 42.0 dB）。装得下时，单卡 `ggml_cuda` 仍是最快的放置；该后端上的 `--tp` 尚未支持（其分 rank 图运行器不运行
+  DiT 卸载节点）。`ggml_cuda` 两段层切分时第一张卡峰值 22.8 GB（共 24 GB），接近驻留规划的预算。
 
 ## 内存
 
@@ -579,4 +617,4 @@ TensorAgent 应用在模型页的 MiniMax H3 下列出两个条目：
 - 该模型的聊天规划提问（后续消息修改哪张图）：其文本编码器没有输出头，因此后续消息修改最新的图片。
 - 对保留行的遮罩感知调制（把它们按干净状态调制，如 ComfyUI 的 H3 视频那样）：设计为默认关闭的实验，尚未实现或测量。
 - 提示词扩写器（MiniMaxAI/MiniMax-H3-Image-PE）。ComfyUI 的文生图模板默认不启用它。
-- `mlx`、`cuda` 与 `cpu`（纯 C#）后端。
+- `mlx` 与 `cpu`（纯 C#）后端，以及 `ggml_cuda` 上的 `--tp`（其分 rank 图运行器不运行 DiT 卸载节点）。

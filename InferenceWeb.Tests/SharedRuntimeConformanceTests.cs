@@ -67,11 +67,13 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         ["nemotron_h"] = typeof(NemotronRuntimeTests),
         // GPT-OSS's fixtures are its own (sinks, biased projections, MXFP4 experts with biases, alternating sliding windows).
         ["gptoss"] = typeof(GptOssRuntimeTests),
+        // Qwen3.8-Flash-Next's checkpoint is its own (hyper-connections, the PLE n-gram layer, QSA, Gated DeltaNet, shared-expert MoE).
+        ["qwen4exp"] = typeof(Qwen4ExpRuntimeConformanceTests),
     };
 
     /// <summary>Shared-runtime families that run whole-forward graphs only (StandardDecoderModel.RequiresGraphs): their
     /// dedicated suite has no per-op path to compare the graphs with. A family leaves the list when it gains one.</summary>
-    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano", "gemma4", "diffusion-gemma", "nemotron_h", "gptoss" };
+    public static readonly IReadOnlySet<string> GraphOnlyFamilies = new HashSet<string>(StringComparer.Ordinal) { "inkling2", "raon1nano", "gemma4", "diffusion-gemma", "nemotron_h", "gptoss", "qwen4exp" };
 
     /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)
     /// does not declare.</summary>
@@ -138,32 +140,8 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// reference: the pinned GGML backend (ggml_cpu by default; ggml_metal, ggml_cuda or
     /// ggml_vulkan in their lanes), so the runtime's backend fast paths (fused SwiGLU FFN,
     /// fused softmax, native paged attention) are covered wherever the suite runs.</summary>
-    /// <summary>Tensor parallelism over two GGML devices as whole-forward graphs on ggml's meta device:
-    /// the same logits as one device (partial sums reduce in another order), decode replays, and
-    /// speculation.</summary>
-    [GgmlTheory(BackendType.GgmlCuda, Devices = 2, Skip = "Tensor-parallel graphs are opt-in (TS_GRAPH_TENSOR_PARALLEL=1) until validated on " +
-        "GPUs with peer access; on MIG slices the meta device's all-reduce faults or hangs.")]
-    [MemberData(nameof(Families))]
-    public void TensorParallelGraphsMatchOneDevice(string family)
-    {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
-        // Head dim 64: ggml-cuda's flash attention has no kernel for the default 16, and a
-        // tensor-parallel graph refuses the explicit-ops fallback.
-        string path = Fixture(family, keyLength: 64);
-        List<float[]> single;
-        using (var one = Create(family, path, 1, 1, BackendType.GgmlCuda))
-            single = Script(one);
-        using ModelBase tp = CreateGgmlTensorParallel(family, path);
-        List<float[]> actual = Script(tp);
-        var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(tp);
-        Assert.True(sdm.GraphRuns > 0 && sdm.GraphReplays > 0, $"{family}: tensor parallelism did not run as replayed graphs");
-        for (int i = 0; i < single.Count; i++)
-            Assert.True(RelL2(actual[i], single[i]) <= 5e-3, $"{family} tp2 graphs row {i}: relL2 {RelL2(actual[i], single[i]):E2}");
-        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => CreateGgmlTensorParallel(family, path), $"{family} tp2", tieTolerance: 1e-2);
-    }
-
-    /// <summary>Tensor parallelism over two ggml_cuda GPUs as per-rank graphs run together (the default; the meta-device
-    /// graphs above are opt-in): the same logits as one device, decode replays, and speculation.</summary>
+    /// <summary>Tensor parallelism over two ggml_cuda GPUs as per-rank graphs run together: the same logits as one device,
+    /// decode replays, and speculation.</summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
     [MemberData(nameof(Families))]
     public void RankGraphsOnGgmlMatchOneDevice(string family) => AssertRankGraphsMatchOneDevice(family, BackendType.GgmlCuda);
@@ -195,13 +173,15 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
             tieTolerance: 1e-2);
     }
 
-    /// <summary>Speculation on per-rank graphs over two simulated devices matches plain greedy decoding.</summary>
+    /// <summary>Speculation on per-rank graphs matches plain greedy decoding: over two simulated devices, and over the
+    /// hybrid's two stages of two (each stage's verify windows as per-rank graphs on its own group).</summary>
     [Theory]
     [MemberData(nameof(Families))]
     public void SpeculationOnRankGraphsMatchesPlainGreedy(string family)
     {
         string path = Fixture(family);
         SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 2, 1), $"{family} tp2");
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 2, 2), $"{family} tp2 x stages2");
     }
 
     /// <summary>A GGML tensor-parallel group of two (the model builds it: no group is passed).</summary>
@@ -448,6 +428,10 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         AssertPlacement(decoder, tp, stages);
 
         List<float[]> actual = Script(placed);
+        // Every tensor-parallel placement runs as per-rank graphs, a hybrid's on every stage's group: the runtime's one
+        // lowering of the family, whatever the mesh.
+        if (tp > 1)
+            Assert.True(decoder.RunsRankGraphs && decoder.GraphRuns > 0, $"{family} tp={tp} stages={stages}: the per-rank graphs did not run");
         // Whole-layer stages run the very same ops on another allocator: exact. Tensor
         // parallelism splits each row-parallel sum into per-rank partials, which changes
         // only the summation order.
@@ -456,6 +440,31 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         {
             double rel = RelL2(actual[i], reference[i]);
             Assert.True(rel <= tolerance, $"{family} tp={tp} stages={stages} row {i}: relL2 {rel:E2} > {tolerance:E0}");
+        }
+    }
+
+    /// <summary>The tensor executors' compiled per-rank plans in lockstep (TensorGraphExecutor.RunRanked: direct CUDA's
+    /// decode steps that advance) answer as one device, as the streamed ranks do: every step of the script so.</summary>
+    [Theory]
+    [InlineData("mistral3", 2, 1)]
+    [InlineData("qwen3vl", 2, 1)]
+    [InlineData("mistral3", 2, 2)]
+    public void CompiledRankPlansMatchOneDevice(string family, int tp, int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        List<float[]> reference;
+        using (var single = Create(family, path, 1, 1))
+            reference = Script(single);
+        using var placed = Create(family, path, tp, stages);
+        var decoder = Assert.IsAssignableFrom<StandardDecoderModel>(placed);
+        decoder.CompiledRankedStepsForTests = true;
+        List<float[]> actual = Script(placed);
+        Assert.True(decoder.RunsRankGraphs && decoder.GraphRuns > 0, $"{family} tp={tp} stages={stages}: the per-rank plans did not run");
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            Assert.True(rel <= 1e-4, $"{family} tp={tp} stages={stages} compiled row {i}: relL2 {rel:E2}");
         }
     }
 

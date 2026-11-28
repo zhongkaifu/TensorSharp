@@ -211,6 +211,10 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName)]
         public static partial int cuStreamEndCapture(IntPtr stream, out IntPtr graph);
 
+        /// <summary>Whether <paramref name="stream"/> is recording (status 0: no, 1: active, 2: invalidated).</summary>
+        [LibraryImport(LibName)]
+        public static partial int cuStreamIsCapturing(IntPtr stream, out int captureStatus);
+
         [LibraryImport(LibName)]
         public static partial int cuGraphInstantiateWithFlags(out IntPtr graphExec, IntPtr graph, ulong flags);
 

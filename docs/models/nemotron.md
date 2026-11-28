@@ -641,7 +641,7 @@ and the tensor-parallel shards keep them.
 | Prefix cache, checkpoints | all | The runtime's holder adapter. A cached prefix carries the Mamba-2 states at its checkpoints, so a continuation restores K/V rows and recurrent state together. `CheckpointsContinueExactly` covers it. |
 | `--tp N` | cuda, ggml_cuda, ggml_vulkan | Per-rank graphs. Mamba-2 is sharded by contiguous blocks of groups: `ssm_in` row blocks, and one `ssm_out` column block per rank, so a quantized row never splits inside a block. Attention is sharded by heads and every expert by its width. Batching is kept. Covered on simulated devices only (§11). |
 | `--layer-split N` | cuda, ggml_cuda, ggml_vulkan | Whole-layer stages, batching kept. |
-| Hybrid (`--tp` x `--layer-split`) | none (gap) | The graph-only family has no graphs for tensor-parallel stages yet. |
+| Hybrid (`--tp` x `--layer-split`) | cuda, ggml_cuda, ggml_vulkan | The runtime's hybrid: every whole-layer stage runs its layers as per-rank graphs over its own group, the stream passing from stage to stage through the host; a stage's partials sum through host staging on GGML (the context's collective spans all of its devices). Covered on simulated devices only. |
 | `--n-cpu-moe` / `--cpu-moe` | all | On one device or over stages; refused with `--tp`. See §10. |
 | Speculation | all | n-gram drafts, the Nemotron 3.5 MTP head (the trunk's NextN block, or an MTP GGUF via `--draft-model`), and the DFlash and DSpark block drafters (`--draft-model`, below), verified in windows that rewind the Mamba-2 states exactly. |
 | Text LoRA | cpu, ggml_cpu, ggml_cuda, cuda | One device. Each adapted product's delta is in the graph (`AppliesTextLoraInGraphs`). The targets are listed below. |
@@ -1000,8 +1000,8 @@ scales against folded twins, and LoRA.
 - **Host-expert tiers for one-projection experts**: the GGML accelerator tier and the CUDA doorbell take gated experts
   only. A ReLU^2 tier would keep each offloaded layer's hottest experts on the device.
 - **Batched expert streaming on direct CUDA**: offloaded prompt chunks stream one expert at a time.
-- **`--tp` with offload, and the tensor-parallel x layer-split hybrid**: both need per-rank graphs this family does not
-  emit yet.
+- **`--tp` with offload**: per-rank graphs keep every rank's expert slices on its device; a host seam per rank (the
+  per-op path's spread of whole experts over the ranks) is not emitted.
 - **DSpark block cost**: the drafter's BF16 attention weights are dequantized to F32 at load (565 MB read per block
   across its six layers); keeping them BF16 on the graph path would halve that. DSpark's blocks could also share one
   program across requests, as DFlash's lanes do.

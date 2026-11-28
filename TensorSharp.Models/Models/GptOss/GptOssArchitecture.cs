@@ -23,8 +23,8 @@ namespace TensorSharp.Models
             Id = "gptoss",
             DisplayName = "GPT-OSS",
             Aliases = new[] { "gptoss", "gpt-oss" },
-            // On the shared decoder runtime (GptOssRuntimeModel): one device, --tp, whole-layer stages, continuous batching, the
-            // prefix cache, checkpoints, speculation (n-gram drafts, DFlash drafters).
+            // On the shared decoder runtime (GptOssRuntimeModel): one device, --tp, whole-layer stages and their hybrid, continuous
+            // batching, the prefix cache, checkpoints, speculation (n-gram drafts, DFlash drafters).
             Factory = c => new GptOssRuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
             Serving = new ServingContract
             {
@@ -33,8 +33,8 @@ namespace TensorSharp.Models
                 ContinuousBatching = MechanismSupport.On(ServingContract.AllBackends.ToArray()),
                 TensorParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
                 LayerSplit = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
-                // The graph-only family has no graphs for tensor-parallel stages yet.
-                HybridParallel = MechanismSupport.None("GPT-OSS runs whole-forward graphs only, which do not cover tensor-parallel stages yet; use --tp N or --layer-split N."),
+                // The runtime's hybrid: every whole-layer stage runs its layers as per-rank graphs over its own group.
+                HybridParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
                 // --n-cpu-moe / --cpu-moe: an offloaded layer's routed experts stay in host memory and run at the graph's host
                 // seam (GGML's host MoE segment; the tensor executors' expert host): the biased gate and up products, the clamped
                 // SwiGLU, the biased down product. Per-rank graphs keep their experts on the devices.

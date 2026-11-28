@@ -275,6 +275,10 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <summary>The tensor-parallel group a shardable denoiser spreads over, or null.</summary>
         public ITensorParallelGroup TensorParallelGroup { get; init; }
 
+        /// <summary>The devices a denoiser's whole-block stages run on (<c>--layer-split N</c>, <see cref="DenoiserStages"/>), one
+        /// a stage, or null for one device.</summary>
+        public IReadOnlyList<IAllocator> DenoiserDevices { get; init; }
+
         /// <summary>The file of <paramref name="role"/>; a missing one is a load refusal naming the role.</summary>
         public string File(string role) =>
             Files != null && Files.TryGetValue(role, out string path) && !string.IsNullOrWhiteSpace(path)

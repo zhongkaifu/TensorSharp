@@ -110,7 +110,7 @@ namespace TensorSharp.Models
 
         /// <summary>Per-rank tensor-parallel graphs on one stage: each rank's share of a slot is primed and copied on its own
         /// device (GGML ranks keep their device copies in per-rank caches).</summary>
-        private bool RankedSlotCopies => _rankGraphs && _graphTpRanks == null && _mesh.TensorParallel > 1 && _mesh.Stages == 1 && IsGgmlBackend;
+        private bool RankedSlotCopies => _rankGraphs && _mesh.TensorParallel > 1 && _mesh.Stages == 1 && IsGgmlBackend;
 
         /// <summary>Every tensor of <paramref name="slot"/> a graph binds has a device copy of the size the graphs bind
         /// (one device; each rank's share on its own device under per-rank graphs; each whole-layer stage's layers on its
@@ -201,8 +201,11 @@ namespace TensorSharp.Models
             // A fresh target where the executor keeps separate device copies: they are zero-filled on the device and the
             // copy writes the rows into them, as into a pooled slot. Dropped, the target's next graph uploaded every
             // cell of its capacity (Qwen3.8-27B, a 16K-token prefix grown to 32K cells: 2 GB at its first token), and a
-            // later growth of it went through the host too.
-            if (!inPlace && _mesh.Stages == 1 && _mesh.TensorParallel == 1
+            // later growth of it went through the host too. Each stage of a local layer split and each rank of per-rank
+            // tensor-parallel graphs primes its share on its own device, and the row uploads find each copy where it is:
+            // on two ggml_cuda GPUs a clone of Qwen3.5-9B's 3.4K-token prefix had uploaded its whole capacity in the
+            // request's first step (48 against 26 ms on one GPU).
+            if (!inPlace && LayerSplitGroup == null && (_mesh.TensorParallel == 1 || RankedSlotCopies)
                 && GraphExecutor is { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
             {
                 PrimeDeviceCopies(slot, overwritten: true);
@@ -242,7 +245,7 @@ namespace TensorSharp.Models
         /// a 54-token checkpoint of Qwen3.6-35B-A3B).</param>
         private bool TryCopySlotOnDevice(Slot source, Slot target, bool targetBound)
         {
-            if (source.Length <= 0 || _graphTpRanks != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
+            if (source.Length <= 0 || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
                 || GraphExecutor is not { Capabilities.BindsHostPointers: true } executor
                 || !(executor.Capabilities.SeparateDeviceCopies || ForceDeviceSlotCopies || targetBound))
                 return false;
@@ -345,7 +348,7 @@ namespace TensorSharp.Models
         /// </summary>
         private bool TryGrowSlotOnDevice(Slot slot, int capacity)
         {
-            if (slot.Length <= 0 || _graphTpRanks != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
+            if (slot.Length <= 0 || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
                 || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } } executor)
                 return false;
             int kvType = KvGgmlType(_kvCacheDtype.ToDType());

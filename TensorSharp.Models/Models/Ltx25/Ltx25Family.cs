@@ -15,8 +15,6 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
-using TensorSharp.Cuda;
-using TensorSharp.MLX;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Models.Video;
@@ -73,8 +71,15 @@ internal sealed class Ltx25Family : IVideoDiffusionFamily
     public IConditioner CreateConditioner(DiffusionLoad load) =>
         new Ltx25Conditioner(load.File(DiffusionLoad.TextEncoder), load.File(DiffusionLoad.Denoiser), _model.DirectAllocator);
 
+    /// <summary>The denoiser of <paramref name="file"/> on the model's device, over the load's whole-block stage devices
+    /// (<see cref="DiffusionLoad.DenoiserDevices"/>, <c>--layer-split N</c>; the first is the model's device), or sharded over
+    /// the load's tensor-parallel group (<see cref="DiffusionLoad.TensorParallelGroup"/>, <c>--tp N</c>; its first device is
+    /// the model's).</summary>
     public IDenoiser CreateDenoiser(DiffusionLoad load, string file) =>
-        new Ltx25Denoiser(file, _model.DirectAllocator) { AdapterBytes = () => _model.Ingredients?.FactorBytes ?? 0 };
+        new Ltx25Denoiser(file, _model.DirectAllocator, devices: load.DenoiserDevices, tensorParallel: load.TensorParallelGroup)
+        {
+            AdapterBytes = () => _model.Ingredients?.FactorBytes ?? 0,
+        };
 
     public IResidentComponent CreateVideoCodec(DiffusionLoad load) =>
         new Ltx25VideoCodec(load.File(DiffusionLoad.Vae), _model.DiffusionVaePath, _model.LatentUpscalerPath, _model.DirectAllocator);
@@ -512,12 +517,8 @@ internal sealed class Ltx25Family : IVideoDiffusionFamily
     // ---- helpers
 
     /// <summary>Return the allocator's free buffers to the device between phases, as the direct pipeline did (CUDA's pool
-    /// trimmed after a sync, MLX's cache cleared).</summary>
-    private void Trim()
-    {
-        if (_model.DirectAllocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
-        else if (_model.DirectAllocator is MlxAllocator) MlxBackend.ClearCache();
-    }
+    /// trimmed after a sync, MLX's cache cleared); under a split, every stage device's.</summary>
+    private void Trim() => _model.TrimDevicePools();
 
     private static void Timing(string phase, Stopwatch clock) =>
         Console.WriteLine($"  [ltx25-timing] {phase}: {clock.Elapsed.TotalMilliseconds:F3}ms");

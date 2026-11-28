@@ -262,6 +262,7 @@ namespace tsg
         std::lock_guard<std::mutex> lock(g_tp_comm_mutex);
 #ifdef TSG_GGML_USE_CUDA
         tp_cuda_allreduce_f32_free();
+        tp_p2p_allreduce_free();
 #endif
         if (g_tp_comm.ctx != nullptr && g_tp_comm.free_fn != nullptr)
             g_tp_comm.free_fn(g_tp_comm.ctx);
@@ -631,8 +632,15 @@ namespace tsg
         // is genuinely unusable — a per-call refusal (an unsupported shape, say)
         // falls back to summing through the host so the token still completes.
         bool tp_reduce_segment(ggml_tensor** nodes, int rank_count,
-                               bool exact_f32 = false, bool host_only = false)
+                               bool exact_f32 = false, bool host_only = false, int first_device = 0)
         {
+            // A group of devices inside a larger context (a hybrid placement's stage): the context's collective spans
+            // every device and cannot reduce a subset, so the group sums through host staging, exactly in F32.
+            if (first_device != 0 || rank_count != g_device_count.load(std::memory_order_acquire))
+            {
+                exact_f32 = false;
+                host_only = true;
+            }
             if (exact_f32)
             {
                 // Upstream NCCL silently converts >=32768 F32 elements to BF16
@@ -673,6 +681,19 @@ namespace tsg
                     if (bytes > 0) chunk_limit = std::min<int64_t>(chunk_limit, (bytes - 1) / sizeof(float));
                 }
                 chunk_limit -= chunk_limit % 4;
+#ifdef TSG_GGML_USE_CUDA
+                // No NCCL: a partial the chunked fallback below would split (one of the context's collectives per 32,764
+                // floats: a diffusion block's 4K-token partials took hundreds) is TensorSharp's own exact sum over peer
+                // memory, one collective a partial. A partial that fits one chunk (a decode step's) keeps the context's
+                // own collective, one call that costs less (Qwen3.8-27B decoded 61.5 tok/s with it against 57.8).
+                if (g_backend_type == BACKEND_TYPE_CUDA && ggml_nelements(nodes[0]) > chunk_limit)
+                {
+                    ggml_backend_t backends[TSG_MAX_DEVICES];
+                    for (int r = 0; r < rank_count; ++r) backends[r] = dev(r).backend;
+                    const int result = tp_p2p_allreduce_f32(backends, nodes, rank_count);
+                    if (result != 0) return result > 0;
+                }
+#endif
                 if (chunk_limit > 0)
                 {
                     const int64_t count = ggml_nelements(nodes[0]);
@@ -736,13 +757,13 @@ namespace tsg
 
             auto stage_down = [&](int r)
             {
-                ScopedRank rank(r);
+                ScopedRank rank(first_device + r);
                 tsg::sync_backend(g_backend);
                 ggml_backend_tensor_get(nodes[r], ptrs[r], 0, bytes);
             };
             auto stage_up = [&](int r)
             {
-                ScopedRank rank(r);
+                ScopedRank rank(first_device + r);
                 ggml_backend_tensor_set(nodes[r], ptrs[r], 0, bytes);
             };
 
@@ -778,6 +799,21 @@ namespace tsg
             return false;
         }
 
+        // The group's devices: consecutive from plans[0]'s (a whole-layer stage's of a hybrid placement), or the context's
+        // ranks 0..rank_count-1.
+        const int base = plans[0] != nullptr && plans[0]->device >= 0 ? plans[0]->device : 0;
+        if (base > 0 && base + rank_count > g_device_count.load(std::memory_order_acquire))
+        {
+            set_last_error("Tensor-parallel plans name devices outside the context.");
+            return false;
+        }
+        for (int r = 0; r < rank_count; ++r)
+            if (plans[r] != nullptr && plans[r]->device >= 0 && plans[r]->device != base + r)
+            {
+                set_last_error("Tensor-parallel plans must run on consecutive devices in rank order.");
+                return false;
+            }
+
         const std::size_t n_seg = plans[0]->seg_end.size();
         const std::size_t n_host_moe = plans[0]->host_moe.size();
         for (int r = 0; r < rank_count; ++r)
@@ -806,7 +842,7 @@ namespace tsg
             // capture stays valid, unlike a worker-per-rank fan-out.
             for (int r = 0; r < rank_count; ++r)
             {
-                ScopedRank rank(r);
+                ScopedRank rank(base + r);
                 const int end = plans[r]->seg_end[s];
                 const int begin = start[static_cast<std::size_t>(r)];
                 start[static_cast<std::size_t>(r)] = end;
@@ -838,11 +874,11 @@ namespace tsg
                 // could otherwise see the upload out of order.
                 for (int r = 0; r < rank_count; ++r)
                 {
-                    ScopedRank rank(r);
+                    ScopedRank rank(base + r);
                     tsg::sync_backend(g_backend);
                 }
                 {
-                    ScopedRank rank(0);
+                    ScopedRank rank(base);
                     // allow_device_stream=false: the offloaded layer is evaluated
                     // ONCE here, on the host, over the unsharded expert stack,
                     // and the ranks differ only in where that one result lands
@@ -856,7 +892,7 @@ namespace tsg
                 }
                 for (int r = 0; r < rank_count; ++r)
                 {
-                    ScopedRank rank(r);
+                    ScopedRank rank(base + r);
                     const HostMoeSegment& hm = plans[r]->host_moe[static_cast<std::size_t>(hm_idx)];
                     // tp_reduced: the graph still sums this layer's MoE output
                     // across ranks, so only rank 0 may carry it.
@@ -873,7 +909,7 @@ namespace tsg
                     nodes[static_cast<std::size_t>(r)] = plans[r]->ar_tensor[s];
                 // One local rank has nothing to reduce on-node; the cross-node
                 // exchange below is the whole reduction in that configuration.
-                if (rank_count > 1 && !tp_reduce_segment(nodes.data(), rank_count, plans[0]->allreduce_f32))
+                if (rank_count > 1 && !tp_reduce_segment(nodes.data(), rank_count, plans[0]->allreduce_f32, false, base))
                     return false;
 
                 // Multi-node: the local reduce above collapsed this node's
@@ -892,7 +928,7 @@ namespace tsg
                     static thread_local std::vector<float> s_xnode;
                     if (s_xnode.size() < n) s_xnode.resize(n);
                     {
-                        ScopedRank rank(0);
+                        ScopedRank rank(base);
                         ggml_backend_synchronize(g_backend);
                         ggml_backend_tensor_get(ar0, s_xnode.data(), 0, n * sizeof(float));
                     }
@@ -903,7 +939,7 @@ namespace tsg
                     }
                     for (int r = 0; r < rank_count; ++r)
                     {
-                        ScopedRank rank(r);
+                        ScopedRank rank(base + r);
                         // tensor_set runs on a different stream than this rank's own
                         // collective, which must finish before its buffer is
                         // overwritten. After the network exchange that wait is free.
@@ -916,7 +952,7 @@ namespace tsg
 
         for (int r = 0; r < rank_count; ++r)
         {
-            ScopedRank rank(r);
+            ScopedRank rank(base + r);
             tsg::sync_backend(g_backend);
         }
 
@@ -926,7 +962,7 @@ namespace tsg
             const bool has_out = p->out_tensor != nullptr && p->out_host != nullptr && p->out_bytes != 0;
             if (!has_out && p->extra_out.empty())
                 continue;
-            ScopedRank rank(r);
+            ScopedRank rank(base + r);
             if (has_out)
                 ggml_backend_tensor_get(p->out_tensor, p->out_host, 0, p->out_bytes);
             for (const auto& d : p->extra_out)
