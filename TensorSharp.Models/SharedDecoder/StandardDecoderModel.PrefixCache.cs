@@ -93,7 +93,7 @@ namespace TensorSharp.Models
                 foreach (Tensor t in AllCacheTensors(slot.K)) bytes = checked(bytes + t.Storage.ByteLength);
                 foreach (Tensor t in AllCacheTensors(slot.V)) bytes = checked(bytes + t.Storage.ByteLength);
             }
-            bool host = _backend is BackendType.Cpu or BackendType.GgmlCpu;
+            bool host = SlotBytesAreHostMemory;
             var vector = new ResourceVector { HostKv = host ? bytes : 0, DeviceKv = host ? 0 : bytes };
             return new PayloadFootprint(slot.Length, slot.Capacity, vector, PositionDelta: 0);
         }
@@ -102,9 +102,21 @@ namespace TensorSharp.Models
         {
             if (!TryGetRetained(payloadKey, out Slot slot)) return default;
             long bytes = CloneBytes(slot, targetTokens);
-            bool host = _backend is BackendType.Cpu or BackendType.GgmlCpu;
+            bool host = SlotBytesAreHostMemory;
             return new ResourceVector { HostKv = host ? bytes : 0, DeviceKv = host ? 0 : bytes };
         }
+
+        /// <summary>
+        /// Whether a kept slot's bytes are charged to host memory: on the CPU backends, and on ggml-cuda where its caches and
+        /// states are host tensors whose device copies are mirrors this model drops when it needs their room (a new slot's,
+        /// <see cref="SlotDeficit"/>; a step's, FreeGraphMemory). Charged to the device there, the prefix cache fixed its cap
+        /// from the device's spare when the engine started: with a 30B-A3B MoE's experts filling one 24 GB GPU that was
+        /// 43 MiB, below one 63-72 MiB checkpoint of its shared prompt, so every request restored the checkpoint from disk,
+        /// the cap evicted it at once, and all eight requests of a burst re-prefilled their 3.6K-token prompts (13.5 tok/s
+        /// against 278 over two GPUs).
+        /// </summary>
+        private bool SlotBytesAreHostMemory
+            => _backend is BackendType.Cpu or BackendType.GgmlCpu || (_backend == BackendType.GgmlCuda && DropsIdleSlotMirrors);
 
         /// <summary>A slot's recurrent states, which the prefix cache's budget charges with its caches.</summary>
         private static long RecurrentStateBytes(Slot slot)

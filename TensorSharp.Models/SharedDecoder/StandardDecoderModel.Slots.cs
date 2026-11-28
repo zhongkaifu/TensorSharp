@@ -443,6 +443,14 @@ namespace TensorSharp.Models
         // split's stage or a tensor-parallel rank holds its layers' or heads' part; one device holds all of it.
         private (int Stage, int Rank, long PerToken, long States)[] _slotShares;
 
+        /// <summary>Whether idle slots' device copies are mirrors of host tensors that <see cref="DropIdleSlotDeviceCopies"/> can
+        /// drop: one device, a local layer split's stages or per-rank tensor-parallel graphs' ranks (the native sync and
+        /// invalidation visit every device's cache, so each stage's or rank's copies go wherever they live), on an executor
+        /// that binds host bytes into separate device copies.</summary>
+        private bool DropsIdleSlotMirrors
+            => KeepsDeviceCopies && LayerSplitGroup == null && (_mesh.TensorParallel == 1 || RankedSlotCopies)
+               && GraphExecutor is { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } };
+
         /// <summary>Beside a slot's caches and states: its drafter buffers and its share of the graphs' memory (the margin
         /// Qwen4ExpModel keeps for a holder on Metal).</summary>
         private const long SlotExtraBytes = 256L << 20;
@@ -593,17 +601,13 @@ namespace TensorSharp.Models
         /// <summary>
         /// Drops the device copies of the slots no request runs on (finished requests kept for a continuation, pooled ones)
         /// where the executor keeps separate device copies: their host tensors hold every row and state (synced first), and
-        /// a slot's next graph uploads what it binds. Kept, they filled the device: fifteen finished Qwen3.8-27B DFlash2
+        /// a slot's next graph uploads what it binds (<see cref="DropsIdleSlotMirrors"/>). Kept, they filled the device: fifteen finished Qwen3.8-27B DFlash2
         /// requests held 6.6 GB of a 24 GB GPU, and four new ones found no memory for their first step. Returns the slots
         /// dropped.
         /// </summary>
         private int DropIdleSlotDeviceCopies()
         {
-            // One device, a local layer split's stages or per-rank tensor-parallel graphs' ranks: the native sync and
-            // invalidation visit every device's cache, so each stage's or rank's copies go wherever they live.
-            if (!KeepsDeviceCopies || LayerSplitGroup != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
-                || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
-                return 0;
+            if (!DropsIdleSlotMirrors) return 0;
             int dropped = 0;
             foreach (Slot slot in IdleSlots())
             {

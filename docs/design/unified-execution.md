@@ -1336,11 +1336,40 @@ on the same backend; tensor parallelism sums partials in another order, so its t
 | Qwen3.6-35B-A3B UD-Q4_K_M | ggml_cuda | does not fit | 5332 / 114 | 4722 / 123 | (no one-GPU reference) |
 | | cuda | does not fit | 4906 / 43.7 | 3872 / 151 | |
 
-**Concurrency.** Qwen3.5-9B, eight different prompts at once (256 tokens each, greedy) after their lone runs, through
-the server: 0 errors in every placement (before the leak fix, `ggml_cuda --layer-split 2` failed all eight). Aggregate
-tok/s: `ggml_cuda` 226 (one GPU), 250 (`--tp 2`), 190 (`--layer-split 2`); `cuda` 234, 127, 233. Between 2 and 4 of the
-eight replies equal their lone runs in each placement, one GPU included: a batched step takes other kernels than a lone
-one, so near-tie tokens part; that the count does not fall under a placement is the check.
+**Concurrency.** Eight different prompts at once through `TensorSharp.Server.Host` (128 tokens each, greedy, the
+server's shared system prompt of ~3.6K tokens), after each prompt alone: **0 errors in all 47 runs** (before the leak fix,
+`ggml_cuda --layer-split 2` failed all eight Qwen3.5-9B requests). Aggregate tok/s of the burst (in parentheses: one
+request alone):
+
+| Model | `ggml_cuda` 1 GPU | `ggml_cuda --tp 2` | `ggml_cuda --layer-split 2` | `cuda --layer-split 2` |
+|---|---|---|---|---|
+| Hy-MT2-1.8B | 679 (266) | 417 (208) | 659 (267) | 327 (150) |
+| LFM3-1.7B | 412 (229) | 316 (200) | 337 (205) | 305 (182) |
+| Ministral-3-3B | 642 (196) | 500 (208) | 660 (195) | 359 (152) |
+| Qwen3-VL-8B | 220 (78.1) | 222 (106) | 213 (80.8) | 203 (80.6) |
+| Nemotron-H-8B | 207 (64.3) | 250 (104) | 207 (64.5) | 160 (57.4) |
+| gemma-4-E4B | 300 (87.0) | 269 (105) | 290 (85.9) | 231 (78.5) |
+| gpt-oss-20b | 283 (147) | 344 (185) | 275 (148) | 167 (109) |
+| Mistral-Small-3.1-24B | 214 (37.1) | 242 (62.4) | 214 (39.0) | 107 (36.5) |
+| gemma-4-26B-A4B | 185 (113) | 186 (111) | 192 (111) | 132 (84.2) |
+| Muse-Glimmer-30B | 162 (32.7) | 168 (52.9) | 164 (34.5) | 82.0 (32.1) |
+| Nemotron-3.5-Lightning-30B-A3B | 13.5 (68.4), 244 (119) after the fix below | 310 (166) | 278 (134) | 103 (62.5) |
+| Qwen3.6-35B-A3B | does not fit | 199 (109) | 233 (109) | 272 (136) |
+
+Between 0 and 6 of the eight replies equal their lone runs in each placement, one GPU included: a batched step takes
+other kernels than a lone one, so near-tie tokens part (Lightning's MoE parts on all eight in every placement); that a
+placement does not lower the count against one GPU is the check. Qwen3.5-9B (256 tokens): `ggml_cuda` 226 / 250 / 190,
+`cuda` 234 (one GPU) / 127 (`--tp 2`) / 233 (`--layer-split 2`).
+
+**Prefix reuse on a full GPU.** Lightning on one 24 GB GPU (5 of its 52 layers' experts planned onto the host, the rest
+resident) re-prefilled every request's whole prompt: the prefix cache charged a kept slot to the device, and fixed the
+device's cap from its spare when the engine started, 43 MiB, below one 63-72 MiB checkpoint of the shared prompt. Each
+request restored the checkpoint from disk and the cap evicted it at once (`[prefix-cap] DeviceKv cached=72MiB
+cap=43MiB`). On `ggml_cuda` a kept slot's caches and states are host tensors whose device copies are mirrors the runtime
+drops when it needs their room (a new slot's, `SlotDeficit`; a step's, `FreeGraphMemory`), so they are now charged to host
+memory there (`SlotBytesAreHostMemory`). Rerun (cold prefix cache, the same burst): 16 of the 17 requests resumed the
+3560-token prefix, the burst ran at 244 tok/s (13.5 before) and a lone request at 119 (68.4), with no error or
+out-of-memory; Qwen3.5-9B on one GPU (225) and `--tp 2` (231) and gemma-4-E4B `--layer-split 2` (295) were unchanged.
 
 **Open.**
 
@@ -1348,6 +1377,10 @@ one, so near-tie tokens part; that the count does not fall under a placement is 
   all-reduce (`CudaP2PCommunicator`) fences on the host three times a reduce, two reduces a layer, and a tensor-parallel
   step is not recorded as a CUDA graph; `ggml_cuda` reduces on the devices and wins on the larger models. A device-side
   reduction joined to the ranks' recordings is the fix; until then `ggml_cuda` is the backend for `--tp`.
+* Direct-CUDA bursts over `--layer-split 2` reach half of `ggml_cuda`'s on Mistral-Small-3.1-24B (107 against 214 tok/s)
+  and Muse-Glimmer-30B (82 against 164); Qwen3.5-9B's equals one direct-CUDA GPU's (233 against 234), and the one-GPU
+  direct-CUDA bursts of the other models were not run, so whether the stages or the batched direct-CUDA step costs it is
+  open.
 * `ggml_cuda --tp 2` loses to one GPU on the smallest models and on gemma-4-26B-A4B decode (a few active parameters a
   token: the 2 x layers all-reduces dominate).
 * A layer split adds ~0.6 ms a step (the host hand-off between stages); gemma-4-E4B `ggml_cuda --layer-split 2` prefill
