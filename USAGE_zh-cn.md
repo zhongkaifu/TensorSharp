@@ -2451,7 +2451,7 @@ Telemetry: off (no OTLP endpoint, APPLICATIONINSIGHTS_CONNECTION_STRING or TENSO
 | `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | 该信号除 Application Insights 之外的去处，逗号分隔：`otlp`、`console`（标准输出）或 `none`。设置后它取代默认选择：`otlp` 发往已配置的端点（或默认端点），`none` 让该信号对所有去处关闭，包括 Application Insights。未设置时，只要设置了通用端点、该信号自己的端点或 `TENSORSHARP_OTEL`，该信号就走 OTLP。无法识别的名称会被忽略并给出警告。这些变量由 TensorSharp 自己读取，.NET SDK 并不读取它们。 |
 | `OTEL_SDK_DISABLED` | `true`：无论其他设置如何都关闭（`Telemetry: off (OTEL_SDK_DISABLED=true)`）。 |
 | `OTEL_SERVICE_NAME` | 服务名。默认 `tensorsharp-server`，CLI 为 `tensorsharp-cli`。 |
-| `OTEL_RESOURCE_ATTRIBUTES` | `key=value,...` 形式的 resource 属性，优先于 TensorSharp 自带的属性：`service.version`（TensorSharp 版本）、`service.instance.id`（`<机器名>:<pid>`）、`host.name`、`process.pid`，以及取自 `TENSORSHARP_TP_NODE_ID` / `TENSORSHARP_TP_DEGREE` 的 `tensorsharp.tp.node_id` / `tensorsharp.tp.degree`。 |
+| `OTEL_RESOURCE_ATTRIBUTES` | `key=value,...` 形式的 resource 属性，优先于 TensorSharp 自带的属性：`service.version`（TensorSharp 版本）、`service.instance.id`（`<机器名>:<pid>`）、`host.name`、`process.pid`，以及取自服务器解析后的放置配置（`--tp-node-id` / `--tp`，未给出时为 `TENSORSHARP_TP_NODE_ID` / `TENSORSHARP_TP_DEGREE`）的 `tensorsharp.tp.node_id` / `tensorsharp.tp.degree`。 |
 | `OTEL_TRACES_SAMPLER`、`OTEL_TRACES_SAMPLER_ARG` | trace 采样。默认 `parentbased_always_on`：保留每条 trace，并遵循客户端 `traceparent` 的采样决定。不接 Application Insights 时由 SDK 按标准取值处理（`traceidratio` 配合 `OTEL_TRACES_SAMPLER_ARG=0.1` 保留 10%）。Application Insights 接收 trace 时，该值会映射到它的采样器上，见 [Application Insights](#application-insights)。 |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | Application Insights 连接串。每种已开启的信号都会额外发往那里；单独设置它就会开启全部三种信号。 |
 | `TENSORSHARP_AZURE_MONITOR_AAD` | 开关：用 Entra ID（`DefaultAzureCredential`）代替连接串中的密钥向 Application Insights 认证。仍然需要连接串；没有连接串时它不起作用。 |

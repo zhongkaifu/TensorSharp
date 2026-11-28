@@ -829,8 +829,14 @@ public static class ServerOptionsBuilder
         return chosen;
     }
 
-    /// <summary>Apply the shared, validated tensor-parallel or layer-split configuration.</summary>
-    public static bool ApplyTensorParallelCliFlags(string[] args)
+    /// <summary>Apply the shared, validated tensor-parallel or layer-split configuration by publishing it into the process
+    /// environment. Kept for integrations that read the variables; the server resolves the options
+    /// (<see cref="ResolveModelParallelism"/>) and hands them to its model service instead.</summary>
+    public static bool ApplyTensorParallelCliFlags(string[] args) => ResolveModelParallelism(args).ApplyEnvironment();
+
+    /// <summary>The validated tensor-parallel, layer-split and multi-node placement of <paramref name="args"/>, each value
+    /// from its flag, else the environment, else the default (D04: resolved once by the host, then passed on).</summary>
+    public static TensorSharp.Distributed.ModelParallelismOptions ResolveModelParallelism(string[] args)
     {
         var parallelismArgs = new List<string>();
         // Use the host's existing operand consumption rather than scanning values
@@ -838,7 +844,7 @@ public static class ServerOptionsBuilder
         ParseArgs(args ?? Array.Empty<string>(), out _, out _, out _, out _, out _, out _, out _,
             out _, out _, out _, out _, out _, out _, out _, out _, out _,
             parallelismArgs, ignoreUnknownOptions: true);
-        return TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray()).ApplyEnvironment();
+        return TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray());
     }
 
     /// <summary>

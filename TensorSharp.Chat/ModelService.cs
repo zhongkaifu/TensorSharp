@@ -335,6 +335,17 @@ namespace TensorSharp.Server
         }
 
         /// <summary>
+        /// The model placement the host resolved (<c>--tp</c>, <c>--layer-split</c>, <c>--tp-node-id</c>, <c>--tp-peers</c>,
+        /// then the environment): handed to every load (<see cref="ModelLifecycleService.Placement"/>). Null reads the
+        /// environment at each load. Set it before <see cref="LoadModel"/>.
+        /// </summary>
+        public ModelPlacementOptions? Placement
+        {
+            get => _lifecycle.Placement;
+            set => _lifecycle.Placement = value;
+        }
+
+        /// <summary>
         /// The operator's <c>--chat-template-file</c> and the model it applies to (the
         /// host's <c>--model</c>); see <see cref="ModelLifecycleService.ChatTemplateOverride"/>.
         /// Read at load time: set it before <see cref="LoadModel"/>.

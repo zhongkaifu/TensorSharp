@@ -222,6 +222,25 @@ namespace TensorSharp.Runtime.Scheduling
             _logger = logger ?? NullLogger.Instance;
         }
 
+        /// <summary>The engine's execution options and their effective time (D04): one snapshot a step, read by the
+        /// admission of the step's requests, its plan, this executor and the prefix cache alike. Follows the environment's
+        /// TS_* overrides at step boundaries unless the host gave explicit options (<see cref="ExecutionOptionsSource.Fixed"/>).
+        /// Set before the prefix cache is initialized.</summary>
+        internal ExecutionOptionsSource OptionsSource { get; set; } = ExecutionOptionsSource.FollowEnvironment();
+
+        private bool _stepBegun;
+
+        /// <summary>A step boundary (the engine's, before it schedules): the options snapshot every reader of the step
+        /// reads. <see cref="ExecuteStep"/> begins one itself when its caller did not.</summary>
+        internal ExecutionOptions BeginStep()
+        {
+            _stepBegun = true;
+            return OptionsSource.BeginStep();
+        }
+
+        /// <summary>The current step's options snapshot.</summary>
+        internal ExecutionOptions StepOptions => OptionsSource.Current;
+
         public IModelArchitecture Model => _model;
         public SequenceState? CurrentOwner => _currentOwner;
         internal PrefixCacheCoordinator? RadixCache { get; private set; }
@@ -232,7 +251,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (!configuration.EnablePrefixCaching || _model is not IPrefixCacheModel prefixModel) return;
             PrefixCacheCapabilities capabilities = prefixModel.GetPrefixCacheCapabilities();
             RadixCache = new PrefixCacheCoordinator(_model, _pool, _scheduler, capabilities, _logger,
-                configuration.PromptTailCheckpointMinTokens);
+                configuration.PromptTailCheckpointMinTokens, () => OptionsSource.Current);
             _scheduler.AttachRadixCacheContinuation(RadixCache, ComputeFusedContinuationLcp, TryAdoptFusedContinuation);
         }
 
@@ -262,6 +281,10 @@ namespace TensorSharp.Runtime.Scheduling
             // ggml_metal_synchronize aborts the process. A request already
             // waiting for the lock goes first (see GpuLockWaiters).
             GpuLockWaiters.YieldToWaiters(_model.GpuComputeLock, MaxYieldToPreparation);
+            // The step's options snapshot: the engine began it before scheduling (so admission read it too); a caller that
+            // drives the executor directly gets one here.
+            ExecutionOptions options = _stepBegun ? StepOptions : OptionsSource.BeginStep();
+            _stepBegun = false;
             lock (_model.GpuComputeLock)
             {
                 // A request adapter (text LoRA) is selected on the model for exactly this
@@ -308,10 +331,10 @@ namespace TensorSharp.Runtime.Scheduling
                     // what this step's requests need (ExecutionStepFeatures), then
                     // ask the planner for the candidate chain. All the "which
                     // path?" logic lives in ExecutionPlanner.PlanStep; this method
-                    // only executes the plan. Options/capabilities are snapshotted
-                    // per step because several are env-var backed and tests toggle
-                    // them at runtime.
-                    var options = ExecutionOptions.FromEnvironment();
+                    // only executes the plan. The options are the step's snapshot
+                    // (OptionsSource: one version per step, changed only at step
+                    // boundaries); capabilities are read per step because a model's
+                    // can change between steps (pending media, a retiring load).
                     var caps = ExecutionCapabilities.FromModel(_model);
                     var features = ComputeStepFeatures(output, caps);
                     var plan = ExecutionPlanner.PlanStep(caps, options, PlanConfig, features);
@@ -2069,7 +2092,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             var results = new List<SequenceStepResult>(output.ScheduledWork.Count);
             var prepared = new List<ScheduledSequenceWork>(output.ScheduledWork.Count);
-            int kvReserveMax = ExecutionOptions.FromEnvironment().KvGenerationReserveMax;
+            int kvReserveMax = StepOptions.KvGenerationReserveMax;
             // A verify writes its whole padded window past the committed rows: room for it, so no slot grows mid-stream.
             int verifySlack = SpeculationEnabledThisStep && _model is IBatchedSpeculativeTarget verifier ? verifier.BatchedSpecWindow(1) : 0;
             foreach (var work in output.ScheduledWork)
@@ -3946,7 +3969,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// byte snapshots are deliberately not cross-request reusable, but its full
         /// request-owned attention + recurrent-state holder is.</summary>
         private bool ModelUsesRetainableFusedCache()
-            => ExecutionOptions.FromEnvironment().RetainedFusedCacheBudget != 0
+            => StepOptions.RetainedFusedCacheBudget != 0
             && _model is IBatchedPagedModel f
             && f.SupportsPerSequenceFusedForward
             && f.SupportsRetainedFusedCache;
@@ -4253,7 +4276,7 @@ namespace TensorSharp.Runtime.Scheduling
                     seq.PromptTokens.Count,
                     seq.MaxNewTokens,
                     _model.MaxContextLength,
-                    ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
+                    StepOptions.KvGenerationReserveMax));
             }
 
             int[] chunk = PrefillTokens(seq, work);

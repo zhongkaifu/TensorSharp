@@ -283,12 +283,16 @@ public sealed class MiniMaxM3ModelTests : IDisposable
     [Fact]
     public void ShouldPrefaultSkipsOnlyOffloadedExperts()
     {
-        using var model = new PrefaultProbe(Write(new MiniMaxM3SyntheticModelBuilder()));
+        // The policy is the model's load-time snapshot (ModelBase.MoeOffload): set before the load, it holds for the model;
+        // a later change of the process default reaches the next load only.
         MoeCpuOffloadConfig.SetLayers(3);
+        using var model = new PrefaultProbe(Write(new MiniMaxM3SyntheticModelBuilder()));
+        MoeCpuOffloadConfig.SetLayers(5);
         Assert.False(model.Prefaults("blk.2.ffn_up_exps.weight"));
         Assert.True(model.Prefaults("blk.3.ffn_up_exps.weight"));
         Assert.True(model.Prefaults("blk.2.ffn_up_shexp.weight"));
         Assert.True(model.Prefaults("blk.0.attn_q.weight"));
+        Assert.Equal(3, model.MoeOffload.CpuMoeLayers);
     }
 
     /// <summary>Both directions between the options the native MiniMax-M3 sources read (env_long, env_flag,

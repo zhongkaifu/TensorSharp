@@ -15,8 +15,8 @@ public partial class MuseSparkModel
         // stacked expert tensor is one resident allocation, not one allocation
         // plus another for each of its per-expert views. Fused QKVG replaces its
         // source matrices with an equal-sized allocation.
-        var bytes = CapacityLayerBytes(MoeCpuOffloadConfig.AllLayers
-            ? Config.NumLayers : MoeCpuOffloadConfig.CpuMoeLayers, out long embedding, out long head);
+        var bytes = CapacityLayerBytes(MoeOffload.AllLayers
+            ? Config.NumLayers : MoeOffload.CpuMoeLayers, out long embedding, out long head);
         _layerRanks = PlanLayerPlacement(bytes, embedding, head, LayerSplitDegree,
             Environment.GetEnvironmentVariable("TS_MUSE_SPARK_LAYER_SPLIT"));
         if (LayerSplitDegree <= 1) return;

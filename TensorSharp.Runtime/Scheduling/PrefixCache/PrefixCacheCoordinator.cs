@@ -31,22 +31,23 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     internal PrefixCacheCoordinator(IModelArchitecture model, BlockPool pool,
         ContinuousBatchScheduler scheduler, PrefixCacheCapabilities capabilities, ILogger logger,
-        int promptTailCheckpointMinTokens = 0)
+        int promptTailCheckpointMinTokens = 0, Func<ExecutionOptions>? stepOptions = null)
     {
+        // The engine step's options snapshot (BatchExecutor.OptionsSource: the same version the step's plan and executor
+        // read); a coordinator built without an engine reads the environment.
+        _options = stepOptions ?? ExecutionOptions.FromEnvironment;
         _promptTailCheckpointMinTokens = promptTailCheckpointMinTokens;
         _model = model;
         _pool = pool;
         _scheduler = scheduler;
         _cacheModel = (IPrefixCacheModel)model;
         _logger = logger;
-        var options = ExecutionOptions.FromEnvironment();
+        var options = _options();
         // A materialized holder is only readable through the fused per-request route, a paged end state only
         // through the batched route. Without that route (--no-continuous-batching, TS_PER_SEQ_FUSED=0, or a model
-        // that lacks it) no placeholder blocks may be adopted for it. A unified model reads every request's slot.
-        bool endStateRoute = capabilities.PagedEndStates
-            ? !options.BatchedPathDisabled && model is IBatchedPagedModel { BatchedForwardAvailable: true }
-            : ServesFromSlots(model) || (!options.BatchedPathDisabled && options.PerSeqFusedEnabled
-              && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true });
+        // that lacks it) no placeholder blocks may be adopted for it. A unified model reads every request's slot. The
+        // admission plan says which (ExecutionPlanner.PlanAdmission, the one place the routes are decided).
+        bool endStateRoute = Admission(options).EndStatesReadable(capabilities.PagedEndStates);
         if (!endStateRoute)
             capabilities = capabilities with
             {
@@ -79,10 +80,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal int RequestCount => _requests.Count;
     internal bool PrimaryAvailable { get; set; }
     internal bool RequiresSoleAdmission { get; private set; }
-    private static bool RetentionEnabled
-        => ExecutionOptions.FromEnvironment() is { RetainedFusedCacheBudget: null or > 0 };
-    private static bool PublicCheckpointsEnabled
-        => ExecutionOptions.FromEnvironment() is { PrefixCheckpointBudget: > 0 };
+    private readonly Func<ExecutionOptions> _options;
+    private bool RetentionEnabled
+        => _options() is { RetainedFusedCacheBudget: null or > 0 };
+    private bool PublicCheckpointsEnabled
+        => _options() is { PrefixCheckpointBudget: > 0 };
     /// <summary>Public checkpoints a <see cref="PrefixCacheCapabilities.CountCapsByBytes"/> family keeps
     /// at least.</summary>
     private const int ByteBoundPublicMax = 32;
@@ -213,20 +215,20 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             Math.Max(0, limit), GetSpans(sequence), route, PrimaryAvailable, promptEnd);
     }
 
-    /// <summary>Every step of the model runs on per-request slots (<see cref="ExecutionPathKind.Unified"/>), whatever
-    /// the per-sequence switches say.</summary>
-    private static bool ServesFromSlots(object model) => model is IUnifiedBatchModel { SupportsUnifiedBatching: true };
+    /// <summary>The admission plan of the model's requests under <paramref name="options"/> (the executor's step plans run
+    /// under it: <see cref="ExecutionPlanner.PlanAdmission"/>).</summary>
+    private AdmissionPlan Admission(ExecutionOptions options)
+        => ExecutionPlanner.PlanAdmission(ExecutionCapabilities.ForAdmission(_model), options);
 
+    /// <summary>The route a request's reused state is read on: its slot or holder, or the primary cache.</summary>
     private ExpectedRoute PredictRoute()
-    {
-        var options = ExecutionOptions.FromEnvironment();
-        if (ServesFromSlots(_model))
-            return ExpectedRoute.PerSequenceFused;
-        if (!options.BatchedPathDisabled && options.PerSeqFusedEnabled
-            && _model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true })
-            return ExpectedRoute.PerSequenceFused;
-        return ExpectedRoute.Primary;
-    }
+        => Admission(_options()).Route == AdmissionRoute.Slots ? ExpectedRoute.PerSequenceFused : ExpectedRoute.Primary;
+
+    /// <summary>Whether the model holds state for <paramref name="requestId"/> in its own store (a unified model's slot, a
+    /// legacy model's per-request holder).</summary>
+    private bool HoldsRequestState(string requestId)
+        => _model is ISequenceStateStore store ? store.HasSequenceState(requestId)
+            : _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(requestId);
 
     internal int ComputeReusablePrefix(SequenceState sequence)
     {
@@ -241,22 +243,22 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             LastDeclineReason = null;
             return _plan.Length;
         }
-        var request = BuildRequest(sequence, PredictRoute());
+        // One admission plan for the whole decision (the options and capabilities of this moment).
+        AdmissionPlan admission = Admission(_options());
+        ExpectedRoute route = admission.Route == AdmissionRoute.Slots ? ExpectedRoute.PerSequenceFused : ExpectedRoute.Primary;
+        var request = BuildRequest(sequence, route);
         _tree.Plan(request, _plan);
         if (request.Route == ExpectedRoute.Primary
             && _plan.Mode is MaterializeMode.CloneEndState or MaterializeMode.DonateEndState
                 or MaterializeMode.ConvertPrimaryThenClone)
             _plan.Reset();
-        if (!_plan.HasReuse && PredictRoute() == ExpectedRoute.Primary
-            && !ExecutionOptions.FromEnvironment().BatchedPathDisabled
-            && _model is IBatchedPagedModel { BatchedForwardAvailable: true } paged
-            && (sequence.MediaSpans.Count == 0 || paged.SupportsBatchedMultimodal))
+        if (!_plan.HasReuse && route == ExpectedRoute.Primary && admission.ReplansOnBatchedPaged(sequence.MediaSpans.Count > 0))
         {
             request = BuildRequest(sequence, ExpectedRoute.BatchedPaged);
             _tree.Plan(request, _plan);
         }
         // A holder is read by the per-request route only; a paged end state by the batched route only.
-        if (PredictRoute() != ExpectedRoute.PerSequenceFused
+        if (route != ExpectedRoute.PerSequenceFused
             && _plan.Mode is MaterializeMode.CloneEndState or MaterializeMode.DonateEndState
                 or MaterializeMode.ConvertPrimaryThenClone
             && !(request.Route == ExpectedRoute.BatchedPaged && IsPagedEndState(_plan)))
@@ -470,7 +472,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                     if (!donate && _plan.Mode != MaterializeMode.CloneEndState) return false;
                     int reservation = donate ? 0 : _cacheModel.ResolveCloneReservationTokens(payload.Key,
                         BatchExecutor.ResolvePrefillReservation(sequence.PromptTokens.Count, sequence.MaxNewTokens,
-                            _model.MaxContextLength, ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
+                            _model.MaxContextLength, _options().KvGenerationReserveMax));
                     if (!donate && !ReserveClone(payload.Key, length, reservation)) return false;
                     var materialize = new MaterializeRequest(donate ? MaterializeOp.Donate : MaterializeOp.Clone,
                         payload.Key, sequence.RequestId, payload.Footprint.Tokens, length, reservation,
@@ -834,7 +836,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
             && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
         if (!captured && RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
-            && _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(sequence.RequestId)
+            && HoldsRequestState(sequence.RequestId)
             && ReleaseOldestScopedPayload())
             captured = _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
         // A model may keep a copy of the request's holder (the CUDA executor's short slots): the log says which.

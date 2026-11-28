@@ -206,7 +206,7 @@ public sealed class GraphOpSchemaTests
     [Fact]
     public void NativeBridgeRefusesAMalformedOp()
     {
-        using var c = new NetworkGraphTests.LaneContext(NetworkGraphTests.Lane.GgmlCpu);
+        using var c = new NetworkGraphTests.LaneContext(NetworkGraphTests.PinnedGgmlLane);   // one GGML backend per process
         using var g = new GgmlGraph(64);
         var data = new float[4];
         unsafe

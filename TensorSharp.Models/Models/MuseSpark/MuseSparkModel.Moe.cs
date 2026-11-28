@@ -58,7 +58,7 @@ public partial class MuseSparkModel
         _sparkPhaseFrame?.Next(MuseSparkPhase.LatentPreparation);
         using var latent = LinearForward(input, p + "ffn_latent_down.weight");
         using var expertInput = Norm(latent, Config.Eps, p + "ffn_pre_exp_norm.weight");
-        if (IsTensorParallel && !MoeCpuOffloadConfig.IsLayerOnCpu(layer))
+        if (IsTensorParallel && !MoeOffload.IsLayerOnCpu(layer))
         {
             using var parallelOutput = TensorParallelExperts(expertInput, layer, rows, selected, routing);
             _sparkPhaseFrame?.Next(MuseSparkPhase.LatentUp);
@@ -66,7 +66,7 @@ public partial class MuseSparkModel
         }
         if (_sparkPhaseFrame != null)
         {
-            bool nativeCpu = IsGgmlBackend && MoeCpuOffloadConfig.IsLayerOnCpu(layer) &&
+            bool nativeCpu = IsGgmlBackend && MoeOffload.IsLayerOnCpu(layer) &&
                 _stackedExpertWeights.ContainsKey(p + "ffn_gate_exps.weight") &&
                 _stackedExpertWeights.ContainsKey(p + "ffn_up_exps.weight") &&
                 _stackedExpertWeights.ContainsKey(p + "ffn_down_exps.weight");
@@ -93,7 +93,7 @@ public partial class MuseSparkModel
             gate.Data, gate.GgmlType, gate.PerExpertNe0, gate.PerExpertNe1, gate.TotalRawBytes,
             up.Data, up.GgmlType, up.PerExpertNe0, up.PerExpertNe1, up.TotalRawBytes,
             down.Data, down.GgmlType, down.PerExpertNe0, down.PerExpertNe1, down.TotalRawBytes,
-            null, null, null, GgmlBasicOps.MoEActivation.SwiGLUSplit, runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer),
+            null, null, null, GgmlBasicOps.MoEActivation.SwiGLUSplit, runOnCpu: MoeOffload.IsLayerOnCpu(layer),
             postExpertNorm: norm, postExpertNormEps: _postNormEps);
         ReleaseExpertGpuSourcePages(layer);
         InvalidateTensorDeviceCache(output);
@@ -142,7 +142,7 @@ public partial class MuseSparkModel
         if (_quantWeights.TryGetValue(p + $".{expert}.weight", out var weight))
         {
             var result = new Tensor(_allocator, DType.Float32, input.Sizes[0], width);
-            if (IsGgmlBackend && !MoeCpuOffloadConfig.IsLayerOnCpu(layer))
+            if (IsGgmlBackend && !MoeOffload.IsLayerOnCpu(layer))
                 GgmlBasicOps.AddmmQuant(result, input, weight.CacheKey, weight.GgmlType, weight.Ne0, weight.Ne1, weight.RawBytes);
             else
                 AddmmQuantManaged(result, input, weight);

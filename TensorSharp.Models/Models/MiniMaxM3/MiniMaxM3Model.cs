@@ -153,7 +153,7 @@ public partial class MiniMaxM3Model : ModelBase
     // Do not prefault hundreds of gigabytes of sparse offloaded experts: the OS
     // demand-pages selected expert rows from the unchanged GGUF mmap.
     protected override bool ShouldPrefaultWeight(GgufTensorInfo info)
-        => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(info.Name);
+        => !MoeOffload.IsOffloadedExpertWeightName(info.Name);
 
     // The executor keeps K, V and index keys as F16 rows that its kernels read directly.
     protected override bool SupportsBlockQuantizedKvCache => false;

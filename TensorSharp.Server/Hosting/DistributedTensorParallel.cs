@@ -32,8 +32,13 @@ public static class DistributedTensorParallel
     /// both set (single-node), otherwise the group for <paramref name="backend"/>.
     /// </summary>
     public static ITensorParallelGroup? CreateGroup(BackendType backend)
+        => CreateGroup(backend, ModelParallelismOptions.Parse(Array.Empty<string>()));
+
+    /// <summary>The group <paramref name="options"/> (the host's resolved flags and environment) describe for
+    /// <paramref name="backend"/>, or null on one node.</summary>
+    public static ITensorParallelGroup? CreateGroup(BackendType backend, ModelParallelismOptions options)
     {
-        var options = ModelParallelismOptions.Parse(Array.Empty<string>());
+        ArgumentNullException.ThrowIfNull(options);
         var distConfig = options.Distributed;
         if (distConfig == null)
             return null;

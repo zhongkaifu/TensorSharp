@@ -158,6 +158,13 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public SpeculationOptions Speculation { get; init; } = SpeculationOptions.Disabled;
 
+        /// <summary>
+        /// The engine's explicit execution options (D04), or null to follow the environment's TS_* overrides at each step
+        /// boundary (the compatibility default). A host that resolved its options once passes them here; the engine then
+        /// changes them only through <see cref="InferenceEngine.UpdateExecutionOptions"/>, at a step boundary.
+        /// </summary>
+        public ExecutionOptions? ExecutionOptions { get; init; }
+
         public static SchedulerConfig Default => new();
 
         /// <summary>This configuration with a different speculation policy: the
@@ -190,6 +197,7 @@ namespace TensorSharp.Runtime.Scheduling
             StopRepetition = StopRepetition,
             DecodeQuantumTokens = DecodeQuantumTokens,
             Speculation = speculation,
+            ExecutionOptions = ExecutionOptions,
         };
 
         public static SchedulerConfig FromEnvironment()

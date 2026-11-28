@@ -165,8 +165,8 @@ public partial class MuseSparkModel : ISoloPrefillBudgetModel
 
         int nUbatch = ParseEnvInt("TS_MUSE_SPARK_UBATCH", 2048);
         int nThreads = ParseEnvInt("TS_MUSE_SPARK_THREADS", 0);
-        int cpuMoe = !MoeCpuOffloadConfig.IsExplicitlySet ? 0
-            : MoeCpuOffloadConfig.AllLayers ? Config.NumLayers : MoeCpuOffloadConfig.CpuMoeLayers;
+        int cpuMoe = !MoeOffload.IsExplicitlySet ? 0
+            : MoeOffload.AllLayers ? Config.NumLayers : MoeOffload.CpuMoeLayers;
         if (Environment.GetEnvironmentVariable("TS_MUSE_SPARK_CPU_MOE") is string auto &&
             string.Equals(auto, "auto", StringComparison.OrdinalIgnoreCase))
             cpuMoe = -1;

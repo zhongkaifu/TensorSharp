@@ -190,7 +190,7 @@ namespace TensorSharp.Models
                     down.Data, down.GgmlType, down.PerExpertNe0, down.PerExpertNe1, down.TotalRawBytes,
                     null, null, null,
                     useSwiGLUOAI: false,
-                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
+                    runOnCpu: MoeOffload.IsLayerOnCpu(layer));
                 InvalidateTensorDeviceCache(output);
                 _linearTicks += Stopwatch.GetTimestamp() - t0;
                 return true;

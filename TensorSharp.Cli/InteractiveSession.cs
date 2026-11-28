@@ -913,7 +913,8 @@ namespace TensorSharp.Cli
             {
                 Console.WriteLine($"Loading {Path.GetFileName(modelPath)} on {backend}...");
                 var sw = Stopwatch.StartNew();
-                var loaded = CreateModelForReload(modelPath, backend);
+                // The reload keeps the placement the session's model was loaded with (its snapshot, not the environment).
+                var loaded = CreateModelForReload(modelPath, backend, placement: _model?.Placement);
                 newModel = loaded.Model;
                 string draftHeadError = loaded.DraftHeadError;
                 if (draftHeadError != null)
@@ -1013,10 +1014,12 @@ namespace TensorSharp.Cli
             string modelPath,
             BackendType backend,
             Func<string, BackendType, string, ModelBase> createModel = null,
-            DraftHeadAttacher attachDraftHead = null)
+            DraftHeadAttacher attachDraftHead = null,
+            ModelPlacementOptions placement = null)
         {
-            createModel ??= static (path, selectedBackend, draftPath) =>
-                ModelBase.Create(path, selectedBackend, draftModelPath: draftPath);
+            ModelPlacementOptions reloadPlacement = placement ?? ModelPlacementOptions.FromEnvironment();
+            createModel ??= (path, selectedBackend, draftPath) =>
+                ModelBase.Create(path, selectedBackend, reloadPlacement, draftModelPath: draftPath);
             attachDraftHead ??= SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead;
 
             ModelBase model = null;

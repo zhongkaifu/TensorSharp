@@ -92,7 +92,7 @@ public abstract partial class ModelBase
     /// </summary>
     private void RefuseLayerSplitPastTheCudaDevices()
     {
-        int[] devices = ParseDeviceIds(LayerSplitDegree, "TENSORSHARP_LAYER_SPLIT_DEVICES");
+        int[] devices = Placement.DeviceIds(LayerSplitDegree, collectives: false);
         int visible = TensorSharp.Cuda.CudaDevice.GetDeviceCount();
         if (devices.Max() >= visible)
             throw new ModelLoadRefusedException(
@@ -108,7 +108,7 @@ public abstract partial class ModelBase
     {
         BackendType.Cpu => rank == 0 ? _allocator : new TensorSharp.Cpu.CpuAllocator(BlasEnum.DotNet),
         BackendType.Cuda => rank == 0 ? _allocator
-            : new TensorSharp.Cuda.CudaAllocator(ParseDeviceIds(LayerSplitDegree, "TENSORSHARP_LAYER_SPLIT_DEVICES")[rank]),
+            : new TensorSharp.Cuda.CudaAllocator(Placement.DeviceIds(LayerSplitDegree, collectives: false)[rank]),
         BackendType.Mlx => throw new NotSupportedException("The mlx backend exposes one device; whole-layer placement needs several."),
         _ => new GgmlAllocator(_ggmlContext, rank),
     };

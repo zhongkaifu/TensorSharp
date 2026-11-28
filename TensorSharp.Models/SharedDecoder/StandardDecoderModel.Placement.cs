@@ -132,7 +132,7 @@ namespace TensorSharp.Models
         /// the host, and the group is this process's own devices (a distributed group's ranks of other nodes run the per-op
         /// path's collectives); the executor runs ranks of <paramref name="tp"/> devices over the mesh's stages.</summary>
         private bool RankGraphsServe(int tp)
-            => GraphLoweringEnabled && AttentionLowers && RanksLower && !MoeCpuOffloadConfig.IsEnabled
+            => GraphLoweringEnabled && AttentionLowers && RanksLower && !MoeOffload.IsEnabled
                && StepAdapter == null && GlobalTpDegree == _mesh.DeviceCount && TpRankOffset == 0
                && ExecutorFor(_mesh.Allocator(0, 0)) switch
                {

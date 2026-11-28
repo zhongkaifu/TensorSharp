@@ -121,7 +121,7 @@ namespace TensorSharp.Models
         protected override bool ShouldPreloadDirectCudaWeight(string weightName) => ShouldPreloadCudaQuantWeightToDevice(weightName);
 
         protected override bool ShouldPreloadMlxQuantWeightToDevice(string weightName, QuantizedWeight weight)
-            => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName) && base.ShouldPreloadMlxQuantWeightToDevice(weightName, weight);
+            => !MoeOffload.IsOffloadedExpertWeightName(weightName) && base.ShouldPreloadMlxQuantWeightToDevice(weightName, weight);
 
         private static string ExpertName(int layer, string kind, int expert) => $"blk.{layer}.ffn_{kind}_exps.{expert}.weight";
 

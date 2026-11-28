@@ -501,9 +501,9 @@ namespace TensorSharp.Models
         /// </summary>
         private static int ResolveCpuMoeLayers()
         {
-            if (!MoeCpuOffloadConfig.IsExplicitlySet)
+            if (!MoeCpuOffloadConfig.Current.IsExplicitlySet)
                 return 0;
-            return MoeCpuOffloadConfig.AllLayers ? int.MaxValue : MoeCpuOffloadConfig.CpuMoeLayers;
+            return MoeCpuOffloadConfig.Current.AllLayers ? int.MaxValue : MoeCpuOffloadConfig.Current.CpuMoeLayers;
         }
 
         /// <summary>

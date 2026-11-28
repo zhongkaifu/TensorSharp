@@ -840,7 +840,7 @@ namespace TensorSharp.Models
                 return;
             }
             _slotPool ??= new List<Slot>(SlotPoolMax);
-            if (_slotPool.Count < Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax) && RoomToPool(slot))
+            if (_slotPool.Count < Math.Min(SlotPoolMax, _holderPoolMax) && RoomToPool(slot))
                 _slotPool.Add(slot);
             else
                 DisposeSlot(slot);

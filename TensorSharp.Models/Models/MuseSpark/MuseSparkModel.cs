@@ -123,7 +123,7 @@ public partial class MuseSparkModel : ModelBase
             throw new NotSupportedException("Muse Spark tensor parallelism requires ggml_cuda or ggml_vulkan (or an explicit CPU test group).");
         if (split > 1 && backend is not (BackendType.GgmlCuda or BackendType.GgmlVulkan))
             throw new NotSupportedException("Muse Spark layer placement requires ggml_cuda or ggml_vulkan.");
-        if (MoeCpuOffloadConfig.IsEnabled && backend is not (BackendType.Cpu or BackendType.GgmlCpu or
+        if (MoeCpuOffloadConfig.Current.IsEnabled && backend is not (BackendType.Cpu or BackendType.GgmlCpu or
             BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal))
             throw new NotSupportedException("Muse Spark expert CPU offload requires a GGML backend.");
         return backend;
@@ -132,7 +132,7 @@ public partial class MuseSparkModel : ModelBase
     // Do not prefault hundreds of gigabytes of sparse offloaded experts: the OS
     // demand-pages selected expert rows from the unchanged GGUF mmap.
     protected override bool ShouldPrefaultWeight(GgufTensorInfo info)
-        => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(info.Name);
+        => !MoeOffload.IsOffloadedExpertWeightName(info.Name);
 
     protected override bool ShouldPreloadCudaQuantWeightToDevice(string name)
         => base.ShouldPreloadCudaQuantWeightToDevice(name) && !_stackedExpertMemberNames.Contains(name);

@@ -33,7 +33,7 @@ namespace TensorSharp.Models
         private protected long _pendingDraftBytes;
 
         private protected override bool IsExpertLayerOffloaded(int layer)
-            => _expertOnHost == null ? MoeCpuOffloadConfig.IsLayerOnCpu(layer)
+            => _expertOnHost == null ? MoeOffload.IsLayerOnCpu(layer)
                 : layer >= 0 && layer < _expertOnHost.Length && _expertOnHost[layer];
 
         /// <summary>A weight the host reads and the accelerator never binds (Flash Next's PLE table).</summary>
@@ -297,13 +297,13 @@ namespace TensorSharp.Models
             if (_mesh.Stages > 1)
             {
                 // Explicit flags already name the layers; otherwise each stage plans against its own GPU.
-                if (!MoeCpuOffloadConfig.IsExplicitlySet && _backend == BackendType.GgmlCuda)
+                if (!MoeOffload.IsExplicitlySet && _backend == BackendType.GgmlCuda)
                     PlanCudaStages(n);
                 return;
             }
-            if (MoeCpuOffloadConfig.IsExplicitlySet)
+            if (MoeOffload.IsExplicitlySet)
             {
-                if (!MoeCpuOffloadConfig.IsEnabled || _backend == BackendType.GgmlCpu)
+                if (!MoeOffload.IsEnabled || _backend == BackendType.GgmlCpu)
                     return;
                 // An explicit offload still records routing: a --cpu-moe run is how a complete profile is collected.
                 AttachRoutingProfile(Config.Architecture, _numExperts);
@@ -311,7 +311,7 @@ namespace TensorSharp.Models
                 {
                     long resident = 0;
                     for (int l = 0; l < n; l++)
-                        if (_moeLayer[l] && !MoeCpuOffloadConfig.IsLayerOnCpu(l)) resident += LayerExpertBytes(l);
+                        if (_moeLayer[l] && !MoeOffload.IsLayerOnCpu(l)) resident += LayerExpertBytes(l);
                     ConfigureHostExpertIo(HostExpertIoBudget(resident));
                 }
                 return;
@@ -364,9 +364,9 @@ namespace TensorSharp.Models
             if (_mesh.Stages > 1 || _allocator is not IDeviceMemoryInfo memory || memory.SharesHostMemory)
                 return;
             int n = Config.NumLayers;
-            if (MoeCpuOffloadConfig.IsExplicitlySet)
+            if (MoeOffload.IsExplicitlySet)
             {
-                if (MoeCpuOffloadConfig.IsEnabled)
+                if (MoeOffload.IsEnabled)
                     AttachRoutingProfile(Config.Architecture, _numExperts);
                 return;
             }

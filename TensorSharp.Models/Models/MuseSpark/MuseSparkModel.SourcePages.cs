@@ -44,7 +44,7 @@ public partial class MuseSparkModel
     {
         // CPU experts include the optional streamed-to-GPU prefill route. They
         // must remain host-resident for the next decode or streamed prefill.
-        if (!CanReleaseGpuSourcePages(_releaseGpuSourcePages, _backend, MoeCpuOffloadConfig.IsLayerOnCpu(layer)) ||
+        if (!CanReleaseGpuSourcePages(_releaseGpuSourcePages, _backend, MoeOffload.IsLayerOnCpu(layer)) ||
             !OperatingSystem.IsLinux() || _advisedGpuExpertLayers.Contains(layer)) return;
         int before = _advisedGpuSourceWeights.Count;
         bool complete = true;
@@ -91,7 +91,7 @@ public partial class MuseSparkModel
             if (_sparkTpGate == null) return;
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
-                if (MoeCpuOffloadConfig.IsLayerOnCpu(layer) || _sparkTpGate[layer] == null) continue;
+                if (MoeOffload.IsLayerOnCpu(layer) || _sparkTpGate[layer] == null) continue;
                 var collections = new[] { _sparkTpGate[layer], _sparkTpUp[layer], _sparkTpDown[layer] };
                 for (int projection = 0; projection < collections.Length; projection++)
                 {

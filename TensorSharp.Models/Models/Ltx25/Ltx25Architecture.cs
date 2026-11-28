@@ -44,11 +44,18 @@ internal static class Ltx25Architecture
         // A process that previously ran MLX should set it at launch instead.
         if (OperatingSystem.IsMacOS() || OperatingSystem.IsMacCatalyst())
         {
+            // A process-scope setting (D04): if MLX already ran its first GEMM with another precision in this process, the
+            // variable below changes nothing, so the conflict is reported instead of passed off as this model's own choice.
+            if (!ProcessSettings.TryClaim(MlxTf32Setting, "0", "LTX 2.5 (its Float32 denoiser)", out ProcessSettingConflictException conflict))
+                Console.Error.WriteLine($"[ltx-2.5] WARNING: {conflict.Message}");
             if (SetEnvironment("MLX_ENABLE_TF32", "0", 1) != 0)
                 throw new InvalidOperationException("Unable to configure LTX Float32 MLX precision.");
             Environment.SetEnvironmentVariable("MLX_ENABLE_TF32", "0");
         }
     }
+
+    /// <summary>MLX's GEMM precision, latched on its first GEMM (TensorSharp.MLX.MlxAllocator claims what it ran with).</summary>
+    internal const string MlxTf32Setting = "MLX_ENABLE_TF32";
 
     [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "setenv", CallingConvention = CallingConvention.Cdecl)]
     private static extern int SetEnvironment(string name, string value, int overwrite);

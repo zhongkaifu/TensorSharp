@@ -287,7 +287,7 @@ namespace TensorSharp.Models
 
         /// <summary>Whether layer <paramref name="layer"/>'s routed experts run at a host seam (the
         /// family's offload plan; <c>--n-cpu-moe</c> / <c>--cpu-moe</c> by default).</summary>
-        private protected virtual bool IsExpertLayerOffloaded(int layer) => MoeCpuOffloadConfig.IsLayerOnCpu(layer);
+        private protected virtual bool IsExpertLayerOffloaded(int layer) => MoeOffload.IsLayerOnCpu(layer);
 
         /// <summary>Test hook: the native routing counters of layer <paramref name="layer"/>.</summary>
         internal ulong[] RoutingCountsForTests(int layer)

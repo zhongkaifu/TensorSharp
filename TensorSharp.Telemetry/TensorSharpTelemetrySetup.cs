@@ -72,9 +72,11 @@ namespace TensorSharp.Telemetry
                 new("host.name", machine),
                 new("process.pid", pid),
             };
-            if (Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID") is { Length: > 0 } nodeId)
+            // The host's resolved placement first (D04), the environment for a host that resolved none.
+            if ((options.TensorParallelNodeId ?? Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) is { Length: > 0 } nodeId)
                 attributes.Add(new(TelemetryAttributes.TensorParallelNodeId, nodeId.Trim()));
-            if (Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE") is { Length: > 0 } degree)
+            if ((options.TensorParallelDegree?.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                 ?? Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE")) is { Length: > 0 } degree)
                 attributes.Add(new(TelemetryAttributes.TensorParallelDegree, degree.Trim()));
 
             return resource

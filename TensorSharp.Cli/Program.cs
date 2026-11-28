@@ -757,8 +757,9 @@ namespace TensorSharp.Cli
                 }
             }
 
+            // The placement is resolved once (flags, then the environment, then the defaults) and handed to the loader
+            // (D04): it is not published into the environment for other modules to read back.
             var parallelism = TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray());
-            parallelism.ApplyEnvironment();
             int tpDegree = parallelism.TpDegree;
             imageMask.Validate(imagePathList.Count);
             ValidateKeepSourceSize(keepSourceSize, imagePathList.Count, imageWidth, imageHeight);
@@ -1148,8 +1149,9 @@ namespace TensorSharp.Cli
                     tpDegree = parallelism.IsDistributedPipeline ? 1 : localDegree;
                 }
 
-                createdModel = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath,
-                    layerSplitDegree: parallelism.LayerSplitDegree);
+                createdModel = ModelBase.Create(modelPath, backend,
+                    parallelism.Placement with { TpDegree = tpDegree, LayerSplitDegree = parallelism.LayerSplitDegree },
+                    tpGroup, draftModelPath);
             }
             catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string loadRefusal))
             {

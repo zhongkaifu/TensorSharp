@@ -47,8 +47,47 @@ namespace TensorSharp.Models
     /// environment variables, then read by <c>ModelBase</c> (weight residency)
     /// and by each MoE model's FFN dispatch (execution placement).</para>
     /// </summary>
+    /// <summary>
+    /// The MoE CPU-offload policy of one model instance (D04: model-instance scope, immutable from load on). A model takes
+    /// the process default (<see cref="MoeCpuOffloadConfig.Current"/>, set by the host from <c>--n-cpu-moe</c> /
+    /// <c>--cpu-moe</c> or <c>TS_N_CPU_MOE</c> / <c>TS_CPU_MOE</c>) once, when it is constructed, and its weight residency,
+    /// expert placement and FFN dispatch all read that snapshot: a later change of the default reaches the next load, never
+    /// a loaded model half-way through.
+    /// </summary>
+    /// <param name="CpuMoeLayers">The leading layers whose routed experts live on the host (when not <paramref name="AllLayers"/>).</param>
+    /// <param name="AllLayers">Every MoE layer's routed experts live on the host.</param>
+    /// <param name="IsExplicitlySet">A flag or variable set the policy (else the model plans its own placement).</param>
+    public sealed record MoeCpuOffloadPolicy(int CpuMoeLayers, bool AllLayers, bool IsExplicitlySet)
+    {
+        /// <summary>No offload, nothing set.</summary>
+        public static MoeCpuOffloadPolicy None { get; } = new(0, false, false);
+
+        /// <summary>True when any MoE layer is offloaded to the host.</summary>
+        public bool IsEnabled => AllLayers || CpuMoeLayers > 0;
+
+        /// <summary>True when <paramref name="layer"/>'s routed experts are kept in system RAM and multiplied on the host.</summary>
+        public bool IsLayerOnCpu(int layer) => AllLayers || (layer >= 0 && layer < CpuMoeLayers);
+
+        /// <summary>True when <paramref name="name"/> is a routed-expert tensor of a layer this policy places on the host.</summary>
+        public bool IsOffloadedExpertWeightName(string name)
+        {
+            if (!IsEnabled || !MoeCpuOffloadConfig.IsRoutedExpertWeightName(name))
+                return false;
+            if (AllLayers)
+                return true;
+            return MoeCpuOffloadConfig.TryParseLayerIndex(name, out int layer) && layer < CpuMoeLayers;
+        }
+
+        /// <summary>The model-load banner's summary (null when offload is off).</summary>
+        public string Describe() => AllLayers ? "all layers" : CpuMoeLayers > 0 ? $"first {CpuMoeLayers} layer(s)" : null;
+    }
+
     public static class MoeCpuOffloadConfig
     {
+        /// <summary>The process default as an immutable policy: what a model constructed now takes
+        /// (<see cref="ModelBase.MoeOffload"/>).</summary>
+        public static MoeCpuOffloadPolicy Current => new(CpuMoeLayers, AllLayers, IsExplicitlySet);
+
         private const string EnvVarLayers = "TS_N_CPU_MOE";
         private const string EnvVarAll = "TS_CPU_MOE";
         private const string EnvVarThreads = "TS_CPU_MOE_THREADS";

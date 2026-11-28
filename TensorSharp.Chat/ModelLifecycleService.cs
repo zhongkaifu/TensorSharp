@@ -31,19 +31,39 @@ namespace TensorSharp.Server
         /// <c>--tp</c>), as the CLI passes its <c>--layer-split</c>: the GPU count refused a node of one two-GPU stage
         /// ("the layer-split degree must match the local device group").</remarks>
         public ModelLifecycleService(ILogger logger)
-            : this(logger, static (path, backend, tpGroup, draftPath) =>
-                ModelBase.Create(path, backend, tpDegree: tpGroup is ILayerSplitGroup ? 1 : tpGroup?.Degree ?? 1,
-                    tpGroup: tpGroup, draftModelPath: draftPath,
-                    layerSplitDegree: tpGroup is ILayerSplitGroup layers ? layers.LocalStages : 1))
+            : this(logger, null)
         {
         }
 
         /// <summary>Test seam: <paramref name="createModel"/> stands in for
-        /// <see cref="ModelBase.Create(string, BackendType, int, ITensorParallelGroup, string, int)"/>.</summary>
+        /// <see cref="ModelBase.Create(string, BackendType, ModelPlacementOptions, ITensorParallelGroup, string)"/>.</summary>
         internal ModelLifecycleService(ILogger logger, Func<string, BackendType, ITensorParallelGroup, string, ModelBase> createModel)
         {
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
-            _createModel = createModel;
+            _createModel = createModel ?? CreateWithPlacement;
+        }
+
+        /// <summary>
+        /// The model placement the host resolved from its flags and environment (D04: model-instance scope), handed to every
+        /// load; null reads the environment's placement at each load (a host that resolved none). The distributed checks
+        /// read it too, instead of the environment the host used to write its flags into.
+        /// </summary>
+        public ModelPlacementOptions Placement { get; set; }
+
+        private ModelPlacementOptions ResolvedPlacement => Placement ?? ModelPlacementOptions.FromEnvironment();
+
+        /// <remarks>A node of a multi-node layer split runs its group's local stages (its GPUs over its stages' <c>--tp</c>),
+        /// as the CLI passes its <c>--layer-split</c>.</remarks>
+        private ModelBase CreateWithPlacement(string path, BackendType backend, ITensorParallelGroup tpGroup, string draftPath)
+        {
+            ModelPlacementOptions placement = ResolvedPlacement;
+            if (tpGroup != null)
+                placement = placement with
+                {
+                    TpDegree = tpGroup is ILayerSplitGroup ? 1 : tpGroup.Degree,
+                    LayerSplitDegree = tpGroup is ILayerSplitGroup layers ? layers.LocalStages : 1,
+                };
+            return ModelBase.Create(path, backend, placement, tpGroup, draftPath);
         }
 
         public bool IsLoaded => _model != null;
@@ -173,9 +193,7 @@ namespace TensorSharp.Server
         /// weights, so it must be refused before disposing the serving model.</summary>
         internal bool ShouldLoadDistributedModel(string modelPath, string mmProjPath, string backendStr, bool startupLoad)
         {
-            bool distributed = TensorParallelGroupFactory != null &&
-                (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) ||
-                 !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")));
+            bool distributed = TensorParallelGroupFactory != null && ResolvedPlacement.NamesDistributedGroup;
             if (!distributed) return true;
             var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
             bool SamePath(string left, string right) => string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right)
@@ -375,13 +393,12 @@ namespace TensorSharp.Server
         /// unavailable backend or a load creates its GPU group and connects to peers.</summary>
         internal void ValidateDistributedModelSupport(string modelPath, string backendStr)
         {
-            if (TensorParallelGroupFactory == null ||
-                string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) ||
-                string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
+            ModelPlacementOptions placement = ResolvedPlacement;
+            if (TensorParallelGroupFactory == null || !placement.IsDistributed)
                 return;
 
             // Across nodes an explicit --layer-split selects the node pipeline (each node's stages may be --tp groups).
-            bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"));
+            bool layerSelected = placement.LayerSplitRequested;
             BackendType backend = ResolveBackend(backendStr);
             if (layerSelected) ModelBase.ValidateDistributedLayerSplit(modelPath, backend);
             else ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);

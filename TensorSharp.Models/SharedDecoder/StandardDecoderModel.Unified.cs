@@ -24,6 +24,10 @@ namespace TensorSharp.Models
         /// <see cref="SupportsPerSequenceFusedForward"/> is derived from it, not the other way round.</summary>
         public bool SupportsUnifiedBatching => _cacheK != null && LayerSplitGroup == null;
 
+        /// <summary>How many released slots this model parks for reuse (TS_KV_HOLDER_POOL_MAX), taken when the model is
+        /// constructed (D04: model-instance scope; TensorAgent's memory policy sets it before each load).</summary>
+        private readonly int _holderPoolMax = ExecutionOptions.FromEnvironment().KvHolderPoolMax;
+
         // ---------------------------------------------------------------- ISequenceStateStore
 
         /// <summary>Whether <paramref name="requestId"/> has a slot (one it ran on, or one a restored prefix made).</summary>
@@ -768,7 +772,7 @@ namespace TensorSharp.Models
         {
             if (_spareBuild == null)
             {
-                if (_slotStateBytes < 0 || (_slotPool?.Count ?? 0) >= Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax))
+                if (_slotStateBytes < 0 || (_slotPool?.Count ?? 0) >= Math.Min(SlotPoolMax, _holderPoolMax))
                     return false;
                 if (RoomForTwoSlots(capacity) != true)
                 {
@@ -815,7 +819,7 @@ namespace TensorSharp.Models
         internal int SpareSlotsMade { get; private set; }
 
         /// <summary>Slots in the pool, and how many it keeps at most (tests).</summary>
-        internal (int Pooled, int Cap) SlotPoolForTests => (_slotPool?.Count ?? 0, Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax));
+        internal (int Pooled, int Cap) SlotPoolForTests => (_slotPool?.Count ?? 0, Math.Min(SlotPoolMax, _holderPoolMax));
 
         // The device had no room for an idle spare: none is tried again until a slot is given back.
         private bool _idleSpareRefused;
@@ -838,7 +842,7 @@ namespace TensorSharp.Models
             // next request's prompt end came with no states made.
             if (BuildSpareCheckpointStates()) return true;
             if (_sparePending || _idleSpareRefused) return false;
-            int cap = Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax);
+            int cap = Math.Min(SlotPoolMax, _holderPoolMax);
             if (_spareBuild == null && (_slotPool?.Count ?? 0) >= cap) return false;
             int capacity = _spareBuild?.Capacity ?? SpareCapacity;
             if (_spareBuild == null && RoomForTwoSlots(capacity) != true)

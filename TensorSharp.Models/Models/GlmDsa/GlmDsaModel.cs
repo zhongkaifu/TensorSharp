@@ -529,7 +529,7 @@ namespace TensorSharp.Models
 
         /// <summary>Routed experts stay in host RAM on layers the operator offloaded (--n-cpu-moe).</summary>
         protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
-            => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);
+            => !MoeOffload.IsOffloadedExpertWeightName(weightName);
 
         private void AllocateScratch()
         {

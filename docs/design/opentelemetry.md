@@ -325,7 +325,8 @@ overrides the line is as above.
   version without the `+<commit>` Source Link suffix; `service.instance.id` = `<machine>:<pid>`, readable in
   Application Insights' `cloud_RoleInstance` and stable across a process's lifetime;
 - the SDK's telemetry attributes; `host.name`, `process.pid`; `tensorsharp.tp.node_id` and `tensorsharp.tp.degree`
-  when those variables are set;
+  from the host's resolved placement (`TelemetryOptions.TensorParallelNodeId` / `TensorParallelDegree`, which the server
+  sets from its flags), else from `TENSORSHARP_TP_NODE_ID` / `TENSORSHARP_TP_DEGREE` when those variables are set;
 - the SDK's environment detector **last**, so `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` win over every
   default.
 

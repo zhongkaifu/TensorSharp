@@ -551,7 +551,7 @@ namespace TensorSharp.Models
         private void WarmPooledSlot()
         {
             if (!SupportsUnifiedBatching || GraphUnsupportedReason() != null || _mesh.Stages > 1
-                || ExecutionOptions.FromEnvironment().KvHolderPoolMax <= 0)
+                || _holderPoolMax <= 0)
                 return;
             string[] keys = SupportsPrefixCheckpoints ? new[] { "\u0001warm-slot", "\u0001warm-checkpoint" } : new[] { "\u0001warm-slot" };
             int safeToken = Config.VocabSize > 1 ? 1 : 0;

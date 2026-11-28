@@ -907,16 +907,21 @@ internal enum GgmlIndexReductionOp
 
         private static void ApplyTensorParallelCudaGraphTunable()
         {
-            if (!string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_CUDA_GRAPHS"), "0",
+            string degreeText = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
+            if (int.TryParse(degreeText, System.Globalization.NumberStyles.Integer,
+                              System.Globalization.CultureInfo.InvariantCulture, out int degree))
+                ApplyTensorParallelCudaGraphTunable(degree);
+        }
+
+        /// <summary>The opt-out TS_GGML_TP_CUDA_GRAPHS=0 for a load of <paramref name="tpDegree"/> tensor-parallel ranks:
+        /// GGML_CUDA_DISABLE_GRAPHS for ggml-cuda, which latches it when its backend initializes (a process-scope setting).
+        /// The loader calls it with the placement it resolved (ModelBase.Create), before any backend comes up; the static
+        /// initializer still honours a degree set in the environment.</summary>
+        internal static void ApplyTensorParallelCudaGraphTunable(int tpDegree)
+        {
+            if (tpDegree <= 1 || !string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_CUDA_GRAPHS"), "0",
                                StringComparison.Ordinal))
                 return;
-
-            string degreeText = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
-            if (!int.TryParse(degreeText, System.Globalization.NumberStyles.Integer,
-                              System.Globalization.CultureInfo.InvariantCulture, out int degree)
-                || degree <= 1)
-                return;
-
             SetNativeEnvironmentVariable("GGML_CUDA_DISABLE_GRAPHS", "1", overwrite: false);
         }
 
@@ -2783,6 +2788,13 @@ internal enum GgmlIndexReductionOp
                 ApplyVulkanDeviceFromEnvironment();
             }
 
+            // ggml keeps one backend type per process (ggml_ops_core.cpp's ensure_backend): a process-scope setting, claimed
+            // once (D04). A second type is refused here with who took the first, before the native call fails without saying.
+            const string BackendSetting = "ggml.backend";
+            if (ProcessSettings.TryGet(BackendSetting, out string heldBackend, out string heldOwner)
+                && !string.Equals(heldBackend, backendType.ToString(), StringComparison.Ordinal))
+                throw new ProcessSettingConflictException(BackendSetting, heldBackend, heldOwner, backendType.ToString(),
+                    $"the GGML {backendType} backend");
             try
             {
                 EnsureGraphSchema();
@@ -2797,6 +2809,7 @@ internal enum GgmlIndexReductionOp
                     };
                     throw new InvalidOperationException($"Failed to initialize {backendName}. {GetBackendAvailabilityHint(backendType)}");
                 }
+                ProcessSettings.Claim(BackendSetting, backendType.ToString(), $"the GGML {backendType} backend");
             }
             catch (DllNotFoundException ex)
             {

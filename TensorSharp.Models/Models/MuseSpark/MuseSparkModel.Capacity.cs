@@ -23,8 +23,8 @@ public partial class MuseSparkModel
         BuildLayerPlacement();
         if (_backend is not (BackendType.GgmlCuda or BackendType.GgmlVulkan)) return;
 
-        var totals = CapacityWeightTotals(MoeCpuOffloadConfig.AllLayers
-            ? Config.NumLayers : MoeCpuOffloadConfig.CpuMoeLayers, _layerRanks);
+        var totals = CapacityWeightTotals(MoeOffload.AllLayers
+            ? Config.NumLayers : MoeOffload.CpuMoeLayers, _layerRanks);
         long[] free = QueryCapacityFreeBytes(LayerSplitDegree);
         long reserve = ResolveScratchReserveBytes(Config.HiddenSize, _latentSize,
             _expertFfnLength, _prefillChunk, Environment.GetEnvironmentVariable(ScratchReserveVariable));
@@ -36,7 +36,7 @@ public partial class MuseSparkModel
             // Only suggest a count when every selected device was measured.
             if (free.All(bytes => bytes >= 0))
             {
-                int current = MoeCpuOffloadConfig.AllLayers ? Config.NumLayers : MoeCpuOffloadConfig.CpuMoeLayers;
+                int current = MoeOffload.AllLayers ? Config.NumLayers : MoeOffload.CpuMoeLayers;
                 for (int count = current + 1; count <= Config.NumLayers; count++)
                 {
                     var layers = CapacityLayerBytes(count, out long embedding, out long head);

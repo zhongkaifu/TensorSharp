@@ -97,6 +97,14 @@ namespace TensorSharp.Telemetry
         public bool CaptureMessageContent { get; private init; }
         public bool TraceSteps { get; private init; }
 
+        /// <summary>The node id the resource reports for a multi-node placement (D04: the host's resolved placement; when
+        /// unset the resource falls back to <c>TENSORSHARP_TP_NODE_ID</c>).</summary>
+        public string? TensorParallelNodeId { get; set; }
+
+        /// <summary>The tensor-parallel degree the resource reports (the host's resolved placement; when unset the resource
+        /// falls back to <c>TENSORSHARP_TP_DEGREE</c>).</summary>
+        public int? TensorParallelDegree { get; set; }
+
         /// <summary>
         /// Minimum level exported through OpenTelemetry, from <c>TENSORSHARP_OTEL_LOG_LEVEL</c>;
         /// null keeps the host's level (and, on the server, honours

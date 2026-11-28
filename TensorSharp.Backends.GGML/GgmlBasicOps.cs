@@ -1792,6 +1792,10 @@ namespace TensorSharp.GGML
         /// <summary>The graph op schema the native bridge was built from (TSGgml_GraphSchemaHash / Version): it must equal
         /// TensorSharp.Graph.GraphOpSchema's, which <see cref="EnsureBackendAvailable"/> checks.</summary>
         public static (string Hash, int Version) NativeGraphSchema() => GgmlNative.NativeGraphSchema();
+
+        /// <summary>Applies the process-scope native tunables a tensor-parallel load of <paramref name="tpDegree"/> ranks
+        /// needs before its backend initializes (TS_GGML_TP_CUDA_GRAPHS=0: ggml-cuda's graph capture off).</summary>
+        public static void ApplyTensorParallelProcessTunables(int tpDegree) => GgmlNative.ApplyTensorParallelCudaGraphTunable(tpDegree);
         public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);
 
         /// <summary>Env var (read at Vulkan backend init) selecting the Vulkan device index.</summary>

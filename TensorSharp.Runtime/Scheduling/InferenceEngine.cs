@@ -108,6 +108,8 @@ namespace TensorSharp.Runtime.Scheduling
             };
             AttachSoloPrefillPolicy(model, cfg, _scheduler, _logger);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
+            if (cfg.ExecutionOptions is { } explicitOptions)
+                _executor.OptionsSource = ExecutionOptionsSource.Fixed(explicitOptions);
             _executor.InitializeRadixCache(cfg);
             // A prompt a step finished before the step's verify windows ran streams its first token then.
             _executor.PromptFinished = seq =>
@@ -143,7 +145,7 @@ namespace TensorSharp.Runtime.Scheduling
                 model.Config?.Architecture ?? "model",
                 ExecutionPlanner.BuildCapabilityReport(
                     ExecutionCapabilities.FromModel(model),
-                    ExecutionOptions.FromEnvironment(),
+                    _executor.StepOptions,
                     cfg));
 
             _worker = new Thread(WorkerLoop)
@@ -158,6 +160,17 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         public IModelArchitecture Model => _model;
+
+        /// <summary>The execution options of the engine's current step (D04: one snapshot a step).</summary>
+        public ExecutionOptions ExecutionOptions => _executor.StepOptions;
+
+        /// <summary>The version of <see cref="ExecutionOptions"/>: it changes at the step boundary where new options took
+        /// effect.</summary>
+        public long ExecutionOptionsVersion => _executor.OptionsSource.Version;
+
+        /// <summary>Replaces the engine's execution options from its next step boundary on (the step running now keeps the
+        /// snapshot it began with), and stops following the environment's TS_* overrides.</summary>
+        public void UpdateExecutionOptions(ExecutionOptions options) => _executor.OptionsSource.Update(options);
         public BlockPoolStats PoolStats => _pool.GetStats();
 
         /// <summary>The model's slot and graph counters, when it keeps sequence slots of its own
@@ -583,6 +596,9 @@ namespace TensorSharp.Runtime.Scheduling
                     List<SequenceStepResult> results;
                     try
                     {
+                        // The step boundary: the execution options this step's admission, plan, executor and prefix cache
+                        // read (one version for the whole step; an UpdateExecutionOptions takes effect here).
+                        _executor.BeginStep();
                         output = _scheduler.Schedule();
                         ScheduledForTests?.Invoke(output);
                     }

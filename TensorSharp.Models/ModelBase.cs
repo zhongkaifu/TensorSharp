@@ -170,6 +170,20 @@ namespace TensorSharp.Models
 
         protected int _cacheSeqLen;
         protected int _maxContextLength;
+
+        /// <summary>This model's placement (D04: model-instance scope, fixed at load): its degrees and the GPUs each rank and
+        /// stage uses. Taken from what <see cref="Create(string, BackendType, ModelPlacementOptions, ITensorParallelGroup, string)"/>
+        /// resolved, never read from the environment after construction.</summary>
+        public ModelPlacementOptions Placement { get; }
+
+        /// <summary>The placement <see cref="Create(string, BackendType, ModelPlacementOptions, ITensorParallelGroup, string)"/>
+        /// is constructing a model with (its factory's constructor takes it as its snapshot).</summary>
+        [ThreadStatic] private static ModelPlacementOptions t_creatingPlacement;
+
+        /// <summary>This model's MoE CPU-offload policy, taken from the process default when the model is constructed (D04:
+        /// model-instance scope). Weight residency, expert placement and FFN dispatch read it; a later change of the default
+        /// (<see cref="MoeCpuOffloadConfig"/>) applies to the next load only.</summary>
+        public MoeCpuOffloadPolicy MoeOffload { get; } = MoeCpuOffloadConfig.Current;
         protected float[] _logitsBuffer;
 
         /// <summary>
@@ -438,6 +452,13 @@ namespace TensorSharp.Models
                 throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
             LayerSplitDegree = layerSplitDegree;
             _requestedTpDegree = tpDegree;
+            // The model's placement snapshot (D04): what ModelBase.Create resolved (the host's flags, else the environment),
+            // with the degrees this constructor was given. A model constructed directly reads the environment once, here.
+            Placement = (t_creatingPlacement ?? ModelPlacementOptions.EnvironmentDevices()) with
+            {
+                TpDegree = tpDegree,
+                LayerSplitDegree = layerSplitDegree,
+            };
             _backend = backend;
             UseFloatKvCacheOnMlx();
             // The pure-C# CPU backend and the direct-CUDA backend never touch GGML: every load-time
@@ -481,7 +502,7 @@ namespace TensorSharp.Models
                         // and leaving it set would also make the startup banner claim a
                         // transport that is never used.
                         var shared = FindGgmlContext(LayerSplitGroup);
-                        _ggmlContext = shared ?? CreateGgmlContext(ggmlType, LayerSplitDegree, enableCollectives: false);
+                        _ggmlContext = shared ?? CreateGgmlContext(ggmlType, LayerSplitDegree, enableCollectives: false, Placement);
                         _ownsGgmlContext = shared == null;
                         _allocator = LayerSplitGroup?.GetAllocator(0) ?? new GgmlAllocator(_ggmlContext, 0);
                     }
@@ -491,7 +512,7 @@ namespace TensorSharp.Models
                         // multi-GPU context; reuse it rather than initializing the
                         // devices a second time.
                         GgmlContext shared = FindGgmlContext(_tpGroup);
-                        _ggmlContext = shared ?? CreateGgmlContext(ggmlType, tpDegree);
+                        _ggmlContext = shared ?? CreateGgmlContext(ggmlType, tpDegree, placement: Placement);
                         _ownsGgmlContext = shared == null;
                         _tpGroup ??= CreateGgmlTpGroup(_ggmlContext);
                         _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new GgmlAllocator(_ggmlContext, 0);
@@ -552,13 +573,12 @@ namespace TensorSharp.Models
         /// you avoid a display-attached or otherwise busy card.
         /// </summary>
         private static GgmlContext CreateGgmlContext(GgmlBackendType backendType, int tpDegree,
-            bool enableCollectives = true)
+            bool enableCollectives = true, ModelPlacementOptions placement = null)
         {
             if (tpDegree <= 1)
                 return new GgmlContext(new[] { 0 }, backendType);
 
-            int[] devices = ParseDeviceIds(tpDegree, enableCollectives
-                ? "TENSORSHARP_TP_DEVICES" : "TENSORSHARP_LAYER_SPLIT_DEVICES");
+            int[] devices = (placement ?? ModelPlacementOptions.FromEnvironment()).DeviceIds(tpDegree, enableCollectives);
             int available = GgmlBasicOps.GetGpuDeviceCount(backendType);
             if (available < tpDegree)
             {
@@ -570,32 +590,11 @@ namespace TensorSharp.Models
             return new GgmlContext(devices, backendType, enableCollectives);
         }
 
+        /// <summary>The device ordinals of <paramref name="tpDegree"/> ranks from <paramref name="variable"/> in the
+        /// environment (a static entry point a host calls before any model exists); a model reads its own
+        /// <see cref="Placement"/>.</summary>
         internal static int[] ParseDeviceIds(int tpDegree, string variable)
-        {
-            string raw = Environment.GetEnvironmentVariable(variable);
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                var seq = new int[tpDegree];
-                for (int i = 0; i < tpDegree; i++) seq[i] = i;
-                return seq;
-            }
-
-            string[] parts = raw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length != tpDegree)
-            {
-                throw new ArgumentException(
-                    $"{variable} lists {parts.Length} device(s) but the requested degree is {tpDegree}.");
-            }
-            var devices = new int[tpDegree];
-            for (int i = 0; i < tpDegree; i++)
-            {
-                if (!int.TryParse(parts[i].Trim(), out devices[i]) || devices[i] < 0)
-                    throw new ArgumentException($"Invalid device index '{parts[i]}' in {variable}.");
-                if (Array.IndexOf(devices, devices[i], 0, i) >= 0)
-                    throw new ArgumentException($"{variable} contains duplicate device index {devices[i]}.");
-            }
-            return devices;
-        }
+            => ModelPlacementOptions.ParseDeviceIds(tpDegree, Environment.GetEnvironmentVariable(variable), variable);
 
         private static ITensorParallelGroup CreateGgmlTpGroup(GgmlContext context)
             => context.Degree > 1 ? new GgmlTensorParallelGroup(context) : null;
@@ -3985,10 +3984,47 @@ namespace TensorSharp.Models
         public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             string draftModelPath = null, int layerSplitDegree = 1)
         {
-            if (tpGroup == null && tpDegree <= 1)
-                tpDegree = ReadParallelDegree("TENSORSHARP_TP_DEGREE", tpDegree);
-            if (layerSplitDegree <= 1)
-                layerSplitDegree = ReadParallelDegree("TENSORSHARP_LAYER_SPLIT_DEGREE", layerSplitDegree);
+            // The compatibility entry: the environment's placement, with a degree above one given here taking its place (a
+            // degree of one cannot say "not two": a host that resolved its flags passes them as a placement instead).
+            ModelPlacementOptions placement = ModelPlacementOptions.FromEnvironment();
+            if (tpGroup != null || tpDegree > 1) placement = placement with { TpDegree = tpDegree };
+            if (layerSplitDegree > 1) placement = placement with { LayerSplitDegree = layerSplitDegree };
+            return Create(ggufPath, backend, placement, tpGroup, draftModelPath);
+        }
+
+        /// <summary>
+        /// Loads a model with the placement its host resolved (D04): <paramref name="placement"/> is authoritative - its
+        /// degrees and device lists are the model's snapshot (<see cref="Placement"/>) and nothing of it is read from the
+        /// environment. <paramref name="tpGroup"/>, when given, is the group the placement's ranks run in (a multi-node
+        /// group, or a local one the host built).
+        /// </summary>
+        public static ModelBase Create(string ggufPath, BackendType backend, ModelPlacementOptions placement, ITensorParallelGroup tpGroup = null,
+            string draftModelPath = null)
+        {
+            ArgumentNullException.ThrowIfNull(placement);
+            int tpDegree = placement.TpDegree, layerSplitDegree = placement.LayerSplitDegree;
+            // A process-scope native setting the placement implies, before any backend initializes (it used to be read back
+            // from the environment the host had written the flags into).
+            if (tpDegree > 1 && backend is BackendType.GgmlCuda)
+            {
+                try { GgmlBasicOps.ApplyTensorParallelProcessTunables(tpDegree); }
+                catch (DllNotFoundException) { }
+            }
+            ModelPlacementOptions previous = t_creatingPlacement;
+            t_creatingPlacement = placement;
+            try
+            {
+                return CreateCore(ggufPath, backend, tpDegree, tpGroup, draftModelPath, layerSplitDegree);
+            }
+            finally
+            {
+                t_creatingPlacement = previous;
+            }
+        }
+
+        private static ModelBase CreateCore(string ggufPath, BackendType backend, int tpDegree, ITensorParallelGroup tpGroup,
+            string draftModelPath, int layerSplitDegree)
+        {
 
             // A safetensors model file (a diffusion family's denoiser in its original tensor names, such as
             // MiniMax-H3-Image's release) has no GGUF header: the family whose detector claims it builds it, through the
@@ -4017,15 +4053,6 @@ namespace TensorSharp.Models
             ModelBase model = architecture.Factory(context);
             model.VerifyTensorParallelShardedWeights(architecture.Id);
             return model;
-        }
-
-        private static int ReadParallelDegree(string variable, int fallback)
-        {
-            string raw = Environment.GetEnvironmentVariable(variable);
-            if (string.IsNullOrWhiteSpace(raw)) return fallback;
-            if (!int.TryParse(raw, out int degree) || degree < 1)
-                throw new ArgumentException($"{variable} must be a positive integer.");
-            return degree;
         }
 
         /// <summary>Read architecture metadata and reject unsupported distributed
@@ -4202,7 +4229,7 @@ namespace TensorSharp.Models
         internal static void ValidateExpertOffloadRequest(ModelArchitectureDescriptor architecture, BackendType backend,
             int tpDegree, GgufFile checkpoint = null)
         {
-            if (!MoeCpuOffloadConfig.IsEnabled) return;
+            if (!MoeCpuOffloadConfig.Current.IsEnabled) return;
             string inert = architecture.Serving.ExpertOffload.Kind == SupportKind.NotApplicable
                 ? architecture.Serving.ExpertOffload.Reason
                 : checkpoint != null && !checkpoint.Tensors.Keys.Any(MoeCpuOffloadConfig.IsRoutedExpertWeightName)

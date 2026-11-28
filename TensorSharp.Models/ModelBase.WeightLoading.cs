@@ -751,11 +751,11 @@ namespace TensorSharp.Models
         /// </summary>
         private void EnableHostExpertIoForCpuMoe()
         {
-            if (!MoeCpuOffloadConfig.IsEnabled || _gguf == null || _hostExpertIoBases != null)
+            if (!MoeOffload.IsEnabled || _gguf == null || _hostExpertIoBases != null)
                 return;
             long hostBytes = 0;
             foreach (var kv in _stackedExpertWeights)
-                if (MoeCpuOffloadConfig.IsOffloadedExpertWeightName(kv.Key))
+                if (MoeOffload.IsOffloadedExpertWeightName(kv.Key))
                     hostBytes += kv.Value.TotalRawBytes;
             if (hostBytes <= 0)
                 return;
@@ -923,7 +923,7 @@ namespace TensorSharp.Models
         protected virtual bool ShouldPreloadDirectCudaWeight(string weightName) => true;
 
         protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
-            => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);
+            => !MoeOffload.IsOffloadedExpertWeightName(weightName);
 
         /// <summary>
         /// Per-weight veto for the eager MLX quantized preload

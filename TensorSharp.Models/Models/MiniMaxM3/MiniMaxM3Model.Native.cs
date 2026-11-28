@@ -82,8 +82,8 @@ public partial class MiniMaxM3Model : IBatchedPagedModel, ISoloPrefillBudgetMode
     {
         if (autoSetting is string auto && string.Equals(auto.Trim(), "auto", StringComparison.OrdinalIgnoreCase))
             return -1;
-        int cpuMoe = !MoeCpuOffloadConfig.IsExplicitlySet ? 0
-            : MoeCpuOffloadConfig.AllLayers ? numLayers : Math.Min(numLayers, MoeCpuOffloadConfig.CpuMoeLayers);
+        int cpuMoe = !MoeCpuOffloadConfig.Current.IsExplicitlySet ? 0
+            : MoeCpuOffloadConfig.Current.AllLayers ? numLayers : Math.Min(numLayers, MoeCpuOffloadConfig.Current.CpuMoeLayers);
         if (cpuMoe > 0 && cpuMoe <= denseLead)
             Console.Error.WriteLine($"[minimax-m3] --n-cpu-moe {cpuMoe} moves no experts: layers 0..{denseLead - 1} are " +
                 $"dense, so the first routed experts are in layer {denseLead}. Use --n-cpu-moe {denseLead + 1} or more.");

@@ -24,6 +24,11 @@ public sealed class ModelParallelismOptions
     public DistributedTpConfig Distributed { get; private set; }
     public bool HasCliOverrides => _overrides.Count != 0;
 
+    /// <summary>The resolved placement (D04): each value from its flag, else the environment, else the default. A host hands
+    /// this to the loader (<c>ModelBase.Create(path, backend, placement, ...)</c>) and to its distributed group factory
+    /// instead of publishing the flags into the environment (<see cref="ApplyEnvironment"/>).</summary>
+    public ModelPlacementOptions Placement { get; private set; } = ModelPlacementOptions.Default;
+
     /// <summary>Collect one placement option at the host parser's current option
     /// boundary. The host must consume other options' operands itself so literal
     /// prompt text such as "--tp=2" is never interpreted as configuration.</summary>
@@ -102,6 +107,19 @@ public sealed class ModelParallelismOptions
 
         string node = Resolve(NodeIdVariable);
         string peers = Resolve(PeersVariable);
+        // The device lists have no flags: they come from the environment (an operator's input), read here once.
+        static string EnvironmentValue(string variable)
+            => Environment.GetEnvironmentVariable(variable) is { } v && !string.IsNullOrWhiteSpace(v) ? v.Trim() : null;
+        result.Placement = new ModelPlacementOptions
+        {
+            TpDevices = EnvironmentValue(ModelPlacementOptions.TpDevicesVariable),
+            LayerSplitDevices = EnvironmentValue(ModelPlacementOptions.LayerSplitDevicesVariable),
+            TpDegree = result.TpDegree,
+            LayerSplitDegree = result.LayerSplitDegree,
+            LayerSplitRequested = !string.IsNullOrWhiteSpace(Resolve(LayerSplitDegreeVariable)),
+            DistributedNodeId = string.IsNullOrWhiteSpace(node) ? null : node.Trim(),
+            DistributedPeers = string.IsNullOrWhiteSpace(peers) ? null : peers.Trim(),
+        };
         bool hasNode = !string.IsNullOrWhiteSpace(node);
         bool hasPeers = !string.IsNullOrWhiteSpace(peers);
         // Across nodes an explicit --layer-split selects the node pipeline, --tp then sizing each of this node's stages
@@ -132,6 +150,9 @@ public sealed class ModelParallelismOptions
         return result;
     }
 
+    /// <summary>Publishes the flags into the process environment. Kept for tools that start child processes or old
+    /// integrations; the hosts pass <see cref="Placement"/> to the loader instead (D04: the environment is an input
+    /// channel, not how modules hand configuration to each other).</summary>
     public bool ApplyEnvironment()
     {
         foreach (var pair in _overrides)

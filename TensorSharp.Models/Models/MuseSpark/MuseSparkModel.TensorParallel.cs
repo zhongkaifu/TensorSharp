@@ -46,7 +46,7 @@ public partial class MuseSparkModel
             long bytes = PlacementWeightBytes(info, _gguf.GetTensorByteCount(info), _backend);
             bool isLayer = MoeCpuOffloadConfig.TryParseLayerIndex(info.Name, out int layer);
             bool experts = isLayer && info.Name.Contains("_exps.", StringComparison.Ordinal);
-            bool offloaded = experts && MoeCpuOffloadConfig.IsLayerOnCpu(layer);
+            bool offloaded = experts && MoeOffload.IsLayerOnCpu(layer);
             if (offloaded && IsQuantizedLinearWeight(info)) continue;
             bool query = info.Name.EndsWith("attn_q.weight", StringComparison.Ordinal) ||
                 info.Name.EndsWith("attn_gate.weight", StringComparison.Ordinal) ||
@@ -170,7 +170,7 @@ public partial class MuseSparkModel
         {
             string p = _prefixes[l];
             _sparkTpPostNorm[l] = TensorToFloatArray(_weights[p + "ffn_post_exp_norm.weight"]);
-            if (MoeCpuOffloadConfig.IsLayerOnCpu(l)) continue;
+            if (MoeOffload.IsLayerOnCpu(l)) continue;
             if (!_stackedExpertWeights.TryGetValue(p + "ffn_gate_exps.weight", out var gate) ||
                 !_stackedExpertWeights.TryGetValue(p + "ffn_up_exps.weight", out var up) ||
                 !_stackedExpertWeights.TryGetValue(p + "ffn_down_exps.weight", out var down)) continue;

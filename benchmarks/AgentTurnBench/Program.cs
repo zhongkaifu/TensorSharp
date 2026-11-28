@@ -76,8 +76,8 @@ internal static class Program
         // join the model at construction; only Gemma 4's assistant head attaches after.
         if (o.DraftModel != null)
             Environment.SetEnvironmentVariable(SpeculationEnvVars.DraftModel, o.DraftModel);
-        using ModelBase model = ModelBase.Create(o.Model, backend, o.Parallelism.TpDegree,
-            draftModelPath: o.DraftModel, layerSplitDegree: o.Parallelism.LayerSplitDegree);
+        // The resolved placement goes to the loader (D04), not into the environment.
+        using ModelBase model = ModelBase.Create(o.Model, backend, o.Parallelism.Placement, draftModelPath: o.DraftModel);
         if (o.DraftModel != null && !SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string err))
             Console.Error.WriteLine($"[agent-turn-bench] draft head NOT attached: {err}");
         if (o.SpecCandidates?.Contains("auto") == true &&
@@ -307,7 +307,6 @@ internal sealed class Options
             o.Parallelism = ModelParallelismOptions.Parse(placement.ToArray());
             if (o.Parallelism.Distributed != null)
                 throw new ArgumentException("AgentTurnBench supports local placement only; use the CLI/server for distributed tensor parallelism.");
-            o.Parallelism.ApplyEnvironment();
         }
         catch (ArgumentException ex)
         {

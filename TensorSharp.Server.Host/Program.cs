@@ -213,6 +213,7 @@ string? configuredBackendInput = ServerOptionsBuilder.ReadConfiguredBackendInput
 bool redisFlagsApplied, continuousBatchingFlagApplied, specFlagsApplied, qwenImageFlagsApplied,
     kvCacheDtypeFlagApplied, moeCpuOffloadFlagsApplied, gpuDeviceFlagApplied, tensorParallelFlagsApplied,
     promptAttentionFlagApplied, diffusionProductsFlagApplied;
+TensorSharp.Distributed.ModelParallelismOptions parallelism;
 try
 {
     ServerOptionsBuilder.ApplyPrefixCacheCliFlag(args);
@@ -258,11 +259,11 @@ try
     promptAttentionFlagApplied = ServerOptionsBuilder.ApplyPromptAttentionCliFlag(args);
     // Translate --diffusion-products into TS_DIFFUSION_PRODUCTS, which the native CUDA products read.
     diffusionProductsFlagApplied = ServerOptionsBuilder.ApplyDiffusionProductsCliFlag(args);
-    // Translate --tp / --layer-split and distributed options into the model placement env vars
-    // the model loader reads (ModelBase.Create for the local degree,
-    // DistributedTpConfig for the multi-node pair). Must run before the startup
-    // model is loaded so the very first load is sharded across the GPUs.
-    tensorParallelFlagsApplied = ServerOptionsBuilder.ApplyTensorParallelCliFlags(args);
+    // Resolve --tp / --layer-split and the distributed options once (flags, then the environment, then the
+    // defaults: D04). The model service hands the placement to every load and the distributed group factory
+    // reads the same options; nothing is published into the environment for them to read back.
+    parallelism = ServerOptionsBuilder.ResolveModelParallelism(args);
+    tensorParallelFlagsApplied = parallelism.HasCliOverrides;
 }
 catch (Exception ex) when (ex is ArgumentException or IOException)
 {
@@ -276,12 +277,15 @@ catch (Exception ex) when (ex is ArgumentException or IOException)
 }
 
 // OpenTelemetry is off unless an OTLP endpoint, APPLICATIONINSIGHTS_CONNECTION_STRING or
-// TENSORSHARP_OTEL=1 asks for it (TelemetryOptions has every rule). Resolved after the flag
-// appliers above, which set the TENSORSHARP_TP_* variables the resource reports.
+// TENSORSHARP_OTEL=1 asks for it (TelemetryOptions has every rule). The resource reports the
+// placement resolved above.
 TelemetryOptions telemetryOptions;
 try
 {
     telemetryOptions = TelemetryOptions.FromEnvironment(TelemetryHost.Server);
+    telemetryOptions.TensorParallelNodeId = parallelism.Placement.DistributedNodeId;
+    if (parallelism.HasCliOverrides || parallelism.Placement.TpDegree > 1)
+        telemetryOptions.TensorParallelDegree = parallelism.Placement.TpDegree;
 }
 catch (ArgumentException ex)
 {
@@ -393,7 +397,8 @@ builder.Services.AddSingleton<ICodeRunner>(sp => codeExecOptions.Enabled
 // returns null for the ordinary single-node case.
 builder.Services.AddSingleton(sp => new ModelService(sp.GetRequiredService<ILogger<ModelService>>())
 {
-    TensorParallelGroupFactory = DistributedTensorParallel.CreateGroup,
+    Placement = parallelism.Placement,
+    TensorParallelGroupFactory = backend => DistributedTensorParallel.CreateGroup(backend, parallelism),
     // Inline Jev image input lands in the same governed upload directory as chat
     // attachments, so --upload-max-mb, --upload-quota-mb and --upload-ttl-hours cover it.
     MediaStorage = uploadPolicy,
@@ -582,10 +587,10 @@ if (tensorParallelFlagsApplied)
 {
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
         "Model placement configured via CLI: tensorParallelDegree={TpDegree} layerSplitDegree={LayerSplitDegree} nodeId={TpNodeId} peers={TpPeers}",
-        Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE") ?? "1",
-        Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE") ?? "1",
-        Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID") ?? "(single-node)",
-        Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS") ?? "(none)");
+        parallelism.Placement.TpDegree,
+        parallelism.Placement.LayerSplitDegree,
+        parallelism.Placement.DistributedNodeId ?? "(single-node)",
+        parallelism.Placement.DistributedPeers ?? "(none)");
 }
 
 if (moeCpuOffloadFlagsApplied || TensorSharp.Models.MoeCpuOffloadConfig.IsEnabled)
