@@ -100,22 +100,103 @@ public sealed class PipelinedPromptTests : IDisposable
         _output.WriteLine($"{family} on two ggml_cuda GPUs: {wavefronts} wavefronts, {sequential.Count} logit rows bit for bit");
     }
 
+    /// <summary>The engine's route: a lone request's whole prompt as one slot step (the solo prefill) runs pipelined, then its
+    /// last row as a one-row step, and holds the bits of its slot fed the same 16-row chunks one step after another.</summary>
+    [Theory]
+    [MemberData(nameof(Cases))]
+    public void PipelinedSlotPromptIsTheStagesChunkAfterChunk(string family, int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        var rng = new Random(17);
+        int[] prompt = Enumerable.Range(0, 70).Select(_ => rng.Next(10, 250)).ToArray();
+        (List<float[]> sequential, int none, _) = RunSlot(family, path, stages, prompt, pipelined: false);
+        (List<float[]> pipelined, int prompts, int wavefronts) = RunSlot(family, path, stages, prompt, pipelined: true);
+        Assert.Equal(0, none);
+        Assert.Equal(1, prompts);
+        Assert.Equal(5 + stages - 1, wavefronts);
+        Assert.Equal(sequential.Count, pipelined.Count);
+        for (int i = 0; i < sequential.Count; i++)
+            Assert.True(sequential[i].AsSpan().SequenceEqual(pipelined[i]),
+                $"{family} stages {stages}: slot logits {i} differ (max |d| {sequential[i].Zip(pipelined[i], (a, b) => Math.Abs(a - b)).Max():E2})");
+        _output.WriteLine($"{family} over {stages} stages: the slot's prompt in {wavefronts} wavefronts, {sequential.Count} logit rows bit for bit");
+    }
+
+    /// <summary>The slot route on two ggml_cuda GPUs.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [MemberData(nameof(GgmlFamilies))]
+    public void PipelinedSlotPromptOnTwoGgmlCudaGpusIsTheStagesChunkAfterChunk(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        var rng = new Random(19);
+        int[] prompt = Enumerable.Range(0, 70).Select(_ => rng.Next(10, 250)).ToArray();
+        (List<float[]> sequential, int none, _) = RunSlot(family, path, 2, prompt, pipelined: false, BackendType.GgmlCuda);
+        (List<float[]> pipelined, int prompts, int wavefronts) = RunSlot(family, path, 2, prompt, pipelined: true, BackendType.GgmlCuda);
+        Assert.Equal(0, none);
+        Assert.Equal(1, prompts);
+        Assert.Equal(6, wavefronts);
+        for (int i = 0; i < sequential.Count; i++)
+            Assert.True(sequential[i].AsSpan().SequenceEqual(pipelined[i]),
+                $"{family} on ggml_cuda: slot logits {i} differ (max |d| {sequential[i].Zip(pipelined[i], (a, b) => Math.Abs(a - b)).Max():E2})");
+        _output.WriteLine($"{family} on two ggml_cuda GPUs: the slot's prompt in {wavefronts} wavefronts, {sequential.Count} logit rows bit for bit");
+    }
+
+    private static ModelBase Open(string family, string path, BackendType backend, int stages) => family switch
+    {
+        "mistral3" => new Mistral3Model(path, backend, 1, null, stages),
+        "qwen3vl" => new Qwen3VLModel(path, backend, 1, null, stages),
+        "qwen35" => new Qwen35RuntimeModel(path, backend, 1, null, stages),
+        "nemotron_h" => new NemotronRuntimeModel(path, backend, 1, null, stages),
+        "gemma4" => new Gemma4RuntimeModel(path, backend, 1, null, stages),
+        "lfm3" => new Lfm3RuntimeModel(path, backend, 1, null, stages),
+        _ => throw new ArgumentOutOfRangeException(nameof(family)),
+    };
+
+    /// <summary>A request's slot: its prompt as one step (pipelined) or as 16-row steps and its last row (one after another),
+    /// then three greedy decode steps.</summary>
+    private static (List<float[]> Logits, int Prompts, int Wavefronts) RunSlot(string family, string path, int stages, int[] prompt, bool pipelined,
+        BackendType backend = BackendType.Cpu)
+    {
+        using ModelBase model = Open(family, path, backend, stages);
+        var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(model);
+        Assert.True(sdm.SupportsUnifiedBatching, $"{family} serves unified steps");
+        sdm.PromptChunkTokensForTests = 16;
+        sdm.PipelinedPromptForTests = pipelined && backend == BackendType.Cpu;
+        sdm.PipelinedPromptDisabledForTests = !pipelined;
+        const string id = "r";
+        string[] ids = { id };
+        sdm.EnsureSequenceSlot(id, 128);
+        var logits = new float[1][];
+        if (pipelined)
+        {
+            Assert.True(sdm.TryForwardUnified(ids, new[] { prompt }, new[] { 0 }, logits));
+        }
+        else
+        {
+            int last = prompt.Length - 1;
+            for (int from = 0; from < last; from += 16)
+                Assert.True(sdm.TryForwardUnified(ids, new[] { prompt[from..Math.Min(last, from + 16)] }, new[] { from }, logits));
+            Assert.True(sdm.TryForwardUnified(ids, new[] { new[] { prompt[last] } }, new[] { last }, logits));
+        }
+        var rows = new List<float[]> { (float[])logits[0].Clone() };
+        for (int i = 0; i < 3; i++)
+        {
+            float[] row = rows[^1];
+            int next = Array.IndexOf(row, row.Max());
+            Assert.True(sdm.TryForwardUnified(ids, new[] { new[] { next } }, new[] { prompt.Length + i }, logits));
+            rows.Add((float[])logits[0].Clone());
+        }
+        return (rows, sdm.PipelinedSlotPrompts, sdm.PipelinedWavefronts);
+    }
+
     /// <summary>The refill's logits, then three greedy decode steps' (each step's input the argmax of the last).</summary>
     private static (List<float[]> Logits, int Wavefronts) Run(string family, string path, int stages, int[] prompt, bool pipelined,
         BackendType backend = BackendType.Cpu)
     {
         // The families directly (on the CPU over simulated host devices: the serving contract admits --layer-split on GPU
         // backends only).
-        using ModelBase model = family switch
-        {
-            "mistral3" => new Mistral3Model(path, backend, 1, null, stages),
-            "qwen3vl" => new Qwen3VLModel(path, backend, 1, null, stages),
-            "qwen35" => new Qwen35RuntimeModel(path, backend, 1, null, stages),
-            "nemotron_h" => new NemotronRuntimeModel(path, backend, 1, null, stages),
-            "gemma4" => new Gemma4RuntimeModel(path, backend, 1, null, stages),
-            "lfm3" => new Lfm3RuntimeModel(path, backend, 1, null, stages),
-            _ => throw new ArgumentOutOfRangeException(nameof(family)),
-        };
+        using ModelBase model = Open(family, path, backend, stages);
         var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(model);
         Assert.Equal(stages, sdm.Mesh.Stages);
         sdm.PromptChunkTokensForTests = 16;

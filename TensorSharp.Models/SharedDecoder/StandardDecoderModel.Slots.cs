@@ -1247,6 +1247,7 @@ namespace TensorSharp.Models
             NoteEngineThread();
             ForgetDeferredGraphs();
             if (SlotInvariantChecksForTests) CheckSlotShareInvariants();
+            if (TryForwardSlotPromptPipelined(requestIds, chunks, starts, outLogits, features, rowIO)) return true;
             if (_maxSequenceStepRows != int.MaxValue && chunks.Any(c => c != null && c.Length > _maxSequenceStepRows))
                 return TryForwardSlotsInRingSteps(requestIds, chunks, starts, outLogits, features, rowIO);
             try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features, rowIO); }

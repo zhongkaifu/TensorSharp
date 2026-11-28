@@ -68,9 +68,55 @@ namespace TensorSharp.Models
         private void TryRunPipelinedPrompt(int[] tokens, int count)
         {
             SettlePendingVerify();
-            int chunk = PromptChunkTokens, chunks = (count + chunk - 1) / chunk, stages = _mesh.Stages;
             int baseStart = _cacheSeqLen;
             EnsureCacheCapacity(checked(baseStart + count));
+            RunPipelinedChunks(tokens, count, baseStart, bound: null);
+            _cacheDeviceDirty = true;
+            _cacheSeqLen = baseStart + count;
+        }
+
+        /// <summary>Lone prompt steps of a request's slot that ran pipelined (<see cref="TryForwardSlotPromptPipelined"/>; a test seam).</summary>
+        internal int PipelinedSlotPrompts { get; private set; }
+
+        /// <summary>
+        /// A lone request's plain prompt step over local whole-layer stages (the engine's solo prefill: the prompt, up to
+        /// SchedulerConfig.SoloPrefillChunkSize tokens, as one step) as <see cref="RunPipelinedChunks"/>'s wavefronts of
+        /// <see cref="PromptChunkTokens"/> rows, its last row then a one-row step for the logits: the bits of those chunks one
+        /// after another, as <see cref="ForwardRefill"/>'s. As one step, each stage had waited for the whole prompt to pass the
+        /// stage before it (Qwen3.5-9B Q8_0 over two GGML stages: a 5,131-token chat prompt in 3.1 s either way before the
+        /// engine's steps pipelined). False (nothing run) where the step does not pipeline (<see cref="PipelinesPrompt"/>, rows
+        /// handed in or out, drafter features, a prompt a draft layer or DFlash ring follows).
+        /// </summary>
+        private bool TryForwardSlotPromptPipelined(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
+            float[][] features, SlotRowIO rowIO)
+        {
+            if (requestIds.Count != 1 || chunks.Count != 1 || starts.Length != 1 || outLogits.Length != 1 || rowIO != null) return false;
+            if (features != null && Array.Exists(features, f => f != null)) return false;
+            if (chunks[0] is not { Length: > 1 } chunk || !PipelinesPrompt(chunk.Length - 1)) return false;
+            if (!SupportsPerSequenceFusedForward || _slots == null || _followPromptRequests?.ContainsKey(requestIds[0]) == true) return false;
+            RestorePrimaryCache();
+            if (!_slots.TryGetValue(requestIds[0], out Slot slot) || slot.K == null || slot.Length != starts[0]) return false;
+            int start = starts[0], count = chunk.Length - 1, required = checked(start + chunk.Length);
+            EnsureSlotCapacity(slot, required, wanted: WantedCells(requestIds[0], required));
+            RunPipelinedChunks(chunk, count, start, slot);
+            slot.DeviceDirty = true;
+            slot.Length = start + count;
+            PipelinedSlotPrompts++;
+            // The slot continues at the last row's position, so the one-row step passes every check the whole step did.
+            if (!TryForwardSlots(requestIds, new[] { new[] { chunk[^1] } }, new[] { start + count }, outLogits, features, rowIO))
+                throw new InvalidOperationException($"{Config.Architecture}: the pipelined prompt's last row declined after its chunks ran.");
+            return true;
+        }
+
+        /// <summary>
+        /// <see cref="TryRunPipelinedPrompt"/>'s wavefronts over rows <paramref name="tokens"/>[0, <paramref name="count"/>) at
+        /// positions from <paramref name="baseStart"/>: of the active fields (<paramref name="bound"/> null: their rotary delta
+        /// settled chunk by chunk, BeginRotaryPositions) or of a request's slot (its own delta), capacity ensured by the caller,
+        /// which sets the length and the device-written flag once every wavefront ran.
+        /// </summary>
+        private void RunPipelinedChunks(int[] tokens, int count, int baseStart, Slot bound)
+        {
+            int chunk = PromptChunkTokens, chunks = (count + chunk - 1) / chunk, stages = _mesh.Stages;
             PrepareHeadLayout();
             MarkDrafterWeights();
             RoomForRecordings();
@@ -105,8 +151,7 @@ namespace TensorSharp.Models
                             EnterStage(s);
                             if (s == 0)
                             {
-                                PrepareWrite(_cacheK, start);
-                                BeginRotaryPositions(start, rows);
+                                if (bound == null) BeginRotaryPositions(start, rows);
                                 long t0 = Stopwatch.GetTimestamp();
                                 inputs[i] = EmbedStep(chunkTokens);
                                 _embTicks += Stopwatch.GetTimestamp() - t0;
@@ -117,7 +162,7 @@ namespace TensorSharp.Models
                                 inputs[i] = CreateFloatTensor(handed[s - 1], rows, StreamWidth);
                                 if (handedCarry[s - 1] != null) carries[i] = CreateFloatTensor(handedCarry[s - 1], rows, StageCarryWidth);
                             }
-                            Slot slot = SnapshotActiveFields();
+                            Slot slot = bound ?? SnapshotActiveFields();
                             var slots = new[] { slot };
                             starts[i] = new[] { start };
                             counts[i] = new[] { rows };
@@ -154,8 +199,6 @@ namespace TensorSharp.Models
                         }
                     }
                 }
-                _cacheDeviceDirty = true;
-                _cacheSeqLen = baseStart + count;
             }
             finally
             {
