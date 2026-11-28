@@ -1248,6 +1248,12 @@ namespace TensorSharp.Models
             ForgetDeferredGraphs();
             if (SlotInvariantChecksForTests) CheckSlotShareInvariants();
             if (TryForwardSlotPromptPipelined(requestIds, chunks, starts, outLogits, features, rowIO)) return true;
+            // A lone prompt step the model chose for its pipeline (PreferredSoloPrefillTokens) that did not pipeline runs in the
+            // steps it would have had: its activations were sized for one chunk at a time.
+            int fallback = _pipelinedSoloFallbackRows;
+            _pipelinedSoloFallbackRows = 0;
+            if (fallback > 0 && requestIds.Count == 1 && chunks[0]?.Length > fallback)
+                return TryForwardSlotsInRingSteps(requestIds, chunks, starts, outLogits, features, rowIO, Math.Min(fallback, _maxSequenceStepRows));
             if (_maxSequenceStepRows != int.MaxValue && chunks.Any(c => c != null && c.Length > _maxSequenceStepRows))
                 return TryForwardSlotsInRingSteps(requestIds, chunks, starts, outLogits, features, rowIO);
             try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features, rowIO); }
@@ -1290,15 +1296,16 @@ namespace TensorSharp.Models
         /// A batched step whose chunks hold more rows of a sequence than its sliding-window rings hold beside their window, as
         /// rounds of at most <see cref="MaxSequenceStepRows"/> rows a sequence (StandardDecoderModel.SlidingRings.cs): round k
         /// carries piece k of every chunk that has one, and each sequence's logits come from the round of its last piece.
-        /// Declines (nothing run) where the first round does.
+        /// Declines (nothing run) where the first round does. With <paramref name="stepRows"/>, rounds of that many rows: a lone
+        /// prompt step the model chose for its pipeline that did not pipeline.
         /// </summary>
         private bool TryForwardSlotsInRingSteps(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
-            float[][] features, SlotRowIO rowIO = null)
+            float[][] features, SlotRowIO rowIO = null, int stepRows = 0)
         {
             // Drafter features come back round by round, into each sequence's buffer at its rows.
             bool wantsFeatures = features != null && Array.Exists(features, f => f != null);
             int featureWidth = wantsFeatures ? SpecFeatureSize : 0;
-            int step = _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
+            int step = stepRows > 0 ? stepRows : _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
             for (int s = 0; s < n; s++) rounds = Math.Max(rounds, ((chunks[s]?.Length ?? 0) + step - 1) / step);
             // A chunk whose rows its request's drafter follows (FollowPlainPrompt, FollowUnspeculatedPrompt) is followed in every
             // round: registered once for the chunk, the registration the first round took left the later rounds' rows out of

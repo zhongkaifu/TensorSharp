@@ -34,14 +34,15 @@ namespace TensorSharp.Models
         /// (<see cref="TryRunPipelinedPrompt"/>): local stages on one executor that runs several devices' plans together (the
         /// GGML executors: their staged chunks otherwise run one device at a time, each run waiting for every device), a plain
         /// prompt (no media, no position table, no draft or DFlash ring following it, no step adapter), no experts on the host
-        /// (a ranked run takes no host-expert pause), and two chunks at least.
+        /// (a ranked run takes no host-expert pause), and two chunks at least. Direct CUDA's stages pipeline too (its tensor
+        /// executor's runs return with their device work queued).
         /// </summary>
         private bool PipelinesPrompt(int count)
         {
             if (!PipelinedPromptEnabled || PipelinedPromptDisabledForTests || _mesh == null || _mesh.Stages < 2 || _rankGraphs || _mesh.TensorParallel > 1) return false;
             if (LayerSplitGroup?.NodeCount > 1 || HasPendingMedia || _pendingPositionTable != null || _followPlainPrompt) return false;
             if (StepAdapter != null || AnyExpertLayerOffloaded()) return false;
-            if (count < 2 * PipelinedChunkTokens || PipelinedChunkTokens > _maxSequenceStepRows) return false;
+            if (count <= PipelinedChunkTokens || PipelinedChunkTokens > _maxSequenceStepRows) return false;
             if (GraphExecutor is not { } executor || GraphUnsupportedReason() != null) return false;
             bool ggml = executor is IRankedGraphExecutor && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
             bool cuda = _backend == BackendType.Cuda && executor is TensorGraphExecutor;

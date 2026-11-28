@@ -32,12 +32,53 @@ namespace TensorSharp.Models
         /// 8.99 s at 31 GB). Elsewhere the scheduler's own steps (0).
         /// </summary>
         public int PreferredSoloPrefillTokens(int start, int remaining)
-            => _backend switch
+        {
+            int own = _backend switch
             {
                 BackendType.Mlx => Math.Min(remaining, MlxPromptStepTokens),
                 BackendType.Cuda => CudaPromptStepTokens(remaining),
                 _ => 0,
             };
+            return PipelinedSoloStep(remaining, own);
+        }
+
+        /// <summary>A lone prompt's step where it pipelines over whole-layer stages (StandardDecoderModel.PipelinedPrompt.cs).</summary>
+        internal const int PipelinedSoloStepTokens = 8192;
+
+        /// <summary>The rows a lone prompt step the model chose for its pipeline runs in when it does not pipeline after all
+        /// (a request's LoRA, say): the step it would have had (0: none chosen).</summary>
+        private int _pipelinedSoloFallbackRows;
+
+        /// <summary>The chunk rows direct CUDA's next pipelined prompt step takes (its lone prompt step, fitted to the device's
+        /// room by <see cref="CudaPromptStepTokens"/>; 0 until one was).</summary>
+        private int _cudaPipelinedChunk;
+
+        private int CudaPipelinedChunkRows => _cudaPipelinedChunk > 0 ? _cudaPipelinedChunk : _cudaPromptRows > 0 ? _cudaPromptRows : MaxCudaPromptStepRows;
+
+        /// <summary>
+        /// Where a lone prompt pipelines over the stages, it asks for steps of <see cref="PipelinedSoloStepTokens"/> (Muse Spark's
+        /// rule: a remainder of at most a quarter step joins the step before it), each step's chunks the pipeline's: the stages
+        /// fill and drain once a step, so the scheduler's 4,096-row steps (and direct CUDA's 2,048) each left a stage idle for
+        /// a chunk at either end, and on direct CUDA a step that is itself one chunk does not pipeline at all. On direct CUDA the
+        /// chunks are the step <paramref name="own"/> it fitted to the device's room. Else <paramref name="own"/>; and never
+        /// where a draft layer or DFlash ring follows the prompts (their steps do not pipeline).
+        /// </summary>
+        private int PipelinedSoloStep(int remaining, int own)
+        {
+            _pipelinedSoloFallbackRows = 0;
+            if (remaining <= 0 || DraftSelfCatchUp || _backend == BackendType.Mlx) return own;
+            if (_backend == BackendType.Cuda)
+            {
+                if (own <= 0) return own;   // the remainder fits one step of its own
+                _cudaPipelinedChunk = own;
+            }
+            int step = Math.Min(remaining, PipelinedSoloStepTokens);
+            int rest = remaining - step;
+            if (rest > 0 && rest <= PipelinedSoloStepTokens / 4) step = remaining;
+            if (step <= own || !PipelinesPrompt(step - 1)) return own;
+            _pipelinedSoloFallbackRows = own > 0 ? own : PromptChunkTokens;
+            return step;
+        }
 
         /// <summary>Device memory a direct-CUDA prompt step keeps beside its rows' activations (cuBLAS workspace, the
         /// dequantized-weight and activation scratch).</summary>

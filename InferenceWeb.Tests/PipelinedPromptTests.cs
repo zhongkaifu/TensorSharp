@@ -142,6 +142,69 @@ public sealed class PipelinedPromptTests : IDisposable
         _output.WriteLine($"{family} on two ggml_cuda GPUs: the slot's prompt in {wavefronts} wavefronts, {sequential.Count} logit rows bit for bit");
     }
 
+    /// <summary>A model whose lone prompts pipeline asks the scheduler for 8,192-token steps, a remainder of at most a quarter
+    /// step joined to the step before it; none for a prompt of one chunk or where it does not pipeline.</summary>
+    [Fact]
+    public void PipelinedPromptsChooseTheirLonePromptSteps()
+    {
+        string path = Fixture("mistral3");
+        using var model = new Mistral3Model(path, BackendType.Cpu, 1, null, 2);
+        model.PromptChunkTokensForTests = 16;
+        model.PipelinedPromptForTests = true;
+        Assert.Equal(StandardDecoderModel.PipelinedSoloStepTokens, model.PreferredSoloPrefillTokens(0, int.MaxValue / 2));
+        Assert.Equal(8192, model.PreferredSoloPrefillTokens(0, 20_000));
+        Assert.Equal(10_000, model.PreferredSoloPrefillTokens(0, 10_000));
+        Assert.Equal(8192, model.PreferredSoloPrefillTokens(8192, 10_241));
+        Assert.Equal(0, model.PreferredSoloPrefillTokens(0, 16));
+        model.PipelinedPromptDisabledForTests = true;
+        Assert.Equal(0, model.PreferredSoloPrefillTokens(0, 20_000));
+        using var single = new Mistral3Model(path, BackendType.Cpu, 1, null, 1);
+        single.PipelinedPromptForTests = true;
+        Assert.Equal(0, single.PreferredSoloPrefillTokens(0, 20_000));
+    }
+
+    /// <summary>A lone prompt step the model chose for its pipeline that does not pipeline after all runs in the steps it would
+    /// have had (the refill's chunks): as many steps, the bits of those steps one after another, nothing pipelined.</summary>
+    [Theory]
+    [InlineData("mistral3")]
+    [InlineData("qwen35")]
+    public void AChosenStepThatDoesNotPipelineRunsInTheStepsItWouldHaveHad(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        var rng = new Random(29);
+        int[] prompt = Enumerable.Range(0, 70).Select(_ => rng.Next(10, 250)).ToArray();
+        (float[] Logits, int Steps) Prompt(bool chosen)
+        {
+            using ModelBase model = Open(family, path, BackendType.Cpu, 2);
+            var sdm = (StandardDecoderModel)model;
+            sdm.PromptChunkTokensForTests = 16;
+            sdm.PipelinedPromptForTests = true;
+            string[] ids = { "r" };
+            sdm.EnsureSequenceSlot("r", 128);
+            var logits = new float[1][];
+            if (chosen)
+            {
+                Assert.Equal(prompt.Length, sdm.PreferredSoloPrefillTokens(0, prompt.Length));
+                sdm.PipelinedPromptDisabledForTests = true;   // as a request's LoRA would, after the step was chosen
+                Assert.True(sdm.TryForwardUnified(ids, new[] { prompt }, new[] { 0 }, logits));
+            }
+            else
+            {
+                sdm.PipelinedPromptDisabledForTests = true;
+                for (int from = 0; from < prompt.Length; from += 16)
+                    Assert.True(sdm.TryForwardUnified(ids, new[] { prompt[from..Math.Min(prompt.Length, from + 16)] }, new[] { from }, logits));
+            }
+            Assert.Equal(0, sdm.PipelinedWavefronts);
+            return ((float[])logits[0].Clone(), sdm.BatchedForwardCount);
+        }
+        var expected = Prompt(chosen: false);
+        var actual = Prompt(chosen: true);
+        Assert.Equal(5, expected.Steps);
+        Assert.Equal(expected.Steps, actual.Steps);
+        Assert.True(expected.Logits.AsSpan().SequenceEqual(actual.Logits), $"{family}: the fallback's logits differ");
+    }
+
     public static TheoryData<string, bool> CudaCases => new()
     {
         { "mistral3", false }, { "qwen3vl", false }, { "qwen35", false }, { "nemotron_h", false }, { "gemma4", false }, { "lfm3", false },

@@ -60,7 +60,13 @@ namespace TensorSharp.Models
 
         private int PromptChunkTokens => PromptChunkTokensForTests ?? PrefillChunkTokens;
 
-        private int PipelinedChunkTokens => PromptChunkTokensForTests ?? PipelinedChunkTokensDefault;
+        private static readonly bool PipelinedChunkChosen = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_PIPELINED_CHUNK"));
+
+        /// <summary>The rows of a pipelined prompt's chunks: on direct CUDA its lone prompt step (the activations the device's room
+        /// holds, at most 2,048 rows: its products of prompt rows cost about the same at any rows, so 256-row chunks were slower
+        /// than no pipeline, Qwen3.8-27B UD-IQ3_XXS 17.4 s against 11.5 s), elsewhere <c>TS_PIPELINED_CHUNK</c> (256).</summary>
+        private int PipelinedChunkTokens => PromptChunkTokensForTests
+            ?? (_backend == BackendType.Cuda && !PipelinedChunkChosen ? CudaPipelinedChunkRows : PipelinedChunkTokensDefault);
 
         private readonly int _requestedTensorParallel;
         private readonly int _requestedStages;
