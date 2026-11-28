@@ -990,9 +990,8 @@ bool p2p_prepare(P2pAllReduce& s, const int* devices, int count)
         }
     if (tp_probe_cuda_peer_access(devices, count) != 1) return s.usable = false;
     // Peer access is left as it is (off, as the probe leaves it): enabling it changes the path the backend's own
-    // collective takes for the partials this one leaves to it, which then decoded 6 % slower and summed a test model's
-    // decode partials wrongly (SharedRuntimeConformanceTests.RankGraphsOnGgmlMatchOneDevice, qwen3vl). The peer copies
-    // below need no mapping, and the sum reads only the rank's own memory.
+    // collective takes for the partials this one leaves to it (the probe measured 30 % of tp2 decode for leaving it on).
+    // The peer copies below need no mapping, and the sum reads only the rank's own memory.
     int previous = 0;
     const bool restore = cudaGetDevice(&previous) == cudaSuccess;
     bool ok = true;
