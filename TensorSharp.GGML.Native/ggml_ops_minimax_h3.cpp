@@ -51,6 +51,7 @@
 #include "ggml_ops_dit_offload.h"
 #include "ggml_h3_attention.h"
 #include "ggml_h3_upload.h"
+#include "ggml_ops_graph_optimize.h"
 
 #include <atomic>
 #include <cmath>
@@ -125,6 +126,21 @@ struct TSGgmlMiniMaxH3VideoVaeDecodeDesc
 };
 
 namespace {
+
+// ggml-metal fuses a graph's chains while it encodes them (rms_norm + mul (+ add), mul_mat + add, chains of adds) and runs
+// the fused kernel at the chain's first node, writing the chain's last output. The allocator places tensors as if each
+// node ran on its own, so without being told it may put that output over an input of the chain whose last reader it
+// takes to be the first node: the fused kernel then reads rows other threadgroups are already overwriting, and the
+// result is wrong with no error. ggml's scheduler asks the backend for these allocation dependencies; a graph computed
+// directly must add them itself, as the graph builder does (tsg_add_metal_fusion_alloc_dependencies). Before allocation;
+// a no-op off ggml-metal. Which tensors meet depends on the graph's sizes: on ggml_metal a MiniMax-H3-Image edit of two
+// pictures (about 2,800 text rows, its attention in query blocks) ignored its prompt and returned its first picture,
+// while one picture (about 1,400 rows) edited as asked. The text encoder and the vision tower take them (their graphs
+// keep room for the views a layer); the VAE graphs here, of fixed node budgets, do not yet.
+void h3_metal_fusion_deps(ggml_context* ctx, ggml_cgraph* graph)
+{
+    if (g_backend_type == BACKEND_TYPE_METAL) tsg_add_metal_fusion_alloc_dependencies(ctx, graph);
+}
 
 // Keep ordinary submissions unchanged. Opt-in profiling uses the existing
 // TensorSharp profiler and stage tags; it synchronizes every node and therefore
@@ -849,6 +865,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         }
 
         BufferHandle buffer(nullptr);
+        h3_metal_fusion_deps(ctx, graph);
         if (!alloc_graph_reuse_gallocr(graph))
         {
             buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
@@ -1706,6 +1723,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
             ggml_cgraph* pg = ggml_new_graph_custom(ctx, 16384, false);
             ggml_build_forward_expand(pg, pCopy);
             BufferHandle pbuf(nullptr);
+            h3_metal_fusion_deps(ctx, pg);
             if (!alloc_graph_reuse_gallocr(pg))
             {
                 pbuf.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
@@ -1768,6 +1786,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
         }
 
         BufferHandle buffer(nullptr);
+        h3_metal_fusion_deps(ctx, graph);
         if (!alloc_graph_reuse_gallocr(graph))
         {
             buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
