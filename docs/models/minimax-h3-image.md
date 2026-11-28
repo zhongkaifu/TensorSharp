@@ -145,8 +145,9 @@ timings are under [Performance](#performance).
 
 **Which one.** 20-24 GB GPU: Q5_K_M (the closest that fits, clean text), or Q4_K_M for 16-20 MP
 output. 32 GB Mac: Q4_K_M (the text encoder's phase, 18.9 GB with its working memory, is the
-largest; Q8_0's denoise is past a 32 GB Mac's GPU working set). 46-48 GB GPU or 48 GB Mac: Q8_0.
-80 GB and up: bf16.
+largest; Q8_0's denoise is past a 32 GB Mac's GPU working set, so it would run only
+[streamed](#streaming-on-a-mac)). 24 GB Mac: Q4_K_M, its text encoder and an edit's denoise
+streamed (not measured on a 24 GB Mac). 46-48 GB GPU or 48 GB Mac: Q8_0. 80 GB and up: bf16.
 
 ## Editing
 
@@ -463,9 +464,49 @@ and 15 s from disk on that VM, whose page cache cannot hold both). bf16 does not
 48 GB Mac at all (40.2 GB of weights against a 40.2 GB working set): use Q8_0 there. An
 H100-class card keeps everything, bf16 at 16 MP included.
 
+### Streaming on a Mac
+
+On `ggml_metal` the working set is a hard ceiling, so a phase whose own component and working
+memory do not fit the budget even with every other component released streams its weights through
+the device instead of being refused:
+
+- **Text encoder.** The trunk runs as consecutive layer groups, as many whole layers a group as the
+  room beside the encoding's working memory holds (at least the three layers the DeepStack taps
+  join); each group's device copies are handed back before the next group's are made, and an edit's
+  vision tower hands its copies back before the first group.
+- **Denoiser.** Each step runs as consecutive block spans, each its own program over the residual
+  stream the span before handed on (as `--layer-split` stages hand it from GPU to GPU), as many
+  blocks a span as the room beside the step's working memory holds; a span's weights' copies go once
+  it has run. A LoRA set's factors stay resident.
+- **After the phase** the streamed component holds nothing on the device; the next picture plans
+  from there.
+
+The hidden state and the residual stream cross between groups as the F32 they are inside one
+program, so the conditioning and every step's velocity are the resident components' bit for bit
+(`MiniMaxH3ImageStreamingTests`, on `ggml_cpu` with synthetic checkpoints and ggml `bb877c0c` unchanged:
+Q8_0 and Q4_K DiTs, a prompt and an edit's DeepStack rows; not yet run on `ggml_metal` hardware). Weights bind zero-copy on Apple Silicon, so a group costs its
+mapping, not an upload; where the page cache cannot hold the files (a 24 GB Mac holds neither the
+15.5 GB trunk nor the 12.7 GB DiT beside the other), each picture reads them from disk again.
+`ggml_cuda` and `ggml_vulkan` do not stream (a step would upload the DiT over PCIe each time).
+
+On a 24 GB Mac (a 17.2 GB working set, of which the plan keeps 1.1 GB free) a two-picture edit with
+`<Picture 1>` masked, both photos 2048x1536, was refused before: its text encoding needs 15.5 GB of
+trunk beside 5.4 GB of working memory, and its step 12.7 GB of Q4_K_M DiT beside 9.6 GB. Streamed,
+its plan is (computed, `MiniMaxH3ImageResidencyTests`; not measured on a 24 GB Mac):
+
+```
+[diffusion-residency] 2048x1536, 2 reference(s): before Denoise: release the vae; Condition: stream the conditioner's weights 10.7 GB at a time; Denoise: stream the denoiser's weights 6.5 GB at a time (peak 16.1 GB, budget 16.1 GB)
+```
+
+that is, the trunk in two groups (34 and 16 layers) and each step in two spans. A text to image at
+2048x2048 there streams only the text encoder (0.1 GB past the budget beside its working memory).
+Streaming trades time for room: smaller pictures (fewer rows in the step) run much faster, and a
+step's working memory alone past the working set is still refused.
+
 A picture the device cannot hold is refused before any phase runs: when its most
 demanding phase needs more than the device has free even with every other component
-released (that component's weights and its working memory), the CLI exits `2` with
+released (that component's weights, or on `ggml_metal` the fewest it streams with, and its
+working memory), the CLI exits `2` with
 `error: request refused: <reason>` and the server answers `507`, and the model stays
 loaded for the next picture. A phase that runs out of memory inside a ggml-cuda kernel
 would end the process instead. On the RTX A4500 (20 GiB, of which 20.8 GB is free after the CUDA context) the largest square

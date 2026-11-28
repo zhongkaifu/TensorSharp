@@ -62,6 +62,8 @@ namespace TensorSharp.Models.MiniMaxH3
         // holds their buffers at teardown.
         private readonly List<IntPtr> _bound = new();
         private readonly H3TeLayerW[] _layers;
+        // Each layer's device bytes (its projections and F32 vectors): what a group of layers holds on the device.
+        private readonly long[] _layerBytes;
         /// <summary>Bytes of the encoder file, used only to size layer groups.</summary>
         private readonly long _trunkBytes;
         private GCHandle _layersPin;
@@ -82,6 +84,33 @@ namespace TensorSharp.Models.MiniMaxH3
         /// and F32 vectors. The embedding table is read on the host, and the vision tower has its own.</summary>
         public long DeviceWeightBytes { get; private set; }
 
+        /// <summary>The device bytes of the trunk's largest layer (its projections and F32 vectors): a layer group holds a
+        /// whole number of them.</summary>
+        public long LargestLayerBytes
+        {
+            get
+            {
+                long most = 0;
+                foreach (long b in _layerBytes) most = Math.Max(most, b);
+                return most;
+            }
+        }
+
+        /// <summary>
+        /// The most of the trunk's weight bytes an encode may hold on the device at once, or null for all of them (one call
+        /// over every layer). With a budget below <see cref="DeviceWeightBytes"/> the trunk runs as consecutive layer groups
+        /// of at most this many bytes, each group's device copies handed back before the next group's are made (the last
+        /// group's stay until <see cref="ReleaseDeviceResidency"/>): the hidden state crosses between groups as the F32 it
+        /// is inside one call, so the result is the same. A diffusion pipeline's residency plan sets it where the trunk
+        /// does not fit beside its working memory (a 24 GB Mac: 15.5 GB of Q4_K_M trunk, a 17.2 GB working set). A group
+        /// holds one layer at least, and the first the DeepStack taps' layers.
+        /// </summary>
+        public long? DeviceWeightBudget { get; set; }
+
+        /// <summary>The layers of the groups the last encode ran (one entry, every layer, when it ran as one call; a test
+        /// seam).</summary>
+        internal int[] LastLayerGroups { get; private set; }
+
         public MiniMaxH3TextEncoder(string ggufPath, string tokenizerDir = null)
             : this(ggufPath, tokenizerDir, BackendType.GgmlCuda, null) { }
 
@@ -100,8 +129,10 @@ namespace TensorSharp.Models.MiniMaxH3
 
             _embed = Get("model.embed_tokens.weight");
             _layers = new H3TeLayerW[Config.NumLayers];
+            _layerBytes = new long[Config.NumLayers];
             for (int i = 0; i < Config.NumLayers; i++)
             {
+                long before = DeviceWeightBytes;
                 string p = $"model.layers.{i}.";
                 _layers[i] = new H3TeLayerW
                 {
@@ -117,6 +148,7 @@ namespace TensorSharp.Models.MiniMaxH3
                     Up = Lin(p + "mlp.up_proj.weight", null),
                     Down = Lin(p + "mlp.down_proj.weight", null),
                 };
+                _layerBytes[i] = DeviceWeightBytes - before;
             }
             _layersPin = GCHandle.Alloc(_layers, GCHandleType.Pinned);
 
@@ -595,6 +627,9 @@ namespace TensorSharp.Models.MiniMaxH3
                 try
                 {
                     int groups = (layers + groupSize - 1) / groupSize;
+                    var sizes = new int[groups];
+                    for (int g = 0; g < groups; g++) sizes[g] = Math.Min(groupSize, layers - g * groupSize);
+                    LastLayerGroups = sizes;
                     IntPtr src = ePin.AddrOfPinnedObject();
                     for (int g = 0; g < groups; g++)
                     {
@@ -690,7 +725,18 @@ namespace TensorSharp.Models.MiniMaxH3
             string ov = Environment.GetEnvironmentVariable("TS_H3_TE_GROUP");
             if (!string.IsNullOrWhiteSpace(ov) && int.TryParse(ov, out int forced) && forced > 0)
                 return Math.Min(layers, Math.Max(forced, Math.Max(1, numDeepstack)));
-            // Grouping is OFF unless asked for, and that is a measured decision rather
+            // A device budget the whole trunk does not fit (DeviceWeightBudget): as many whole layers a group as it holds,
+            // the first group the DeepStack taps' layers at least.
+            long trunk = 0;
+            for (int i = 0; i < layers; i++) trunk += _layerBytes[i];
+            if (DeviceWeightBudget is long budget && budget < trunk)
+            {
+                long largest = 0;
+                for (int i = 0; i < layers; i++) largest = Math.Max(largest, _layerBytes[i]);
+                int fit = largest > 0 ? (int)Math.Min(layers, budget / largest) : layers;
+                return Math.Min(layers, Math.Max(fit, Math.Max(1, numDeepstack)));
+            }
+            // Otherwise grouping is OFF, and that is a measured decision rather
             // than a default-safe one. On a 16 GB card the 17 GB trunk does overflow into
             // shared host memory, and grouping does remove the overflow - peak device use
             // fell from 16041 MiB to 12981 MiB at 640x384. It was still 3 s SLOWER over
@@ -705,7 +751,9 @@ namespace TensorSharp.Models.MiniMaxH3
             // diffusion runtime's residency plan decides it now), not this trunk.
             //
             // Kept because it is the right tool when device memory, not time, is the
-            // binding constraint - a smaller card, or another process needing the VRAM.
+            // binding constraint - a smaller card, another process needing the VRAM, or
+            // Metal's working set, a hard ceiling past which a command buffer fails (the
+            // budget above: the diffusion runtime's residency plan sets it then).
             return layers;
         }
 

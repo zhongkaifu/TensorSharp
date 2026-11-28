@@ -46,8 +46,9 @@ namespace TensorSharp.Models.SharedDiffusion
         private readonly object _gate = new();
         private readonly HashSet<DiffusionComponent> _resident = new();
         private readonly Dictionary<DiffusionComponent, long> _workspaces = new();
-        // The component of the phase running now (null between phases).
+        // The component of the phase running now (null between phases), and whether the plan streams that phase.
         private DiffusionComponent? _running;
+        private bool _streaming;
         private IConditioner _conditioner;
         private IVaeCodec _vae;
         private IDenoiser _denoiser;
@@ -82,8 +83,8 @@ namespace TensorSharp.Models.SharedDiffusion
         /// Run one request. <paramref name="cancellationToken"/> is checked between phases, between steps and (by the
         /// codec) between VAE tile rows; <paramref name="betweenSteps"/> runs before every step after the first (a
         /// queue's checkpoint, which may give the model to waiting compute work). A cancelled or failed run releases
-        /// the components' activations and keeps their weights resident, except the weights of the phase that failed
-        /// (see <see cref="ReleaseFailedPhase"/>). A request the device cannot hold is refused before any phase runs
+        /// the components' activations and keeps their weights resident, except the weights of the phase that failed, or of a
+        /// streamed phase that was cancelled (see <see cref="ReleaseFailedPhase"/>). A request the device cannot hold is refused before any phase runs
         /// (<see cref="RequestRefusedException"/>, <see cref="ResidencyPlan.Refused"/>).
         /// </summary>
         public DiffusionResult Run(DiffusionRequest request, CancellationToken cancellationToken = default, Action betweenSteps = null)
@@ -112,13 +113,15 @@ namespace TensorSharp.Models.SharedDiffusion
                 }
                 catch (Exception error)
                 {
-                    if (error is not OperationCanceledException) ReleaseFailedPhase();
+                    // A streamed phase's component holds an unknown part of its weights, cancelled or not.
+                    if (error is not OperationCanceledException || _streaming) ReleaseFailedPhase();
                     ReleaseWorkspaces();
                     throw;
                 }
                 finally
                 {
                     _running = null;
+                    _streaming = false;
                 }
             }
         }
@@ -406,11 +409,14 @@ namespace TensorSharp.Models.SharedDiffusion
             var workload = new DiffusionWorkload(job.Target,
                 job.VaeCopies.Select(c => new LatentShape(geometry.LatentChannels, 1, c.Height / geometry.VaeFactor, c.Width / geometry.VaeFactor)).ToArray(),
                 r.Prompt ?? string.Empty) { Pictures = job.Pictures };
-            job.Demands = new List<PhaseDemand> { new(DiffusionPhase.Condition, DiffusionComponent.Conditioner, Conditioner.WorkingBytes(workload, DiffusionPhase.Condition)) };
+            // Each phase's working memory, and the fewest of its weights it holds at once where its component streams them.
+            PhaseDemand Demand(DiffusionPhase phase, DiffusionComponent component, IResidentComponent c) =>
+                new(phase, component, c.WorkingBytes(workload, phase)) { StreamedWeightBytes = c.StreamedWeightBytes(workload, phase) };
+            job.Demands = new List<PhaseDemand> { Demand(DiffusionPhase.Condition, DiffusionComponent.Conditioner, Conditioner) };
             if (job.EncodesReferences)
-                job.Demands.Add(new(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.EncodeReferences)));
-            job.Demands.Add(new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser.WorkingBytes(workload, DiffusionPhase.Denoise)));
-            job.Demands.Add(new(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.Decode)));
+                job.Demands.Add(Demand(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae));
+            job.Demands.Add(Demand(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser));
+            job.Demands.Add(Demand(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae));
             job.ReferenceRows = workload.References.Sum(Rows);
             _log($"{name}: {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height}" +
                  (job.Canvas.Output != job.Canvas.Sampling ? $" (returned at {job.Canvas.Output.Width}x{job.Canvas.Output.Height})" : "") +
@@ -466,16 +472,27 @@ namespace TensorSharp.Models.SharedDiffusion
                 _ => plan.Limiting.Component.ToString().ToLowerInvariant(),
             };
             var (w, h) = job.Canvas.Sampling;
+            // A phase that streams needs only part of its weights at once: the fewest it streams with.
+            string held = plan.Limiting.StreamedWeightBytes > 0 && plan.LimitingWeights == plan.Limiting.StreamedWeightBytes
+                ? " streamed a group at a time" : "";
             return $"{_family.DisplayName} cannot run {w}x{h} on this device: its {phase} alone needs {Gb(plan.MinimumPeak)} " +
-                   $"(the {component}'s {Gb(plan.LimitingWeights)} of weights and {Gb(plan.Limiting.WorkingBytes)} of working memory), " +
+                   $"(the {component}'s {Gb(plan.LimitingWeights)} of weights{held} and {Gb(plan.Limiting.WorkingBytes)} of working memory), " +
                    $"more than the {Gb(plan.Capacity ?? 0)} of device memory free for it. Use a smaller size or a smaller " +
                    "quantization, or free the device.";
         }
 
         /// <summary>Make the plan's releases before <paramref name="phase"/>; <paramref name="component"/> is resident from
-        /// here on (its first use uploads it, whether or not the phase finishes).</summary>
+        /// here on (its first use uploads it, whether or not the phase finishes). A phase the plan streams holds at most its
+        /// budget of the component's weights at once (<see cref="IResidentComponent.StreamWithin"/>), every other holds them
+        /// all.</summary>
         private void EnterPhase(DiffusionRequest request, DiffusionPhase phase, DiffusionComponent component, ResidencyPlan plan)
         {
+            long? stream = plan.StreamBudget(phase);
+            Make(component).StreamWithin(stream);
+            _streaming = stream.HasValue;
+            if (stream is long room)
+                _log($"  [diffusion-residency] {phase}: the {component.ToString().ToLowerInvariant()} streams its weights, " +
+                     $"{(room / 1e9).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)} GB on the device at a time");
             foreach (ResidencyRelease release in plan.Before(phase))
             {
                 IResidentComponent released = Created(release.Component);
@@ -510,12 +527,16 @@ namespace TensorSharp.Models.SharedDiffusion
             _workspaces.Remove(failed);
         }
 
-        /// <summary>The phase finished: its component keeps its workspace (cached plans) for the next request.</summary>
+        /// <summary>The phase finished: its component keeps its workspace (cached plans) for the next request. A streamed
+        /// phase's component holds part of its weights at most, which its weight bytes do not describe: it is released, as
+        /// a component that releases after every phase is.</summary>
         private void LeavePhase(DiffusionComponent component, long workingBytes)
         {
             _workspaces[component] = Math.Max(_workspaces.GetValueOrDefault(component), workingBytes);
             _running = null;
-            if (Created(component) is { ReleaseAfterPhase: true } released)
+            bool streamed = _streaming;
+            _streaming = false;
+            if (Created(component) is IResidentComponent released && (released.ReleaseAfterPhase || streamed))
             {
                 released.ReleaseWorkspace();
                 released.ReleaseDevice();
@@ -544,6 +565,15 @@ namespace TensorSharp.Models.SharedDiffusion
             ?? throw new InvalidOperationException($"{_family.DisplayName} made no VAE.");
         private IDenoiser Denoiser => _denoiser ??= _family.CreateDenoiser(_load)
             ?? throw new InvalidOperationException($"{_family.DisplayName} made no denoiser.");
+
+        /// <summary>The component, made on first use.</summary>
+        private IResidentComponent Make(DiffusionComponent component) => component switch
+        {
+            DiffusionComponent.Conditioner => Conditioner,
+            DiffusionComponent.Vae => Vae,
+            DiffusionComponent.Denoiser => Denoiser,
+            _ => throw new ArgumentOutOfRangeException(nameof(component)),
+        };
 
         private IResidentComponent Created(DiffusionComponent component) => component switch
         {

@@ -415,6 +415,16 @@ and the retired `QwenImage21Pipeline` (which disposed its conditioner before the
 precedents that this generalizes; Qwen-Image-2.1's components now declare it (`IResidentComponent.ReleaseAfterPhase`, §3.10). The planner logs its decision once per load and per geometry
 class, and the decision is visible in telemetry.
 
+A phase whose own component and working memory pass the budget even with every other component
+released streams its weights where its component can (`IResidentComponent.StreamedWeightBytes`,
+`StreamWithin`; `ResidencyPlan.Streams`): it holds what the room leaves of them at once, never
+fewer than it reports, and none of them after the phase, and the refusal is measured at that
+fewest. A component that cannot stream reports 0, which keeps the plan as it was. MiniMax-H3-Image
+streams on `ggml_metal` (and `ggml_cpu`, for its tests): the text encoder's trunk as layer groups,
+the DiT's steps as block spans over the residual stream, both bit for bit the resident result. A
+24 GB Mac's 17.2 GB working set holds neither the 15.5 GB trunk beside an edit's encoding nor the
+12.7 GB Q4_K_M DiT beside a two-picture edit's step.
+
 ### 3.5 Scheduling and batching
 
 * **Queue.** One `DiffusionJobQueue` per loaded diffusion model, FIFO. A job runs phase by

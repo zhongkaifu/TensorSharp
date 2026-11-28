@@ -25,6 +25,7 @@ using TensorSharp.Models.Graph;
 using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.MiniMaxH3Image
 {
@@ -378,6 +379,117 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>The device bytes of the LoRA factors the next steps bind (the family's current set), for residency.</summary>
         internal Func<long> AdapterBytes { get; set; }
 
+        // ---- streamed steps
+
+        // The weight bytes a step may hold on the device at once (StreamWithin), or null for all of them; and whether a
+        // streamed step's compute memory is in the backend's shared reuse allocator (ReleaseWorkspace hands it back).
+        private long? _streamBudget;
+        private bool _streamedScratch;
+
+        /// <summary>The block spans the last step ran as, one a program (one span, the whole step, when it did not stream; a
+        /// test seam).</summary>
+        internal DenoiserSpan[] LastSpans { get; private set; }
+
+        /// <summary>
+        /// Whether a step can stream its blocks within a device budget: on one device of ggml_metal, whose working set is a
+        /// hard ceiling on unified memory and whose weights bind zero-copy (a group's copies cost no upload, only their
+        /// mapping), and of ggml_cpu (the tests: it reports no device budget, so a plan never streams there on its own).
+        /// ggml_cuda keeps the step's weights resident (a stream would upload the DiT over PCIe every step, and its fused
+        /// routes key what they derive from a weight by its device copy); stages and tensor-parallel ranks hold their own
+        /// shares already.
+        /// </summary>
+        private bool CanStream => _stages == null && _ranks == null && _tensorAllocator == null
+                                  && Backend is BackendType.GgmlMetal or BackendType.GgmlCpu;
+
+        /// <summary>
+        /// The fewest weight bytes a denoising step holds on the device at once when it streams: its largest one-block span
+        /// (the first opens the step with the text refiner and the patch and condition projections, the last closes it with
+        /// the final layer), and the bound LoRA set's factors, which stay resident. 0 where the step does not stream
+        /// (<see cref="CanStream"/>).
+        /// </summary>
+        public long StreamedWeightBytes(DiffusionWorkload workload, DiffusionPhase phase)
+        {
+            if (phase != DiffusionPhase.Denoise || !CanStream) return 0;
+            int blocks = _w.Blocks.Length;
+            long most = 0;
+            for (int b = 0; b < blocks; b++) most = Math.Max(most, SpanBytes(new DenoiserSpan(b, b + 1, b == 0, b == blocks - 1)));
+            return most + (AdapterBytes?.Invoke() ?? 0);
+        }
+
+        /// <summary>The next steps hold at most <paramref name="weightBytes"/> of the weights on the device at once, their blocks
+        /// run as consecutive spans (<see cref="StreamSpans"/>); null holds them all, as before.</summary>
+        public void StreamWithin(long? weightBytes)
+        {
+            lock (_gate) _streamBudget = CanStream ? weightBytes : null;
+        }
+
+        private long SpanBytes(DenoiserSpan span)
+        {
+            long bytes = 0;
+            foreach (MiniMaxH3ImageWeight w in _w.WeightsOf(span)) bytes += w.Bytes;
+            return bytes;
+        }
+
+        /// <summary>
+        /// The block spans a step holding at most <paramref name="budget"/> weight bytes at once runs as: consecutive spans,
+        /// each as many blocks as fit beside the LoRA factors (which stay resident), one block at least. A budget the whole
+        /// step fits is one span, the whole step.
+        /// </summary>
+        internal DenoiserSpan[] StreamSpans(long budget)
+        {
+            int blocks = _w.Blocks.Length;
+            long room = budget - (AdapterBytes?.Invoke() ?? 0);
+            var spans = new List<DenoiserSpan>();
+            int first = 0;
+            while (first < blocks)
+            {
+                int end = first + 1;
+                while (end < blocks && SpanBytes(new DenoiserSpan(first, end + 1, first == 0, end + 1 == blocks)) <= room) end++;
+                spans.Add(new DenoiserSpan(first, end, first == 0, end == blocks));
+                first = end;
+            }
+            return spans.ToArray();
+        }
+
+        /// <summary>
+        /// One step as consecutive block spans on the one device, each its own one-shot program over the residual stream the
+        /// span before it handed on (as whole-block stages hand it from device to device): a span's weights are bound when its
+        /// program is built and their device copies go once it has run, so the device holds one span's weights (and the
+        /// shared compute memory) at a time. The stream crosses between spans as the F32 it is inside one program, so the
+        /// velocity is the step's own. Weights the device holds from an earlier, resident step go first.
+        /// </summary>
+        private float[] ForwardStreamed(StepValues step, DenoiserSpan[] spans, bool floatProducts)
+        {
+            if (_plan != null || _preloaded)
+            {
+                DropPlans();
+                foreach (MiniMaxH3ImageWeight w in BoundWeights()) ReleaseEverywhere(w.Data);
+                _preloaded = false;
+            }
+            float[] carry = null;
+            foreach (DenoiserSpan span in spans)
+            {
+                float[] input = carry;
+                using (var recorded = new GraphEmitter(_executor, record: true, floatProducts))
+                {
+                    Emit(recorded, step, span, input);
+                    IGraphPlan plan = recorded.Compile(replayable: false);
+                    _streamedScratch = true;
+                    try
+                    {
+                        if (!recorded.Run(plan))
+                            throw new InvalidOperationException(
+                                $"MiniMax-H3-Image denoiser step failed in blocks {span.First}-{span.End - 1}: " + plan.LastError);
+                        carry = plan.Outputs[0];
+                    }
+                    finally { plan.Dispose(); }
+                    _compiles++;
+                }
+                foreach (MiniMaxH3ImageWeight w in _w.WeightsOf(span)) ReleaseEverywhere(w.Data);
+            }
+            return carry;
+        }
+
         /// <summary>The LoRA set the cached plan was compiled with (a test seam).</summary>
         internal MiniMaxH3ImageLoraSet BoundLora => _lora;
 
@@ -610,8 +722,21 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 };
                 (step.Cos, step.Sin) = Rope(layout.Positions);
                 step.SinSigned = _rope.SinSigned;
-                PreloadLocked();
                 bool floatProducts = FloatProducts;
+
+                // A device budget the step's weights do not fit (StreamWithin): its blocks as consecutive spans, one span's
+                // weights on the device at a time.
+                if (_streamBudget is long budget && CanStream)
+                {
+                    DenoiserSpan[] spans = StreamSpans(budget);
+                    if (spans.Length > 1)
+                    {
+                        LastSpans = spans;
+                        return ForwardStreamed(step, spans, floatProducts);
+                    }
+                }
+                LastSpans = new[] { DenoiserSpan.Whole(_w.Blocks.Length) };
+                PreloadLocked();
 
                 // Tensor parallelism: every rank's program (its heads and MLP columns, two all-reduces a block) traced, compiled
                 // once a geometry and LoRA set, and run in lockstep; the velocity is rank 0's.
@@ -1025,7 +1150,17 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         public void ReleaseWorkspace()
         {
-            lock (_gate) DropPlans();
+            lock (_gate)
+            {
+                DropPlans();
+                // A streamed step's programs ran in the backend's shared reuse allocator, which every GGML model's one-shot
+                // graphs share: it goes while no live model of the process runs a step.
+                if (_streamedScratch && !_disposed)
+                {
+                    _streamedScratch = false;
+                    ModelBase.RunWhileGgmlModelsAreIdle(null, GgmlBasicOps.ReleaseReuseComputeBuffers);
+                }
+            }
         }
 
         /// <summary>A request's denoise ended. On direct CUDA the plans go and the step's intermediates the allocators pooled

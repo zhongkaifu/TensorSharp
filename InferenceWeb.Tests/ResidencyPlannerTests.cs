@@ -134,4 +134,69 @@ public sealed class ResidencyPlannerTests
         Assert.Equal(2, log.Count);
         Assert.StartsWith("[diffusion-residency] 4096x4096: before Condition: release the denoiser", log[1]);
     }
+
+    // ---- streamed phases
+
+    private static PhaseDemand[] Streamed(double conditionWork, double conditionLeast, double denoiseWork, double denoiseLeast) => new[]
+    {
+        new PhaseDemand(DiffusionPhase.Condition, C.Conditioner, (long)(conditionWork * GB)) { StreamedWeightBytes = (long)(conditionLeast * GB) },
+        new PhaseDemand(DiffusionPhase.Denoise, C.Denoiser, (long)(denoiseWork * GB)) { StreamedWeightBytes = (long)(denoiseLeast * GB) },
+        new PhaseDemand(DiffusionPhase.Decode, C.Vae, 1 * GB),
+    };
+
+    /// <summary>A component that can stream does not, where releasing the others makes the room: the plan is the one it was.</summary>
+    [Fact]
+    public void APhaseThatFitsOnceTheOthersAreReleasedDoesNotStream()
+    {
+        ResidencyPlan plain = ResidencyPlanner.Decide(TextToImage(3), Weights(18.2, 40.2, 1.2), Array.Empty<C>(), NoWork, A40);
+        ResidencyPlan plan = ResidencyPlanner.Decide(Streamed(0.5, 1, 3, 1), Weights(18.2, 40.2, 1.2), Array.Empty<C>(), NoWork, A40);
+        Assert.Empty(plan.Streams);
+        Assert.Equal(plain.Releases, plan.Releases);
+        Assert.Equal(plain.Peak, plan.Peak);
+        Assert.True(ResidencyPlanner.Decide(Streamed(0.5, 1, 10, 1), Weights(18.2, 40.2, 1.2), Array.Empty<C>(), NoWork, 88 * GB).KeepsAll);
+    }
+
+    /// <summary>A phase past the budget with nothing else held streams within what the room leaves of it; its component holds
+    /// nothing afterwards, so the next phase has the room it had; and the refusal is measured at the fewest it streams with.</summary>
+    [Fact]
+    public void APhasePastTheBudgetAloneStreamsWithinTheRoomAndHoldsNothingAfter()
+    {
+        // 16 GB: the 15.5 GB trunk beside 5 GB of encoding, the 12.7 GB DiT beside 9.5 GB of step.
+        ResidencyPlan plan = ResidencyPlanner.Decide(Streamed(5, 1.2, 9.5, 0.9), Weights(15.5, 12.7, 1.2), Array.Empty<C>(), NoWork,
+            16 * GB, capacity: 17 * GB);
+        Assert.True(plan.Fits, plan.Describe());
+        Assert.False(plan.Refused);
+        Assert.Equal(new ResidencyStream(DiffusionPhase.Condition, C.Conditioner, 11 * GB), plan.Streams[0]);
+        Assert.Equal(new ResidencyStream(DiffusionPhase.Denoise, C.Denoiser, (long)(6.5 * GB)), plan.Streams[1]);
+        Assert.Equal(16 * GB, plan.Peak);
+        // Nothing streamed is held before the denoise and the decode: no release names the conditioner or the denoiser.
+        Assert.DoesNotContain(plan.Releases, r => r.Component is C.Conditioner or C.Denoiser);
+        Assert.Contains("Denoise: stream the denoiser's weights 6.5 GB at a time", plan.Describe());
+        Assert.Equal(DiffusionPhase.Denoise, plan.Limiting.Phase);
+        Assert.Equal((long)(0.9 * GB), plan.LimitingWeights);
+        Assert.Equal((long)(10.4 * GB), plan.MinimumPeak);
+
+        // The same without streaming is refused at the DiT's whole weights.
+        ResidencyPlan whole = ResidencyPlanner.Decide(Streamed(5, 0, 9.5, 0), Weights(15.5, 12.7, 1.2), Array.Empty<C>(), NoWork,
+            16 * GB, capacity: 17 * GB);
+        Assert.True(whole.Refused);
+        Assert.Empty(whole.Streams);
+        Assert.Equal(Weights(15.5, 12.7, 1.2)[C.Denoiser] + (long)(9.5 * GB), whole.MinimumPeak);
+    }
+
+    /// <summary>A step whose working memory leaves less room than the fewest weights it streams with streams at that fewest,
+    /// past the budget (the device decides), and is refused past the device's capacity.</summary>
+    [Fact]
+    public void AStepPastTheBudgetEvenStreamedStreamsAtItsLeastOrIsRefused()
+    {
+        ResidencyPlan plan = ResidencyPlanner.Decide(Streamed(1, 1, 15.5, 0.9), Weights(15.5, 12.7, 1.2), Array.Empty<C>(), NoWork,
+            16 * GB, capacity: 17 * GB);
+        Assert.False(plan.Fits);
+        Assert.False(plan.Refused);
+        Assert.Equal((long)(0.9 * GB), plan.StreamBudget(DiffusionPhase.Denoise));
+        ResidencyPlan refused = ResidencyPlanner.Decide(Streamed(1, 1, 16.5, 0.9), Weights(15.5, 12.7, 1.2), Array.Empty<C>(), NoWork,
+            16 * GB, capacity: 17 * GB);
+        Assert.True(refused.Refused);
+        Assert.Contains("refused: Denoise needs 17.4 GB", refused.Describe());
+    }
 }

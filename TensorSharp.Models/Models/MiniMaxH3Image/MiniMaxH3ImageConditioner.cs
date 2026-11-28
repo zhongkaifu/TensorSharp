@@ -22,6 +22,7 @@ using TensorSharp.GGML;
 using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.MiniMaxH3Image
 {
@@ -103,6 +104,47 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         private bool _visionUsed;
 
+        // The weight bytes the next encode may hold on the device at once (StreamWithin), or null for all of them.
+        private long? _streamBudget;
+
+        /// <summary>The DeepStack taps a picture adds after the trunk's first layers (Qwen3-VL-32B's tower: three), which the
+        /// first layer group holds.</summary>
+        internal const int DeepStackLayers = 3;
+
+        /// <summary>Whether the trunk can stream its layers within a device budget: the GGML trunk on ggml_metal, whose
+        /// working set is a hard ceiling on unified memory (and whose weights bind zero-copy, so a group costs no upload), and
+        /// on ggml_cpu (the tests: it reports no device budget, so a plan never streams there on its own). ggml_cuda keeps
+        /// the whole trunk, as its plans were calibrated (its grouped trunk, TS_H3_TE_GROUP, was measured slower on a 16 GB
+        /// card), and the direct CUDA trunk is released after every encode.</summary>
+        private bool CanStream => !Direct && Backend is BackendType.GgmlMetal or BackendType.GgmlCpu;
+
+        /// <summary>
+        /// The fewest weight bytes the text encoding holds on the device at once when it streams: the trunk's largest layer
+        /// (three, the DeepStack taps' layers, for an edit), or for an edit the vision tower if that is more (it runs before
+        /// the trunk, and a streamed encode hands its copies back before the trunk's first group). 0 where the trunk does not
+        /// stream (<see cref="CanStream"/>).
+        /// </summary>
+        public long StreamedWeightBytes(DiffusionWorkload workload, DiffusionPhase phase)
+        {
+            if (phase != DiffusionPhase.Condition || !CanStream) return 0;
+            lock (_gate)
+            {
+                if (_disposed || _encoder == null) return 0;
+                bool pictures = workload.Pictures is { Count: > 0 };
+                long layers = _encoder.LargestLayerBytes * (pictures ? DeepStackLayers : 1);
+                if (!pictures || !_encoder.HasVision) return layers;
+                return Math.Max(layers, _encoder.Vision.DeviceWeightBytes);
+            }
+        }
+
+        /// <summary>The next encode holds at most <paramref name="weightBytes"/> of the trunk's weights on the device at once
+        /// (<see cref="MiniMaxH3TextEncoder.DeviceWeightBudget"/>), the vision tower's copies handed back before the trunk
+        /// runs; null holds them all, as before.</summary>
+        public void StreamWithin(long? weightBytes)
+        {
+            lock (_gate) _streamBudget = CanStream ? weightBytes : null;
+        }
+
         /// <summary>The trunk's compute memory for <paramref name="workload"/>'s prompt (<see cref="WorkingBytesFor"/>), with an
         /// edit's vision rows and the vision tower's own for its largest picture.</summary>
         public long WorkingBytes(DiffusionWorkload workload)
@@ -171,6 +213,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 MiniMaxH3TextEncoder encoder = Encoder;
+                BeginStream(encoder);
                 // Raw prompt tokens (no chat template); an empty prompt is the encoder's BOS alone.
                 List<int> ids = encoder.Tokenize(prompt ?? string.Empty);
                 if (ids.Count == 0) ids.Add(encoder.Tokenizer.BosTokenId);
@@ -196,6 +239,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 BpeTokenizer tokenizer = encoder.Tokenizer;
                 MiniMaxH3Requests.RequireVisionTokens(tokenizer);
                 var markers = (Single(tokenizer, "<|vision_start|>"), Single(tokenizer, "<|image_pad|>"), Single(tokenizer, "<|vision_end|>"));
+                BeginStream(encoder);
                 var outputs = new MiniMaxH3VisionOutput[pictures.Count];
                 var vision = Stopwatch.StartNew();
                 for (int i = 0; i < pictures.Count; i++)
@@ -205,6 +249,13 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     _visionUsed = true;
                 }
                 vision.Stop();
+                if (_streamBudget != null)
+                {
+                    // A streamed encode: the tower's device copies and its compute buffers go before the trunk's first
+                    // group is made, so the device holds one of the two at a time.
+                    encoder.Vision.ReleaseDeviceResidency();
+                    ReleaseSharedScratch();
+                }
                 var counts = new int[outputs.Length];
                 for (int i = 0; i < counts.Length; i++) counts[i] = outputs[i].TokenCount;
                 var (ids, tags, starts) = Present(encoder.Tokenize, markers, counts, prompt);
@@ -258,6 +309,16 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return (ids, tags, starts);
 
             static List<int> Truncate(List<int> ids) => ids.Count > MaxSequenceLength ? ids.GetRange(0, MaxSequenceLength) : ids;
+        }
+
+        /// <summary>The trunk's budget for this encode. A streamed encode first hands back the device copies an earlier,
+        /// resident encode left (the trunk's and the tower's), so the device holds no more than one group at a time.</summary>
+        private void BeginStream(MiniMaxH3TextEncoder encoder)
+        {
+            encoder.DeviceWeightBudget = _streamBudget;
+            if (_streamBudget == null) return;
+            encoder.ReleaseDeviceResidency();
+            if (_visionUsed) encoder.Vision.ReleaseDeviceResidency();
         }
 
         private static int Single(BpeTokenizer tokenizer, string marker)

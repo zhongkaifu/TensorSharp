@@ -339,4 +339,109 @@ public sealed class MiniMaxH3ImageResidencyTests
         Assert.False(Plan(DitQ8, 2048, fused: false, quantized: true, M5Pro, capacity: M5ProFree).Refused);
         Assert.True(Plan(DitBf16, 2048, fused: false, quantized: false, M5Pro, capacity: M5ProFree).Refused);
     }
+
+    // ---- streamed phases: a phase whose own weights and working memory pass the device streams them (ggml_metal)
+
+    /// <summary>A 24 GB Mac's Metal recommended working set: two thirds of the memory, 16 GiB (17,179.9 MB as ggml-metal reports
+    /// it on 24 GB Apple Silicon). An assumption, as for the 32 GB Mac: no 24 GB Mac was measured.</summary>
+    private const long Mac24Free = 17_179_869_184L;
+
+    private static readonly long Mac24 = Mac24Free - Math.Max(512 * MiB, Mac24Free / 16);
+
+    /// <summary>The trunk's layers (309,453,824 device bytes each in the Q4_K_M encoder), and the vision tower's tensors
+    /// (BF16, 1,190,533,600 bytes in the file's header).</summary>
+    private const long TextEncoderLayerBytes = 309_453_824, VisionBytes = 1_190_533_600;
+
+    /// <summary>The Q4_K_M DiT's largest one-block span: the first, the token refiner and the patch and condition projections
+    /// (590,136,320 bytes) beside the largest block (268,413,952).</summary>
+    private const long DitQ4SpanBytes = 590_136_320 + 268_413_952;
+
+    /// <summary>Two 2048x1536 photos, <c>&lt;Picture 1&gt;</c> masked: the VAE copies keep their size (3,072 DiT rows each), the
+    /// vision copies are 1376x1024 (1,376 merged tokens each), and the selection samples the picture's own 2048x1536.</summary>
+    private static DiffusionWorkload TwoPictureMaskedEdit()
+    {
+        var reference = new LatentShape(24, 1, 1536 / 16, 2048 / 16);
+        var vision = new RgbImage(1376, 1024, new float[1376 * 1024 * 3]);
+        return new DiffusionWorkload(reference, new[] { reference, reference }, EditPrompt)
+        {
+            Pictures = new[] { new PresentedImage(vision, 0), new PresentedImage(vision, 1) },
+        };
+    }
+
+    /// <summary>The conditioner's estimate for <paramref name="w"/> (MiniMaxH3ImageConditioner.WorkingBytes).</summary>
+    private static long EditConditionerWorking(DiffusionWorkload w)
+    {
+        long rows = 0, largest = 0;
+        foreach (PresentedImage p in w.Pictures)
+        {
+            long tokens = MiniMaxH3ImageConditioner.VisionTokens(p.Image.Width, p.Image.Height);
+            rows += tokens + 8;
+            largest = Math.Max(largest, tokens);
+        }
+        long seq = Math.Max(16, w.Prompt.Length / 3 + 16) + rows;
+        return MiniMaxH3ImageConditioner.WorkingBytesFor(TextEncoder, w.Prompt, rows) + MiniMaxH3ImageConditioner.VisionWorkingBytesFor(largest)
+               + MiniMaxH3ImageConditioner.ScoreBytesFor(seq, TextEncoder.Heads);
+    }
+
+    private static ResidencyPlan Mac24Plan(DiffusionWorkload w, bool streams, bool edit)
+    {
+        var phases = new List<PhaseDemand>
+        {
+            new(DiffusionPhase.Condition, DiffusionComponent.Conditioner, edit ? EditConditionerWorking(w) : ConditionerWorking)
+            {
+                StreamedWeightBytes = streams ? (edit ? Math.Max(3 * TextEncoderLayerBytes, VisionBytes) : TextEncoderLayerBytes) : 0,
+            },
+            new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, MiniMaxH3ImageDenoiser.WorkingBytesFor(Dit,
+                MiniMaxH3ImageDenoiser.RowsOf(w), fused: false, quantized: true, edit: edit))
+            {
+                StreamedWeightBytes = streams ? DitQ4SpanBytes : 0,
+            },
+            new(DiffusionPhase.Decode, DiffusionComponent.Vae, VaeWorking(2048)),
+        };
+        var weights = new Dictionary<DiffusionComponent, long>
+        {
+            [DiffusionComponent.Conditioner] = TextEncoderBytes,
+            [DiffusionComponent.Denoiser] = DitQ4,
+            [DiffusionComponent.Vae] = VaeBytes,
+        };
+        return ResidencyPlanner.Decide(phases, weights, Array.Empty<DiffusionComponent>(), new Dictionary<DiffusionComponent, long>(),
+            Mac24, Mac24Free);
+    }
+
+    /// <summary>
+    /// The report this was fixed for: a two-picture edit, one of them masked, on a 24 GB Mac with Q4_K_M. The text encoding
+    /// (15.5 GB of trunk beside about 5.4 GB of working memory) and the denoise (12.7 GB of DiT beside about 9.5 GB of step)
+    /// each pass the 17.2 GB working set alone, so the request was refused. Streamed, the text encoder holds a group of its
+    /// layers at a time and the DiT a span of its blocks, the vision tower goes before the trunk, and the request fits.
+    /// </summary>
+    [Fact]
+    public void ATwentyFourGbMacStreamsATwoPictureMaskedEditThatItRefusedBefore()
+    {
+        DiffusionWorkload edit = TwoPictureMaskedEdit();
+        ResidencyPlan before = Mac24Plan(edit, streams: false, edit: true);
+        Assert.True(before.Refused, before.Describe());
+        Assert.Equal(DiffusionPhase.Denoise, before.Limiting.Phase);
+
+        ResidencyPlan plan = Mac24Plan(edit, streams: true, edit: true);
+        Assert.False(plan.Refused, plan.Describe());
+        Assert.True(plan.Fits, plan.Describe());
+        Assert.Equal(new[] { DiffusionPhase.Condition, DiffusionPhase.Denoise }, plan.Streams.Select(s => s.Phase).ToArray());
+        Assert.Null(plan.StreamBudget(DiffusionPhase.Decode));
+        Assert.True(plan.Peak <= Mac24, plan.Describe());
+        // A group of the trunk (each beside the working memory) and a span of the blocks, never less than one of each.
+        long trunk = plan.StreamBudget(DiffusionPhase.Condition).Value, dit = plan.StreamBudget(DiffusionPhase.Denoise).Value;
+        Assert.InRange(trunk / TextEncoderLayerBytes, 3, 49);
+        Assert.InRange(dit, DitQ4SpanBytes, DitQ4 - 1);
+    }
+
+    /// <summary>Text to image at 2048x2048 on the 24 GB Mac: the denoise fits beside nothing else and holds the whole DiT; only
+    /// the text encoder, 0.1 GB past the budget beside its working memory, streams (it ran in the headroom before).</summary>
+    [Fact]
+    public void ATwentyFourGbMacStreamsOnlyTheTextEncoderForTextToImage()
+    {
+        ResidencyPlan plan = Mac24Plan(Workload(2048), streams: true, edit: false);
+        Assert.False(plan.Refused, plan.Describe());
+        Assert.Equal(new[] { DiffusionPhase.Condition }, plan.Streams.Select(s => s.Phase).ToArray());
+        Assert.False(Mac24Plan(Workload(2048), streams: false, edit: false).Refused);
+    }
 }

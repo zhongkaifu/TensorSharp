@@ -101,6 +101,20 @@ namespace TensorSharp.Models.SharedDiffusion
         /// residency plan would keep: a family whose components took turns on the device before it moved to the runtime
         /// (Qwen-Image-2.1's), and whose working memory is not calibrated on every device yet.</summary>
         bool ReleaseAfterPhase => false;
+
+        /// <summary>
+        /// The fewest of the component's weight bytes <paramref name="phase"/> must hold on the device at once when it streams
+        /// its weights through the device a group at a time (a group's device copies go before the next group's are made), or
+        /// 0 when the phase holds every weight. The residency plan streams a phase only when its component's weights and
+        /// working memory do not fit with every other component released (<see cref="ResidencyStream"/>). The default: no
+        /// streaming.
+        /// </summary>
+        long StreamedWeightBytes(DiffusionWorkload workload, DiffusionPhase phase) => 0;
+
+        /// <summary>Hold at most <paramref name="weightBytes"/> of the weights on the device at once in the next phase,
+        /// streaming the rest through it a group at a time, or every weight (null: the default). The pipeline sets it before
+        /// every phase the component runs, and releases a streamed component's device copies and workspace after the phase.</summary>
+        void StreamWithin(long? weightBytes) { }
     }
 
     /// <summary>Text (and, for references, the vision tower) to hidden rows with modality tags.</summary>
