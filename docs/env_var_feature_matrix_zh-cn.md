@@ -152,6 +152,8 @@ Qwen 3.5 / 3.6 / 3.8 家族与 Qwen 3.8 Flash Next 的直连 CUDA 引擎以及 N
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
 | `TS_PREFILL_CHUNK` | 在 GPT OSS、Qwen 3.5 / 3.6 family 长上下文功能上 sweep；运行时 Gemma 4、Nemotron-H 以及所有共享解码运行时家族（Mistral 3、Hunyuan Dense、GPT OSS，其滑动窗口环把一步限制在 512 行以内）也会读取 | 分块 prefill 大小 | 架构默认值 | `256`, `512`, `1024` | 是 |
+| `TS_PIPELINED_PROMPT` | 在 `ggml_cuda`、`ggml_vulkan` 和 `cuda` 上以本机 `--layer-split` 分段运行的共享解码运行时家族（无 `--tp`、无主机专家、无 LoRA、无跟随 prompt 的草稿层或 DFlash 环、无多媒体） | `0` 让长 prompt 的各分块逐段依次运行。默认：分块流水化，第 s 段处理第 k - s 块的同时第 s + 1 段处理第 k - s - 1 块，适用于引擎的单请求 prompt 步和 refill；结果与同样的分块依次运行逐位一致 | 启用 | 未注册 | 否 |
+| `TS_PIPELINED_CHUNK` | 同上 | 流水化 prompt 每个分块的行数。一步至少有两个分块才会流水化（引擎的单请求 prompt 步最多 `TS_SCHED_MAX_BATCHED_TOKENS`，即 4,096 行）。在两块 RTX 2000 Ada 上测过的每个模型中，256 都是 256-1,024 里最快的 | `256` | 未注册 | 否 |
 | `TS_GGML_ASYNC_COMPUTE` | GGML 后端 | 异步 compute 提交 | `ggml_metal` 上启用（`0` 关闭），其他 GGML 后端关闭 | `0`, `1` | 是 |
 
 ## 多模态

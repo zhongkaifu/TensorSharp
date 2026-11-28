@@ -60,13 +60,13 @@ namespace TensorSharp.Models
         /// <summary>
         /// The prompt rows <paramref name="tokens"/>[0, <paramref name="count"/>) of the active sequence over the whole-layer
         /// stages as a pipeline of chunks: wavefront t runs stage s on chunk t - s, every stage of a wavefront submitted together
-        /// (<see cref="IRankedGraphExecutor.RunRanked"/>: each device's graph queued before any is waited for), so stage s + 1
-        /// works on chunk k while stage s works on chunk k + 1. Each stage's step is the one the chunk's sequential step emits
+        /// (<see cref="RunWavefront"/>), so stage s + 1 works on chunk k while stage s works on chunk k + 1. Each stage's step is the one the chunk's sequential step emits
         /// (its layers, caches and states, the chunk's tokens, positions and start): a stage reads only its own layers' caches,
         /// and the rows it hands on are the previous wavefront's output of the stage before it, so the result is the chunks'
         /// one after another, bit for bit. Two stages take max(stage) a wavefront where one chunk after another took their sum
-        /// (Qwen3.5-9B Q8_0 on two RTX 2000 Ada: an 8K prompt at 1,893 tok/s over two GGML stages against 1,924 on one GPU;
-        /// direct CUDA's stages, whose runs return with their device work queued, already overlapped: 2,794).
+        /// (Qwen3.5-9B Q8_0 on two RTX 2000 Ada: an 8K refill at 1,893 tok/s over two GGML stages against 1,924 on one GPU,
+        /// 2,911 pipelined in 2,048-row chunks and 3,348 in 512-row ones; direct CUDA's refill chunks, whose runs return with
+        /// their device work queued, had overlapped across chunks: 2,794).
         /// </summary>
         private void TryRunPipelinedPrompt(int[] tokens, int count)
         {
@@ -85,9 +85,9 @@ namespace TensorSharp.Models
         /// A lone request's plain prompt step over local whole-layer stages (the engine's solo prefill: the prompt, up to
         /// SchedulerConfig.SoloPrefillChunkSize tokens, as one step) as <see cref="RunPipelinedChunks"/>'s wavefronts of
         /// <see cref="PipelinedChunkTokens"/> rows, its last row then a one-row step for the logits: the bits of those chunks one
-        /// after another. As one step, each stage had waited for the whole prompt to pass the
-        /// stage before it (Qwen3.5-9B Q8_0 over two GGML stages: a 5,131-token chat prompt in 3.1 s either way before the
-        /// engine's steps pipelined). False (nothing run) where the step does not pipeline (<see cref="PipelinesPrompt"/>, rows
+        /// after another. As one step, each stage had waited for the whole step to pass the stage before it (Qwen3.5-9B Q8_0
+        /// over two GGML stages: a 5,131-token chat prompt, a 4,096-row and a 1,035-row step, in 3.07 s, against 1.86 s in
+        /// 256-row chunks and 3.04 s on one GPU). False (nothing run) where the step does not pipeline (<see cref="PipelinesPrompt"/>, rows
         /// handed in or out, drafter features, a prompt a draft layer or DFlash ring follows).
         /// </summary>
         private bool TryForwardSlotPromptPipelined(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,

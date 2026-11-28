@@ -162,6 +162,8 @@ switches `TS_GGML_FUSED_PLE`, `TS_GEMMA4_TP_FUSED_MOE`, `TS_BATCHED_FUSED_MOE`, 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `TS_PREFILL_CHUNK` | swept on GPT OSS, Qwen 3.5 / 3.6 family long-context features; honored at runtime by Gemma 4, Nemotron-H and every shared-decoder-runtime family (Mistral 3, Hunyuan Dense, GPT OSS, whose sliding-window rings cap a step at 512 rows) as well | Chunked prefill block size | architecture default | `256`, `512`, `1024` | yes |
+| `TS_PIPELINED_PROMPT` | shared-decoder-runtime families over local `--layer-split` stages on `ggml_cuda`, `ggml_vulkan` and `cuda` (no `--tp`, no host experts, no LoRA, no draft layer or DFlash ring following the prompt, no media) | `0` runs a long prompt's chunks one stage after another. Default: the chunks pipeline, stage s working on chunk k - s while stage s + 1 works on chunk k - s - 1, for the engine's lone prompt steps and for refills; the result is the bits of the same chunks one after another | ON | not registered | no |
+| `TS_PIPELINED_CHUNK` | as above | Rows of a pipelined prompt's chunks. A step pipelines from two chunks on (the engine's lone prompt steps are at most `TS_SCHED_MAX_BATCHED_TOKENS`, 4,096 rows). 256 was the fastest of 256-1,024 for every model measured on two RTX 2000 Ada | `256` | not registered | no |
 | `TS_GGML_ASYNC_COMPUTE` | GGML backends | Async compute submission | ON on `ggml_metal` (`0` disables), OFF on other GGML backends | `0`, `1` | yes |
 
 ## Multimodal

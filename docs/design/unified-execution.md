@@ -1641,3 +1641,85 @@ peer path left to it: the long prompt took 11.1 s, and 4.0 s with it off (3.4 s 
   `ggml_cuda`'s int8 tensor-core products): about 11 TFLOPS. A faster product there is a precision decision of its own.
 * The intermittent `ggml_cuda --tp 2` failure of `SharedRuntimeConformanceTests.RankGraphsOnGgmlMatchOneDevice` (qwen3vl)
   above: one failure in 19 runs, on code this work did not change.
+
+### 9.8 Long prompts over two GPUs: pipelined whole-layer stages (2026-11-28)
+
+Two NVIDIA RTX 2000 Ada (16 GB each, sm_89, PCIe), driver 595.112.07, CUDA 13.2, ggml v1.1.1 (`bb877c0c`) unchanged,
+no NCCL. Qwen3.5-9B Q8_0, Nemotron-H-8B-Reasoning Q4_K_M, Qwen3.8-27B UD-IQ3_XXS and Mistral-Small-3.1-24B Q4_K_M (the
+last does not fit one GPU).
+
+**Before.** The CLI benchmark (`--benchmark --bench-chunked`: the prompt through `ForwardRefill` in 2,048-token chunks,
+best of two runs), prefill tok/s for a 1,024- and an 8,192-token prompt:
+
+| Model | Backend | 1 GPU | `--layer-split 2` | `--tp 2` |
+|---|---|---:|---:|---:|
+| Qwen3.5-9B | `ggml_cuda` | 1,969 / 1,924 | 1,918 / 1,893 | 2,615 / 2,523 |
+| | `cuda` | 1,728 / 1,834 | 1,555 / 2,794 | 2,283 / 2,258 |
+| Nemotron-H-8B | `ggml_cuda` | 1,589 / 1,606 | 1,573 / 1,590 | 2,516 / 2,432 |
+| | `cuda` | 971 / 1,093 | 960 / 1,698 | 1,617 / 1,780 |
+| Qwen3.8-27B | `ggml_cuda` | 553 / 536 | 553 / 536 | 829 / 803 |
+| | `cuda` | 407 / 478 | 405 / 664 | 654 / 731 |
+| Mistral-Small-3.1-24B | `ggml_cuda` | out of memory | 721 / 706 | 1,148 / 1,080 |
+| | `cuda` | out of memory | 517 / 924 | 832 / 917 |
+
+* A `ggml_cuda` layer split was one GPU's speed at any length. Each stage's chunk is a GGML run, and a run drains every
+  device before it returns (the native runner's host read barrier), so stage 1 took chunk k only once stage 0 had
+  finished it, and stage 0 took chunk k + 1 only once stage 1 had finished chunk k.
+* Direct CUDA's stages overlapped across the refill's chunks (a run that reads nothing back returns with its device work
+  queued: the last stage's), so its 8K refill gained 1.4-1.6x; a 1K prompt is one chunk, with nothing to overlap.
+* The engine's route did not overlap on either backend: the scheduler hands a lone prompt over as steps of at most
+  `TS_SCHED_MAX_BATCHED_TOKENS` (4,096) rows, each one slot step through the stages in turn. A 5,131-token chat prompt
+  (CLI, greedy) took 3.04 s on one GPU and 3.07 s over two `ggml_cuda` stages (Qwen3.5-9B).
+* Tensor parallelism gained 1.31-1.51x on `ggml_cuda` and 1.23-1.63x on `cuda` at 8K. Its all-reduces cross PCIe at
+  about 10 GB/s a rank: a microbenchmark of a 2,048-row chunk's 4,096-wide F32 partial took 3.4 ms by peer reads (direct
+  CUDA's) and 3.1 ms by the copy engine. At two a layer that is, by estimate, about a quarter of Qwen3.5-9B's direct-CUDA
+  chunk, of which the copy engine would save about 3 %, so it was not pursued; overlapping the all-reduces with the next
+  rows' products is the remaining lever there (Open).
+
+**What changed.**
+
+* `StandardDecoderModel.PipelinedPrompt.cs`: a long prompt over local whole-layer stages runs as wavefronts of chunks,
+  wavefront t running stage s on chunk t - s. On GGML the wavefront's plans are one `IRankedGraphExecutor.RunRanked` (every
+  device's graph queued before any is waited for); on the tensor executors they run one after another, the last stage
+  first, so each earlier stage runs while the later ones' work is queued. Each stage's step is the one the chunk's
+  sequential step emits (its layers, caches and states; the rows it reads are the previous wavefront's output of the stage
+  before it), so the result is those chunks one after another, bit for bit.
+* Both routes: `ForwardRefill`, and the engine's lone prompt step (`TryForwardSlotPromptPipelined`: one request, a plain
+  prompt, no rows handed in or out, no drafter features, no draft layer or DFlash ring following it), which runs its last
+  row as a one-row step for the logits.
+* The chunks are `TS_PIPELINED_CHUNK` rows (256 by default; a step pipelines from two chunks on); `TS_PREFILL_CHUNK` (2,048)
+  remains the chunk of a refill run one after another. `TS_PIPELINED_PROMPT=0` turns the pipeline off. Not pipelined:
+  `--tp` (alone or with `--layer-split`), a multi-node pipeline, host experts, a request's LoRA, media, multi-axis position
+  tables, prompts a draft layer or DFlash ring follows (a speculating request's).
+
+**After** (`ggml_cuda --layer-split 2`). The 5,131-token chat prompt through the CLI (the engine's route), prompt time,
+by chunk rows:
+
+| Model | Off | 1,024 | 768 | 512 | 384 | 256 | 1 GPU | `--tp 2` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.5-9B | 3.07-3.10 s | 2.25 s | 2.20 s | 1.98-1.99 s | 2.17 s | 1.86 s | 3.04 s | 2.39 s |
+| Nemotron-H-8B | 3.59 s | | | 2.26 s | | 2.11 s | 3.54 s | 2.43 s |
+| Qwen3.8-27B | 10.32 s | | | 6.90 s | | 6.70 s | | |
+| Mistral-Small-3.1-24B | 8.68 s | | | 5.25 s | | 5.13 s | out of memory | |
+
+The replies are the same text with and without the pipeline for every model at 256 rows (and at 512, but for Qwen3.8-27B,
+whose reply ended "...while others are offloaded to host memory." against "...are handled by the host.": a greedy near-tie
+under the other chunking; the bits are those of the same chunks one after another). Decode is unchanged (22.2-22.7 tok/s
+for Qwen3.5-9B). The 8K refill benchmark, prefill tok/s:
+
+| Model | Off | 2,048-row chunks | 512-row chunks | `--tp 2` |
+|---|---:|---:|---:|---:|
+| Qwen3.5-9B | 1,884-1,892 | 2,837-2,911 | 3,348 (3,356 at 256) | 2,523 |
+| Nemotron-H-8B | 1,593 | 2,449 | 2,815 | 2,432 |
+| Qwen3.8-27B | 532 | 735 | 825 | 803 |
+| Mistral-Small-3.1-24B | 703 | 1,084 | 1,246 | 1,080 |
+
+Two pipelined stages now prefill faster than `--tp 2` for each of the four, which keeps the faster decode (Qwen3.5-9B
+39.6 tok/s against 22.3).
+
+**Tests.** `PipelinedPromptTests`: the refill and the engine's slot route against the same chunks one after another, bit
+for bit through the prompt and three greedy decode steps, for mistral3 (two and three stages), qwen3vl (routed experts),
+qwen35 (Gated DeltaNet), nemotron_h (Mamba), gemma4 (sliding rings, a stage carry) and lfm3 (short convolutions) on the
+managed executor, the GGML families on two `ggml_cuda` GPUs, and every family on two direct-CUDA GPUs. On the VM, with
+`TS_TEST_GGML_BACKEND=cuda`, the pipelined, stage and two-GPU tests: 51 passed, 2 skipped (a native GLM layer split and
+Vulkan, not counted).

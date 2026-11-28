@@ -46,11 +46,16 @@ namespace TensorSharp.Models
         private static readonly int MlxEvalEveryNLayers = ResolvePositiveEnv("TS_MLX_EVAL_EVERY_N_LAYERS", 4);
         private static readonly int PrefillChunkTokens = ResolvePositiveEnv("TS_PREFILL_CHUNK", 2048);
 
-        /// <summary>Rows of a pipelined prompt's chunks over whole-layer stages (StandardDecoderModel.PipelinedPrompt.cs).</summary>
-        private static readonly int PipelinedChunkTokensDefault = ResolvePositiveEnv("TS_PIPELINED_CHUNK", 512);
+        /// <summary>Rows of a pipelined prompt's chunks over whole-layer stages (StandardDecoderModel.PipelinedPrompt.cs): a
+        /// wavefront takes its longest stage's chunk, and the engine's lone prompt steps are at most 4,096 rows
+        /// (TS_SCHED_MAX_BATCHED_TOKENS), so the stages fill and drain once a step. A 5,131-token prompt over two ggml_cuda
+        /// stages on two RTX 2000 Ada: 1.86 s in 256-row chunks, 2.17 s in 384, 1.98 s in 512, 2.20 s in 768 and 2.25 s in
+        /// 1,024 (Qwen3.5-9B Q8_0; 3.07 s one after another); 256 rows were also the fastest for Nemotron-H-8B, Qwen3.8-27B
+        /// and Mistral-Small-3.1-24B.</summary>
+        private static readonly int PipelinedChunkTokensDefault = ResolvePositiveEnv("TS_PIPELINED_CHUNK", 256);
 
         /// <summary>Tests: the rows of a long prompt's chunks, pipelined or not (<c>TS_PREFILL_CHUNK</c>, 2,048, and
-        /// <c>TS_PIPELINED_CHUNK</c>, 512, otherwise), so a short prompt spans several.</summary>
+        /// <c>TS_PIPELINED_CHUNK</c>, 256, otherwise), so a short prompt spans several.</summary>
         internal int? PromptChunkTokensForTests { get; set; }
 
         private int PromptChunkTokens => PromptChunkTokensForTests ?? PrefillChunkTokens;
