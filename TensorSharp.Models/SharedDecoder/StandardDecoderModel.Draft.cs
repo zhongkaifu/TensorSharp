@@ -571,6 +571,7 @@ namespace TensorSharp.Models
         /// <summary>The prompt's end lets a DFlash ring take only the rows it holds when the prompt ends.</summary>
         public void FollowPlainPrompt(string requestId, int promptEnd)
         {
+            _promptsFollowed = true;
             if (requestId == null)
             {
                 _followPlainPrompt = true;
@@ -595,7 +596,12 @@ namespace TensorSharp.Models
             // A request registered to speculate for this chunk keeps that registration.
             if (_followPromptRequests.TryGetValue(requestId, out var registered) && !registered.Aside) return;
             _followPromptRequests[requestId] = (promptEnd, true);
+            _promptsFollowed = true;
         }
+
+        /// <summary>A prompt was followed since load (the engine speculates, or feeds a DFlash ring): lone prompts keep the
+        /// scheduler's steps, which a followed prompt's do not pipeline (StandardDecoderModel.PipelinedSoloStep).</summary>
+        private bool _promptsFollowed;
 
         /// <summary>Each request's registered prompt end (<see cref="FollowPlainPrompt(string, int)"/>; -1 unknown), the
         /// registrations taken, or <see cref="DFlashNoFollow"/> for a request that registered none; null when none did.

@@ -156,6 +156,15 @@ public sealed class PipelinedPromptTests : IDisposable
         Assert.Equal(10_000, model.PreferredSoloPrefillTokens(0, 10_000));
         Assert.Equal(8192, model.PreferredSoloPrefillTokens(8192, 10_241));
         Assert.Equal(0, model.PreferredSoloPrefillTokens(0, 16));
+        // Once a prompt is followed (the engine speculates), the scheduler's own steps.
+        using (var followed = new Mistral3Model(path, BackendType.Cpu, 1, null, 2))
+        {
+            followed.PromptChunkTokensForTests = 16;
+            followed.PipelinedPromptForTests = true;
+            Assert.Equal(8192, followed.PreferredSoloPrefillTokens(0, 20_000));
+            followed.FollowPlainPrompt("r", 20_000);
+            Assert.Equal(0, followed.PreferredSoloPrefillTokens(0, 20_000));
+        }
         model.PipelinedPromptDisabledForTests = true;
         Assert.Equal(0, model.PreferredSoloPrefillTokens(0, 20_000));
         using var single = new Mistral3Model(path, BackendType.Cpu, 1, null, 1);

@@ -60,13 +60,17 @@ namespace TensorSharp.Models
         /// rule: a remainder of at most a quarter step joins the step before it), each step's chunks the pipeline's: the stages
         /// fill and drain once a step, so the scheduler's 4,096-row steps (and direct CUDA's 2,048) each left a stage idle for
         /// a chunk at either end, and on direct CUDA a step that is itself one chunk does not pipeline at all. On direct CUDA the
-        /// chunks are the step <paramref name="own"/> it fitted to the device's room. Else <paramref name="own"/>; and never
-        /// where a draft layer or DFlash ring follows the prompts (their steps do not pipeline).
+        /// chunks are the step <paramref name="own"/> it fitted to the device's room. Else <paramref name="own"/>; and so once
+        /// a prompt was followed (a draft layer or DFlash ring takes its rows, and such a step does not pipeline): the engine
+        /// registers that only when it speculates, after the step is chosen, so the first such step runs in the steps it would
+        /// have had (the fallback in TryForwardSlots). Qwen3.8-27B carries an MTP layer and serves without speculation unless
+        /// asked: declined for the layer alone, its 5,131-token prompt over two ggml_cuda stages took 6.68 s in 4,096-row
+        /// steps against 6.43 s in one.
         /// </summary>
         private int PipelinedSoloStep(int remaining, int own)
         {
             _pipelinedSoloFallbackRows = 0;
-            if (remaining <= 0 || DraftSelfCatchUp || _backend == BackendType.Mlx) return own;
+            if (remaining <= 0 || _promptsFollowed || _backend == BackendType.Mlx) return own;
             if (_backend == BackendType.Cuda)
             {
                 if (own <= 0) return own;   // the remainder fits one step of its own
