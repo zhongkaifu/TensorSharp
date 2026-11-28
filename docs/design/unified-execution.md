@@ -1430,40 +1430,87 @@ own precision and VRAM choices that the presets and TensorAgent set, not switche
   the CUDA device has 23674 MiB free"): the fit check counted every weight against the first GPU, though the preload puts
   each on its layer's GPU. Each device is now asked for its own share (`RefuseQuantizedWeightsThatCannotFit`).
 
+* **Loading the model for direct-CUDA `--tp 2` took 108 s** (`ggml_cuda`'s: 22 s): the weight sharding matched each of the
+  74K tensor names against each of the ~74K patterns (every expert member is listed) by substring, and logged the patterns
+  on one 2.3 MB line. Whole names are looked up now (`ShardWeightsForTensorParallelism`) and the line is gone.
+* **Tensor-parallel decode steps never advanced** (`TryAdvanceRanked`): the check compared the step's `Slot` objects with
+  the kept step's, but each step hands the primary cache in a new one, so every decode step re-traced and found its plans by
+  signature, on GGML and on the tensor executors alike, and direct CUDA had no kept step to record. The check now compares
+  what the plans bind (caches, states, capacity, rotary offset), as the one-device advance does.
+
+**Qwen3.8 Flash Next end to end** (greedy; text: 96 tokens of a short prompt; bench: `--benchmark`, 512 prompt / 128 decode,
+best of two runs; long: a 5,130-token document and a question, `--no-skills`; MTP: `--draft-model` with the shared head):
+
+| Placement | Text | MTP acceptance (short / long) | Bench prefill / decode tok/s | Long: prefill s / decode tok/s | 4 requests at once |
+|---|---|---|---|---|---|
+| `ggml_cuda --layer-split 2` | coherent | 49 % / 72 % | 1,659-1,662 / 74.0-77.9 | 3.4 / 61.6 | 32.1 tok/s aggregate (lone 60.2): 2 of 4 re-prefilled |
+| `ggml_cuda --tp 2` | coherent | 40-44 % / 50 % | 1,162-1,172 / 57.6-58.9 | 18.4 / 46.8 | 24.2 aggregate (lone 46.3): 2 of 4 re-prefilled |
+| `cuda --layer-split 2` | coherent | 76 % / 72 % | 1,943 / 96.2 | 15.0 / 66.0 | 135.3 aggregate (lone 82.2) |
+| `cuda --tp 2` | coherent | 48 % / 72 % | {Q4E_TP_BENCH} | {Q4E_TP_LONG} | {Q4E_TP_CONC} |
+
+Every placement answers the document question with the same sentence. The `ggml_cuda` bursts re-prefilled two of the four
+requests because their shared-prefix checkpoint could not be cloned: "a clone needs 206 MiB of HostKv but 0 MiB is spare"
+(the model's 26.8 GB of host-only tables leave this 62 GB VM no host budget); direct CUDA resumed all four.
+
+**Suites on the GPUs.** The Qwen4Exp and MoE-kernel tests on the default lane: 318 passed, 56 skipped; on the `cuda` lane
+(`TS_TEST_GGML_BACKEND=cuda`): 309 passed, 59 skipped; the two-GPU tests (rank and stage graphs on `ggml_cuda`, the direct-CUDA
+placements, the P2P all-reduce, Qwen4Exp's stages and rank graphs): {SUITE_MULTI}. Skipped there and not counted: the Vulkan
+pair and a GLM-DSA test whose model is not on the VM. The opt-in `Qwen4ExpQ2_0Int8PromptTests` precision study (hours) was
+not run.
+
 **Direct-CUDA tensor parallelism.** Every all-reduce waited for every device three times (before the reduce, after the
-reduce to GPU 0, after the broadcast), so the host's op launches never overlapped the devices' work, and a step's ranks
-were re-traced every token.
+reduce to GPU 0, after the broadcast), so the host's op launches never overlapped the devices' work, every step's ranks were
+traced again, and no decode step was recorded.
 
 * `CudaP2PCommunicator.AllReduce` now runs ordered on the devices where every pair passed the peer self-test (a peer copy
   and a kernel reading the peer's memory): each rank's stream records that its partial is ready and waits for its peers';
   every rank sums all the partials over the peer mappings in rank order into its scratch (the same additions on every
   rank, so the ranks hold the bits the reduce-to-zero made: `CudaP2PAllReduceTests.DeviceOrderedAllReduceMatchesTheHostSynchronizedOne`
   over a 24-reduction chain with no host read between); once every rank has read the others', each copies its sum over its
-  partial. The host never waits. Pairs without verified peer reads keep the host-synchronized reduce-to-zero.
-* The tensor executors' ranks run compiled per-rank plans (`TensorGraphExecutor.RunRanked`: rank by rank, each plan up to
-  its next all-reduce, every all-reduce kept live on every rank), on the model path `ggml_cuda` takes (`RankRunner`: the plan
-  cache by the ranks' signatures, a decode step advanced one position without a trace, one kept step a stage). The
-  streaming ranked path is removed.
+  partial. The host never waits. Pairs without verified peer reads keep the host-synchronized reduce-to-zero. A scratch
+  that grows is retired, not freed (a recording keeps reading the one it was recorded with).
+* A ranked step that advances runs as the ranks' compiled plans in lockstep (`TensorGraphExecutor.RunRanked`: each plan
+  up to its next all-reduce, every all-reduce kept live on every rank); every other step streams each rank's ops as the
+  trace emits them (`TryRunRankedStreamedStep`), which lets the host trace while the devices work. Compiled plans for every
+  step had made direct CUDA's prompt chunks ~5 % slower and Mistral-Small-24B's decode 5 % slower (ABBA, streamed against
+  compiled: Nemotron-H-8B prefill 3,719 -> 3,532, gpt-oss-20b prefill 3,154 -> 2,982, Mistral decode 64.1 -> 61.0); the
+  per-step choice kept the gains and lost the losses (streamed against per-step, decode: Qwen3.5-0.8B 108.6 -> 117.3-121.1,
+  gemma-4-E4B 42.0-42.4 -> 44.3-45.3, Mistral 63.8-65.0 -> 63.8-64.1, Nemotron 73.2-73.5 -> 73.7-73.8; prefill within noise;
+  the greedy text equal in every pair).
+* A kept decode step is recorded once as one CUDA graph over every rank's device and replayed a position on
+  (`RankedDecodeCapture`): the recording begins on rank 0's stream and every other rank's stream joins it through an event,
+  so each rank's kernels and the all-reduce's event waits land in the one graph on their own devices (a probe on the VM
+  first showed a capture holding work on both GPUs replays correctly). Each rank keeps its stable inputs, dynamic lengths
+  and the pool blocks its kernels used (`CudaGraphCapture` tracks a context per allocator; `CudaPrefillGraphCache` takes
+  joined captures, which own blocks but no graph; `CudaDecodeDynParams` activates one block per rank); each launch waits
+  for what the ranks' streams queued, and each rank's stream waits for the launch. A step whose host reads a device value
+  mid-step (routed experts that route on the host) is not recorded, as on one device.
+  `Qwen35RuntimeTests.DirectCudaTensorParallelDecodeReplaysItsRecording` (two GPUs) checks the advances, the recordings and
+  their replays against the unrecorded ranks (relL2 <= 1e-5) and one GPU.
 
-Before/after, `--backend cuda --tp 2` (ABBA over prebuilt binaries, best of two runs of 512/128; the greedy text equal in
-every pair):
+Decode tok/s of `--tp 2`, the device-ordered all-reduce against the host-synchronized one (ABBA, best of two runs of
+512/128; the greedy text equal in every pair):
 
-| Model | Device-ordered all-reduce: decode | prefill | Compiled ranked plans: decode | One GPU decode |
-|---|---|---|---|---|
-| Qwen3.5-0.8B Q8_0 | 103 -> 104 | 18.4K -> 24.8K | 106 -> 120 | 417 |
-| Qwen3.5-9B Q8_0 | 56.3 -> 79.0 | 3973 -> 4394 | 80.8 -> 81.5 | 65.0 |
-| gemma-4-E4B Q8_0 | 37.3 -> 40.6 | 4567 -> 5773 | | 83.8 |
-| Nemotron-H-8B Q8_0 | 55.2 -> 70.5 | 3269 -> 3628 | | 61.6 |
-| gpt-oss-20b MXFP4 | 61.8 -> 66.2 | 2831 -> 3054 | | 133 |
-| Mistral-Small-3.1-24B Q4_K_M | 39.7 -> 64.0 | 1596 -> 1711 | | 38.7 |
+| Model | Device-ordered all-reduce: decode | prefill | One GPU decode |
+|---|---|---|---|
+| Qwen3.5-0.8B Q8_0 | 103 -> 104 | 18.4K -> 24.8K | 417 |
+| Qwen3.5-9B Q8_0 | 56.3 -> 79.0 | 3973 -> 4394 | 65.0 |
+| gemma-4-E4B Q8_0 | 37.3 -> 40.6 | 4567 -> 5773 | 83.8 |
+| Nemotron-H-8B Q8_0 | 55.2 -> 70.5 | 3269 -> 3628 | 61.6 |
+| gpt-oss-20b MXFP4 | 61.8 -> 66.2 | 2831 -> 3054 | 133 |
+| Mistral-Small-3.1-24B Q4_K_M | 39.7 -> 64.0 | 1596 -> 1711 | 38.7 |
 
-`--tp 2` on direct CUDA now decodes faster than one GPU on the 8B-24B models (Mistral-Small 64.0 against `ggml_cuda`'s
-66.8). The small and op-heavy models stay host-bound: a direct-CUDA TP step dispatches every op of both ranks from the
-host, where one GPU replays its recorded decode step as one launch.
+The advancing, recorded decode steps against the per-step build before them (D: no step advanced, E: advanced and
+recorded; ABBA D1 E1 E2 D2, best of two runs of 512/128 each):
+
+{W15_TABLE}
 
 **Open.**
 
-* Recording a direct-CUDA TP decode step: the ranks' graphs cannot order on host-recorded events (each rank's graph would
-  wait on a record its peer's graph has not reached), so it needs a device-side barrier in the all-reduce (a flag each rank
-  writes and its peers poll, with a counter on the device for replays), per-rank captures launched together, and an
-  all-or-nothing capture (a rank whose recording fails must not leave its peers' graphs waiting).
+* `ggml_cuda --tp 2` prompt chunks of a family that sums its partials exactly (Qwen3.8 Flash Next: `ExactTensorParallelSums`)
+  reduce in 32,764-element pieces without NCCL (ggml's own transport carries wider sums in BF16), about 30K collectives a
+  4K-row chunk: its 5,130-token prompt took 18.4 s against 3.4 s over two stages. An exact device all-reduce of TensorSharp's
+  own for GGML buffers (as `CudaP2PCommunicator` for direct CUDA) would lift it.
+* Direct CUDA's long prompts: 1,943 tok/s at 512 tokens but 343 over 5,130 (`--layer-split 2`; `--tp 2` 218). Not profiled
+  further here.
+* The hybrid (`--tp 2 --layer-split 2`) was validated on simulated devices only; the VM has two GPUs.
