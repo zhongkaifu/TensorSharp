@@ -1526,8 +1526,8 @@ of it), and Qwen3.8 Flash Next faster than over two stages. Mistral-Small's fami
 
 * `ggml_cuda --tp 2` prompt chunks of a family that sums its partials exactly (Qwen3.8 Flash Next: `ExactTensorParallelSums`)
   reduce in 32,764-element pieces without NCCL (ggml's own transport carries wider sums in BF16), about 30K collectives a
-  4K-row chunk: its 5,130-token prompt took 18.4 s against 3.4 s over two stages. An exact device all-reduce of TensorSharp's
-  own for GGML buffers (as `CudaP2PCommunicator` for direct CUDA) would lift it.
+  4K-row chunk: its 5,130-token prompt took 18.4 s against 3.4 s over two stages. Closed in 9.7 (an exact all-reduce over
+  peer memory for the wider partials: 4.0 s).
 * Direct CUDA's long prompts: 1,943 tok/s at 512 tokens but 343 over 5,130 (`--layer-split 2`; `--tp 2` 218). Not profiled
   further here.
 * Families that declare no advancing decode steps (the generic decoder's: Mistral-Small, Qwen3-VL, Hunyuan dense) re-trace
@@ -1535,3 +1535,108 @@ of it), and Qwen3.8 Flash Next faster than over two stages. Mistral-Small's fami
 * A step whose host reads a device value mid-step (routed experts that route on the host, such as the BF16 experts of the
   `moe-tp` fixture) runs unrecorded, as on one device.
 * The hybrid (`--tp 2 --layer-split 2`) was validated on simulated devices only; the VM has two GPUs.
+
+### 9.7 Diffusion denoisers over two GPUs; an exact all-reduce over peer memory (2026-11-28)
+
+The same two-GPU VM as 9.5 and 9.6 (two RTX PRO 4000 Blackwell, 24 GB each, PCIe, ggml `bb877c0c` unchanged, CUDA 13.2,
+no NCCL).
+
+**What changed.**
+
+* `DenoiserStages` (`TensorSharp.Models/SharedDiffusion`): `--layer-split N` for every diffusion family as whole-block
+  stages, contiguous block spans balanced by weight bytes, one program a stage on its device, the residual stream (or
+  streams: video and audio, image and text) handed on in F32 through the host, the per-step values (time embedding,
+  modulation, rotary and segment tables) inputs of every stage. GGML stages compile and run with the context's active rank;
+  a tensor executor is one a device. MiniMax-H3 video and MiniMax-H3-Image on `cuda` and `ggml_cuda`, Qwen-Image 2.1 on
+  `ggml_cuda`, LTX 2.5 on `cuda`.
+* `DenoiserRanks` and `DitShards`: `--tp N` for the denoisers on direct CUDA as per-rank programs (Megatron: q, k, v and
+  fc1 by output rows, the attention output and fc2 by input columns with quantized blocks whole, a `GraphOp.AllReduce`
+  before each gated residual, a LoRA set's factors cut the same way, the tensor executors joining one collective).
+  MiniMax-H3 video, MiniMax-H3-Image and LTX 2.5 (whose whole-width q/k norms take an all-reduced sum of squares, 14
+  all-reduces a block). Qwen-Image 2.1's `--tp` on `ggml_cuda` is its ranked GGML programs, as before.
+* Per-device native state: the cuDNN SDPA and the Q4_K/int8 GEMM states (`tsg_cuda_cudnn_sdpa.cu`,
+  `tsg_cuda_q4k_gemm.cu`) were process-wide and made on the first GPU, so a stage on the second failed ("backend graph
+  execution failed"); each device has its own, and the releases visit every device that made one.
+* An exact F32 all-reduce of TensorSharp's own over peer memory for `ggml_cuda` without NCCL (`ggml_ops_tp_probe.cu`:
+  events, a peer copy of every other rank's partial, a sum in rank order on each GPU), for partials wider than the
+  32,764-float pieces the exact fallback ran one of the context's collectives each (`TS_GGML_TP_P2P_ALLREDUCE=0` turns it
+  off). Narrower partials keep the context's collective: taking every partial (with peer access left on, below) cost
+  Qwen3.8-27B's decode 6 % (ABBA, 512/128, best of two: 57.5-57.8 tok/s against 61.1-61.5, prefill alike) and Qwen3.8
+  Flash Next's 8 % (65.7 against 71.5). The all-reduce leaves peer access off, as the peer-copy probe does.
+* The tensor executors: a product whose first operand is a large host input (past 65,536 floats, kept on the host until
+  read: MiniMax-H3-Image's PDD head, `[hidden, patch]` F32 every step) read its absent tensor, which the synthetic
+  checkpoints' small heads never reached (the real checkpoint on `cuda` failed on its first step;
+  `GraphLargeInputViewTests.AProductOfAnInputFirstOperandReadsItAtAnySize`). `GraphOp.GroupNorm` is the layer norm of each
+  group's contiguous run, so MiniMax-H3-Image's VAE encoder, and with it edits, run on `cuda` (its leaves as device
+  tensors; `MiniMaxH3ImageEditTests.VaeEncoderMatchesTheNumPyOracleOnTheManagedExecutor` and `...OnCuda`).
+
+**Tests on the two GPUs.** Run with `TS_TEST_GGML_BACKEND=cuda` over every test whose name names tensor parallelism, whole-block
+stages, two GPUs or MiniMax-H3-Image: 426 passed and none failed, among them the stages and the ranks against one GPU
+for MiniMax-H3 video (`cuda` and `ggml_cuda`, the eight frozen cases each), MiniMax-H3-Image (`cuda`, with and without
+LoRA, Q8_0 and BF16), Qwen-Image 2.1 (`ggml_cuda`) and LTX 2.5 (`cuda`, with and without the adapter). The 49 skipped
+need more GPUs (3 to 10 ranks), another backend (Metal, `ggml_cpu`) or checkpoints the VM lacks, and are not counted.
+After the all-reduce's last change (peer access left off), the GGML and CUDA rank-graph tests, the stages' tests and the
+MiniMax-H3-Image tests (283) passed twice in a row. `SharedRuntimeConformanceTests.RankGraphsOnGgmlMatchOneDevice` (qwen3vl)
+failed in one of six runs over this work (token 0 was 191 against 64, a 3.7 % margin) in a process where the peer path never
+ran, so on the context's own collective as before it; not explained (Open).
+
+**Real checkpoints** (one run each, `--diffusion-seed 7`; time is the denoising loop; memory is each GPU's peak sampled every
+0.5 s, the first GPU also holding the encoders and the VAE; PSNR against one GPU over the decoded frames):
+
+| Family, backend | Workload | 1 GPU | `--layer-split 2` | `--tp 2` | PSNR: split / TP |
+|---|---|---:|---:|---:|---|
+| Qwen-Image 2.1, `ggml_cuda` | 1024², 40 steps | 44.6 s (1.05 s a step) | 43.3 s (1.05 s) | 34.4 s (0.79 s) | identical / 40.4 dB |
+| Qwen-Image 2.1-Turbo, `ggml_cuda` | 1024², 8 steps | 10.2 s (1.07 s) | 10.0 s | 9.9 s (0.76 s) | identical / 28.2 dB |
+| Qwen-Image 2.1 + Fun-Acc-4Step LoRA, `ggml_cuda` | 1024², 4 steps | 6.3 s (1.27 s) | 6.8 s | 5.2 s (0.90 s) | identical / 40.6 dB |
+| MiniMax-H3-Image, `ggml_cuda` | 1024², 6 steps | 5.8 s (0.70 s) | 5.8 s (0.68 s) | refused | identical / - |
+| MiniMax-H3-Image + pDMD 2-step, `ggml_cuda` | 1024², 2 steps | 3.3 s | 3.5 s | refused | identical / - |
+| MiniMax-H3-Image, `cuda` | 1024², 6 steps | 28.1 s (3.50 s) | 22.4 s (3.47 s) | 13.8 s (1.92 s) | identical / 52.3 dB |
+| MiniMax-H3-Image + pDMD 2-step, `cuda` | 1024², 2 steps | 9.0 s (3.66 s) | | 8.1 s (1.97 s) | - / 61.8 dB |
+| MiniMax-H3-Image edit, `cuda` | one reference, 2048² sampled | 144.3 s (23.9 s) | 147.7 s (24.5 s) | 84.5 s (12.6 s) | identical / 57.9 dB |
+| MiniMax-H3 video, `ggml_cuda` | 17 frames at 640x384, 20 steps | 21.9 s (1.03 s) | 22.0 s (1.01 s) | refused | identical / - |
+| MiniMax-H3 video + Turbo 4-step, `ggml_cuda` | 4 steps | 6.4 s | 6.3 s | refused | identical / - |
+| MiniMax-H3 video, `cuda` | 20 steps | 110.0 s (5.42 s) | 113.3 s (5.61 s) | 62.5 s (2.93 s) | identical / 42.0 dB |
+| MiniMax-H3 video + Turbo 4-step, `cuda` | 4 steps | out of memory | 24.9 s (5.88 s) | 17.3 s (3.16 s) | - / 40.8 dB against the split |
+| LTX 2.5 distilled, `cuda` | 17 frames at 512x320, 11 steps | 8.8-9.4 s (0.43 s) | 8.9-9.1 s (0.44 s) | 7.9-8.0 s (0.36 s) | identical / 26.9 dB |
+
+Peak memory and the prompts are in the model pages (docs/models: qwenimage21, minimax-h3-image, minimax-h3, ltx-2.5).
+The edit on `cuda` and on `ggml_cuda` turned the lanterns blue and kept the rest (42.0 dB apart; their products differ:
+F32 activations on `cuda`, q8_1-guarded int8 on `ggml_cuda`).
+
+The stages give one GPU's pixels byte for byte on every family and backend, plug-ins included. Tensor parallelism changes
+the order partials are summed in, so its pictures are not one GPU's bits; the rounding compounds along the trajectory into
+moved details (Qwen-Image Turbo 28.2 dB: the same room and cat; LTX 26.9 dB: the same lake and boat, the sail cut
+differently), most with a distilled model's few large steps. The per-step differences are bounded on the synthetic
+checkpoints by the two-GPU tests above.
+
+**Text models with the peer all-reduce** (`ggml_cuda --tp 2`, 512/128 best of two, ABBA where two values are given):
+
+| Qwen3.8 `ggml_cuda --tp 2` | The context's collectives | The peer path for every exact sum, peer access left on | Multi-chunk partials only, peer access left on | Multi-chunk partials only, peer access off |
+|---|---:|---:|---:|---:|
+| 27B decode, tok/s | 61.1-61.5 | 57.5-57.8 | 61.5, 61.5 | 61.3 |
+| 27B prefill, tok/s | 1,861-1,863 | 1,835-1,891 | 1,865-1,876 | 1,872 |
+| Flash Next decode, tok/s | 71.5 | 63.8-65.7 | 69.6 | 73.5 |
+| Flash Next prefill, tok/s | 1,154 | 1,866-1,959 | 1,954 | 1,935 |
+| Flash Next 5,130-token prompt | 18.4 s | 15.4 s | 11.1 s | 4.0 s |
+
+Qwen3.8-27B sums only its decode partials exactly, and they fit one piece: the multi-chunk rule leaves it on the context's
+collective. Qwen3.8 Flash Next sums every partial exactly (`ExactTensorParallelSums`), so its prompt chunks take the peer
+path. The all-reduce first enabled peer access and left it on; the peer-copy probe hands the devices back as it found them
+because enabling it changes the path the context's own collective takes (it measured 30 % of tp2 decode), so the
+all-reduce now leaves it off too: its copies need no mapping and its sum reads only local memory. That costs the copies a
+little (Qwen-Image 2.1 `--tp 2`: 0.79 s a step against 0.76 s). The answer to the 5,130-token prompt is the same text in
+every column. With peer access left on, the context's collective had also taken the slow path for everything the
+peer path left to it: the long prompt took 11.1 s, and 4.0 s with it off (3.4 s over two stages).
+
+**Open.**
+
+* `--tp` on `ggml_cuda` for MiniMax-H3 (video and image) and LTX 2.5 (its ranked runner takes no DiT regions), and the
+  hybrid (`--tp` with `--layer-split`) for every denoiser, are refused.
+* MiniMax-H3 video on direct CUDA is about five times slower than on `ggml_cuda` on one GPU (110 s against 21.9 s), so
+  `--tp 2` on `cuda` (62.5 s) is still slower than one GPU on `ggml_cuda` where that fits.
+* LTX 2.5's IC-LoRA adapters are gated on Hugging Face (401 here): LTX under stages and TP was checked with an adapter on
+  the synthetic checkpoint only. Qwen3.8-27B (text) takes no LoRA.
+* MiniMax-H3-Image on direct CUDA keeps F32 activations in every product (3.5 s a 1024² step against 0.70 s on
+  `ggml_cuda`'s int8 tensor-core products): about 11 TFLOPS. A faster product there is a precision decision of its own.
+* The intermittent `ggml_cuda --tp 2` failure of `SharedRuntimeConformanceTests.RankGraphsOnGgmlMatchOneDevice` (qwen3vl)
+  above: one failure in six runs, on code this work did not change.
