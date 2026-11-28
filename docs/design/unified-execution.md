@@ -1721,7 +1721,7 @@ cost about the same at any rows. In one 5,131-row step (the scheduler's solo ste
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Qwen3.5-9B | 3.09 s | 1.76 s | 3.04-3.07 s | 2.39 s | 3.32 s | 2.39 s | 3.08 s | 2.52 s |
 | Nemotron-H-8B | 3.59 s | 2.01 s | 3.54 s | 2.43 s | 5.10 s | 3.64 s | 5.01 s | 3.20 s |
-| Qwen3.8-27B | 10.30 s | | 10.42 s | | 11.57 s | | | |
+| Qwen3.8-27B | 10.30 s | 6.43 s | 10.42 s | | 11.57 s | 8.19 s | | |
 | Mistral-Small-3.1-24B | 8.70 s | 4.75 s | does not fit | | 10.30 s | 7.12 s | does not fit | |
 | Decode, Qwen3.5-9B | 22.3 | 22.5 | 22.0 | 39.6 | 22.4 | 22.4 | 22.7 | 36.9 |
 
@@ -1736,9 +1736,10 @@ of the same chunks one after another). Decode is unchanged. The 8K refill benchm
 | Qwen3.8-27B | 532 | 735 | 825 | 803 |
 | Mistral-Small-3.1-24B | 703 | 1,084 | 1,246 | 1,080 |
 
-On `ggml_cuda` two pipelined stages now prefill faster than `--tp 2` for each of the four; `--tp 2` keeps the faster
-decode (Qwen3.5-9B 39.6 tok/s against 22.5). On direct CUDA the pipeline gains 1.39-1.45x over the stages one after another;
-`--tp 2` stays ahead there for Nemotron-H-8B.
+On `ggml_cuda` two pipelined stages now prefill faster than `--tp 2` for each of the four in the 8K benchmark, and for
+the two whose chat prompt ran under `--tp 2`; `--tp 2` keeps the faster decode (Qwen3.5-9B 39.6 tok/s against 22.5). The
+pipeline gains 1.60-1.83x over the stages one after another on `ggml_cuda` and 1.39-1.45x on direct CUDA, where `--tp 2`
+stays ahead for Nemotron-H-8B (3.20 s against 3.64).
 
 **Tests.** `PipelinedPromptTests`: the refill and the engine's slot route against the same chunks one after another, bit
 for bit through the prompt and three greedy decode steps, for mistral3 (two and three stages), qwen3vl (routed experts),
@@ -1759,4 +1760,4 @@ failed, 1,459 skipped; after them the scheduler, slot, stage, prefill and pipeli
 * A speculating request's prompt is not pipelined (its draft layer or DFlash ring follows the prompt's rows step by step),
   so `--spec` keeps the stages one after another on a long prompt.
 * On direct CUDA a product of a few hundred prompt rows costs about as much as one of 2,048 for the K-quant and IQ formats,
-  which keeps its chunks at 2,048 rows and its gain below `ggml_cuda`'s (1.39-1.45x against 1.76-1.83x).
+  which keeps its chunks at 2,048 rows and its gain below `ggml_cuda`'s (1.39-1.45x against 1.60-1.83x).
