@@ -61,11 +61,21 @@ denoiser's 48 blocks over N GPUs as whole-block stages: each GPU holds a
 contiguous run of blocks (balanced by bytes) and the AdaLN projections every stage
 computes, the video and audio streams cross from one GPU to the next through host
 memory, and the text encoder, VAEs and upscaler stay on the first GPU. It runs a
-denoiser one GPU cannot hold; it does not make a step faster. `ggml_cuda` runs on
-one GPU, and `--tp` is unsupported. The stages give one device's bits on the
+denoiser one GPU cannot hold; it does not make a step faster. `--backend cuda --tp N`
+instead shards every block over N GPUs (Megatron style): each GPU holds 32/N heads of
+every attention (q, k, v, the head gates and its columns of the output projection)
+and 1/N of every feed-forward, and the AdaLN MLPs, modulation tables and output heads
+whole; the GPUs run each step together, summing the output projections' partials and
+the whole-width q/k norms' sums of squares by all-reduces (14 a block). N must divide
+the 32 heads, and with Q4_K weights the 2,048-wide row-parallel projections cap N at
+8 (whole 256-value blocks a GPU); other degrees are refused at load. The two cannot be
+combined, and `ggml_cuda` runs on one GPU. The stages give one device's bits on the
 managed CPU executor (two host devices, the synthetic two-block checkpoint, with and
-without an Ingredients adapter); the two-GPU comparison
-(`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`) and real-checkpoint
+without an Ingredients adapter), and `--tp 2` on a simulated two-device group stays
+within 2.3e-7 of one device (relative, every step of every oracle case, with and
+without the adapter); the two-GPU comparisons
+(`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`,
+`Ltx25DenoiserTests.TensorParallelRanksOnTwoGpusMatchOneGpu`) and real-checkpoint
 clips have not been run on GPUs yet. Desktop MP4 audio requires
 FFmpeg on `PATH` or `TS_FFMPEG`; the CLI also writes the original PCM as a WAV.
 The Mac app encodes audio/video through AVFoundation.
@@ -124,8 +134,8 @@ Ingredients IC-LoRA described below. For video continuation, `ContinuationVideoP
 frame zero; a second clip pins the new take's last frame. `ReferenceVideoPaths` (HTTP
 `referenceVideos`) in `Mode = "ref"` instead supplies a full temporal reference clip.
 Reference audio, retake/refinement, HDR/EXR and generated
-keyframe slots remain unavailable; multi-GPU is the denoiser's whole-block stages on `cuda`
-only (see [Files and startup](#files-and-startup)). Disabling audio decode still runs the trained joint
+keyframe slots remain unavailable; multi-GPU is the denoiser's whole-block stages or its
+tensor-parallel shards on `cuda` only (see [Files and startup](#files-and-startup)). Disabling audio decode still runs the trained joint
 AV denoiser.
 The native audio length can be slightly shorter than the video duration; the
 original decoder/export rule crops excess samples and does not pad short tracks.

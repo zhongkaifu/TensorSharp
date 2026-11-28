@@ -28,15 +28,15 @@ public sealed class SingleDeviceArchitectureGateTests
         // is held by MiniMaxH3DenoiserTests.TensorParallelIsTheContractsGapAndLayerSplitPassesItsGate.
     };
 
-    /// <summary>Families without a tensor-parallel path: the single-device ones, and MiniMax-H3 video and LTX 2.5, whose
-    /// blocks split over GPUs as whole-block stages (--layer-split N: MiniMaxH3DenoiserTests and Ltx25DenoiserStageTests'
-    /// WholeBlockStages*) but are not sharded.</summary>
+    /// <summary>Families without a tensor-parallel path: the single-device ones, and MiniMax-H3 video, whose blocks split over
+    /// GPUs as whole-block stages (--layer-split N: MiniMaxH3DenoiserTests) but are not sharded. LTX 2.5 is no longer here: its
+    /// denoiser shards over GPUs on --backend cuda (Ltx25DenoiserTensorParallelTests), and its ggml_cuda gap is held by
+    /// <see cref="Ltx25_DeclaresTensorParallelismAndLayerSplitOnCuda"/>.</summary>
     public static TheoryData<string> NoTensorParallelFamilies => new()
     {
         "diffusion-gemma",
         "wan",
         "minimax-h3",
-        "ltx-2.5",
     };
 
     private static ModelArchitectureDescriptor Arch(string id)
@@ -56,14 +56,23 @@ public sealed class SingleDeviceArchitectureGateTests
         Assert.Contains(id, arch.Serving.TensorParallel.GapReason, StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>LTX 2.5 declares no tensor parallelism (a gap naming the family) and layer split on cuda only.</summary>
+    /// <summary>LTX 2.5 declares tensor parallelism and layer split on cuda only (ggml_cuda's gaps naming the family), no hybrid,
+    /// and no distributed tensor parallelism; --tp on ggml_cuda is refused without falling back.</summary>
     [Fact]
-    public void Ltx25_DeclaresNoTensorParallelismAndLayerSplitOnCuda()
+    public void Ltx25_DeclaresTensorParallelismAndLayerSplitOnCuda()
     {
         var arch = Arch("ltx-2.5");
-        Assert.Empty(arch.Serving.TensorParallel.Backends);
+        Assert.Equal(new[] { BackendType.Cuda }, arch.Serving.TensorParallel.Backends);
         Assert.Contains("ltx-2.5", arch.Serving.TensorParallel.GapReason, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(new[] { BackendType.Cuda }, arch.Serving.LayerSplit.Backends);
+        Assert.Empty(arch.Serving.HybridParallel.Backends);
+        Assert.False(arch.SupportsDistributedTensorParallel);
+        ITensorParallelGroup group = null;
+        var error = Assert.Throws<NotSupportedException>(() =>
+            TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(arch, BackendType.GgmlCuda, 2, ref group, out _));
+        Assert.Null(group);
+        Assert.Contains("--tp 2", error.Message, StringComparison.Ordinal);
+        Assert.Contains("ltx-2.5", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]

@@ -51,9 +51,15 @@ dotnet run --project TensorSharp.Cli -- \
 
 不支持 Vulkan。NVIDIA 上 `--backend cuda --layer-split N` 把去噪器的 48 个块按整块阶段分到 N 张 GPU：
 每张卡持有一段按字节均衡的连续块，以及每个阶段都要计算的 AdaLN 投影；视频与音频残差流经主机内存传到下一张卡；
-文本编码器、VAE 与上采样器留在第一张卡。它让单卡放不下的去噪器得以运行，但不会加快单步。`ggml_cuda` 只用一张卡，
-不支持 `--tp`。在托管 CPU executor 的两个主机设备上（合成两块检查点，带与不带 Ingredients 适配器），各阶段与单设备
-逐位一致；双 GPU 对比（`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`）与真实检查点的整段生成尚未在 GPU 上运行。
+文本编码器、VAE 与上采样器留在第一张卡。它让单卡放不下的去噪器得以运行，但不会加快单步。`--backend cuda --tp N`
+则把每个块按 Megatron 方式切到 N 张 GPU：每张卡持有每个注意力的 32/N 个头（q、k、v、头门控及其输出投影的对应列）和每个
+前馈层的 1/N，AdaLN MLP、调制表与输出头在每张卡上完整计算；各卡同步执行每一步，用 all-reduce 汇总输出投影的部分和以及
+覆盖整个内宽的 q/k 归一化的平方和（每块 14 次）。N 必须整除 32 个头；Q4_K 权重下 2,048 宽的行并行投影把 N 限制在 8 以内
+（每张卡取整个 256 值量化块），其余并行度在加载时拒绝。二者不能同时使用，`ggml_cuda` 只用一张卡。在托管 CPU executor 的
+两个主机设备上（合成两块检查点，带与不带 Ingredients 适配器），各阶段与单设备逐位一致；模拟双设备组上的 `--tp 2` 与单设备
+相差不超过 2.3e-7（相对误差，覆盖每个 oracle 用例的每一步，带与不带适配器）；双 GPU 对比
+（`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`、`Ltx25DenoiserTests.TensorParallelRanksOnTwoGpusMatchOneGpu`）
+与真实检查点的整段生成尚未在 GPU 上运行。
 GPU 测量不证明 CPU 吞吐。
 桌面 MP4 音轨需要 `PATH` 上的 FFmpeg 或 `TS_FFMPEG`，CLI 另写原始 PCM WAV；
 Mac 应用通过 AVFoundation 编码。
@@ -97,7 +103,7 @@ Studio 和聊天使用相同的生成流程，但结果一致不等于手指或�
 普通单张首图上传在自动或 `i2v` 模式采用上述 0.7/1.0 默认值；显式 `ImageConditions` 强度、
 有序多图、尾帧和其他模式保持原值，各阶段会记录实际引导强度。
 当前保留用户提示词，不自动使用官方 ComfyUI 模板的图像感知提示词增强。
-不支持参考视频/音频、retake、HDR/EXR 或生成式关键帧槽；多 GPU 仅限 `cuda` 上去噪器的整块阶段（见上文）。
+不支持参考视频/音频、retake、HDR/EXR 或生成式关键帧槽；多 GPU 仅限 `cuda` 上去噪器的整块阶段或张量并行切分（见上文）。
 关闭音频解码仍运行训练好的联合 AV 去噪器。
 原生音频可能略短于视频；导出裁掉多余音频，不给短音轨补齐。
 

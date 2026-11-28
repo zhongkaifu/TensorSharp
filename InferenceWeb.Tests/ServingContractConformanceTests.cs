@@ -94,7 +94,6 @@ public sealed class ServingContractConformanceTests
         "ltx-2.5: HybridParallel@cuda",
         "ltx-2.5: HybridParallel@ggml_cuda",
         "ltx-2.5: LayerSplit@ggml_cuda",
-        "ltx-2.5: TensorParallel@cuda",
         "ltx-2.5: TensorParallel@ggml_cuda",
         "minimax-h3: HybridParallel@cuda",
         "minimax-h3: HybridParallel@ggml_cuda",

@@ -71,10 +71,12 @@ internal sealed class Ltx25Family : IVideoDiffusionFamily
     public IConditioner CreateConditioner(DiffusionLoad load) =>
         new Ltx25Conditioner(load.File(DiffusionLoad.TextEncoder), load.File(DiffusionLoad.Denoiser), _model.DirectAllocator);
 
-    /// <summary>The denoiser of <paramref name="file"/> on the model's device, or over the load's whole-block stage devices
-    /// (<see cref="DiffusionLoad.DenoiserDevices"/>, <c>--layer-split N</c>; the first is the model's device).</summary>
+    /// <summary>The denoiser of <paramref name="file"/> on the model's device, over the load's whole-block stage devices
+    /// (<see cref="DiffusionLoad.DenoiserDevices"/>, <c>--layer-split N</c>; the first is the model's device), or sharded over
+    /// the load's tensor-parallel group (<see cref="DiffusionLoad.TensorParallelGroup"/>, <c>--tp N</c>; its first device is
+    /// the model's).</summary>
     public IDenoiser CreateDenoiser(DiffusionLoad load, string file) =>
-        new Ltx25Denoiser(file, _model.DirectAllocator, devices: load.DenoiserDevices)
+        new Ltx25Denoiser(file, _model.DirectAllocator, devices: load.DenoiserDevices, tensorParallel: load.TensorParallelGroup)
         {
             AdapterBytes = () => _model.Ingredients?.FactorBytes ?? 0,
         };

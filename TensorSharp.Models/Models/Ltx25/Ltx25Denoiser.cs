@@ -9,7 +9,9 @@
 // products as DirectLinear ran them (TensorGraphExecutor.DirectProducts), its norms (GraphFusion.RowNorm), its per-head
 // rotary tables (HeadRotary), head gates (HeadGate) and F32 attention (FullAttention). Under --layer-split N the blocks run
 // as whole-block stages over several devices (DenoiserStages): each stage's program is its blocks on its own device, the
-// video and audio residual streams handed from one stage to the next.
+// video and audio residual streams handed from one stage to the next. Under --tp N every block is sharded over the devices of
+// a tensor-parallel group (DenoiserRanks): each rank's program holds its heads of every attention and its slice of every
+// feed-forward, with an all-reduce after each row-parallel projection and one for the whole-inner q/k norms' sums of squares.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -76,6 +78,18 @@ public sealed record Ltx25DenoiserOutput(float[] VideoVelocity, float[] AudioVel
 /// blocks' projections and Ingredients factors on its device, and keeps its own copies of the rotary tables and the small
 /// tensors. A pass's later steps rerun each stage's plan with only the new timestep features written, as on one device.
 /// </para>
+/// <para>
+/// Over a tensor-parallel group (<c>--tp N</c>) the blocks are sharded Megatron-style (<see cref="DenoiserRanks"/>): every
+/// attention by heads (the rank's rows of q, k, v and the head gates' logits with their bias slices, its input columns of
+/// to_out), every feed-forward by width (rows of the up projection, columns of the down one), and the rest (patchify, the AdaLN
+/// MLPs, the modulation tables, the output heads) whole on every rank, so every rank holds both residual streams whole between
+/// the projections and the result is rank 0's. A row-parallel projection's partial products are summed by an all-reduce
+/// before its bias and the gated residual; the q and k RMS norms span the whole inner width, so each rank's sums of squares
+/// over its heads' columns are summed by one all-reduce an attention (q's rows, then k's) before it normalizes its columns
+/// with the global mean and its slice of the norm weight. Each rank's program runs on its own device's executor (made as the
+/// one device's), in lockstep from one all-reduce to the next, and a pass's later steps rerun the ranks' plans with only the
+/// new timestep features written.
+/// </para>
 /// </summary>
 public sealed class Ltx25Denoiser : IDenoiser
 {
@@ -94,6 +108,19 @@ public sealed class Ltx25Denoiser : IDenoiser
     private readonly TensorGraphExecutor[] _stageExecutors;
     private readonly LiveStep[] _stageLive;
     private readonly long _stageWeightBytes;
+    // Tensor parallelism (--tp N), or null: the ranks (each its executor, made as the one device's, joined to the group's
+    // collective), each rank's shards of the block projections by name, the column copies the shards own, the largest rank's
+    // projection bytes, the ranks' live step, the bound adapter set's factors as each rank binds them (and the copies those
+    // own), and ranks 1.. copies of the keyframe embedding.
+    private readonly DenoiserRanks _ranks;
+    private readonly TensorGraphExecutor[] _rankExecutors;
+    private readonly Dictionary<string, Ltx25Weight>[] _rankShards;
+    private readonly List<IntPtr> _shardOwned = new();
+    private readonly long _rankWeightBytes;
+    private RankLive _rankLive;
+    private readonly Dictionary<(string, int), (Ltx25Weight Down, Ltx25Weight Up)> _loraShards = new();
+    private readonly List<IntPtr> _loraShardOwned = new();
+    private Tensor[] _keyframeCopies;
     private readonly object _gate = new();
     private readonly List<(ulong, ulong, IGraphPlan)> _plans = new();
     private readonly HashSet<Ltx25Weight> _warmed = new();
@@ -112,16 +139,20 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// <summary>The checkpoint's file.</summary>
     public string Path => _w.Path;
 
-    /// <summary>Steps that compiled their program (the rest replayed a cached plan); under a split, stage programs.</summary>
-    internal int Compiles => _compiles + (_stages?.Compiles ?? 0);
+    /// <summary>Steps that compiled their program (the rest replayed a cached plan); under a split, stage programs; under
+    /// tensor parallelism, rank programs (a geometry compiles one a rank).</summary>
+    internal int Compiles => _compiles + (_stages?.Compiles ?? 0) + (_ranks?.Compiles ?? 0);
 
     private int _compiles;
 
-    /// <summary>The executor the steps run on (tests); stage 0's under a split.</summary>
+    /// <summary>The executor the steps run on (tests); stage 0's under a split, rank 0's under tensor parallelism.</summary>
     internal TensorGraphExecutor Executor => _executor;
 
     /// <summary>The whole-block stages, or null for one device (a test seam).</summary>
     internal DenoiserStages Stages => _stages;
+
+    /// <summary>The tensor-parallel ranks, or null (a test seam).</summary>
+    internal DenoiserRanks Ranks => _ranks;
 
     public bool ReferenceLoraLoaded => _ownedLora != null;
     public int ReferenceLoraProjections => _ownedLora?.ProjectionCount ?? 0;
@@ -134,19 +165,51 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// stage, the first <paramref name="allocator"/> itself (the latents, the keyframe embedding and the first blocks live
     /// there); null or one device runs every block on <paramref name="allocator"/>. CUDA devices, or managed CPU host
     /// "devices" (functional placement for tests).</param>
-    public Ltx25Denoiser(string checkpoint, IAllocator allocator, string referenceLoraPath = null, IReadOnlyList<IAllocator> devices = null)
+    /// <param name="tensorParallel">A device group the blocks are sharded over (<c>--tp N</c>, <see cref="DenoiserRanks"/>), its
+    /// first device <paramref name="allocator"/> itself (the latents, the keyframe embedding and rank 0's program live there);
+    /// null or one device runs every block whole. A CUDA tensor-parallel group, or a <see cref="SimulatedDeviceGroup"/>'s host
+    /// devices (functional placement for tests). A degree the heads or the row-parallel projections' quant blocks do not divide
+    /// is refused, and so is a split with it (tensor-parallel stages are not implemented).</param>
+    public Ltx25Denoiser(string checkpoint, IAllocator allocator, string referenceLoraPath = null, IReadOnlyList<IAllocator> devices = null,
+        ITensorParallelGroup tensorParallel = null)
     {
         _allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
         bool split = devices is { Count: > 1 };
+        bool sharded = tensorParallel is { Degree: > 1 };
+        if (split && sharded)
+            throw new NotSupportedException("LTX 2.5 runs --layer-split or --tp, not both: tensor-parallel stages are not implemented.");
         if (split && !ReferenceEquals(devices[0], allocator))
             throw new ArgumentException("A whole-block split's first device is the denoiser's allocator.", nameof(devices));
         if (split && devices.Any(d => d is MlxAllocator))
             throw new NotSupportedException("LTX 2.5's whole-block stages run on CUDA devices; MLX exposes one device.");
+        if (sharded && !ReferenceEquals(tensorParallel.GetAllocator(0), allocator))
+            throw new ArgumentException("A tensor-parallel group's first device is the denoiser's allocator.", nameof(tensorParallel));
+        if (sharded && allocator is MlxAllocator)
+            throw new NotSupportedException("LTX 2.5's tensor parallelism runs on CUDA devices; MLX exposes one device.");
         _w = new Ltx25DenoiserWeights(checkpoint, allocator);
         var made = new List<TensorGraphExecutor>();
         try
         {
-            if (split)
+            if (sharded)
+            {
+                // The shards first (a degree that does not divide is refused before any device is touched), then each rank's
+                // executor, made as the one device's (direct products, the wide DiT regions); this denoiser owns them.
+                int n = tensorParallel.Degree;
+                _rankShards = _w.Shard(n, _shardOwned);
+                _ranks = new DenoiserRanks(tensorParallel, a =>
+                {
+                    TensorGraphExecutor x = CreateExecutor(a);
+                    made.Add(x);
+                    return x;
+                });
+                _rankExecutors = new TensorGraphExecutor[n];
+                for (int r = 0; r < n; r++) _rankExecutors[r] = (TensorGraphExecutor)_ranks.Executor(r);
+                long replicated = _w.Projections.Where(w => !_rankShards[0].ContainsKey(w.Name)).Sum(w => w.Bytes);
+                foreach (Dictionary<string, Ltx25Weight> shards in _rankShards)
+                    _rankWeightBytes = Math.Max(_rankWeightBytes, replicated + shards.Values.Sum(w => w.Bytes));
+                _executor = _rankExecutors[0];
+            }
+            else if (split)
             {
                 // Each stage's executor is made as the one device's (direct products, the wide DiT regions), so a stage runs
                 // the one device's kernels; this denoiser owns them.
@@ -169,6 +232,7 @@ public sealed class Ltx25Denoiser : IDenoiser
         {
             foreach (TensorGraphExecutor x in made) (x as IDisposable)?.Dispose();
             if (made.Count == 0) (_executor as IDisposable)?.Dispose();
+            FreeShards();
             _w.Dispose();
             throw;
         }
@@ -189,9 +253,10 @@ public sealed class Ltx25Denoiser : IDenoiser
     public DenoiserCaps Caps { get; } = new() { Streams = new[] { AudioStream } };
 
     /// <summary>The projections' device bytes: under a split, the largest stage's share (each device holds its stage's blocks,
-    /// the AdaLN MLPs every stage computes, and the first's patchify or the last's output projections). The Ingredients
-    /// factors count whole, as on one device.</summary>
-    public long WeightBytes => (_stages == null ? _w.Bytes : _stageWeightBytes) + (AdapterBytes?.Invoke() ?? 0);
+    /// the AdaLN MLPs every stage computes, and the first's patchify or the last's output projections); under tensor
+    /// parallelism a rank's share (its shards of the block projections and every replicated projection whole). The Ingredients
+    /// factors count whole, as on one device (an upper bound for a rank, which holds a slice of one factor of each pair).</summary>
+    public long WeightBytes => (_ranks != null ? _rankWeightBytes : _stages == null ? _w.Bytes : _stageWeightBytes) + (AdapterBytes?.Invoke() ?? 0);
 
     /// <summary>The device bytes of the Ingredients factors the next steps may bind, for residency.</summary>
     internal Func<long> AdapterBytes { get; set; }
@@ -288,6 +353,7 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     private Ltx25DenoiserOutput RunStep(Ltx25DenoiserInput input, Ltx25LoraSet lora, int blocks)
     {
+        if (_ranks != null) return RunRanks(input, lora, blocks);
         if (_stages != null) return RunStages(input, lora, blocks);
         RopeCache rope = Rope(input);
         Tensor keyframes = Keyframes(input);
@@ -424,6 +490,103 @@ public sealed class Ltx25Denoiser : IDenoiser
         return outputs;
     }
 
+    /// <summary>
+    /// One step over the tensor-parallel ranks, the one device's live step for all of them: while the step's inputs are the
+    /// arrays the last step bound (the same latents, contexts, tables and adapter), only the new timestep features are written
+    /// into the arrays the ranks' kept traces bind, and the ranks' plans run again in lockstep. Otherwise the ranks' runner
+    /// (<see cref="DenoiserRanks.Run"/>) traces every rank's program, compiles each rank's plan where the combined signature is
+    /// new, and runs them; a trace of each rank's program, its inputs pinned, is kept for the later steps. Every rank computes
+    /// the whole streams and the output heads; the velocities are rank 0's.
+    /// </summary>
+    private Ltx25DenoiserOutput RunRanks(Ltx25DenoiserInput input, Ltx25LoraSet lora, int blocks)
+    {
+        RopeCache rope = Rope(input);
+        Tensor keyframes = Keyframes(input);
+        float[][] features = StepFeatures(input);
+        var span = new DenoiserSpan(0, blocks, IsFirst: true, IsLast: true);
+        var key = new LiveKey(input.Video, input.Audio, input.VideoContext, input.AudioContext, rope, keyframes, lora, span,
+            features.Select(f => f.Length).ToArray(), null, null);
+        float[][] outputs;
+        if (_rankLive != null && _rankLive.Key.Equals(key) && _rankLive.Runs(_ranks.Plans))
+        {
+            for (int i = 0; i < features.Length; i++) Array.Copy(features[i], _rankLive.Features[i], features[i].Length);
+            if (!TensorGraphExecutor.RunRanked(_rankLive.Plans, _rankLive.Inputs, out string error))
+            {
+                _rankLive.Dispose();
+                _rankLive = null;
+                throw new InvalidOperationException($"LTX denoiser tensor-parallel step over {_ranks.Count} devices failed: {error}");
+            }
+            outputs = _rankLive.Plans[0].Outputs;
+        }
+        else
+        {
+            _rankLive?.Dispose();
+            _rankLive = null;
+            int n = _ranks.Count;
+            var steps = new StepValues[n];
+            // A step without keyframes binds none on any rank (the copies of an earlier mask stay for its next pass).
+            for (int r = 0; r < n; r++)
+                steps[r] = new StepValues(input, span, lora, rope[r], r == 0 || keyframes == null ? keyframes : _keyframeCopies[r], features,
+                    _ranks.TensorAllocator(r), null, null) { Rank = r, Ranks = n, Shards = _rankShards[r] };
+            var traces = new GraphEmitter[n];
+            try
+            {
+                for (int r = 0; r < n; r++)
+                {
+                    traces[r] = new GraphEmitter(_rankExecutors[r], record: false);
+                    Emit(traces[r], steps[r]);
+                }
+                int compiled = _ranks.Compiles;
+                var clock = Stopwatch.StartNew();
+                outputs = _ranks.Run((e, r) => Emit(e, steps[r]), "LTX 2.5 denoiser");
+                if (_ranks.Compiles != compiled)
+                    Console.WriteLine($"  [ltx25] step programs of {n} tensor-parallel ranks for {input.VideoTokens} video + " +
+                        $"{input.AudioTokens} audio tokens: emitted, compiled and run in {clock.Elapsed.TotalSeconds:F2}s");
+            }
+            catch
+            {
+                foreach (GraphEmitter t in traces) t?.Dispose();
+                throw;
+            }
+            _rankLive = new RankLive(key, traces, _ranks.Plans.ToArray(), features);
+        }
+        float[] video = (float[])outputs[0].Clone(), audio = (float[])outputs[1].Clone();
+        foreach (float v in video) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        foreach (float v in audio) if (!float.IsFinite(v)) throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
+        return new Ltx25DenoiserOutput(video, audio, blocks);
+    }
+
+    /// <summary>The ranks' last step: each rank's trace (its inputs pinned) and the inputs it binds, the plans it ran, and the
+    /// timestep-feature arrays every rank's trace binds.</summary>
+    private sealed class RankLive : IDisposable
+    {
+        public RankLive(LiveKey key, GraphEmitter[] traces, IGraphPlan[] plans, float[][] features)
+        {
+            Key = key; Traces = traces; Plans = plans; Features = features;
+            Inputs = Array.ConvertAll(traces, t => t.RunInputs());
+        }
+
+        public LiveKey Key { get; }
+        public GraphEmitter[] Traces { get; }
+        public IGraphPlan[] Plans { get; }
+        public GraphRunInputs[] Inputs { get; }
+        public float[][] Features { get; }
+
+        /// <summary>Whether <paramref name="current"/> (the ranks' cached plans) are the plans this step ran.</summary>
+        public bool Runs(IReadOnlyList<IGraphPlan> current)
+        {
+            if (current == null || current.Count != Plans.Length) return false;
+            for (int r = 0; r < Plans.Length; r++)
+                if (!ReferenceEquals(current[r], Plans[r])) return false;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            foreach (GraphEmitter t in Traces) t.Dispose();
+        }
+    }
+
     /// <summary>What makes a step's program and bindings the previous step's: the very arrays and tables it binds and its shape
     /// (under a split, also the previous stage's output arrays the stage reads).</summary>
     private sealed record LiveKey(float[] Video, float[] Audio, float[] VideoContext, float[] AudioContext, RopeCache Rope, Tensor Keyframes,
@@ -502,14 +665,17 @@ public sealed class Ltx25Denoiser : IDenoiser
         foreach (var (_, _, plan) in _plans) plan.Dispose();
         _plans.Clear();
         _stages?.DropPlans();
+        _ranks?.DropPlans();
     }
 
-    /// <summary>Unpin the last step's inputs (a request's state arrays) and forget its trace, every stage's under a split; the
-    /// plans stay.</summary>
+    /// <summary>Unpin the last step's inputs (a request's state arrays) and forget its trace, every stage's under a split and
+    /// every rank's under tensor parallelism; the plans stay.</summary>
     private void DropLive()
     {
         _live?.Dispose();
         _live = null;
+        _rankLive?.Dispose();
+        _rankLive = null;
         if (_stageLive == null) return;
         for (int s = 0; s < _stageLive.Length; s++)
         {
@@ -518,9 +684,14 @@ public sealed class Ltx25Denoiser : IDenoiser
         }
     }
 
-    /// <summary>The devices the steps run on, each with its executor: the one device, or every stage's.</summary>
+    /// <summary>The devices the steps run on, each with its executor: the one device, every stage's, or every rank's.</summary>
     private IEnumerable<(IAllocator Device, TensorGraphExecutor Executor)> Lanes()
     {
+        if (_ranks != null)
+        {
+            for (int r = 0; r < _ranks.Count; r++) yield return (_ranks.TensorAllocator(r), _rankExecutors[r]);
+            yield break;
+        }
         if (_stages == null)
         {
             yield return (_allocator, _executor);
@@ -537,10 +708,16 @@ public sealed class Ltx25Denoiser : IDenoiser
     }
 
     /// <summary>Bind <paramref name="lora"/> for the step: another set than the one bound before drops the old set's device
-    /// copies (the plans that bound it differ in signature and age out).</summary>
+    /// copies (the plans that bound it differ in signature and age out); under tensor parallelism also the ranks' plans, which
+    /// bind the old set's per-rank slices, freed with it.</summary>
     private void Bind(Ltx25LoraSet lora)
     {
         if (lora == null || ReferenceEquals(lora, _boundLora)) return;
+        if (_ranks != null && _boundLora != null)
+        {
+            DropLive();
+            _ranks.DropPlans();
+        }
         if (_boundLora != null) ReleaseFactors(_boundLora);
         _boundLora = lora;
     }
@@ -568,7 +745,9 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// file stores tensors alphabetically). The step's end (<see cref="EndUpload"/>) stops the read-ahead. On MLX every
     /// projection is converted to its device form before the step. Under a split every stage's executor takes the hook: the
     /// stages run their blocks in block order, so the file is read ahead in the same order, each stage device uploading its
-    /// own blocks (and the AdaLN MLPs every stage computes).
+    /// own blocks (and the AdaLN MLPs every stage computes). Under tensor parallelism every rank's executor takes it too: the
+    /// ranks run every block in lockstep, each uploading its rows of the column-parallel projections (views of the mapping) and
+    /// the replicated ones; the row-parallel shards are host copies made at load, which the file is not read ahead for.
     /// </summary>
     private void MakeResident()
     {
@@ -579,6 +758,7 @@ public sealed class Ltx25Denoiser : IDenoiser
             for (int i = 0; i < stages.Length; i++) stages[i] = new();
             foreach (Ltx25Weight w in _w.Projections)
             {
+                if (_rankShards != null && Ltx25DenoiserWeights.ParallelOf(w.Name) == Ltx25Parallel.RowParallel) continue;
                 int block = _w.BlockOf(w.Name);
                 stages[block < 0 ? 0 : block + 1].Add(w);
             }
@@ -625,8 +805,8 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     /// <summary>Drop the device copy of the host bytes at <paramref name="data"/>: the CUDA and MLX resident-weight caches key
     /// them by that address (a copy left there outlives the denoiser, and a file mapped later at that address would compute
-    /// with the old values); the managed executor's F32 copies by the same address. Under a split, every stage device's copy
-    /// (a device that never uploaded it has none to drop).</summary>
+    /// with the old values); the managed executor's F32 copies by the same address. Under a split, every stage device's copy,
+    /// and under tensor parallelism every rank device's (a device that never uploaded it has none to drop).</summary>
     private void ReleaseCopy(IntPtr data)
     {
         if (data == IntPtr.Zero) return;
@@ -639,9 +819,49 @@ public sealed class Ltx25Denoiser : IDenoiser
             }
     }
 
+    /// <summary>Drop the device copies of <paramref name="set"/>'s factors; under tensor parallelism also those of the ranks'
+    /// slices of them, whose copies are freed (they are made again, from the set's factors, by the next step that binds it).</summary>
     private void ReleaseFactors(Ltx25LoraSet set)
     {
         foreach (IntPtr factor in set.FactorAddresses) ReleaseCopy(factor);
+        foreach (var (down, up) in _loraShards.Values)
+        {
+            ReleaseCopy(down.Data);
+            ReleaseCopy(up.Data);
+        }
+        _loraShards.Clear();
+        foreach (IntPtr owned in _loraShardOwned) QuantizedWeight.FreeBuffer(owned);
+        _loraShardOwned.Clear();
+    }
+
+    /// <summary>
+    /// The factors of adapter <paramref name="set"/>'s update of projection <paramref name="name"/> as rank
+    /// <paramref name="rank"/> of <paramref name="ranks"/> binds them, or null where the set does not update it: a
+    /// column-parallel projection keeps the down factor whole and takes the rank's output rows of the up factor (a view of the
+    /// set's host copy), so its update fills the rank's rows of the output; a row-parallel one takes the rank's input columns of
+    /// the down factor (a copy) and keeps the up factor whole, so its update is the rank's partial of the whole update, summed
+    /// with the product's partial by the projection's all-reduce. Exact F32 products either way. Made once a rank for the bound
+    /// set (<see cref="ReleaseFactors"/> forgets them).
+    /// </summary>
+    private (Ltx25Weight Down, Ltx25Weight Up)? LoraShard(Ltx25LoraSet set, string name, int rank, int ranks)
+    {
+        if (_loraShards.TryGetValue((name, rank), out var cached)) return cached;
+        if (set.Factors(name) is not { } f) return null;
+        (Ltx25Weight Down, Ltx25Weight Up) shard;
+        if (Ltx25DenoiserWeights.ParallelOf(name) == Ltx25Parallel.RowParallel)
+        {
+            DitShards.Slice down = DitShards.Columns(new DitShards.Slice(f.Down.Format, f.Down.Ne0, f.Down.Ne1, f.Down.Data, f.Down.Bytes),
+                rank, ranks, _loraShardOwned);
+            shard = (f.Down with { Ne0 = down.Ne0, Data = down.Data, Bytes = down.Bytes }, f.Up);
+        }
+        else
+        {
+            DitShards.Slice up = DitShards.Rows(new DitShards.Slice(f.Up.Format, f.Up.Ne0, f.Up.Ne1, f.Up.Data, f.Up.Bytes),
+                1, rank, ranks, _loraShardOwned);
+            shard = (f.Down, f.Up with { Ne1 = up.Ne1, Data = up.Data, Bytes = up.Bytes });
+        }
+        _loraShards[(name, rank)] = shard;
+        return shard;
     }
 
     /// <summary>A clip's denoising ended: the direct kernels' scratch goes back to the device (every stage's) before the decode.</summary>
@@ -666,7 +886,8 @@ public sealed class Ltx25Denoiser : IDenoiser
     }
 
     /// <summary>Drops the projections' and factors' device copies, the position tables and the plans (on every stage device
-    /// under a split); the mapping and the small tensors stay, so the next step uploads from memory again.</summary>
+    /// under a split, every rank device under tensor parallelism, with the copies of the ranks' shards); the mapping, the
+    /// shards' host bytes and the small tensors stay, so the next step uploads from memory again.</summary>
     public void ReleaseDevice()
     {
         lock (_gate)
@@ -675,13 +896,28 @@ public sealed class Ltx25Denoiser : IDenoiser
             DropPlans();
             _rope?.Dispose();
             _rope = null;
-            _keyframes.Absolute?.Dispose();
-            _keyframes = default;
+            ForgetKeyframes();
             ReleaseDirectWorkspaces();
             foreach (Ltx25Weight w in _w.Projections) ReleaseCopy(w.Data);
+            ReleaseShardCopies();
             if (_boundLora != null) ReleaseFactors(_boundLora);
             _resident = false;
         }
+    }
+
+    /// <summary>Drop every rank device's copies of the ranks' shards of the block projections.</summary>
+    private void ReleaseShardCopies()
+    {
+        if (_rankShards == null) return;
+        foreach (Dictionary<string, Ltx25Weight> shards in _rankShards)
+            foreach (Ltx25Weight w in shards.Values) ReleaseCopy(w.Data);
+    }
+
+    /// <summary>Free the column copies the ranks' shards own (their device copies were released first).</summary>
+    private void FreeShards()
+    {
+        foreach (IntPtr owned in _shardOwned) QuantizedWeight.FreeBuffer(owned);
+        _shardOwned.Clear();
     }
 
     public void Dispose()
@@ -692,16 +928,18 @@ public sealed class Ltx25Denoiser : IDenoiser
             DropPlans();
             _rope?.Dispose();
             _rope = null;
-            _keyframes.Absolute?.Dispose();
-            _keyframes = default;
+            ForgetKeyframes();
             foreach (Ltx25Weight w in _w.Projections) ReleaseCopy(w.Data);
+            ReleaseShardCopies();
             if (_boundLora != null) ReleaseFactors(_boundLora);
             _boundLora = null;
             _ownedLora?.Dispose();
             _ownedLora = null;
             _prefault?.Dispose();
             _stages?.Dispose();
+            _ranks?.Dispose();
             foreach (var (_, executor) in Lanes()) (executor as IDisposable)?.Dispose();
+            FreeShards();
             _w.Dispose();
             _disposed = true;
         }
@@ -711,16 +949,18 @@ public sealed class Ltx25Denoiser : IDenoiser
 
     /// <summary>The rotary tables of a geometry (video, audio and the video's temporal positions at the audio width), on the
     /// executor's allocator, or under a split one copy on each stage's device (every block reads all three; another GPU's
-    /// tensor is not a stage's memory): they do not depend on sigma, so one request's steps share them. Each table is computed
-    /// on the host once and copied to every device. The caller's coordinates are snapshotted, so edits to a reused grid rebuild
-    /// them.</summary>
+    /// tensor is not a stage's memory), or under tensor parallelism each rank's heads of them on its device: they do not depend
+    /// on sigma, so one request's steps share them. Each table is computed on the host once and copied to every device. The
+    /// caller's coordinates are snapshotted, so edits to a reused grid rebuild them.</summary>
     private sealed class RopeCache : IDisposable
     {
         private readonly float[] _video, _audio;
         private readonly Ltx25FrequencyPrecision _precision;
         private readonly RopeTables[] _devices;
 
-        public RopeCache(IReadOnlyList<IAllocator> allocators, Ltx25Config c, Ltx25DenoiserInput input)
+        /// <param name="ranks">1: every device gets the whole tables; the tensor-parallel degree: device d is rank d and gets its
+        /// heads (the tables are per head, so a rank's slice is exactly the heads it attends).</param>
+        public RopeCache(IReadOnlyList<IAllocator> allocators, Ltx25Config c, Ltx25DenoiserInput input, int ranks = 1)
         {
             _video = (float[])input.VideoPositions.Boundaries.Clone();
             _audio = (float[])input.AudioPositions.Boundaries.Clone();
@@ -730,14 +970,14 @@ public sealed class Ltx25Denoiser : IDenoiser
             try
             {
                 Ltx25Rope video = Ltx25Geometry.BuildRope(input.VideoPositions, c.VideoDim, c.VideoHeads, _precision);
-                for (int d = 0; d < _devices.Length; d++) _devices[d].Video = Device(allocators[d], video);
+                for (int d = 0; d < _devices.Length; d++) _devices[d].Video = Device(allocators[d], video, d, ranks);
                 video = null;
                 Ltx25Rope audio = Ltx25Geometry.BuildRope(input.AudioPositions, c.AudioDim, c.AudioHeads, _precision);
-                for (int d = 0; d < _devices.Length; d++) _devices[d].Audio = Device(allocators[d], audio);
+                for (int d = 0; d < _devices.Length; d++) _devices[d].Audio = Device(allocators[d], audio, d, ranks);
                 audio = null;
                 Ltx25Rope cross = Ltx25Geometry.BuildRope(Ltx25Geometry.TemporalPositions(input.VideoPositions),
                     c.AudioDim, c.AudioHeads, _precision);
-                for (int d = 0; d < _devices.Length; d++) _devices[d].CrossVideo = Device(allocators[d], cross);
+                for (int d = 0; d < _devices.Length; d++) _devices[d].CrossVideo = Device(allocators[d], cross, d, ranks);
             }
             catch
             {
@@ -746,16 +986,37 @@ public sealed class Ltx25Denoiser : IDenoiser
             }
         }
 
-        /// <summary>The tables on device <paramref name="device"/> (0 for one device, else the stage).</summary>
+        /// <summary>The tables on device <paramref name="device"/> (0 for one device, else the stage or the rank).</summary>
         public RopeTables this[int device] => _devices[device];
 
-        private static (Tensor, Tensor, int, int, int) Device(IAllocator allocator, Ltx25Rope rope)
+        private static (Tensor, Tensor, int, int, int) Device(IAllocator allocator, Ltx25Rope rope, int rank, int ranks)
         {
+            if (ranks > 1) return RankDevice(allocator, rope, rank, ranks);
             var cos = new Tensor(allocator, DType.Float32, rope.Tokens, rope.Heads, rope.HeadDim / 2);
             var sin = new Tensor(allocator, DType.Float32, rope.Tokens, rope.Heads, rope.HeadDim / 2);
             cos.SetElementsAsFloat(rope.Cosine);
             sin.SetElementsAsFloat(rope.Sine);
             return (cos, sin, rope.Tokens, rope.Heads, rope.HeadDim);
+        }
+
+        /// <summary>Rank <paramref name="rank"/>'s heads of <paramref name="rope"/>'s tables, [tokens, heads / ranks, head dim /
+        /// 2], copied out of each token's row.</summary>
+        private static (Tensor, Tensor, int, int, int) RankDevice(IAllocator allocator, Ltx25Rope rope, int rank, int ranks)
+        {
+            int local = rope.Heads / ranks, half = rope.HeadDim / 2, run = local * half;
+            var cosine = new float[(long)rope.Tokens * run];
+            var sine = new float[cosine.LongLength];
+            for (long t = 0; t < rope.Tokens; t++)
+            {
+                long from = (t * rope.Heads + (long)rank * local) * half;
+                Array.Copy(rope.Cosine, from, cosine, t * run, run);
+                Array.Copy(rope.Sine, from, sine, t * run, run);
+            }
+            var cos = new Tensor(allocator, DType.Float32, rope.Tokens, local, half);
+            var sin = new Tensor(allocator, DType.Float32, rope.Tokens, local, half);
+            cos.SetElementsAsFloat(cosine);
+            sin.SetElementsAsFloat(sine);
+            return (cos, sin, rope.Tokens, local, rope.HeadDim);
         }
 
         public bool Matches(Ltx25DenoiserInput input) => _precision == input.FrequencyPrecision &&
@@ -786,18 +1047,19 @@ public sealed class Ltx25Denoiser : IDenoiser
         // Release the old geometry's tables before making potentially large new ones.
         _rope?.Dispose();
         _rope = null;
-        return _rope = new RopeCache(_stages == null ? new[] { _allocator } : Lanes().Select(l => l.Device).ToArray(), Config, input);
+        return _rope = new RopeCache(_stages == null && _ranks == null ? new[] { _allocator } : Lanes().Select(l => l.Device).ToArray(),
+            Config, input, _ranks?.Count ?? 1);
     }
 
     /// <summary>The keyframe embedding the marked tokens add ([tokens, dim]: 0 or 1 times the embedding, the products the
-    /// direct denoiser took), made once a mask: the same for every step of a pass.</summary>
+    /// direct denoiser took), made once a mask: the same for every step of a pass. Under tensor parallelism every rank adds it
+    /// to its whole video stream, so ranks 1.. get copies on their devices (<see cref="_keyframeCopies"/>).</summary>
     private Tensor Keyframes(Ltx25DenoiserInput input)
     {
         if (input.KeyframeMask == null) return null;
         if (!Config.KeyframeEmbedding) throw new ArgumentException("Checkpoint has no keyframe embedding.");
         if (_keyframes.Mask != null && _keyframes.Mask.AsSpan().SequenceEqual(input.KeyframeMask)) return _keyframes.Absolute;
-        _keyframes.Absolute?.Dispose();
-        _keyframes = default;
+        ForgetKeyframes();
         float[] embedding = DirectOps.DequantTensor(_w.File, Config.Prefix + "keyframes_abs_pos_embedding");
         int dim = Config.VideoDim;
         var values = new float[(long)input.VideoTokens * dim];
@@ -809,7 +1071,26 @@ public sealed class Ltx25Denoiser : IDenoiser
         var absolute = new Tensor(_allocator, DType.Float32, input.VideoTokens, dim);
         absolute.SetElementsAsFloat(values);
         _keyframes = ((float[])input.KeyframeMask.Clone(), absolute);
+        if (_ranks != null)
+        {
+            _keyframeCopies = new Tensor[_ranks.Count];
+            for (int r = 1; r < _keyframeCopies.Length; r++)
+            {
+                _keyframeCopies[r] = new Tensor(_ranks.TensorAllocator(r), DType.Float32, input.VideoTokens, dim);
+                _keyframeCopies[r].SetElementsAsFloat(values);
+            }
+        }
         return absolute;
+    }
+
+    /// <summary>Dispose the keyframe embedding (and the ranks' copies of it).</summary>
+    private void ForgetKeyframes()
+    {
+        _keyframes.Absolute?.Dispose();
+        _keyframes = default;
+        if (_keyframeCopies == null) return;
+        foreach (Tensor t in _keyframeCopies) t?.Dispose();
+        _keyframeCopies = null;
     }
 
     // ---- emission
@@ -846,6 +1127,14 @@ public sealed class Ltx25Denoiser : IDenoiser
         /// program does not open the step.</summary>
         public float[] CarryVideo { get; }
         public float[] CarryAudio { get; }
+
+        /// <summary>The program's tensor-parallel rank of <see cref="Ranks"/> (0 of 1: every block whole).</summary>
+        public int Rank { get; init; }
+        public int Ranks { get; init; } = 1;
+
+        /// <summary>The rank's shards of the block projections, by name (<see cref="Ltx25DenoiserWeights.Shard"/>), where
+        /// <see cref="Ranks"/> is more than one.</summary>
+        public IReadOnlyDictionary<string, Ltx25Weight> Shards { get; init; }
     }
 
     /// <summary>Original cosine-first 256-feature timestep encoding, before
@@ -884,6 +1173,12 @@ public sealed class Ltx25Denoiser : IDenoiser
     /// boundary each step), against about one block's worth of products to recompute (nothing measurable on an unguided pass,
     /// whose coefficients are one row).
     /// </para>
+    /// <para>
+    /// A tensor-parallel rank's program (<see cref="StepValues.Rank"/>) is the whole step with the rank's shards of the block
+    /// projections in place of them: each attention over the rank's heads (<c>ShardAttention</c>), each sharded projection
+    /// through <c>ShardLinear</c> (an all-reduce after every row-parallel one), the rest the one device's ops. A program of one
+    /// rank emits exactly the one device's ops.
+    /// </para>
     /// </summary>
     private void Emit(GraphEmitter e, StepValues s)
     {
@@ -893,6 +1188,8 @@ public sealed class Ltx25Denoiser : IDenoiser
         DenoiserSpan span = s.Span;
         float eps = Ltx25Config.NormEpsilon;
         var leaves = new Dictionary<object, int>();
+        // A tensor-parallel rank's program (StepValues.Rank): its shards of the block projections, the rest whole.
+        bool tensorParallel = s.Ranks > 1;
         e.MarkWideTokenProducts();
         // A plan binds one adapter set's factors.
         if (s.Lora != null) e.Mix(s.Lora.Generation);
@@ -925,6 +1222,7 @@ public sealed class Ltx25Denoiser : IDenoiser
         // tokens held 2.4 GB more as separate ops).
         int Linear(string name, int x)
         {
+            if (tensorParallel && s.Shards.TryGetValue(name, out Ltx25Weight shard)) return ShardLinear(name, shard, x);
             Ltx25Weight w = _w.Projection(name);
             bool biased = _w.HasBias(name);
             if (s.Lora?.Factors(name) is { } f)
@@ -933,6 +1231,36 @@ public sealed class Ltx25Denoiser : IDenoiser
             int y = b.Op(GraphOp.MulMat, Projection(w), x);
             if (biased) y = b.Op(GraphOp.Add, y, Vector(name + ".bias"));
             return y;
+        }
+        // A rank's slice of a small vector (a column-parallel projection's bias, a whole-inner norm's weight): its heads' values.
+        int Slice(string name)
+        {
+            string key = name + "#slice";
+            if (leaves.TryGetValue(key, out int node)) return node;
+            Tensor t = _w.VectorSlice(name, s.Rank, s.Ranks, s.Device);
+            node = e.TensorWeight(t, t.ElementCount());
+            leaves[key] = node;
+            return node;
+        }
+        // A sharded projection on its rank (Ltx25Parallel): a column-parallel one is the rank's rows of the product plus its
+        // slice of the bias; a row-parallel one is the rank's partial product over its input columns (with the adapter's
+        // partial update), summed over the ranks by an all-reduce, then the bias, whole, once.
+        int ShardLinear(string name, Ltx25Weight w, int x)
+        {
+            bool rowParallel = Ltx25DenoiserWeights.ParallelOf(name) == Ltx25Parallel.RowParallel;
+            int bias = !_w.HasBias(name) ? -1 : rowParallel ? Vector(name + ".bias") : Slice(name + ".bias");
+            int y;
+            if (s.Lora != null && LoraShard(s.Lora, name, s.Rank, s.Ranks) is { } f)
+                y = GraphDitRegions.LoraLinear(b, x, Projection(w), new[] { new GraphDitRegions.LoraPart(0, Projection(f.Down), Projection(f.Up)) },
+                    w.Ne1, slotRows: 0, rows: 0 /* one slot: no row views */, bias: rowParallel ? -1 : bias);
+            else
+            {
+                y = b.Op(GraphOp.MulMat, Projection(w), x);
+                if (!rowParallel && bias >= 0) y = b.Op(GraphOp.Add, y, bias);
+            }
+            if (!rowParallel) return y;
+            y = b.Op(GraphOp.AllReduce, y);
+            return bias >= 0 ? b.Op(GraphOp.Add, y, bias) : y;
         }
         int Silu(int x) => b.Op(GraphOp.Silu, x);
         (int Coefficients, int Embedded) Ada(string name, int features)
@@ -960,6 +1288,7 @@ public sealed class Ltx25Denoiser : IDenoiser
             (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? queryRope = null,
             (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? keyRope = null)
         {
+            if (tensorParallel) return ShardAttention(name, query, queryRows, context, contextRows, heads, headDim, queryRope, keyRope);
             // q and k RMS-normed over the whole inner width, then (self and cross-stream attention) rotated per head, as the
             // direct denoiser normed and rotated them in place; the attention gated per head in place before to_out.
             int Prep(int raw, string norm, long rows, (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? rope) => rope is { } r
@@ -971,6 +1300,40 @@ public sealed class Ltx25Denoiser : IDenoiser
             int v = Linear(name + ".to_v", context);
             int logits = Linear(name + ".to_gate_logits", query);
             int gated = GraphDitRegions.FullAttention(b, q3, k3, Reshape3(v, headDim, heads, contextRows), headDim, heads, queryRows,
+                1f / MathF.Sqrt(headDim), logits, 2f);
+            return Linear(name + ".to_out.0", gated);
+        }
+
+        // The rank's heads of an attention (Attention's ops over heads / ranks heads): q, k, v and the gate logits are the
+        // rank's rows (its heads' columns of the inner width), to_out its partial over them, summed by the projection's
+        // all-reduce. The q and k RMS norms span the whole inner width, so each rank's sums of squares over its columns are
+        // summed over the ranks first (q's rows then k's, one all-reduce), and the rank normalizes its columns with the whole
+        // row's mean and its slice of the norm weight, then rotates its heads by its slice of the tables (HeadRotary without
+        // a norm of its own).
+        int ShardAttention(string name, int query, long queryRows, int context, long contextRows, int heads, int headDim,
+            (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? queryRope,
+            (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? keyRope)
+        {
+            int local = heads / s.Ranks;
+            float meanScale = 1f / ((long)heads * headDim);
+            int q = Linear(name + ".to_q", query), k = Linear(name + ".to_k", context);
+            int SumSquares(int x) => b.Op(GraphOp.SumRows, b.Op(GraphOp.Sqr, x));
+            int sums = b.Op(GraphOp.AllReduce, b.Op(GraphOp.Concat, stackalloc[] { SumSquares(q), SumSquares(k) }, stackalloc long[] { 1 }));
+            int Prep(int raw, string norm, long rows, long first, (Tensor Cos, Tensor Sin, int Tokens, int Heads, int HeadDim)? rope)
+            {
+                int rowSums = e.View2(sums, 1, rows, sizeof(float), first * sizeof(float));
+                int rms = b.Op(GraphOp.Sqrt, b.Op(GraphOp.ScaleBias, stackalloc[] { rowSums }, default, stackalloc[] { meanScale, eps }));
+                int normed = b.Op(GraphOp.Mul, b.Op(GraphOp.Div, raw, rms), Slice(norm));
+                return rope is { } r
+                    ? GraphDitRegions.HeadRotary(b, normed, Constant(r.Cos, headDim / 2, local, rows), Constant(r.Sin, headDim / 2, local, rows),
+                        headDim, local, rows)
+                    : Reshape3(normed, headDim, local, rows);
+            }
+            int q3 = Prep(q, name + ".q_norm.weight", queryRows, 0, queryRope);
+            int k3 = Prep(k, name + ".k_norm.weight", contextRows, queryRows, keyRope);
+            int v = Linear(name + ".to_v", context);
+            int logits = Linear(name + ".to_gate_logits", query);
+            int gated = GraphDitRegions.FullAttention(b, q3, k3, Reshape3(v, headDim, local, contextRows), headDim, local, queryRows,
                 1f / MathF.Sqrt(headDim), logits, 2f);
             return Linear(name + ".to_out.0", gated);
         }

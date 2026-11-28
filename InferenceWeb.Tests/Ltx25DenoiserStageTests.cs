@@ -119,15 +119,14 @@ public sealed partial class Ltx25DenoiserTests
     }
 
     /// <summary>The family's contract: it is on the shared diffusion runtime; --layer-split N is honoured on --backend cuda (the
-    /// CUDA tensor executor's devices) and refused on ggml_cuda with the advice to use cuda, and on a single-device backend;
-    /// tensor parallelism stays a gap.</summary>
+    /// CUDA tensor executor's devices) and refused on ggml_cuda with the advice to use cuda, and on a single-device backend
+    /// (tensor parallelism: <see cref="TensorParallelismIsTheContractsOnCudaAndTheHybridAGap"/>).</summary>
     [Fact]
-    public void LayerSplitIsTheContractsOnCudaAndTensorParallelismAGap()
+    public void LayerSplitIsTheContractsOnCuda()
     {
         Assert.True(ModelArchitectureRegistry.TryGet(Ltx25Model.ArchitectureId, out var arch));
         Assert.Equal(ServingImplementation.SharedDiffusionRuntime, arch.Serving.Implementation);
         Assert.Equal(new[] { BackendType.Cuda }, arch.Serving.LayerSplit.Backends);
-        Assert.Empty(arch.Serving.TensorParallel.Backends);
         Assert.Empty(arch.Serving.HybridParallel.Backends);
 
         ITensorParallelGroup group = null;
@@ -139,8 +138,6 @@ public sealed partial class Ltx25DenoiserTests
         var cpu = Assert.Throws<NotSupportedException>(() =>
             ModelBase.ResolveTensorParallelSupport(arch, BackendType.Cpu, 1, ref group, out _, requestedLayerSplitDegree: 2));
         Assert.Contains("multi-device", cpu.Message);
-        var tp = Assert.Throws<NotSupportedException>(() => ModelBase.ResolveTensorParallelSupport(arch, BackendType.Cuda, 2, ref group, out _));
-        Assert.Contains("ltx-2.5", tp.Message);
     }
 
     /// <summary>The blocks over two GPUs of the CUDA tensor executor (two CudaAllocators, as --backend cuda --layer-split 2 makes

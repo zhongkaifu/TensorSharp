@@ -61,8 +61,13 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
 
     /// <param name="layerSplitDegree">Devices the denoiser's 48 blocks are split over as whole-block stages (--layer-split N,
     /// --backend cuda): each holds its share of the blocks; the text encoder, the VAEs and the upscaler run on the first.</param>
-    public Ltx25Model(string checkpoint, BackendType backend, int layerSplitDegree = 1)
-        : base(checkpoint, DirectBackend(backend), layerSplitDegree: layerSplitDegree)
+    /// <param name="tpDegree">GPUs the denoiser's blocks are sharded over (--tp N, --backend cuda): each holds its heads of every
+    /// attention and its slice of every feed-forward, the rest of the denoiser whole; the text encoder, the VAEs and the
+    /// upscaler run on the first. A degree the 32 heads or the checkpoint's quant blocks do not divide is refused at load.</param>
+    /// <param name="tpGroup">A tensor-parallel group the caller made (its first device is the model's); null makes one of
+    /// <paramref name="tpDegree"/> CUDA devices.</param>
+    public Ltx25Model(string checkpoint, BackendType backend, int layerSplitDegree = 1, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
+        : base(checkpoint, DirectBackend(backend), tpDegree, tpGroup, layerSplitDegree: layerSplitDegree)
     {
         try
         {
@@ -70,6 +75,20 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             if (geometry.VideoDim != 4096 || geometry.AudioDim != 2048 || geometry.Layers != 48 ||
                 geometry.VideoChannels != 128 || geometry.AudioChannels != 128)
                 throw new NotSupportedException("LTX generation requires the authentic 48-layer LTX 2.5 AV checkpoint.");
+            // Tensor parallelism shards the denoiser over the CUDA tensor executor's devices of this machine (the serving
+            // contract refuses the rest before a load; a model made directly is held to the same), and only where every rank's
+            // share is whole heads and whole quant blocks: refused here, before any weight is read.
+            if (tpDegree > 1 || IsTensorParallel)
+            {
+                if (backend != BackendType.Cuda || !IsTensorParallel)
+                    throw new ModelLoadRefusedException(
+                        "LTX 2.5 shards its denoiser over GPUs on --backend cuda (its CUDA tensor executor): use --backend cuda --tp N.");
+                if (TpNodeCount > 1 || GlobalTpDegree != TpDegree)
+                    throw new ModelLoadRefusedException(
+                        "LTX 2.5 tensor parallelism shards the denoiser over the GPUs of one machine; a multi-node --tp group is not supported.");
+                if (Ltx25DenoiserWeights.TensorParallelRefusal(_gguf, geometry, TpDegree) is string refusal)
+                    throw new ModelLoadRefusedException(refusal);
+            }
             // The stage devices, made (and a split past the visible CUDA devices refused) before any companion is resolved.
             _denoiserDevices = StageDeviceAllocators();
             if (IsDevCheckpointName(checkpoint))
@@ -89,6 +108,9 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             if (_denoiserDevices != null)
                 Console.WriteLine($"  placement    = denoiser blocks over {_denoiserDevices.Count} GPUs as whole-block stages " +
                     "(the text encoder, VAEs and upscaler on the first)");
+            if (IsTensorParallel)
+                Console.WriteLine($"  placement    = denoiser blocks sharded over {TpDegree} GPUs ({geometry.VideoHeads / TpDegree} heads " +
+                    $"of every attention and 1/{TpDegree} of every feed-forward a GPU; the text encoder, VAEs and upscaler on the first)");
             string configuredReference = Environment.GetEnvironmentVariable("TS_LTX25_INGREDIENTS_LORA");
             string reference = null;
             if (!string.IsNullOrWhiteSpace(configuredReference))
@@ -232,22 +254,31 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     }
 
     /// <summary>Return the free buffers of the model's devices to them (CUDA's pools trimmed after a sync, MLX's cache cleared):
-    /// the first device's, and under a split every stage device's too, whose pools hold the denoiser's freed working buffers.</summary>
+    /// the first device's, and under a split every stage device's too, whose pools hold the denoiser's freed working buffers
+    /// (under tensor parallelism every rank device's).</summary>
     internal void TrimDevicePools()
     {
         if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
         else if (_allocator is MlxAllocator) MlxBackend.ClearCache();
+        if (IsTensorParallel)
+            for (int r = 1; r < _tpGroup.Degree; r++)
+                if (_tpGroup.GetAllocator(r) is CudaAllocator rank && !ReferenceEquals(rank, _allocator)) { rank.Synchronize(); rank.TrimPool(); }
         if (_denoiserDevices == null) return;
         foreach (IAllocator device in _denoiserDevices)
             if (!ReferenceEquals(device, _allocator) && device is CudaAllocator stage) { stage.Synchronize(); stage.TrimPool(); }
     }
 
+    /// <summary>The denoiser (made with the pipeline's first clip) shards its blocks over the model's tensor-parallel group.</summary>
+    protected override bool ShardsWeightsInComponents => true;
+
     /// <summary>The runtime's load: the denoiser, the text encoder and the VAE this model resolved (the upscaler, the diffusion
-    /// decoder and the audio VAE travel with the family), and the denoiser's stage devices under a split.</summary>
+    /// decoder and the audio VAE travel with the family), and the denoiser's stage devices under a split or its tensor-parallel
+    /// group under --tp.</summary>
     private DiffusionLoad Load() => new()
     {
         Backend = DirectBackend(_backend),
         DenoiserDevices = _denoiserDevices,
+        TensorParallelGroup = IsTensorParallel ? _tpGroup : null,
         Files = new Dictionary<string, string>
         {
             [DiffusionLoad.Denoiser] = CheckpointPath,
