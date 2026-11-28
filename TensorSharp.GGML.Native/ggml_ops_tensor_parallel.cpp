@@ -669,15 +669,6 @@ namespace tsg
                     const int result = tp_cuda_allreduce_f32(backends, nodes, rank_count);
                     if (result != 0) return result > 0;
                 }
-                // No NCCL: TensorSharp's own exact sum over peer memory, one collective a partial (the chunked fallback
-                // below runs one of the context's per 32,764 floats).
-                if (g_backend_type == BACKEND_TYPE_CUDA)
-                {
-                    ggml_backend_t backends[TSG_MAX_DEVICES];
-                    for (int r = 0; r < rank_count; ++r) backends[r] = dev(r).backend;
-                    const int result = tp_p2p_allreduce_f32(backends, nodes, rank_count);
-                    if (result != 0) return result > 0;
-                }
 #endif
                 // The internal CUDA transport requires 16-byte aligned data
                 // and lengths. Keep each next view aligned as well as staying
@@ -690,6 +681,19 @@ namespace tsg
                     if (bytes > 0) chunk_limit = std::min<int64_t>(chunk_limit, (bytes - 1) / sizeof(float));
                 }
                 chunk_limit -= chunk_limit % 4;
+#ifdef TSG_GGML_USE_CUDA
+                // No NCCL: a partial the chunked fallback below would split (one of the context's collectives per 32,764
+                // floats: a diffusion block's 4K-token partials took hundreds) is TensorSharp's own exact sum over peer
+                // memory, one collective a partial. A partial that fits one chunk (a decode step's) keeps the context's
+                // own collective, one call that costs less (Qwen3.8-27B decoded 61.5 tok/s with it against 57.8).
+                if (g_backend_type == BACKEND_TYPE_CUDA && ggml_nelements(nodes[0]) > chunk_limit)
+                {
+                    ggml_backend_t backends[TSG_MAX_DEVICES];
+                    for (int r = 0; r < rank_count; ++r) backends[r] = dev(r).backend;
+                    const int result = tp_p2p_allreduce_f32(backends, nodes, rank_count);
+                    if (result != 0) return result > 0;
+                }
+#endif
                 if (chunk_limit > 0)
                 {
                     const int64_t count = ggml_nelements(nodes[0]);
