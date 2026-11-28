@@ -1360,7 +1360,7 @@ encoders and the VAE):
 
 | Workload | 1 GPU | `--layer-split 2` | `--tp 2` | PSNR vs 1 GPU: split / TP |
 |---|---:|---:|---:|---|
-| 2.1 | 44.6 s (1.05 s a step), 5.6 GB | 43.3 s (1.05 s), 4.9 + 3.5 GB | 33.0 s (0.76 s), 5.0 + 3.2 GB | identical / 40.4 dB |
+| 2.1 | 44.6 s (1.05 s a step), 5.6 GB | 43.3 s (1.05 s), 4.9 + 3.5 GB | 34.4 s (0.79 s), 5.0 + 3.2 GB | identical / 40.4 dB |
 | 2.1-Turbo | 10.2 s (1.07 s), 6.0 GB | 10.0 s, 5.0 + 3.7 GB | 9.9 s (0.76 s), 5.0 + 3.3 GB | identical / 28.2 dB |
 | 2.1 + Fun-Acc-4Step LoRA | 6.3 s (1.27 s), 6.0 GB | 6.8 s, 4.9 + 3.7 GB | 5.2 s (0.90 s), 5.0 + 3.4 GB | identical / 40.6 dB |
 
