@@ -10,7 +10,10 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using TensorSharp;
+using TensorSharp.Cpu;
 using TensorSharp.Cuda;
+using TensorSharp.GGML;
+using TensorSharp.Models.Architecture;
 using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
@@ -421,6 +424,234 @@ public sealed class MiniMaxH3DenoiserTests(ITestOutputHelper output)
             MiniMaxH3VideoGoldens.StepCase.TextTokens, c.Layout(), c.Sigma, blockLimit: 1);
         Assert.Equal(2, dit.Compiles);
         Assert.NotEqual(all.Video, one);
+    }
+
+    // ================================================================ whole-block stages (--layer-split N)
+
+    /// <summary>A case's steps at its sigma and at half of it, as a sampler's: the second replays the plan its geometry
+    /// compiled (at sigma 1 a layout packs its timesteps differently: another geometry, as a clip's first step is).</summary>
+    private static List<(float[] Video, float[] Audio)> Steps(MiniMaxH3Denoiser dit, MiniMaxH3VideoGoldens.StepCase c, MiniMaxH3LoraSet lora) =>
+        new() { Run(dit, c, lora), Run(dit, c with { Sigma = c.Sigma * .5f }, lora) };
+
+    private static MiniMaxH3LoraSet LoadLora(string manifest, MiniMaxH3Denoiser dit, BackendType backend) =>
+        MiniMaxH3LoraSet.Load(LoraCliFlags.Resolve(new[] { new LoraSpec(manifest) }), dit.Config, MiniMaxH3Partition.FirstLastFrame,
+            backend, tensorExecutor: dit.OnTensorExecutor);
+
+    private static void AssertStepBits(List<(float[] Video, float[] Audio)> want, List<(float[] Video, float[] Audio)> got, string what)
+    {
+        Assert.Equal(want.Count, got.Count);
+        for (int i = 0; i < want.Count; i++)
+        {
+            TinyH3Step.AssertBits(want[i].Video, got[i].Video, $"{what}, step {i + 1} video");
+            TinyH3Step.AssertBits(want[i].Audio, got[i].Audio, $"{what}, step {i + 1} audio");
+        }
+    }
+
+    /// <summary>The largest difference over the largest value, and the L2 norm of the difference over the reference's.</summary>
+    private static (double Rel, double RelL2) Compare(float[] want, float[] got)
+    {
+        Assert.Equal(want.Length, got.Length);
+        double scale = want.Max(v => Math.Abs((double)v)), worst = 0, l2 = 0, n2 = 0;
+        for (int k = 0; k < want.Length; k++)
+        {
+            Assert.True(float.IsFinite(got[k]), $"value {k} is {got[k]}");
+            double d = got[k] - (double)want[k];
+            worst = Math.Max(worst, Math.Abs(d));
+            l2 += d * d;
+            n2 += (double)want[k] * want[k];
+        }
+        return (worst / scale, Math.Sqrt(l2 / n2));
+    }
+
+    /// <summary>Each step's video and audio against one device's, within <paramref name="bound"/> of the largest value; the
+    /// measured errors logged.</summary>
+    private void AssertStepsClose(List<(float[] Video, float[] Audio)> want, List<(float[] Video, float[] Audio)> got, string what,
+        double bound = 1e-5)
+    {
+        Assert.Equal(want.Count, got.Count);
+        for (int i = 0; i < want.Count; i++)
+        {
+            var (video, videoL2) = Compare(want[i].Video, got[i].Video);
+            var (audio, audioL2) = Compare(want[i].Audio, got[i].Audio);
+            output.WriteLine($"[h3-stages] {what}, step {i + 1}: stages vs one device: video max {video:E3} (L2 {videoL2:E3}), " +
+                             $"audio max {audio:E3} (L2 {audioL2:E3})");
+            Assert.True(video <= bound && audio <= bound, $"{what}, step {i + 1}: video {video:E3}, audio {audio:E3}");
+        }
+    }
+
+    /// <summary>
+    /// The trunk's blocks over two devices as whole-block stages (DenoiserStages: one program a stage, the packed sequence's
+    /// residual stream handed on as F32 rows; the token refiner and the patch projections with the first stage, the final
+    /// layer and both heads with the last), on the managed executor of two host "devices": every case's every step, video
+    /// and audio, equals one device's bit for bit, with and without the LoRA plug-in (each stage binds its own blocks'
+    /// factors, the refiner's with the first) and again after it; each stage compiles where one device compiles (once a
+    /// geometry and LoRA set), and the refiner runs once a prompt; released device copies give the same bytes. The stages'
+    /// weights are the denoiser's, each leaf on one stage.
+    /// </summary>
+    [Fact]
+    public void WholeBlockStagesMatchOneDeviceOnTheManagedExecutor()
+    {
+        foreach (MiniMaxH3VideoGoldens.StepCase c in MiniMaxH3VideoGoldens.Cases)
+        {
+            using var fx = new MiniMaxH3VideoFixture(c.Projections);
+            using var one = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu);
+            var devices = new IAllocator[] { new CpuAllocator(BlasEnum.DotNet), new CpuAllocator(BlasEnum.DotNet) };
+            using var staged = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cpu, devices: devices);
+            Assert.Equal(2, staged.Stages.Count);
+            Assert.Equal((0, 1), (staged.Stages.First(0), staged.Stages.End(0)));
+            Assert.Equal((1, 2), (staged.Stages.First(1), staged.Stages.End(1)));
+            Assert.True(staged.OnTensorExecutor);
+            Assert.True(staged.WeightBytes < one.WeightBytes, "a stage holds its share of the weights, not all of them");
+
+            List<(float[] Video, float[] Audio)> want = Steps(one, c, null);
+            AssertStepBits(want, Steps(staged, c, null), c.Name + ", stages");
+            // One program a stage wherever one device compiles one (a geometry), replayed by the steps that follow.
+            Assert.InRange(one.Compiles, 1, 2);
+            Assert.Equal(2 * one.Compiles, staged.Compiles);
+            Assert.Equal(1, one.Refinements);
+            Assert.Equal(one.Refinements, staged.Refinements);
+
+            if (c.Lora)
+            {
+                string manifest = fx.WriteLora();
+                using MiniMaxH3LoraSet oneSet = LoadLora(manifest, one, BackendType.Cpu);
+                using MiniMaxH3LoraSet stagedSet = LoadLora(manifest, staged, BackendType.Cpu);
+                AssertStepBits(Steps(one, c, oneSet), Steps(staged, c, stagedSet), c.Name + ", stages with the LoRA plug-in");
+                Assert.Same(stagedSet, staged.BoundLora);
+                Assert.Equal(2 * one.Compiles, staged.Compiles);
+                Assert.Equal(one.Refinements, staged.Refinements);
+                // Without the adapters again: no stage keeps the set's plan or factors.
+                AssertStepBits(Steps(one, c, null), Steps(staged, c, null), c.Name + ", stages after the LoRA plug-in");
+                Assert.Null(staged.BoundLora);
+                Assert.Equal(2 * one.Compiles, staged.Compiles);
+            }
+
+            // Released device copies (every stage's plan with them): the next steps compile each stage again, to the same bytes.
+            one.ReleaseDevice();
+            staged.ReleaseDevice();
+            List<(float[] Video, float[] Audio)> released = Steps(staged, c, null);
+            AssertStepBits(Steps(one, c, null), released, c.Name + ", stages after released device copies");
+            AssertStepBits(want, released, c.Name + ", stages after released device copies, against the first steps");
+            Assert.Equal(2 * one.Compiles, staged.Compiles);
+        }
+
+        // Each weight leaf on exactly one stage: the first holds the patch projections and the token refiner, the last the heads.
+        using var file = new MiniMaxH3VideoFixture(MiniMaxH3ImageFixture.BF16);
+        using var weights = new MiniMaxH3DenoiserWeights(file.DitPath, BackendType.Cpu);
+        long[] blockBytes = weights.BlockBytes();
+        Assert.Equal(MiniMaxH3VideoFixture.Blocks, blockBytes.Length);
+        var first = weights.WeightsOf(new DenoiserSpan(0, 1, IsFirst: true, IsLast: false));
+        var last = weights.WeightsOf(new DenoiserSpan(1, 2, IsFirst: false, IsLast: true));
+        Assert.Empty(first.Intersect(last));
+        Assert.Equal(weights.All.ToHashSet(), first.Concat(last).ToHashSet());
+        Assert.Equal(weights.All.Count, first.Count + last.Count);
+        Assert.Contains(weights.AudioPatch.Weight, first);
+        Assert.Contains(weights.ConditionProj.Weight, first);
+        Assert.Contains(weights.FinalAudioOut.Weight, last);
+        Assert.Equal(weights.All.Count, weights.WeightsOf(DenoiserSpan.Whole(MiniMaxH3VideoFixture.Blocks)).Count);
+    }
+
+    /// <summary>
+    /// The same over two CUDA devices on the direct CUDA executors (one a device, the products F32 as on one device), every
+    /// case's steps against one GPU's, plain and with the LoRA plug-in where the case has one: within 1e-5 of the largest
+    /// value (the stages run one device's kernels; the residual stream they hand on is F32).
+    /// </summary>
+    [MultiCudaTheory(2)]
+    [MemberData(nameof(CaseNames))]
+    public void WholeBlockStagesOnTwoCudaDevicesMatchOneDevice(string name)
+    {
+        MiniMaxH3VideoGoldens.StepCase c = MiniMaxH3VideoGoldens.Cases.Single(x => x.Name == name);
+        using var fx = new MiniMaxH3VideoFixture(c.Projections);
+        string manifest = c.Lora ? fx.WriteLora() : null;
+        using var first = new CudaAllocator(0);
+        using var second = new CudaAllocator(1);
+        List<(float[] Video, float[] Audio)> want, wantLora = null;
+        int compiles;
+        using (var one = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cuda, first))
+        using (MiniMaxH3LoraSet set = c.Lora ? LoadLora(manifest, one, BackendType.Cuda) : null)
+        {
+            want = Steps(one, c, null);
+            if (set != null) wantLora = Steps(one, c, set);
+            compiles = one.Compiles;
+        }
+        using var staged = new MiniMaxH3Denoiser(fx.DitPath, BackendType.Cuda, devices: new IAllocator[] { first, second });
+        Assert.Equal(2, staged.Stages.Count);
+        AssertStepsClose(want, Steps(staged, c, null), name + " on two CUDA devices");
+        if (c.Lora)
+        {
+            using MiniMaxH3LoraSet stagedSet = LoadLora(manifest, staged, BackendType.Cuda);
+            AssertStepsClose(wantLora, Steps(staged, c, stagedSet), name + " on two CUDA devices with the LoRA plug-in");
+        }
+        Assert.Equal(2 * compiles, staged.Compiles);   // one program a stage wherever one device compiles one
+    }
+
+    /// <summary>
+    /// The same over two GPUs of one ggml_cuda context (the layer split's: collectives off), each stage's program compiled
+    /// and run with its GPU active and its weights preloaded there: every case's steps against one GPU's, plain and with the
+    /// LoRA plug-in where the case has one, within 1e-5 of the largest value.
+    /// </summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [MemberData(nameof(CaseNames))]
+    public void WholeBlockStagesOnTwoGgmlCudaGpusMatchOneGpu(string name)
+    {
+        GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
+        MiniMaxH3VideoGoldens.StepCase c = MiniMaxH3VideoGoldens.Cases.Single(x => x.Name == name);
+        using var fx = new MiniMaxH3VideoFixture(c.Projections);
+        string manifest = c.Lora ? fx.WriteLora() : null;
+        List<(float[] Video, float[] Audio)> want, wantLora = null;
+        int compiles;
+        using (var one = new MiniMaxH3Denoiser(fx.DitPath, BackendType.GgmlCuda))
+        using (MiniMaxH3LoraSet set = c.Lora ? LoadLora(manifest, one, BackendType.GgmlCuda) : null)
+        {
+            want = Steps(one, c, null);
+            if (set != null) wantLora = Steps(one, c, set);
+            compiles = one.Compiles;
+        }
+        var context = new GgmlContext(new[] { 0, 1 }, GgmlBackendType.Cuda, enableCollectives: false);   // as a layer-split model makes it
+        var devices = new IAllocator[] { new GgmlAllocator(context, 0), new GgmlAllocator(context, 1) };
+        using var staged = new MiniMaxH3Denoiser(fx.DitPath, BackendType.GgmlCuda, devices: devices);
+        Assert.Equal(new[] { 0, 1 }, staged.Stages.Devices);
+        Assert.True(staged.Preload() > 0);
+        AssertStepsClose(want, Steps(staged, c, null), name + " on two ggml_cuda GPUs");
+        if (c.Lora)
+        {
+            using MiniMaxH3LoraSet stagedSet = LoadLora(manifest, staged, BackendType.GgmlCuda);
+            AssertStepsClose(wantLora, Steps(staged, c, stagedSet), name + " on two ggml_cuda GPUs with the LoRA plug-in");
+        }
+        Assert.Equal(2 * compiles, staged.Compiles);   // one program a stage wherever one device compiles one
+    }
+
+    /// <summary>The family's contract: the shared diffusion runtime's, with layer split on cuda and ggml_cuda (whole-block
+    /// stages, the tests above), which the gate lets through there and refuses on a backend of one device; tensor parallelism
+    /// and the hybrid are gaps the gate refuses, naming the family, and distributed groups are refused.</summary>
+    [Fact]
+    public void TensorParallelIsTheContractsGapAndLayerSplitPassesItsGate()
+    {
+        Assert.True(ModelArchitectureRegistry.TryGet("minimax-h3", out var arch));
+        Assert.Equal(ServingImplementation.SharedDiffusionRuntime, arch.Serving.Implementation);
+        Assert.Equal(new[] { BackendType.Cuda, BackendType.GgmlCuda }, arch.Serving.LayerSplit.Backends);
+        Assert.Empty(arch.Serving.TensorParallel.Backends);
+        Assert.Empty(arch.Serving.HybridParallel.Backends);
+        Assert.Contains("minimax-h3", arch.Serving.TensorParallel.GapReason, StringComparison.Ordinal);
+        foreach (BackendType backend in new[] { BackendType.Cuda, BackendType.GgmlCuda })
+        {
+            ITensorParallelGroup group = null;
+            Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(arch, backend, 1, ref group, out int split, 2));
+            Assert.Equal(2, split);
+            var tp = Assert.Throws<NotSupportedException>(() => ModelBase.ResolveTensorParallelSupport(arch, backend, 2, ref group, out _));
+            Assert.Contains("--tp 2", tp.Message, StringComparison.Ordinal);
+            Assert.Contains("minimax-h3", tp.Message, StringComparison.Ordinal);
+            var hybrid = Assert.Throws<NotSupportedException>(() =>
+                ModelBase.ResolveTensorParallelSupport(arch, backend, 2, ref group, out _, 2));
+            Assert.Contains("--layer-split 2", hybrid.Message, StringComparison.Ordinal);
+            Assert.Null(group);
+        }
+        ITensorParallelGroup none = null;
+        var oneDevice = Assert.Throws<NotSupportedException>(() =>
+            ModelBase.ResolveTensorParallelSupport(arch, BackendType.GgmlCpu, 1, ref none, out _, 2));
+        Assert.Contains("layer-split", oneDevice.Message, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedLayerSplit(arch, BackendType.GgmlCuda));
+        Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedTensorParallelism(arch, BackendType.GgmlCuda));
     }
 
     /// <summary>The retired pipeline, DiTs and native forward are gone: the runtime's denoiser is the only one.</summary>

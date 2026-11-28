@@ -24,7 +24,8 @@ public sealed class SingleDeviceArchitectureGateTests
     {
         "diffusion-gemma",
         "wan",
-        "minimax-h3",
+        // minimax-h3 is no longer here: its denoiser runs --layer-split N as whole-block stages, and its tensor-parallel gap
+        // is held by MiniMaxH3DenoiserTests.TensorParallelIsTheContractsGapAndLayerSplitPassesItsGate.
         "ltx-2.5",
     };
 

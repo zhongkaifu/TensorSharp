@@ -84,8 +84,10 @@ namespace TensorSharp.Models.MiniMaxH3
         public IConditioner CreateConditioner(DiffusionLoad load) =>
             new MiniMaxH3Conditioner(load.File(DiffusionLoad.TextEncoder), load.Backend, _model.DirectAllocator);
 
+        /// <summary>The denoiser of <paramref name="file"/>: on one device, or over the load's devices as whole-block stages
+        /// (<see cref="DiffusionLoad.DenoiserDevices"/>, <c>--layer-split N</c>), the first of which is the model's own.</summary>
         public IDenoiser CreateDenoiser(DiffusionLoad load, string file) =>
-            new MiniMaxH3Denoiser(file, load.Backend, _model.DirectAllocator)
+            new MiniMaxH3Denoiser(file, load.Backend, _model.DirectAllocator, load.DenoiserDevices)
             {
                 AdapterBytes = () => _model.Loras?.FactorBytes ?? 0,
             };

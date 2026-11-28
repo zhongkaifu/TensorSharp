@@ -40,7 +40,11 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <param name="blockBytes">Each block's weight bytes, in block order (the split balances them).</param>
         /// <param name="devices">Each stage's device allocator: GGML allocators of one context, or one allocator a device of a
         /// tensor executor's backend.</param>
-        public DenoiserStages(IReadOnlyList<long> blockBytes, IReadOnlyList<IAllocator> devices)
+        /// <param name="executorFor">A stage device's executor where the family configures its own on one device (MiniMax-H3's
+        /// managed executor serves the wide DiT regions), so a stage runs its blocks as one device runs them; null, or null for a
+        /// device, takes the backend's registered executor (<see cref="GraphExecutors.For"/>).</param>
+        public DenoiserStages(IReadOnlyList<long> blockBytes, IReadOnlyList<IAllocator> devices,
+            Func<IAllocator, IGraphExecutor> executorFor = null)
         {
             ArgumentNullException.ThrowIfNull(blockBytes);
             ArgumentNullException.ThrowIfNull(devices);
@@ -55,7 +59,8 @@ namespace TensorSharp.Models.SharedDiffusion
             {
                 IAllocator a = devices[s] ?? throw new ArgumentException($"stage {s} has no device", nameof(devices));
                 if ((a is GgmlAllocator) != _ggml) throw new ArgumentException("the stages' devices are of different backends", nameof(devices));
-                _executors[s] = GraphExecutors.For(a) ?? throw new NotSupportedException($"{a.GetType().Name} has no graph executor.");
+                _executors[s] = executorFor?.Invoke(a) ?? GraphExecutors.For(a)
+                    ?? throw new NotSupportedException($"{a.GetType().Name} has no graph executor.");
                 _tensorAllocators[s] = _executors[s].Capabilities.BindsHostPointers ? null : a;
             }
             _bounds = Balance(blockBytes, n);

@@ -51,6 +51,12 @@ namespace TensorSharp.Models.MiniMaxH3
     /// the host; the first step makes the weights resident (<see cref="Preload"/>: MiniMax-H3's uploader on the GGML backends)
     /// and compiles the step's program, which every later step of the same geometry replays with new inputs. The step's video
     /// velocity is negated and its audio prediction scaled by the shift slope, the retired forward's component contract.
+    /// <para>
+    /// Over several devices (<c>--layer-split N</c>) the 50 blocks run as whole-block stages (<see cref="DenoiserStages"/>):
+    /// each device holds its stage's weights and compiles its stage's program, the first also the token refiner's and the
+    /// patch projections, the last the final layer and both heads; the one packed sequence's residual stream (its text,
+    /// condition, audio and video rows) goes from stage to stage, so a step computes what one device's does.
+    /// </para>
     /// </summary>
     public sealed class MiniMaxH3Denoiser : IDenoiser
     {
@@ -86,17 +92,36 @@ namespace TensorSharp.Models.MiniMaxH3
         // The LoRA set the cached plan binds (null: none), and a tensor executor's handles for its factors.
         private MiniMaxH3LoraSet _lora;
         private readonly Dictionary<IntPtr, MiniMaxH3DitWeight> _loraHandles = new();
+        // Whole-block stages over several devices (--layer-split N), or null for one device; while a stage's program is
+        // emitted, the stage whose tensor executor holds the F32 vectors its weights bind (the token refiner's is stage 0's).
+        private readonly DenoiserStages _stages;
+        private int _emitStage;
+        private int _compiles;
 
         /// <summary>The denoiser in <paramref name="path"/> on <paramref name="backend"/>: a GGML backend (its graph executor),
         /// <see cref="BackendType.Cpu"/> (the managed executor) or a backend with a tensor executor for
         /// <paramref name="allocator"/> (<see cref="BackendType.Cuda"/>, <see cref="BackendType.Mlx"/>).</summary>
-        public MiniMaxH3Denoiser(string path, BackendType backend, IAllocator allocator = null)
+        /// <param name="devices">The devices of a whole-block split (<c>--layer-split N</c>, <see cref="DenoiserStages"/>), one a
+        /// stage: GGML allocators of one context on a GGML backend, else one tensor-executor allocator a device (two
+        /// <see cref="CpuAllocator"/>s are a test's two host devices); null or one for one device, which
+        /// <paramref name="allocator"/> then names.</param>
+        public MiniMaxH3Denoiser(string path, BackendType backend, IAllocator allocator = null, IReadOnlyList<IAllocator> devices = null)
         {
             Backend = backend;
             _w = new MiniMaxH3DenoiserWeights(path, backend);
             try
             {
-                (_executor, _tensorAllocator, _ownsAllocator) = Resolve(backend, allocator);
+                if (devices is { Count: > 1 })
+                {
+                    bool ggml = backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu or BackendType.GgmlVulkan;
+                    if ((devices[0] is GgmlAllocator) != ggml)
+                        throw new ArgumentException($"MiniMax-H3's stages on {Architecture.BackendNames.OptionName(backend)} need " +
+                            (ggml ? "the GGML context's devices" : "a tensor executor's devices") + ".", nameof(devices));
+                    _stages = new DenoiserStages(_w.BlockBytes(), devices, StageExecutor);
+                    (_executor, _tensorAllocator, _ownsAllocator) = (_stages.Executor(0), _stages.TensorAllocator(0), false);
+                }
+                else
+                    (_executor, _tensorAllocator, _ownsAllocator) = Resolve(backend, allocator);
             }
             catch
             {
@@ -127,6 +152,12 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
+        /// <summary>A stage's executor as <see cref="Resolve"/> makes one device's: the managed executor serves the step's wide
+        /// DiT regions (the registered one would run the regions' ops, other bytes than one device's step); the other backends
+        /// take their registered executor (null), as one device does.</summary>
+        private static IGraphExecutor StageExecutor(IAllocator device) =>
+            device is CpuAllocator cpu ? new ManagedGraphExecutor(cpu) { ServesWideDitRegions = true } : null;
+
         public BackendType Backend { get; }
 
         public MiniMaxH3Config Config => _w.Config;
@@ -140,11 +171,14 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>Whether the steps run on a tensor executor (weights bound as objects, F32 LoRA factors).</summary>
         internal bool OnTensorExecutor => _tensorAllocator != null;
 
-        /// <summary>The plan the last step ran (a test seam).</summary>
-        internal IGraphPlan LastPlan => _plan;
+        /// <summary>The plan the last step ran (a test seam); the last stage's under a split.</summary>
+        internal IGraphPlan LastPlan => _stages?.Plan(_stages.Count - 1) ?? _plan;
 
-        /// <summary>Steps that compiled their program (the rest replayed the cached plan).</summary>
-        internal int Compiles { get; private set; }
+        /// <summary>Steps that compiled their program (the rest replayed the cached plan); under a split, stage programs.</summary>
+        internal int Compiles => _compiles + (_stages?.Compiles ?? 0);
+
+        /// <summary>The whole-block stages, or null for one device (a test seam).</summary>
+        internal DenoiserStages Stages => _stages;
 
         /// <summary>Prompts the token refiner ran for (a step whose prompt and LoRA set the last refined rows were made with
         /// takes them as they are).</summary>
@@ -152,7 +186,22 @@ namespace TensorSharp.Models.MiniMaxH3
 
         public DenoiserCaps Caps { get; } = new() { Streams = new[] { AudioStream } };
 
-        public long WeightBytes => _w.Bytes + (AdapterBytes?.Invoke() ?? 0);
+        /// <summary>The weights' device bytes: under a split, the largest stage's share (each device holds its own; the
+        /// residency plan budgets one device).</summary>
+        public long WeightBytes => StageWeightBytes() + (AdapterBytes?.Invoke() ?? 0);
+
+        private long StageWeightBytes()
+        {
+            if (_stages == null) return _w.Bytes;
+            long most = 0;
+            for (int s = 0; s < _stages.Count; s++)
+            {
+                long bytes = 0;
+                foreach (MiniMaxH3DitWeight w in _w.WeightsOf(_stages.Span(s))) bytes += w.Bytes;
+                most = Math.Max(most, bytes);
+            }
+            return most;
+        }
 
         /// <summary>The device bytes of the LoRA factors the next steps bind, for residency.</summary>
         internal Func<long> AdapterBytes { get; set; }
@@ -206,9 +255,20 @@ namespace TensorSharp.Models.MiniMaxH3
         private int PreloadLocked()
         {
             if (_preloaded) return 0;
-            int copied = _executor.Capabilities.BindsHostPointers
-                ? _executor.Preload(new List<IGraphWeight>(_w.All), "minimax-h3/denoiser")
-                : 0;
+            int copied = 0;
+            if (_executor.Capabilities.BindsHostPointers)
+            {
+                if (_stages == null) copied = _executor.Preload(new List<IGraphWeight>(_w.All), "minimax-h3/denoiser");
+                else
+                    for (int st = 0; st < _stages.Count; st++)
+                    {
+                        // Each stage's weights onto its own device (the token refiner's with the first stage's).
+                        IGraphExecutor x = _stages.Executor(st);
+                        var weights = new List<IGraphWeight>(_w.WeightsOf(_stages.Span(st)));
+                        int stage = st;
+                        copied += _stages.OnDevice(st, () => x.Preload(weights, $"minimax-h3/denoiser stage {stage}"));
+                    }
+            }
             _preloaded = true;
             return copied;
         }
@@ -249,8 +309,7 @@ namespace TensorSharp.Models.MiniMaxH3
         private void BindLora(MiniMaxH3LoraSet lora)
         {
             if (ReferenceEquals(lora, _lora)) return;
-            _plan?.Dispose();
-            _plan = null;
+            DropPlans();
             DropTextPlan();
             ReleaseLoraDevice();
             _lora = lora;
@@ -291,16 +350,48 @@ namespace TensorSharp.Models.MiniMaxH3
         /// bytes (<see cref="IGraphExecutor.Invalidate"/>); the CUDA and MLX tensor executors keep it in their backends'
         /// resident-weight caches under the same address, which Invalidate does not reach (NetworkWeights releases its weights
         /// the same way, as the retired direct DiT's linears did). A copy left there outlives the denoiser: its device memory
-        /// stays taken, and a file mapped later at that address computes with the old values.</summary>
+        /// stays taken, and a file mapped later at that address computes with the old values. Under a split the copy is on its
+        /// stage's device: every stage's cache is asked (a release of a key a device does not hold is a no-op).</summary>
         private void ReleaseCopy(IntPtr data)
         {
             if (data == IntPtr.Zero) return;
-            switch (_tensorAllocator)
+            if (_stages == null) ReleaseCopy(data, _tensorAllocator, _executor);
+            else if (_tensorAllocator == null) _stages.InvalidateEverywhere(data);
+            else
+                for (int s = 0; s < _stages.Count; s++) ReleaseCopy(data, _stages.TensorAllocator(s), _stages.Executor(s));
+        }
+
+        private static void ReleaseCopy(IntPtr data, IAllocator tensorAllocator, IGraphExecutor executor)
+        {
+            switch (tensorAllocator)
             {
                 case TensorSharp.Cuda.CudaAllocator cuda: TensorSharp.Cuda.CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data); break;
                 case TensorSharp.MLX.MlxAllocator mlx: TensorSharp.MLX.MlxQuantizedOps.ReleaseQuantizedWeight(mlx, data); break;
-                default: _executor.Invalidate(data); break;
+                default: executor.Invalidate(data); break;
             }
+        }
+
+        /// <summary>Where the tensor executors keep what the steps allocate: the one device's allocator, or each stage's (null
+        /// on GGML).</summary>
+        private IEnumerable<IAllocator> TensorAllocators()
+        {
+            if (_stages == null) yield return _tensorAllocator;
+            else
+                for (int s = 0; s < _stages.Count; s++) yield return _stages.TensorAllocator(s);
+        }
+
+        /// <summary>The managed executor's kept intermediates back to the system, on every device that keeps them.</summary>
+        private void TrimRecycled()
+        {
+            foreach (IAllocator a in TensorAllocators()) (a as RecyclingCpuAllocator)?.Trim();
+        }
+
+        /// <summary>The cached step plan, or every stage's.</summary>
+        private void DropPlans()
+        {
+            _plan?.Dispose();
+            _plan = null;
+            _stages?.DropPlans();
         }
 
         /// <summary>Forget the bound LoRA set (its device copies and the plan that binds them): the model calls it under its
@@ -386,6 +477,13 @@ namespace TensorSharp.Models.MiniMaxH3
                 PreloadLocked();
                 if (textCount > 0) step.Refined = RefinedText(step);
 
+                // Whole-block stages: each stage's program on its device, the residual stream handed from one to the next.
+                if (_stages != null)
+                {
+                    var (stagedVideo, stagedAudio) = RunStages(step);
+                    return (stagedVideo, ScaledAudio(stagedAudio, sigma, videoShift, audioShift));
+                }
+
                 // With a cached plan, the program's signature first (a hash-only trace, whose inputs this step runs with). A
                 // geometry the plan was not compiled for (or the clip's first step, with none) records the program and compiles
                 // it, after the old plan's memory is released, and that recording runs the step: one emission, not two.
@@ -410,7 +508,7 @@ namespace TensorSharp.Models.MiniMaxH3
                         double emitted = clock.Elapsed.TotalSeconds;
                         _plan = recorded.Compile(replayable: true);
                         _planSignature = recorded.Signature;
-                        Compiles++;
+                        _compiles++;
                         Console.WriteLine($"  [h3] step program for {layout.TokenCount} tokens: emitted in {emitted:F2}s, " +
                                           $"compiled in {clock.Elapsed.TotalSeconds - emitted:F2}s");
                     }
@@ -421,14 +519,52 @@ namespace TensorSharp.Models.MiniMaxH3
                 {
                     runner?.Dispose();
                 }
-                // The audio head's scale changes every step, so it is applied here rather than in the program (whose signature
-                // would change with it): x * s in F32, as the retired graph's scale op multiplies.
-                float audioScale = -MiniMaxH3Scheduler.ShiftSlope(MiniMaxH3Scheduler.ClampSigma(sigma), videoShift, audioShift);
-                float[] audioRaw = _plan.Outputs[1];
-                var audio = new float[audioRaw.LongLength];
-                for (long i = 0; i < audio.LongLength; i++) audio[i] = audioRaw[i] * audioScale;
-                return (_plan.Outputs[0], audio);
+                return (_plan.Outputs[0], ScaledAudio(_plan.Outputs[1], sigma, videoShift, audioShift));
             }
+        }
+
+        /// <summary>The audio head's scale changes every step, so it is applied here rather than in the program (whose signature
+        /// would change with it): x * s in F32, as the retired graph's scale op multiplies.</summary>
+        private static float[] ScaledAudio(float[] audioRaw, float sigma, float videoShift, float audioShift)
+        {
+            float audioScale = -MiniMaxH3Scheduler.ShiftSlope(MiniMaxH3Scheduler.ClampSigma(sigma), videoShift, audioShift);
+            var audio = new float[audioRaw.LongLength];
+            for (long i = 0; i < audio.LongLength; i++) audio[i] = audioRaw[i] * audioScale;
+            return audio;
+        }
+
+        /// <summary>
+        /// One step as whole-block stages (<see cref="DenoiserStages"/>): each stage's program compiled and run on its device,
+        /// the first with the inputs, the patch projections and the packed sequence (the refined text rows, made on the same
+        /// device, its first rows), the last with the final layer and both heads; between two, the residual stream of the one
+        /// packed sequence (text, conditions, audio and video rows: [hidden, tokens] in F32) as one stage's output and the
+        /// next stage's input. Each stage's program takes the products one device's takes (<see cref="FloatProducts"/>), and
+        /// compiles once a geometry and LoRA set. Returns the video velocity (the last plan's buffer, valid until the next
+        /// step) and the audio head's unscaled prediction.
+        /// </summary>
+        private (float[] Video, float[] Audio) RunStages(StepValues step)
+        {
+            float[][] outputs = null;
+            try
+            {
+                for (int st = 0; st < _stages.Count; st++)
+                {
+                    DenoiserSpan span = _stages.Span(st);
+                    float[] carry = outputs?[0];
+                    int compiled = _stages.Compiles;
+                    var clock = System.Diagnostics.Stopwatch.StartNew();
+                    _emitStage = st;
+                    outputs = _stages.RunAll(st, e => Emit(e, step, text: false, span, carry), "MiniMax-H3 denoiser", FloatProducts);
+                    if (_stages.Compiles != compiled)
+                        Console.WriteLine($"  [h3] stage {st} (blocks {span.First}-{span.End - 1}) program for {step.Layout.TokenCount} " +
+                                          $"tokens: compiled and run in {clock.Elapsed.TotalSeconds:F2}s");
+                }
+            }
+            finally
+            {
+                _emitStage = 0;
+            }
+            return (outputs[0], outputs[1]);
         }
 
         /// <summary>
@@ -443,6 +579,21 @@ namespace TensorSharp.Models.MiniMaxH3
             if (_refined != null && _refinedLora == generation && _refinedFor != null
                 && MemoryMarshal.AsBytes(_refinedFor.AsSpan()).SequenceEqual(MemoryMarshal.AsBytes(step.Text.AsSpan())))
                 return _refined;
+            // Under a split the refiner runs on the first stage's device (its executor, weights and active GGML rank), whose
+            // program packs the refined rows first.
+            if (_stages != null) _stages.OnDevice(0, () => RunRefiner(step));
+            else RunRefiner(step);
+            Refinements++;
+            _refined = (float[])_textPlan.Outputs[0].Clone();
+            _refinedFor = (float[])step.Text.Clone();
+            _refinedLora = generation;
+            return _refined;
+        }
+
+        /// <summary>The token refiner's program for <paramref name="step"/>'s text: traced, compiled on a signature its plan was
+        /// not compiled for, and run.</summary>
+        private void RunRefiner(StepValues step)
+        {
             GraphEmitter runner = null;
             try
             {
@@ -470,11 +621,6 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 runner?.Dispose();
             }
-            Refinements++;
-            _refined = (float[])_textPlan.Outputs[0].Clone();
-            _refinedFor = (float[])step.Text.Clone();
-            _refinedLora = generation;
-            return _refined;
         }
 
         /// <summary>Each executor takes the products the retired path took on its backend: on direct CUDA (and MLX) the products
@@ -621,7 +767,17 @@ namespace TensorSharp.Models.MiniMaxH3
         /// projection and the refiner blocks, whose result the step program takes as its input (<see cref="RefinedText"/>);
         /// both programs carry WideTokenProducts, so the refiner's attention takes the routes it took inside the step.
         /// </summary>
-        private void Emit(GraphEmitter e, StepValues s, bool text)
+        private void Emit(GraphEmitter e, StepValues s, bool text) => Emit(e, s, text, DenoiserSpan.Whole(_w.Blocks.Length), null);
+
+        /// <summary>
+        /// The step program of <paramref name="span"/>'s blocks (a whole-block stage; one device's step is
+        /// <see cref="DenoiserSpan.Whole"/>, the program above node for node): where it opens the step, the latents' inputs,
+        /// the refined text rows and the patch projections that pack the sequence; else the residual stream the previous stage
+        /// handed on (<paramref name="carry"/>, [hidden, tokens]). Where it closes the step, the final layer and both heads;
+        /// else the residual stream as its output. Every stage takes the step's time embedding, rotary and segment tables as
+        /// its own inputs. A block limit (<see cref="StepValues.Blocks"/>) ends the trunk early in any stage.
+        /// </summary>
+        private void Emit(GraphEmitter e, StepValues s, bool text, DenoiserSpan span, float[] carry)
         {
             MiniMaxH3Config c = _w.Config;
             GraphProgramBuilder b = e.Builder;
@@ -718,10 +874,12 @@ namespace TensorSharp.Models.MiniMaxH3
                 return;
             }
 
-            // ---- inputs
-            int vin = e.InputF32(s.Video, c.VideoPatchDim, s.ConditionCount + s.VideoCount);
-            int ain = e.InputF32(s.Audio, c.AudioLatentChannels, s.AudioCount);
-            int acin = s.ConditionAudioCount > 0 ? e.InputF32(s.ConditionAudio, c.AudioLatentChannels, s.ConditionAudioCount) : -1;
+            // ---- inputs (the latents only where the program opens the step)
+            int vin = span.IsFirst ? e.InputF32(s.Video, c.VideoPatchDim, s.ConditionCount + s.VideoCount) : -1;
+            int ain = span.IsFirst ? e.InputF32(s.Audio, c.AudioLatentChannels, s.AudioCount) : -1;
+            int acin = span.IsFirst && s.ConditionAudioCount > 0
+                ? e.InputF32(s.ConditionAudio, c.AudioLatentChannels, s.ConditionAudioCount)
+                : -1;
             int temb = e.InputF32(s.TimeEmbed, c.TimeEmbedDim, nts);
             // A projection of the time embedding viewed as [hidden, columns]: the modulation matrix.
             int Modulations(MiniMaxH3DitLinear l, long columns) => b.Op(GraphOp.Reshape, stackalloc[] { Linear(l, temb, guard: false) },
@@ -731,41 +889,48 @@ namespace TensorSharp.Models.MiniMaxH3
             // so an executor serving them sees the tables' values.
             int sinS = e.InputF32(s.SinSigned, rot, ntok);
             // The token refiner's rows (its own program, RefinedText): the packed sequence's first rows.
-            int x = s.TextCount > 0 ? e.InputF32(s.Refined, hidden, s.TextCount) : -1;
+            int x = span.IsFirst && s.TextCount > 0 ? e.InputF32(s.Refined, hidden, s.TextCount) : -1;
             GraphDitRegions.CheckSegments(s.Segments, ntok, 18L * nts, 5);
             int table = e.InputI32(GraphDitRegions.SegmentTable(s.Segments), 3, s.Segments.Length);
 
             // ---- patchify video (conditions and target with one projection) and audio, then pack
-            // [text | conditions | audio | video]; a chunk list rebuilds the conditioning run in its order.
-            int allVideo = Linear(_w.VideoPatch, vin);
-            int audioTok = Linear(_w.AudioPatch, ain);
-            int condAudioTok = acin >= 0 ? Linear(_w.AudioPatch, acin) : -1;
-            int condTok = -1, videoTok = allVideo;
-            if (s.ConditionCount > 0)
+            // [text | conditions | audio | video]; a chunk list rebuilds the conditioning run in its order. A later stage
+            // starts from the residual stream the previous one handed on.
+            if (!span.IsFirst)
+                x = e.InputF32(carry ?? throw new ArgumentNullException(nameof(carry)), hidden, ntok);
+            else
             {
-                condTok = Rows(allVideo, hidden, 0, s.ConditionCount);
-                videoTok = Rows(allVideo, hidden, s.ConditionCount, s.VideoCount);
-            }
-            if (s.Chunks is { Count: > 0 })
-            {
-                int rebuilt = -1, videoRow = 0, audioRow = 0;
-                foreach (var (kind, count) in s.Chunks)
+                int allVideo = Linear(_w.VideoPatch, vin);
+                int audioTok = Linear(_w.AudioPatch, ain);
+                int condAudioTok = acin >= 0 ? Linear(_w.AudioPatch, acin) : -1;
+                int condTok = -1, videoTok = allVideo;
+                if (s.ConditionCount > 0)
                 {
-                    if (count <= 0) continue;
-                    int part;
-                    if (kind == 0) { part = Rows(condTok, hidden, videoRow, count); videoRow += count; }
-                    else { part = Rows(condAudioTok, hidden, audioRow, count); audioRow += count; }
-                    rebuilt = Join(rebuilt, part);
+                    condTok = Rows(allVideo, hidden, 0, s.ConditionCount);
+                    videoTok = Rows(allVideo, hidden, s.ConditionCount, s.VideoCount);
                 }
-                condTok = rebuilt;
+                if (s.Chunks is { Count: > 0 })
+                {
+                    int rebuilt = -1, videoRow = 0, audioRow = 0;
+                    foreach (var (kind, count) in s.Chunks)
+                    {
+                        if (count <= 0) continue;
+                        int part;
+                        if (kind == 0) { part = Rows(condTok, hidden, videoRow, count); videoRow += count; }
+                        else { part = Rows(condAudioTok, hidden, audioRow, count); audioRow += count; }
+                        rebuilt = Join(rebuilt, part);
+                    }
+                    condTok = rebuilt;
+                }
+                if (condTok >= 0) x = Join(x, condTok);
+                x = Join(x, audioTok);
+                x = Join(x, videoTok);
             }
-            if (condTok >= 0) x = Join(x, condTok);
-            x = Join(x, audioTok);
-            x = Join(x, videoTok);
 
             // ---- the blocks
             float vScale = GraphDitRegions.FlashVScale(ntok);
-            for (int bi = 0; bi < s.Blocks; bi++)
+            int endBlock = Math.Min(span.End, s.Blocks);
+            for (int bi = span.First; bi < endBlock; bi++)
             {
                 MiniMaxH3DitBlock blk = _w.Blocks[bi];
                 // The curve-table variant feeds the interpolated embedding straight in (no SiLU), and takes no guard.
@@ -786,6 +951,13 @@ namespace TensorSharp.Models.MiniMaxH3
                 x = GraphDitRegions.GatedResidual(b, x, m, -1, -1, mods, table, s.Segments, hidden, 5);
             }
 
+            // A stage that does not close the step hands its residual stream on.
+            if (!span.IsLast)
+            {
+                e.Output(x, (long)hidden * ntok);
+                return;
+            }
+
             // ---- final layer: shift and scale by TIMESTEP row (timestep * 2), then each stream's head
             int fmods = Modulations(_w.FinalAdaLn, 2L * nts);
             int FinalSlice(MiniMaxH3ModulationSpan span)
@@ -802,7 +974,8 @@ namespace TensorSharp.Models.MiniMaxH3
             e.Output(audioOut, (long)c.AudioLatentChannels * s.AudioCount);
         }
 
-        /// <summary>A tensor executor's object for a weight leaf: an F32 vector as a tensor, a projection as itself.</summary>
+        /// <summary>A tensor executor's object for a weight leaf: an F32 vector as a tensor (under a split on the device of the
+        /// stage whose program binds it: each vector is one stage's), a projection as itself.</summary>
         private object Handle(MiniMaxH3DitWeight w)
         {
             if (!w.Vector) return w;
@@ -810,7 +983,7 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 var values = new float[w.Ne0];
                 Marshal.Copy(w.Data, values, 0, values.Length);
-                t = new Tensor(_tensorAllocator, DType.Float32, w.Ne0);
+                t = new Tensor(_stages?.TensorAllocator(_emitStage) ?? _tensorAllocator, DType.Float32, w.Ne0);
                 t.SetElementsAsFloat(values);
                 _tensors[w] = t;
             }
@@ -830,26 +1003,27 @@ namespace TensorSharp.Models.MiniMaxH3
         /// the next clip's 17 GB text encoder); the next clip compiles its step again. On direct CUDA the plans go too and the
         /// step's intermediates the allocator pooled return to the driver (<see cref="TensorSharp.Cuda.CudaAllocator.TrimPool"/>,
         /// as the Wan pipeline hands its denoise over to the VAE): their shapes are of no use to the decode, beside which the
-        /// retired pipeline kept them. The managed executor's kept intermediates go back as well. The weights stay.</summary>
+        /// retired pipeline kept them. The managed executor's kept intermediates go back as well. The weights stay. Under a
+        /// split, every stage's plan and every stage device's pool.</summary>
         public void FinishRequest()
         {
             if (Backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlVulkan || _tensorAllocator is TensorSharp.Cuda.CudaAllocator)
                 ReleaseWorkspace();
-            else lock (_gate) (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
-            if (_tensorAllocator is TensorSharp.Cuda.CudaAllocator cuda)
-                lock (_gate) cuda.TrimPool();
+            else lock (_gate) TrimRecycled();
+            if (_tensorAllocator is TensorSharp.Cuda.CudaAllocator)
+                lock (_gate)
+                    foreach (IAllocator a in TensorAllocators()) (a as TensorSharp.Cuda.CudaAllocator)?.TrimPool();
         }
 
         public void ReleaseWorkspace()
         {
             lock (_gate)
             {
-                _plan?.Dispose();
-                _plan = null;
+                DropPlans();
                 // The refined rows are host values: the next clip with this prompt and LoRA set takes them as they are.
                 _textPlan?.Dispose();
                 _textPlan = null;
-                (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+                TrimRecycled();
             }
         }
 
@@ -860,15 +1034,15 @@ namespace TensorSharp.Models.MiniMaxH3
             lock (_gate)
             {
                 if (_disposed) return;
-                _plan?.Dispose();
-                _plan = null;
+                DropPlans();
                 _textPlan?.Dispose();
                 _textPlan = null;
                 foreach (MiniMaxH3DitWeight w in _w.All) ReleaseCopy(w.Data);
-                // The LoRA factors' copies too; the set stays bound and the next step uploads them again.
+                // The LoRA factors' copies too (on every device: the GGML executor's are dropped on each rank); the set stays
+                // bound and the next step uploads them again.
                 if (_lora != null && _tensorAllocator == null) _lora.InvalidateDeviceCopies();
                 foreach (IntPtr factor in _loraHandles.Keys) ReleaseCopy(factor);
-                (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+                TrimRecycled();
                 _preloaded = false;
             }
         }
@@ -879,16 +1053,16 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 if (_disposed) return;
                 _disposed = true;
-                _plan?.Dispose();
-                _plan = null;
+                DropPlans();
                 DropTextPlan();
                 ReleaseLoraDevice();
                 _lora = null;
                 foreach (MiniMaxH3DitWeight w in _w.All) ReleaseCopy(w.Data);
                 foreach (Tensor t in _tensors.Values) t.Dispose();
                 _tensors.Clear();
-                (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+                TrimRecycled();
                 if (_executor is IDisposable owned && _ownsAllocator) owned.Dispose();
+                _stages?.Dispose();
                 _w.Dispose();
             }
         }

@@ -108,6 +108,57 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>Every weight leaf a step binds.</summary>
         public IReadOnlyList<MiniMaxH3DitWeight> All => _all;
 
+        /// <summary>The weight leaves of <paramref name="block"/> (null ones left out).</summary>
+        public static IEnumerable<MiniMaxH3DitWeight> Of(MiniMaxH3DitBlock block)
+        {
+            foreach (MiniMaxH3DitWeight w in new[] { block.Norm1, block.Norm2, block.QNorm, block.KNorm })
+                if (w != null) yield return w;
+            foreach (MiniMaxH3DitLinear l in new[] { block.AdaLn, block.Qkv, block.Out, block.Fc1, block.Fc2 })
+            {
+                if (l?.Weight != null) yield return l.Weight;
+                if (l?.Bias != null) yield return l.Bias;
+            }
+        }
+
+        /// <summary>Each trunk block's weight bytes, in block order (a whole-block split balances them).</summary>
+        public long[] BlockBytes()
+        {
+            var bytes = new long[Blocks.Length];
+            for (int i = 0; i < bytes.Length; i++)
+                foreach (MiniMaxH3DitWeight w in Of(Blocks[i])) bytes[i] += w.Bytes;
+            return bytes;
+        }
+
+        /// <summary>The weight leaves the programs of <paramref name="span"/>'s stage bind: its blocks; where it opens the step,
+        /// the video and audio patch projections and the token refiner's (its program runs on the first stage's device); where
+        /// it closes it, the final layer and both heads. The stages' leaves together are <see cref="All"/>.</summary>
+        public List<MiniMaxH3DitWeight> WeightsOf(SharedDiffusion.DenoiserSpan span)
+        {
+            var weights = new List<MiniMaxH3DitWeight>();
+            void Add(MiniMaxH3DitLinear l)
+            {
+                if (l?.Weight != null) weights.Add(l.Weight);
+                if (l?.Bias != null) weights.Add(l.Bias);
+            }
+            if (span.IsFirst)
+            {
+                Add(VideoPatch);
+                Add(AudioPatch);
+                Add(ConditionProj);
+                foreach (MiniMaxH3DitBlock r in Refiner) weights.AddRange(Of(r));
+                if (RefinerFinalNorm != null) weights.Add(RefinerFinalNorm);
+            }
+            for (int i = span.First; i < span.End; i++) weights.AddRange(Of(Blocks[i]));
+            if (span.IsLast)
+            {
+                Add(FinalAdaLn);
+                Add(FinalVideoOut);
+                Add(FinalAudioOut);
+                if (FinalNorm != null) weights.Add(FinalNorm);
+            }
+            return weights;
+        }
+
         /// <summary>The device bytes the weight leaves take.</summary>
         public long Bytes
         {

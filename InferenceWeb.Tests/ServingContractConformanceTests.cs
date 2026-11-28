@@ -29,7 +29,7 @@ public sealed class ServingContractConformanceTests
     {
         "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
-        "wan", "ltx-2.5", "minimax-h3",
+        "wan", "ltx-2.5",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
         // families they generate media rather than decode steps, so the decoder runtime does not apply.
         "whisper", "kokoro", "ace-step-1.5",
@@ -99,8 +99,6 @@ public sealed class ServingContractConformanceTests
         "ltx-2.5: TensorParallel@ggml_cuda",
         "minimax-h3: HybridParallel@cuda",
         "minimax-h3: HybridParallel@ggml_cuda",
-        "minimax-h3: LayerSplit@cuda",
-        "minimax-h3: LayerSplit@ggml_cuda",
         "minimax-h3: TensorParallel@cuda",
         "minimax-h3: TensorParallel@ggml_cuda",
         "minimax-h3-image: HybridParallel@ggml_cuda",
@@ -185,10 +183,11 @@ public sealed class ServingContractConformanceTests
     /// The families on the shared diffusion runtime (TensorSharp.Models.SharedDiffusion). Each is proven by its own suites
     /// against the implementation it replaced (MiniMax-H3-Image: MiniMaxH3ImageDenoiserTests, MiniMaxH3ImageVaeCodecTests
     /// and MiniMaxH3ImageSwitchTests against the legacy model's denoiser and decoder; Qwen-Image-2.1: QwenImage21DenoiserTests
-    /// against the retired transformer's frozen outputs, QwenImage21Goldens). A family moved there leaves
-    /// <see cref="LegacyBespokeFamilies"/> and joins this list.
+    /// against the retired transformer's frozen outputs, QwenImage21Goldens; MiniMax-H3 video: MiniMaxH3DenoiserTests against the
+    /// retired DiT's frozen steps, MiniMaxH3VideoGoldens). A family moved there leaves <see cref="LegacyBespokeFamilies"/> and
+    /// joins this list.
     /// </summary>
-    internal static readonly HashSet<string> DiffusionRuntimeFamilies = new(StringComparer.Ordinal) { "minimax-h3-image", "qwen_image" };
+    internal static readonly HashSet<string> DiffusionRuntimeFamilies = new(StringComparer.Ordinal) { "minimax-h3", "minimax-h3-image", "qwen_image" };
 
     [Fact]
     public void TheDiffusionRuntimeFamiliesAreExactlyTheKnownOnes()

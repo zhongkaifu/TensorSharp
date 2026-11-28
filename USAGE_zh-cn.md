@@ -1778,7 +1778,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | DeepSeek V4.1 Flash | partial TP + 按层切分 | GGML CUDA 上的 `--layer-split N` 选择整层放置，`--tp N` 选择路由 MoE 切分。两种模式均可配合节点与 peer 参数跨节点运行；TP 中的注意力保持不切分。详见[多节点配置与限制](docs/multi-node-inference.md)。 |
 | Hunyuan Dense | ✅ + 按层切分 + 混合 | 共享解码运行时：与 Mistral 3 相同的放置方式（`--tp T`、`--layer-split P` 及两者组合），每种放置下都保持批处理。 |
 | DiffusionGemma | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
-| Wan 2.1 / 2.2、MiniMax-H3 | — | 仅支持单设备：张量并行、按层切分和分布式组均在启动时被拒绝 |
+| Wan 2.1 / 2.2 | — | 仅支持单设备：张量并行、按层切分和分布式组均在启动时被拒绝 |
+| MiniMax-H3 | 按层切分 | `cuda` 与 `ggml_cuda` 上的 `--layer-split N` 把去噪器的 50 个块按整块分段放到 N 张 GPU 上，按权重字节均衡：每张 GPU 只持有本段的权重与 LoRA 因子，残差流每步在段与段之间传递一次。文本编码器、视觉塔与两个 VAE 留在第一张 GPU 上。它用来容纳单卡放不下的去噪器，不会让单步更快。`--tp N > 1`、`--tp` 与 `--layer-split` 组合以及分布式组均在启动时被拒绝。已在两个模拟的主机设备上逐位验证；双 GPU 测试尚未运行 |
 | Qwen-Image-2.1 | ✅（仅本地，扩散 Transformer） | 在 `ggml_cuda` / `ggml_vulkan` 上，`--tp N`（N 为任何能整除 32 个注意力头的 GPU 数——单机上为 2、4、8 或 16——并受切分时的块对齐约束）切分 DiT 的注意力头与 MLP 列；LoRA 插件随之切分。用已退役的原生计算图在 2× A40 上以 `ggml_cuda` 实测加速 1.34-1.57×，但在 `ggml_vulkan` 上比单卡更慢（0.86×，主机归约）；扩散运行时的切分程序尚未在两张 GPU 上运行过。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，不支持多节点组。见 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#cuda-graph-与张量并行) |
 
 ### 后端支持

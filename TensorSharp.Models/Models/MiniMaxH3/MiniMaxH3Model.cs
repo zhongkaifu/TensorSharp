@@ -23,7 +23,9 @@
 // A clip runs on the diffusion runtime's video pipeline (SharedDiffusion/DiffusionVideoPipeline)
 // with the MiniMax-H3 family's hooks (MiniMaxH3Family): the denoiser's steps are graph programs
 // (MiniMaxH3Denoiser) that the GGML graph executor runs on ggml_cuda / ggml_metal / ggml_cpu and
-// the tensor executors run on cpu / cuda / mlx.
+// the tensor executors run on cpu / cuda / mlx. With --layer-split N (cuda, ggml_cuda) the denoiser's
+// blocks run as whole-block stages over N GPUs (SharedDiffusion/DenoiserStages); the text encoder,
+// vision tower and VAEs stay on the first.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -60,6 +62,8 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly string _tePath;
         private readonly string _vaePath;
         private readonly string _audioVaePath;
+        // The devices the denoiser's whole-block stages run on (--layer-split N), or null for one device.
+        private readonly IReadOnlyList<IAllocator> _denoiserDevices;
         private DiffusionVideoPipeline _pipeline;
 
         /// <summary>The audio VAE's role among the diffusion load's files.</summary>
@@ -84,8 +88,11 @@ namespace TensorSharp.Models.MiniMaxH3
         public MiniMaxH3Config DitConfig { get; }
         public MiniMaxH3Partition Partition { get; }
 
-        public MiniMaxH3Model(string ggufPath, BackendType backend)
-            : base(ggufPath, backend)
+        /// <param name="layerSplitDegree">Devices the denoiser's blocks are split over as whole-block stages (<c>--layer-split
+        /// N</c>; cuda and ggml_cuda): each holds its share of the weights, the text encoder, vision tower and both VAEs run on
+        /// the first.</param>
+        public MiniMaxH3Model(string ggufPath, BackendType backend, int layerSplitDegree = 1)
+            : base(ggufPath, backend, layerSplitDegree: layerSplitDegree)
         {
             _ditPath = ggufPath;
             string dir = Path.GetDirectoryName(Path.GetFullPath(ggufPath));
@@ -143,6 +150,12 @@ namespace TensorSharp.Models.MiniMaxH3
                     "(Comfy-Org/MiniMax-H3). The text encoder also needs vocab.json, merges.txt " +
                     "and tokenizer_config.json (MiniMaxAI/MiniMax-H3, processor/) beside it, since " +
                     "its GGUF carries no tokenizer; a photo or a reference needs the last of them.");
+
+            // The stages' devices now, so a split past the devices this process sees is refused at load, not at the first clip.
+            _denoiserDevices = StageDeviceAllocators();
+            if (_denoiserDevices != null)
+                Console.WriteLine($"  placement    = denoiser blocks over {_denoiserDevices.Count} GPUs as whole-block stages " +
+                                  "(the text encoder, vision tower and VAEs on the first)");
 
             // LoRA plug-ins from the host (--lora / TS_LORAS). They are loaded and checked
             // against the transformer now, so a bad adapter or a contradicted recipe fails
@@ -433,7 +446,8 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
-        /// <summary>The runtime's load: the denoisers, the text encoder and the VAEs this model resolved.</summary>
+        /// <summary>The runtime's load: the denoisers, the text encoder and the VAEs this model resolved, and the devices of
+        /// the denoiser's whole-block stages under a split.</summary>
         private DiffusionLoad Load()
         {
             var files = new Dictionary<string, string>
@@ -443,7 +457,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 [DiffusionLoad.Vae] = _vaePath,
             };
             if (_audioVaePath != null) files[AudioVaeRole] = _audioVaePath;
-            return new DiffusionLoad { Backend = Backend, Files = files };
+            return new DiffusionLoad { Backend = Backend, Files = files, DenoiserDevices = _denoiserDevices };
         }
 
         /// <summary>A runtime report as the hosts' progress: "text-encode" (with the encoder, the denoiser's load and the

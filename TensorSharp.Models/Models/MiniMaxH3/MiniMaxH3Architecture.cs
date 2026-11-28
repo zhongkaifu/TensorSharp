@@ -16,28 +16,23 @@ namespace TensorSharp.Models.MiniMaxH3
             Id = MiniMaxH3Model.ArchitectureId,
             DisplayName = "MiniMax-H3",
             Aliases = new[] { MiniMaxH3Model.ArchitectureId, "minimax_h3" },
-            Factory = c => new MiniMaxH3Model(c.GgufPath, c.Backend),
+            Factory = c => new MiniMaxH3Model(c.GgufPath, c.Backend, c.LayerSplitDegree),
 
             // MiniMax-H3's published GGUFs carry ZERO metadata - no architecture string at
             // all - so they have to be recognised by their tensors. Without this detector,
             // architecture resolution fails closed.
             DetectFromTensors = MiniMaxH3Model.LooksLikeMiniMaxH3,
 
-            // The factory never passes the degree or group on, so without this
-            // declaration --tp N was dropped in silence and a distributed group
-            // was left waiting on collectives this rank never issues.
-            Serving = new ServingContract
-            {
-                Implementation = ServingImplementation.Bespoke,
-                Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.Mlx, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda },
-                Autoregressive = false,
-                HasRoutedExperts = false,
-                ContinuousBatching = MechanismSupport.NotApplicable("generates media, not decode steps; requests are serialized by its pipeline"),
-                TensorParallel = MechanismSupport.None("minimax-h3 has no tensor-parallel path; it runs on one GPU and extra GPUs stay idle."),
-                LayerSplit = MechanismSupport.None("minimax-h3 has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
-                HybridParallel = MechanismSupport.None("minimax-h3 has no multi-GPU placement to combine."),
-                ExpertOffload = MechanismSupport.NotApplicable("no routed experts"),
-            },
+            // A clip runs on the shared diffusion runtime (DiffusionVideoPipeline with MiniMaxH3Family; MiniMaxH3Denoiser is
+            // its IDenoiser). --layer-split N runs the denoiser's blocks as whole-block stages over N GPUs on cuda and
+            // ggml_cuda (DenoiserStages; MiniMaxH3DenoiserTests.WholeBlockStages*); the factory passes the degree on, and the
+            // text encoder, vision tower and VAEs stay on the first GPU. Tensor parallelism and the hybrid are gaps: --tp N
+            // is refused by the gate rather than dropped in silence, and a distributed group never reaches the model.
+            Serving = ServingContract.SharedDiffusionRuntime(
+                new[] { BackendType.Cpu, BackendType.Cuda, BackendType.Mlx, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda },
+                tensorParallelGap: "minimax-h3 has no tensor-parallel path (its denoiser declares no shardable blocks); " +
+                    "--layer-split N places its denoiser's blocks over N GPUs instead.",
+                layerSplitBackends: new[] { BackendType.Cuda, BackendType.GgmlCuda }),
 
             // Step-distillation adapters (the LightX2V Turbo plug-ins) as minimax-h3-lora
             // configs, which declare the checkpoint partition and the sampling contract.
