@@ -118,7 +118,11 @@ namespace TensorSharp.Models.SharedDiffusion
         /// stage's device, after the old plan's memory is released. Returns the plan's first output (the residual stream the
         /// next stage reads, or the last stage's result), valid until the stage runs again.
         /// </summary>
-        public float[] Run(int stage, Action<GraphEmitter> emit, string what)
+        public float[] Run(int stage, Action<GraphEmitter> emit, string what) => RunAll(stage, emit, what)[0];
+
+        /// <summary><see cref="Run"/> returning every output of the stage's plan, in emission order: a family whose blocks carry
+        /// several residual streams (a dual-stream DiT's image and text, or video and audio) hands each on as its own output.</summary>
+        public float[][] RunAll(int stage, Action<GraphEmitter> emit, string what)
         {
             ArgumentNullException.ThrowIfNull(emit);
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -140,7 +144,7 @@ namespace TensorSharp.Models.SharedDiffusion
                 if (!trace.Run(_plans[stage]))
                     throw new InvalidOperationException($"{what} stage {stage} (blocks {First(stage)}-{End(stage) - 1}) failed: " +
                         _plans[stage].LastError);
-                return _plans[stage].Outputs[0];
+                return _plans[stage].Outputs;
             });
         }
 
