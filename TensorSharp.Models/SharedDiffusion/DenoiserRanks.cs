@@ -40,7 +40,9 @@ namespace TensorSharp.Models.SharedDiffusion
         private (ulong, ulong) _signature;
         private bool _disposed;
 
-        public DenoiserRanks(ITensorParallelGroup group)
+        /// <param name="executorFor">A rank device's tensor executor where the family configures its own on one device (direct
+        /// products, served wide DiT regions); null takes the backend's registered executor. Ignored on GGML.</param>
+        public DenoiserRanks(ITensorParallelGroup group, Func<IAllocator, IGraphExecutor> executorFor = null)
         {
             ArgumentNullException.ThrowIfNull(group);
             int n = group.Degree;
@@ -51,14 +53,15 @@ namespace TensorSharp.Models.SharedDiffusion
             _tensorAllocators = new IAllocator[n];
             _devices = new int[n];
             IAllocator first = group.GetAllocator(0);
-            IGraphExecutor lead = GraphExecutors.For(first) ?? throw new NotSupportedException($"{first.GetType().Name} has no graph executor.");
+            IGraphExecutor lead = executorFor?.Invoke(first) ?? GraphExecutors.For(first)
+                ?? throw new NotSupportedException($"{first.GetType().Name} has no graph executor.");
             if (lead is TensorGraphExecutor)
             {
                 var collective = new GroupCollective(group);
                 for (int r = 0; r < n; r++)
                 {
                     IAllocator a = group.GetAllocator(r);
-                    var x = GraphExecutors.For(a) as TensorGraphExecutor
+                    var x = (r == 0 ? lead : executorFor?.Invoke(a) ?? GraphExecutors.For(a)) as TensorGraphExecutor
                         ?? throw new NotSupportedException($"rank {r}'s device has no tensor executor");
                     x.JoinCollective(collective, r);
                     _executors[r] = x;
