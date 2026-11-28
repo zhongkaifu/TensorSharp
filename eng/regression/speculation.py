@@ -23,7 +23,7 @@ _SOURCES = ("benchmarks/AgentTurnBench/Program.cs", "benchmarks/AgentTurnBench/c
             "TensorSharp.Runtime/Scheduling/InferenceEngine.cs",
             "TensorSharp.Runtime/Scheduling/BatchExecutor.cs",
             "TensorSharp.Runtime/Speculative/SpeculatorRegistry.cs",
-            "TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs",
+            "TensorSharp.Models/SharedDecoder/StandardDecoderModel.Speculative.cs",
             "TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Speculative.cs",
             "TensorSharp.Models/Models/MiniMaxM3/MiniMaxM3Model.Speculative.cs")
 _FAMILY_BACKENDS = {
