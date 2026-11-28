@@ -54,6 +54,9 @@ namespace TensorSharp.Graph
         /// <summary>The step is recorded: <see cref="TryLaunch"/> replays it.</summary>
         bool Captured { get; }
 
+        /// <summary>Why the last <see cref="CaptureAndLaunch"/> recorded nothing, or null.</summary>
+        string Refusal => null;
+
         /// <summary>Rank <paramref name="rank"/>'s stable inputs (<see cref="IDecodeCapture.Stable"/>) and the tensors a launch
         /// rewrote (<see cref="IDecodeCapture.MarkWritten"/>); the group records and launches.</summary>
         IDecodeCapture Rank(int rank);

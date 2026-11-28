@@ -414,7 +414,8 @@ public sealed class Qwen35RuntimeTests : IDisposable
         using var recordedGroup = new TensorSharp.Cuda.TensorParallelGroup(2);
         using var placed = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, recordedGroup, 1);
         List<float[]> recorded = LongScript(placed);
-        Assert.True(placed.DecodeRecordings >= 2, $"{variant}: {placed.DecodeRecordings} recordings");
+        Assert.True(placed.DecodeRecordings >= 2, $"{variant}: {placed.DecodeRecordings} recordings, {placed.DecodeAdvances} advances " +
+            $"(last unrecorded: {placed.RankedRecordingSkipped ?? "none"}; last not advanced: {placed.RankedAdvanceRefused ?? "none"})");
         Assert.True(placed.RecordedDecodeReplays >= 8, $"{variant}: {placed.RecordedDecodeReplays} recorded replays");
         for (int i = 0; i < reference.Count; i++)
         {

@@ -50,6 +50,14 @@ namespace TensorSharp.Cuda
 
         public bool Captured { get; private set; }
 
+        public string Refusal { get; private set; }
+
+        private bool Refuse(string reason)
+        {
+            Refusal = reason;
+            return false;
+        }
+
         public IDecodeCapture Rank(int rank) => _ranks[rank];
 
         private IntPtr Stream(int rank) => _ranks[rank].Allocator.Stream.Handle;
@@ -83,15 +91,15 @@ namespace TensorSharp.Cuda
         {
             int n = _ranks.Length;
             if (Captured || _disposed || sequences == null || written == null || sequences.Length != n || written.Length != n)
-                return false;
+                return Refuse("the recording is not open for these ranks");
             for (int r = 0; r < n; r++)
-                if (!_ranks[r].CanRecord(attendLengths, writeRows, sequences[r])) return false;
+                if (!_ranks[r].CanRecord(attendLengths, writeRows, sequences[r])) return Refuse($"rank {r} cannot record this step");
             for (int r = 0; r < n; r++)
                 _ranks[r].Prepare(attendLengths, writeRows, sequences[r]);
             // What the ranks queued before the recording (their inputs' uploads) precedes its launch on rank 0's stream.
             OriginWaitsForRanks();
             RuntimeDecodeCapture origin = _ranks[0];
-            if (!origin.Graphs.BeginCapture(Key)) return false;
+            if (!origin.Graphs.BeginCapture(Key)) return Refuse("rank 0 could not begin recording (another recording is open)");
             int joined = 0;
             string refusal = null;
             try
@@ -131,7 +139,7 @@ namespace TensorSharp.Cuda
             if (refusal != null)
             {
                 Abort(joined, refusal);
-                return false;
+                return Refuse(refusal);
             }
             // Rank 0's stream waits for every rank's recorded work: the recording ends there.
             for (int r = 1; r < n && refusal == null; r++)
@@ -144,7 +152,7 @@ namespace TensorSharp.Cuda
             if (refusal != null)
             {
                 Abort(joined, refusal);
-                return false;
+                return Refuse(refusal);
             }
             bool recorded = false;
             try
@@ -160,7 +168,7 @@ namespace TensorSharp.Cuda
                 for (int r = 1; r < n; r++)
                     _ranks[r].Graphs.EndJoinedCapture(Key, _ranks[r].FirstStable, written[r], recorded);
             }
-            if (!recorded) return false;
+            if (!recorded) return Refuse("the graph could not be ended, made or launched");
             RanksWaitForOrigin();
             foreach (RuntimeDecodeCapture rank in _ranks) rank.MarkRecordedInGroup();
             Captured = true;

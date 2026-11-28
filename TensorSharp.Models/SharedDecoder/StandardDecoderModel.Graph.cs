@@ -2387,18 +2387,22 @@ namespace TensorSharp.Models
         {
             plans = null;
             outputs = default;
-            if (!_rankedReplays.TryGetValue(stage, out RankedReplay r) || r.Epoch != _graphEpoch || r.Shape != shape
-                || r.Slots.Length != slots.Length || BindingsChanged(r.Bindings, r.Stamp, r.Recurrent)) return false;
+            if (!_rankedReplays.TryGetValue(stage, out RankedReplay r)) return RefuseAdvance("no kept step");
+            if (r.Epoch != _graphEpoch || r.Shape != shape || r.Slots.Length != slots.Length)
+                return RefuseAdvance(r.Epoch != _graphEpoch ? "graphs were dropped" : r.Shape != shape ? "another shape" : "other sequences");
+            if (BindingsChanged(r.Bindings, r.Stamp, r.Recurrent)) return RefuseAdvance("a recurrent state was rebound");
             for (int s = 0; s < slots.Length; s++)
             {
                 Slot slot = slots[s];
                 if (!ReferenceEquals(slot, r.Slots[s]) || !ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.Recurrent, r.Recurrent[s])
                     || slot.Capacity != r.Capacity[s] || slot.RopeDelta != r.RopeDelta[s] || starts[s] != r.Starts[s] + 1)
-                    return false;
+                    return RefuseAdvance(starts[s] != r.Starts[s] + 1 ? $"start {starts[s]} after {r.Starts[s]}" : "another slot or its caches");
             }
             if (!_rankGraphCache.TryGetValue(r.Signature, out CachedGraph[] cached) || !ReferenceEquals(cached, r.Plans)
                 || !r.Steps[0].TryAdvance(inputs[0]))
             {
+                RefuseAdvance(cached == null ? "its plans left the cache" : !ReferenceEquals(cached, r.Plans) ? "other plans under its signature"
+                    : "its inputs cannot move on");
                 DropRankedReplay(stage);
                 return false;
             }
@@ -2426,16 +2430,18 @@ namespace TensorSharp.Models
             GraphStep[] steps = r.Steps;
             if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length > runner.MaxRecordedSequences
                 || (_expertHost != null && !runner.Capabilities.RecordsHostExperts))
-                return false;
+                return Skip(r.CaptureFailed ? "its recording failed" : DecodeCaptureDisabled ? "recording is off"
+                    : slots.Length > runner.MaxRecordedSequences ? $"{slots.Length} sequences, the ranks record {runner.MaxRecordedSequences}"
+                    : "host experts read their routes mid-step");
             var keeps = new IGraphTensorOutputs[plans.Length];
             for (int k = 0; k < plans.Length; k++)
-                if ((keeps[k] = plans[k].Plan as IGraphTensorOutputs) == null) return false;
+                if ((keeps[k] = plans[k].Plan as IGraphTensorOutputs) == null) return Skip($"rank {k}'s plan keeps no outputs");
             foreach (GraphStep step in steps)
-                if (step.AttentionFloor > 0 || AnyFloor(step.AttentionFloors)) return false;
+                if (step.AttentionFloor > 0 || AnyFloor(step.AttentionFloors)) return Skip("an attention floor");
             if (Array.Exists(steps, step => step.SlidingFloorInWindow))
             {
                 NoteSlidingWindowUnrecorded();
-                return false;
+                return Skip("a sliding window's floor moves");
             }
             if (r.Capture == null)
             {
@@ -2443,13 +2449,13 @@ namespace TensorSharp.Models
                 if (!runner.HasRoomToRecord())
                 {
                     r.Advances = 0;
-                    return false;
+                    return Skip("no room on a rank's device");
                 }
                 r.Capture = runner.OpenRecording();
                 if (r.Capture == null)
                 {
                     r.CaptureFailed = true;
-                    return false;
+                    return Skip("the ranks' executors cannot record together");
                 }
             }
             int n = slots.Length, ranks = steps.Length;
@@ -2467,7 +2473,7 @@ namespace TensorSharp.Models
                     {
                         r.DisposeCapture();
                         r.CaptureFailed = true;
-                        return false;
+                        return Skip($"rank {bound}'s inputs cannot be rebound");
                     }
                 if (!r.Capture.Captured)
                 {
@@ -2496,9 +2502,10 @@ namespace TensorSharp.Models
                     if (!recorded)
                     {
                         foreach (IGraphTensorOutputs keep in keeps) keep.KeepTensors = false;
+                        string why = r.Capture.Refusal ?? "the recording failed";
                         r.DisposeCapture();
                         r.CaptureFailed = r.Advances > 1;
-                        return false;
+                        return Skip(why);
                     }
                     DecodeRecordings++;
                     r.CaptureOutputs = new Tensor[ranks][];
@@ -2516,7 +2523,7 @@ namespace TensorSharp.Models
                         // Out of device memory: this step runs as usual and the stage's recording is not made again.
                         r.DisposeCapture();
                         r.CaptureFailed = true;
-                        return false;
+                        return Skip("a replay found no device memory");
                     }
                     for (int k = 0; k < ranks; k++) r.Capture.Rank(k).MarkWritten(r.CaptureOutputs[k]);
                     RecordedDecodeReplays++;
@@ -2530,6 +2537,24 @@ namespace TensorSharp.Models
             {
                 for (int k = 0; k < bound; k++) steps[k].UnbindStable();
             }
+        }
+
+        /// <summary>Why the last ranked decode step did not advance its stage's kept step (tests report it), or null.</summary>
+        internal string RankedAdvanceRefused { get; private set; }
+
+        private bool RefuseAdvance(string reason)
+        {
+            RankedAdvanceRefused = reason;
+            return false;
+        }
+
+        /// <summary>Why the last kept ranked decode step ran unrecorded (tests report it), or null.</summary>
+        internal string RankedRecordingSkipped { get; private set; }
+
+        private bool Skip(string reason)
+        {
+            RankedRecordingSkipped = reason;
+            return false;
         }
 
         /// <summary>A recorded step's kept output <paramref name="t"/> read into the plan's output array.</summary>
@@ -2577,6 +2602,9 @@ namespace TensorSharp.Models
             // A decode step one position on from the last runs as it advanced, without a trace (TryAdvanceDecode's rule).
             bool advance = replayable && DecodeStepsAdvance && !DecodeAdvanceDisabled && StepAdapter == null && request.PositionTable == null
                 && !request.RecurrentSnapshots && Array.TrueForAll(counts, c => c == 1);
+            if (!advance && Array.TrueForAll(counts, c => c == 1))
+                RefuseAdvance(!replayable ? "the plans do not replay" : !DecodeStepsAdvance ? "the family's steps do not advance"
+                    : request.PositionTable != null ? "a position table" : request.RecurrentSnapshots ? "recurrent snapshots" : "advancing is off");
             Tensor[] inputs = RankInputs(hidden, span.Stage), carries = carry == null ? null : RankInputs(carry, span.Stage);
             var steps = new GraphStep[ranks];
             CachedGraph[] plans = null;
@@ -2666,6 +2694,10 @@ namespace TensorSharp.Models
                 {
                     KeepRankedReplay(span.Stage, steps, plans, outputs, slots, starts, shape);
                     Array.Clear(steps);
+                }
+                else if (advance)
+                {
+                    RefuseAdvance(owned ? "its plans are not kept" : "a rank's step has an input that cannot move on");
                 }
                 // A one-shot plan is disposed below: its outputs are the caller's arrays, which disposal does not free.
                 CachedGraph[] ran = plans;
