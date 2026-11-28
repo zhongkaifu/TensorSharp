@@ -45,8 +45,9 @@ namespace TensorSharp.Models
             string arch = _gguf.GetString("general.architecture") ?? "raon1nano";
             Config = new ModelConfig { Architecture = arch };
             ParseBaseConfig();
-            if (tpDegree > 1 || layerSplitDegree > 1 || tpGroup != null)
-                throw new NotSupportedException($"{arch}: tensor parallelism and layer split are not implemented yet (one device).");
+            if (tpDegree > 1 || tpGroup != null)
+                throw new NotSupportedException($"{arch}: tensor parallelism is not implemented yet: its lowering traces no rank's shard. " +
+                    "Use --layer-split N for several GPUs.");
 
             RaonSpec p = Spec;
             Config.NumLayers = p.Layers;
@@ -198,16 +199,18 @@ namespace TensorSharp.Models
                     if (chart.ElementCount() != expected)
                         throw new InvalidOperationException($"{name} holds {chart.ElementCount()} values, not {expected}.");
                     float[] v = chart.GetElementsAsFloat(expected);
-                    _charts[(l, ffn)] = (Constant(v, 0, mix * cells, cells, mix), Constant(v, mix * cells, cells, cells),
-                        Constant(v, mix * cells + cells, cells, cells));
+                    // On the layer's whole-layer stage, which reads them.
+                    IAllocator stage = Mesh.Allocator(Mesh.StageOf(l), 0);
+                    _charts[(l, ffn)] = (Constant(stage, v, 0, mix * cells, cells, mix), Constant(stage, v, mix * cells, cells, cells),
+                        Constant(stage, v, mix * cells + cells, cells, cells));
                 }
         }
 
-        private Tensor Constant(float[] source, int offset, int count, params long[] sizes)
+        private Tensor Constant(IAllocator allocator, float[] source, int offset, int count, params long[] sizes)
         {
             var values = new float[count];
             Array.Copy(source, offset, values, 0, count);
-            var t = new Tensor(Mesh.Allocator(0, 0), DType.Float32, sizes);
+            var t = new Tensor(allocator, DType.Float32, sizes);
             t.SetElementsAsFloat(values);
             HostWritten(t);
             return t;

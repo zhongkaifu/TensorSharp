@@ -16,7 +16,8 @@ namespace TensorSharp.GGML
     /// <summary>
     /// The GGML backends' graph executor plugin: a program becomes one ggml graph (the generic native
     /// builder), weights bind to their cached device copies, states update in place, and a replayable
-    /// program keeps its graph and memory. Tensor-parallel programs run on ggml's meta device.
+    /// program keeps its graph and memory. Tensor parallelism runs each rank's program on its own device
+    /// (<see cref="IRankedGraphExecutor"/>), the ranks' graphs together, reducing at their all-reduce nodes.
     /// </summary>
     public sealed class GgmlGraphExecutor : IRankedGraphExecutor
     {
@@ -79,7 +80,6 @@ namespace TensorSharp.GGML
                 // (A40, nsys).
                 // (ggml-vulkan: a family opts in, StandardDecoderModel.PadsPromptWindowsOnVulkan.)
                 PaddedCacheAttention = metal || backend == GgmlBackendType.Cuda,
-                TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,
                 SeparateDeviceCopies = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
                 QuantizedKvCache = true,
@@ -128,9 +128,7 @@ namespace TensorSharp.GGML
         {
             ArgumentNullException.ThrowIfNull(program);
             int maxNodes = Math.Max(1024, program.NodeCount + 64);
-            GgmlGraph g = program.TensorParallelRanks != null
-                ? new GgmlGraph(maxNodes, program.Replayable, program.TensorParallelRanks)
-                : new GgmlGraph(maxNodes, program.Replayable, program.Reorder && Capabilities.ConcurrencyReorder);
+            var g = new GgmlGraph(maxNodes, program.Replayable, program.Reorder && Capabilities.ConcurrencyReorder);
             var outputs = new List<float[]>();
             var pins = new List<GCHandle>();
             int served = 0, lowered = 0;
@@ -144,10 +142,7 @@ namespace TensorSharp.GGML
                 {
                     switch (n.Kind)
                     {
-                        case GraphNodeKind.Leaf:
-                            int leaf = g.Leaf((GgmlLeafRole)(int)n.Role, n.Format, n.Ne, n.Data, n.Bytes);
-                            if (n.Split != null) g.Split(leaf, n.Split.Axis, n.Split.Ne, n.Split.Nr);
-                            break;
+                        case GraphNodeKind.Leaf: g.Leaf((GgmlLeafRole)(int)n.Role, n.Format, n.Ne, n.Data, n.Bytes); break;
                         case GraphNodeKind.Op: g.Op((GgmlGraphOp)(int)n.Op, n.Srcs, n.Ip, n.Fp); break;
                         case GraphNodeKind.Effect: g.Effect(n.Node); break;
                         case GraphNodeKind.Alias: g.Alias(n.Node, n.Srcs[0], n.Bytes, n.Srcs[1]); break;
@@ -182,9 +177,13 @@ namespace TensorSharp.GGML
         /// ggml-cuda sums each partial on the devices (NCCL or its peer pipeline); ggml-vulkan's collective sums it through
         /// host memory (ggml-vulkan-comm's imported host buffers, or the driver's own host staging, tsg::tp_reduce_segment,
         /// without it), the transport legacy Muse-Glimmer's Vulkan --tp ran on. That is two host crossings a layer, where the
-        /// per-op tensor-parallel path the runtime ran on Vulkan before crossed for every op (see <see cref="RanksSumOnHost"/>).</summary>
-        public bool RunsRanks(int ranks)
-            => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
+        /// per-op tensor-parallel path the runtime ran on Vulkan before crossed for every op (see <see cref="RanksSumOnHost"/>).
+        /// A hybrid placement's stages are <paramref name="groups"/> groups of the context's devices, each a run of consecutive
+        /// devices (TSGgml_GraphRunRanked takes the graphs of one); the context's collective spans all of its devices, so a
+        /// stage's partials sum through host staging.</summary>
+        public bool RunsRanks(int ranks, int groups = 1)
+            => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan && ranks > 1 && groups >= 1
+               && GgmlBasicOps.TensorParallelFusedAvailable(ranks * groups);
 
         /// <summary>Whether <paramref name="ranks"/> ranks of a loopback group run here (TSGgml_TensorParallelInitLoopback on
         /// ggml-cpu or ggml-metal: backend instances on the one device, sums through host memory). A caller that opts in
@@ -198,8 +197,8 @@ namespace TensorSharp.GGML
         /// two. Without a collective that passed its probe (tsg::tp_device_allreduce_usable) the native driver stages the sums
         /// through host RAM itself (tsg::tp_reduce_segment). Only ggml-cuda's NCCL or peer pipeline keeps them on the
         /// devices.</summary>
-        public bool RanksSumOnHost(int ranks)
-            => RunsRanks(ranks) && (Backend == GgmlBackendType.Vulkan || !GgmlNative.TensorParallelHasDeviceAllReduce());
+        public bool RanksSumOnHost(int ranks, int groups = 1)
+            => RunsRanks(ranks, groups) && (groups > 1 || Backend == GgmlBackendType.Vulkan || !GgmlNative.TensorParallelHasDeviceAllReduce());
 
         /// <summary>A graph is built for the active rank's device: compile with rank <paramref name="rank"/> active.</summary>
         public IGraphPlan CompileForRank(GraphProgram program, int rank)

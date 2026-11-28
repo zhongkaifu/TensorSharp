@@ -486,14 +486,16 @@ namespace TensorSharp.Models
             => _slotStateBytes < 0 ? -1 : _slotBytesPerToken * capacity + _slotStateBytes + SlotExtraBytes;
 
         /// <summary>
-        /// Whether one device's free memory bounds how many requests hold slots: Metal's working set, or one ggml_cuda GPU
-        /// (a split or tensor-parallel mesh plans its devices explicitly), as Qwen4ExpModel and Qwen35Model admit their
-        /// holders. Without it the runtime allocated a slot for every concurrent request and kept every finished one: two
-        /// Qwen3.8-Flash-Next conversations on a 48 GB Mac reached 38 GB wired, where Qwen4ExpModel stayed at 32 GB; an
-        /// allocation past a CUDA GPU's memory aborts the process inside ggml.
+        /// Whether device memory bounds how many requests hold slots: Metal's working set, one ggml_cuda GPU, or every GPU of
+        /// a local mesh (tensor-parallel ranks, layer-split stages, on ggml_cuda or direct CUDA), each judged by its own share
+        /// of a slot (<see cref="SlotDeficit"/>), as Qwen4ExpModel and Qwen35Model admit their holders. Without it the runtime
+        /// allocated a slot for every concurrent request and kept every finished one: two Qwen3.8-Flash-Next conversations on
+        /// a 48 GB Mac reached 38 GB wired, where Qwen4ExpModel stayed at 32 GB; an allocation past a CUDA GPU's memory aborts
+        /// the process inside ggml. One direct-CUDA device accounts its memory itself (<see cref="DeviceRoomManaged"/>).
         /// </summary>
-        private bool AdmitsSlotsByDeviceMemory => IsGgmlBackend && _mesh.Stages == 1 && _mesh.TensorParallel == 1
-            && LayerSplitGroup == null && (_backend == BackendType.GgmlMetal || _backend == BackendType.GgmlCuda);
+        private bool AdmitsSlotsByDeviceMemory => LayerSplitGroup == null && (_mesh.IsSingleDevice
+            ? IsGgmlBackend && (_backend == BackendType.GgmlMetal || _backend == BackendType.GgmlCuda)
+            : true);   // a mesh whose devices report no memory (host-memory or simulated devices) measures no deficit
 
         /// <summary>The device memory kept free beside the slots: the larger of 1 GB and 1/32 of it.</summary>
         private static long DeviceHeadroom(long totalBytes) => Math.Max(1L << 30, totalBytes / 32);
@@ -536,6 +538,59 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// What the device shortest of room lacks for one more slot of <paramref name="capacity"/> cells beside its headroom
+        /// (0 when every device fits it or none is measured yet). One device: <see cref="DeviceDeficit"/>. A mesh: every device
+        /// that holds part of a slot (<see cref="_slotShares"/>: a stage's layers, a rank's heads) against its own free memory,
+        /// after the kept graph arenas are released and then the idle slots' device copies dropped. Before, a tensor-parallel or layer-split model gave every concurrent
+        /// request a slot, and a GPU that filled aborted the process inside ggml.
+        /// </summary>
+        private long SlotDeficit(int capacity)
+        {
+            if (_mesh.IsSingleDevice) return DeviceDeficit(SlotDeviceBytes(capacity));
+            if (_slotShares == null || _slotShares.Length == 0) return 0;
+            long Worst()
+            {
+                long worst = 0;
+                foreach (var (stage, rank, perToken, states) in _slotShares)
+                {
+                    if (MeshDeviceMemory(stage, rank) is not { } m) continue;
+                    long need = perToken * capacity + states + SlotExtraBytes;
+                    worst = Math.Max(worst, need + DeviceHeadroom(m.Total) - m.Free);
+                }
+                return worst;
+            }
+            long deficit = Worst();
+            if (deficit > 0 && IsGgmlBackend && GgmlBasicOps.ReleaseKeptArenas() > 0)
+                deficit = Worst();
+            if (deficit > 0 && DropIdleSlotDeviceCopies() > 0)
+                deficit = Worst();
+            return deficit;
+        }
+
+        /// <summary>The free and total bytes of the mesh's device (<paramref name="stage"/>, <paramref name="rank"/>), or null where
+        /// it has none of its own (host memory, simulated devices); tests stand in for it (<see cref="SlotDeviceMemoryForTests"/>).</summary>
+        private (long Free, long Total)? MeshDeviceMemory(int stage, int rank)
+        {
+            if (SlotDeviceMemoryForTests?.Invoke(_mesh.GlobalDevice(stage, rank)) is { } stand) return stand;
+            IAllocator allocator = _mesh.Allocator(stage, rank);
+            if (allocator is IDeviceMemoryInfo memory)
+                return !memory.SharesHostMemory && memory.TryGetDeviceMemory(out long free, out long total) && total > 0 ? (free, total) : null;
+            // One GGML device keeps its own probe (DeviceMemoryProbe); a mesh's GGML devices are each asked in turn, the backend
+            // reporting the calling thread's active device.
+            if (_mesh.IsSingleDevice || allocator is not GgmlAllocator ggml || _backend != BackendType.GgmlCuda) return null;
+            int previous = GgmlBasicOps.GetActiveRank();
+            GgmlBasicOps.SetActiveRank(ggml.DeviceId);
+            try
+            {
+                return GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0 ? (free, total) : null;
+            }
+            finally
+            {
+                GgmlBasicOps.SetActiveRank(previous);
+            }
+        }
+
+        /// <summary>
         /// Drops the device copies of the slots no request runs on (finished requests kept for a continuation, pooled ones)
         /// where the executor keeps separate device copies: their host tensors hold every row and state (synced first), and
         /// a slot's next graph uploads what it binds. Kept, they filled the device: fifteen finished Qwen3.8-27B DFlash2
@@ -544,8 +599,9 @@ namespace TensorSharp.Models
         /// </summary>
         private int DropIdleSlotDeviceCopies()
         {
-            // One device: a split's or a rank's copies live in another device's cache.
-            if (!KeepsDeviceCopies || _mesh.Stages != 1 || _mesh.TensorParallel != 1
+            // One device, a local layer split's stages or per-rank tensor-parallel graphs' ranks: the native sync and
+            // invalidation visit every device's cache, so each stage's or rank's copies go wherever they live.
+            if (!KeepsDeviceCopies || LayerSplitGroup != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
                 || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
                 return 0;
             int dropped = 0;
@@ -581,7 +637,7 @@ namespace TensorSharp.Models
         /// allocated (<see cref="EnsureDeviceRoom"/>), which knows what to keep.</remarks>
         protected override long DeviceMemoryDeficitBytes()
         {
-            if (AdmitsSlotsByDeviceMemory) return DeviceDeficit(SlotDeviceBytes(FreshSlotTokens));
+            if (AdmitsSlotsByDeviceMemory) return SlotDeficit(FreshSlotTokens);
             if (!DeviceRoomManaged) return 0;
             var (free, total) = DeviceMemory();
             return total <= 0 ? 0 : Math.Max(0, DeviceHeadroom(total) - free);
@@ -597,7 +653,7 @@ namespace TensorSharp.Models
         {
             if (!AdmitsSlotsByDeviceMemory || _slots == null || _slots.Count == 0 || (_slotPool?.Count ?? 0) > 0) return;
             long need = SlotDeviceBytes(capacity);
-            long deficit = DeviceDeficit(need);
+            long deficit = SlotDeficit(capacity);
             if (deficit > 0)
                 throw new SequenceSlotUnavailableException(
                     $"{Config.Architecture}: no device memory for another request's slot ({need / 1048576.0:F0} MB, " +
@@ -610,13 +666,15 @@ namespace TensorSharp.Models
         /// bytes are dead rows (past the slot's length) or a reset state's zeros; with <paramref name="overwritten"/>, a copy
         /// on the device writes every bound byte before anything reads it. Those uploads were most of a request's setup:
         /// Qwen3.5-9B on an RTX 2000 Ada uploaded 48-165 MB per graph at ~3 GB/s, twice a request (its slot, then its prefix
-        /// checkpoint's), 31-65 ms each. A state whose reset is not all zeros keeps the upload.
+        /// checkpoint's), 31-65 ms each. A state whose reset is not all zeros keeps the upload. Each device primes its own
+        /// share: a rank's heads under per-rank tensor-parallel graphs, a whole-layer stage's layers on its device. Stages had
+        /// primed nothing: on two ggml_cuda GPUs every request's clone of a 3.4K-token prefix uploaded its whole capacity
+        /// (Qwen3.5-9B, about 160 MB) before its first token, ~50 ms more than on one GPU.
         /// </summary>
         private void PrimeDeviceCopies(Slot slot, bool overwritten)
         {
-            // One device, or the ranks of per-rank tensor-parallel graphs: each rank primes its share on its own device.
-            bool ranked = RankedSlotCopies;
-            if (!IsGgmlBackend || _mesh.Stages != 1 || (_mesh.TensorParallel != 1 && !ranked)
+            bool ranked = RankedSlotCopies, staged = _mesh.Stages > 1;
+            if (!IsGgmlBackend || LayerSplitGroup != null || (_mesh.TensorParallel != 1 && !ranked)
                 || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
                 return;
             // Each by the bytes a graph binds it with (ggml's size of the leaf): a cache whole, a state's F32 view by its
@@ -625,33 +683,36 @@ namespace TensorSharp.Models
             // each on ggml-vulkan. Apart, a slot that grows frees its old caches' buffer whole.
             var keys = new List<IntPtr>();
             var bytes = new List<long>();
-            int previous = ranked ? GgmlBasicOps.GetActiveRank() : 0;
+            bool switches = ranked || staged;
+            int previous = switches ? GgmlBasicOps.GetActiveRank() : 0;
             try
             {
+                for (int stage = 0; stage < _mesh.Stages; stage++)
                 for (int rank = 0; rank < _mesh.TensorParallel; rank++)
                 {
-                    if (ranked) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, rank));
-                    foreach (Tensor t in RankTensors(slot.K, rank)) Add(t, t.Storage.ByteLength);
-                    foreach (Tensor t in RankTensors(slot.V, rank)) Add(t, t.Storage.ByteLength);
+                    if (switches) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(stage, rank));
+                    foreach (Tensor t in StageRankTensors(slot.K, stage, rank)) Add(t, t.Storage.ByteLength);
+                    foreach (Tensor t in StageRankTensors(slot.V, stage, rank)) Add(t, t.Storage.ByteLength);
                     Prime();
                     if (slot.Recurrent == null) continue;
-                    foreach (RecurrentState[] layer in slot.Recurrent)
-                        if (layer != null && rank < layer.Length && layer[rank]?.GraphTensors is { } tensors
-                            && (overwritten || layer[rank].GraphTensorsResetToZero))
+                    for (int l = 0; l < slot.Recurrent.Length; l++)
+                        if (slot.Recurrent[l] is { } layer && StageOfLayer(l) == stage && rank < layer.Length
+                            && layer[rank]?.GraphTensors is { } tensors && (overwritten || layer[rank].GraphTensorsResetToZero))
                             foreach (Tensor t in tensors) Add(t, t.ElementCount() * sizeof(float));
                     Prime();
                 }
             }
             finally
             {
-                if (ranked) GgmlBasicOps.SetActiveRank(previous);
+                if (switches) GgmlBasicOps.SetActiveRank(previous);
             }
 
-            static IEnumerable<Tensor> RankTensors(Tensor[][] caches, int rank)
+            IEnumerable<Tensor> StageRankTensors(Tensor[][] caches, int stage, int rank)
             {
                 if (caches == null) yield break;
-                foreach (Tensor[] entry in caches)
-                    if (entry != null && rank < entry.Length && entry[rank] != null) yield return entry[rank];
+                for (int e = 0; e < caches.Length; e++)
+                    if (CacheStage(e) == stage && caches[e] is { } entry && rank < entry.Length && entry[rank] != null)
+                        yield return entry[rank];
             }
 
             void Add(Tensor t, long size)
@@ -1253,7 +1314,7 @@ namespace TensorSharp.Models
             // no head and hands the host nothing, so its run returns with its work queued while the next round is embedded,
             // traced and built. The slots hold their whole chunks first, so no round grows them.
             IDisposable overlap = null;
-            if (OverlapPromptSteps && rounds > 1 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null
+            if (OverlapPromptSteps && rounds > 1 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs
                 && followedEnds == null && !wantsFeatures && _slots != null
                 && requestIds.All(id => _slots.ContainsKey(id)))
             {

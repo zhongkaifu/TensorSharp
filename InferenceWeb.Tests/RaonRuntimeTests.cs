@@ -96,6 +96,33 @@ public sealed class RaonRuntimeTests : IDisposable
         for (int i = 0; i < managed.Count; i++) AssertClose(managed[i], ggml[i], tolerance, $"step {i}");
     }
 
+    /// <summary>Whole-layer stages answer as one device: each stage's layers run the one device's ops, the hc streams and
+    /// the per-layer embeddings (the stage carry) passing from stage to stage, the RDA states with their layers.</summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void PlacementMatchesOneDevice(int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture();
+        int[] prompt = Prompt(17), decode = { 9, 41, 77, 5 };
+        List<float[]> Run(RaonRuntimeModel model)
+        {
+            using (model)
+            {
+                var logits = new List<float[]> { (float[])model.Forward(prompt).Clone() };
+                foreach (int t in decode) logits.Add((float[])model.Forward(new[] { t }).Clone());
+                Assert.True(model.GraphRuns > 0, "no graph ran");
+                return logits;
+            }
+        }
+        List<float[]> one = Run(Create(path));
+        var placed = new RaonRuntimeModel(path, BackendType.Cpu, layerSplitDegree: stages);
+        Assert.Equal(stages, placed.Mesh.Stages);
+        List<float[]> split = Run(placed);
+        for (int i = 0; i < one.Count; i++) AssertClose(one[i], split[i], 1e-6, $"{stages} stages, step {i}");
+    }
+
     [Fact]
     public void SpeculativeDecodingMatchesPlainGreedy()
     {

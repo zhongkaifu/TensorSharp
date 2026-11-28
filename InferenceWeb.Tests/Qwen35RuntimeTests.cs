@@ -517,8 +517,10 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.Equal(tp, placed.Mesh.TensorParallel);
         Assert.Equal(stages, placed.Mesh.Stages);
         List<float[]> actual = Script(placed);
-        // One stage of tensor parallelism runs per-rank graphs: their partials meet in the graphs' all-reduces.
-        if (tp > 1 && stages == 1) Assert.True(group.AllReduceCount > 0 && placed.GraphRuns > 0, $"{variant} tp={tp}: no per-rank graph ran");
+        // Tensor parallelism runs per-rank graphs, a hybrid's on every stage's group: their partials meet in the graphs'
+        // all-reduces (one stage's through the group's own collective).
+        if (tp > 1) Assert.True(placed.RunsRankGraphs && placed.GraphRuns > 0, $"{variant} tp={tp} stages={stages}: no per-rank graph ran");
+        if (tp > 1 && stages == 1) Assert.True(group.AllReduceCount > 0, $"{variant} tp={tp}: no all-reduce ran on the group");
         double tolerance = tp == 1 ? 0 : 1e-4;
         for (int i = 0; i < reference.Count; i++)
         {
@@ -1703,6 +1705,36 @@ public sealed class Qwen35RuntimeTests : IDisposable
         model.SlotDeviceMemoryForTests = d => (Need(d), total);
         Assert.True(model.RoomForSlotsForTests(capacity, 1));
         Assert.False(model.RoomForSlotsForTests(capacity, 2));
+    }
+
+    /// <summary>A new request's slot on a mesh (two whole-layer stages, or two tensor-parallel ranks) waits while any device
+    /// holding part of it is short of its share beside its headroom, and the prefix cache sees that device's deficit. Before,
+    /// a layer-split or tensor-parallel model gave every concurrent request a slot until a GPU filled and ggml aborted the
+    /// process; one device's own probe had been the only admission.</summary>
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(1, 2)]
+    public void ANewSlotWaitsForRoomOnEveryDeviceOfAMesh(int stages, int tp)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), tp: tp, stages: stages);
+        var unified = (IUnifiedBatchModel)model;
+        unified.EnsureSequenceSlot("a", 64);
+        var shares = model.SlotSharesForTests;
+        Assert.Equal(2, shares.Length);
+        const long total = 1L << 34;
+        long plenty = long.MaxValue / 4;
+        // Devices without a report (host memory, simulated devices) measure nothing.
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        model.SlotDeviceMemoryForTests = _ => (plenty, total);
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        unified.EnsureSequenceSlot("b", 64);
+        // The second device has nothing free: its share does not fit, whatever the first device holds.
+        model.SlotDeviceMemoryForTests = d => (d == 1 ? 0 : plenty, total);
+        Assert.True(model.DeviceSlotDeficitBytes > 0);
+        Assert.Throws<SequenceSlotUnavailableException>(() => unified.EnsureSequenceSlot("c", 64));
+        model.SlotDeviceMemoryForTests = _ => (plenty, total);
+        unified.EnsureSequenceSlot("c", 64);
     }
 
     /// <summary>A conversation's next turn adopts its retained slot (exactly its rows) and reserves past it: the rows move into

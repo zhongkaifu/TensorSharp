@@ -487,7 +487,7 @@ NVFP4 scale、latent bottleneck、共享 expert、逐层 expert 数与 top-k）�
 | 前缀缓存、检查点 | 全部 | 运行时的 holder 适配器。缓存的前缀在其检查点处携带 Mamba-2 状态，因此续接时 K/V 行与递归状态一起恢复。由 `CheckpointsContinueExactly` 覆盖。 |
 | `--tp N` | cuda、ggml_cuda、ggml_vulkan | 按 rank 的计算图。Mamba-2 按连续的 group 块切分：`ssm_in` 的行块，以及每个 rank 一个 `ssm_out` 列块，因此量化行不会在块内被切开。注意力按 head 切分，每个 expert 按宽度切分。保持批处理。仅在模拟设备上覆盖（§11）。 |
 | `--layer-split N` | cuda、ggml_cuda、ggml_vulkan | 整层阶段，保持批处理。 |
-| 混合（`--tp` x `--layer-split`） | 无（缺口） | 这个只用计算图的家族还没有张量并行阶段的计算图。 |
+| 混合（`--tp` x `--layer-split`） | cuda、ggml_cuda、ggml_vulkan | 运行时的混合放置：每个整层阶段在自己的组上以按 rank 的计算图运行其层，残差流经主机从一个阶段传到下一个阶段；在 GGML 上，阶段内的部分和经主机暂存求和（上下文的集合通信跨越它的全部设备）。只在模拟设备上覆盖过。 |
 | `--n-cpu-moe` / `--cpu-moe` | 全部 | 单设备或各阶段上可用；`--tp` 下拒绝。见 §10。 |
 | 投机解码 | 全部 | n-gram 草稿、Nemotron 3.5 MTP 头（主干内的 NextN 块，或通过 `--draft-model` 加载的 MTP GGUF），以及 DFlash 与 DSpark 块级草稿器（`--draft-model`，见下文），在能精确回退 Mamba-2 状态的窗口中验证。 |
 | 文本 LoRA | cpu、ggml_cpu、ggml_cuda、cuda | 单设备。每个被适配乘积的增量都在计算图中（`AppliesTextLoraInGraphs`）。适配目标与以前相同（见下文"文本 LoRA 适配器"）。 |

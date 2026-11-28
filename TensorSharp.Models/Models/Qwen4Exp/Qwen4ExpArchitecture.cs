@@ -42,8 +42,9 @@ namespace TensorSharp.Models
 
             Serving = new ServingContract
             {
-                // The shared runtime on every backend but MLX; not ServingContract.SharedRuntime because the runtime runs
-                // --tp and --layer-split only as separate placement modes for this family (no hybrid).
+                // The shared runtime on every backend but MLX, every placement the runtime's. Registered as bespoke until a
+                // conformance suite declares the shared runtime's mechanism tests for it (ServingContractConformanceTests
+                // .EverySharedRuntimeFamilyHasAConformanceFixture); Qwen4ExpRuntimeTests proves them under its own names.
                 Implementation = ServingImplementation.Bespoke,
                 Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlMetal,
                     BackendType.GgmlCuda, BackendType.GgmlVulkan },
@@ -53,8 +54,8 @@ namespace TensorSharp.Models
                 // Per-rank graphs: ggml's multi-device backends, and the CUDA graph executor's ranks on --backend cuda.
                 TensorParallel = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda).KeepsBatching(),
                 LayerSplit = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda).KeepsBatching(),
-                // The runtime's staged graphs do not run per-rank graphs yet, and qwen4exp runs only as graphs.
-                HybridParallel = MechanismSupport.None("qwen4exp runs --tp and --layer-split as separate placement modes."),
+                // The runtime's hybrid: every whole-layer stage runs its layers as per-rank graphs over its own group.
+                HybridParallel = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda).KeepsBatching(),
                 ExpertOffload = MechanismSupport.On(BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlMetal,
                     BackendType.GgmlCuda, BackendType.GgmlVulkan),
             },

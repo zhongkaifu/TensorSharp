@@ -186,10 +186,12 @@ public sealed class GptOssRuntimeTests : IDisposable
         { "mxfp4", 1, 2 },
         { "tp", 1, 2 },
         { "long", 1, 3 },
+        { "tp", 2, 2 },
     };
 
     /// <summary>Tensor parallelism (per-rank graphs over simulated devices: each rank owns its heads, their biases and sinks,
-    /// and a slice of every expert's width with its biases) and whole-layer stages answer as one device.</summary>
+    /// and a slice of every expert's width with its biases), whole-layer stages and their hybrid (every stage's layers as
+    /// per-rank graphs over its own group) answer as one device.</summary>
     [Theory]
     [MemberData(nameof(Placements))]
     public void PlacementMatchesOneDevice(string name, int tp, int stages)

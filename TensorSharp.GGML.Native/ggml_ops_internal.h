@@ -273,6 +273,12 @@ namespace tsg
         // The sidecar must be released before backend replacement/teardown.
         ggml_backend_t spark_float32_backend = nullptr;
         std::mutex spark_float32_mutex;
+        // Inkling 2's fused-op backend over this rank's ggml-cuda backend (made at its first use; null where it cannot
+        // be made, and not asked again until the backend is released). One per rank, released with the backend as the
+        // Spark sidecar is: a layer split runs each stage's graphs on its own rank's backend.
+        ggml_backend_t inkling_fused_backend = nullptr;
+        bool inkling_fused_made = false;
+        std::mutex inkling_fused_mutex;
         // Index into the ggml device list this slot was initialized from
         // (== the CUDA/Vulkan ordinal). -1 until initialized.
         int device_index = -1;
@@ -1165,6 +1171,9 @@ namespace tsg
     {
         // Optional TensorSharp wrapper sharing this rank's underlying device stream.
         ggml_backend_t backend = nullptr;
+        // The device this plan runs on, or -1 for its rank index. A ranked run's plans are one group's: consecutive
+        // devices from plans[0]'s (a hybrid placement's stage of devices [first, first + ranks) inside the context).
+        int device = -1;
         // Some upstream device collectives compress large F32 tensors to BF16.
         // Precision-sensitive graph families require exact F32 transport instead.
         bool allreduce_f32 = false;
@@ -1195,6 +1204,7 @@ namespace tsg
         void clear()
         {
             backend = nullptr;
+            device = -1;
             allreduce_f32 = false;
             graph = nullptr;
             seg_end.clear();
@@ -1216,8 +1226,11 @@ namespace tsg
     // the builder did not emit.
     bool tp_plan_segments(TpRankPlan& plan, const std::vector<ggml_tensor*>& boundary);
 
-    // Run one segmented graph per rank. `plans[r]` must describe rank r and all
-    // ranks must agree on the segment count. Returns false (with the last error
+    // Run one segmented graph per rank. `plans[r]` must describe rank r of the
+    // group (device plans[0]->device + r, or rank r of the context when the
+    // plans carry no device) and all ranks must agree on the segment count. A
+    // group of devices other than the context's whole set reduces through host
+    // staging: the context's collective spans all of its devices. Returns false (with the last error
     // set) when a submission or a collective fails.
     /// Cross-node AllReduce hook: sums `data` element-wise across every node
     /// of the cluster and leaves the result in place on all of them. Returns
@@ -1621,6 +1634,8 @@ namespace tsg
     // Free the cached reuse buffer (called from TSGgml_Shutdown).
     void free_reuse_compute_buffer();
 
+    // Free the active rank's fused-op sidecars (the Spark F32 backend and Inkling 2's fused-op backend) before its backend
+    // is replaced or freed; the plural form frees every rank's.
     void free_spark_float32_backend();
     void free_spark_float32_backends();
 

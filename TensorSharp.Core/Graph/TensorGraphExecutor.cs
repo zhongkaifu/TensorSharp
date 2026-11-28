@@ -115,8 +115,6 @@ namespace TensorSharp.Graph
         public IGraphPlan Compile(GraphProgram program)
         {
             ArgumentNullException.ThrowIfNull(program);
-            if (program.TensorParallelRanks != null)
-                throw new NotSupportedException($"{GetType().Name} runs a program on one device.");
             return new Plan(this, program);
         }
 

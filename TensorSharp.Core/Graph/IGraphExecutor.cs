@@ -48,8 +48,6 @@ namespace TensorSharp.Graph
         public bool ConcurrencyReorder { get; init; }
         /// <summary>The bucket a decode step's padded attention window grows by (a window's programs replay).</summary>
         public int DecodeWindowRows { get; init; } = 256;
-        /// <summary>Programs may spread over several ranks (<see cref="GraphProgram.TensorParallelRanks"/>).</summary>
-        public bool TensorParallel { get; init; }
         /// <summary>Prompt chunks write K/V by row index (no copy into a strided cache view).</summary>
         public bool IndexedCacheWrites { get; init; }
         /// <summary>A prompt chunk that attends its own fresh K/V rows takes them as the permuted views of its projections: it
@@ -264,19 +262,23 @@ namespace TensorSharp.Graph
     /// </summary>
     public interface IRankedGraphExecutor : IGraphExecutor
     {
-        /// <summary>Whether steps over <paramref name="ranks"/> devices can run here (the devices' collective is up).</summary>
-        bool RunsRanks(int ranks);
+        /// <summary>Whether steps over groups of <paramref name="ranks"/> devices can run here: the executor's devices split into
+        /// <paramref name="groups"/> such groups in device order (a hybrid placement's whole-layer stages; one: tensor
+        /// parallelism over every device), and their collective is up.</summary>
+        bool RunsRanks(int ranks, int groups = 1);
 
-        /// <summary>Whether the ranks' all-reduces over <paramref name="ranks"/> devices go through host memory (ggml-vulkan's
-        /// collective, or a CUDA group whose NCCL / peer path is not usable). Each step then pays a host round trip a
-        /// reduction, so the runtime takes wider prompt steps there (<c>StandardDecoderModel.RingStepRowsForPlacement</c>).</summary>
-        bool RanksSumOnHost(int ranks);
+        /// <summary>Whether the ranks' all-reduces within a group of <paramref name="ranks"/> devices (of <paramref name="groups"/>)
+        /// go through host memory (ggml-vulkan's collective, a CUDA group whose NCCL / peer path is not usable, or a stage's
+        /// devices inside a larger group). Each step then pays a host round trip a reduction, so the runtime takes wider prompt
+        /// steps there (<c>StandardDecoderModel.RingStepRowsForPlacement</c>).</summary>
+        bool RanksSumOnHost(int ranks, int groups = 1);
 
-        /// <summary>Compile <paramref name="program"/> for rank <paramref name="rank"/>'s device.</summary>
+        /// <summary>Compile <paramref name="program"/> for device <paramref name="rank"/> of the executor's devices.</summary>
         IGraphPlan CompileForRank(GraphProgram program, int rank);
 
-        /// <summary>Run every rank's plan together; false with <paramref name="error"/> on failure. <paramref name="exactSums"/>:
-        /// sum the partials in F32 whatever the transport would round (a fast transport may carry large sums in BF16).</summary>
+        /// <summary>Run every rank's plan together; false with <paramref name="error"/> on failure. The plans are one group's,
+        /// in rank order, compiled for consecutive devices. <paramref name="exactSums"/>: sum the partials in F32 whatever the
+        /// transport would round (a fast transport may carry large sums in BF16).</summary>
         bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, bool exactSums, out string error);
     }
 

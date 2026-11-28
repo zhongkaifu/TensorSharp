@@ -23,7 +23,7 @@ namespace TensorSharp.Models
             Id = "nemotron_h",
             DisplayName = "Nemotron-H",
             Aliases = new[] { "nemotron_h", "nemotron_h_moe", "nemotron_h_omni" },
-            // On the shared decoder runtime (NemotronRuntimeModel): one device, --tp, whole-layer stages, continuous batching,
+            // On the shared decoder runtime (NemotronRuntimeModel): one device, --tp, whole-layer stages and their hybrid, continuous batching,
             // the prefix cache, checkpoints, host-served experts, speculation (n-gram, the Nemotron 3.5 MTP head, DFlash / DSpark
             // drafters).
             Factory = c => new NemotronRuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
@@ -35,8 +35,8 @@ namespace TensorSharp.Models
                 ContinuousBatching = MechanismSupport.On(ServingContract.AllBackends.ToArray()),
                 TensorParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
                 LayerSplit = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
-                // The graph-only family has no graphs for tensor-parallel stages yet.
-                HybridParallel = MechanismSupport.None("Nemotron-H runs whole-forward graphs only, which do not cover tensor-parallel stages yet; use --tp N or --layer-split N."),
+                // The runtime's hybrid: every whole-layer stage runs its layers as per-rank graphs over its own group.
+                HybridParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
                 // --n-cpu-moe / --cpu-moe: an offloaded layer's routed experts stay in host memory and run at the graph's host
                 // seam (the tensor executors' expert host; GGML's host MoE segment): one projection, relu(s up)^2, each route's
                 // NVFP4 up scale s applied before the square. Per-rank graphs keep their experts on the devices.

@@ -61,6 +61,10 @@ namespace TensorSharp.Models
         private int _localKvHeads;
         private readonly ConcurrentDictionary<(Tensor Weight, int Device), Tensor> _replicas = new();
 
+        /// <summary>The whole-layer stage whose device is active (<see cref="EnterStage"/>): a stage's graphs read the model's
+        /// replicated weights from that device.</summary>
+        private int _activeStage;
+
         /// <param name="tpDegree">T, the tensor-parallel degree of every stage.</param>
         /// <param name="tpGroup">A caller-supplied device group: a distributed TP group, a
         /// multi-node layer-split group, or (tests) a simulated group of T x P devices.</param>
@@ -224,9 +228,9 @@ namespace TensorSharp.Models
         private protected int KvHeadsOf(int layer) => (uint)layer < (uint)_layerKvHeads.Length ? _layerKvHeads[layer] : Config.NumKVHeads;
 
         /// <summary>The KV heads of <paramref name="layer"/> one rank holds: the model's over the shard degree (all of them on
-        /// one device and on ggml's meta device, whose graphs keep global shapes).</summary>
+        /// one device).</summary>
         private protected int LocalKvHeadsOf(int layer)
-            => _graphTpRanks != null || _shardDegree <= 1 ? KvHeadsOf(layer) : KvHeadsOf(layer) / _shardDegree;
+            => _shardDegree <= 1 ? KvHeadsOf(layer) : KvHeadsOf(layer) / _shardDegree;
 
         /// <summary>The layer whose cache <paramref name="layer"/> attends (<see cref="KvSourceLayer"/>).</summary>
         private protected int KvSourceOf(int layer) => (uint)layer < (uint)_kvSource.Length ? _kvSource[layer] : layer;
@@ -1028,7 +1032,7 @@ namespace TensorSharp.Models
                 int last = tokens.Length - 1;
                 // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
                 IDisposable overlap = null;
-                if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
+                if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs)
                 {
                     EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
                     overlap = GraphExecutor.OverlapSteps();
@@ -1864,6 +1868,7 @@ namespace TensorSharp.Models
         private void EnterStage(int stage)
         {
             if (_mesh == null || _mesh.IsSingleDevice) return;
+            _activeStage = stage;
             _allocator = _mesh.Allocator(stage, 0);
             if (IsGgmlBackend) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(stage, 0));
         }

@@ -26,7 +26,7 @@ namespace TensorSharp.Models.QwenImage21
         public int State(int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, Tensor tensor)
             => tensor == null
                 ? Leaf(GraphLeafRole.State, format, ne, data, bytes)
-                : Leaf(GraphLeafRole.State, format, ne, GraphIdentity.Of(tensor.Storage, tensor.StorageOffset), tensor.Storage.ByteLength, null, tensor);
+                : Leaf(GraphLeafRole.State, format, ne, GraphIdentity.Of(tensor.Storage, tensor.StorageOffset), tensor.Storage.ByteLength, tensor);
 
         /// <summary>An input read every run from <paramref name="bytes"/> of host memory at <paramref name="data"/>.</summary>
         public int InputHost(int format, ReadOnlySpan<long> ne, IntPtr data, long bytes)

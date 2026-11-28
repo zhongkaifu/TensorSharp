@@ -196,11 +196,13 @@ public sealed class NemotronRuntimeTests : IDisposable
         { "moe", 2, 1 },
         { "moe", 1, 2 },
         { "moe-latent-scaled", 2, 1 },
+        { "dense", 2, 2 },
+        { "moe", 2, 2 },
     };
 
     /// <summary>Tensor parallelism (per-rank graphs over simulated devices: each rank owns a block of Mamba-2 groups and the
-    /// heads that read them, a slice of every expert's width) and whole-layer stages answer as one device. The hybrid is a
-    /// declared gap.</summary>
+    /// heads that read them, a slice of every expert's width), whole-layer stages and their hybrid (every stage's layers as
+    /// per-rank graphs over its own group) answer as one device.</summary>
     [Theory]
     [MemberData(nameof(Placements))]
     public void PlacementMatchesOneDevice(string name, int tp, int stages)

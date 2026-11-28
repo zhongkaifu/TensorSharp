@@ -1081,6 +1081,28 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         Assert.True(group.AllReduceCount > 0, "the ranks never reduced");
     }
 
+    /// <summary>The hybrid (--tp 2 --layer-split 2) on four simulated devices: every whole-layer stage runs its layers as
+    /// per-rank graphs over its own pair, the stream (with the per-layer embeddings and hyper-connection streams) passing from
+    /// stage to stage, and every row answers as one device's.</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void HybridRankGraphsMatchOneDeviceOnTheManagedCpu(bool qsa, bool chunkedPrompt)
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-hybrid-{qsa}.gguf"), indexerTopK: 64, qsa: qsa,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        ModelBase Placed()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cpu, layerSplitDegree: 2, tpDegree: 2, tpGroup: new SimulatedDeviceGroup(4));
+            Assert.Equal(2, model.Mesh.TensorParallel);
+            Assert.Equal(2, model.Mesh.Stages);
+            Assert.True(model.RunsRankGraphs, "the hybrid's stages do not run per-rank graphs");
+            return model;
+        }
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt), Run(Placed, chunkedPrompt), 1e-4,
+            $"tp2 x stages2 qsa={qsa} chunked={chunkedPrompt}");
+    }
+
     [Fact]
     public void RankGraphsSelectTheSameQsaBlocksAsOneDevice()
     {

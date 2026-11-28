@@ -226,13 +226,15 @@ public sealed class Gemma4RuntimeTests : IDisposable
         { "moe-kv2", 2, 1 },
         { "moe-kv2", 1, 2 },
         { "moe-kv2", 1, 3 },
+        { "dense", 2, 2 },
+        { "moe-kv2", 2, 2 },
     };
 
     /// <summary>Tensor parallelism (per-rank graphs over simulated devices) and whole-layer stages (the per-layer embeddings
     /// carried from stage to stage, the KV-shared layers on their sources' stage) answer as one device; a MoE layer's fused
     /// gate|up experts split by halves. A stage's layers run the one device's ops; the ranks' partial sums meet in another
-    /// order (noise-level apart on these fixtures, <see cref="NoiseTolerance"/>). The hybrid is a declared gap: the graph-only
-    /// family has no graphs for tensor-parallel stages yet.</summary>
+    /// order (noise-level apart on these fixtures, <see cref="NoiseTolerance"/>). The hybrid runs every stage's layers as per-rank
+    /// graphs over its own group, the per-layer embeddings carried from stage to stage as without tensor parallelism.</summary>
     [Theory]
     [MemberData(nameof(Placements))]
     public void PlacementMatchesOneDevice(string name, int tp, int stages)

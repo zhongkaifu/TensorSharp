@@ -695,8 +695,9 @@ first token, which also excludes `<|channel>`.
 layer's fused `[gate | up]` experts split by halves (each rank's slice is `[gate_r | up_r]`, on GGML as its own expert
 stack); the `[dense | routed]` partials reduce in one all-reduce before their norms. KV heads must divide by N on every
 layer. `--layer-split N` runs one graph per stage; the per-layer embeddings travel from stage to stage beside the stream,
-and the stage planner never starts a stage between a KV-shared layer and its source. Tensor-parallel stages (the hybrid)
-are a declared gap: the graph-only family has no graphs for them yet.
+and the stage planner never starts a stage between a KV-shared layer and its source. `--tp T --layer-split P` (the hybrid)
+runs every stage's layers as per-rank graphs over its own T devices, the per-layer embeddings carried from stage to stage as
+without tensor parallelism (Gemma4RuntimeTests.PlacementMatchesOneDevice, simulated devices).
 
 ## 14. Open items
 

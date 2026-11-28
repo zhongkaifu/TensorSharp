@@ -285,9 +285,8 @@ namespace TensorSharp.Models
         /// decode step had read back Qwen3.8's 248,320 logits (1 MB) and scanned them on the host.</summary>
         public bool SupportsUnifiedGreedyIds => GraphGreedyIds && !_rankGraphs && _mesh.Stages == 1;
 
-        /// <summary>This model's graphs may end in greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>) - except
-        /// tensor-parallel graphs on ggml's meta device, whose head reads its logits.</summary>
-        private bool GraphGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true && _graphTpRanks == null;
+        /// <summary>This model's graphs may end in greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>).</summary>
+        private bool GraphGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true;
 
         public bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens)
         {
@@ -518,13 +517,8 @@ namespace TensorSharp.Models
             if (_slotShares == null || _slotShares.Length == 0) return null;
             foreach (var (stage, rank, perToken, states) in _slotShares)
             {
-                long free, total;
-                if (SlotDeviceMemoryForTests?.Invoke(_mesh.GlobalDevice(stage, rank)) is { } stand)
-                    (free, total) = stand;
-                else if (_mesh.Allocator(stage, rank) is not IDeviceMemoryInfo memory || memory.SharesHostMemory
-                    || !memory.TryGetDeviceMemory(out free, out total))
-                    return null;
-                if (free < count * (perToken * capacity + states + SlotExtraBytes) + DeviceHeadroom(total) + PromptStepBytes)
+                if (MeshDeviceMemory(stage, rank) is not { } memory) return null;
+                if (memory.Free < count * (perToken * capacity + states + SlotExtraBytes) + DeviceHeadroom(memory.Total) + PromptStepBytes)
                     return false;
             }
             return true;

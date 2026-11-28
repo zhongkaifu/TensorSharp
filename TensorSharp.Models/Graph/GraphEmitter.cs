@@ -110,8 +110,8 @@ namespace TensorSharp.Models.Graph
 
         // ---- leaves
 
-        private protected int Leaf(GraphLeafRole role, int type, ReadOnlySpan<long> ne, IntPtr data, long bytes, GraphSplit split = null, object handle = null)
-            => _b.Leaf(role, type, ne, data, bytes, split, handle);
+        private protected int Leaf(GraphLeafRole role, int type, ReadOnlySpan<long> ne, IntPtr data, long bytes, object handle = null)
+            => _b.Leaf(role, type, ne, data, bytes, handle);
 
         /// <summary>A weight held in a block layout (<see cref="IGraphWeight"/>): bound by its device-cache key.</summary>
         public int Weight(IGraphWeight weight)
@@ -119,21 +119,21 @@ namespace TensorSharp.Models.Graph
             ArgumentNullException.ThrowIfNull(weight);
             IntPtr key = weight.CacheKey != IntPtr.Zero ? weight.CacheKey : weight.Data;
             ReadOnlySpan<long> ne = weight.Ne2 > 1 ? stackalloc long[] { weight.Ne0, weight.Ne1, weight.Ne2 } : stackalloc long[] { weight.Ne0, weight.Ne1 };
-            return Leaf(GraphLeafRole.Weight, weight.Format, ne, key, weight.Bytes, null, weight);
+            return Leaf(GraphLeafRole.Weight, weight.Format, ne, key, weight.Bytes, weight);
         }
 
         /// <summary>Read-only model bytes of <paramref name="format"/> at a host address (a mapped file's tensor, a
         /// family constant), with the given extents. An executor that binds host pointers keeps its device copy under
         /// <paramref name="data"/>; <paramref name="handle"/> is what an executor binding objects reads.</summary>
         public int HostWeight(int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, object handle = null)
-            => Leaf(GraphLeafRole.Weight, format, ne, data, bytes, null, handle);
+            => Leaf(GraphLeafRole.Weight, format, ne, data, bytes, handle);
 
         /// <summary>An F32 tensor (device constants, norms) as a read-only leaf.</summary>
         public virtual int TensorWeight(Tensor t, params long[] ne)
             => TensorLeaf(GraphLeafRole.Weight, t, GraphFormat.F32, ne.Length == 0 ? Extents(t) : ne);
 
-        private protected int TensorLeaf(GraphLeafRole role, Tensor t, int type, ReadOnlySpan<long> ne, GraphSplit split = null)
-            => Leaf(role, type, ne, LeafIdentity(t), t.Storage.ByteLength, split, t);
+        private protected int TensorLeaf(GraphLeafRole role, Tensor t, int type, ReadOnlySpan<long> ne)
+            => Leaf(role, type, ne, LeafIdentity(t), t.Storage.ByteLength, t);
 
         /// <summary>A tensor leaf's bytes for an executor that binds host memory, else a stable identity
         /// (a device storage's host pointer would sync it every step).</summary>
@@ -321,10 +321,10 @@ namespace TensorSharp.Models.Graph
         public void MarkBackendFusions() => _b.MarkBackendFusions();
 
         /// <summary>The recorded program (see <see cref="GraphProgramBuilder.ToProgram"/>).</summary>
-        public GraphProgram ToProgram(bool replayable, bool reorder = false, int[] tensorParallelRanks = null)
+        public GraphProgram ToProgram(bool replayable, bool reorder = false)
         {
             if (!_b.Recording) throw new InvalidOperationException("a hash-only trace records no program");
-            return Program = _b.ToProgram(replayable, reorder, tensorParallelRanks);
+            return Program = _b.ToProgram(replayable, reorder);
         }
 
         /// <summary>Compile the recorded program with <see cref="Executor"/>.</summary>

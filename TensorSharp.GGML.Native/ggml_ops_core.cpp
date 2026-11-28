@@ -3968,12 +3968,6 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
     return 1;
 }
 
-namespace tsg_graphtp
-{
-    void on_drop(void* ptr);
-    void on_drop_ranges(const tsg::HostRanges& ranges);
-    bool sync_to_host(void* ptr, std::size_t size);
-}
 
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
@@ -3985,7 +3979,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
         invalidate_cached_buffer(ptr);
     }
 
-    tsg_graphtp::on_drop(ptr);
     tsg::moe_hot_tier_on_drop(ptr);
     tsg::host_expert_io_on_drop(ptr);
 }
@@ -4051,7 +4044,6 @@ TSG_EXPORT int TSGgml_ReleaseHostRanges(const void* const* bases, const std::uin
         }
 
         tsg::cpu_repack_forget_ranges(ranges.spans);
-        tsg_graphtp::on_drop_ranges(ranges);
         tsg::moe_hot_tier_drop_ranges(ranges);
         for (const auto& span : ranges.spans) tsg::host_expert_io_on_drop(reinterpret_cast<const void*>(span.first));
         tsg::host_pin_release_ranges(ranges.spans);
@@ -4069,7 +4061,7 @@ TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
 {
     // Queued work (an overlapped graph step, Metal's lazy sync) may still write what this downloads.
     host_read_barrier();
-    bool any = tsg_graphtp::sync_to_host(ptr, size);
+    bool any = false;
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {
         tsg::ScopedRank rank(r);

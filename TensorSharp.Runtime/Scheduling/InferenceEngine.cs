@@ -89,14 +89,6 @@ namespace TensorSharp.Runtime.Scheduling
             FirstTokenLogitsDump.ClearStaleOutputs();
             if (cfg.BlockSize <= 0) cfg = cfg.WithBlockSize(PreferredBlockSize(model));
             _logger = logger ?? NullLogger.Instance;
-            if (!cfg.MixedStepPrefillBudgetChosen
-                && model is Speculative.IMixedStepPrefillTarget { PreferredMixedStepPrefillTokens: > 0 } mixedTarget)
-            {
-                cfg = cfg.WithMixedStepPrefillBudget(mixedTarget.PreferredMixedStepPrefillTokens);
-                _logger.LogInformation(
-                    "Steps that also decode carry at most {Tokens} prompt tokens (the model's bound; " +
-                    "TS_SCHED_MIXED_PREFILL_TOKENS overrides it, 0 for none)", cfg.MixedStepPrefillBudget);
-            }
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above
             _nativeSlotContextLimit = UsesNativeSequenceSlots(model) ? Math.Max(0, model.MaxContextLength) : 0;
             _contextLimit = Math.Max(0, model.MaxContextLength);

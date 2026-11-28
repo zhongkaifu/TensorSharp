@@ -688,34 +688,4 @@ namespace TensorSharp.Runtime.Speculative
             return TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, scratch, features);
         }
     }
-
-    /// <summary>
-    /// A batched trunk that can run one sequence's prompt chunk inside its next
-    /// <see cref="IBatchedSpeculativeTarget.TryBatchedSpecVerify"/>: one forward over the
-    /// chunk's rows and the verify windows, so the verify reads no weights of its own.
-    /// </summary>
-    public interface IMixedStepPrefillTarget
-    {
-        /// <summary>
-        /// Stage <paramref name="tokens"/> of <paramref name="requestId"/> at
-        /// <paramref name="position"/> (its cache length) for the next batched verify. The
-        /// chunk takes the media rows queued since the last forward (queue them for its slice
-        /// first). <paramref name="whole"/>: the chunk must run whole (it ends the prompt or a
-        /// checkpoint); otherwise the trunk may run only a prefix of it. False when the chunk
-        /// cannot ride a verify; its media is then dropped, as it is when no verify runs it.
-        /// </summary>
-        bool StageMixedPrefill(string requestId, int[] tokens, int position, bool whole);
-
-        /// <summary>
-        /// End the staged chunk: true with the tokens a verify ran (a prefix of the chunk) and
-        /// its last row's logits; false when no verify ran it (nothing advanced). Throws when the
-        /// forward that carried it failed after writing its cache.
-        /// </summary>
-        bool TakeMixedPrefill(string requestId, out int tokensRun, out float[]? logits);
-
-        /// <summary>The prompt tokens a step that also decodes should carry
-        /// (<see cref="Scheduling.SchedulerConfig.MixedStepPrefillBudget"/>) when the configuration
-        /// does not set it; 0 leaves it unbounded.</summary>
-        int PreferredMixedStepPrefillTokens => 0;
-    }
 }

@@ -880,8 +880,10 @@ without a trace (`TryAdvanceRanked`; each rank owns its position input, which th
 vs 94.4 / 91.8, Qwen3.6-35B-A3B UD-Q4_K_M 105.6 / 100.9 vs 106.3 / 105.1; 4K prefill 1.17 vs 0.91 s
 (9B) and 1.14 vs 0.96 s (35B) - both gaps open. Shards and replicated weights are preloaded on every rank's device,
 one thread rank by rank (a ggml preload lands on the calling thread's active rank); routed-expert shards
-are preloaded too, since each rank's graph reads its slices device-resident. ggml's meta device stays
-opt-in (`TS_GRAPH_TENSOR_PARALLEL=1`).
+are preloaded too, since each rank's graph reads its slices device-resident. The earlier alternative, the
+whole step as one graph on ggml's meta device behind `TS_GRAPH_TENSOR_PARALLEL=1`, was never the default and
+no longer loaded a model (2026-11-28: "sharded no weights"); it was removed with its native builder support, and the
+variable is now refused with that advice.
 
 Flash Next lowers per rank as well: the recurrent and attention heads and the experts' width split as
 Qwen 3.5's, while the hyper-connection mixes, the PLE and QSA's indexer (its keys, its block selection)
@@ -1217,3 +1219,150 @@ MoE checkpoints, a node with several tensor-parallel stages (covered only by the
   freeze, so those ops need device-index forms first; then exact decode windows give way to padded ones
   (a replayable shape), inputs refresh into stable device buffers before each launch, and blocks
   returned during the capture stay with the plan.
+
+### 9.5 Multi-GPU and concurrency audit (2026-11-28)
+
+Two NVIDIA RTX PRO 4000 Blackwell (24 GB each, sm_120, PCIe, peer access granted and verified by the self-tests),
+driver 595.112.07, CUDA 13.2, upstream ggml `bb877c0c` unchanged, `libGgmlOps` built for `120-real` without NCCL
+(ggml's own all-reduce pipeline). Every shared-runtime text family that fits two 24 GB GPUs ran on `ggml_cuda` and on
+direct `cuda`, on one GPU, `--tp 2` and `--layer-split 2`: a 64-token greedy reply from the CLI and the CLI benchmark
+(512-token prompt, 128 decoded tokens, best of two runs), then concurrent requests through `TensorSharp.Server.Host`
+(each prompt alone, then all at once, greedy): `eng/placement-matrix.py` and `eng/concurrent-parity.py`.
+
+**Found and fixed.**
+
+* **A `ggml_cuda` layer split leaked 64 MiB a GPU at every decode step.** The native graph runner asked a function-static
+  cache for Inkling 2's fused-op backend on every replayable CUDA graph, before it read the experiment flag that made the
+  answer matter. The cache held one wrapper for the last ggml backend asked; a layer split's stages run on their own ranks'
+  backends, so every stage switch made a new wrapper (a private cuBLAS handle, its 64 MiB workspace, 128 KiB and 1 KiB
+  buffers, found by tracing `cudaMalloc` under Nsight Systems) and dropped the old one. A server lost ~640 MB a GPU per
+  short Qwen3.5-9B request, flat on one GPU and under `--tp 2`, and failed every request of an 8-way burst with CUDA out of
+  memory once both GPUs were full. The wrapper now lives in the rank's `DeviceState`, made once and freed with the rank's
+  backend, and only graphs with fused nodes (or the experiment) ask for it: every other model saves 64 MiB a device.
+* **Slot admission ignored meshes.** Device memory gated new requests' slots on one ggml device only; a layer split or a
+  tensor-parallel mesh (on `ggml_cuda` or direct CUDA) gave every concurrent request a slot until a GPU filled. Each
+  device of a mesh is now asked for its own share of a slot (`SlotDeficit`, the shares `MeasureSlotBytes` records): a
+  request whose share does not fit waits for a running one (`SequenceSlotUnavailableException`), the prefix cache sees
+  the deficit, and idle slots' device copies are dropped first, as on one device (the native sync and invalidation visit
+  every rank's cache).
+* **Direct-CUDA layer split ran Gemma 4's rotary on the host.** A graph of stage 1 read the model's rotary frequency
+  factors (and its norms outside the layers) on stage 0's device; direct CUDA then took the host fallback for the
+  frequency-scaled rotary. `Replicated` now reads the active stage's copy: `--backend cuda --layer-split 2` prefill
+  709 -> 3777 tok/s on gemma-4-E4B (one GPU: 4845) and 430 -> 2653 on gemma-4-26B-A4B (one GPU: 2715, decode 78.9 -> 100
+  against 101), the same text as one GPU.
+* **Layer-split stages never primed slot copies.** `PrimeDeviceCopies` returned on a mesh of stages, so a request's clone
+  of the shared prefix (Qwen3.5-9B, 3.4K tokens of tools and skills) uploaded its whole capacity (~160 MB) inside its
+  first step: 48-120 ms against 26 on one GPU, and 323 ms against 56 for a 5-request burst's prompt step. Each stage (and
+  each per-rank TP device) now zero-fills its own share and the host route uploads only the copied rows: 26-28 ms, and a
+  4-request burst step 62 ms.
+
+**Removed.** `TS_GRAPH_TENSOR_PARALLEL` and the whole-step tensor parallelism on ggml's meta device behind it (never the
+default; on these GPUs it no longer loaded a model: "sharded no weights"), with its native builder support
+(`TSGgml_GraphCreateTp`, `TSGgml_GraphLeafSplit`, the meta residents), `GraphProgram.TensorParallelRanks`, `GraphSplit`
+and `GraphCapabilities.TensorParallel`; the scheduler's pipelined decode groups (`IPipelinedBatchedDecode`,
+`TS_SCHED_PIPELINE_DECODE`), its mixed prompt/verify step (`IMixedStepPrefillTarget`, `TS_SCHED_MIXED_STEP`) and the
+decode-lane metrics, which nothing has implemented since the direct-CUDA Qwen engines were removed. The three variables
+now stop the hosts with advice (`RemovedCliFlags`). `--no-continuous-batching`, `TS_PER_SEQ_FUSED` and
+`TS_BATCHED_FUSED_DECODE` were documented as covering the shared runtime; its unified step never reads them (they still
+steer the per-sequence executors), and the documentation says so.
+
+**One placement implementation for every family: the hybrid as per-rank graphs.** Tensor parallelism ran per-rank graphs
+only on a mesh of one stage (`_rankGraphs` was set for `--tp T` alone); `--tp T --layer-split P` fell back to the per-op
+path, whose stages reduce through `StageGroup.AllReduce`. Families that run only as graphs (Gemma 4, GPT-OSS, Nemotron-H,
+Qwen4Exp) therefore declared the hybrid as a gap, and the others paid the per-op path for it. The runtime now runs every
+tensor-parallel group the same way:
+
+* `BuildMesh` enables per-rank graphs for the local hybrid as for `--tp` (`EnableRankGraphs`), with one `MeshCollective`
+  a stage for the streaming executors (managed CPU, direct CUDA), each joined by that stage's ranks.
+* A step over stages (`TryRunStagedGraphStep`) runs each stage as a `RankedSpan` (its layers, then the head on the last
+  stage or the stream and the family's `StageCarryWidth` carry for the next): `EmitRankedStep`, `TryRunRankedGraphStep`
+  and `TryRunRankedCompiledStep` take the span, trace on the stage's allocators and devices, and keep one advancing decode
+  step a stage. Rank 0's stream (every rank's after the stage's last reduce) passes to the next stage through the host.
+* Weights were already sharded per stage group (`ShardForMesh`); the vocabulary-split head now lands on the last stage,
+  `PrepareRankGraphResidency` preloads every stage's shards, expert stacks and replicated weights onto that stage's ranks,
+  and the step's leaves (`Replicated`, `RankExpertSet`, the leaf allocator check) read the active stage's copies.
+* Native: `TSGgml_GraphRunRanked` takes the graphs of consecutive devices from the first graph's (a stage's devices
+  inside the context), `tsg::tp_execute_plans` runs and downloads each plan on its own device, and `tp_reduce_segment`
+  sums a group of devices other than the context's whole set through host staging, exactly in F32: ggml's collective
+  spans every device of the context. `IRankedGraphExecutor.RunsRanks` / `RanksSumOnHost` take the group count.
+
+No family code changed for the hybrid. Gemma 4 (its per-layer embeddings carried across stages), GPT-OSS, Nemotron-H and
+Qwen4Exp now declare it on every multi-device backend, and their gaps left `ServingContractConformanceTests.KnownGaps`.
+Raon gained whole-layer stages the same way Gemma 4 has them, by declaring its per-layer embeddings as the stage carry.
+
+Coverage: `PlacementMatchesOneDevice` on simulated devices runs 2 x 2 for Mistral 3, Hunyuan Dense, Qwen3-VL (also
+2 x 3), Qwen 3.5, Gemma 4 (dense and MoE with KV sharing), GPT-OSS, Nemotron-H (dense and MoE), Muse-Glimmer and the
+transformed-logits hook family, and `Qwen4ExpRuntimeTests.HybridRankGraphsMatchOneDeviceOnTheManagedCpu` 2 x 2 (with and
+without QSA): every row within 1e-4 relL2 of one device, every placement asserted to run per-rank graphs. Batched slots
+and concurrent requests run in the 2 x 2 and 2 x 3 placements (`SlotBatchesMatchEachSequenceAlone`,
+`ConcurrentRequestsAreBatchedInEveryPlacement`), and speculation over a 2 x 2 mesh matches plain greedy
+(`SpeculationOnRankGraphsMatchesPlainGreedy`). **Not run on
+GPUs:** the hybrid needs four devices and the validation VM has two, so the native sub-group run and the stage residency
+on `ggml_cuda` / direct CUDA are unexercised on hardware. The changed native driver's whole-context path ran on the two
+GPUs: Qwen3.5-9B `ggml_cuda --tp 2` decoded at 98.7 tok/s (99.8 before) with the one-GPU text, and gemma-4-E4B
+`ggml_cuda --tp 2` at 110 (109).
+
+**Measurements** (best of two runs, 512-token prompt, 128 decoded tokens; text: the 64-token greedy reply against one GPU's
+on the same backend; tensor parallelism sums partials in another order, so its text may part on a near tie):
+
+| Model | Backend | 1 GPU prefill / decode | `--tp 2` | `--layer-split 2` | Text (tp2, ls2) |
+|---|---|---|---|---|---|
+| Qwen3.5-0.8B Q8_0 | ggml_cuda | 22540 / 397 | 19796 / 321 | 20927 / 311 | parts at 277, same |
+| | cuda | 29241 / 417 | 18347 / 107 | 21205 / 355 | parts at 52, parts at 52 |
+| Qwen3.5-9B Q8_0 | ggml_cuda | 4674 / 64.2 | 4942 / 99.8 | 4368 / 63.4 | same, same |
+| | cuda | 3348 / 65.0 | 3753 / 60.8 | 3105 / 65.2 | same, same |
+| Ministral-3-3B Q4_K_M | ggml_cuda | 11217 / 200 | 11934 / 241 | 9153 / 178 | parts at 15, same |
+| | cuda | 6759 / 180 | 6611 / 92.7 | 6032 / 172 | parts at 151, parts at 201 |
+| Mistral-Small-3.1-24B Q4_K_M | ggml_cuda | 1936 / 38.7 | 2917 / 66.8 | 1958 / 39.0 | same, same |
+| | cuda | 1066 / 38.7 | 1601 / 40.9 | 1054 / 38.5 | parts at 271, same |
+| Hy-MT2-1.8B Q4_K_M | ggml_cuda | 17981 / 300 | 15625 / 261 | 15334 / 249 | parts at 156, same |
+| | cuda | 12259 / 178 | 9151 / 75.1 | 10657 / 161 | parts at 114, same |
+| LFM3-1.7B Q4_K_M | ggml_cuda | 20648 / 358 | 17216 / 320 | 19069 / 293 | parts at 288, same |
+| | cuda | 13146 / 286 | 9519 / 89.6 | 11499 / 271 | same, same |
+| Qwen3-VL-8B Q4_K_M | ggml_cuda | 5264 / 99.5 | 6100 / 141 | 4695 / 102 | same, same |
+| | cuda | 3011 / 95.8 | 3416 / 58.5 | 2900 / 94.0 | parts at 118, parts at 118 |
+| gemma-4-E4B Q8_0 | ggml_cuda | 7669 / 94.9 | 7961 / 109 | 4874 / 95.2 | same, same |
+| | cuda | 4838 / 83.8 | 4833 / 38.4 | 709 / 70.2, now 3777 / 83.1 | same, same |
+| gemma-4-26B-A4B Q4_0 | ggml_cuda | 6237 / 135 | 6193 / 117 | 5786 / 136 | parts at 186, same |
+| | cuda | 2707 / 101 | 1944 / 40.0 | 430 / 78.9, now 2653 / 100 | same, same |
+| gpt-oss-20b MXFP4 | ggml_cuda | 10403 / 169 | 10673 / 200 | 8980 / 168 | same, same |
+| | cuda | 2277 / 133 | 2781 / 59.0 | 2268 / 125 | same, same |
+| Nemotron-H-8B Q8_0 | ggml_cuda | 4052 / 67.8 | 5063 / 111 | 3952 / 67.0 | parts at 143, same |
+| | cuda | 2238 / 61.6 | 3278 / 56.6 | 2213 / 62.1 | same, same |
+| Nemotron-3.5-Lightning-30B-A3B MXFP4 | ggml_cuda | 5526 / 151 | 6268 / 164 | 5485 / 148 | parts at 105, same |
+| | cuda | 157 / 62.3 (5 layers' experts on the host) | 1813 / 31.6 | 1484 / 69.8 | parts at 145, parts at 186 |
+| Muse-Glimmer-30B UD-Q4_K_XL | ggml_cuda | 1614 / 35.0 | 2300 / 55.3 | 1694 / 36.5 | same, same |
+| | cuda | 862 / 34.1 | 1200 / 30.0 | 851 / 34.0 | same, same |
+| Qwen3.6-35B-A3B UD-Q4_K_M | ggml_cuda | does not fit | 5332 / 114 | 4722 / 123 | (no one-GPU reference) |
+| | cuda | does not fit | 4906 / 43.7 | 3872 / 151 | |
+
+**Concurrency.** Qwen3.5-9B, eight different prompts at once (256 tokens each, greedy) after their lone runs, through
+the server: 0 errors in every placement (before the leak fix, `ggml_cuda --layer-split 2` failed all eight). Aggregate
+tok/s: `ggml_cuda` 226 (one GPU), 250 (`--tp 2`), 190 (`--layer-split 2`); `cuda` 234, 127, 233. Between 2 and 4 of the
+eight replies equal their lone runs in each placement, one GPU included: a batched step takes other kernels than a lone
+one, so near-tie tokens part; that the count does not fall under a placement is the check.
+
+**Open.**
+
+* Direct-CUDA `--tp 2` decodes 1.1-4x slower than one GPU on every model (Qwen3.5-0.8B: 107 against 417 tok/s). Its
+  all-reduce (`CudaP2PCommunicator`) fences on the host three times a reduce, two reduces a layer, and a tensor-parallel
+  step is not recorded as a CUDA graph; `ggml_cuda` reduces on the devices and wins on the larger models. A device-side
+  reduction joined to the ranks' recordings is the fix; until then `ggml_cuda` is the backend for `--tp`.
+* `ggml_cuda --tp 2` loses to one GPU on the smallest models and on gemma-4-26B-A4B decode (a few active parameters a
+  token: the 2 x layers all-reduces dominate).
+* A layer split adds ~0.6 ms a step (the host hand-off between stages); gemma-4-E4B `ggml_cuda --layer-split 2` prefill
+  is 36 % below one GPU's.
+* On direct CUDA, a layer split's text parts from one GPU's on Qwen3.5-0.8B, Qwen3-VL-8B (at the same character as
+  `--tp 2`), Ministral-3-3B and Nemotron Lightning: one GPU's decode takes steps a mesh does not (recorded steps, fused
+  decode kernels sized for one device), so near ties can resolve otherwise.
+* Direct CUDA's host experts (Lightning on one 24 GB GPU plans 5 of its 52 layers' experts onto the host) run a `sum` on
+  the element-by-element CPU fallback ("no GPU implementation for these arguments"): 157 tok/s prefill against 1484 over
+  two GPUs, where every expert is resident.
+* A clone of the shared-prefix checkpoint still copies through the host on one GPU and on a layer split (~75 ms for the
+  3.4K-token prefix); per-rank TP clones stay on the devices.
+* The hybrid's stage groups reduce through host staging on `ggml_cuda` (a sub-group collective per stage is the
+  follow-up) and through `StageGroup.AllReduce` on direct CUDA; neither has run on four GPUs.
+* Raon now runs whole-layer stages (`--layer-split N`, its per-layer embeddings as the stage carry, three lines of family
+  declaration; simulated devices only). Its tensor parallelism, and every placement of Inkling 2, stay gaps: their
+  lowerings trace no rank's shard (`RanksLower`), and Inkling 2's loop reads one stored layer from several runs of the
+  stack, which a whole-layer stage would have to hold on every stage that runs it.

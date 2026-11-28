@@ -35,28 +35,21 @@ public class PrefixCacheConfigurationTests
         Assert.Equal(32768, set.SoloPrefillChunkSize);
     }
 
-    /// <summary>Likewise the mixed-step prompt bound: unset, a model with its own bound (the
-    /// direct-CUDA Qwen engine's fused mixed step) sets it; an explicit 0 chooses none.</summary>
+    /// <summary>The mixed-step prompt bound comes from the environment alone: unset or 0, none.</summary>
     [Fact]
-    public void TheMixedStepPrefillBudgetIsChosenOnlyWhenTheEnvironmentSetsIt()
+    public void TheMixedStepPrefillBudgetComesFromTheEnvironment()
     {
         using var env = new EnvScope();
         env.Set("TS_SCHED_MIXED_PREFILL_TOKENS", null);
         var unset = SchedulerConfig.FromEnvironment();
-        Assert.False(unset.MixedStepPrefillBudgetChosen);
         Assert.Equal(0, unset.MixedStepPrefillBudget);
-        Assert.False(unset.WithSpeculation(SpeculationOptions.Disabled).MixedStepPrefillBudgetChosen);
-        var modelBound = unset.WithMixedStepPrefillBudget(1024).WithSpeculation(SpeculationOptions.Disabled);
-        Assert.True(modelBound.MixedStepPrefillBudgetChosen);
-        Assert.Equal(1024, modelBound.MixedStepPrefillBudget);
-
+        Assert.Equal(0, unset.WithSpeculation(SpeculationOptions.Disabled).MixedStepPrefillBudget);
         env.Set("TS_SCHED_MIXED_PREFILL_TOKENS", "0");
-        var off = SchedulerConfig.FromEnvironment();
-        Assert.True(off.MixedStepPrefillBudgetChosen);
-        Assert.Equal(0, off.MixedStepPrefillBudget);
+        Assert.Equal(0, SchedulerConfig.FromEnvironment().MixedStepPrefillBudget);
         env.Set("TS_SCHED_MIXED_PREFILL_TOKENS", "512");
-        Assert.Equal(512, SchedulerConfig.FromEnvironment().MixedStepPrefillBudget);
-        Assert.True(new SchedulerConfig { MixedStepPrefillBudget = 8 }.MixedStepPrefillBudgetChosen);
+        var bound = SchedulerConfig.FromEnvironment();
+        Assert.Equal(512, bound.MixedStepPrefillBudget);
+        Assert.Equal(512, bound.WithSpeculation(SpeculationOptions.Disabled).MixedStepPrefillBudget);
     }
 
     [Fact]

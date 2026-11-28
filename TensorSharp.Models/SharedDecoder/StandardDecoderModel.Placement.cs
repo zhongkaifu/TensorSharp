@@ -25,22 +25,6 @@ namespace TensorSharp.Models
         private void BuildMesh(string executionIdentity)
         {
             int stages = _requestedStages, tp = _requestedTensorParallel;
-            if (tp > 1 && stages == 1 && LayerSplitGroup == null && _tpGroup is GgmlTensorParallelGroup && GraphTensorParallelism)
-            {
-                // Tensor parallelism as whole-forward graphs on ggml's meta device: the model is laid
-                // out as on one device (global heads, unsharded weights), and each graph's weight and
-                // state leaves are spread over the ranks by their split (GraphWeightSplit).
-                ValidateShardable(tp);
-                _graphTpRanks = Enumerable.Range(0, tp).ToArray();
-                _shardDegree = 1;
-                _shardRankOffset = 0;
-                _localHeads = Config.NumHeads;
-                _localKvHeads = Config.NumKVHeads;
-                IAllocator rank0 = _tpGroup.GetAllocator(0);
-                _mesh = new DeviceMesh(1, 1, _ => rank0, null, null);
-                Console.WriteLine($"  Tensor parallelism: whole-forward graphs over {tp} GPUs (ggml's meta device).");
-                return;
-            }
             // A distributed TP group shards by its GLOBAL degree; a stage group (local or a pipeline node's) by its own.
             bool distributedTp = tp > 1 && stages == 1 && LayerSplitGroup == null;
             int shardDegree = tp == 1 ? 1 : distributedTp ? GlobalTpDegree : tp;
@@ -76,26 +60,14 @@ namespace TensorSharp.Models
                 // geometry; every collective here spans one stage's T devices.
                 if (IsGgmlBackend)
                     GgmlBasicOps.TensorParallelSetGlobalGeometry(tp, 0);
+                EnableRankGraphs(tp);
             }
             else if (tp > 1)
             {
                 if (_tpGroup == null || _tpGroup.Degree != tp)
                     throw new InvalidOperationException($"Tensor parallelism needs a group of {tp} devices.");
                 _mesh = new DeviceMesh(1, tp, d => _tpGroup.GetAllocator(d), _tpGroup, null);
-                _rankGraphs = RankGraphsServe(tp);
-                _rankSumsCrossHost = _rankGraphs && ExecutorFor(_mesh.Allocator(0, 0)) is IRankedGraphExecutor ranked && ranked.RanksSumOnHost(tp);
-                if (_rankGraphs)
-                {
-                    // A streaming executor sums each partial as the last rank hands it in; a compiling one (GGML) runs
-                    // the ranks' plans together, pausing at every all-reduce (IRankedGraphExecutor).
-                    if (ExecutorFor(_mesh.Allocator(0, 0)) is TensorGraphExecutor)
-                    {
-                        var collective = new MeshCollective(_mesh, 0);
-                        for (int r = 0; r < tp; r++)
-                            ((TensorGraphExecutor)ExecutorFor(_mesh.Allocator(0, r))).JoinCollective(collective, r);
-                    }
-                    Console.WriteLine($"  Tensor parallelism: each of {tp} devices runs its shard of every step as a graph, in lockstep.");
-                }
+                EnableRankGraphs(tp);
             }
             else
             {
@@ -103,20 +75,46 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <summary>Ranks of tensor-parallel graphs (ggml's meta device), or null.</summary>
-        private int[] _graphTpRanks;
+        /// <summary>
+        /// Per-rank graphs for a local mesh of <paramref name="tp"/> ranks a stage (<see cref="_rankGraphs"/>): one stage's
+        /// group (tensor parallelism), or every stage's of a hybrid placement. A streaming executor sums each partial as the
+        /// stage's last rank hands it in (a collective a stage); a compiling one (GGML) runs the stage's plans together,
+        /// pausing at every all-reduce (IRankedGraphExecutor).
+        /// </summary>
+        private void EnableRankGraphs(int tp)
+        {
+            _rankGraphs = RankGraphsServe(tp);
+            if (!_rankGraphs) return;
+            IGraphExecutor lead = ExecutorFor(_mesh.Allocator(0, 0));
+            _rankSumsCrossHost = lead is IRankedGraphExecutor ranked && ranked.RanksSumOnHost(tp, _mesh.Stages);
+            if (lead is TensorGraphExecutor)
+                for (int s = 0; s < _mesh.Stages; s++)
+                {
+                    var collective = new MeshCollective(_mesh, s);
+                    for (int r = 0; r < tp; r++)
+                        ((TensorGraphExecutor)ExecutorFor(_mesh.Allocator(s, r))).JoinCollective(collective, r);
+                }
+            Console.WriteLine(_mesh.Stages == 1
+                ? $"  Tensor parallelism: each of {tp} devices runs its shard of every step as a graph, in lockstep."
+                : $"  Hybrid parallelism: each of {_mesh.Stages} whole-layer stages runs its layers as per-rank graphs over its {tp} devices.");
+        }
 
         /// <summary>
-        /// Tensor parallelism as each rank's own program (direct CUDA, and the managed executor of a simulated group):
-        /// every rank traces its shard of the step on its device's executor, the ranks' nodes interleaved block by block
-        /// (TryRunRankedGraphStep); each block's partial is summed by <see cref="GraphOp.AllReduce"/> before it joins the
-        /// rank's copy of the residual stream. Routed experts are sharded like the dense feed-forwards (each expert's
-        /// width), not spread whole over the ranks as the per-op path does, so such a model runs only as these graphs.
+        /// Tensor parallelism as each rank's own program (every executor that lowers the shared decoder: GGML's compiled plans,
+        /// direct CUDA's and the managed streams of a simulated group): every rank traces its shard of the step on its device's
+        /// executor, the ranks' nodes interleaved block by block (TryRunRankedGraphStep); each block's partial is summed by
+        /// <see cref="GraphOp.AllReduce"/> before it joins the rank's copy of the residual stream. A hybrid placement runs each
+        /// whole-layer stage so over its own group, the stream passing from stage to stage (TryRunStagedGraphStep). Routed
+        /// experts are sharded like the dense feed-forwards (each expert's width), not spread whole over the ranks as the
+        /// per-op path does, so such a model runs only as these graphs.
         /// </summary>
         private bool _rankGraphs;
 
         /// <summary>Whether this model's tensor-parallel steps run as per-rank graphs (see <see cref="_rankGraphs"/>).</summary>
         protected bool RankGraphs => _rankGraphs;
+
+        /// <summary>Tests: whether the placement's steps run as per-rank graphs (tensor parallelism, or every stage of a hybrid).</summary>
+        internal bool RunsRankGraphs => _rankGraphs;
 
         /// <summary>Per-rank graphs whose all-reduces go through host memory (<see cref="IRankedGraphExecutor.RanksSumOnHost"/>):
         /// every step pays a host round trip a reduction, two a layer.</summary>
@@ -129,13 +127,16 @@ namespace TensorSharp.Models
         /// state); default: families without recurrent layers, whose blocks the runtime emits.</summary>
         protected virtual bool RanksLower => !_anyRecurrent;
 
+        /// <summary>Whether the mesh's steps run as per-rank graphs: the family lowers a rank's shard, no layer's experts run on
+        /// the host, and the group is this process's own devices (a distributed group's ranks of other nodes run the per-op
+        /// path's collectives); the executor runs ranks of <paramref name="tp"/> devices over the mesh's stages.</summary>
         private bool RankGraphsServe(int tp)
             => GraphLoweringEnabled && AttentionLowers && RanksLower && !MoeCpuOffloadConfig.IsEnabled
-               && StepAdapter == null && GlobalTpDegree == tp && TpRankOffset == 0
+               && StepAdapter == null && GlobalTpDegree == _mesh.DeviceCount && TpRankOffset == 0
                && ExecutorFor(_mesh.Allocator(0, 0)) switch
                {
                    TensorGraphExecutor => true,
-                   IRankedGraphExecutor ranked => ranked.RunsRanks(tp),
+                   IRankedGraphExecutor ranked => ranked.RunsRanks(tp, _mesh.Stages),
                    _ => false,
                };
 
@@ -180,17 +181,6 @@ namespace TensorSharp.Models
                 }
             }
         }
-
-        /// <summary>
-        /// Tensor parallelism runs as whole-forward graphs on ggml's meta device: the family lowers
-        /// (rotary, mixers) and no layer keeps its experts on the host; recurrent stacks wait for
-        /// their state splits. Opt-in (TS_GRAPH_TENSOR_PARALLEL=1) until validated on GPUs with peer
-        /// access: on MIG slices without it (the 2026-11-10 lab VM) the meta device's internal
-        /// all-reduce faults in flash attention or hangs, and --tp keeps the per-op path.
-        /// </summary>
-        private bool GraphTensorParallelism
-            => AttentionLowers && !_anyRecurrent && !MoeCpuOffloadConfig.IsEnabled
-               && Environment.GetEnvironmentVariable("TS_GRAPH_TENSOR_PARALLEL") == "1";
 
         private void ValidateShardable(int degree)
         {
@@ -392,7 +382,7 @@ namespace TensorSharp.Models
                     }
                 }
                 ShardWeightsForTensorParallelism(columns, rows);
-                if (_mesh.Stages == 1) ShardHeadByVocab();
+                if (stage == _mesh.Stages - 1) ShardHeadByVocab();
             }
         }
 
@@ -603,8 +593,6 @@ namespace TensorSharp.Models
 
         private void PrepareResidency()
         {
-            // Tensor-parallel graphs upload each weight's slices to the meta device on first use.
-            if (_graphTpRanks != null) return;
             if (_mesh.TensorParallel == 1)
             {
                 // One device, or whole layers: the single-device preload places each weight on
@@ -612,13 +600,12 @@ namespace TensorSharp.Models
                 PrepareCudaQuantizedWeightsForInference();
                 return;
             }
-            if (_mesh.Stages == 1 && LayerSplitGroup == null)
-            {
-                if (_rankGraphs) PrepareRankGraphResidency();
-                else PrepareCudaQuantizedWeightsForInferenceTP();
-                return;
-            }
-            PrepareHybridResidency();
+            if (_rankGraphs)
+                PrepareRankGraphResidency();
+            else if (_mesh.Stages == 1 && LayerSplitGroup == null)
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            else
+                PrepareHybridResidency();
         }
 
         /// <summary>
@@ -669,9 +656,10 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Per-rank graphs: each shard onto its rank's device, and every replicated weight onto every rank (each rank's
-        /// executor finds a weight under its own allocator); the head stays on rank 0, which runs it. Host copies of the
-        /// replicated weights are kept (the per-op embedding and sampling read them); the shards' are released.
+        /// Per-rank graphs: each shard onto its rank's device, and every replicated weight onto every rank of the stage that
+        /// reads it (each rank's executor finds a weight under its own device); the head stays on the last stage's rank 0,
+        /// which runs it. Host copies of the replicated weights are kept (the per-op embedding and sampling read them); the
+        /// shards' are released.
         /// </summary>
         /// <remarks>
         /// Where every rank holds its vocabulary slice of the head (<see cref="ShardHeadByVocab"/>), the whole head is not
@@ -685,59 +673,69 @@ namespace TensorSharp.Models
             bool ggml = _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
             if (_backend != BackendType.Cuda && !ggml) return;   // host-memory devices (simulated groups): nothing to upload
             if (ggml) EnsureQuantBackendAvailable();
-            int ranks = _mesh.TensorParallel;
-            long[] bytes = new long[ranks];
-            var resident = new HashSet<QuantizedWeight>[ranks];
-            for (int r = 0; r < ranks; r++) resident[r] = new HashSet<QuantizedWeight>(ReferenceEqualityComparer.Instance);
-            void PreloadShards(int r)
+            int ranks = _mesh.TensorParallel, devices = _mesh.DeviceCount;
+            long[] bytes = new long[devices];
+            var resident = new HashSet<QuantizedWeight>[devices];
+            for (int d = 0; d < devices; d++) resident[d] = new HashSet<QuantizedWeight>(ReferenceEqualityComparer.Instance);
+            void PreloadShards(int stage, int r)
             {
+                int device = _mesh.GlobalDevice(stage, r);
                 foreach (var kv in _tpQuantWeights)
                 {
                     QuantizedWeight shard = kv.Value[r];
-                    if (!shard.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key)) continue;
-                    if (Preload(shard, _mesh.Allocator(0, r), ggml))
+                    if (StageOfWeight(kv.Key) != stage || !shard.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key)) continue;
+                    if (Preload(shard, _mesh.Allocator(stage, r), ggml))
                     {
-                        bytes[r] += shard.RawBytes;
-                        resident[r].Add(shard);
+                        bytes[device] += shard.RawBytes;
+                        resident[device].Add(shard);
                     }
                 }
             }
-            // A ggml preload lands on the calling thread's active rank: one thread, rank by rank.
-            if (ggml)
-                for (int r = 0; r < ranks; r++)
-                {
-                    GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, r));
-                    PreloadShards(r);
-                    // The rank's expert stacks (each its own copy, read whole by its graph's mul_mat_id).
-                    foreach (var ((_, device), stack) in _rankStacks)
-                        if (device == _mesh.GlobalDevice(0, r) && stack.Stack.HasHostData && Preload(stack.Stack, null, ggml: true))
-                        {
-                            bytes[r] += stack.Bytes;
-                            stack.Stack.ReleaseHostData();
-                        }
-                }
-            else
-                _mesh.RunPerRank(0, PreloadShards);
+            for (int stage = 0; stage < _mesh.Stages; stage++)
+            {
+                int s = stage;
+                // A ggml preload lands on the calling thread's active rank: one thread, device by device.
+                if (ggml)
+                    for (int r = 0; r < ranks; r++)
+                    {
+                        int device = _mesh.GlobalDevice(s, r);
+                        GgmlBasicOps.SetActiveRank(device);
+                        PreloadShards(s, r);
+                        // The rank's expert stacks (each its own copy, read whole by its graph's mul_mat_id).
+                        foreach (var ((_, holder), stack) in _rankStacks)
+                            if (holder == device && stack.Stack.HasHostData && Preload(stack.Stack, null, ggml: true))
+                            {
+                                bytes[device] += stack.Bytes;
+                                stack.Stack.ReleaseHostData();
+                            }
+                    }
+                else
+                    _mesh.RunPerRank(s, r => PreloadShards(s, r));
+            }
             bool wholeHeadOnHost = WholeHeadStaysOnHost;
             foreach (var kv in _quantWeights)
             {
                 QuantizedWeight weight = kv.Value;
                 if (!weight.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key) || kv.Key == "token_embd.weight") continue;
                 if (wholeHeadOnHost && kv.Key == "output.weight") continue;
-                int holders = IsHeadWeight(kv.Key) ? 1 : ranks;
+                int stage = StageOfWeight(kv.Key), holders = IsHeadWeight(kv.Key) ? 1 : ranks;
                 for (int r = 0; r < holders; r++)
                 {
-                    if (ggml) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, r));
-                    if (Preload(weight, _mesh.Allocator(0, r), ggml)) bytes[r] += weight.RawBytes;
+                    int device = _mesh.GlobalDevice(stage, r);
+                    if (ggml) GgmlBasicOps.SetActiveRank(device);
+                    if (Preload(weight, _mesh.Allocator(stage, r), ggml)) bytes[device] += weight.RawBytes;
                 }
             }
             if (ggml) GgmlBasicOps.SetActiveRank(0);
             // Only a shard its rank holds gives up its host copy (another is read from the host).
             foreach (var kv in _tpQuantWeights)
                 for (int r = 0; r < kv.Value.Length; r++)
-                    if (resident[r].Contains(kv.Value[r]) && !ShouldRetainCudaHostQuantWeight(kv.Key)) kv.Value[r].ReleaseHostData();
-            for (int r = 0; r < bytes.Length; r++)
-                Console.WriteLine($"  Rank {r}: {bytes[r] / 1024 / 1024} MB of quantized weights resident.");
+                    if (resident[_mesh.GlobalDevice(StageOfWeight(kv.Key), r)].Contains(kv.Value[r]) && !ShouldRetainCudaHostQuantWeight(kv.Key))
+                        kv.Value[r].ReleaseHostData();
+            for (int d = 0; d < bytes.Length; d++)
+                Console.WriteLine(_mesh.Stages == 1
+                    ? $"  Rank {d}: {bytes[d] / 1024 / 1024} MB of quantized weights resident."
+                    : $"  Device {d} (stage {d / ranks}, rank {d % ranks}): {bytes[d] / 1024 / 1024} MB of quantized weights resident.");
         }
 
         /// <summary>Per-rank graphs leave the whole untied head on the host (see <see cref="PrepareRankGraphResidency"/>).</summary>

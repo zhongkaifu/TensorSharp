@@ -54,20 +54,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// step, so two prompts' chunks beside the decodes doubled their per-round latency
         /// (Qwen3.8-27B agent lanes: ~650 ms rounds against ~350 ms with one chunk).
         /// Env: <c>TS_SCHED_MIXED_PREFILL_TOKENS</c> (0 turns the bound off).
-        /// <para>A model that implements
-        /// <see cref="Speculative.IMixedStepPrefillTarget.PreferredMixedStepPrefillTokens"/> sets
-        /// the bound itself unless this value was set (in code or through the environment variable).</para>
         /// </summary>
-        public int MixedStepPrefillBudget
-        {
-            get => _mixedStepPrefillBudget;
-            init { _mixedStepPrefillBudget = value; MixedStepPrefillBudgetChosen = true; }
-        }
-        private readonly int _mixedStepPrefillBudget;
-
-        /// <summary><see cref="MixedStepPrefillBudget"/> was set rather than left at its default, so a
-        /// model's own bound is not used.</summary>
-        public bool MixedStepPrefillBudgetChosen { get; private init; }
+        public int MixedStepPrefillBudget { get; init; }
 
         /// <summary>
         /// With <see cref="MixedStepPrefillBudget"/>, give a mixed step's prompt budget to
@@ -184,19 +172,13 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>This configuration with a chosen <see cref="SoloPrefillChunkSize"/>.</summary>
         public SchedulerConfig WithSoloPrefillChunkSize(int tokens) => Copy(BlockSize, Speculation, tokens);
 
-        /// <summary>This configuration with a chosen <see cref="MixedStepPrefillBudget"/>.</summary>
-        public SchedulerConfig WithMixedStepPrefillBudget(int tokens) => Copy(BlockSize, Speculation, mixedStepPrefillBudget: tokens);
-
-        private SchedulerConfig Copy(int blockSize, SpeculationOptions speculation, int? soloPrefillChunk = null,
-            int? mixedStepPrefillBudget = null) => new()
+        private SchedulerConfig Copy(int blockSize, SpeculationOptions speculation, int? soloPrefillChunk = null) => new()
         {
             MaxNumBatchedTokens = MaxNumBatchedTokens,
             MaxNumRunningSequences = MaxNumRunningSequences,
             MaxPrefillChunkSize = MaxPrefillChunkSize,
             PrefillOnlyFirstComeFirstServed = PrefillOnlyFirstComeFirstServed,
-            // Assigned in this order: the copy keeps whether the budget was chosen.
-            MixedStepPrefillBudget = mixedStepPrefillBudget ?? MixedStepPrefillBudget,
-            MixedStepPrefillBudgetChosen = mixedStepPrefillBudget.HasValue || MixedStepPrefillBudgetChosen,
+            MixedStepPrefillBudget = MixedStepPrefillBudget,
             MixedStepPrefillFirstComeFirstServed = MixedStepPrefillFirstComeFirstServed,
             // Assigned in this order: the copy keeps whether the size was chosen.
             SoloPrefillChunkSize = soloPrefillChunk ?? SoloPrefillChunkSize,
@@ -222,6 +204,7 @@ namespace TensorSharp.Runtime.Scheduling
                 MaxNumRunningSequences = ReadInt("TS_SCHED_MAX_RUNNING_SEQS", 16),
                 MaxPrefillChunkSize = ReadInt("TS_SCHED_PREFILL_CHUNK", 256),
                 PrefillOnlyFirstComeFirstServed = ReadBool("TS_SCHED_PREFILL_FCFS", false),
+                MixedStepPrefillBudget = ReadInt("TS_SCHED_MIXED_PREFILL_TOKENS", 0),
                 MixedStepPrefillFirstComeFirstServed = ReadBool("TS_SCHED_MIXED_PREFILL_FCFS", false),
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 0),
@@ -231,10 +214,7 @@ namespace TensorSharp.Runtime.Scheduling
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
                 Speculation = SpeculationOptions.FromEnvironment(),
             };
-            // Only a value the user gave counts as chosen (see SoloPrefillChunkSize and
-            // MixedStepPrefillBudget); an explicit 0 chooses no mixed-step bound.
-            if (!string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("TS_SCHED_MIXED_PREFILL_TOKENS")))
-                cfg = cfg.WithMixedStepPrefillBudget(ReadInt("TS_SCHED_MIXED_PREFILL_TOKENS", 0));
+            // Only a value the user gave counts as chosen (see SoloPrefillChunkSize).
             int solo = ReadInt("TS_SCHED_SOLO_PREFILL_CHUNK", 0);
             return solo > 0 ? cfg.WithSoloPrefillChunkSize(solo) : cfg;
         }

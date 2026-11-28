@@ -282,7 +282,7 @@ now stops startup and names the change (`RemovedCliFlags`), as the earlier `TS_G
 | Prefix cache, checkpoints | all | The runtime's holder adapter: captures, clones, donated holders, export/import. A rewind past a whole Harmony answer is exact while the rings still hold the positions the next rows' windows read (§9). |
 | `--tp N` | cuda, ggml_cuda, ggml_vulkan | Per-rank graphs. Attention is sharded by heads (the sinks with them), and every expert by its width (gate/up columns, down rows; the down bias added once). Batching is kept. gpt-oss-20b's MXFP4 down rows are 90 blocks, so `--tp 2` splits them and `--tp 4` / `--tp 8` are refused at load with the reason. Covered on simulated devices only (§11). |
 | `--layer-split N` | cuda, ggml_cuda, ggml_vulkan | Whole-layer stages, batching kept. New with the runtime. |
-| Hybrid (`--tp` x `--layer-split`) | none (gap) | The graph-only family has no graphs for tensor-parallel stages yet. |
+| Hybrid (`--tp` x `--layer-split`) | cuda, ggml_cuda, ggml_vulkan | The runtime's hybrid: every whole-layer stage runs its layers as per-rank graphs over its own group, the stream passing from stage to stage through the host; a stage's partials sum through host staging on GGML (the context's collective spans all of its devices). Covered on simulated devices only. |
 | `--n-cpu-moe` / `--cpu-moe` | all | On one device or over stages; refused with `--tp`. See §10. |
 | Speculation | all | n-gram drafts and the DFlash block drafter (below), verified in windows whose rings roll back exactly. |
 

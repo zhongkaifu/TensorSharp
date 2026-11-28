@@ -36,8 +36,9 @@ namespace TensorSharp.Models
                 ContinuousBatching = MechanismSupport.On(ServingContract.AllBackends.ToArray()),
                 TensorParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
                 LayerSplit = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
-                // The graph-only family has no graphs for tensor-parallel stages yet (the legacy model had no whole-layer placement).
-                HybridParallel = MechanismSupport.None("Gemma 4 runs whole-forward graphs only, which do not cover tensor-parallel stages yet; use --tp N or --layer-split N."),
+                // The runtime's hybrid: every whole-layer stage runs its layers as per-rank graphs over its own group, the per-layer
+                // embeddings carried from stage to stage.
+                HybridParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
                 ExpertOffload = MechanismSupport.On(ServingContract.AllBackends.ToArray()),
             },
         };

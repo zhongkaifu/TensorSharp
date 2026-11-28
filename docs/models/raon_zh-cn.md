@@ -26,7 +26,7 @@ TensorSharp 可运行 [KRAFTON/Raon-1-nano](https://huggingface.co/KRAFTON/Raon-
 | 工具调用 | 模板的 Qwen 3.5 风格 `<tool_call><function=…>` 块，由 Qwen 3.5 输出解析器解析；尚未做端到端验证。 |
 | 后端 | `cpu`（托管）、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`；`cuda` 与 `mlx` 在加载时拒绝。 |
 | 批处理 | 经共享运行时支持连续批处理、检查点与推测解码校验 |
-| 多 GPU | 无。张量并行、层切分与混合放置均声明为缺口。 |
+| 多 GPU | `ggml_cuda` 与 `ggml_vulkan` 上的 `--layer-split N`：共享运行时的整层阶段，hc 流与该步的每层嵌入（阶段携带量）从一个阶段传到下一个阶段，每层的 RDA 状态位于其所在阶段（`RaonRuntimeTests.PlacementMatchesOneDevice`，模拟设备：与单设备的 logits 一致）。张量并行与混合放置仍声明为缺口：该家族的降低不追踪单个 rank 的分片。 |
 | MTP | `*_MTP` 文件可加载，但其 NextN 块被跳过（不加载、不运行） |
 
 ## 运行

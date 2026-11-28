@@ -213,7 +213,8 @@ namespace TensorSharp.Models
             lock (_rankExpertSets)
             {
                 if (_rankExpertSets.TryGetValue((name, rank), out IGraphExpertWeights set)) return set;
-                if (_rankStacks.TryGetValue((name, _mesh.GlobalDevice(0, rank)), out RankExpertStack own)) return _rankExpertSets[(name, rank)] = own;
+                if (_rankStacks.TryGetValue((name, _mesh.GlobalDevice(StageOfWeight(name), rank)), out RankExpertStack own))
+                    return _rankExpertSets[(name, rank)] = own;
                 if (!_stackedExpertWeights.TryGetValue(name, out StackedExpertWeights stacked)) return null;
                 string baseName = name.EndsWith(".weight", StringComparison.Ordinal) ? name[..^7] : name;
                 var members = new QuantizedWeight[stacked.NumExperts];
@@ -378,6 +379,9 @@ namespace TensorSharp.Models
             public float[] Final;
             /// <summary>Each sequence's last row after the final norm [hidden, sequences] (<see cref="GraphRequest.LastRowHidden"/>).</summary>
             public float[] LastHidden;
+            /// <summary>A whole-layer stage that is not the last: its stream rows [width, rows] and the family's carry
+            /// (<see cref="StageCarryWidth"/>) for the next stage.</summary>
+            public float[] Hidden, Carry;
         }
 
         /// <summary>Rows per sequence up to which a step writes K/V by index and attends to the padded
@@ -550,7 +554,8 @@ namespace TensorSharp.Models
                 if (Binds(r.K, r.Recurrent)) (drop ??= new List<string>()).Add(shape);
             if (drop != null)
                 foreach (string shape in drop) DropDecodeReplay(shape, park);
-            if (_rankedReplay != null && Binds(_rankedReplay.K, _rankedReplay.Recurrent)) DropRankedReplay();
+            foreach (int stage in new List<int>(_rankedReplays.Keys))
+                if (Binds(_rankedReplays[stage].K, _rankedReplays[stage].Recurrent)) DropRankedReplay(stage);
         }
 
         private bool _capturesDroppedReported;
@@ -1322,9 +1327,6 @@ namespace TensorSharp.Models
             string reason = GraphUnsupportedReason();
             if (reason != null && RequiresGraphs)
                 throw new NotSupportedException($"{Config.Architecture} runs only as graphs on the shared runtime, which this step cannot use ({reason}).");
-            if (reason != null && _graphTpRanks != null && reason != "disabled")
-                throw new NotSupportedException(
-                    $"{Config.Architecture}: tensor parallelism runs as whole-forward graphs, which this step cannot use ({reason}).");
             if (reason != null && _rankGraphs)
                 throw new NotSupportedException(
                     $"{Config.Architecture}: tensor parallelism runs as per-rank graphs, which this step cannot use ({reason}).");
@@ -1345,7 +1347,7 @@ namespace TensorSharp.Models
             if (_mesh.Stages > 1)
                 return TryRunStagedGraphStep(hidden, slots, first, counts, starts, request, replayable, out result);
             if (_rankGraphs)
-                return TryRunRankedGraphStep(hidden, slots, first, counts, starts, request, out result);
+                return TryRunRankedGraphStep(hidden, null, slots, first, counts, starts, request, WholeStack, out result);
             CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
                 step => EmitStep(step, hidden, request), out StepOutputs outputs, out bool owned, shape: request.Shape,
                 advanceHidden: request.PositionTable == null ? hidden : null);
@@ -1385,6 +1387,34 @@ namespace TensorSharp.Models
                     EnterStage(s);
                     (int from, int to) = StageLayers(s);
                     bool last = s == stages - 1;
+                    if (_rankGraphs)
+                    {
+                        // The stage's tensor-parallel group runs its layers as per-rank graphs; rank 0's stream (every rank's
+                        // after the stage's last reduce) passes on.
+                        TryRunRankedGraphStep(input, carry, slots, first, counts, starts, request, new RankedSpan(s, from, to, last),
+                            out GraphResult ranked);
+                        if (ranked.Captures != null)
+                            for (int c = 0; c < ranked.Captures.Length; c++)
+                                if (ranked.Captures[c] != null) captures[c] = (float[])ranked.Captures[c].Clone();
+                        if (!last)
+                        {
+                            if (!ReferenceEquals(input, hidden)) input.Dispose();
+                            carry?.Dispose();
+                            carry = null;
+                            EnterStage(s + 1);
+                            input = CreateFloatTensor((float[])ranked.Hidden.Clone(), rows, StreamWidth);
+                            if (ranked.Carry != null) carry = CreateFloatTensor((float[])ranked.Carry.Clone(), rows, StageCarryWidth);
+                            continue;
+                        }
+                        result = new GraphResult
+                        {
+                            Logits = ranked.Logits,
+                            Final = ranked.Final,
+                            Captures = captures,
+                            LastHidden = (float[])ranked.LastHidden?.Clone(),
+                        };
+                        continue;
+                    }
                     Tensor stageInput = input, stageCarry = carry;
                     // Each stage keeps its decode step to advance (one replay a stage shape).
                     CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
@@ -1951,16 +1981,26 @@ namespace TensorSharp.Models
                 ? step.Op(GraphOp.TopK, stackalloc[] { logits, step.ConstantInputF32(suppression.Mask, Config.VocabSize) }, stackalloc long[] { 1, 1 })
                 : step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1, 1 });
 
+        /// <summary>What one per-rank step traces on a stage's tensor-parallel group: decoder layers [<see cref="From"/>,
+        /// <see cref="To"/>) of <see cref="Stage"/>, then the head when <see cref="Head"/> (the last stage), else the stream
+        /// (and the family's carry, <see cref="StageCarryWidth"/>) for the next stage. Tensor parallelism alone is stage 0's
+        /// whole stack (<see cref="WholeStack"/>); a hybrid placement runs one span per whole-layer stage
+        /// (<see cref="TryRunStagedGraphStep"/>).</summary>
+        private readonly record struct RankedSpan(int Stage, int From, int To, bool Head);
+
+        private RankedSpan WholeStack => new(0, 0, Config.NumLayers, true);
+
         /// <summary>
-        /// One step's layers over a tensor-parallel group, as each rank's program (see <see cref="TryRunRankedGraphStep"/>):
-        /// a block's partial joins the rank's copy of the residual stream once <see cref="GraphOp.AllReduce"/> summed it,
-        /// and rank 0 runs the head. The ranks' nodes are emitted block by block, so every rank's reduce follows every
-        /// rank's partial.
+        /// One span of a step over a stage's tensor-parallel group, as each rank's program (see <see cref="TryRunRankedGraphStep"/>):
+        /// a block's partial joins the rank's copy of the residual stream once <see cref="GraphOp.AllReduce"/> summed it, and the
+        /// last stage's rank 0 runs the head. The ranks' nodes are emitted block by block, so every rank's reduce follows every
+        /// rank's partial. A later stage starts from the stream (and carry) the previous stage handed over; a stage that is not
+        /// the last hands its own on from rank 0, whose copy every rank shares after the last reduce.
         /// </summary>
-        private StepOutputs EmitRankedStep(GraphStep[] steps, Tensor[] hidden, GraphRequest request)
+        private StepOutputs EmitRankedStep(GraphStep[] steps, Tensor[] hidden, Tensor[] carry, GraphRequest request, RankedSpan span)
         {
             GraphStep lead = steps[0];
-            int n = lead.Sequences, rows = lead.Rows, hiddenSize = Config.HiddenSize, ranks = steps.Length;
+            int n = lead.Sequences, rows = lead.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth, ranks = steps.Length;
             var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
             var positions = new int[rows];
             for (int s = 0; s < n; s++)
@@ -1975,7 +2015,14 @@ namespace TensorSharp.Models
                     if (n != 1) throw new InvalidOperationException("A rotary position table drives one sequence's rows.");
                     steps[r].SetPositionTable(AxisMajorPositions(request.PositionTable, rows));
                 }
-                h[r] = EmitStreamInput(steps[r], steps[r].HiddenInput(hidden[r], hiddenSize, rows));
+                // The first stage widens the embedded rows into the residual stream; later stages receive it, and what the
+                // family carries beside it (Gemma 4's per-layer embeddings).
+                h[r] = span.From == 0
+                    ? EmitStreamInput(steps[r], steps[r].HiddenInput(hidden[r], hiddenSize, rows))
+                    : steps[r].HiddenInput(hidden[r], width, rows);
+                if (span.From > 0 && StageCarryWidth > 0)
+                    TakeStageCarry(steps[r], steps[r].HiddenInput(carry?[r] ?? throw new InvalidOperationException(
+                        $"{Config.Architecture}: stage from layer {span.From} has no carry."), StageCarryWidth, rows));
             }
             if (request.CaptureLayers.Length > 0)
             {
@@ -1984,7 +2031,7 @@ namespace TensorSharp.Models
             }
             var block = new int[ranks];
             var context = new int[ranks];
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            for (int layer = span.From; layer < span.To; layer++)
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
@@ -2011,6 +2058,12 @@ namespace TensorSharp.Models
                     for (int r = 0; r < ranks; r++) h[r] = EmitBlockOutput(steps[r], layer, h[r], BlockSite.Ffn, context[r], block[r]);
                 }
                 for (int r = 0; r < ranks; r++) steps[r].Boundary(h[r]);
+            }
+            if (!span.Head)
+            {
+                outputs.Hidden = lead.Output(h[0], (long)width * rows);
+                if (StageCarryWidth > 0) outputs.CarryAt = lead.Output(EmitStageCarry(lead), (long)StageCarryWidth * rows) + 1;
+                return outputs;
             }
             if (_vocabHeadRows != null && request.LastRowLogits && !request.AllRowLogits)
                 EmitVocabSplitHead(steps, h, request, ref outputs);
@@ -2066,27 +2119,44 @@ namespace TensorSharp.Models
 
         private float[] _vocabLogits;
 
+        /// <summary>A per-rank step's results from its ranks' outputs (<paramref name="output"/>: rank, output index): rank 0's
+        /// but the vocabulary slices, which every rank scores.</summary>
+        private GraphResult RankedResult(StepOutputs outputs, int sequences, Func<int, int, float[]> output) => new GraphResult
+        {
+            Logits = outputs.Logits >= 0 ? output(0, outputs.Logits)
+                : outputs.RankLogits != null ? JoinVocabSlices(outputs.RankLogits, sequences, output) : null,
+            Final = outputs.Final >= 0 ? output(0, outputs.Final) : null,
+            Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? output(0, i) : null),
+            LastHidden = outputs.LastHiddenAt > 0 ? output(0, outputs.LastHiddenAt - 1) : null,
+            Hidden = outputs.Hidden >= 0 ? output(0, outputs.Hidden) : null,
+            Carry = outputs.CarryAt > 0 ? output(0, outputs.CarryAt - 1) : null,
+        };
+
+        /// <summary>The replay shape of a span: a whole-layer stage's steps are kinds of their own.</summary>
+        private string RankedShape(GraphRequest request, RankedSpan span)
+            => _mesh.Stages > 1 ? $"{request.Shape}|stage{span.Stage}" : request.Shape;
+
         /// <summary>Each kind's programs of the ranks (recorded once, before the kind's first step streams), whose readers
         /// let each rank's stream free its tensors.</summary>
         private readonly Dictionary<string, GraphProgram[]> _rankTemplates = new();
 
         /// <summary>
-        /// A step over a tensor-parallel group as per-rank graphs (<see cref="_rankGraphs"/>): every rank's program is
-        /// traced on one thread, block by block across the ranks, into its executor's stream, so the ops run as they are
-        /// emitted and the devices work at once; a block's all-reduce runs when the last rank hands its partial in. A kind
+        /// A span of a step over a stage's tensor-parallel group as per-rank graphs (<see cref="_rankGraphs"/>): every rank's
+        /// program is traced on one thread, block by block across the ranks, into its executor's stream, so the ops run as they
+        /// are emitted and the devices work at once; a block's all-reduce runs when the last rank hands its partial in. A kind
         /// that has not run records the ranks' programs first (nothing runs), for the streams to free tensors by.
         /// </summary>
-        private bool TryRunRankedGraphStep(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
-            GraphRequest request, out GraphResult result)
+        private bool TryRunRankedGraphStep(Tensor hidden, Tensor carry, Slot[] slots, int[] first, int[] counts, int[] starts,
+            GraphRequest request, RankedSpan span, out GraphResult result)
         {
-            if (ExecutorFor(_mesh.Allocator(0, 0)) is IRankedGraphExecutor compiled)
-                return TryRunRankedCompiledStep(compiled, hidden, slots, first, counts, starts, request, out result);
+            if (ExecutorFor(_mesh.Allocator(span.Stage, 0)) is IRankedGraphExecutor compiled)
+                return TryRunRankedCompiledStep(compiled, hidden, carry, slots, first, counts, starts, request, span, out result);
             result = null;
             int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
-            string kind = $"{rows}|{slots.Length}|{request.RecurrentSnapshots}|{string.Join(",", counts)}|{request.Shape}|" +
+            string kind = $"{span}|{rows}|{slots.Length}|{request.RecurrentSnapshots}|{string.Join(",", counts)}|{request.Shape}|" +
                           $"{request.LastRowLogits}|{request.AllRowLogits}|{request.CaptureFinal}|{string.Join(",", request.CaptureLayers)}|" +
                           $"{request.PositionTable != null}|{EmissionVariant(counts, starts)}" + RingWrapVariant(counts, starts);
-            Tensor[] inputs = RankInputs(hidden);
+            Tensor[] inputs = RankInputs(hidden, span.Stage), carries = carry == null ? null : RankInputs(carry, span.Stage);
             var steps = new GraphStep[ranks];
             var streams = new IGraphStream[ranks];
             try
@@ -2098,7 +2168,7 @@ namespace TensorSharp.Models
                     {
                         for (int r = 0; r < ranks; r++)
                             recorded[r] = new GraphStep(this, rows, slots, first, counts, starts, false, request.RecurrentSnapshots, record: true) { Rank = r };
-                        EmitRankedStep(recorded, inputs, request);
+                        EmitRankedStep(recorded, inputs, carries, request, span);
                         templates = Array.ConvertAll(recorded, step => step.Record());
                     }
                     finally
@@ -2109,14 +2179,14 @@ namespace TensorSharp.Models
                 }
                 for (int r = 0; r < ranks; r++)
                 {
-                    streams[r] = ((IStreamingGraphExecutor)ExecutorFor(_mesh.Allocator(0, r))).OpenStream(templates[r]);
+                    streams[r] = ((IStreamingGraphExecutor)ExecutorFor(_mesh.Allocator(span.Stage, r))).OpenStream(templates[r]);
                     steps[r] = new GraphStep(this, rows, slots, first, counts, starts, false, request.RecurrentSnapshots, record: false)
                         { Rank = r, Sink = streams[r] };
                 }
                 StepOutputs outputs = default;
                 bool ok = streams[0].Execute(() =>
                 {
-                    outputs = EmitRankedStep(steps, inputs, request);
+                    outputs = EmitRankedStep(steps, inputs, carries, request, span);
                     bool all = true;
                     for (int r = 0; r < ranks; r++) all &= steps[r].Run(streams[r]);
                     return all;
@@ -2128,23 +2198,15 @@ namespace TensorSharp.Models
                 }
                 GraphRuns++;
                 foreach (Slot slot in slots) slot.DeviceDirty = true;
-                IGraphPlan lead = streams[0];
-                result = new GraphResult
-                {
-                    Logits = outputs.Logits >= 0 ? lead.Outputs[outputs.Logits]
-                        : outputs.RankLogits != null ? JoinVocabSlices(outputs.RankLogits, slots.Length, (r, o) => ((IGraphPlan)streams[r]).Outputs[o]) : null,
-                    Final = outputs.Final >= 0 ? lead.Outputs[outputs.Final] : null,
-                    Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? lead.Outputs[i] : null),
-                    LastHidden = outputs.LastHiddenAt > 0 ? lead.Outputs[outputs.LastHiddenAt - 1] : null,
-                };
+                result = RankedResult(outputs, slots.Length, (r, o) => ((IGraphPlan)streams[r]).Outputs[o]);
                 return true;
             }
             finally
             {
                 foreach (GraphStep step in steps) step?.Dispose();
                 foreach (IGraphStream stream in streams) stream?.Dispose();
-                for (int r = 0; r < inputs.Length; r++)
-                    if (!ReferenceEquals(inputs[r], hidden)) inputs[r].Dispose();
+                DisposeRankInputs(inputs, hidden);
+                DisposeRankInputs(carries, carry);
             }
         }
 
@@ -2156,7 +2218,7 @@ namespace TensorSharp.Models
         private readonly Dictionary<(ulong, ulong), CachedGraph[]> _rankGraphCache = new();
         private readonly LinkedList<(ulong, ulong)> _rankGraphLru = new();
 
-        /// <summary>The last per-rank decode step, kept to run again one position on (<see cref="DecodeReplay"/>'s ranked form).</summary>
+        /// <summary>A stage's last per-rank decode step, kept to run again one position on (<see cref="DecodeReplay"/>'s ranked form).</summary>
         private sealed class RankedReplay
         {
             public GraphStep[] Steps;
@@ -2172,11 +2234,12 @@ namespace TensorSharp.Models
             public long Bindings, Stamp;
         }
 
-        private RankedReplay _rankedReplay;
+        /// <summary>The kept per-rank decode step of each whole-layer stage (one without stages: stage 0's).</summary>
+        private readonly Dictionary<int, RankedReplay> _rankedReplays = new();
 
-        private void KeepRankedReplay(GraphStep[] steps, CachedGraph[] plans, StepOutputs outputs, Slot[] slots, int[] starts, string shape)
+        private void KeepRankedReplay(int stage, GraphStep[] steps, CachedGraph[] plans, StepOutputs outputs, Slot[] slots, int[] starts, string shape)
         {
-            DropRankedReplay();
+            DropRankedReplay(stage);
             foreach (GraphStep step in steps) step.OwnPositions();   // each rank's step moves its own positions on
             int n = slots.Length;
             var r = new RankedReplay
@@ -2194,26 +2257,31 @@ namespace TensorSharp.Models
                 r.RopeDelta[s] = slots[s].RopeDelta;
             }
             r.Stamp = BindingStamp(r.Recurrent);
-            _rankedReplay = r;
+            _rankedReplays[stage] = r;
         }
 
-        private void DropRankedReplay()
+        private void DropRankedReplay(int stage)
         {
-            if (_rankedReplay == null) return;
-            foreach (GraphStep step in _rankedReplay.Steps) step?.Dispose();
-            _rankedReplay = null;
+            if (!_rankedReplays.Remove(stage, out RankedReplay replay)) return;
+            foreach (GraphStep step in replay.Steps) step?.Dispose();
         }
 
-        /// <summary>The kept per-rank decode step advanced one position with <paramref name="inputs"/> as the ranks' rows: the
-        /// same slots (caches, states, capacity), every sequence one position on, the same shape, no graph dropped since,
-        /// and every rank's masks still inside their window (the ranks' steps agree on that, so all advance or none).</summary>
-        private bool TryAdvanceRanked(Slot[] slots, int[] starts, string shape, Tensor[] inputs, out CachedGraph[] plans, out StepOutputs outputs)
+        private void DropRankedReplays()
+        {
+            foreach (int stage in new List<int>(_rankedReplays.Keys)) DropRankedReplay(stage);
+        }
+
+        /// <summary>The stage's kept per-rank decode step advanced one position with <paramref name="inputs"/> as each rank's
+        /// rows (and the stage's carry): the same slots (caches, states, capacity), every sequence one position on, the same
+        /// shape, no graph dropped since, and every rank's masks still inside their window (the ranks' steps agree on that, so
+        /// all advance or none).</summary>
+        private bool TryAdvanceRanked(int stage, Slot[] slots, int[] starts, string shape, Tensor[][] inputs, out CachedGraph[] plans,
+            out StepOutputs outputs)
         {
             plans = null;
             outputs = default;
-            RankedReplay r = _rankedReplay;
-            if (r == null || r.Epoch != _graphEpoch || r.Shape != shape || r.Slots.Length != slots.Length
-                || BindingsChanged(r.Bindings, r.Stamp, r.Recurrent)) return false;
+            if (!_rankedReplays.TryGetValue(stage, out RankedReplay r) || r.Epoch != _graphEpoch || r.Shape != shape
+                || r.Slots.Length != slots.Length || BindingsChanged(r.Bindings, r.Stamp, r.Recurrent)) return false;
             for (int s = 0; s < slots.Length; s++)
             {
                 Slot slot = slots[s];
@@ -2222,13 +2290,13 @@ namespace TensorSharp.Models
                     return false;
             }
             if (!_rankGraphCache.TryGetValue(r.Signature, out CachedGraph[] cached) || !ReferenceEquals(cached, r.Plans)
-                || !r.Steps[0].TryAdvance(new[] { inputs[0] }))
+                || !r.Steps[0].TryAdvance(inputs[0]))
             {
-                DropRankedReplay();
+                DropRankedReplay(stage);
                 return false;
             }
             for (int rank = 1; rank < r.Steps.Length; rank++)
-                if (!r.Steps[rank].TryAdvance(new[] { inputs[rank] }))
+                if (!r.Steps[rank].TryAdvance(inputs[rank]))
                     throw new InvalidOperationException($"{Config.Architecture}: tensor-parallel rank {rank} could not advance where rank 0 did.");
             Array.Copy(starts, r.Starts, starts.Length);
             _rankGraphLru.Remove(r.Signature);
@@ -2240,7 +2308,7 @@ namespace TensorSharp.Models
 
         private void ClearRankGraphCache()
         {
-            DropRankedReplay();
+            DropRankedReplays();
             foreach (CachedGraph[] plans in _rankGraphCache.Values)
                 foreach (CachedGraph plan in plans) plan.Dispose();
             _rankGraphCache.Clear();
@@ -2260,31 +2328,36 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// A step over a tensor-parallel group on an executor that compiles whole programs (GGML): every rank's program is
-        /// traced block by block across the ranks, compiled for the rank's device, and the ranks' plans run together,
-        /// pausing at each <see cref="GraphOp.AllReduce"/> while the devices sum the partial (IRankedGraphExecutor). Decode
-        /// kinds replay: a later step only re-traces to bind its inputs and finds the plans by the ranks' signatures.
+        /// A span of a step over a stage's tensor-parallel group on an executor that compiles whole programs (GGML): every
+        /// rank's program is traced block by block across the ranks, compiled for the rank's device, and the ranks' plans run
+        /// together, pausing at each <see cref="GraphOp.AllReduce"/> while the stage's devices sum the partial
+        /// (IRankedGraphExecutor). Decode kinds replay: a later step only re-traces to bind its inputs and finds the plans by
+        /// the ranks' signatures, and a decode step one position on advances the stage's kept step without a trace.
         /// </summary>
-        private bool TryRunRankedCompiledStep(IRankedGraphExecutor executor, Tensor hidden, Slot[] slots, int[] first, int[] counts,
-            int[] starts, GraphRequest request, out GraphResult result)
+        private bool TryRunRankedCompiledStep(IRankedGraphExecutor executor, Tensor hidden, Tensor carry, Slot[] slots, int[] first,
+            int[] counts, int[] starts, GraphRequest request, RankedSpan span, out GraphResult result)
         {
             result = null;
             int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
+            string shape = RankedShape(request, span);
             bool replayable = executor.Capabilities.Replays;
             foreach (int c in counts) replayable &= c <= SmallChunkRows;
             // A decode step one position on from the last runs as it advanced, without a trace (TryAdvanceDecode's rule).
             bool advance = replayable && DecodeStepsAdvance && !DecodeAdvanceDisabled && StepAdapter == null && request.PositionTable == null
                 && !request.RecurrentSnapshots && Array.TrueForAll(counts, c => c == 1);
-            Tensor[] inputs = RankInputs(hidden);
+            Tensor[] inputs = RankInputs(hidden, span.Stage), carries = carry == null ? null : RankInputs(carry, span.Stage);
             var steps = new GraphStep[ranks];
             CachedGraph[] plans = null;
             bool owned = false, replayed = false;
             StepOutputs outputs = default;
             try
             {
-                if (advance && TryAdvanceRanked(slots, starts, request.Shape, inputs, out plans, out outputs))
+                // Each rank advances its step's inputs in emission order: the stream rows, then the carry.
+                var advanced = new Tensor[ranks][];
+                for (int r = 0; r < ranks; r++) advanced[r] = carries == null ? new[] { inputs[r] } : new[] { inputs[r], carries[r] };
+                if (advance && TryAdvanceRanked(span.Stage, slots, starts, shape, advanced, out plans, out outputs))
                 {
-                    Array.Copy(_rankedReplay.Steps, steps, ranks);
+                    Array.Copy(_rankedReplays[span.Stage].Steps, steps, ranks);
                     replayed = true;
                     DecodeAdvances++;
                     GraphReplays++;
@@ -2293,7 +2366,7 @@ namespace TensorSharp.Models
                 {
                     for (int r = 0; r < ranks; r++)
                         steps[r] = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: false) { Rank = r };
-                    outputs = EmitRankedStep(steps, inputs, request);
+                    outputs = EmitRankedStep(steps, inputs, carries, request, span);
                     var key = RankedSignature(steps);
                     if (_rankGraphCache.TryGetValue(key, out plans))
                     {
@@ -2311,12 +2384,12 @@ namespace TensorSharp.Models
                 {
                     for (int r = 0; r < ranks; r++)
                         steps[r] = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: true) { Rank = r };
-                    outputs = EmitRankedStep(steps, inputs, request);
+                    outputs = EmitRankedStep(steps, inputs, carries, request, span);
                     plans = new CachedGraph[ranks];
                     try
                     {
                         for (int r = 0; r < ranks; r++)
-                            plans[r] = steps[r].BuildForRank(executor, _mesh.GlobalDevice(0, r), replayable);
+                            plans[r] = steps[r].BuildForRank(executor, _mesh.GlobalDevice(span.Stage, r), replayable);
                     }
                     catch
                     {
@@ -2328,7 +2401,7 @@ namespace TensorSharp.Models
                         var key = RankedSignature(steps);
                         _rankGraphCache[key] = plans;
                         _rankGraphLru.AddFirst(key);
-                        while (_rankGraphLru.Count > GraphCacheEntries)
+                        while (_rankGraphLru.Count > GraphCacheEntries * _mesh.Stages)
                         {
                             var evict = _rankGraphLru.Last.Value;
                             _rankGraphLru.RemoveLast();
@@ -2346,7 +2419,7 @@ namespace TensorSharp.Models
                 bool exact = ExactTensorParallelSums || replayable;
                 if (!executor.RunRanked(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), exact, out string error))
                 {
-                    if (replayed) DropRankedReplay();
+                    if (replayed) DropRankedReplay(span.Stage);
                     throw new InvalidOperationException($"{Config.Architecture} tensor-parallel graph step failed: {error}");
                 }
                 GraphRuns++;
@@ -2357,19 +2430,12 @@ namespace TensorSharp.Models
                 }
                 else if (advance && !owned && Array.TrueForAll(steps, step => step.Advanceable))
                 {
-                    KeepRankedReplay(steps, plans, outputs, slots, starts, request.Shape);
+                    KeepRankedReplay(span.Stage, steps, plans, outputs, slots, starts, shape);
                     Array.Clear(steps);
                 }
-                CachedGraph lead = plans[0];
-                result = new GraphResult
-                {
-                    // A one-shot plan is disposed below: its outputs are the caller's arrays, which disposal does not free.
-                    Logits = outputs.Logits >= 0 ? lead.Outputs[outputs.Logits]
-                        : outputs.RankLogits != null ? JoinVocabSlices(outputs.RankLogits, slots.Length, (r, o) => plans[r].Outputs[o]) : null,
-                    Final = outputs.Final >= 0 ? lead.Outputs[outputs.Final] : null,
-                    Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? lead.Outputs[i] : null),
-                    LastHidden = outputs.LastHiddenAt > 0 ? lead.Outputs[outputs.LastHiddenAt - 1] : null,
-                };
+                // A one-shot plan is disposed below: its outputs are the caller's arrays, which disposal does not free.
+                CachedGraph[] ran = plans;
+                result = RankedResult(outputs, slots.Length, (r, o) => ran[r].Outputs[o]);
                 return true;
             }
             finally
@@ -2378,20 +2444,21 @@ namespace TensorSharp.Models
                     foreach (GraphStep step in steps) step?.Dispose();
                 if (owned)
                     foreach (CachedGraph plan in plans) plan?.Dispose();
-                for (int r = 0; r < inputs.Length; r++)
-                    if (!ReferenceEquals(inputs[r], hidden)) inputs[r].Dispose();
+                DisposeRankInputs(inputs, hidden);
+                DisposeRankInputs(carries, carry);
             }
         }
 
-        /// <summary>The step's rows on every rank's allocator. Rank 0 copies them too unless they are its allocator's: another
-        /// allocator of the same GPU (the model's) works on another stream, which the rank's kernels do not wait for.</summary>
-        private Tensor[] RankInputs(Tensor hidden)
+        /// <summary>The step's rows on every rank's allocator of <paramref name="stage"/>. Rank 0 copies them too unless they are
+        /// its allocator's: another allocator of the same GPU (the model's) works on another stream, which the rank's kernels do
+        /// not wait for.</summary>
+        private Tensor[] RankInputs(Tensor hidden, int stage)
         {
             var inputs = new Tensor[_mesh.TensorParallel];
             float[] values = null;
             for (int r = 0; r < inputs.Length; r++)
             {
-                IAllocator alloc = _mesh.Allocator(0, r);
+                IAllocator alloc = _mesh.Allocator(stage, r);
                 if (ReferenceEquals(hidden.Storage.Allocator, alloc))
                 {
                     inputs[r] = hidden;
@@ -2403,6 +2470,13 @@ namespace TensorSharp.Models
                 HostWritten(inputs[r]);
             }
             return inputs;
+        }
+
+        private static void DisposeRankInputs(Tensor[] inputs, Tensor source)
+        {
+            if (inputs == null) return;
+            foreach (Tensor input in inputs)
+                if (!ReferenceEquals(input, source)) input?.Dispose();
         }
 
 
@@ -2612,9 +2686,8 @@ namespace TensorSharp.Models
             }
             int kvType = KvGgmlType(_kvCacheDtype.ToDType());
             GraphCapabilities caps = GraphExecutor.Capabilities;
-            // Decode rows and short chunks (a verify window) are written by index. Tensor-parallel graphs write every chunk by
-            // index too: ggml's meta device splits set_rows by KV head, while a copy into a strided cache view fails on the ranks.
-            bool Indexed(int count) => count <= SmallChunkRows || _graphTpRanks != null || caps.IndexedCacheWrites
+            // Decode rows and short chunks (a verify window) are written by index.
+            bool Indexed(int count) => count <= SmallChunkRows || caps.IndexedCacheWrites
                 || ((caps.PaddedCacheAttention || (PadsPromptWindowsOnVulkan && _backend == BackendType.GgmlVulkan)) && kvType != GraphFormat.F32);
             // One sequence's rows written by index: a family may take their query/key prep and cache writes as one region, which
             // the rotated queries close once the rows are written (the caches' leaves and the write rows exist before it opens).
@@ -2626,8 +2699,8 @@ namespace TensorSharp.Models
                 Slot only = step.Slots[0];
                 int cells = CacheCells(layer, only.Capacity);
                 BeginAttentionPrep(step, layer, new AttentionPrepOperands(q, k, v,
-                    step.State(only.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cells, kvHeads),
-                    step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cells, kvHeads),
+                    step.State(only.K[layer][step.RankIndex], kvType, d, cells, kvHeads),
+                    step.State(only.V[layer][step.RankIndex], kvType, dv, cells, kvHeads),
                     step.WriteRows(step.Starts[0], step.Counts[0], 0), heads, kvHeads, d, dv));
             }
             // Several sequences' verify windows written by index (a batched verify, as many rows each, none past a ring's first lap
@@ -2651,8 +2724,8 @@ namespace TensorSharp.Models
                 {
                     Slot slot = step.Slots[s];
                     int cells = CacheCells(layer, slot.Capacity);
-                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cells, kvHeads);
-                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cells, kvHeads);
+                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, d, cells, kvHeads);
+                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, dv, cells, kvHeads);
                     prepRows[s] = step.WriteRows(step.Starts[s], step.Counts[s], s);
                     if (s == 0) (firstK, firstV) = (ck, cv);
                     else further.AddRange(new[] { ck, cv, prepRows[s] });
@@ -2667,13 +2740,13 @@ namespace TensorSharp.Models
             bool blocks = GraphExecutor.Capabilities.PackedProductBlocks && !prep && !preps;
             // A prompt chunk's fresh rows as their permuted views (GraphCapabilities.FreshRowViews): written by index, attended
             // where they lie.
-            bool freshViews = caps.FreshRowViews && _graphTpRanks == null;
+            bool freshViews = caps.FreshRowViews;
             if (!blocks)
             {
                 q = step.Cont(q);
                 k = step.Cont(k);
             }
-            if (!blocks || step.Sequences > 1 || !(Indexed(step.Counts[0]) || freshViews) || _graphTpRanks != null) v = step.Cont(v);
+            if (!blocks || step.Sequences > 1 || !(Indexed(step.Counts[0]) || freshViews)) v = step.Cont(v);
             EmitQueryKey(step, layer, ref q, ref k);
             q = step.Cont(q);
             k = step.Cont(k);
@@ -2689,8 +2762,8 @@ namespace TensorSharp.Models
                     int vs = step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
                     int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Permute(ks, 0, 2, 1, 3);
                     int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Permute(vs, 0, 2, 1, 3);
-                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cells, kvHeads);
-                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cells, kvHeads);
+                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, d, cells, kvHeads);
+                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, dv, cells, kvHeads);
                     step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, prepRows[s]));
                     step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, prepRows[s]));
                 }
@@ -2731,20 +2804,19 @@ namespace TensorSharp.Models
                 int qPerm = prep ? -1 : step.Permute(qs, 0, 2, 1, 3);
                 // [d, heads, count] -> [d, count, heads]; one row is the same bytes either way. Rows written by index are read
                 // from the permuted view (set_rows reads rows at any strides: no copy of every prompt chunk's K and V, 22 of a
-                // LFM3 prompt step's 471 Metal dispatches); a chunk that attends its own rows, and the tensor-parallel ranks'
-                // writes (ggml's meta device splits set_rows by KV head), take them contiguous.
+                // LFM3 prompt step's 471 Metal dispatches); a chunk that attends its own rows takes them contiguous.
                 // A chunk that attends its own rows reads them from the views too where the executor takes them so
                 // (FreshRowViews; not past a ring's first lap, whose runs address the rows' contiguous copies).
                 bool wrapped = RingWrapped(layer, start, count);
-                bool indexedRows = (Indexed(count) || (freshViews && !wrapped)) && _graphTpRanks == null;
+                bool indexedRows = Indexed(count) || (freshViews && !wrapped);
                 int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : indexedRows ? step.Permute(ks, 0, 2, 1, 3) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
                 int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : indexedRows ? step.Permute(vs, 0, 2, 1, 3) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
 
                 // The layer's cells: a sliding-window layer's ring (StandardDecoderModel.SlidingRings.cs) holds at most its own.
                 int cap = CacheCells(layer, slot.Capacity);
                 int ring = RingOf(layer);
-                int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(layer), d, cap, kvHeads);
-                int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(layer), dv, cap, kvHeads);
+                int ck = step.State(slot.K[layer][step.RankIndex], kvType, d, cap, kvHeads);
+                int cv = step.State(slot.V[layer][step.RankIndex], kvType, dv, cap, kvHeads);
 
                 int fa;
                 if (Indexed(count) && wrapped)
@@ -2909,7 +2981,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The per-head attention sinks' leaf of <paramref name="layer"/> (<see cref="AttentionSinksWeight"/>; a rank's own
-        /// heads under per-rank graphs, split by heads on ggml's meta device), or -1.</summary>
+        /// heads under per-rank graphs), or -1.</summary>
         private int Sinks(GraphStep step, int layer)
             => AttentionSinksWeight(layer) is { } name ? step.Weight(name) : -1;
 
@@ -2922,7 +2994,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The attention's output projection, plus its bias (<see cref="AttentionProjectionsHaveBiases"/>) once: on rank 0
-        /// of per-rank graphs, whose partials the all-reduce sums (on ggml's meta device the add follows the partial's reduce).</summary>
+        /// of per-rank graphs, whose partials the all-reduce sums.</summary>
         private int AttentionOutputProjection(GraphStep step, int layer, int attn)
         {
             int y = step.MatMul(LayerName(layer, "attn_output.weight"), attn);
@@ -3022,8 +3094,8 @@ namespace TensorSharp.Models
             Slot slot = step.Slots[s];
             int kvType = KvGgmlType(_kvCacheDtype.ToDType());
             int cap = CacheCells(cacheLayer, slot.Capacity), ring = RingOf(cacheLayer), band = SlidingWindow(cacheLayer);
-            int ck = step.State(slot.K[cacheLayer][step.RankIndex], kvType, KvCacheSplit(cacheLayer), d, cap, kvHeads);
-            int cv = step.State(slot.V[cacheLayer][step.RankIndex], kvType, KvCacheSplit(cacheLayer), dv, cap, kvHeads);
+            int ck = step.State(slot.K[cacheLayer][step.RankIndex], kvType, d, cap, kvHeads);
+            int cv = step.State(slot.V[cacheLayer][step.RankIndex], kvType, dv, cap, kvHeads);
             int qPerm = step.Permute(step.Cont(q), 0, 2, 1, 3);
             int gqa = AttendsStridedWindows ? -1 : heads / kvHeads;
             int fa;
@@ -3472,7 +3544,7 @@ namespace TensorSharp.Models
                 => _sharedKv != null && _sharedKv.TryGetValue((layer, sequence), out SharedKvOperands kv) ? kv : null;
 
             /// <summary>The tensor-parallel rank whose shard this step traces (its weights' shards, caches, states and
-            /// device), or -1: the model's own weights (one device, a stage, or ggml's meta device).</summary>
+            /// device), or -1: the model's own weights (one device or a stage).</summary>
             internal int Rank { get; init; } = -1;
 
             /// <summary>The rank's index into per-rank arrays (0 without a rank).</summary>
@@ -3521,8 +3593,8 @@ namespace TensorSharp.Models
             /// <summary>The model's executor, read where a leaf's binding depends on it (a layer split's stage sets it).</summary>
             protected override IGraphExecutor Executor => _m.GraphExecutor;
 
-            private int Leaf(GraphLeafRole role, int type, ReadOnlySpan<long> ne, IntPtr data, long bytes, LeafSplit split = null, object handle = null)
-                => _b.Leaf(role, type, ne, data, bytes, split == null ? null : new GraphSplit(split.Axis, split.Ne, split.Nr), handle);
+            private int Leaf(GraphLeafRole role, int type, ReadOnlySpan<long> ne, IntPtr data, long bytes, object handle = null)
+                => _b.Leaf(role, type, ne, data, bytes, handle);
 
             /// <summary>Output <paramref name="output"/> holds layer <paramref name="layer"/>'s top-K expert ids (I32).</summary>
             internal void RecordRoutes(int output, int layer) => (_routes ??= new()).Add((output, layer));
@@ -3552,7 +3624,7 @@ namespace TensorSharp.Models
                     QuantizedWeight shard = shards[Rank];
                     long[] ne = { shard.Ne0, shard.Ne1 };
                     node = Leaf(GraphLeafRole.Weight, shard.GgmlType, ne, shard.CacheKey != IntPtr.Zero ? shard.CacheKey : shard.Data,
-                        shard.RawBytes, null, shard);
+                        shard.RawBytes, shard);
                 }
                 else if (Rank >= 0 && _m._tpWeights.TryGetValue(name, out Tensor[] tensors))
                 {
@@ -3562,12 +3634,12 @@ namespace TensorSharp.Models
                 {
                     IntPtr key = q.CacheKey != IntPtr.Zero ? q.CacheKey : q.Data;
                     long[] ne = { q.Ne0, q.Ne1 };
-                    node = Leaf(GraphLeafRole.Weight, q.GgmlType, ne, key, q.RawBytes, _m.SplitOf(name, ne, q.GgmlType), q);
+                    node = Leaf(GraphLeafRole.Weight, q.GgmlType, ne, key, q.RawBytes, q);
                 }
                 else if (_m._weights.TryGetValue(name, out Tensor t))
                 {
                     long[] ne = Extents(t);
-                    node = TensorLeaf(GraphLeafRole.Weight, Replicated(t), GraphFormat.F32, ne, _m.SplitOf(name, ne, GraphFormat.F32));
+                    node = TensorLeaf(GraphLeafRole.Weight, Replicated(t), GraphFormat.F32, ne);
                 }
                 else
                 {
@@ -3592,13 +3664,13 @@ namespace TensorSharp.Models
                 {
                     IGraphExpertWeights shard = _m.RankExpertSet(name, Rank) ?? throw Reject($"experts '{name}' have no shards for rank {Rank}");
                     node = Leaf(GraphLeafRole.Weight, shard.Format, stackalloc long[] { shard.Ne0, shard.Ne1, shard.Ne2 }, shard.CacheKey,
-                        shard.Bytes, null, shard);
+                        shard.Bytes, shard);
                     _weights[name] = node;
                     return node;
                 }
                 if (!_m._stackedExpertWeights.TryGetValue(name, out StackedExpertWeights w)) throw Reject($"experts '{name}' are not stacked");
                 long[] ne = { w.PerExpertNe0, w.PerExpertNe1, w.NumExperts };
-                node = Leaf(GraphLeafRole.Weight, w.GgmlType, ne, w.Data, w.TotalRawBytes, _m.SplitOf(name, ne, w.GgmlType), _m.ExpertSet(name, w));
+                node = Leaf(GraphLeafRole.Weight, w.GgmlType, ne, w.Data, w.TotalRawBytes, _m.ExpertSet(name, w));
                 _weights[name] = node;
                 return node;
             }
@@ -3608,7 +3680,7 @@ namespace TensorSharp.Models
             {
                 // An executor that binds tensors by object reads them on the rank's device; GGML binds host bytes and keeps
                 // each rank's device copy itself, so any rank may read any tensor.
-                if (Rank >= 0 && !_m.IsGgmlBackend && !ReferenceEquals(t.Storage.Allocator, _m._mesh.Allocator(0, Rank)))
+                if (Rank >= 0 && !_m.IsGgmlBackend && !ReferenceEquals(t.Storage.Allocator, _m._mesh.Allocator(_m._activeStage, Rank)))
                     throw new InvalidOperationException($"A leaf of tensor-parallel rank {Rank} lives on another allocator: pass the rank's " +
                         "own tensor, or Replicated() for one every rank reads.");
                 return TensorLeaf(GraphLeafRole.Weight, t, GraphFormat.F32, ne.Length == 0 ? Extents(t) : ne);
@@ -3617,17 +3689,18 @@ namespace TensorSharp.Models
             /// <summary><paramref name="t"/> as the step's rank reads it: a copy on the rank's allocator (made once) for a tensor
             /// every rank reads whole. Rank 0 too: the model's own allocator of that GPU is another one, with its own stream,
             /// which the rank's kernels and its group's all-reduce do not order against (Qwen3.6-35B-A3B --tp 2 on direct
-            /// CUDA: decode 19.9 -> 29.9 tok/s with rank 0 on its own copies).</summary>
-            public Tensor Replicated(Tensor t) => Rank >= 0 ? _m.Replica(t, 0, Rank) : t;
+            /// CUDA: decode 19.9 -> 29.9 tok/s with rank 0 on its own copies). A whole-layer stage reads its own device's copy of
+            /// a weight another stage holds (the model's rotary frequency factors, its norms outside the layers): read across
+            /// devices, direct CUDA ran Gemma 4's frequency-scaled rotary on the host, and a 512-token prompt over two stages took
+            /// 722 against 106 ms on one GPU.</summary>
+            public Tensor Replicated(Tensor t)
+                => Rank >= 0 || _m._mesh.Stages > 1 ? _m.Replica(t, _m._activeStage, RankIndex) : t;
 
             /// <summary>Read-write state the graph updates in place (a slot's cache or recurrent state).</summary>
-            public int State(Tensor t, int type, params long[] ne) => State(t, type, null, ne);
-
-            /// <summary>A state spread over tensor-parallel ranks by <paramref name="split"/> (null: mirrored).</summary>
-            internal int State(Tensor t, int type, LeafSplit split, params long[] ne)
+            public int State(Tensor t, int type, params long[] ne)
             {
                 if (_states.TryGetValue(t, out int node)) return node;
-                node = TensorLeaf(GraphLeafRole.State, t, type, ne, _m._graphTpRanks != null ? split : null);
+                node = TensorLeaf(GraphLeafRole.State, t, type, ne);
                 _states[t] = node;
                 _stateOrder.Add(t);
                 return node;
@@ -3636,8 +3709,8 @@ namespace TensorSharp.Models
             /// <summary>Sequence s's recurrent state of (layer, rank 0).</summary>
             internal RecurrentState SequenceState(int s, int layer) => Slots[s].Recurrent[layer][RankIndex];
 
-            private int TensorLeaf(GraphLeafRole role, Tensor t, int type, ReadOnlySpan<long> ne, LeafSplit split = null)
-                => Leaf(role, type, ne, LeafIdentity(t), t.Storage.ByteLength, split, t);
+            private int TensorLeaf(GraphLeafRole role, Tensor t, int type, ReadOnlySpan<long> ne)
+                => Leaf(role, type, ne, LeafIdentity(t), t.Storage.ByteLength, t);
 
             // ---- per-run inputs
 
@@ -4286,13 +4359,13 @@ namespace TensorSharp.Models
             internal GraphProgram Record()
             {
                 if (!_record) throw new InvalidOperationException("a hash-only trace records no program");
-                return Program = _b.ToProgram(false, false, _m._graphTpRanks);
+                return Program = _b.ToProgram(false, false);
             }
 
             internal CachedGraph Build(bool replayable, bool reorder)
             {
                 if (!_record) throw new InvalidOperationException("a hash-only trace cannot be built");
-                GraphProgram program = _b.ToProgram(replayable, reorder, _m._graphTpRanks);
+                GraphProgram program = _b.ToProgram(replayable, reorder);
                 Program = program;
                 return new CachedGraph { Plan = _m.GraphExecutor.Compile(program) };
             }
@@ -4301,7 +4374,7 @@ namespace TensorSharp.Models
             internal CachedGraph BuildForRank(IRankedGraphExecutor executor, int device, bool replayable)
             {
                 if (!_record) throw new InvalidOperationException("a hash-only trace cannot be built");
-                GraphProgram program = _b.ToProgram(replayable, false, _m._graphTpRanks);
+                GraphProgram program = _b.ToProgram(replayable, false);
                 Program = program;
                 return new CachedGraph { Plan = executor.CompileForRank(program, device) };
             }

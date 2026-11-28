@@ -263,7 +263,7 @@ GPT-OSS 与 Gemma 4、Qwen 3.5、Nemotron-H、Mistral 3 一样运行在共享解
 | 前缀缓存、检查点 | 全部 | 运行时的 holder 适配器：捕获、克隆、捐赠的 holder、导出/导入。只要环形缓存仍保留后续行的窗口要读取的位置，回退整段 Harmony 回答就是精确的（§9）。 |
 | `--tp N` | cuda、ggml_cuda、ggml_vulkan | 按 rank 的计算图。注意力按 head 切分（sink 随之切分），每个 expert 按宽度切分（gate/up 按列、down 按行；down bias 只加一次）。保持批处理。gpt-oss-20b 的 MXFP4 down 行由 90 个块组成，因此 `--tp 2` 能切分它们，`--tp 4` / `--tp 8` 在加载时被拒绝并说明原因。仅在模拟设备上覆盖（§11）。 |
 | `--layer-split N` | cuda、ggml_cuda、ggml_vulkan | 整层阶段，保持批处理。随运行时新增。 |
-| 混合（`--tp` x `--layer-split`） | 无（缺口） | 这个只用计算图的家族还没有张量并行阶段的计算图。 |
+| 混合（`--tp` x `--layer-split`） | cuda、ggml_cuda、ggml_vulkan | 运行时的混合放置：每个整层阶段在自己的组上以按 rank 的计算图运行其层，残差流经主机从一个阶段传到下一个阶段；在 GGML 上，阶段内的部分和经主机暂存求和（上下文的集合通信跨越它的全部设备）。只在模拟设备上覆盖过。 |
 | `--n-cpu-moe` / `--cpu-moe` | 全部 | 单设备或各阶段上可用；`--tp` 下拒绝。见 §10。 |
 | 投机解码 | 全部 | n-gram 草稿与 DFlash 块级草稿器（见下文），在环形缓存可精确回退的窗口中验证。 |
 

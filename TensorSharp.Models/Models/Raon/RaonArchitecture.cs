@@ -21,9 +21,11 @@ namespace TensorSharp.Models
             "Raon-1 nano runs as whole-forward graphs on the managed and GGML backends (--backend cpu, ggml_cpu, ggml_metal, " +
             "ggml_cuda, ggml_vulkan); --backend cuda and mlx have not run it yet.";
 
-        private const string OneDevice =
-            "Raon-1 nano runs on one device so far: its hyper-connection streams, per-layer embeddings and RDA state " +
-            "have no tensor-parallel or whole-layer placement yet.";
+        private const string NoTensorParallel =
+            "Raon-1 nano has no tensor-parallel placement yet: its lowering (hyper-connection mixes, MLA, RDA) traces no rank's " +
+            "shard. Use --layer-split N for several GPUs.";
+
+        private static readonly BackendType[] MultiDeviceGraphBackends = { BackendType.GgmlCuda, BackendType.GgmlVulkan };
 
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
@@ -33,17 +35,18 @@ namespace TensorSharp.Models
             Factory = c => Array.IndexOf(GraphBackends, c.Backend) < 0
                 ? throw new NotSupportedException(BackendRefusal)
                 : new RaonRuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
-            // On the shared runtime, with the placements it does not run yet declared as gaps (ServingContractConformanceTests
-            // .KnownGaps); RaonRuntimeTests proves the rest.
+            // On the shared runtime, with tensor parallelism declared as a gap (ServingContractConformanceTests.KnownGaps);
+            // RaonRuntimeTests proves the rest.
             Serving = new ServingContract
             {
                 Implementation = ServingImplementation.SharedRuntime,
                 Backends = GraphBackends,
                 HasRoutedExperts = false,
                 ContinuousBatching = MechanismSupport.On(GraphBackends),
-                TensorParallel = MechanismSupport.None(OneDevice),
-                LayerSplit = MechanismSupport.None(OneDevice),
-                HybridParallel = MechanismSupport.None(OneDevice),
+                TensorParallel = MechanismSupport.None(NoTensorParallel),
+                // The runtime's whole-layer stages: the hc streams and the per-layer embeddings (the stage carry) pass on.
+                LayerSplit = MechanismSupport.On(MultiDeviceGraphBackends).KeepsBatching(),
+                HybridParallel = MechanismSupport.None(NoTensorParallel),
                 ExpertOffload = MechanismSupport.NotApplicable("dense: no routed experts"),
             },
         };

@@ -186,14 +186,14 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
         Assert.Contains("post=1E-08", model.KVStateFingerprint, StringComparison.Ordinal);
     }
 
-    /// <summary>Tensor parallelism (per-rank programs: one tensor-parallel stage always runs them; the output gate's rows
-    /// sharded with the query heads, the Q/K norms replicated), whole-layer stages (programs and per op) and their hybrid (whose
-    /// tensor-parallel stages run per op) on simulated devices give the one-device logits of the decode and ring-wrap cases.</summary>
+    /// <summary>Tensor parallelism (per-rank programs, which every tensor-parallel group runs: the output gate's rows sharded
+    /// with the query heads, the Q/K norms replicated), whole-layer stages (programs and per op) and their hybrid (each stage's
+    /// group running per-rank programs) on simulated devices give the one-device logits of the decode and ring-wrap cases.</summary>
     [Theory]
     [InlineData(2, 1, true)]
     [InlineData(1, 2, true)]
     [InlineData(1, 2, false)]
-    [InlineData(2, 2, false)]
+    [InlineData(2, 2, true)]
     public void PlacementsOnSimulatedDevicesGiveTheOneDeviceLogits(int tp, int stages, bool graphs)
     {
         Directory.CreateDirectory(_dir);
