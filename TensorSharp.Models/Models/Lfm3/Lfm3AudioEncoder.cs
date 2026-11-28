@@ -372,7 +372,8 @@ namespace TensorSharp.Models
                 void Free(Tensor t)
                 {
                     if (t == null) return;
-                    if (executor is { Capabilities.BindsHostPointers: true }) executor.Invalidate(TensorComputePrimitives.GetStoragePointer(t));
+                    // Its device copies first, then the bytes (DeviceResidency).
+                    DeviceResidency.InvalidateBound(TensorComputePrimitives.GetStoragePointer(t), executor);
                     t.Dispose();
                 }
                 Free(Ds0);

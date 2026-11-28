@@ -231,9 +231,8 @@ namespace TensorSharp.Models.Lfm3
                 foreach (Tensor t in set)
                 {
                     if (t == null) continue;
-                    // A GGML executor keeps device copies keyed on the state's host bytes: drop them before the bytes go.
-                    if (executor.Capabilities.BindsHostPointers) executor.Invalidate(TensorComputePrimitives.GetStoragePointer(t));
-                    t.Dispose();
+                    // The state's device copies go with it (DeviceResidency: the executor that bound its bytes).
+                    DeviceResidency.ReleaseTensor(t, executor);
                 }
             }
         }

@@ -283,10 +283,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// on direct CUDA a projection's copy in the backend's resident-weight cache, which Invalidate does not reach (the
         /// denoiser releases its copies the same way). A pinned F32 leaf's tensor stays (the codec's own, freed with it).</summary>
         private void Release(MiniMaxH3ImageWeight w)
-        {
-            if (_tensorAllocator is TensorSharp.Cuda.CudaAllocator cuda) TensorSharp.Cuda.CudaQuantizedOps.ReleaseQuantizedWeight(cuda, w.Data);
-            else _executor.Invalidate(w.Data);
-        }
+            => DeviceResidency.ReleaseWeightCopies(_tensorAllocator, w.Data, w.Data, _executor);
 
         // ---- IResidentComponent
 

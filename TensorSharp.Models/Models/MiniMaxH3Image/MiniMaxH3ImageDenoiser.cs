@@ -1092,10 +1092,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         }
 
         private static void ReleaseCopy(IntPtr data, IAllocator allocator, IGraphExecutor executor)
-        {
-            if (allocator is TensorSharp.Cuda.CudaAllocator cuda) TensorSharp.Cuda.CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data);
-            else executor.Invalidate(data);
-        }
+            // The backend's resident weight by the address where it keeps one, else the executor's copy (DeviceResidency).
+            => DeviceResidency.ReleaseWeightCopies(allocator, data, data, executor);
 
         /// <summary>Every weight leaf a device may hold a copy of: the file's and, under tensor parallelism, the ranks' shards.</summary>
         private IEnumerable<MiniMaxH3ImageWeight> BoundWeights()

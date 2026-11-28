@@ -20,7 +20,12 @@ namespace TensorSharp.MLX
     {
         [ModuleInitializer]
         internal static void Register()
-            => GraphExecutors.Register(typeof(MlxAllocator), allocator => new MlxGraphExecutor(allocator));
+        {
+            GraphExecutors.Register(typeof(MlxAllocator), allocator => new MlxGraphExecutor(allocator));
+            // The resident quantized weights live under their cache keys: their owners drop them through DeviceResidency (D02).
+            DeviceResidency.RegisterWeightReleaser(typeof(MlxAllocator),
+                (allocator, cacheKey) => MlxQuantizedOps.ReleaseQuantizedWeight((MlxAllocator)allocator, cacheKey));
+        }
 
         public MlxGraphExecutor(IAllocator allocator) : base(allocator) { }
 

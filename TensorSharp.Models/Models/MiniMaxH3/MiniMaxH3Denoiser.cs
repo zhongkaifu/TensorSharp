@@ -668,14 +668,8 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         private static void ReleaseCopy(IntPtr data, IAllocator tensorAllocator, IGraphExecutor executor)
-        {
-            switch (tensorAllocator)
-            {
-                case TensorSharp.Cuda.CudaAllocator cuda: TensorSharp.Cuda.CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data); break;
-                case TensorSharp.MLX.MlxAllocator mlx: TensorSharp.MLX.MlxQuantizedOps.ReleaseQuantizedWeight(mlx, data); break;
-                default: executor.Invalidate(data); break;
-            }
-        }
+            // The backend's resident weight by the address where it keeps one, else the executor's copy (DeviceResidency).
+            => DeviceResidency.ReleaseWeightCopies(tensorAllocator, data, data, executor);
 
         /// <summary>Where the tensor executors keep what the steps allocate: the one device's allocator, each stage's, or each
         /// rank's (null on GGML).</summary>

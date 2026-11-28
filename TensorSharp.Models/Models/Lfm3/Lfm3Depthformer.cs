@@ -178,9 +178,8 @@ namespace TensorSharp.Models.Lfm3
                 _disposed = true;
                 IGraphExecutor executor = _graph.Executor;
                 _graph.Dispose();
-                // A GGML executor keeps device copies keyed on the state's host bytes: drop them before the bytes go.
-                if (executor.Capabilities.BindsHostPointers) executor.Invalidate(TensorComputePrimitives.GetStoragePointer(_projection));
-                _projection.Dispose();
+                // The projection's device copies go with it (DeviceResidency: whichever executor bound its bytes).
+                DeviceResidency.ReleaseTensor(_projection, executor);
             }
         }
     }

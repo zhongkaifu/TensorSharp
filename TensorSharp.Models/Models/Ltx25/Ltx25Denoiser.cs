@@ -810,13 +810,10 @@ public sealed class Ltx25Denoiser : IDenoiser
     private void ReleaseCopy(IntPtr data)
     {
         if (data == IntPtr.Zero) return;
+        // Each lane's backend drops what it keeps (DeviceResidency): the CUDA and MLX resident weights by the address; MLX's
+        // executor's F32 copy and a GGML executor's pointer cache by the same address.
         foreach (var (device, executor) in Lanes())
-            switch (device)
-            {
-                case CudaAllocator cuda: CudaQuantizedOps.ReleaseQuantizedWeight(cuda, data); break;
-                case MlxAllocator mlx: MlxQuantizedOps.ReleaseQuantizedWeight(mlx, data); executor.Invalidate(data); break;
-                default: executor.Invalidate(data); break;
-            }
+            DeviceResidency.ReleaseWeightCopies(device, data, data, executor);
     }
 
     /// <summary>Drop the device copies of <paramref name="set"/>'s factors; under tensor parallelism also those of the ranks'

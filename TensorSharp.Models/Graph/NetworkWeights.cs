@@ -425,19 +425,13 @@ namespace TensorSharp.Models.Graph
             if (w.Quantized != null)
             {
                 QuantizedWeight q = w.Quantized;
-                // Every backend's resident copy keyed on the weight goes first, then the host bytes it was made from.
-                if (Allocator is CudaAllocator cuda) CudaQuantizedOps.ReleaseQuantizedWeight(cuda, q.CacheKey);
-                else if (Allocator is MlxAllocator mlx) MlxQuantizedOps.ReleaseQuantizedWeight(mlx, q.CacheKey);
-                else if (q.Data != IntPtr.Zero && GraphExecutors.For(Allocator) is { Capabilities.BindsHostPointers: true } executor)
-                    executor.Invalidate(q.Data);
+                // Every backend's resident copy keyed on the weight goes first, then the host bytes it was made from
+                // (DeviceResidency knows which backend keeps which copy).
+                DeviceResidency.ReleaseWeightCopies(Allocator, q.CacheKey, q.Data);
                 q.Dispose();
             }
             if (w.Dense != null)
-            {
-                if (GraphExecutors.For(Allocator) is { Capabilities.BindsHostPointers: true } executor)
-                    executor.Invalidate(TensorComputePrimitives.GetStoragePointer(w.Dense));
-                w.Dense.Dispose();
-            }
+                DeviceResidency.ReleaseTensor(w.Dense);
         }
 
         public void Dispose()

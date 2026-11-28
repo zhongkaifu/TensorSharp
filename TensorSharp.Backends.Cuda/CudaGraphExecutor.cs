@@ -21,7 +21,12 @@ namespace TensorSharp.Cuda
     {
         [ModuleInitializer]
         internal static void Register()
-            => GraphExecutors.Register(typeof(CudaAllocator), allocator => new CudaGraphExecutor(allocator));
+        {
+            GraphExecutors.Register(typeof(CudaAllocator), allocator => new CudaGraphExecutor(allocator));
+            // The resident quantized weights live under their cache keys: their owners drop them through DeviceResidency (D02).
+            DeviceResidency.RegisterWeightReleaser(typeof(CudaAllocator),
+                (allocator, cacheKey) => CudaQuantizedOps.ReleaseQuantizedWeight((CudaAllocator)allocator, cacheKey));
+        }
 
         public CudaGraphExecutor(IAllocator allocator) : base(allocator) { }
 
