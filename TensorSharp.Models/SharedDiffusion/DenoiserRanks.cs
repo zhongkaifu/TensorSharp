@@ -115,7 +115,9 @@ namespace TensorSharp.Models.SharedDiffusion
         /// for the rank's device. The plans then run together, each paused at its all-reduces while the group sums the
         /// partials. Returns rank 0's outputs, valid until the next step.
         /// </summary>
-        public float[][] Run(Action<GraphEmitter, int> emit, string what)
+        /// <param name="floatProducts">The emitters' F32 products (GraphEmitter's floatProducts), as the family's one-device
+        /// step sets it.</param>
+        public float[][] Run(Action<GraphEmitter, int> emit, string what, bool floatProducts = false)
         {
             ArgumentNullException.ThrowIfNull(emit);
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -126,7 +128,7 @@ namespace TensorSharp.Models.SharedDiffusion
                 ulong a = 0xcbf29ce484222325UL, b = (ulong)n;
                 for (int r = 0; r < n; r++)
                 {
-                    traces[r] = new GraphEmitter(_executors[r], record: false);
+                    traces[r] = new GraphEmitter(_executors[r], record: false, floatProducts);
                     emit(traces[r], r);
                     (ulong x, ulong y) = traces[r].Signature;
                     a = (a ^ x) * 0x100000001b3UL;
@@ -140,7 +142,7 @@ namespace TensorSharp.Models.SharedDiffusion
                     {
                         for (int r = 0; r < n; r++)
                         {
-                            using var recorded = new GraphEmitter(_executors[r], record: true);
+                            using var recorded = new GraphEmitter(_executors[r], record: true, floatProducts);
                             emit(recorded, r);
                             GraphProgram program = recorded.ToProgram(replayable: true);
                             plans[r] = _ranked != null ? _ranked.CompileForRank(program, _devices[r]) : _executors[r].Compile(program);

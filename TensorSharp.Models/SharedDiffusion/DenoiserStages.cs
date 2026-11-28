@@ -118,24 +118,27 @@ namespace TensorSharp.Models.SharedDiffusion
         /// stage's device, after the old plan's memory is released. Returns the plan's first output (the residual stream the
         /// next stage reads, or the last stage's result), valid until the stage runs again.
         /// </summary>
-        public float[] Run(int stage, Action<GraphEmitter> emit, string what) => RunAll(stage, emit, what)[0];
+        public float[] Run(int stage, Action<GraphEmitter> emit, string what, bool floatProducts = false)
+            => RunAll(stage, emit, what, floatProducts)[0];
 
         /// <summary><see cref="Run"/> returning every output of the stage's plan, in emission order: a family whose blocks carry
-        /// several residual streams (a dual-stream DiT's image and text, or video and audio) hands each on as its own output.</summary>
-        public float[][] RunAll(int stage, Action<GraphEmitter> emit, string what)
+        /// several residual streams (a dual-stream DiT's image and text, or video and audio) hands each on as its own output.
+        /// <paramref name="floatProducts"/>: the emitters' F32 products (GraphEmitter's floatProducts; a denoiser that sets it
+        /// on one device sets it here).</summary>
+        public float[][] RunAll(int stage, Action<GraphEmitter> emit, string what, bool floatProducts = false)
         {
             ArgumentNullException.ThrowIfNull(emit);
             ObjectDisposedException.ThrowIf(_disposed, this);
             return OnDevice(stage, () =>
             {
                 IGraphExecutor x = _executors[stage];
-                using var trace = new GraphEmitter(x, record: false);
+                using var trace = new GraphEmitter(x, record: false, floatProducts);
                 emit(trace);
                 if (_plans[stage] == null || _signatures[stage] != trace.Signature)
                 {
                     _plans[stage]?.Dispose();
                     _plans[stage] = null;
-                    using var recorded = new GraphEmitter(x, record: true);
+                    using var recorded = new GraphEmitter(x, record: true, floatProducts);
                     emit(recorded);
                     _plans[stage] = recorded.Compile(replayable: true);
                     _signatures[stage] = recorded.Signature;
