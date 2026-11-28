@@ -1741,6 +1741,17 @@ the two whose chat prompt ran under `--tp 2`; `--tp 2` keeps the faster decode (
 pipeline gains 1.60-1.83x over the stages one after another on `ggml_cuda` and 1.39-1.45x on direct CUDA, where `--tp 2`
 stays ahead for Nemotron-H-8B (3.20 s against 3.64).
 
+**Speculation and serving.** With `--spec` (Qwen3.8-27B's MTP layer) the prompt is not pipelined, and the pipeline's switch
+changes nothing: on `ggml_cuda` the same reply and prompt time with it on and off (10.37 s against 10.40 s, 23.4-23.6 tok/s
+decode at 69 % acceptance), on direct CUDA the plain greedy reply at 75 % acceptance. Through `TensorSharp.Server.Host`
+(Qwen3.5-9B, `ggml_cuda --layer-split 2`, `eng/concurrent-parity.py`, eight requests over the server's shared 3,454-token
+prompt): no errors with the pipeline on or off; the first request, which prefills the shared prompt, reached its first
+token in 2.17 s against 3.11 s; a request with the 5,132-token document after the shared prompt took 3.18-3.25 s against
+4.41-4.51 s (one GPU 4.40-4.46 s). The other requests prefill about 25 tokens after the shared prompt and do not pipeline:
+their burst took 5.92 s against 5.91, and, with the shared prompt's checkpoint restored from disk, 6.46-6.58 s against
+6.43-6.62 s (ABAB). Equal to their lone replies: 4-6 of 8 either way (one GPU 5 of 8), as the batched steps' kernels part on
+near ties.
+
 **Tests.** `PipelinedPromptTests`: the refill and the engine's slot route against the same chunks one after another, bit
 for bit through the prompt and three greedy decode steps, for mistral3 (two and three stages), qwen3vl (routed experts),
 qwen35 (Gated DeltaNet), nemotron_h (Mamba), gemma4 (sliding rings, a stage carry) and lfm3 (short convolutions) on the
@@ -1761,3 +1772,6 @@ failed, 1,459 skipped; after them the scheduler, slot, stage, prefill and pipeli
   so `--spec` keeps the stages one after another on a long prompt.
 * On direct CUDA a product of a few hundred prompt rows costs about as much as one of 2,048 for the K-quant and IQ formats,
   which keeps its chunks at 2,048 rows and its gain below `ggml_cuda`'s (1.39-1.45x against 1.60-1.83x).
+* A shared-prompt checkpoint restored from disk costs every request that reuses it about 70 ms more to its first token
+  than one the server prefilled itself (Qwen3.5-9B over two `ggml_cuda` stages: 127-160 ms against 58-75 ms alone, 408-983 ms
+  against about 180 ms in a burst of eight), with the pipeline on or off. Not investigated here.
