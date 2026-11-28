@@ -971,13 +971,22 @@ namespace TensorSharp.Runtime.Scheduling
 
             try
             {
-                batched?.OnSequenceReleased(requestId);
+                ReleaseModelState(batched, requestId);
                 _executor.RadixCache?.Drain();
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Model release hook failed for sequence {EngineRequestId}", requestId);
             }
+        }
+
+        /// <summary>Frees the model's state of <paramref name="requestId"/>: through the unified contract's state store when the
+        /// model has one (D01: a model that implements only that contract is released without the legacy hook), else the legacy
+        /// batched model's release hook (<see cref="IBatchedPagedModel.OnSequenceReleased"/>).</summary>
+        private void ReleaseModelState(IBatchedPagedModel? batched, string requestId)
+        {
+            if (_model is ISequenceStateStore store) store.ReleaseSequenceState(requestId);
+            else batched?.OnSequenceReleased(requestId);
         }
 
         private void ApplyCommand(EngineCommand cmd)
@@ -1546,14 +1555,15 @@ namespace TensorSharp.Runtime.Scheduling
                 ? SchedulerConfig.PageFamilyBlockSize
                 : SchedulerConfig.DefaultBlockSize;
 
-        /// <summary>Whether the model keeps each sequence's whole state in a native slot
-        /// (<see cref="IBatchedPagedModel.UsesNativeSequenceSlots"/>, or DeepSeek V4.1's
-        /// holders), so the block pool only tracks reservations.</summary>
-        private static bool UsesNativeSequenceSlots(IModelArchitecture model)
+        /// <summary>Whether the model keeps each sequence's whole state in a native slot, so the block pool only tracks
+        /// reservations: its state store says so (<see cref="ISequenceStateStore.StateStorage"/> is
+        /// <see cref="SequenceStateStorage.NativeSlots"/>), or a legacy per-sequence model declares it
+        /// (<see cref="IBatchedPagedModel.UsesNativeSequenceSlots"/>: DeepSeek V4.1). The contract decides, not the
+        /// architecture's name.</summary>
+        internal static bool UsesNativeSequenceSlots(IModelArchitecture model)
             => !model.SupportsKVStateSnapshot
-                && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true } batched
-                && (batched.UsesNativeSequenceSlots
-                    || string.Equals(model.Config?.Architecture, "deepseek41", StringComparison.OrdinalIgnoreCase));
+                && (model is ISequenceStateStore { StateStorage: SequenceStateStorage.NativeSlots }
+                    || model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true, UsesNativeSequenceSlots: true });
 
         private struct EngineCommand
         {

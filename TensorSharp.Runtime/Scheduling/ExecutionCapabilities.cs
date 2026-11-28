@@ -135,6 +135,22 @@ namespace TensorSharp.Runtime.Scheduling
             };
         }
 
+        /// <summary>The capabilities an admission plan reads (<see cref="ExecutionPlanner.PlanAdmission"/>): the state and
+        /// batching surface only, without the speculation queries a step plan also makes.</summary>
+        public static ExecutionCapabilities ForAdmission(IModelArchitecture model)
+        {
+            var batched = model as IBatchedPagedModel;
+            return new ExecutionCapabilities
+            {
+                SupportsBatchedPagedAttention = batched != null,
+                SupportsUnifiedBatching = model is IUnifiedBatchModel unified && unified.SupportsUnifiedBatching,
+                BatchedForwardAvailable = batched != null && batched.BatchedForwardAvailable,
+                SupportsBatchedMultimodal = batched != null && batched.SupportsBatchedMultimodal,
+                SupportsPerSequenceFusedForward = batched != null && batched.SupportsPerSequenceFusedForward,
+                SupportsRetainedFusedCache = batched != null && batched.SupportsRetainedFusedCache,
+            };
+        }
+
         /// <summary>Human-readable multi-line capability listing (startup log).</summary>
         public string Describe()
         {

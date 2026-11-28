@@ -19,7 +19,29 @@ namespace TensorSharp.Models
     /// </summary>
     public abstract partial class StandardDecoderModel : IUnifiedBatchModel, ISoloPrefillBudgetModel
     {
-        public bool SupportsUnifiedBatching => SupportsPerSequenceFusedForward;
+        /// <summary>The unified contract's own capability (D01): the load has per-request slots to batch over (a cache), and is
+        /// not a multi-node pipeline (which runs the serialized stage protocol, binding no request). The legacy
+        /// <see cref="SupportsPerSequenceFusedForward"/> is derived from it, not the other way round.</summary>
+        public bool SupportsUnifiedBatching => _cacheK != null && LayerSplitGroup == null;
+
+        // ---------------------------------------------------------------- ISequenceStateStore
+
+        /// <summary>Whether <paramref name="requestId"/> has a slot (one it ran on, or one a restored prefix made).</summary>
+        public bool HasSequenceState(string requestId) => HasFusedSequenceCache(requestId);
+
+        /// <summary>Rewinds the request's slot to its first <paramref name="tokens"/> tokens (a reused slot adopted past the
+        /// prompt): the slot is bound, truncated (attention caches rewind, a recurrent state only where a checkpoint is kept)
+        /// and written back, so the primary cache stays as it was.</summary>
+        public bool TryRewindSequenceState(string requestId, int tokens)
+        {
+            if (!HasSequenceState(requestId)) return false;
+            BindSequenceCache(requestId);
+            try { return TryTruncateKVCache(tokens); }
+            finally { RestorePrimaryCache(); }
+        }
+
+        /// <summary>Frees the request's slot (a slot the prefix cache retained is no longer the request's).</summary>
+        public void ReleaseSequenceState(string requestId) => OnSequenceReleased(requestId);
 
         /// <summary>A lone prompt's step on MLX, in tokens (see <see cref="PreferredSoloPrefillTokens"/>).</summary>
         private const int MlxPromptStepTokens = 512;

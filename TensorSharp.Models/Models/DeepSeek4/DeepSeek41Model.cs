@@ -29,6 +29,11 @@ namespace TensorSharp.Models
             : base(ggufPath, backend, tpDegree, tpGroup, draftModelPath, layerSplitDegree)
             => _requestedBackend = backend;
 
+        /// <summary>V4.1's executor keeps each request's complete state in its own native slot: the engine sizes its
+        /// zero-byte block pool for every running request's context and refuses a request longer than one slot
+        /// (InferenceEngine.UsesNativeSequenceSlots), declared here rather than recognised by the architecture's name.</summary>
+        public override bool UsesNativeSequenceSlots => true;
+
         /// <summary>
         /// ggml registry name the vision companion loads on. It must be the text
         /// executor's own backend: the encoder's output rows are handed straight

@@ -34,6 +34,30 @@ namespace TensorSharp.Runtime.Scheduling
     /// </summary>
     public static class ExecutionPlanner
     {
+        /// <summary>
+        /// The admission plan of a request (D01): which state route its state is stored and read on, and so which reused
+        /// states it can resume (a slot is read only by the per-request route, a paged end state only by the batched route).
+        /// The step plan (<see cref="PlanStep"/>) then picks each step's path under it; both read the same capabilities and
+        /// options, so what admission reuses is what execution can read. The prefix cache coordinator consumes this plan
+        /// instead of predicting the route itself.
+        /// </summary>
+        public static AdmissionPlan PlanAdmission(ExecutionCapabilities caps, ExecutionOptions options)
+        {
+            System.ArgumentNullException.ThrowIfNull(caps);
+            System.ArgumentNullException.ThrowIfNull(options);
+            bool batchedEnabled = !options.BatchedPathDisabled;
+            // A unified model reads every request's slot, whatever the per-sequence switches say (PlanStep's Unified branch).
+            if (caps.SupportsUnifiedBatching)
+                return new AdmissionPlan(AdmissionRoute.Slots, BatchedPagedOnMiss: false, BatchedPagedTakesMedia: false,
+                    PagedEndStatesReadable: false, SlotEndStatesReadable: true);
+            bool perSequence = batchedEnabled && options.PerSeqFusedEnabled && caps.SupportsBatchedPagedAttention
+                && caps.SupportsPerSequenceFusedForward;
+            bool batchedPaged = batchedEnabled && caps.BatchedForwardAvailable;
+            return new AdmissionPlan(perSequence ? AdmissionRoute.Slots : AdmissionRoute.Primary,
+                BatchedPagedOnMiss: !perSequence && batchedPaged, BatchedPagedTakesMedia: caps.SupportsBatchedMultimodal,
+                PagedEndStatesReadable: batchedPaged, SlotEndStatesReadable: perSequence);
+        }
+
         public static ExecutionPlan PlanStep(
             ExecutionCapabilities caps,
             ExecutionOptions options,
@@ -226,6 +250,11 @@ namespace TensorSharp.Runtime.Scheduling
         {
             var sb = new StringBuilder();
 
+            // The unified contract serves every step on its own (PlanStep's first branch): the legacy paths below are not
+            // reached for such a model.
+            sb.Append("unified execution contract: ")
+                .Append(caps.SupportsUnifiedBatching ? "serving (every step one batched forward over per-request slots)" : "not served")
+                .Append('\n');
             sb.Append("batched paged attention: ");
             if (!caps.SupportsBatchedPagedAttention)
                 sb.Append("unavailable (model does not implement IBatchedPagedModel)");

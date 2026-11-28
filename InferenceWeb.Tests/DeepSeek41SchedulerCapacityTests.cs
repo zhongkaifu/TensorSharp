@@ -21,12 +21,15 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
     public void Dispose() => _env.Dispose();
 
     [Theory]
-    [InlineData("deepseek41", true, false, false, 132)]
-    [InlineData("DEEPSEEK41", true, false, false, 132)]
+    // The model's declaration decides (DeepSeek41Model declares native slots), never the architecture's name: a
+    // "deepseek41" model that does not declare them keeps the shared pool.
+    [InlineData("deepseek41", true, false, true, 132)]
+    [InlineData("DEEPSEEK41", true, false, true, 132)]
+    [InlineData("deepseek41", true, false, false, 33)]
     [InlineData("deepseek4", true, false, false, 33)]
     [InlineData("qwen35", true, false, false, 33)]
-    [InlineData("deepseek41", false, false, false, 33)]
-    [InlineData("deepseek41", true, true, false, 33)]
+    [InlineData("deepseek41", false, false, true, 33)]
+    [InlineData("deepseek41", true, true, true, 33)]
     // A model that declares native sequence slots (the direct-CUDA Qwen 3.8
     // Flash Next engine), whatever its architecture; the declaration alone does
     // not count without the per-sequence path, or with byte snapshots.
@@ -42,6 +45,17 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
         using var model = new SlotModel(architecture, 257, perSequence, snapshots, declaresNativeSlots);
         using var engine = new InferenceEngine(model, Config());
         Assert.Equal(expectedBlocks, engine.PoolStats.totalBlocks);
+    }
+
+    [Fact]
+    public void DeepSeekV41DeclaresItsNativeSlotsAndV4DoesNot()
+    {
+        // The engine reads the declaration (IBatchedPagedModel.UsesNativeSequenceSlots), so the model types must make it.
+        var v41 = typeof(TensorSharp.Models.DeepSeek41Model).GetProperty(nameof(IBatchedPagedModel.UsesNativeSequenceSlots))!;
+        var v4 = typeof(TensorSharp.Models.DeepSeek4Model).GetProperty(nameof(IBatchedPagedModel.UsesNativeSequenceSlots))!;
+        Assert.Equal(typeof(TensorSharp.Models.DeepSeek41Model), v41.GetMethod!.DeclaringType);
+        Assert.True(v4.GetMethod!.IsVirtual);
+        Assert.Equal(typeof(TensorSharp.Models.DeepSeek4Model), v4.GetMethod.DeclaringType);
     }
 
     [Fact]
@@ -196,7 +210,7 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
     private sealed class SlotModel(
         string architecture = "deepseek41", int context = 256,
         bool perSequence = true, bool snapshots = false,
-        bool declaresNativeSlots = false) : IModelArchitecture, IBatchedPagedModel
+        bool declaresNativeSlots = true) : IModelArchitecture, IBatchedPagedModel
     {
         private readonly HashSet<string> _slots = new(StringComparer.Ordinal);
         public int PromptTokensForwarded { get; private set; }

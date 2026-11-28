@@ -506,9 +506,8 @@ namespace TensorSharp.Server
                 if (model.IsRetiring)
                     throw new ModelUnloadedException();
                 throw new InvalidOperationException(
-                    "Continuous-batching engine is unavailable for this model " +
-                    "(the model supports neither IBatchedPagedModel.ForwardBatch " +
-                    "nor IModelArchitecture.SupportsKVStateSnapshot).");
+                    "Continuous-batching engine is unavailable for this model. "
+                    + (TensorSharp.Runtime.Scheduling.EngineServability.RefusalReason(model) ?? "The engine host is disposed."));
             }
             // Until this request is submitted, an idle engine holds the step that would start the requests already submitted
             // (at most a few milliseconds), so requests sent together prefill together (InferenceEngine.BeginPreparation).

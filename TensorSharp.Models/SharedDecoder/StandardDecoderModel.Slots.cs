@@ -304,8 +304,8 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- capability
 
-        /// <summary>A multi-node pipeline runs the serialized stage protocol, which binds no request.</summary>
-        public bool SupportsPerSequenceFusedForward => _cacheK != null && LayerSplitGroup == null;
+        /// <summary>The legacy per-sequence fused capability, the unified contract's (<see cref="SupportsUnifiedBatching"/>).</summary>
+        public bool SupportsPerSequenceFusedForward => SupportsUnifiedBatching;
 
         /// <summary>The paged-storage forward is gone: requests run on their own device-resident slots.</summary>
         public bool BatchedForwardAvailable => false;

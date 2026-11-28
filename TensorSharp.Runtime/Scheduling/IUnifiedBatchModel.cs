@@ -10,12 +10,17 @@ using System.Collections.Generic;
 namespace TensorSharp.Runtime.Scheduling
 {
     /// <summary>
-    /// A model whose every step is one batched forward over per-request device slots (the shared decoder runtime):
-    /// prompt chunks and decode tokens of any number of requests run in the same forward, each request attending to
-    /// its own slot. There is no shared primary cache, no ownership swap and no paged migration; the executor serves
-    /// such a model on <see cref="ExecutionPathKind.Unified"/>.
+    /// The execution capability of the unified execution contract: a model whose every step is one batched forward over
+    /// per-request device slots (the shared decoder runtime): prompt chunks and decode tokens of any number of requests run
+    /// in the same forward, each request attending to its own slot. There is no shared primary cache, no ownership swap and
+    /// no paged migration; the executor serves such a model on <see cref="ExecutionPathKind.Unified"/>. Its requests' state
+    /// lives in the model's <see cref="ISequenceStateStore"/> (created, rewound and released through it alone); state reuse
+    /// (<see cref="PrefixCache.IPrefixCacheModel"/>) and speculation
+    /// (<see cref="TensorSharp.Runtime.Speculative.IBatchedSpeculativeTarget"/>) are optional capabilities beside it. A model
+    /// that implements this contract needs neither <see cref="IBatchedPagedModel"/> nor KV state snapshots to be served
+    /// (<see cref="EngineServability"/>).
     /// </summary>
-    public interface IUnifiedBatchModel
+    public interface IUnifiedBatchModel : ISequenceStateStore
     {
         /// <summary>False when this load cannot batch over slots (a multi-node pipeline).</summary>
         bool SupportsUnifiedBatching { get; }
@@ -28,7 +33,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary><see cref="EnsureSequenceSlot(string, int)"/> where the step needs only <paramref name="requiredTokens"/>
         /// (its prompt, its first token and a verify window's slack): a model that sizes slots to the device's memory may hold
         /// less than the reservation and grow the slot when a later step needs it. Others hold the reservation.</summary>
-        int EnsureSequenceSlot(string requestId, int reserveTokens, int requiredTokens) => EnsureSequenceSlot(requestId, reserveTokens);
+        int ISequenceStateStore.EnsureSequenceSlot(string requestId, int reserveTokens, int requiredTokens) => EnsureSequenceSlot(requestId, reserveTokens);
 
         /// <summary>One forward: request s's <paramref name="tokens"/>[s] at positions <paramref name="starts"/>[s]
         /// onward, every request's rows together; <paramref name="lastRowLogits"/>[s] its last row's logits. Declines

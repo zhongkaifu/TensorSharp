@@ -107,20 +107,20 @@ namespace TensorSharp.Server
         /// <summary>Get the engine for the currently-loaded model, constructing
         /// it if it hasn't been built yet (or rebuilding it if the model has
         /// changed). Returns null when no model is loaded or when the model
-        /// supports neither the KV-state snapshot contract nor the batched
-        /// paged-attention contract.
+        /// implements no serving contract.
         ///
-        /// Models that implement <see cref="IBatchedPagedModel"/> serve
-        /// parallel requests via <c>ForwardBatch</c> and don't need to swap
-        /// KV state between sequences, so they qualify even when
-        /// <see cref="ModelBase.SupportsKVStateSnapshot"/> reports false.</summary>
+        /// Which contract serves a model is one decision shared by every host
+        /// (<see cref="EngineServability"/>): the unified execution contract
+        /// (<see cref="IUnifiedBatchModel"/> with its <see cref="ISequenceStateStore"/>)
+        /// is enough on its own, and the legacy batched paged-attention and
+        /// KV-snapshot contracts are still served through their adapters.</summary>
         public InferenceEngine TryGetEngine()
         {
             var model = _lifecycle.Model;
             // A model being unloaded gets no new engine: its dispose would free the weights
             // under that engine's worker.
             if (model == null || model.IsRetiring) return null;
-            if (!model.SupportsKVStateSnapshot && model is not IBatchedPagedModel) return null;
+            if (!EngineServability.CanServe(model)) return null;
 
             string fp = model.KVStateFingerprint ?? string.Empty;
             lock (_gate)

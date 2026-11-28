@@ -158,8 +158,8 @@ public sealed class EnginePreparationTests
     }
 
     /// <summary>A model served on the unified path (every request on its own slot, one forward a step), with idle work of
-    /// <see cref="IdleSlices"/> slices.</summary>
-    private sealed class UnifiedSlotModel : IModelArchitecture, IBatchedPagedModel, IUnifiedBatchModel
+    /// <see cref="IdleSlices"/> slices. It implements only the unified contract (no legacy batched-paged holders).</summary>
+    private sealed class UnifiedSlotModel : IModelArchitecture, IUnifiedBatchModel
     {
         private readonly Dictionary<string, int> _lengths = new(StringComparer.Ordinal);
         public int IdleSlices { get; init; }
@@ -173,18 +173,11 @@ public sealed class EnginePreparationTests
         public bool SupportsKVStateSnapshot => false;
         public bool SupportsCrossSequenceKvReuse => false;
         public int MaxContextLength => 256;
-        public bool BatchedForwardAvailable => false;
-        public bool SupportsPerSequenceFusedForward => true;
         public bool SupportsUnifiedBatching => true;
-        public bool CanBatchDecode(string requestId, int position) => false;
         public float[] Forward(int[] tokens) => Logits();
-        public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext context)
-            => throw new InvalidOperationException("The slots have no batched graph.");
-        public bool BindSequenceCache(string id) => _lengths.TryAdd(id, 0);
-        public void AdoptPrimaryCacheToFused(string id) => BindSequenceCache(id);
-        public bool HasFusedSequenceCache(string id) => _lengths.ContainsKey(id);
-        public void OnSequenceReleased(string id) => _lengths.Remove(id);
-        public void RestorePrimaryCache() { }
+        public bool HasSequenceState(string id) => _lengths.ContainsKey(id);
+        public bool TryRewindSequenceState(string id, int tokens) => false;
+        public void ReleaseSequenceState(string id) => _lengths.Remove(id);
         public void ResetKVCache() { }
         public void TruncateKVCache(int count) { }
         public void Dispose() { }

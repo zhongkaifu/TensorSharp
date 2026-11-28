@@ -158,4 +158,34 @@ namespace TensorSharp.Runtime.Scheduling
             return sb.ToString();
         }
     }
+
+    /// <summary>The state route a request's state is stored and read on (<see cref="ExecutionPlanner.PlanAdmission"/>).</summary>
+    public enum AdmissionRoute
+    {
+        /// <summary>The model's single primary cache (the per-sequence path with ownership swaps).</summary>
+        Primary = 0,
+        /// <summary>The request's own slot or holder (the unified or per-sequence fused path).</summary>
+        Slots = 1,
+    }
+
+    /// <summary>
+    /// Where a request's state is stored and which reused states it can resume (<see cref="ExecutionPlanner.PlanAdmission"/>).
+    /// </summary>
+    /// <param name="Route">The route its state is stored on.</param>
+    /// <param name="BatchedPagedOnMiss">On a primary route, a request no reuse serves may plan its prefix on the batched paged
+    /// route instead (its pages are read where they are).</param>
+    /// <param name="BatchedPagedTakesMedia">That re-plan also takes a request with media.</param>
+    /// <param name="PagedEndStatesReadable">A paged end state (pages the batched forward reads) can be resumed.</param>
+    /// <param name="SlotEndStatesReadable">A slot or holder end state (a retained or materialized request state) can be
+    /// resumed.</param>
+    public sealed record AdmissionPlan(AdmissionRoute Route, bool BatchedPagedOnMiss, bool BatchedPagedTakesMedia,
+        bool PagedEndStatesReadable, bool SlotEndStatesReadable)
+    {
+        /// <summary>Whether a request with <paramref name="hasMedia"/> may re-plan on the batched paged route on a miss.</summary>
+        public bool ReplansOnBatchedPaged(bool hasMedia) => BatchedPagedOnMiss && (!hasMedia || BatchedPagedTakesMedia);
+
+        /// <summary>Whether end states of the kind the prefix cache keeps (<paramref name="pagedEndStates"/>: paged ones, else
+        /// slot or holder ones) can be resumed on this plan.</summary>
+        public bool EndStatesReadable(bool pagedEndStates) => pagedEndStates ? PagedEndStatesReadable : SlotEndStatesReadable;
+    }
 }

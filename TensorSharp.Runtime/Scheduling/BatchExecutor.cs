@@ -32,7 +32,7 @@ namespace TensorSharp.Runtime.Scheduling
     /// share the model's KV tensors via a slot mapping and block table tensor;
     /// see <see cref="IBatchedPagedModel"/> for the opt-in interface.
     /// </summary>
-    public sealed class BatchExecutor
+    public sealed partial class BatchExecutor
     {
         private readonly IModelArchitecture _model;
         private readonly BlockPool _pool;
@@ -2081,17 +2081,9 @@ namespace TensorSharp.Runtime.Scheduling
                     // continued the others) continues its conversation's drafter context before its slot asks the device for
                     // room, which gives back the kept contexts no request holds.
                     if (SpeculationEnabledThisStep) EnsureDraftContinuation(seq);
-                    // A slot adopted past this prompt rewinds, a revoked live-cache claim is dropped and a reused
-                    // prefix is injected the way a per-request holder binds (BindFusedHolder).
-                    if (_model is IBatchedPagedModel holders
-                        && (_pendingRetainedFusedTruncations.ContainsKey(seq.RequestId)
-                            || (!holders.HasFusedSequenceCache(seq.RequestId) && (seq.NumComputedTokens > 0 || seq.UsesLiveCacheContinuation))))
-                    {
-                        bool bound;
-                        try { bound = BindFusedHolder(holders, seq, results); }
-                        finally { holders.RestorePrimaryCache(); }
-                        if (!bound) continue;
-                    }
+                    // A state adopted past this prompt rewinds and a revoked live-cache claim is dropped, through the model's
+                    // state store (or, for a model on the legacy holder protocol, its adapter: UnifiedStateBinding).
+                    if (!UnifiedState.Prepare(model, seq, results)) continue;
                     int reserve = ResolvePrefillReservation(seq.PromptTokens.Count, seq.MaxNewTokens, _model.MaxContextLength, kvReserveMax);
                     reserve = (int)Math.Min(_model.MaxContextLength, (long)reserve + verifySlack);
                     // What this step needs: the prompt and its first token (a request too long for the device is refused before
@@ -2099,9 +2091,7 @@ namespace TensorSharp.Runtime.Scheduling
                     long needed = Math.Max((long)seq.PromptTokens.Count + 1, (long)seq.NumComputedTokens + work.NumScheduledTokens) + verifySlack;
                     int required = (int)Math.Min(reserve, Math.Min(_model.MaxContextLength, needed));
                     int held = model.EnsureSequenceSlot(seq.RequestId, reserve, required);
-                    if (held != seq.NumComputedTokens)
-                        throw new InvalidOperationException(
-                            $"{seq.RequestId}: its slot holds {held} tokens, the sequence {seq.NumComputedTokens}.");
+                    UnifiedState.Reconcile(model, seq, held);
                     prepared.Add(work);
                 }
                 catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == 0)

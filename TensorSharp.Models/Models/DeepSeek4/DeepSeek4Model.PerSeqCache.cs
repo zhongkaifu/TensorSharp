@@ -120,6 +120,11 @@ namespace TensorSharp.Models
         /// on the serial per-sequence path.</summary>
         public bool SupportsPerSequenceFusedForward => _slotExecutor != null;
 
+        /// <summary>Whether each request's whole state lives in the executor's native slot, so the scheduler's block pool only
+        /// tracks reservations (<see cref="IBatchedPagedModel.UsesNativeSequenceSlots"/>): V4.1's slots do
+        /// (<see cref="DeepSeek41Model"/>); V4 keeps the shared pool's semantics.</summary>
+        public virtual bool UsesNativeSequenceSlots => false;
+
         public bool HasFusedSequenceCache(string requestId)
         {
             lock (_sync)
