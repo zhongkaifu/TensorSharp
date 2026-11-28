@@ -142,6 +142,43 @@ public sealed class PipelinedPromptTests : IDisposable
         _output.WriteLine($"{family} on two ggml_cuda GPUs: the slot's prompt in {wavefronts} wavefronts, {sequential.Count} logit rows bit for bit");
     }
 
+    public static TheoryData<string, bool> CudaCases => new()
+    {
+        { "mistral3", false }, { "qwen3vl", false }, { "qwen35", false }, { "nemotron_h", false }, { "gemma4", false }, { "lfm3", false },
+        { "mistral3", true }, { "qwen3vl", true }, { "qwen35", true }, { "nemotron_h", true }, { "gemma4", true }, { "lfm3", true },
+    };
+
+    /// <summary>On two direct-CUDA GPUs, where a wavefront runs its stages one after another, the last first (a run that
+    /// reads nothing back returns with its device work queued): the refill and the slot route, the stages' bits chunk after
+    /// chunk.</summary>
+    [MultiCudaTheory(2)]
+    [MemberData(nameof(CudaCases))]
+    public void PipelinedPromptOnTwoCudaGpusIsTheStagesChunkAfterChunk(string family, bool slot)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        var rng = new Random(23);
+        int[] prompt = Enumerable.Range(0, 70).Select(_ => rng.Next(10, 250)).ToArray();
+        List<float[]> sequential, pipelined;
+        int wavefronts;
+        if (slot)
+        {
+            (sequential, _, _) = RunSlot(family, path, 2, prompt, pipelined: false, BackendType.Cuda);
+            (pipelined, int prompts, wavefronts) = RunSlot(family, path, 2, prompt, pipelined: true, BackendType.Cuda);
+            Assert.Equal(1, prompts);
+        }
+        else
+        {
+            (sequential, _) = Run(family, path, 2, prompt, pipelined: false, BackendType.Cuda);
+            (pipelined, wavefronts) = Run(family, path, 2, prompt, pipelined: true, BackendType.Cuda);
+        }
+        Assert.Equal(6, wavefronts);
+        for (int i = 0; i < sequential.Count; i++)
+            Assert.True(sequential[i].AsSpan().SequenceEqual(pipelined[i]),
+                $"{family} on cuda ({(slot ? "slot" : "refill")}): logits {i} differ (max |d| {sequential[i].Zip(pipelined[i], (a, b) => Math.Abs(a - b)).Max():E2})");
+        _output.WriteLine($"{family} on two CUDA GPUs ({(slot ? "slot" : "refill")}): {wavefronts} wavefronts, {sequential.Count} logit rows bit for bit");
+    }
+
     private static ModelBase Open(string family, string path, BackendType backend, int stages) => family switch
     {
         "mistral3" => new Mistral3Model(path, backend, 1, null, stages),

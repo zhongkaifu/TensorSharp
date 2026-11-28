@@ -46,11 +46,16 @@ namespace TensorSharp.Models
         private static readonly int MlxEvalEveryNLayers = ResolvePositiveEnv("TS_MLX_EVAL_EVERY_N_LAYERS", 4);
         private static readonly int PrefillChunkTokens = ResolvePositiveEnv("TS_PREFILL_CHUNK", 2048);
 
-        /// <summary>Tests: the rows of a long prompt's chunks (<c>TS_PREFILL_CHUNK</c>, 2,048, otherwise), so a short prompt
-        /// spans several.</summary>
+        /// <summary>Rows of a pipelined prompt's chunks over whole-layer stages (StandardDecoderModel.PipelinedPrompt.cs).</summary>
+        private static readonly int PipelinedChunkTokensDefault = ResolvePositiveEnv("TS_PIPELINED_CHUNK", 512);
+
+        /// <summary>Tests: the rows of a long prompt's chunks, pipelined or not (<c>TS_PREFILL_CHUNK</c>, 2,048, and
+        /// <c>TS_PIPELINED_CHUNK</c>, 512, otherwise), so a short prompt spans several.</summary>
         internal int? PromptChunkTokensForTests { get; set; }
 
         private int PromptChunkTokens => PromptChunkTokensForTests ?? PrefillChunkTokens;
+
+        private int PipelinedChunkTokens => PromptChunkTokensForTests ?? PipelinedChunkTokensDefault;
 
         private readonly int _requestedTensorParallel;
         private readonly int _requestedStages;
@@ -1030,18 +1035,18 @@ namespace TensorSharp.Models
             _promptScope = true;
             try
             {
+                // Over local whole-layer stages the chunks pipeline: each stage works on its own chunk at once.
+                if (tokens is { Length: > 2 } && PipelinesPrompt(tokens.Length - 1))
+                {
+                    TryRunPipelinedPrompt(tokens, tokens.Length - 1);
+                    return ForwardCore(new[] { tokens[^1] });
+                }
                 // Long prompts run in chunks so the per-layer score tensor stays bounded
                 // (~heads x chunk x context). Media carry positions within one forward, and a
                 // multi-node pipeline follows the serialized protocol, so neither is chunked.
                 if (tokens == null || tokens.Length <= PromptChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
                     return ForwardCore(tokens);
                 int last = tokens.Length - 1;
-                // Over local whole-layer stages the chunks pipeline: each stage works on its own chunk at once.
-                if (PipelinesPrompt(last))
-                {
-                    TryRunPipelinedPrompt(tokens, last);
-                    return ForwardCore(new[] { tokens[last] });
-                }
                 // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
                 IDisposable overlap = null;
                 if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs)

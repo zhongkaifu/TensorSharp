@@ -24,6 +24,8 @@ namespace TensorSharp.Models
         /// <summary><c>TS_PIPELINED_PROMPT=0</c>: prompts over whole-layer stages run one chunk after another (an A/B switch).</summary>
         private static readonly bool PipelinedPromptEnabled = Environment.GetEnvironmentVariable("TS_PIPELINED_PROMPT") != "0";
 
+        private bool _pipelinedNoted;
+
         /// <summary>Wavefronts the pipelined prompts ran (a test seam: 0 when every prompt ran chunk after chunk).</summary>
         internal int PipelinedWavefronts { get; private set; }
 
@@ -39,10 +41,11 @@ namespace TensorSharp.Models
             if (!PipelinedPromptEnabled || PipelinedPromptDisabledForTests || _mesh == null || _mesh.Stages < 2 || _rankGraphs || _mesh.TensorParallel > 1) return false;
             if (LayerSplitGroup?.NodeCount > 1 || HasPendingMedia || _pendingPositionTable != null || _followPlainPrompt) return false;
             if (StepAdapter != null || AnyExpertLayerOffloaded()) return false;
-            if (count < 2 * PromptChunkTokens || PromptChunkTokens > _maxSequenceStepRows) return false;
+            if (count < 2 * PipelinedChunkTokens || PipelinedChunkTokens > _maxSequenceStepRows) return false;
             if (GraphExecutor is not { } executor || GraphUnsupportedReason() != null) return false;
             bool ggml = executor is IRankedGraphExecutor && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
-            return ggml || (PipelinedPromptForTests && executor is TensorGraphExecutor);
+            bool cuda = _backend == BackendType.Cuda && executor is TensorGraphExecutor;
+            return ggml || cuda || (PipelinedPromptForTests && executor is TensorGraphExecutor);
         }
 
         /// <summary>Whether any layer's routed experts run on the host (a stage's graph then pauses for them).</summary>
@@ -81,8 +84,8 @@ namespace TensorSharp.Models
         /// <summary>
         /// A lone request's plain prompt step over local whole-layer stages (the engine's solo prefill: the prompt, up to
         /// SchedulerConfig.SoloPrefillChunkSize tokens, as one step) as <see cref="RunPipelinedChunks"/>'s wavefronts of
-        /// <see cref="PromptChunkTokens"/> rows, its last row then a one-row step for the logits: the bits of those chunks one
-        /// after another, as <see cref="ForwardRefill"/>'s. As one step, each stage had waited for the whole prompt to pass the
+        /// <see cref="PipelinedChunkTokens"/> rows, its last row then a one-row step for the logits: the bits of those chunks one
+        /// after another. As one step, each stage had waited for the whole prompt to pass the
         /// stage before it (Qwen3.5-9B Q8_0 over two GGML stages: a 5,131-token chat prompt in 3.1 s either way before the
         /// engine's steps pipelined). False (nothing run) where the step does not pipeline (<see cref="PipelinesPrompt"/>, rows
         /// handed in or out, drafter features, a prompt a draft layer or DFlash ring follows).
@@ -116,7 +119,12 @@ namespace TensorSharp.Models
         /// </summary>
         private void RunPipelinedChunks(int[] tokens, int count, int baseStart, Slot bound)
         {
-            int chunk = PromptChunkTokens, chunks = (count + chunk - 1) / chunk, stages = _mesh.Stages;
+            int chunk = PipelinedChunkTokens, chunks = (count + chunk - 1) / chunk, stages = _mesh.Stages;
+            if (!_pipelinedNoted)
+            {
+                _pipelinedNoted = true;
+                Console.WriteLine($"  {Config.Architecture}: long prompts pipeline over the {stages} whole-layer stages in {chunk}-row chunks (TS_PIPELINED_CHUNK; TS_PIPELINED_PROMPT=0 runs them one after another).");
+            }
             PrepareHeadLayout();
             MarkDrafterWeights();
             RoomForRecordings();
@@ -209,17 +217,23 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <summary>One wavefront's plans, the stages first .. first + n - 1 in order: one plan runs alone; several run together
-        /// (the GGML executor queues every device's graph before it waits for any; the tensor executors run them in lockstep).</summary>
+        /// <summary>One wavefront's plans, the stages first .. first + n - 1: the GGML executor queues every device's graph
+        /// before it waits for any (<see cref="IRankedGraphExecutor.RunRanked"/>); the tensor executors run them one after
+        /// another, the last stage first: a direct-CUDA run returns with its device work queued unless it reads rows back, which
+        /// every stage but the last does for the stage after it, so each earlier stage runs while the later ones' work is
+        /// queued (the first stage first, the second had started only once the first's rows were back).</summary>
         private void RunWavefront(GraphStep[] steps, CachedGraph[] plans, int first)
         {
-            string error;
-            bool ok;
-            if (plans.Length == 1)
+            string error = null;
+            bool ok = true;
+            if (plans.Length == 1 || GraphExecutor is not IRankedGraphExecutor ranked || GraphExecutor is TensorGraphExecutor)
             {
-                EnterStage(first);
-                ok = steps[0].Run(plans[0].Plan);
-                error = plans[0].Plan.LastError;
+                for (int i = plans.Length - 1; i >= 0 && ok; i--)
+                {
+                    EnterStage(first + i);
+                    ok = steps[i].Run(plans[i].Plan);
+                    if (!ok) error = $"stage {first + i}: {plans[i].Plan.LastError}";
+                }
             }
             else
             {
@@ -227,9 +241,7 @@ namespace TensorSharp.Models
                 var compiled = Array.ConvertAll(plans, p => p.Plan);
                 EnterStage(first);
                 long started = Stopwatch.GetTimestamp();
-                ok = GraphExecutor is IRankedGraphExecutor ranked && GraphExecutor is not TensorGraphExecutor
-                    ? ranked.RunRanked(compiled, runInputs, exactSums: false, out error)
-                    : TensorGraphExecutor.RunRanked(compiled, runInputs, out error);
+                ok = ranked.RunRanked(compiled, runInputs, exactSums: false, out error);
                 long ticks = Stopwatch.GetTimestamp() - started;
                 for (int i = 0; i < steps.Length; i++) steps[i].CountRun(compiled[i], ticks / steps.Length);
             }
