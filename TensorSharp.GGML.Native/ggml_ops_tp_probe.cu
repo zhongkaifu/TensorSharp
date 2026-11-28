@@ -918,6 +918,190 @@ void tp_cuda_allreduce_f32_free()
 #endif
 }
 
+#if !defined(_WIN32)
+namespace {
+
+// TensorSharp's exact F32 all-reduce over peer memory, for the exact sums a family asks for where NCCL is absent: one
+// collective a partial, where the chunked fallback ran one of ggml's per 32,764 floats (its transport rounds wider sums to
+// BF16): ~46K collectives a Qwen-Image prediction, which made --tp 2 twice as slow as one GPU, and an 18 s 5K-token prompt
+// on Qwen3.8 Flash Next where two stages took 3.4 s. Every rank copies its peers' partials into its scratch once they are
+// ready (an event per rank, no host wait), then, once every peer has read its own, sums them in rank order over its partial:
+// the same additions on every rank, so every rank holds the same bits.
+struct P2pSources
+{
+    const float* p[TSG_MAX_DEVICES];
+};
+
+__global__ void tp_p2p_sum_kernel(float* dst, P2pSources src, int nranks, int64_t n)
+{
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
+    {
+        float acc = src.p[0][i];
+        for (int k = 1; k < nranks; ++k) acc += src.p[k][i];
+        dst[i] = acc;
+    }
+}
+
+struct P2pAllReduce
+{
+    bool probed = false, usable = false;
+    int count = 0;
+    int devices[TSG_MAX_DEVICES] = {};
+    cudaEvent_t ready[TSG_MAX_DEVICES] = {}, copied[TSG_MAX_DEVICES] = {};
+    float* scratch[TSG_MAX_DEVICES] = {};
+    size_t scratch_bytes[TSG_MAX_DEVICES] = {};
+
+    void clear()
+    {
+        int previous = 0;
+        const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+        for (int r = 0; r < count; ++r)
+        {
+            if (cudaSetDevice(devices[r]) != cudaSuccess) continue;
+            cudaDeviceSynchronize();
+            if (scratch[r]) cudaFree(scratch[r]);
+            if (ready[r]) cudaEventDestroy(ready[r]);
+            if (copied[r]) cudaEventDestroy(copied[r]);
+            scratch[r] = nullptr;
+            scratch_bytes[r] = 0;
+            ready[r] = copied[r] = nullptr;
+        }
+        if (restore) cudaSetDevice(previous);
+        probed = usable = false;
+        count = 0;
+    }
+};
+
+P2pAllReduce g_p2p;
+
+bool p2p_prepare(P2pAllReduce& s, const int* devices, int count)
+{
+    if (s.probed && s.count == count && std::equal(devices, devices + count, s.devices)) return s.usable;
+    s.clear();
+    s.probed = true;
+    s.count = count;
+    std::copy(devices, devices + count, s.devices);
+    if (const char* e = std::getenv("TS_GGML_TP_P2P_ALLREDUCE"); e != nullptr && e[0] == '0') return s.usable = false;
+    for (int a = 0; a < count; ++a)
+        for (int b = 0; b < count; ++b)
+        {
+            int can = 0;
+            if (a != b && (cudaDeviceCanAccessPeer(&can, devices[a], devices[b]) != cudaSuccess || !can)) return s.usable = false;
+        }
+    if (tp_probe_cuda_peer_access(devices, count) != 1) return s.usable = false;
+    int previous = 0;
+    const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+    bool ok = true;
+    for (int r = 0; r < count && ok; ++r)
+    {
+        ok = cudaSetDevice(devices[r]) == cudaSuccess;
+        for (int k = 0; k < count && ok; ++k)
+        {
+            if (k == r) continue;
+            cudaError_t e = cudaDeviceEnablePeerAccess(devices[k], 0);
+            if (e == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e = cudaSuccess; }
+            ok = e == cudaSuccess;
+        }
+        ok = ok && cudaEventCreateWithFlags(&s.ready[r], cudaEventDisableTiming) == cudaSuccess
+                && cudaEventCreateWithFlags(&s.copied[r], cudaEventDisableTiming) == cudaSuccess;
+    }
+    if (restore) cudaSetDevice(previous);
+    if (!ok) { cudaGetLastError(); return s.usable = false; }
+    std::fprintf(stderr, "[TP] TensorSharp exact F32 all-reduce over peer memory: %d ranks.\n", count);
+    return s.usable = true;
+}
+
+} // namespace
+
+int tp_p2p_allreduce_f32(ggml_backend_t* backends, ggml_tensor** tensors, int count)
+{
+    if (count < 2 || count > TSG_MAX_DEVICES) return 0;
+    const int64_t n = ggml_nelements(tensors[0]);
+    int devices[TSG_MAX_DEVICES];
+    cudaStream_t streams[TSG_MAX_DEVICES];
+    for (int r = 0; r < count; ++r)
+    {
+        if (backends[r] == nullptr || !ggml_backend_is_cuda(backends[r]) || tensors[r] == nullptr
+            || tensors[r]->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensors[r]) || ggml_nelements(tensors[r]) != n)
+            return 0;
+        auto* ctx = static_cast<ggml_backend_cuda_context*>(backends[r]->context);
+        devices[r] = ctx->device;
+        streams[r] = ctx->stream();
+    }
+    if (n == 0) return 1;
+    P2pAllReduce& s = g_p2p;
+    if (!p2p_prepare(s, devices, count)) return 0;
+    const size_t bytes = static_cast<size_t>(n) * sizeof(float);
+    int previous = 0;
+    const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+    auto fail = [&](const char* what)
+    {
+        set_last_error(std::string("Tensor-parallel peer all-reduce failed (") + what + "): " + cudaGetErrorString(cudaGetLastError()));
+        if (restore) cudaSetDevice(previous);
+        return -1;
+    };
+    // Room for every peer's partial on every rank (grown before anything is queued, so a failure changes nothing).
+    for (int r = 0; r < count; ++r)
+    {
+        const size_t need = bytes * static_cast<size_t>(count - 1);
+        if (s.scratch_bytes[r] >= need) continue;
+        if (cudaSetDevice(devices[r]) != cudaSuccess) return fail("device");
+        cudaStreamSynchronize(streams[r]);
+        if (s.scratch[r]) cudaFree(s.scratch[r]);
+        s.scratch[r] = nullptr;
+        s.scratch_bytes[r] = 0;
+        if (cudaMalloc(&s.scratch[r], need) != cudaSuccess) { s.scratch[r] = nullptr; return fail("scratch"); }
+        s.scratch_bytes[r] = need;
+    }
+    // Every partial is ready on its own stream.
+    for (int r = 0; r < count; ++r)
+        if (cudaSetDevice(devices[r]) != cudaSuccess || cudaEventRecord(s.ready[r], streams[r]) != cudaSuccess) return fail("ready");
+    // Each rank copies its peers' partials into its scratch, slot by peer.
+    for (int r = 0; r < count; ++r)
+    {
+        if (cudaSetDevice(devices[r]) != cudaSuccess) return fail("device");
+        int slot = 0;
+        for (int k = 0; k < count; ++k)
+        {
+            if (k == r) continue;
+            if (cudaStreamWaitEvent(streams[r], s.ready[k], 0) != cudaSuccess
+                || cudaMemcpyPeerAsync(s.scratch[r] + static_cast<size_t>(slot) * n, devices[r], tensors[k]->data, devices[k], bytes,
+                                       streams[r]) != cudaSuccess)
+                return fail("copy");
+            ++slot;
+        }
+        if (cudaEventRecord(s.copied[r], streams[r]) != cudaSuccess) return fail("copied");
+    }
+    // Once every peer has read this rank's partial, the sum in rank order over it.
+    for (int r = 0; r < count; ++r)
+    {
+        if (cudaSetDevice(devices[r]) != cudaSuccess) return fail("device");
+        P2pSources src = {};
+        int slot = 0;
+        for (int k = 0; k < count; ++k)
+        {
+            if (k == r) { src.p[k] = static_cast<const float*>(tensors[r]->data); continue; }
+            if (cudaStreamWaitEvent(streams[r], s.copied[k], 0) != cudaSuccess) return fail("wait");
+            src.p[k] = s.scratch[r] + static_cast<size_t>(slot++) * n;
+        }
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((n + threads - 1) / threads, 4096));
+        tp_p2p_sum_kernel<<<blocks, threads, 0, streams[r]>>>(static_cast<float*>(tensors[r]->data), src, count, n);
+        if (cudaGetLastError() != cudaSuccess) return fail("sum");
+    }
+    if (restore) cudaSetDevice(previous);
+    return 1;
+}
+
+void tp_p2p_allreduce_free()
+{
+    g_p2p.clear();
+}
+#else
+int tp_p2p_allreduce_f32(ggml_backend_t*, ggml_tensor**, int) { return 0; }
+void tp_p2p_allreduce_free() {}
+#endif
+
 struct TpF32Gather
 {
 #if !defined(_WIN32)

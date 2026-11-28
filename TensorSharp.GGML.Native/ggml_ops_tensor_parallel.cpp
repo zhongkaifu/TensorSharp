@@ -262,6 +262,7 @@ namespace tsg
         std::lock_guard<std::mutex> lock(g_tp_comm_mutex);
 #ifdef TSG_GGML_USE_CUDA
         tp_cuda_allreduce_f32_free();
+        tp_p2p_allreduce_free();
 #endif
         if (g_tp_comm.ctx != nullptr && g_tp_comm.free_fn != nullptr)
             g_tp_comm.free_fn(g_tp_comm.ctx);
@@ -666,6 +667,15 @@ namespace tsg
                     for (int r = 0; r < rank_count; ++r) backends[r] = dev(r).backend;
                     std::lock_guard<std::mutex> lock(g_tp_comm_mutex);
                     const int result = tp_cuda_allreduce_f32(backends, nodes, rank_count);
+                    if (result != 0) return result > 0;
+                }
+                // No NCCL: TensorSharp's own exact sum over peer memory, one collective a partial (the chunked fallback
+                // below runs one of the context's per 32,764 floats).
+                if (g_backend_type == BACKEND_TYPE_CUDA)
+                {
+                    ggml_backend_t backends[TSG_MAX_DEVICES];
+                    for (int r = 0; r < rank_count; ++r) backends[r] = dev(r).backend;
+                    const int result = tp_p2p_allreduce_f32(backends, nodes, rank_count);
                     if (result != 0) return result > 0;
                 }
 #endif

@@ -860,6 +860,9 @@ namespace tsg
     // The TP communicator mutex serializes these calls and teardown.
     int tp_cuda_allreduce_f32(ggml_backend_t* backends, ggml_tensor** tensors, int count);
     void tp_cuda_allreduce_f32_free();
+    // TensorSharp's exact F32 all-reduce over peer memory (no NCCL): 1 summed, 0 not usable here (nothing queued), -1 failed.
+    int tp_p2p_allreduce_f32(ggml_backend_t* backends, ggml_tensor** tensors, int count);
+    void tp_p2p_allreduce_free();
 
     // Behavioural check that peer copies between the given devices actually
     // deliver data (some hosts advertise P2P that never completes). 1 = ok,
