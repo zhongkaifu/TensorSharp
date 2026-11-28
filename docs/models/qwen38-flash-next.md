@@ -2291,6 +2291,15 @@ and on two CUDA GPUs (`StagesOnTwoGpusMatchOneGpu`, `RankGraphsOnTwoGpusMatchOne
 full-model logits while forcing identical token histories, so an early greedy
 mismatch cannot hide the numerical error of later decode steps.
 
+Measured on two RTX PRO 4000 Blackwell (24 GB each, PCIe, no NCCL; the `Q2_0` preset
+with `MAX_CONTEXT=16384`, `TS_Q4E_HC_Q8=1`, `TS_Q4E_MTP_EXPERTS=q2_0`; 512/128 best of
+two): `ggml_cuda --tp 2` prefills 1,935 tok/s and decodes 73.5, and its 5,130-token
+prompt takes 4.0 s (3.4 s over two stages). This family sums every partial exactly,
+which without NCCL ran one collective per 32,764 floats (18.4 s for that prompt) until
+TensorSharp's exact all-reduce over peer memory took the wider partials. Direct CUDA's
+numbers, the recorded tensor-parallel decode steps and the history of these figures are
+in [unified-execution.md](../design/unified-execution.md) sections 9.6 and 9.7.
+
 **Historical: `Qwen4ExpModel`'s tensor parallelism.** The removed implementation
 split only the FFNs under `--tp` on `ggml_cuda`: gate/up produced local
 intermediate channels, gathered in FP32 before the down projections computed

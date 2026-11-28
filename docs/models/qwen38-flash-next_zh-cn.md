@@ -1728,6 +1728,12 @@ ggml 路径通过页缓存读取 host 专家与 PLE n-gram 表。在本机的网
 （`StagesOnTwoGpusMatchOneGpu`、`RankGraphsOnTwoGpusMatchOneGpu`、`HostExpertsOnTwoGpuStagesMatchOneGpu`）都与单设备
 结果一致。`eng/ForcedLogitProbe` 在固定相同 token 历史下比较完整模型 logits，避免早期贪心分歧掩盖后续 decode 的数值误差。
 
+在两张 RTX PRO 4000 Blackwell（各 24 GB，PCIe，无 NCCL；`Q2_0` 预设，`MAX_CONTEXT=16384`、`TS_Q4E_HC_Q8=1`、
+`TS_Q4E_MTP_EXPERTS=q2_0`；512/128，取两次最佳）上实测：`ggml_cuda --tp 2` 预填 1,935 tok/s、解码 73.5 tok/s，
+5,130 token 的提示词预填 4.0 s（两段层切分为 3.4 s）。该模型族对所有部分和做精确求和，没有 NCCL 时每 32,764 个浮点数
+调用一次集合通信（该提示词需 18.4 s），直到 TensorSharp 的对等内存精确 all-reduce 接管较宽的部分和。直接 CUDA 的数据、
+张量并行解码步的录制以及这些数字的演变见 [unified-execution.md](../design/unified-execution.md)（英文）第 9.6 与 9.7 节。
+
 **历史：`Qwen4ExpModel` 的张量并行。** 已移除的实现在 `ggml_cuda` 的 `--tp` 下只切分 FFN：gate/up 产生本地中间通道，
 以 FP32 汇集后由 down 计算互不重叠的输出行；注意力、GDN、QSA 与 PLE 复制运行，输出头在 rank 0。它要求固定几种
 FFN 权重类型的精确条带 MMQ kernel（IQ1_M 与浮点 FFN 被拒绝），保留重叠的 128 行边界 tile，并在 TP 下禁用前缀检查点。
