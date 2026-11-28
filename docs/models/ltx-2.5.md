@@ -75,8 +75,18 @@ without an Ingredients adapter), and `--tp 2` on a simulated two-device group st
 within 2.3e-7 of one device (relative, every step of every oracle case, with and
 without the adapter); the two-GPU comparisons
 (`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`,
-`Ltx25DenoiserTests.TensorParallelRanksOnTwoGpusMatchOneGpu`) and real-checkpoint
-clips have not been run on GPUs yet. Desktop MP4 audio requires
+`Ltx25DenoiserTests.TensorParallelRanksOnTwoGpusMatchOneGpu`, with and without the
+adapter) pass on two RTX PRO 4000 Blackwell (24 GB each, PCIe, no NCCL). On the real
+distilled checkpoint (`config/ltx-2.5-distilled.json`, 17 frames at 512x320,
+`--diffusion-seed 7`, two runs each) the denoising loop took 8.8-9.4 s on one GPU
+(0.43 s a step after the first; 13.0 GB), 8.9-9.1 s over two stages (0.44 s; 7.5 +
+7.3 GB) with the same frames byte for byte, and 7.9-8.0 s under `--tp 2` (0.36 s;
+7.3 + 7.2 GB). `--tp 2` differs from one GPU in the order its partials are summed,
+which the distilled schedule's few steps carry into the clip: the same lake, boat and
+light, the sail cut differently (PSNR 26.9 dB over the 17 frames, the same on every
+run). At this size a step has a few hundred tokens, too few for the sharded products
+to pay much more than their all-reduces. The IC-LoRA adapters are gated on Hugging
+Face and were not run on GPUs. Desktop MP4 audio requires
 FFmpeg on `PATH` or `TS_FFMPEG`; the CLI also writes the original PCM as a WAV.
 The Mac app encodes audio/video through AVFoundation.
 

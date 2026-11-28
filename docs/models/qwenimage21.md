@@ -1360,9 +1360,9 @@ encoders and the VAE):
 
 | Workload | 1 GPU | `--layer-split 2` | `--tp 2` | PSNR vs 1 GPU: split / TP |
 |---|---:|---:|---:|---|
-| 2.1 | 44.6 s (1.05 s a step), 5.8 GB | 43.3 s (1.05 s), 5.0 + 3.6 GB | 33.6 s (0.75 s), 5.1 + 3.2 GB | identical / 40.4 dB |
-| 2.1-Turbo | 10.2 s (1.07 s), 6.1 GB | 10.0 s, 5.1 + 3.8 GB | 9.9 s (0.76 s), 5.1 + 3.4 GB | identical / 28.2 dB |
-| 2.1 + Fun-Acc-4Step LoRA | 6.3 s (1.27 s), 6.1 GB | 6.8 s, 5.1 + 3.8 GB | 5.2 s (0.90 s), 5.1 + 3.4 GB | identical / 40.6 dB |
+| 2.1 | 44.6 s (1.05 s a step), 5.6 GB | 43.3 s (1.05 s), 4.9 + 3.5 GB | 33.0 s (0.76 s), 5.0 + 3.2 GB | identical / 40.4 dB |
+| 2.1-Turbo | 10.2 s (1.07 s), 6.0 GB | 10.0 s, 5.0 + 3.7 GB | 9.9 s (0.76 s), 5.0 + 3.3 GB | identical / 28.2 dB |
+| 2.1 + Fun-Acc-4Step LoRA | 6.3 s (1.27 s), 6.0 GB | 6.8 s, 4.9 + 3.7 GB | 5.2 s (0.90 s), 5.0 + 3.4 GB | identical / 40.6 dB |
 
 Without NCCL, ggml-cuda's own transport carries wide sums in BF16, so the runtime's
 exact F32 sums ran one of the context's collectives per 32,764 floats: hundreds a
@@ -1372,7 +1372,7 @@ every other rank's partial, a sum in rank order on each GPU) takes a partial wid
 than one such piece in one collective; narrower partials (a text model's decode step)
 keep the context's collective, which costs less there. `TS_GGML_TP_P2P_ALLREDUCE=0`
 turns it off. The sums are the same: the images are byte-identical with and without
-it. TP memory was sampled before this change (its scratch adds one partial a peer).
+it. The Turbo and LoRA rows' TP memory was sampled before this change (its scratch adds one partial a peer).
 Turbo's few large steps carry the summation-order difference further: the same room
 and cat, details moved.
 

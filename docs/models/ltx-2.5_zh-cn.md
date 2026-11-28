@@ -58,8 +58,13 @@ dotnet run --project TensorSharp.Cli -- \
 （每张卡取整个 256 值量化块），其余并行度在加载时拒绝。二者不能同时使用，`ggml_cuda` 只用一张卡。在托管 CPU executor 的
 两个主机设备上（合成两块检查点，带与不带 Ingredients 适配器），各阶段与单设备逐位一致；模拟双设备组上的 `--tp 2` 与单设备
 相差不超过 2.3e-7（相对误差，覆盖每个 oracle 用例的每一步，带与不带适配器）；双 GPU 对比
-（`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`、`Ltx25DenoiserTests.TensorParallelRanksOnTwoGpusMatchOneGpu`）
-与真实检查点的整段生成尚未在 GPU 上运行。
+（`Ltx25DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu`、`Ltx25DenoiserTests.TensorParallelRanksOnTwoGpusMatchOneGpu`，
+带与不带适配器）在两张 RTX PRO 4000 Blackwell（各 24 GB，PCIe，无 NCCL）上通过。真实蒸馏检查点
+（`config/ltx-2.5-distilled.json`，512x320 共 17 帧，`--diffusion-seed 7`，每项两次）上，去噪循环单卡 8.8–9.4 s
+（第一步之后每步 0.43 s；13.0 GB），两段层切分 8.9–9.1 s（0.44 s；7.5 + 7.3 GB）且帧逐字节相同，`--tp 2` 为
+7.9–8.0 s（0.36 s；7.3 + 7.2 GB）。`--tp 2` 与单卡的差别来自部分和的求和顺序，蒸馏调度的少数几步把它带进了片段：
+湖面、船与光线相同，帆的形状不同（17 帧 PSNR 26.9 dB，每次运行相同）。这个尺寸下一步只有几百个 token，切分后的
+乘法省下的时间不比 all-reduce 多多少。IC-LoRA 适配器在 Hugging Face 上需要授权，未在 GPU 上运行。
 GPU 测量不证明 CPU 吞吐。
 桌面 MP4 音轨需要 `PATH` 上的 FFmpeg 或 `TS_FFMPEG`，CLI 另写原始 PCM WAV；
 Mac 应用通过 AVFoundation 编码。
