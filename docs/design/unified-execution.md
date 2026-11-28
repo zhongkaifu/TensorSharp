@@ -1577,8 +1577,9 @@ LoRA, Q8_0 and BF16), Qwen-Image 2.1 (`ggml_cuda`) and LTX 2.5 (`cuda`, with and
 need more GPUs (3 to 10 ranks), another backend (Metal, `ggml_cpu`) or checkpoints the VM lacks, and are not counted.
 After the all-reduce's last change (peer access left off), the GGML and CUDA rank-graph tests, the stages' tests and the
 MiniMax-H3-Image tests (283) passed twice in a row. `SharedRuntimeConformanceTests.RankGraphsOnGgmlMatchOneDevice` (qwen3vl)
-failed in one of six runs over this work (token 0 was 191 against 64, a 3.7 % margin) in a process where the peer path never
-ran, so on the context's own collective as before it; not explained (Open).
+failed in one of 19 runs over this work (token 0 was 191 against 64, a 3.7 % margin; it then passed ten times alone and
+three times in that run's whole set) in a process where the peer path never ran, so on the context's own collective as
+before it; not explained (Open).
 
 **Real checkpoints** (one run each, `--diffusion-seed 7`; time is the denoising loop; memory is each GPU's peak sampled every
 0.5 s, the first GPU also holding the encoders and the VAE; PSNR against one GPU over the decoded frames):
@@ -1639,4 +1640,4 @@ peer path left to it: the long prompt took 11.1 s, and 4.0 s with it off (3.4 s 
 * MiniMax-H3-Image on direct CUDA keeps F32 activations in every product (3.5 s a 1024² step against 0.70 s on
   `ggml_cuda`'s int8 tensor-core products): about 11 TFLOPS. A faster product there is a precision decision of its own.
 * The intermittent `ggml_cuda --tp 2` failure of `SharedRuntimeConformanceTests.RankGraphsOnGgmlMatchOneDevice` (qwen3vl)
-  above: one failure in six runs, on code this work did not change.
+  above: one failure in 19 runs, on code this work did not change.
