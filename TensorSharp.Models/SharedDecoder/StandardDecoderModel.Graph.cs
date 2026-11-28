@@ -2315,7 +2315,7 @@ namespace TensorSharp.Models
             public (ulong, ulong) Signature;
             public StepOutputs Outputs;
             public Slot[] Slots;
-            public Tensor[][][] K;
+            public Tensor[][][] K, V;
             public RecurrentState[][][] Recurrent;
             public int[] Capacity, RopeDelta, Starts;
             public string Shape;
@@ -2351,13 +2351,14 @@ namespace TensorSharp.Models
             var r = new RankedReplay
             {
                 Steps = (GraphStep[])steps.Clone(), Plans = plans, Signature = RankedSignature(steps), Outputs = outputs,
-                Slots = (Slot[])slots.Clone(), K = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n],
+                Slots = (Slot[])slots.Clone(), K = new Tensor[n][][], V = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n],
                 RopeDelta = new int[n], Starts = (int[])starts.Clone(), Shape = shape, Epoch = _graphEpoch,
                 Bindings = System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges),
             };
             for (int s = 0; s < n; s++)
             {
                 r.K[s] = slots[s].K;
+                r.V[s] = slots[s].V;
                 r.Recurrent[s] = slots[s].Recurrent;
                 r.Capacity[s] = slots[s].Capacity;
                 r.RopeDelta[s] = slots[s].RopeDelta;
@@ -2391,13 +2392,17 @@ namespace TensorSharp.Models
             if (r.Epoch != _graphEpoch || r.Shape != shape || r.Slots.Length != slots.Length)
                 return RefuseAdvance(r.Epoch != _graphEpoch ? "graphs were dropped" : r.Shape != shape ? "another shape" : "other sequences");
             if (BindingsChanged(r.Bindings, r.Stamp, r.Recurrent)) return RefuseAdvance("a recurrent state was rebound");
+            // What the kept plans bind: the same caches and states (each step may hand them in another slot object, as the
+            // primary cache's is made a step), the same capacity and rotary offset, every sequence one position on. A check of
+            // the slot objects themselves had refused every direct-CUDA tensor-parallel decode step: each one re-traced.
             for (int s = 0; s < slots.Length; s++)
             {
                 Slot slot = slots[s];
-                if (!ReferenceEquals(slot, r.Slots[s]) || !ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.Recurrent, r.Recurrent[s])
+                if (!ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.V, r.V[s]) || !ReferenceEquals(slot.Recurrent, r.Recurrent[s])
                     || slot.Capacity != r.Capacity[s] || slot.RopeDelta != r.RopeDelta[s] || starts[s] != r.Starts[s] + 1)
-                    return RefuseAdvance(starts[s] != r.Starts[s] + 1 ? $"start {starts[s]} after {r.Starts[s]}" : "another slot or its caches");
+                    return RefuseAdvance(starts[s] != r.Starts[s] + 1 ? $"start {starts[s]} after {r.Starts[s]}" : "other caches or states");
             }
+            Array.Copy(slots, r.Slots, slots.Length);
             if (!_rankGraphCache.TryGetValue(r.Signature, out CachedGraph[] cached) || !ReferenceEquals(cached, r.Plans)
                 || !r.Steps[0].TryAdvance(inputs[0]))
             {

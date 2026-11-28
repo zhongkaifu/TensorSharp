@@ -396,7 +396,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
 
     /// <summary>Direct-CUDA tensor parallelism records a kept decode step once over both GPUs (one CUDA graph holding each
     /// rank's kernels and their all-reduces) and replays it a position on: the rows equal the ranks' plans run unrecorded,
-    /// and one GPU's within the placement bound. A second prompt in the same slot records again.</summary>
+    /// and one GPU's within the placement bound. A second prompt in the same slot records again. Every decode step after a
+    /// prompt's first advances (a check of the slot objects had re-traced each one). The BF16 experts of "moe-tp" read their
+    /// routes back mid-step, so neither one GPU nor the ranks record them: the placement records where one GPU does.</summary>
     [MultiCudaTheory(2)]
     [InlineData("dense")]
     [InlineData("moe-tp")]
@@ -405,8 +407,12 @@ public sealed class Qwen35RuntimeTests : IDisposable
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(variant);
         List<float[]> reference;
+        bool singleRecords;
         using (var single = Create(path, backend: BackendType.Cuda))
+        {
             reference = LongScript(single);
+            singleRecords = single.DecodeRecordings > 0;
+        }
         List<float[]> unrecorded;
         using (var group = new TensorSharp.Cuda.TensorParallelGroup(2))
         using (var plain = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, group, 1) { DecodeCaptureDisabled = true })
@@ -414,9 +420,12 @@ public sealed class Qwen35RuntimeTests : IDisposable
         using var recordedGroup = new TensorSharp.Cuda.TensorParallelGroup(2);
         using var placed = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, recordedGroup, 1);
         List<float[]> recorded = LongScript(placed);
-        Assert.True(placed.DecodeRecordings >= 2, $"{variant}: {placed.DecodeRecordings} recordings, {placed.DecodeAdvances} advances " +
-            $"(last unrecorded: {placed.RankedRecordingSkipped ?? "none"}; last not advanced: {placed.RankedAdvanceRefused ?? "none"})");
-        Assert.True(placed.RecordedDecodeReplays >= 8, $"{variant}: {placed.RecordedDecodeReplays} recorded replays");
+        string counts = $"{variant}: {placed.DecodeRecordings} recordings, {placed.RecordedDecodeReplays} replays, {placed.DecodeAdvances} " +
+            $"advances (last unrecorded: {placed.RankedRecordingSkipped ?? "none"}; last not advanced: {placed.RankedAdvanceRefused ?? "none"})";
+        Assert.True(placed.DecodeAdvances >= 15, counts);
+        Assert.Equal(variant == "dense", singleRecords);
+        if (singleRecords)
+            Assert.True(placed.DecodeRecordings >= 2 && placed.RecordedDecodeReplays >= 12, counts);
         for (int i = 0; i < reference.Count; i++)
         {
             double rel = RelL2(recorded[i], unrecorded[i]);
