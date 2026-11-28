@@ -18,14 +18,18 @@ namespace TensorSharp.Models.QwenImage21
             Id = QwenImage21Family.ArchitectureId,
             DisplayName = "Qwen-Image",
             Aliases = new[] { "qwen_image", "qwen-image" },
-            // --tp shards the diffusion transformer (heads and MLP columns per GPU); the text encoder and VAE stay on the
-            // first GPU.
-            Factory = c => new QwenImage21DiffusionModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            // --tp shards the diffusion transformer (heads and MLP columns per GPU); --layer-split splits its blocks over the
+            // GPUs as whole-block stages (DenoiserStages). Either way the text encoder and VAE stay on the first GPU.
+            Factory = c => new QwenImage21DiffusionModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
+            // Layer split is declared where the stages are tested against one device on two GPUs (ggml_cuda,
+            // QwenImage21DenoiserTests.WholeBlockStagesOnTwoGpusMatchOneGpu); ggml_vulkan runs the same programs but no test
+            // covers it there, so it stays a gap, as does the hybrid (tensor-parallel stages).
             Serving = ServingContract.SharedDiffusionRuntime(
                 new[] { BackendType.Cpu, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.GgmlVulkan },
                 tensorParallelBackends: ServingBackends.GgmlMultiDevice,
                 tensorParallelGap: "qwen-image shards its transformer over the GPUs of ggml_cuda and ggml_vulkan only.",
-                layerSplitGap: "qwen-image has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
+                layerSplitGap: "qwen-image's whole-block stages are validated on ggml_cuda only, not on ggml_vulkan.",
+                layerSplitBackends: new[] { BackendType.GgmlCuda }),
             SupportsDistributedTensorParallel = false,
             DetectFromTensors = LooksLikeVersion21,
             LoraPluginType = LoraCliFlags.QwenImagePluginType,

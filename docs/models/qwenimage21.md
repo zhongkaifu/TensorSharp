@@ -1316,6 +1316,34 @@ sharded predictions were within 0.07–0.10% relative L2 of the unsharded ones, 
 and without the prefix cache. vLLM-Omni lists
 TP for 2.1 as unverified and publishes no 2.1 scaling numbers.
 
+**Layer split.** With `--layer-split N` on `ggml_cuda`, the 32 blocks are split
+into N contiguous runs, one per GPU, balanced by weight bytes (the first GPU's run
+also counts the input, text, time and modulation projections; the last's counts
+the output head). Each prediction runs one program per GPU, in turn:
+
+- The first GPU embeds the inputs and runs its blocks. It then hands on the packed
+  text-and-image stream (F32, through host memory), together with the shared
+  modulation and time embedding (a few KiB per step), so no other GPU holds the
+  time or modulation weights.
+- Each later GPU runs its blocks on what it received. The last GPU also runs the
+  output head.
+
+Nothing is sharded and no collective runs, so the stages compute exactly what one
+GPU computes. Each GPU keeps its own compiled plans (two, for the CFG branches)
+and the prefix cache of its own layers, which must fit in half of that GPU's free
+memory. The text encoder, vision encoder and VAE run on the first GPU. This is a
+capacity mode: the GPUs run one after another, so a step is no faster than on one
+GPU that holds the whole transformer.
+
+Hybrid placement (`--layer-split` with `--tp`), `ggml_vulkan` (no test covers the
+stages there yet), `cpu` and multi-node groups are refused. On the managed
+executor, stages on two host "devices" give predictions bit-identical to one
+device's, with and without a LoRA and with the prefix cache on or declined
+(`QwenImage21DenoiserTests.WholeBlockStagesMatchOneDeviceOnTheManagedExecutor`).
+The two-GPU `ggml_cuda` test, which bounds the stages' difference from one GPU at
+1e-5 of the largest value, has not run yet. Nothing has been measured on real
+weights.
+
 **Vulkan VAE.** ggml-vulkan multiplies F32 matrices through F16
 cooperative-matrix operands on GPUs that have them, and the VAE feeds some
 convolutions activations above 65,504; on the NVIDIA A40 used for testing, one

@@ -111,7 +111,7 @@ public sealed class ServingContractConformanceTests
         "muse-spark: TensorParallel+batching@ggml_vulkan",
         "qwen_image: HybridParallel@ggml_cuda",
         "qwen_image: HybridParallel@ggml_vulkan",
-        "qwen_image: LayerSplit@ggml_cuda",
+        // Whole-block stages run on ggml_cuda (QwenImage21DenoiserTests.WholeBlockStages*); no test covers them on ggml_vulkan.
         "qwen_image: LayerSplit@ggml_vulkan",
         // Raon-1 nano's lowering traces no rank's shard: whole-layer stages only.
         "raon1nano: HybridParallel@ggml_cuda",

@@ -169,6 +169,43 @@ namespace TensorSharp.Models.QwenImage21
             }
         }
 
+        /// <summary>The weight leaves of <paramref name="block"/> (its projections and per-head norms; a fused gate_up's
+        /// <see cref="QwenImage21Block.Up"/> is null and left out).</summary>
+        public static IEnumerable<QwenImage21Weight> Of(QwenImage21Block block)
+        {
+            foreach (QwenImage21Weight w in new[] { block.Q, block.K, block.V, block.Out, block.Gate, block.Up, block.Down, block.NormQ, block.NormK })
+                if (w != null) yield return w;
+        }
+
+        /// <summary>Each block's weight bytes, in block order, the first block's with the input, text, time and modulation
+        /// projections and the last's with the head (the stages that run a block also hold those): what a whole-block split
+        /// (<c>--layer-split N</c>, <see cref="SharedDiffusion.DenoiserStages"/>) balances, so it evens what each device holds.</summary>
+        public long[] BlockBytes()
+        {
+            var bytes = new long[Layers];
+            for (int i = 0; i < bytes.Length; i++)
+                foreach (QwenImage21Weight w in Of(Blocks[i])) bytes[i] += w.Bytes;
+            if (bytes.Length == 0) return bytes;
+            foreach (QwenImage21Weight w in WeightsOf(new SharedDiffusion.DenoiserSpan(0, 0, IsFirst: true, IsLast: false))) bytes[0] += w.Bytes;
+            foreach (QwenImage21Weight w in WeightsOf(new SharedDiffusion.DenoiserSpan(Layers, Layers, IsFirst: false, IsLast: true))) bytes[^1] += w.Bytes;
+            return bytes;
+        }
+
+        /// <summary>
+        /// The weight leaves the program of <paramref name="span"/> binds, each once: its blocks; where it opens the step the
+        /// input, text and time projections, the shared modulation and the text norm (the first stage computes them and hands
+        /// the modulation and the time embedding on); where it closes the step the output head (norm_out and proj_out). The
+        /// spans of a split together bind <see cref="All"/>.
+        /// </summary>
+        public List<QwenImage21Weight> WeightsOf(SharedDiffusion.DenoiserSpan span)
+        {
+            var weights = new List<QwenImage21Weight>();
+            if (span.IsFirst) weights.AddRange(new[] { ImageIn, TextIn, TextOut, TimeIn, TimeOut, Modulation, TextNorm });
+            for (int i = span.First; i < span.End; i++) weights.AddRange(Of(Blocks[i]));
+            if (span.IsLast) weights.AddRange(new[] { NormOut, ProjOut });
+            return weights;
+        }
+
         private GgufTensorInfo Info(string name, int rank)
         {
             if (!_gguf.Tensors.TryGetValue(Prefix + name, out GgufTensorInfo info) || (rank > 0 && info.Shape.Length != rank))

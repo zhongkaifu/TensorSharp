@@ -12,6 +12,7 @@ using TensorSharp.GGML;
 using TensorSharp.Graph;
 using TensorSharp.Models.Graph;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.SharedDiffusion;
 
 namespace TensorSharp.Models.QwenImage21
 {
@@ -69,7 +70,18 @@ namespace TensorSharp.Models.QwenImage21
         /// <summary>The program of one prediction: the retired graph's nodes, in its order (ggml_ops_qwen_image21.cpp build_graph).</summary>
         /// <param name="rank">The tensor-parallel rank whose program this is (its heads, MLP columns and stored prefix), or -1
         /// on one device.</param>
-        private void Emit(QwenImage21Emitter e, StepValues s, int rank)
+        private void Emit(QwenImage21Emitter e, StepValues s, int rank) => Emit(e, s, rank, DenoiserSpan.Whole(_w.Layers), default);
+
+        /// <summary>
+        /// The program of <paramref name="span"/>'s blocks; one device's and each tensor-parallel rank's is every block
+        /// (<see cref="DenoiserSpan.Whole"/>), the program as it was before the split. Where it opens the step: the inputs, the
+        /// time MLP and shared modulation, the text conditioner and the packed stream; where it does not also close the step,
+        /// its outputs are the stream, the modulation and the time embedding, in that order. A later stage starts from the
+        /// stream and the modulation handed on (<paramref name="carry"/>) and, where it closes the step, reads the time
+        /// embedding for the output head; otherwise it hands the stream on. Every stage takes the rotary tables and masks as its
+        /// own inputs, and reads and stores the prefix keys and values of its own layers.
+        /// </summary>
+        private void Emit(QwenImage21Emitter e, StepValues s, int rank, DenoiserSpan span, StageCarry carry)
         {
             GraphProgramBuilder b = e.Builder;
             QwenImage21Weights w = _w;
@@ -212,10 +224,22 @@ namespace TensorSharp.Models.QwenImage21
                 return rotated;
             }
 
-            // ---- inputs
-            int images = e.InputF32(s.Images, w.Channels, s.ImageRows);
-            int text = cached ? -1 : e.InputF32(s.Text, w.TextDim, s.TextRows);
-            int time = e.InputF32(s.Time, QwenImage21Weights.TimestepChannels, 2);
+            // ---- inputs: a later stage's are the stream and modulation the first handed on (and the time embedding, for the head)
+            int images = -1, text = -1, time = -1, joint = -1, mod = -1;
+            if (span.IsFirst)
+            {
+                images = e.InputF32(s.Images, w.Channels, s.ImageRows);
+                text = cached ? -1 : e.InputF32(s.Text, w.TextDim, s.TextRows);
+                time = e.InputF32(s.Time, QwenImage21Weights.TimestepChannels, 2);
+            }
+            else
+            {
+                if (carry.Stream == null || carry.Modulation == null || (span.IsLast && carry.Time == null))
+                    throw new ArgumentException("A later stage starts from what the first handed on.", nameof(carry));
+                joint = e.InputF32(carry.Stream, dim, seq);
+                mod = e.InputF32(carry.Modulation, 4L * dim, 2);
+                if (span.IsLast) time = e.InputF32(carry.Time, dim, 2);
+            }
             cos = e.InputF32(s.Cos, half, seq);
             sin = e.InputF32(s.Sin, half, seq);
             ushort[][] maskValues = MasksFor(layout, cached, segments);
@@ -224,21 +248,24 @@ namespace TensorSharp.Models.QwenImage21
                 masks[i] = maskValues[i] == null ? -1
                     : e.InputF16(maskValues[i], MaskKeys(segments[i]), MaskQueries(segments[i]));
 
-            // ---- time MLP, shared AdaLN
-            time = Unary(GraphOp.Silu, Linear(w.TimeOut,
-                Unary(GraphOp.Silu, Linear(w.TimeIn, time, 2, Global("time_text_embed.timestep_embedder.linear_1"))), 2,
-                Global("time_text_embed.timestep_embedder.linear_2")));
-            int mod = Linear(w.Modulation, time, 2, Global("modulation.1"));
+            // ---- time MLP, shared AdaLN (the first stage's: a later one's blocks read the modulation it handed on)
+            if (span.IsFirst)
+            {
+                time = Unary(GraphOp.Silu, Linear(w.TimeOut,
+                    Unary(GraphOp.Silu, Linear(w.TimeIn, time, 2, Global("time_text_embed.timestep_embedder.linear_1"))), 2,
+                    Global("time_text_embed.timestep_embedder.linear_2")));
+                mod = Linear(w.Modulation, time, 2, Global("modulation.1"));
+            }
             var modulation = new int[4];
             for (int i = 0; i < 4; i++)
                 modulation[i] = Unary(GraphOp.Cont, View2(mod, dim, 2, 4L * dim * 4, (long)i * dim * 4));
-            images = Linear(w.ImageIn, images, s.ImageRows, Global("img_in"));
-            int joint;
-            if (cached)
+            // ---- the packed stream (a later stage's is the one handed on)
+            if (span.IsFirst) images = Linear(w.ImageIn, images, s.ImageRows, Global("img_in"));
+            if (span.IsFirst && cached)
             {
                 joint = images;
             }
-            else
+            else if (span.IsFirst)
             {
                 IntPtr textNorm = lora != null && lora.TextNorm != IntPtr.Zero ? lora.TextNorm : w.TextNorm.Data;
                 int norm = ScaleBias(Leaf(textNorm == w.TextNorm.Data ? w.TextNorm : VectorAt(textNorm, w.TextDim)), 1f, 1f);
@@ -255,7 +282,7 @@ namespace TensorSharp.Models.QwenImage21
 
             // ---- the blocks
             int kvFormat = cached ? s.Cache.Format : GraphFormat.F32;
-            for (int i = 0; i < w.Layers; i++)
+            for (int i = span.First; i < span.End; i++)
             {
                 QwenImage21Block blk = blocks[i];
                 QwenImage21Weight gateW = blk.Gate, upW = blk.Up;
@@ -348,6 +375,18 @@ namespace TensorSharp.Models.QwenImage21
                 else h = Mlp(h, seq);
                 if (_ranks > 1) h = b.Op(GraphOp.AllReduce, h);
                 joint = b.Op(GraphOp.Add, joint, Modulate(h, modulation[3], seq, gate: true));
+            }
+
+            // A stage that does not close the step hands the stream on, the first also the modulation and time embedding.
+            if (!span.IsLast)
+            {
+                e.Output(joint, (long)dim * seq);
+                if (span.IsFirst)
+                {
+                    e.Output(mod, 4L * dim * 2);
+                    e.Output(time, 2L * dim);
+                }
+                return;
             }
 
             // ---- the output head
@@ -519,13 +558,14 @@ namespace TensorSharp.Models.QwenImage21
             return b.Op(GraphOp.Reshape, stackalloc[] { permuted }, stackalloc long[] { width, nq });
         }
 
-        // Whether the GGML backend runs a segment's flash attention (ggml's supports_op on the node), by its operands' shapes.
-        private readonly Dictionary<(long, long, long, long, int, long, long), bool> _flashSupport = new();
+        // Whether the GGML backend runs a segment's flash attention (ggml's supports_op on the node), by its operands' shapes
+        // and the stage whose device is active (the GPUs of a split need not be alike).
+        private readonly Dictionary<(long, long, long, long, int, long, long, int), bool> _flashSupport = new();
 
         private bool FlashSupported(long hd, long nq, long nk, long heads, int format, long maskCols, long maskRows)
         {
             if (_executor is not GgmlGraphExecutor ggml) return true;
-            var key = (hd, nq, nk, heads, format, maskCols, maskRows);
+            var key = (hd, nq, nk, heads, format, maskCols, maskRows, _emitStage);
             lock (_flashSupport)
             {
                 if (!_flashSupport.TryGetValue(key, out bool supported))
@@ -543,7 +583,8 @@ namespace TensorSharp.Models.QwenImage21
             {
                 var values = new float[x.Ne0];
                 Marshal.Copy(x.Data, values, 0, values.Length);
-                var t = new Tensor(_tensorAllocator, DType.Float32, x.Ne0);
+                // On the device of the stage whose program binds it (a leaf belongs to one stage's blocks, inputs or head).
+                var t = new Tensor(_stages?.TensorAllocator(_emitStage) ?? _tensorAllocator, DType.Float32, x.Ne0);
                 t.SetElementsAsFloat(values);
                 h = t;
             }

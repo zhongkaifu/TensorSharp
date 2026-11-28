@@ -21,6 +21,14 @@
 // the base product (q, k and v, and gate and up, share one stacked shrink where their factors lie back to back), a DoRA row
 // scale on the base, per-head and text norm replacements, and a parallel-decoding bundle's per-step output head in place of
 // proj_out, uploaded as an input every step so the steps share one plan.
+//
+// Whole-block stages (--layer-split N, DenoiserStages): the 32 blocks in contiguous runs balanced by weight bytes, one a
+// device. A prediction is one program a stage, run one after another, each on its own device: the first also embeds (the
+// time MLP and shared modulation, the text conditioner, the image projection), the last also projects (the output head).
+// The packed stream crosses to the next stage as F32 rows, with the first stage's modulation and time embedding (a few KiB a
+// step): carried, not recomputed, so no stage but the first holds the 4096 x 16384 modulation weight and every stage reads
+// the values one device computes. Each stage retains its own plans (one a CFG branch, as one device does) and keeps the
+// prefix keys and values of its own layers.
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -80,10 +88,17 @@ namespace TensorSharp.Models.QwenImage21
         private bool _disposed;
         // The LoRA set the cached plans bind (null: none).
         private QwenImage21LoraSet _lora;
+        // Whole-block stages over several devices (--layer-split N), or null for one device; each stage's programs compiled;
+        // while a stage's program is emitted, the stage whose tensor executor holds the F32 vectors its leaves bind.
+        private readonly DenoiserStages _stages;
+        private readonly int[] _stageCompiles;
+        private int _emitStage;
 
         /// <summary>The denoiser in <paramref name="path"/> on <paramref name="backend"/>.</summary>
-        public QwenImage21Denoiser(string path, BackendType backend)
-            : this(new QwenImage21Weights(path ?? throw new ArgumentNullException(nameof(path))), backend, null, null)
+        /// <param name="devices">The devices of a whole-block split (<c>--layer-split N</c>, <see cref="DenoiserStages"/>), one a
+        /// stage; null or one for one device.</param>
+        public QwenImage21Denoiser(string path, BackendType backend, IReadOnlyList<IAllocator> devices = null)
+            : this(new QwenImage21Weights(path ?? throw new ArgumentNullException(nameof(path))), backend, null, null, devices: devices)
         {
         }
 
@@ -92,16 +107,34 @@ namespace TensorSharp.Models.QwenImage21
         /// <param name="tensorAllocator">Where a tensor executor's F32 vectors live (null: the managed CPU's).</param>
         /// <param name="tensorParallel">A GPU group the blocks are sharded over (whole heads and MLP columns a GPU, two exact
         /// all-reduces a block), or null for one device.</param>
+        /// <param name="devices">The devices the blocks are split over as whole-block stages, one a stage (GGML allocators of
+        /// one context, or one allocator a device of a tensor executor's backend); null or one for one device. Each stage's
+        /// executor comes from its device, so <paramref name="executor"/> must be null.</param>
         internal QwenImage21Denoiser(QwenImage21Weights weights, BackendType backend, IGraphExecutor executor, IAllocator tensorAllocator,
-            ITensorParallelGroup tensorParallel = null)
+            ITensorParallelGroup tensorParallel = null, IReadOnlyList<IAllocator> devices = null)
         {
             _w = weights ?? throw new ArgumentNullException(nameof(weights));
             Backend = backend;
             try
             {
-                (_executor, _tensorAllocator) = executor != null
-                    ? (executor, executor.Capabilities.BindsHostPointers ? null : tensorAllocator ?? new CpuAllocator(BlasEnum.DotNet))
-                    : Resolve(backend);
+                if (devices is { Count: > 1 })
+                {
+                    // Tensor-parallel stages (the hybrid) are not implemented: a stage is one device.
+                    if (tensorParallel is { Degree: > 1 })
+                        throw new NotSupportedException("Qwen-Image-2.1 runs --layer-split or --tp, not both: tensor-parallel stages are not implemented.");
+                    if (executor != null) throw new ArgumentException("whole-block stages take their executors from their devices", nameof(executor));
+                    _stages = new DenoiserStages(_w.BlockBytes(), devices);
+                    _stageCompiles = new int[_stages.Count];
+                    (_executor, _tensorAllocator) = (_stages.Executor(0), _stages.TensorAllocator(0));
+                    var spans = new List<string>();
+                    for (int st = 0; st < _stages.Count; st++) spans.Add($"{_stages.First(st)}-{_stages.End(st) - 1}");
+                    Console.WriteLine($"Qwen-Image-2.1 DiT: {_w.Layers} layers over {_stages.Count} devices as whole-block stages " +
+                        $"(blocks {string.Join(", ", spans)}), graph programs.");
+                }
+                else
+                    (_executor, _tensorAllocator) = executor != null
+                        ? (executor, executor.Capabilities.BindsHostPointers ? null : tensorAllocator ?? new CpuAllocator(BlasEnum.DotNet))
+                        : Resolve(backend);
                 _style = StyleOf(_executor);
                 if (tensorParallel is { Degree: > 1 })
                 {
@@ -221,8 +254,15 @@ namespace TensorSharp.Models.QwenImage21
         /// <summary>The executor the steps run on.</summary>
         internal IGraphExecutor Executor => _executor;
 
-        /// <summary>Programs compiled so far (a test seam: the rest replayed a retained plan).</summary>
+        /// <summary>Programs compiled so far (a test seam: the rest replayed a retained plan); under a split, stage programs.</summary>
         internal int Compiles { get; private set; }
+
+        /// <summary>The programs stage <paramref name="stage"/> compiled so far (a test seam: under a split each stage compiles
+        /// what one device does, once a program).</summary>
+        internal int StageCompiles(int stage) => _stageCompiles?[stage] ?? (stage == 0 ? Compiles : 0);
+
+        /// <summary>The whole-block stages, or null for one device (a test seam).</summary>
+        internal DenoiserStages Stages => _stages;
 
         /// <summary>The graph the last prediction ran (a test seam).</summary>
         internal Mode LastMode { get; private set; }
@@ -240,7 +280,23 @@ namespace TensorSharp.Models.QwenImage21
         /// (-1: not known, no cache is declined).</summary>
         internal Func<long> FreeMemory { get; init; }
 
-        public long WeightBytes => _w.Bytes + (AdapterBytes?.Invoke() ?? 0);
+        /// <summary>The weights' device bytes: under a split, the largest stage's share (each device holds its own blocks, the
+        /// first the input projections, the last the head). The LoRA factors are counted whole (an upper bound: a stage binds
+        /// its own blocks' factors).</summary>
+        public long WeightBytes => StageWeightBytes() + (AdapterBytes?.Invoke() ?? 0);
+
+        private long StageWeightBytes()
+        {
+            if (_stages == null) return _w.Bytes;
+            long most = 0;
+            for (int st = 0; st < _stages.Count; st++)
+            {
+                long bytes = 0;
+                foreach (QwenImage21Weight w in _w.WeightsOf(_stages.Span(st))) bytes += w.Bytes;
+                most = Math.Max(most, bytes);
+            }
+            return most;
+        }
 
         /// <summary>The device bytes of the LoRA factors the next steps bind (the family's current set), for residency.</summary>
         internal Func<long> AdapterBytes { get; set; }
@@ -249,7 +305,8 @@ namespace TensorSharp.Models.QwenImage21
         /// A step's compute memory for <paramref name="workload"/>'s packed sequence, from the retired graph's allocations: per row
         /// the residual stream and its normed and modulated copies, q, k and v with their rotated and attention copies, the
         /// attention output, and the MLP's [gate | up] product with its activation (F32), plus the prefix cache's keys and
-        /// values at F16 or F32.
+        /// values at F16 or F32. Under a split every stage computes the whole sequence through its blocks and stores its own
+        /// layers' prefix: the stage with the most layers.
         /// </summary>
         public long WorkingBytes(DiffusionWorkload workload)
         {
@@ -257,7 +314,13 @@ namespace TensorSharp.Models.QwenImage21
             long dim = _w.Dim, ff = _w.Ff;
             int kv = _style is Style.Metal or Style.Cuda ? 2 : 4;
             long perRow = 4L * (10 * dim + 3 * ff);
-            long cache = (long)_w.Layers * 2 * dim * prefix * kv;
+            int layers = _w.Layers;
+            if (_stages != null)
+            {
+                layers = 0;
+                for (int st = 0; st < _stages.Count; st++) layers = Math.Max(layers, _stages.End(st) - _stages.First(st));
+            }
+            long cache = (long)layers * 2 * dim * prefix * kv;
             return 256L * 1024 * 1024 + rows * perRow + cache;
         }
 
@@ -289,9 +352,22 @@ namespace TensorSharp.Models.QwenImage21
             // A tensor-parallel group's ranks bind their own shards as their graphs reach them.
             if (_executor.Capabilities.BindsHostPointers && _ranks == 1)
             {
-                var projections = new List<IGraphWeight>();
-                foreach (QwenImage21Weight w in _w.All) if (!w.Vector) projections.Add(w);
-                copied = _executor.Preload(projections, "qwen-image-2.1/denoiser");
+                if (_stages == null)
+                {
+                    var projections = new List<IGraphWeight>();
+                    foreach (QwenImage21Weight w in _w.All) if (!w.Vector) projections.Add(w);
+                    copied = _executor.Preload(projections, "qwen-image-2.1/denoiser");
+                }
+                else
+                    for (int st = 0; st < _stages.Count; st++)
+                    {
+                        // Each stage's projections onto its own device.
+                        IGraphExecutor x = _stages.Executor(st);
+                        var projections = new List<IGraphWeight>();
+                        foreach (QwenImage21Weight w in _w.WeightsOf(_stages.Span(st))) if (!w.Vector) projections.Add(w);
+                        string tag = $"qwen-image-2.1/denoiser stage {st}";
+                        copied += _stages.OnDevice(st, () => x.Preload(projections, tag));
+                    }
             }
             _preloaded = true;
             return copied;
@@ -459,6 +535,7 @@ namespace TensorSharp.Models.QwenImage21
 
         private sealed class RetainedPlan
         {
+            public int Stage;   // the whole-block stage whose plan this is (0 on one device and under tensor parallelism)
             public (ulong, ulong) Signature;
             public IGraphPlan Plan;
             public IGraphPlan[] Plans;   // a tensor-parallel step's, a plan a rank
@@ -466,46 +543,108 @@ namespace TensorSharp.Models.QwenImage21
             public PrefixCache Cache;
         }
 
+        /// <summary>What a stage hands the next (<see cref="RunStages"/>): the packed stream [dim, rows], and the first stage's
+        /// shared modulation [4 dim, 2] and time embedding [dim, 2]. Empty on one device and for the first stage.</summary>
+        private readonly record struct StageCarry(float[] Stream, float[] Modulation, float[] Time);
+
         /// <summary>Run the step's program: a retained plan of the same signature replays, else the program is recorded and
         /// compiled (an extract step's once and dropped: it runs once a request).</summary>
         private float[] Run(StepValues s)
         {
             if (_ranks > 1) return RunRanked(s);
-            using var trace = new QwenImage21Emitter(_executor, record: false);
-            Emit(trace, s, -1);
+            if (_stages != null) return RunStages(s);
+            return RunProgram(_executor, 0, s, e => Emit(e, s, -1), "Qwen-Image-2.1 denoiser step")[0];
+        }
+
+        /// <summary>
+        /// One program on <paramref name="executor"/> (one device's, or stage <paramref name="stage"/>'s with its device
+        /// active): a plan the stage retains with the same signature replays, else the program is recorded and compiled, and
+        /// retained beside at most one other of the stage's (the two CFG branches'); an extract step's is compiled once and
+        /// dropped after its run, as it runs once a request. Returns every output of the plan in emission order, valid until
+        /// the plan runs again (an extract step's as copies).
+        /// </summary>
+        private float[][] RunProgram(IGraphExecutor executor, int stage, StepValues s, Action<QwenImage21Emitter> emit, string what)
+        {
+            using var trace = new QwenImage21Emitter(executor, record: false);
+            emit(trace);
             if (s.Mode == Mode.Extract)
             {
-                using var recorded = new QwenImage21Emitter(_executor, record: true);
-                Emit(recorded, s, -1);
+                using var recorded = new QwenImage21Emitter(executor, record: true);
+                emit(recorded);
                 // With its own allocator, freed when it is disposed: a one-shot GGML graph takes the backend's shared scratch,
                 // which outlives it, and the cached steps' plan would then hold its compute memory beside that scratch (as the
                 // retired graph never did: it freed its extract graph before the cached one ran).
                 using IGraphPlan once = recorded.Compile(replayable: true);
-                Compiles++;
+                CountCompile(stage);
                 if (!trace.Run(once))
-                    throw new InvalidOperationException("Qwen-Image-2.1 denoiser step failed: " + once.LastError);
-                return (float[])once.Outputs[0].Clone();
+                    throw new InvalidOperationException(what + " failed: " + once.LastError);
+                return Array.ConvertAll(once.Outputs, o => (float[])o.Clone());
             }
-            RetainedPlan entry = _plans.Find(p => p.Signature == trace.Signature);
+            RetainedPlan entry = _plans.Find(p => p.Stage == stage && p.Signature == trace.Signature);
             if (entry == null)
             {
-                // Make room first, so the old plan's compute memory is free before the new one allocates.
-                while (_plans.Count >= RetainedPlans)
-                {
-                    RetainedPlan oldest = _plans[0];
-                    foreach (RetainedPlan p in _plans) if (p.Used < oldest.Used) oldest = p;
-                    DropPlan(oldest);
-                }
-                using var recorded = new QwenImage21Emitter(_executor, record: true);
-                Emit(recorded, s, -1);
-                entry = new RetainedPlan { Signature = recorded.Signature, Plan = recorded.Compile(replayable: true), Cache = s.Cache };
-                Compiles++;
+                // Make room first, so the old plan's compute memory is free before the new one allocates (the stage's own
+                // plans: each holds its device's memory).
+                while (OldestPlan(stage, out int retained) is { } oldest && retained >= RetainedPlans) DropPlan(oldest);
+                using var recorded = new QwenImage21Emitter(executor, record: true);
+                emit(recorded);
+                entry = new RetainedPlan { Stage = stage, Signature = recorded.Signature, Plan = recorded.Compile(replayable: true), Cache = s.Cache };
+                CountCompile(stage);
                 _plans.Add(entry);
             }
             entry.Used = ++_uses;
             if (!trace.Run(entry.Plan))
-                throw new InvalidOperationException("Qwen-Image-2.1 denoiser step failed: " + entry.Plan.LastError);
-            return entry.Plan.Outputs[0];
+                throw new InvalidOperationException(what + " failed: " + entry.Plan.LastError);
+            return entry.Plan.Outputs;
+        }
+
+        /// <summary>The least recently used of the plans stage <paramref name="stage"/> retains (null: none), and how many it
+        /// retains.</summary>
+        private RetainedPlan OldestPlan(int stage, out int retained)
+        {
+            RetainedPlan oldest = null;
+            retained = 0;
+            foreach (RetainedPlan p in _plans)
+            {
+                if (p.Stage != stage) continue;
+                retained++;
+                if (oldest == null || p.Used < oldest.Used) oldest = p;
+            }
+            return oldest;
+        }
+
+        private void CountCompile(int stage)
+        {
+            Compiles++;
+            if (_stageCompiles != null) _stageCompiles[stage]++;
+        }
+
+        /// <summary>
+        /// A step over whole-block stages: stage by stage, each one's program compiled for and run on its own device, the packed
+        /// stream the previous stage handed on as its input. The first stage's modulation and time embedding are inputs of every
+        /// later one (their blocks read the modulation, the last stage's head the embedding): exact copies of what one device
+        /// computes, a few KiB a step, where recomputing them would put the time MLP and the modulation projection on every
+        /// device. The last stage's output is the prediction, valid until its plan runs again.
+        /// </summary>
+        private float[] RunStages(StepValues s)
+        {
+            var carry = new StageCarry();
+            try
+            {
+                for (int st = 0; st < _stages.Count; st++)
+                {
+                    int stage = st;
+                    DenoiserSpan span = _stages.Span(st);
+                    IGraphExecutor x = _stages.Executor(st);
+                    StageCarry input = carry;
+                    string what = $"Qwen-Image-2.1 denoiser stage {st} (blocks {span.First}-{span.End - 1})";
+                    _emitStage = st;
+                    float[][] outputs = _stages.OnDevice(st, () => RunProgram(x, stage, s, e => Emit(e, s, -1, span, input), what));
+                    carry = span.IsFirst ? new StageCarry(outputs[0], outputs[1], outputs[2]) : carry with { Stream = outputs[0] };
+                }
+            }
+            finally { _emitStage = 0; }
+            return carry.Stream;
         }
 
         /// <summary>A tensor-parallel step: each rank's program (its heads and MLP columns, two all-reduces a block), compiled for
@@ -650,15 +789,38 @@ namespace TensorSharp.Models.QwenImage21
                 Conditioning = conditioning, References = references, Prefix = prefix, Format = format,
                 Bytes = 2 * layerBytes * _w.Layers,
             };
-            long free = FreeBytes();
-            // The prefix is at most half of what is free (when that is known), so the step's compute memory still fits beside it.
-            if (free >= 0 && cache.Bytes > free / 2)
+            if (_stages != null && _tensorAllocator == null)
             {
-                cache.Declined = true;
-                Console.Error.WriteLine(
-                    $"[qwen21] prefix KV cache declined: {prefix} prefix tokens need {cache.Bytes / (1024.0 * 1024.0):F1} MiB ({FormatName(format)}), " +
-                    $"the device reports {free / (1024.0 * 1024.0):F1} MiB free (the cache may use half); this request recomputes the prefix every step.");
-                return cache;
+                // Each stage stores its own layers' prefix on its own GPU: every stage's share must fit in half of what that GPU
+                // reports free, or the request recomputes the prefix on every stage (one decision: a step's graph is one mode).
+                for (int st = 0; st < _stages.Count; st++)
+                {
+                    long share = 2 * layerBytes * (_stages.End(st) - _stages.First(st));
+                    long stageFree = FreeMemory != null ? FreeMemory() : StageFreeBytes(st);
+                    if (stageFree >= 0 && share > stageFree / 2)
+                    {
+                        cache.Declined = true;
+                        Console.Error.WriteLine(
+                            $"[qwen21] prefix KV cache declined: {prefix} prefix tokens need {share / (1024.0 * 1024.0):F1} MiB ({FormatName(format)}) " +
+                            $"for blocks {_stages.First(st)}-{_stages.End(st) - 1}, whose GPU reports {stageFree / (1024.0 * 1024.0):F1} MiB free " +
+                            "(the cache may use half); this request recomputes the prefix every step.");
+                        return cache;
+                    }
+                }
+            }
+            else
+            {
+                // One device, a tensor-parallel group's least free GPU, or the host the managed executor's stages share.
+                long free = FreeBytes();
+                // The prefix is at most half of what is free (when that is known), so the step's compute memory still fits beside it.
+                if (free >= 0 && cache.Bytes > free / 2)
+                {
+                    cache.Declined = true;
+                    Console.Error.WriteLine(
+                        $"[qwen21] prefix KV cache declined: {prefix} prefix tokens need {cache.Bytes / (1024.0 * 1024.0):F1} MiB ({FormatName(format)}), " +
+                        $"the device reports {free / (1024.0 * 1024.0):F1} MiB free (the cache may use half); this request recomputes the prefix every step.");
+                    return cache;
+                }
             }
             if (_tensorAllocator == null)
             {
@@ -681,12 +843,18 @@ namespace TensorSharp.Models.QwenImage21
                 cache.ValueTensors = new Tensor[_w.Layers];
                 for (int i = 0; i < _w.Layers; i++)
                 {
-                    cache.KeyTensors[i] = new Tensor(_tensorAllocator, DType.Float32, _w.Heads, prefix, _w.HeadDim);
-                    cache.ValueTensors[i] = new Tensor(_tensorAllocator, DType.Float32, _w.Heads, prefix, _w.HeadDim);
+                    // On the device of the stage whose blocks read them.
+                    IAllocator allocator = _stages?.TensorAllocator(_stages.StageOf(i)) ?? _tensorAllocator;
+                    cache.KeyTensors[i] = new Tensor(allocator, DType.Float32, _w.Heads, prefix, _w.HeadDim);
+                    cache.ValueTensors[i] = new Tensor(allocator, DType.Float32, _w.Heads, prefix, _w.HeadDim);
                 }
             }
             return cache;
         }
+
+        /// <summary>What stage <paramref name="stage"/>'s GPU reports free (-1: not known).</summary>
+        private long StageFreeBytes(int stage) =>
+            _stages.OnDevice(stage, () => GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0 ? free : -1);
 
         /// <summary>The memory a prefix cache may take half of: the device's free memory on a GGML backend, the machine's on cpu;
         /// -1 when it is not known (no cache is declined then).</summary>
@@ -729,8 +897,8 @@ namespace TensorSharp.Models.QwenImage21
                 for (int r = 0; r < cache.Keys.Length; r++)
                     for (int i = 0; i < cache.Keys[r].Length; i++)
                     {
-                        InvalidateOnRank(r, cache.Keys[r][i]);
-                        InvalidateOnRank(r, cache.Values[r][i]);
+                        InvalidateLayerState(r, i, cache.Keys[r][i]);
+                        InvalidateLayerState(r, i, cache.Values[r][i]);
                         QuantizedWeight.FreeBuffer(cache.Keys[r][i]);
                         QuantizedWeight.FreeBuffer(cache.Values[r][i]);
                     }
@@ -761,10 +929,38 @@ namespace TensorSharp.Models.QwenImage21
             finally { GgmlBasicOps.SetActiveRank(previous); }
         }
 
-        /// <summary>Every rank's device copies of <paramref name="data"/>.</summary>
+        /// <summary>Drop the device copy of layer <paramref name="layer"/>'s stored keys or values at <paramref name="data"/>:
+        /// rank <paramref name="rank"/>'s, or under a split the copy on the device of the stage that holds the layer.</summary>
+        private void InvalidateLayerState(int rank, int layer, IntPtr data)
+        {
+            if (_stages == null)
+            {
+                InvalidateOnRank(rank, data);
+                return;
+            }
+            int stage = _stages.StageOf(layer);
+            IGraphExecutor x = _stages.Executor(stage);
+            _stages.OnDevice(stage, () => x.Invalidate(data));
+        }
+
+        /// <summary>Every rank's device copies of <paramref name="data"/>, or every stage device's under a split (a weight or a
+        /// LoRA factor sits on the device of the stage that binds it).</summary>
         private void InvalidateEverywhere(IntPtr data)
         {
+            if (_stages != null)
+            {
+                _stages.InvalidateEverywhere(data);
+                return;
+            }
             for (int r = 0; r < _ranks; r++) InvalidateOnRank(r, data);
+        }
+
+        /// <summary>The managed executor's kept intermediates go back: every stage's allocator's under a split.</summary>
+        private void TrimHostMemory()
+        {
+            (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+            if (_stages == null) return;
+            for (int st = 1; st < _stages.Count; st++) (_stages.TensorAllocator(st) as RecyclingCpuAllocator)?.Trim();
         }
 
         private void ReleaseCaches()
@@ -783,7 +979,7 @@ namespace TensorSharp.Models.QwenImage21
                 _joined = null;
                 _joinedReferences = null;
                 // The managed executor's kept intermediates go back before the decode needs the memory.
-                (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+                TrimHostMemory();
             }
         }
 
@@ -840,7 +1036,7 @@ namespace TensorSharp.Models.QwenImage21
             {
                 DropPlans(_ => true);
                 ReleaseCaches();
-                (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+                TrimHostMemory();
             }
         }
 
@@ -856,7 +1052,7 @@ namespace TensorSharp.Models.QwenImage21
                 foreach (IntPtr p in WeightPointers()) InvalidateEverywhere(p);
                 if (_lora != null && _tensorAllocator == null)
                     foreach (IntPtr p in _lora.FactorPointers()) InvalidateEverywhere(p);
-                (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+                TrimHostMemory();
                 _preloaded = false;
             }
             ReleaseCompute?.Invoke();
@@ -876,7 +1072,8 @@ namespace TensorSharp.Models.QwenImage21
                 _shardOwned.Clear();
                 foreach (object h in _handles.Values) (h as IDisposable)?.Dispose();
                 _handles.Clear();
-                (_tensorAllocator as RecyclingCpuAllocator)?.Trim();
+                TrimHostMemory();
+                _stages?.Dispose();
                 _disposed = true;
                 _w.Dispose();
             }
