@@ -1375,8 +1375,9 @@ out-of-memory; Qwen3.5-9B on one GPU (225) and `--tp 2` (231) and gemma-4-E4B `-
 
 * Direct-CUDA `--tp 2` decoded 1.1-4x slower than one GPU on every model (Qwen3.5-0.8B: 107 against 417 tok/s): its
   all-reduce (`CudaP2PCommunicator`) fenced on the host three times a reduce, two reduces a layer, and a tensor-parallel
-  step is not recorded as a CUDA graph. The reduction now runs ordered on the devices and the ranks run compiled plans
-  (9.6): the 8B-24B models decode faster than one GPU; recording the step is what the small models still lack.
+  step is not recorded as a CUDA graph. Fixed in 9.6: the reduction runs ordered on the devices, decode steps advance and
+  are recorded as one graph over both GPUs, and `--tp 2` decodes faster than one GPU on every model there but the 0.8B
+  (395-408 against 417 tok/s).
 * Direct-CUDA bursts over `--layer-split 2` reach half of `ggml_cuda`'s on Mistral-Small-3.1-24B (107 against 214 tok/s)
   and Muse-Glimmer-30B (82 against 164); Qwen3.5-9B's equals one direct-CUDA GPU's (233 against 234), and the one-GPU
   direct-CUDA bursts of the other models were not run, so whether the stages or the batched direct-CUDA step costs it is
@@ -1444,17 +1445,20 @@ best of two runs; long: a 5,130-token document and a question, `--no-skills`; MT
 | Placement | Text | MTP acceptance (short / long) | Bench prefill / decode tok/s | Long: prefill s / decode tok/s | 4 requests at once |
 |---|---|---|---|---|---|
 | `ggml_cuda --layer-split 2` | coherent | 49 % / 72 % | 1,659-1,662 / 74.0-77.9 | 3.4 / 61.6 | 32.1 tok/s aggregate (lone 60.2): 2 of 4 re-prefilled |
-| `ggml_cuda --tp 2` | coherent | 40-44 % / 50 % | 1,162-1,172 / 57.6-58.9 | 18.4 / 46.8 | 24.2 aggregate (lone 46.3): 2 of 4 re-prefilled |
+| `ggml_cuda --tp 2` | coherent | 40-44 % / 50 % | 1,123 / 71.5 (1,162-1,172 / 57.6-58.9 before its steps advanced) | 18.4 / 46.8 | 24.2 aggregate (lone 46.3): 2 of 4 re-prefilled |
 | `cuda --layer-split 2` | coherent | 76 % / 72 % | 1,943 / 96.2 | 15.0 / 66.0 | 135.3 aggregate (lone 82.2) |
-| `cuda --tp 2` | coherent | 48 % / 72 % | {Q4E_TP_BENCH} | {Q4E_TP_LONG} | {Q4E_TP_CONC} |
+| `cuda --tp 2` | coherent | 48 % / 72 % | 303.8-310.0 / 103.7-103.9 (232-294 / 23.1-27.6 unrecorded) | 21.8 / 59.1 | 89.0 aggregate (lone 64.0) |
 
-Every placement answers the document question with the same sentence. The `ggml_cuda` bursts re-prefilled two of the four
+Every placement answers the document question with the same sentence, and no op fell back to the CPU. No placement's
+concurrent greedy replies all equal the lone ones (1 of 4 on `cuda --tp 2` and on `ggml_cuda`, 0 of 4 on `cuda
+--layer-split 2`): batched rows take other kernels than one row, and the Q2_0 checkpoint's near-ties part there; the
+engine's own batching tests (F32 fixtures) are exact. The `ggml_cuda` bursts re-prefilled two of the four
 requests because their shared-prefix checkpoint could not be cloned: "a clone needs 206 MiB of HostKv but 0 MiB is spare"
 (the model's 26.8 GB of host-only tables leave this 62 GB VM no host budget); direct CUDA resumed all four.
 
 **Suites on the GPUs.** The Qwen4Exp and MoE-kernel tests on the default lane: 318 passed, 56 skipped; on the `cuda` lane
 (`TS_TEST_GGML_BACKEND=cuda`): 309 passed, 59 skipped; the two-GPU tests (rank and stage graphs on `ggml_cuda`, the direct-CUDA
-placements, the P2P all-reduce, Qwen4Exp's stages and rank graphs): {SUITE_MULTI}. Skipped there and not counted: the Vulkan
+placements, the P2P all-reduce, Qwen4Exp's stages and rank graphs): 23 passed, 2 skipped. Skipped there and not counted: the Vulkan
 pair and a GLM-DSA test whose model is not on the VM. The opt-in `Qwen4ExpQ2_0Int8PromptTests` precision study (hours) was
 not run.
 
@@ -1503,7 +1507,20 @@ Decode tok/s of `--tp 2`, the device-ordered all-reduce against the host-synchro
 The advancing, recorded decode steps against the per-step build before them (D: no step advanced, E: advanced and
 recorded; ABBA D1 E1 E2 D2, best of two runs of 512/128 each):
 
-{W15_TABLE}
+| Model | Decode D -> E | Prefill D -> E | One GPU decode |
+|---|---|---|---|
+| Qwen3.5-0.8B Q8_0 | 121.1-121.8 -> 394.2-408.3 | 23.5K-25.5K -> 22.9K-27.5K | 417 |
+| Qwen3.5-9B Q8_0 | 80.6-81.8 -> 110.0-110.1 | 4,260-4,471 -> 4,246-4,249 | 65.0 |
+| gemma-4-E4B Q8_0 | 45.8-45.9 -> 106.2 | 5,578-5,807 -> 5,612-5,629 | 83.8 |
+| Nemotron-H-8B Q8_0 | 74.0-75.5 -> 107.2-107.7 | 3,629-3,767 -> 3,575-3,594 | 61.6 |
+| Mistral-Small-3.1-24B Q4_K_M | 64.3-64.9 -> 63.7-63.8 | 1,698-1,704 -> 1,703-1,706 | 38.7 |
+| Qwen3.8 Flash Next Q2_0 (D: two separate runs) | 23.1-27.6 -> 103.7-103.9 | 232-294 -> 304-310 | layer split 96.2 |
+| Qwen3.5-9B Q8_0 on `ggml_cuda` | 98.7-98.9 -> 103.0-103.9 | 5,164-5,175 -> 5,039-5,071 | |
+
+The greedy text is equal in every pair. `--tp 2` now decodes faster than one GPU on every model here but the 0.8B (at 95 %
+of it), and Qwen3.8 Flash Next faster than over two stages. Mistral-Small's family declares no advancing decode steps
+(`DecodeStepsAdvance`), so it neither advances nor records. Prefill is 2-3 % lower with E on the 9B and Nemotron (and on
+`ggml_cuda`); not investigated (the kept recordings hold their pool blocks).
 
 **Open.**
 
@@ -1513,4 +1530,8 @@ recorded; ABBA D1 E1 E2 D2, best of two runs of 512/128 each):
   own for GGML buffers (as `CudaP2PCommunicator` for direct CUDA) would lift it.
 * Direct CUDA's long prompts: 1,943 tok/s at 512 tokens but 343 over 5,130 (`--layer-split 2`; `--tp 2` 218). Not profiled
   further here.
+* Families that declare no advancing decode steps (the generic decoder's: Mistral-Small, Qwen3-VL, Hunyuan dense) re-trace
+  every tensor-parallel decode step and record none; turning `DecodeStepsAdvance` on for them needs their advance checks.
+* A step whose host reads a device value mid-step (routed experts that route on the host, such as the BF16 experts of the
+  `moe-tp` fixture) runs unrecorded, as on one device.
 * The hybrid (`--tp 2 --layer-split 2`) was validated on simulated devices only; the VM has two GPUs.

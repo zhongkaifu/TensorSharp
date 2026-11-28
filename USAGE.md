@@ -1965,8 +1965,10 @@ row-parallel projection. On direct CUDA it runs ordered on the devices where
 every GPU pair passed the peer self-test: the ranks' streams wait on each
 other's events, every rank sums the partials over the peer mappings in rank order
 (the same bits on every rank) and the host never waits, so a step's kernels keep
-flowing across its reductions. Each rank's step is a compiled plan that replays
-and advances a decode step, as on `ggml_cuda`.
+flowing across its reductions. A decode step advances one position without a
+trace and, on direct CUDA, is recorded once as one CUDA graph over every GPU and
+replayed after (Qwen3.8 Flash Next on two RTX PRO 4000s: 104 tok/s, against 27.6
+unrecorded); prompt chunks stream each GPU's ops as they are traced.
 
 ```bash
 # CLI: 2-GPU tensor parallelism
