@@ -151,15 +151,19 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
         Assert.EndsWith("not ggml_vulkan.", codec.Message);
     }
 
-    /// <summary>Multi-GPU requests are refused by the contract's gaps, as for any family, before anything loads.</summary>
+    /// <summary>Tensor parallelism is refused by the contract's gap, as for any family, before anything loads; layer split is
+    /// the contract's on ggml_cuda (whole-block stages: MiniMaxH3ImageLoraDenoiserTests.WholeBlockStages*), so the gate lets
+    /// it through, and on a backend of one device it is refused there.</summary>
     [Fact]
-    public void TensorParallelAndLayerSplitAreTheContractsGaps()
+    public void TensorParallelIsTheContractsGapAndLayerSplitPassesItsGate()
     {
         using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16, safetensors: true);
         var tp = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCuda, tpDegree: 2));
         Assert.Contains("tensor-parallel", tp.Message);
-        var split = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCuda, layerSplitDegree: 2));
-        Assert.Contains("layer-split", split.Message);
+        MechanismSupport split = MiniMaxH3ImageArchitecture.Descriptor.Serving.LayerSplit;
+        Assert.Equal(new[] { BackendType.GgmlCuda }, split.Backends);
+        var cpu = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCpu, layerSplitDegree: 2));
+        Assert.Contains("layer-split", cpu.Message);
     }
 
     /// <summary>The family's detector: the H3 DiT's video and text projections under one prefix, and no audio stream.</summary>

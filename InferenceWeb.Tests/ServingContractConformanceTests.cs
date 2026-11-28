@@ -104,7 +104,6 @@ public sealed class ServingContractConformanceTests
         "minimax-h3: TensorParallel@cuda",
         "minimax-h3: TensorParallel@ggml_cuda",
         "minimax-h3-image: HybridParallel@ggml_cuda",
-        "minimax-h3-image: LayerSplit@ggml_cuda",
         "minimax-h3-image: TensorParallel@ggml_cuda",
         "minimax-m3: HybridParallel@ggml_cuda",
         "muse-spark: HybridParallel@ggml_cuda",

@@ -45,8 +45,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
         private readonly object _generationLock = new();
         private volatile bool _disposed;
 
-        public MiniMaxH3ImageDiffusionModel(string ditPath, BackendType backend)
-            : base(ditPath, backend, openGguf: false)
+        /// <param name="layerSplitDegree">Devices the denoiser's blocks are split over as whole-block stages (--layer-split N;
+        /// ggml_cuda): each holds its share of the weights, the text encoder and the VAE run on the first.</param>
+        public MiniMaxH3ImageDiffusionModel(string ditPath, BackendType backend, int layerSplitDegree = 1)
+            : base(ditPath, backend, layerSplitDegree: layerSplitDegree, openGguf: false)
         {
             if (backend is not (BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu))
                 throw new ModelLoadRefusedException(
@@ -87,9 +89,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     "MiniMaxAI/MiniMax-H3 processor/ beside it) and minimax_h3_image_vae_fp16.safetensors " +
                     "(Comfy-Org/MiniMax-H3-Image).");
 
+            if (layerSplitDegree > 1)
+                Console.WriteLine($"  placement    = denoiser blocks over {layerSplitDegree} GPUs as whole-block stages (the text encoder and VAE on the first)");
             var load = new DiffusionLoad
             {
                 Backend = backend,
+                DenoiserDevices = StageDeviceAllocators(),
                 Files = new Dictionary<string, string>
                 {
                     [DiffusionLoad.Denoiser] = ditPath,

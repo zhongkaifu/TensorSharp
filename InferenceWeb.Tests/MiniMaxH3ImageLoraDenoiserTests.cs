@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using TensorSharp;
+using TensorSharp.Cpu;
 using TensorSharp.GGML;
 using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Models.MiniMaxH3Image;
@@ -147,6 +148,70 @@ public sealed class MiniMaxH3ImageLoraDenoiserTests(ITestOutputHelper output) : 
     }
 
     private static GgmlBackendType GgmlBackend(BackendType b) => TestGates.GgmlBackendTypeOf(b);
+
+    // ================================================================ whole-block stages (--layer-split N)
+
+    /// <summary>The denoiser's blocks over two devices as whole-block stages (DenoiserStages: one program a stage, the
+    /// residual stream handed on through F32 rows), on the managed executor of two host "devices": every step's velocity
+    /// equals one device's bit for bit, with and without LoRA adapters (each stage binds its own blocks' factors), and each
+    /// stage compiles once a geometry.</summary>
+    [Fact]
+    public void WholeBlockStagesMatchOneDeviceOnTheManagedExecutor()
+    {
+        var (specs, _) = Adapters();
+        using var fx = new MiniMaxH3ImageFixture(F32);
+        var family = MiniMaxH3ImageFamily.ForDenoiser(fx.DitPath);
+        using var one = new MiniMaxH3ImageDenoiser(fx.DitPath, BackendType.Cpu);
+        var devices = new IAllocator[] { new CpuAllocator(BlasEnum.DotNet), new CpuAllocator(BlasEnum.DotNet) };
+        using var staged = new MiniMaxH3ImageDenoiser(fx.DitPath, BackendType.Cpu, devices);
+        Assert.Equal(2, staged.Stages.Count);
+        Assert.Equal((0, 1), (staged.Stages.First(0), staged.Stages.End(0)));
+        Assert.Equal((1, 2), (staged.Stages.First(1), staged.Stages.End(1)));
+        AssertBitExact(Steps(family, one, AdapterSet.Empty, wide: false), Steps(family, staged, AdapterSet.Empty, wide: false), "stages, no adapters");
+        Assert.Equal(2, staged.Compiles);   // one program a stage, replayed by the second step
+        using var oneSet = MiniMaxH3ImageLoraSet.Load(LoraCliFlags.Resolve(specs), one.Config, BackendType.Cpu);
+        using var stagedSet = MiniMaxH3ImageLoraSet.Load(LoraCliFlags.Resolve(specs), staged.Config, BackendType.Cpu);
+        AssertBitExact(Steps(family, one, oneSet.AdapterSet, wide: false), Steps(family, staged, stagedSet.AdapterSet, wide: false),
+            "stages, LoRA adapters");
+        Assert.Same(stagedSet, staged.BoundLora);
+        // Without the adapters again: no stage keeps the set's plan or factors.
+        AssertBitExact(Steps(family, one, AdapterSet.Empty, wide: false), Steps(family, staged, AdapterSet.Empty, wide: false),
+            "stages after the adapters");
+    }
+
+    /// <summary>The same over two GPUs of one ggml_cuda context (the layer split's: collectives off), the stages' programs
+    /// compiled and run with their GPU active: every step equals one GPU's, plain and wide (the served regions), with the
+    /// adapters too.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void WholeBlockStagesOnTwoGpusMatchOneGpu(bool wide)
+    {
+        GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
+        var (specs, _) = Adapters();
+        using var fx = new MiniMaxH3ImageFixture(Q8_0);
+        var family = MiniMaxH3ImageFamily.ForDenoiser(fx.DitPath);
+        List<float[]> want, wantLora;
+        using (var one = new MiniMaxH3ImageDenoiser(fx.DitPath, BackendType.GgmlCuda))
+        using (var set = MiniMaxH3ImageLoraSet.Load(LoraCliFlags.Resolve(specs), one.Config, BackendType.GgmlCuda))
+        {
+            want = Steps(family, one, AdapterSet.Empty, wide);
+            wantLora = Steps(family, one, set.AdapterSet, wide);
+        }
+        var context = new GgmlContext(new[] { 0, 1 }, GgmlBackendType.Cuda, enableCollectives: false);   // as a layer-split model makes it
+        var devices = new IAllocator[] { new GgmlAllocator(context, 0), new GgmlAllocator(context, 1) };
+        using var staged = new MiniMaxH3ImageDenoiser(fx.DitPath, BackendType.GgmlCuda, devices);
+        Assert.True(staged.Preload() > 0);
+        using var stagedSet = MiniMaxH3ImageLoraSet.Load(LoraCliFlags.Resolve(specs), staged.Config, BackendType.GgmlCuda);
+        List<float[]> got = Steps(family, staged, AdapterSet.Empty, wide), gotLora = Steps(family, staged, stagedSet.AdapterSet, wide);
+        for (int i = 0; i < want.Count; i++)
+        {
+            var (rel, relL2) = Compare(want[i], got[i]);
+            var (relLora, relL2Lora) = Compare(wantLora[i], gotLora[i]);
+            output.WriteLine($"step {i + 1}{(wide ? " wide" : "")}: stages vs one GPU max {rel:E3} (L2 {relL2:E3}); with LoRA max {relLora:E3} (L2 {relL2Lora:E3})");
+            Assert.True(rel <= 1e-5 && relLora <= 1e-5, $"step {i + 1}: {rel:E3} / {relLora:E3}");
+        }
+    }
 
     // Bounds: the largest relative error measured on each lane (max |err| / max |v|), with headroom. The managed executor
     // and ggml_cpu keep the factors in F32; ggml_metal and ggml_cuda in F16, and ggml_cuda's products round their

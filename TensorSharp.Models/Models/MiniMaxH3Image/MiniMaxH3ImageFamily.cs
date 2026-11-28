@@ -109,7 +109,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public IDenoiser CreateDenoiser(DiffusionLoad load)
         {
             ArgumentNullException.ThrowIfNull(load);
-            return Denoiser = new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend)
+            return Denoiser = new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend, load.DenoiserDevices)
             {
                 AdapterBytes = () => Lora?.FactorBytes ?? 0,
             };

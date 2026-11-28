@@ -316,11 +316,14 @@ namespace TensorSharp.Models.Architecture
         /// The contract of a family built on the shared diffusion runtime: continuous batching does not apply (a job
         /// is one image or clip, run by the model's DiffusionJobQueue); tensor parallelism is supported on
         /// <paramref name="tensorParallelBackends"/>, where the family's denoiser declares shardable blocks, and a gap
-        /// (<paramref name="tensorParallelGap"/>) on its other multi-device backends; layer split and the hybrid are
-        /// gaps (<paramref name="layerSplitGap"/>); expert offload does not apply (no routed experts).
+        /// (<paramref name="tensorParallelGap"/>) on its other multi-device backends; layer split on
+        /// <paramref name="layerSplitBackends"/>, where the denoiser runs whole-block stages (DenoiserStages), and a gap
+        /// (<paramref name="layerSplitGap"/>) elsewhere; the hybrid is a gap; expert offload does not apply (no routed
+        /// experts).
         /// </summary>
         public static ServingContract SharedDiffusionRuntime(IReadOnlyList<BackendType> backends,
-            IReadOnlyList<BackendType> tensorParallelBackends = null, string tensorParallelGap = null, string layerSplitGap = null)
+            IReadOnlyList<BackendType> tensorParallelBackends = null, string tensorParallelGap = null, string layerSplitGap = null,
+            IReadOnlyList<BackendType> layerSplitBackends = null)
         {
             ArgumentNullException.ThrowIfNull(backends);
             var all = backends.Distinct().ToArray();
@@ -331,7 +334,11 @@ namespace TensorSharp.Models.Architecture
             MechanismSupport tensorParallel = multi.Length == 0 ? singleDevice
                 : tensorParallelBackends is { Count: > 0 } ? MechanismSupport.On(tensorParallelBackends.ToArray()).ElsewhereGap(tensorParallelGap)
                 : MechanismSupport.None(tensorParallelGap);
-            MechanismSupport layerSplit = multi.Length == 0 ? singleDevice : MechanismSupport.None(layerSplitGap);
+            MechanismSupport layerSplit = multi.Length == 0 ? singleDevice
+                : layerSplitBackends is { Count: > 0 } ? MechanismSupport.On(layerSplitBackends.ToArray()).ElsewhereGap(layerSplitGap)
+                : MechanismSupport.None(layerSplitGap);
+            MechanismSupport hybrid = multi.Length == 0 ? singleDevice
+                : MechanismSupport.None("tensor-parallel stages are not implemented for diffusion denoisers");
             return new ServingContract
             {
                 Implementation = ServingImplementation.SharedDiffusionRuntime,
@@ -341,7 +348,7 @@ namespace TensorSharp.Models.Architecture
                 ContinuousBatching = MechanismSupport.NotApplicable(DiffusionJobsReason),
                 TensorParallel = tensorParallel,
                 LayerSplit = layerSplit,
-                HybridParallel = layerSplit,
+                HybridParallel = hybrid,
                 ExpertOffload = MechanismSupport.NotApplicable("dense: no routed experts"),
             };
         }

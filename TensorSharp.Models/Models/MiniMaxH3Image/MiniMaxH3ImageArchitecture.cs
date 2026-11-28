@@ -20,7 +20,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             Id = MiniMaxH3ImageFamily.ArchitectureId,
             DisplayName = "MiniMax-H3-Image",
             Aliases = new[] { MiniMaxH3ImageFamily.ArchitectureId, "minimax_h3_image" },
-            Factory = c => new MiniMaxH3ImageDiffusionModel(c.GgufPath, c.Backend),
+            Factory = c => new MiniMaxH3ImageDiffusionModel(c.GgufPath, c.Backend, c.LayerSplitDegree),
             // Style adapters (any number, bare weights too) and one speed adapter (config/lora/minimax-h3-image-*.json).
             LoraPluginType = Runtime.LoraCliFlags.MiniMaxH3ImagePluginType,
             DetectFromTensors = LooksLikeDenoiser,
@@ -37,7 +37,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             Serving = ServingContract.SharedDiffusionRuntime(
                 new[] { BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda },
                 tensorParallelGap: "minimax-h3-image has no tensor-parallel path; it runs on one GPU and extra GPUs stay idle.",
-                layerSplitGap: "minimax-h3-image has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
+                layerSplitBackends: new[] { BackendType.GgmlCuda }),
         };
 
         /// <summary>The architecture detector for a GGUF that holds the image denoiser.</summary>

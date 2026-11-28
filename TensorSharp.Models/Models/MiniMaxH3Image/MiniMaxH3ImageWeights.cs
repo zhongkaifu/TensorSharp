@@ -114,6 +114,53 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>Every weight leaf a step binds.</summary>
         public IReadOnlyList<MiniMaxH3ImageWeight> All => _all;
 
+        /// <summary>The weight leaves of <paramref name="block"/> (null ones left out).</summary>
+        public static IEnumerable<MiniMaxH3ImageWeight> Of(MiniMaxH3ImageBlock block)
+        {
+            foreach (MiniMaxH3ImageWeight w in new[] { block.Norm1, block.Norm2, block.QNorm, block.KNorm })
+                if (w != null) yield return w;
+            foreach (MiniMaxH3ImageLinear l in new[] { block.AdaLn, block.Qkv, block.Out, block.Fc1, block.Fc2 })
+            {
+                if (l?.Weight != null) yield return l.Weight;
+                if (l?.Bias != null) yield return l.Bias;
+            }
+        }
+
+        /// <summary>Each modulated block's weight bytes, in block order (a whole-block split balances them).</summary>
+        public long[] BlockBytes()
+        {
+            var bytes = new long[Blocks.Length];
+            for (int i = 0; i < bytes.Length; i++)
+                foreach (MiniMaxH3ImageWeight w in Of(Blocks[i])) bytes[i] += w.Bytes;
+            return bytes;
+        }
+
+        /// <summary>The weight leaves the program of <paramref name="span"/> binds: its blocks, and the text refiner and patch
+        /// projections where it opens the step, the final layer where it closes it.</summary>
+        public List<MiniMaxH3ImageWeight> WeightsOf(SharedDiffusion.DenoiserSpan span)
+        {
+            var weights = new List<MiniMaxH3ImageWeight>();
+            void Add(MiniMaxH3ImageLinear l)
+            {
+                if (l?.Weight != null) weights.Add(l.Weight);
+                if (l?.Bias != null) weights.Add(l.Bias);
+            }
+            if (span.IsFirst)
+            {
+                Add(VideoPatch);
+                Add(ConditionProj);
+                foreach (MiniMaxH3ImageBlock r in Refiner) weights.AddRange(Of(r));
+                if (RefinerFinalNorm != null) weights.Add(RefinerFinalNorm);
+            }
+            for (int i = span.First; i < span.End; i++) weights.AddRange(Of(Blocks[i]));
+            if (span.IsLast)
+            {
+                Add(FinalAdaLn);
+                if (FinalNorm != null) weights.Add(FinalNorm);
+            }
+            return weights;
+        }
+
         /// <summary>The device bytes the weight leaves take.</summary>
         public long Bytes
         {
