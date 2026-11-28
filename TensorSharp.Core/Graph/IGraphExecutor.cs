@@ -200,6 +200,46 @@ namespace TensorSharp.Graph
         /// executor whose row-invariant products cost more past a few rows keeps them for the rows of one sequence's window
         /// (several sequences' rows past them take its multi-row products, as they did before).</summary>
         int StepSequences { get => 0; set { } }
+
+        /// <summary>The run attributes in effect (<see cref="Drafting"/>, <see cref="StepSequences"/>) as one value.</summary>
+        GraphRunContext RunContext => new(Drafting, StepSequences);
+
+        /// <summary>Runs the steps of the returned scope under <paramref name="context"/> and restores the context before it when
+        /// the scope ends (D07: an explicit, immutable run context instead of each caller setting and restoring the
+        /// executor's attributes).</summary>
+        GraphRunScope EnterRun(GraphRunContext context)
+        {
+            GraphRunContext previous = RunContext;
+            Drafting = context.Drafting;
+            StepSequences = context.StepSequences;
+            return new GraphRunScope(this, previous);
+        }
+    }
+
+    /// <summary>The attributes of the steps an executor runs now (D07): whether they are a drafter's
+    /// (<see cref="IGraphExecutor.Drafting"/>) and how many sequences they carry (<see cref="IGraphExecutor.StepSequences"/>,
+    /// 0: not said). Immutable; entered for a scope with <see cref="IGraphExecutor.EnterRun"/>.</summary>
+    public readonly record struct GraphRunContext(bool Drafting, int StepSequences);
+
+    /// <summary>The scope of a <see cref="GraphRunContext"/> (<see cref="IGraphExecutor.EnterRun"/>): disposing it restores the
+    /// context that was in effect before.</summary>
+    public readonly struct GraphRunScope : IDisposable
+    {
+        private readonly IGraphExecutor? _executor;
+        private readonly GraphRunContext _previous;
+
+        internal GraphRunScope(IGraphExecutor executor, GraphRunContext previous)
+        {
+            _executor = executor;
+            _previous = previous;
+        }
+
+        public void Dispose()
+        {
+            if (_executor == null) return;
+            _executor.Drafting = _previous.Drafting;
+            _executor.StepSequences = _previous.StepSequences;
+        }
     }
 
     /// <summary>A compiled program. Outputs are the plan's arrays, rewritten by each run.</summary>

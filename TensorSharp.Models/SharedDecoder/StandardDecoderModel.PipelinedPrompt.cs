@@ -129,11 +129,8 @@ namespace TensorSharp.Models
             PrepareHeadLayout();
             MarkDrafterWeights();
             RoomForRecordings();
-            IGraphExecutor executor = GraphExecutor;
-            bool drafting = executor.Drafting;
-            int sequences = executor.StepSequences;
-            executor.Drafting = false;
-            executor.StepSequences = 1;
+            // One sequence's prompt, no drafter: the run context of every stage's steps, restored when the prompt ends.
+            GraphRunScope runScope = GraphExecutor.EnterRun(new GraphRunContext(Drafting: false, StepSequences: 1));
             // The rows (and the family's carry) each stage handed on in the last wavefront, for the stage after it.
             var handed = new float[stages][];
             var handedCarry = new float[stages][];
@@ -212,8 +209,7 @@ namespace TensorSharp.Models
             finally
             {
                 _forwardSw.Stop();
-                executor.Drafting = drafting;
-                executor.StepSequences = sequences;
+                runScope.Dispose();
                 EnterStage(0);
             }
         }
