@@ -55,7 +55,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_KV_HOLDER_POOL_MAX` | 具有 per-request fused holder 的模型（共享运行时上的 Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next 与 GPT-OSS，以及 Gemma 4） | 已释放的 holder 最多可停放多少个以待复用而不是释放；每个停放的 holder 都占用其完整 K/V 分配。共享运行时无论取值如何最多停放 4 个 slot；`0` 不停放 | `64` | 不适用 | 否 |
 | `TS_SCHED_DISABLE_BATCHED` | 走按序列执行器的模型（共享解码运行时除外：其请求始终在各自的 slot 上运行统一步骤） | `1` 强制走按序列 KV-swap 路径，投机解码也一样（`--no-continuous-batching`） | 关闭 | `0`, `1` | 是 |
 | `TS_SCHED_PREFIX_CACHE` | 全部自回归模型 | `0` 关闭准入时的全部提示复用（Radix 前缀缓存：页面、保留的终态与公共检查点在同一个索引里）。`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享提示的启动预热，以及服务端的检查点文件 | 启用（`1`） | 未注册 | 否 |
-| `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。有自己单请求步长的模型——启用流水化 prefill 的 Muse Spark：8192——在未设置 `TS_SCHED_SOLO_PREFILL_CHUNK` 时自行决定步长；设置了该变量则按文档生效并关闭模型自己的步长，只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
+| `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。有自己单请求步长的模型——启用流水化 prefill 的 Muse Spark、共享解码运行时流水化的 `--layer-split` 分段：8192——在未设置 `TS_SCHED_SOLO_PREFILL_CHUNK` 时自行决定步长；设置了该变量则按文档生效并关闭模型自己的步长，只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
 | `TS_SCHED_STOP_REPETITION` | 全部 | `0` 时陷入循环的生成会一直跑到 token 上限，而不是以 `repetition` 结束原因停止；重复模板行的思考也不再被闭合 | 启用（`1`） | 未注册 | 否 |
 
 本节的 executor 级开关（`TS_SCHED_DISABLE_BATCHED`、`TS_PER_SEQ_FUSED`、
@@ -153,7 +153,7 @@ Qwen 3.5 / 3.6 / 3.8 家族与 Qwen 3.8 Flash Next 的直连 CUDA 引擎以及 N
 |---|---|---|---|---|---|
 | `TS_PREFILL_CHUNK` | 在 GPT OSS、Qwen 3.5 / 3.6 family 长上下文功能上 sweep；运行时 Gemma 4、Nemotron-H 以及所有共享解码运行时家族（Mistral 3、Hunyuan Dense、GPT OSS，其滑动窗口环把一步限制在 512 行以内）也会读取 | 分块 prefill 大小 | 架构默认值 | `256`, `512`, `1024` | 是 |
 | `TS_PIPELINED_PROMPT` | 在 `ggml_cuda`、`ggml_vulkan` 和 `cuda` 上以本机 `--layer-split` 分段运行的共享解码运行时家族（无 `--tp`、无主机专家、无 LoRA、无跟随 prompt 的草稿层或 DFlash 环、无多媒体） | `0` 让长 prompt 的各分块逐段依次运行。默认：分块流水化，第 s 段处理第 k - s 块的同时第 s + 1 段处理第 k - s - 1 块，适用于引擎的单请求 prompt 步和 refill；结果与同样的分块依次运行逐位一致 | 启用 | 未注册 | 否 |
-| `TS_PIPELINED_CHUNK` | 同上 | 流水化 prompt 每个分块的行数。一步至少有两个分块才会流水化（引擎的单请求 prompt 步最多 `TS_SCHED_MAX_BATCHED_TOKENS`，即 4,096 行）。在两块 RTX 2000 Ada 上测过的每个模型中，256 都是 256-1,024 里最快的 | `256` | 未注册 | 否 |
+| `TS_PIPELINED_CHUNK` | 同上 | 流水化 prompt 每个分块的行数；一步至少有两个分块才会流水化，单请求 prompt 能流水化的模型会请求 8,192 token 的步长（除非设置了 `TS_SCHED_SOLO_PREFILL_CHUNK`）。在 `ggml_cuda` 上，两块 RTX 2000 Ada 测过的每个模型中 256 都是 128-1,024 里最快的；直接 CUDA 在未设置时以它自己的单请求 prompt 步（最多 2,048 行）为分块，因为它对几百行的乘法与 2,048 行的耗时相近 | `256`；直接 CUDA：其 prompt 步 | 未注册 | 否 |
 | `TS_GGML_ASYNC_COMPUTE` | GGML 后端 | 异步 compute 提交 | `ggml_metal` 上启用（`0` 关闭），其他 GGML 后端关闭 | `0`, `1` | 是 |
 
 ## 多模态
